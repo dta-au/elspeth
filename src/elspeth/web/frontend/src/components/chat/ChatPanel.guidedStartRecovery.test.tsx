@@ -66,6 +66,7 @@ const guidedSession: GuidedSession = {
   terminal: null,
   chat_history: [],
   chat_turn_seq: 0,
+  reviewed_components: { sources: [], outputs: [] },
   profile: null,
 };
 const completedResponse: GetGuidedResponse = {
@@ -213,5 +214,62 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
       name: "Describe what you want",
     });
     expect(section.contains(document.activeElement)).toBe(true);
+  });
+
+  // ── T0: the goal card, end to end through the real ChatInput ─────────────
+  //
+  // Goal-first (elspeth-378cfa0e18). This is the ONE transition the tutorial
+  // canary cannot cover — the tutorial's start is programmatic, so its learner
+  // never sees the goal card — which is why the routing is pinned here against
+  // the real input rather than only at the store boundary.
+  it("routes the goal typed on the pre-start card into POST /guided/start as the intent", async () => {
+    const user = userEvent.setup();
+    apiMocks.startGuidedSession.mockResolvedValueOnce(completedResponse);
+    // The adopted GET stub: step 1, a first turn, and NO composition state.
+    useSessionStore.setState({
+      guidedSession: { ...guidedSession, step: "step_1_source" },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+        },
+      },
+      compositionState: null,
+    } as never);
+
+    render(<ChatPanel />);
+
+    // The goal card stands in for the decision card, and the composer asks the
+    // goal question rather than the step-1 source question — this Send does
+    // not answer the turn, it establishes the session's root intent.
+    screen.getByRole("heading", { name: "What should this pipeline produce?" });
+    expect(screen.getByLabelText("Message input")).toHaveAttribute(
+      "placeholder",
+      expect.stringContaining("what should come out the other end"),
+    );
+    // Explain must not be offered pre-start: it sends a canned question down
+    // this same cold-start path, so pressing it would make "why am I seeing
+    // this?" the session's root intent and the planner's brief.
+    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
+
+    await user.type(
+      screen.getByLabelText("Message input"),
+      "Summarise every page as one JSON row.",
+    );
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(apiMocks.startGuidedSession).toHaveBeenCalledTimes(1),
+    );
+    expect(apiMocks.startGuidedSession.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        profile: "live",
+        intent: "Summarise every page as one JSON row.",
+      }),
+    );
   });
 });

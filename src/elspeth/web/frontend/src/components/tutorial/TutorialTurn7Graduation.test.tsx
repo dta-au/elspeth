@@ -320,7 +320,7 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
     ).toBeNull();
   });
 
-  it("both variants point at the real 'Audit panel' — never a nonexistent 'Audit page' (elspeth-4f69b267dd)", () => {
+  it("both variants point at the real 'Checks tab' — never a nonexistent 'Audit page' or the retired Audit drawer (elspeth-4f69b267dd)", () => {
     const { unmount } = render(
       <TutorialTurn7Graduation
         sessionId="sess-new"
@@ -329,9 +329,10 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/Audit panel beside your pipeline/),
+      screen.getByText(/your pipeline's Checks tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Audit page/)).toBeNull();
+    expect(screen.queryByText(/Audit panel/)).toBeNull();
     unmount();
 
     render(
@@ -342,8 +343,9 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       />,
     );
     expect(
-      screen.getByText(/Audit panel beside each pipeline/),
+      screen.getByText(/each pipeline's Checks tab/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/Audit page/)).toBeNull();
+    expect(screen.queryByText(/Audit panel/)).toBeNull();
   });
 });

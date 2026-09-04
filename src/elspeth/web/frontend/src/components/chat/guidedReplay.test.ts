@@ -84,6 +84,50 @@ describe("dedupeGuidedUserMessages", () => {
     expect(dedupeGuidedUserMessages(rows, [])).toEqual(rows);
   });
 
+  // ── The seeded goal pair (goal-first, elspeth-378cfa0e18) ─────────────────
+  //
+  // A started or converted guided session's chat_history OPENS with the goal
+  // (a user turn) and one assistant acknowledgement. On exit_to_freeform that
+  // history is replayed above the freeform transcript, so the goal has to obey
+  // the same consumption rule as any other guided send — otherwise the very
+  // first line of the replayed conversation is the one that renders twice.
+
+  it("consumes exactly one freeform copy of the seeded goal", () => {
+    const goal = "Summarise each page and save the results as JSON.";
+    const kept = dedupeGuidedUserMessages(
+      [message("m1", "user", goal), message("m2", "user", "Now add a sink.")],
+      [
+        guidedTurn(0, "user", goal),
+        guidedTurn(
+          1,
+          "assistant",
+          "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?",
+        ),
+      ],
+    );
+    expect(kept).toEqual([message("m2", "user", "Now add a sink.")]);
+  });
+
+  it("leaves a re-stated goal visible after graduation (consumption, not blanket suppression)", () => {
+    // If the user says the same sentence again in freeform, that second row is
+    // a real message and must render: the guided-phase copy was already spent
+    // by the first row.
+    const goal = "Summarise each page and save the results as JSON.";
+    const rows = [message("m1", "user", goal), message("m2", "user", goal)];
+    expect(dedupeGuidedUserMessages(rows, [guidedTurn(0, "user", goal)])).toEqual([
+      rows[1],
+    ]);
+  });
+
+  it("the goal acknowledgement consumes nothing — it is an assistant turn", () => {
+    const ack =
+      "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?";
+    const rows = [message("m1", "user", ack)];
+    expect(dedupeGuidedUserMessages(rows, [guidedTurn(1, "assistant", ack)])).toEqual(
+      rows,
+    );
+  });
+
   it("keeps user rows with no matching guided turn (ordinary freeform chat)", () => {
     const rows = [
       message("m1", "user", "Please create a CSV source."),

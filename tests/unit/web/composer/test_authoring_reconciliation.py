@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from unittest.mock import MagicMock
 
@@ -12,9 +13,15 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_USER_TERM,
+    build_source_data_contract_draft,
+    source_data_contract_artifact_hash,
+)
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
+from elspeth.web.composer.tools.sources import _execute_patch_source_options
 from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
@@ -23,6 +30,10 @@ from elspeth.web.interpretation_state import (
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
     WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+    InterpretationReviewPending,
+    current_source_data_contract_demand,
+    interpretation_sites,
+    materialize_state_for_execution,
     model_choice_artifact_hash,
     pipeline_decision_artifact_hash,
     reconcile_authoritative_reviews,
@@ -121,6 +132,39 @@ def _trained_context() -> ToolContext:
     return ToolContext(
         catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
         plugin_snapshot=snapshot,
+    )
+
+
+def _resolved_source_contract_state(*, required_fields: list[str]) -> CompositionState:
+    acknowledged_fields = ["colour"]
+    draft = build_source_data_contract_draft(acknowledged_fields, None)
+    requirement = _requirement(
+        requirement_id="source-data-contract-source",
+        kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+        user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+        status="resolved",
+        draft=draft,
+        accepted_value=draft,
+        accepted_artifact_hash=source_data_contract_artifact_hash(acknowledged_fields),
+    )
+    return _state(
+        nodes=(
+            _node(
+                plugin="passthrough",
+                options={
+                    "required_input_fields": required_fields,
+                    "schema": {"mode": "observed"},
+                },
+            ),
+        ),
+        source_options={
+            "path": "rows.csv",
+            "schema": {
+                "mode": "observed",
+                "guaranteed_fields": acknowledged_fields,
+            },
+            INTERPRETATION_REQUIREMENTS_KEY: [requirement],
+        },
     )
 
 
@@ -505,6 +549,157 @@ def test_exact_payload_round_trips_through_real_set_pipeline_with_authoritative_
     carried = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert carried["status"] == "resolved"
     assert carried["event_id"] == "event-1"
+
+
+def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+
+    result = _execute_patch_source_options(
+        {"patch": {"skip_rows": 1}},
+        previous,
+        _trained_context(),
+    )
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    assert source.options["skip_rows"] == 1
+    carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
+
+
+def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:
+    """John's ruling 2026-09-01 (elspeth-1dddcfee3a; supersedes the widening
+    tolerance pinned earlier the same day in 915001735): even a SUPERSET over
+    an acknowledged review is a planner-authored observed-mode stamp — one
+    acknowledgement must not license later widening with no re-ask. The
+    sanctioned paths are growing ``required_input_fields`` and re-requesting
+    the review (the user acknowledges the v2 field set), or declaring an
+    explicit runtime ``fields`` contract. An exact echo of the acknowledged
+    stamp still passes (see the exact-round-trip test below)."""
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+    proposal = deep_thaw(exact.data)
+    proposal["source"]["options"]["schema"]["guaranteed_fields"] = ["colour", "size"]
+    proposal["nodes"][0]["options"]["required_input_fields"] = ["colour", "size"]
+
+    result = _execute_set_pipeline(proposal, previous, _trained_context())
+
+    assert result.success is False
+    assert "guaranteed_fields" in result.data["error"]
+    assert "request_interpretation_review" in result.data["error"]
+
+
+def test_deleting_resolved_source_contract_guarantee_reopens_review() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+
+    result = _execute_patch_source_options(
+        {"patch": {"schema": {"mode": "observed"}}},
+        previous,
+        _trained_context(),
+    )
+
+    assert result.success, result.data
+    source = result.updated_state.sources["source"]
+    assert "guaranteed_fields" not in source.options["schema"]
+    requirement = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert requirement["status"] == "pending"
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+def test_exact_payload_round_trips_resolved_source_contract() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
+
+    assert result.success, result.data
+    carried = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried["status"] == "resolved"
+    assert carried["event_id"] == "event-1"
+
+
+def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = build_source_data_contract_draft(["size"], None)
+    forged = previous.with_named_source("source", replace(source, options=options))
+    exact = _exact_arguments(forged)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), forged, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is forged
+    assert result.data["error_code"] == "review_reconciliation_failed"
+
+
+def test_exact_round_trip_reopens_coherent_legacy_v1_source_contract() -> None:
+    current = _resolved_source_contract_state(required_fields=["colour"])
+    source = current.sources["source"]
+    options = deep_thaw(source.options)
+    legacy_payload = {
+        "contract_version": 1,
+        "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+        "demanded_fields": ["colour"],
+        "sample_header": None,
+        "missing_from_sample": [],
+    }
+    legacy_draft = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    requirement = options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    requirement["draft"] = legacy_draft
+    requirement["accepted_value"] = legacy_draft
+    requirement["accepted_artifact_hash"] = stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": ["colour"]})
+    legacy = current.with_named_source("source", replace(source, options=options))
+    exact = _exact_arguments(legacy)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), legacy, _trained_context())
+
+    assert result.success, result.data
+    reopened = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    # The v1 row remains honest historical evidence, but it no longer admits
+    # execution and the derived current-v2 site is pending.
+    assert reopened["status"] == "resolved"
+    assert reopened["accepted_artifact_hash"] == requirement["accepted_artifact_hash"]
+    assert current_source_data_contract_demand(result.updated_state, "source") == ("colour",)
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+
+
+def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    exact = _exact_arguments(previous)
+    forged = deep_thaw(exact.data)
+    forged["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+        _requirement(
+            requirement_id="source-data-contract-source",
+            kind=InterpretationKind.SOURCE_DATA_CONTRACT,
+            user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+            status="resolved",
+            accepted_value="forged",
+            accepted_artifact_hash="f" * 64,
+        )
+    ]
+
+    result = _execute_set_pipeline(forged, previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.data["error_code"] == "interpretation_requirements_invalid"
+    assert "resolver-owned status 'resolved'" in result.data["error"]
+
+
+def test_stale_source_contract_round_trip_remains_blocked_for_review() -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour", "size"])
+    assert current_source_data_contract_demand(previous, "source") == ("colour", "size")
+    exact = _exact_arguments(previous)
+
+    result = _execute_set_pipeline(deep_thaw(exact.data), previous, _trained_context())
+
+    assert result.success, result.data
+    pending = [site for site in interpretation_sites(result.updated_state) if site.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert [site.component_id for site in pending] == ["source"]
+    materialized = materialize_state_for_execution(result.updated_state)
+    assert isinstance(materialized, InterpretationReviewPending)
 
 
 def test_prompt_shield_recommendation_is_removed_when_effective_shield_is_inserted() -> None:
@@ -959,3 +1154,176 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert result.updated_state.version == previous.version
     assert result.data["error_code"] == "interpretation_requirements_invalid"
     assert "unknown-decision" not in result.data["error"]
+
+
+def _reconciler_stale_hash_state() -> CompositionState:
+    """A committed llm node whose resolved model-choice hash no longer matches.
+
+    Reaching ``reconcile_authoritative_reviews`` at all requires options that
+    survive plugin prevalidation (``_prevalidate_transform_for_context`` runs
+    first and rejects an llm node missing ``prompt_template`` / ``provider`` /
+    ``required_input_fields`` long before reconciliation), so this fixture
+    carries a fully valid node and corrupts only the stored review hash.
+    """
+    model = "bedrock/example.model"
+    stale = _requirement(
+        requirement_id="model_choice_review:enrich",
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        user_term="llm_model_choice:enrich",
+        status="resolved",
+        draft=model,
+        accepted_value=model,
+        resolved_prompt_template_hash="stale-hash",
+    )
+    return _state(
+        nodes=(
+            _node(
+                node_id="enrich",
+                options={
+                    "provider": "bedrock",
+                    "model": model,
+                    "prompt_template": "Extract the industry from {{ row.company }}",
+                    "response_field": "industry",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [stale],
+                },
+            ),
+        )
+    )
+
+
+def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
+    """A reconciliation rejection must say WHICH invariant failed.
+
+    Session f33fa7c3 (2026-09-01) wedged because every raise inside
+    ``reconcile_authoritative_reviews`` — ten distinct causes — collapsed into
+    one identical "re-inspect the payload and retry" sentence at the
+    ``set_pipeline`` boundary. The planner resubmitted a byte-identical
+    payload twice and failed identically: a rejection that cannot name its
+    own cause is unrepairable by construction, the same REPAIR_BLIND_REPEAT
+    shape as the 2026-08-19 withdrawal.
+    """
+    previous = _reconciler_stale_hash_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.updated_state.version == previous.version
+    assert result.data["error_code"] == "review_reconciliation_failed"
+    # The specific invariant, not just the generic retry instruction.
+    assert "hash drifted" in result.data["error"], result.data["error"]
+    # ...and WHICH requirement drifted. This asserts a server-owned requirement
+    # id reaching the planner, which is deliberate and redaction-safe: the id is
+    # a pipeline identifier derived from kind + node id, not row content, and
+    # the same boundary already returns rejected option KEYS and VALUES from
+    # plugin prevalidation (the ``_prevalidate_plugin_options`` messages). Without
+    # the id, a pipeline carrying several resolved reviews still leaves the
+    # planner guessing which one to re-send.
+    assert "model_choice_review:enrich" in result.data["error"], result.data["error"]
+
+
+def _unwired_vague_term_state() -> CompositionState:
+    """The session-4c42a794 shape: pending vague_term, legacy-only placeholder.
+
+    The prompt spells the term as a slug because the legacy placeholder grammar
+    is what the planner actually wrote; the requirement keeps the human phrase.
+    With a matching pending requirement staged, ``vague_term_wiring_count``
+    takes the structured branch and the legacy placeholder no longer counts,
+    so the requirement has no resolvable wiring at all.
+    """
+    return _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": (
+                        "Rate the lead using this scoring guide: {{interpretation:lead_quality}} Company: {{ row.company }}"
+                    ),
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+
+def test_set_pipeline_rejects_unwired_pending_vague_term() -> None:
+    """A staged vague_term with no resolvable wiring must fail closed.
+
+    Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+    vague_term requirement whose only prompt wiring was a legacy
+    ``{{interpretation:...}}`` placeholder — a mixed form
+    ``vague_term_wiring_count`` counts as 0, because the staged requirement
+    disables the legacy fallback and no ``prompt_template_parts``
+    ``interpretation_ref`` exists. The review-staging tool rejects exactly
+    this shape (sessions.py's ``request_interpretation_review`` guard), but
+    ``set_pipeline`` is a second door into the same state and ran no wiring
+    check: the committed requirement was approvable but never resolvable, the
+    execution gate counted it as pending forever, and Run stayed blocked with
+    no card offered.
+    """
+    previous = _unwired_vague_term_state()
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(previous).data), previous, _trained_context())
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.data["error_code"] == "vague_term_unwired"
+    # The rejection must name the node and the term so the planner can repair.
+    assert "score_lead" in result.data["error"], result.data["error"]
+    assert "lead quality" in result.data["error"], result.data["error"]
+    # ...and the repair itself: wire a prompt_template_parts interpretation_ref.
+    assert "prompt_template_parts" in result.data["error"], result.data["error"]
+
+
+def test_set_pipeline_accepts_wired_pending_vague_term() -> None:
+    """The guard must not overfire: a parts-wired vague_term composes fine.
+
+    This is the legitimate one-shot authoring shape (wiring count exactly 1):
+    the pending requirement plus a ``prompt_template_parts``
+    ``interpretation_ref`` naming its id. Placeholder spelling is irrelevant
+    on this path — the ref matches on requirement id.
+    """
+    wired = _state(
+        nodes=(
+            _node(
+                node_id="score_lead",
+                options={
+                    "provider": "bedrock",
+                    "model": "bedrock/example.model",
+                    "prompt_template": "Rate the lead. Company: {{ row.company }}",
+                    PROMPT_TEMPLATE_PARTS_KEY: [
+                        {"kind": "text", "text": "Rate the lead using "},
+                        {"kind": "interpretation_ref", "requirement_id": "lead quality:score_lead"},
+                        {"kind": "text", "text": ". Company: {{ row.company }}"},
+                    ],
+                    "response_field": "lead_score",
+                    "required_input_fields": ["company"],
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        _requirement(
+                            requirement_id="lead quality:score_lead",
+                            kind=InterpretationKind.VAGUE_TERM,
+                            user_term="lead quality",
+                        )
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = _execute_set_pipeline(deep_thaw(_exact_arguments(wired).data), wired, _trained_context())
+
+    assert result.success, result.data

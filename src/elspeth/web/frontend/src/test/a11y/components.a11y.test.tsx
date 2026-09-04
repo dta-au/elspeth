@@ -19,7 +19,7 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
 
@@ -87,9 +87,29 @@ const AUDITED_COMPONENTS = [
   // itself (landmark structure, live-region siblinghood, the named scroll
   // group) had zero axe coverage.
   "ChatPanelTutorialWorkspace",
+  // A completed guided session keeps its conversation (elspeth-986801d218):
+  // the completed branch grew a live transcript log, an Explain control, the
+  // pending strip and the docked composer alongside the completion summary.
+  // That is a NEW landmark/live-region arrangement — summary + announcer as
+  // siblings of a role=log inside a named scroll group — and the tutorial
+  // workspace entry above audits the ACTIVE branch only.
+  "ChatPanelCompletedSurface",
   // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
   // toast is the only completion surface mounted outside the Run panel.
   "RunOutcomeNotice",
+  // Goal-first entry (elspeth-378cfa0e18): before a session has stated its
+  // goal the guided branch REPLACES the current-decision card with a goal
+  // card. That is a distinct arrangement from both audited ChatPanel entries
+  // — the decision card's role=log live region and its Explain control are
+  // absent, and a heading + hint sit where the turn widget was — so the
+  // either/or has to be audited on its own rather than assumed from the
+  // active-branch entry.
+  "ChatPanelGoalCard",
+  // Decision sheets (elspeth-f2a8550b3d): the read-only record a settled
+  // stepper tick opens. A disclosure whose panel takes focus, names itself,
+  // and replays a settled transcript — none of which the in-situ ChatPanel
+  // entries can cover for more than one stage at a time.
+  "GuidedDecisionSheet",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -98,6 +118,8 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "AppHeader",
   "AuditReadinessPanel",
   "ChatInput",
+  "ChatPanelCompletedSurface",
+  "ChatPanelGoalCard",
   "ChatPanelTutorialWorkspace",
   "CommandPalette",
   "ComposerPreferencesPanel",
@@ -109,6 +131,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "GraphMiniView",
   "GraphModal",
   "GraphView",
+  "GuidedDecisionSheet",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
   "HelloWorldTutorial",
@@ -297,6 +320,7 @@ import { ModeSwitchButton } from "@/components/chat/guided/ModeSwitchButton";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
 import { ProposePipelineTurn } from "@/components/chat/guided/ProposePipelineTurn";
+import { GuidedDecisionSheet } from "@/components/chat/guided/GuidedDecisionSheet";
 import { AcknowledgementCard } from "@/components/chat/AcknowledgementCard";
 import { AcknowledgementStack } from "@/components/chat/AcknowledgementStack";
 import { ChatInput } from "@/components/chat/ChatInput";
@@ -564,6 +588,43 @@ describe("WireStageTurn", () => {
         onExitToFreeform={() => {}}
       />,
     );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations with an llm node's prompt summary and its Edit routed to the correction form", async () => {
+    // I-2: prompt block + expand toggle + Edit pre-selecting the node.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const nodeId = "00000000-0000-4000-8000-000000000015";
+    const { container } = render(
+      <WireStageTurn
+        data={{
+          ...wireBase,
+          nodes: [{
+            stable_id: nodeId,
+            label: "summarise",
+            node_type: "transform",
+            plugin: "llm",
+            behavior: { kind: "transform" },
+            required_fields: ["body"],
+            guaranteed_fields: ["summary"],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        onConfirm={() => {}}
+        confirmDisabled={false}
+        onCorrect={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByLabelText("Component")).toHaveValue(nodeId);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -906,6 +967,20 @@ describe("ModeSwitchButton", () => {
     );
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations on the guided confirm card's required goal field", async () => {
+    // Goal-first (elspeth-378cfa0e18) put a form control on this card. A
+    // placeholder is not an accessible name, so axe's `label` rule is the gate
+    // that keeps the question a real <label>.
+    const { container } = render(
+      <ModeSwitchButton target="guided" hasWork />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Switch to guided" }),
+    );
+    screen.getByRole("textbox", { name: "What should this pipeline produce?" });
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("PipelineGloss", () => {
@@ -1042,11 +1117,47 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
     );
-    // Non-vacuous: the labelled graph, the accessible heading, and the enabled
-    // primary control must all be real.
-    screen.getByRole("img", { name: /pipeline proposal graph/i });
+    // Non-vacuous: the Graph-pane pointer (the DAG itself moved to the
+    // Pipeline pane — elspeth-9f0873426a), the accessible heading, and the
+    // enabled primary control must all be real.
+    screen.getByRole("button", { name: "Show graph" });
     screen.getByRole("heading", { name: "Review pipeline proposal" });
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations with the llm prompt summary collapsed, expanded, and its Edit opened", async () => {
+    // I-2: the prompt block (label, pre-wrapped text, expand toggle) and the
+    // Edit that pre-targets the node revise are new default-view controls.
+    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
+    const reviewState: GuidedProposalReviewState = {
+      status: "active",
+      proposal_id: PROPOSAL_ID,
+      draft_hash: DRAFT_HASH,
+    };
+    const base = proposalPayload();
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={{
+          ...base,
+          nodes: [{
+            ...base.nodes[0],
+            node_options_summary: [
+              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+              { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+              { key: "prompt_template", value: longPrompt, tier: "common" },
+            ],
+          }],
+        }}
+        reviewState={reviewState}
+        onSubmit={() => {}}
+      />,
+    );
+    screen.getByText("Model: anthropic/claude-sonnet-4");
+    expect(await axe(container)).toHaveNoViolations();
+    await userEvent.click(screen.getByRole("button", { name: "Show full prompt for summarise" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
+    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveFocus();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1145,9 +1256,8 @@ describe("ProposePipelineTurn", () => {
     );
     // Non-vacuous: the tutorial teaching note renders, the live "Review
     // wiring" primary stays actionable (the tutorial proposal is a REAL
-    // planner proposal the learner must accept to advance; the primary is
-    // live only once the frozen-prompt revision supersedes the pre-Send
-    // auto-proposal), and the off-script reject/revise controls are withheld.
+    // planner proposal the learner must accept to advance), and the off-script
+    // reject/revise controls are withheld.
     screen.getByText(/press Review wiring to continue/i);
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
@@ -1155,7 +1265,13 @@ describe("ProposePipelineTurn", () => {
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations in the tutorial pre-Send auto-proposal render (primary withheld)", async () => {
+  it("has no axe violations on a tutorial FIRST proposal (null supersedes hash, same live primary)", async () => {
+    // The withheld-primary render this replaces is gone with the proposal it
+    // guarded (goal-first, elspeth-378cfa0e18): the frozen transforms prompt is
+    // the session's root intent now, so the step-2 finish plans once and its
+    // proposal — supersedes_draft_hash null — IS the one the learner reviews.
+    // Audited alongside the superseding case so the two hash states are pinned
+    // to render the same controls.
     const reviewState: GuidedProposalReviewState = {
       status: "active",
       proposal_id: PROPOSAL_ID,
@@ -1164,11 +1280,9 @@ describe("ProposePipelineTurn", () => {
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} isTutorial />,
     );
-    // Non-vacuous: the pre-Send auto-proposal (supersedes_draft_hash null)
-    // withholds every action and directs the learner to Send the frozen
-    // transforms prompt instead (tutorial run 18 committed the passthrough).
-    screen.getByText(/press Send/i);
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
+    expect(proposalPayload().supersedes_draft_hash).toBeNull();
+    screen.getByText(/press Review wiring to continue/i);
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
     expect(await axe(container)).toHaveNoViolations();
@@ -1298,6 +1412,7 @@ describe("ChatPanelTutorialWorkspace", () => {
         },
       ],
       chat_turn_seq: 4,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     };
   }
@@ -1400,11 +1515,260 @@ describe("ChatPanelTutorialWorkspace", () => {
 
     expect(await axe(container)).toHaveNoViolations();
   });
+
+  it("has no axe violations with a settled tick expanded into its decision sheet", async () => {
+    // Decision sheets (elspeth-f2a8550b3d): a settled stepper tick becomes a
+    // disclosure BUTTON inside its <li>, and the panel it controls mounts
+    // between the band and the conversation group. That is a new arrangement
+    // inside an already-audited surface — a listitem with an interactive
+    // child, an aria-controls IDREF that must resolve, and a replayed
+    // transcript that must not become a second live region.
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const session = makeTutorialGuidedSession();
+    session.reviewed_components = {
+      sources: [
+        {
+          stable_id: "00000000-0000-4000-8000-0000000009a1",
+          name: "pages",
+          plugin: "web_scrape",
+          status: "reviewed",
+        },
+      ],
+      outputs: [],
+    };
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: session,
+      guidedNextTurn: makeSchemaFormNextTurn(),
+    } as never);
+
+    const { container } = render(
+      <ChatPanel
+        isTutorial
+        lockedChatPrompt={{
+          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
+          step_2_sink: "Write the results out as JSONL.",
+        }}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /^Source/ }));
+
+    // Non-vacuous: the disclosure is expanded, the panel it names is mounted
+    // and its aria-controls resolves, and the replayed turns are a static
+    // group rather than a second "Step chat history" log.
+    const tick = screen.getByRole("button", { name: "Source, completed" });
+    expect(tick).toHaveAttribute("aria-expanded", "true");
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(tick.getAttribute("aria-controls")).toBe(sheet.getAttribute("id"));
+    expect(
+      within(sheet).getByRole("group", { name: "Guided build conversation" }),
+    ).toBeInTheDocument();
+    expect(within(sheet).queryByRole("log")).toBeNull();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("GuidedDecisionSheet", () => {
+  // The read-only record a settled stepper tick opens (elspeth-f2a8550b3d).
+  // Audited as a leaf too, not only in situ: it owns a named region that takes
+  // focus on open, a component list, and a replayed transcript, and the
+  // in-situ case above can only ever mount ONE stage's arrangement.
+  it("has no axe violations with components, a record and replayed turns", async () => {
+    const { container } = render(
+      <GuidedDecisionSheet
+        id="a11y-decision-sheet"
+        stage="step_4_wire"
+        rows={[
+          {
+            key: "00000000-0000-4000-8000-0000000009b1",
+            name: "pages",
+            plugin: "web_scrape",
+          },
+          { key: "fan_out", name: "Fan Out", plugin: null },
+        ]}
+        chatTurns={[
+          {
+            role: "user",
+            content: "does this wiring look right?",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ]}
+        record="Guided pipeline wiring confirmed."
+        onClose={vi.fn()}
+      />,
+    );
+
+    screen.getByRole("region", { name: "Wire — decided" });
+    screen.getByRole("button", { name: "Close" });
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelCompletedSurface", () => {
+  // A completed guided session keeps its conversation (elspeth-986801d218).
+  // The arrangement this audits: the completion summary and the always-mounted
+  // acknowledgement announcer are SIBLINGS of the named "Conversation" scroll
+  // group, and the transcript's role=log lives INSIDE that group — one live
+  // region per event kind, never nested, with the docked composer below.
+  it("has no axe violations with a live transcript and the docked composer", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+    const confirmationHash = "c".repeat(64);
+    useSessionStore.setState({
+      compositionState: makeFullCompositionState(),
+      compositionProposals: [],
+      guidedSession: {
+        step: "step_4_wire",
+        history: [
+          {
+            step: "step_4_wire",
+            turn_type: "confirm_wiring",
+            payload_hash: "aabbcc001122",
+            response_hash: confirmationHash,
+            emitter: "server",
+            summary: "Wiring confirmed",
+          },
+        ],
+        terminal: {
+          kind: "completed",
+          reason: null,
+          pipeline_yaml: "source:\n  plugin: csv\n",
+        },
+        chat_history: [
+          {
+            role: "user",
+            content: "Write the results out as JSONL.",
+            seq: 1,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: "a".repeat(64),
+          },
+          {
+            role: "assistant",
+            content: "Done — the output writes JSONL.",
+            seq: 2,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:00:01Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "user",
+            content: "What does the transform step do?",
+            seq: 3,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T00:01:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: confirmationHash,
+          },
+        ],
+        chat_turn_seq: 4,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: null,
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Guard against a vacuous pass: the audited arrangement must be mounted.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const log = screen.getByRole("log", { name: "Step chat history" });
+    expect(scroll.contains(log)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    screen.getByRole("button", { name: "Explain this pipeline" });
+    screen.getByText("After confirmation");
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("ChatPanelGoalCard", () => {
+  // Goal-first entry (elspeth-378cfa0e18). Before the session has a goal the
+  // store has adopted the lazy GET /guided stub — a first turn and NO
+  // composition state — and the panel replaces the current-decision card with
+  // the goal card. Audited on its own because that arrangement drops the
+  // decision card's role=log live region and its Explain control; the risk
+  // being pinned is a second live region (or a duplicated heading id) landing
+  // inside the named conversation group.
+  it("has no axe violations on the pre-goal guided surface", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+    useSessionStore.setState({
+      activeSessionId: "sess-a11y-goal",
+      messages: [],
+      composeTimeoutReady: true,
+      compositionState: null,
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+        },
+      },
+    } as never);
+
+    const { container } = render(<ChatPanel />);
+
+    // Non-vacuous: the goal card is mounted inside the named conversation
+    // group, the composer landmark survives, and the decision card's log
+    // region and Explain control are BOTH absent — the goal card replaces
+    // that section rather than rendering beside it.
+    const scroll = screen.getByRole("group", { name: "Conversation" });
+    const heading = screen.getByRole("heading", {
+      name: "What should this pipeline produce?",
+    });
+    expect(scroll.contains(heading)).toBe(true);
+    screen.getByRole("region", { name: "Describe what you want" });
+    expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
+
+    expect(await axe(container)).toHaveNoViolations();
+  });
 });
 
 describe("TutorialTurn4Run", () => {
   // The module-level run cache is keyed by sessionId — each test uses a
-  // distinct id so a cached promise never leaks across tests.
+  // distinct id so a cached promise never leaks across tests. The run never
+  // auto-fires (I-1): the executing/results states are reached by clicking
+  // the Run button on the pre-run card.
+  it("has no axe violations on the pre-run card", async () => {
+    const { container } = render(
+      <TutorialTurn4Run
+        sessionId="sess-a11y-run-ready"
+        onCompleted={() => {}}
+        onCancelled={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
   it("has no axe violations while the run is executing", async () => {
     vi.mocked(apiClient.runTutorialPipeline).mockReturnValue(
       new Promise<never>(() => {}),
@@ -1416,6 +1780,8 @@ describe("TutorialTurn4Run", () => {
         onCancelled={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByRole("status", { busy: true })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 
@@ -1443,6 +1809,7 @@ describe("TutorialTurn4Run", () => {
         onBack={() => {}}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
     await screen.findByText(/rows returned/);
     expect(await axe(container)).toHaveNoViolations();
   });

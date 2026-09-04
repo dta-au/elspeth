@@ -28,6 +28,7 @@ Fixtures are replicated locally (rather than imported from
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -282,7 +283,13 @@ def _write_bundle_file(tmp_path: Path, bundle: ReviewBundle) -> Path:
     return write_bundle(bundle, staged_dir=tmp_path / "staged")
 
 
-def _new_judgment_action(finding: Any, rel: str, *, preview: ActionPreview | None = None) -> BundleAction:
+def _new_judgment_action(
+    finding: Any,
+    rel: str,
+    *,
+    preview: ActionPreview | None = None,
+    draft_rationale: str | None = "payload is Tier-3 external data from upstream tool-call",
+) -> BundleAction:
     key = _canonical_key(finding)
     return BundleAction(
         lane="new_judgment",
@@ -292,7 +299,7 @@ def _new_judgment_action(finding: Any, rel: str, *, preview: ActionPreview | Non
         symbol="Widget.lookup",
         rule="R1",
         fingerprint=key.rsplit(":fp=", 1)[1],
-        draft_rationale="payload is Tier-3 external data from upstream tool-call",
+        draft_rationale=draft_rationale,
         preview=preview,
     )
 
@@ -337,12 +344,18 @@ def _argv(
 
 
 @contextmanager
-def _patch_judge(verdict_for: Callable[[str], JudgeVerdict]) -> Iterator[list[str]]:
+def _patch_judge(
+    verdict_for: Callable[[str], JudgeVerdict],
+    *,
+    request_log: list[Any] | None = None,
+) -> Iterator[list[str]]:
     """Patch the real judge at the lazy-import seam; dispatch verdict by file_path."""
     calls: list[str] = []
 
     def _fake(request: Any, **kwargs: Any) -> JudgeResponse:
         calls.append(request.file_path)
+        if request_log is not None:
+            request_log.append(request)
         verdict = verdict_for(request.file_path)
         return JudgeResponse(
             verdict=verdict,
@@ -3813,7 +3826,18 @@ def test_sign_bundle_judge_concurrency_overlaps_judge_calls_and_writes_in_bundle
     findings = {name: _live_finding(root, f"{name}/mod.py") for name in names}
     bundle_path = _write_bundle_file(
         tmp_path,
-        _bundle(root, allowlist_dir, tuple(_new_judgment_action(findings[name], f"{name}/mod.py") for name in names)),
+        _bundle(
+            root,
+            allowlist_dir,
+            tuple(
+                _new_judgment_action(
+                    findings[name],
+                    f"{name}/mod.py",
+                    draft_rationale=f"{name} payload is Tier-3 external data from upstream tool-call",
+                )
+                for name in names
+            ),
+        ),
     )
 
     lock = threading.Lock()
@@ -3845,6 +3869,63 @@ def test_sign_bundle_judge_concurrency_overlaps_judge_calls_and_writes_in_bundle
     assert positions == sorted(positions), "verdict output (post-gate writes) left bundle order"
 
 
+def test_sign_bundle_judge_concurrency_preserves_serial_duplicate_rationale_evidence(tmp_path: Path) -> None:
+    """Same-rationale judges observe prior accepted writes while an independent rationale still overlaps.
+
+    Alpha waits until another request has reached the fake external judge. The
+    current scheduler fills that slot with beta, so both duplicate-rationale
+    requests have already scanned the pre-bundle allowlist and beta incorrectly
+    carries duplicate count zero. A dependency-aware scheduler instead fills
+    the slot with distinct-rationale gamma; after alpha writes, beta may start
+    and must carry the same evidence it would receive under serial execution.
+    """
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    names = ("alpha", "beta", "gamma")
+    for name in names:
+        _write_source(root, f"{name}/mod.py", name)
+    findings = {name: _live_finding(root, f"{name}/mod.py") for name in names}
+    effective_fallback = "Staged via sign-bundle; see bundle provenance for the agent rationale."
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (
+                _new_judgment_action(findings["alpha"], "alpha/mod.py", draft_rationale=None),
+                _new_judgment_action(findings["beta"], "beta/mod.py", draft_rationale=effective_fallback),
+                _new_judgment_action(
+                    findings["gamma"],
+                    "gamma/mod.py",
+                    draft_rationale="gamma has an independent Tier-3 boundary rationale",
+                ),
+            ),
+        ),
+    )
+    another_request_started = threading.Event()
+    requests: list[Any] = []
+
+    def _verdict(file_path: str) -> JudgeVerdict:
+        if file_path == "alpha/mod.py":
+            assert another_request_started.wait(timeout=30), "no independent judge request filled the second worker slot"
+        else:
+            another_request_started.set()
+        return JudgeVerdict.ACCEPTED
+
+    with _patch_judge(_verdict, request_log=requests):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--judge-concurrency", "2")))
+
+    assert rc == 0
+    request_by_file = {request.file_path: request for request in requests}
+    assert set(request_by_file) == {f"{name}/mod.py" for name in names}
+    assert request_by_file["alpha/mod.py"].rationale_duplicate_count == 0
+    assert request_by_file["alpha/mod.py"].similar_entries == ()
+    assert request_by_file["beta/mod.py"].rationale_duplicate_count == 1
+    assert [entry.key for entry in request_by_file["beta/mod.py"].similar_entries] == [_canonical_key(findings["alpha"])]
+    assert request_by_file["gamma/mod.py"].rationale_duplicate_count == 0
+    assert request_by_file["gamma/mod.py"].similar_entries == ()
+
+
 def test_sign_bundle_judge_concurrency_stop_on_block_discards_prefetched_verdicts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3867,9 +3948,21 @@ def test_sign_bundle_judge_concurrency_stop_on_block_discards_prefetched_verdict
             root,
             allowlist_dir,
             (
-                _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"),
-                _new_judgment_action(_live_finding(root, "beta/mod.py"), "beta/mod.py"),
-                _new_judgment_action(gamma, "gamma/mod.py"),
+                _new_judgment_action(
+                    _live_finding(root, "alpha/mod.py"),
+                    "alpha/mod.py",
+                    draft_rationale="alpha has an independent Tier-3 boundary rationale",
+                ),
+                _new_judgment_action(
+                    _live_finding(root, "beta/mod.py"),
+                    "beta/mod.py",
+                    draft_rationale="beta has an independent Tier-3 boundary rationale",
+                ),
+                _new_judgment_action(
+                    gamma,
+                    "gamma/mod.py",
+                    draft_rationale="gamma has an independent Tier-3 boundary rationale",
+                ),
             ),
         ),
     )
@@ -3901,6 +3994,62 @@ def test_sign_bundle_judge_concurrency_stop_on_block_discards_prefetched_verdict
     assert _canonical_key(gamma) not in captured.out
     assert _RECOVERY_GUIDANCE in captured.err
     assert "--judge-concurrency 3" in captured.err
+
+
+def test_judge_prefetcher_interrupted_submit_registers_and_aborts_write_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt after a worker starts cannot strand it or let it write."""
+    from elspeth_lints.core.sign_bundle_transaction import _JudgePrefetcher, _PrefetchAborted
+
+    action = SimpleNamespace(kind="justify", draft_rationale="same effective rationale")
+    prefetch = _JudgePrefetcher(
+        ordered_pending=[(0, action)],
+        concurrency=1,
+        execute=lambda _action, _args, _before_write: 0,
+        args=argparse.Namespace(),
+    )
+    registered_during_submit: list[bool] = []
+    worker_entered_gate = threading.Event()
+    worker_done = threading.Event()
+    worker_errors: list[BaseException] = []
+
+    def _interrupt_after_worker_start(
+        _execute: Any,
+        _action: Any,
+        _args: Any,
+        before_write: Callable[[], None],
+    ) -> Any:
+        gate_is_registered = prefetch._gates.get(0) is not None
+        registered_during_submit.append(gate_is_registered)
+        if gate_is_registered:
+
+            def _worker() -> None:
+                worker_entered_gate.set()
+                try:
+                    before_write()
+                except BaseException as exc:
+                    worker_errors.append(exc)
+                finally:
+                    worker_done.set()
+
+            threading.Thread(target=_worker, daemon=True).start()
+            assert worker_entered_gate.wait(timeout=5)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(prefetch._pool, "submit", _interrupt_after_worker_start)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            prefetch.release_and_wait(0)
+    finally:
+        prefetch.close(wait=False)
+
+    assert registered_during_submit == [True]
+    assert worker_done.wait(timeout=5), "interrupted submit left a worker stranded at before_write"
+    assert len(worker_errors) == 1
+    assert isinstance(worker_errors[0], _PrefetchAborted)
+    assert prefetch._gates == {}
+    assert prefetch._futures == {}
+    assert prefetch._cohorts_by_index == {}
+    assert prefetch._active_cohorts == set()
 
 
 @pytest.mark.parametrize("value", ["0", "9"])

@@ -8,7 +8,7 @@ import functools
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, Request
@@ -28,6 +28,12 @@ from elspeth.web.composer.guided.chat_solver import (
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.guided.planning import (
+    GuidedStructureUnprojectable,
+    guided_structure_compared_behavior,
+    guided_structure_facts,
+    guided_structure_projection,
+)
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, Turn, TurnType, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
@@ -38,7 +44,14 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import GuidedProposalRef
+from elspeth.web.composer.guided.state_machine import (
+    GUIDED_MAX_CHAT_HISTORY_CHARS,
+    GUIDED_MAX_CHAT_TURNS,
+    GuidedProposalRef,
+    GuidedSession,
+    TerminalKind,
+    TerminalState,
+)
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
 from elspeth.web.sessions._guided_step_chat import (
@@ -59,7 +72,9 @@ from elspeth.web.sessions._guided_step_chat import (
 )
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.guided_replay import (
+    guided_completed_chat_token,
     guided_turn_token,
+    guided_validation_errors,
     load_guided_json_payload,
     parse_guided_response_descriptor,
     project_guided_response,
@@ -103,6 +118,8 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _inspect_latest_ready_session_blob,
     _is_client_disconnect_cancel,
+    _log_last_resort_diagnostic,
+    _named_guided_custody_projection,
     _publish_progress,
     _replace,
     _request_plugin_policy_context,
@@ -133,6 +150,7 @@ from .guided_chat_intent_management import (
     deferred_request_retained_intent_ids,
     maybe_prepare_schema8_management_rewind,
 )
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
@@ -204,6 +222,43 @@ def _with_pair_disposition(chat: StepChatResult, disposition: str | None) -> Ste
     if disposition is None:
         return chat
     return _replace(chat, assistant_message=f"{chat.assistant_message} {disposition}")
+
+
+def _require_chat_transcript_capacity(guided: Any, *, message: str) -> None:
+    """Refuse a chat turn the settled transcript could not legally hold.
+
+    ``GuidedSession.__post_init__`` enforces the transcript bounds as
+    invariants, so a settlement that crosses one raises ``InvariantError`` and
+    the request dies as a 500 with the operation recorded as an integrity
+    failure. The bound is a capacity limit on user input, not a server defect,
+    so it is checked here — before reservation, before any provider call — and
+    refused with the ordinary structured 409.
+
+    Two of the three bounds are decidable at this point. The per-turn content
+    cap is already closed upstream: ``GuidedChatRequest.message`` is capped at
+    4096 characters, far under ``GUIDED_MAX_CHAT_CONTENT_CHARS``. The aggregate
+    check is deliberately partial — the assistant's reply does not exist yet —
+    so it refuses the case a user can actually drive (typing into a transcript
+    that is already at the ceiling) and leaves the residual, a reply large
+    enough to cross the aggregate on its own, to the invariant.
+    """
+
+    if len(guided.chat_history) + 2 > GUIDED_MAX_CHAT_TURNS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "guided_chat_history_full",
+                "detail": "This guided conversation has reached its length limit. Open the freeform editor to continue.",
+            },
+        )
+    if sum(len(turn.content) for turn in guided.chat_history) + len(message) > GUIDED_MAX_CHAT_HISTORY_CHARS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "guided_chat_history_full",
+                "detail": "This guided conversation has reached its size limit. Open the freeform editor to continue.",
+            },
+        )
 
 
 def _unsupported_stage(step: GuidedStep) -> HTTPException:
@@ -360,6 +415,177 @@ def _guided_advisory_graph_authority(
     )
 
 
+def _wire_payload_structure(payload: Mapping[str, Any]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Read the ordinal-label structure a frozen CONFIRM_WIRING payload advertises.
+
+    The mirror image of ``guided_structure_projection``: same subset, same
+    shape, read out of the confirmed wire record instead of derived from a live
+    composition state. Every key touched here was proved present and typed by
+    ``validate_current_turn(STEP_4_WIRE, ...)`` on the durable load, and the
+    bytes were content-address re-derived by ``load_guided_json_payload``
+    before that — this is a read of an already-verified owned record, not a
+    parse of foreign input. Specifically, ``_validate_wire_payload``
+    (composer/guided/protocol.py) proves ``stable_id``/``label``/``plugin`` and
+    ``row_cardinality`` on every source through ``source_keys`` (:1718), adds
+    ``node_type``, ``behavior`` and ``structured_output_fields`` on every node
+    through ``node_keys`` (:1741) with ``_validate_node_behavior`` proving each
+    behavior arm's exact key set and ``_public_json_error`` (:1783) the
+    structured-output list, proves ``business_schema`` on every output through
+    ``output_keys`` (:1794) with ``schema_keys`` (:1795) fixing its exact
+    members, and proves ``from_endpoint``/``to_endpoint``/``flow``/
+    ``schema_contract`` on every connection through ``connection_keys`` (:1825),
+    with ``_validate_proposal_flow`` proving the flow members and
+    ``contract_keys`` (:1824) the schema-contract members.
+
+    An asymmetry between the two halves is not a stale-fact risk but a
+    permanent 409: it refuses every completed-session chat on the whole class of
+    pipelines that carries the affected value, with no drift at all. It is
+    therefore proved on values that are NOT empty —
+    ``test_projection_equals_the_mirror_read_of_its_own_wire_payload`` carries a
+    declared output schema and a real llm structured-output list through both
+    halves, and asserts each fixture is non-vacuous — because an empty list
+    compares equal under any asymmetry (RT-4).
+
+    Every fact travels through ``guided_structure_facts`` — the SAME
+    canonicaliser the projection half runs — so a value cannot be compared on
+    one side and dropped on the other, and the durable record's shape cannot
+    make an unchanged pipeline compare unequal: the projection builds its facts
+    with plain dicts and lists while ``PreparedGuidedJsonPayload`` freezes this
+    one into mapping proxies holding tuples, and the canonicaliser thaws both
+    onto a single representation before comparing. The component-identity map
+    handed to it is the one built below: a collector's ``opener_stable_id`` is a
+    per-projection stable ID here and an ordinal label on the projection side,
+    and this is where the two are reconciled. The one subtraction —
+    ``guided_structure_compared_behavior`` over a node's behavior, never over a
+    flow — is likewise the projection half's, called here rather than restated.
+
+    What is NOT read here is as load-bearing as what is: a node's
+    ``row_cardinality``, a node's/source's ``guaranteed_fields``, a node's
+    ``required_fields`` and a connection's ``schema_contract`` all come from the
+    lowered executable state or its validation summary, which the live half
+    cannot re-derive. They are time-qualified in the chat context instead
+    (``chat_solver._guided_committed_time_qualified``) rather than compared.
+    """
+
+    label_by_stable_id = {
+        **{source["stable_id"]: source["label"] for source in payload["sources"]},
+        **{node["stable_id"]: node["label"] for node in payload["nodes"]},
+        **{output["stable_id"]: output["label"] for output in payload["outputs"]},
+    }
+    components = (
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "source",
+                    "alias": source["label"],
+                    "plugin": source["plugin"],
+                    "row_cardinality": source["row_cardinality"],
+                },
+                label_by_component_id=label_by_stable_id,
+            )
+            for source in payload["sources"]
+        ),
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "node",
+                    "alias": node["label"],
+                    "plugin": node["plugin"],
+                    "node_type": node["node_type"],
+                    "behavior": guided_structure_compared_behavior(node["behavior"]),
+                    "structured_output_fields": node["structured_output_fields"],
+                },
+                label_by_component_id=label_by_stable_id,
+            )
+            for node in payload["nodes"]
+        ),
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "output",
+                    "alias": output["label"],
+                    "plugin": output["plugin"],
+                    "business_schema": output["business_schema"],
+                },
+                label_by_component_id=label_by_stable_id,
+            )
+            for output in payload["outputs"]
+        ),
+    )
+    # A discard endpoint carries ONLY "kind" — the same membership
+    # discriminator ``validate_payload`` itself uses on this shape.
+    connections = tuple(
+        guided_structure_facts(
+            {
+                "alias": f"connection-{index + 1}",
+                "from_alias": label_by_stable_id[connection["from_endpoint"]["stable_id"]],
+                "to_alias": (
+                    label_by_stable_id[connection["to_endpoint"]["stable_id"]] if "stable_id" in connection["to_endpoint"] else None
+                ),
+                "flow": connection["flow"],
+            },
+            label_by_component_id=label_by_stable_id,
+        )
+        for index, connection in enumerate(payload["connections"])
+    )
+    return components, connections
+
+
+def _guided_committed_graph_authority(
+    *,
+    guided: Any,
+    current_payload: PreparedGuidedJsonPayload,
+) -> GuidedAdvisoryGraphAuthority:
+    """Bind post-commit advice to the exact confirmed wire CAS record.
+
+    Sibling of :func:`_guided_advisory_graph_authority` for the terminal case,
+    built from OWNED records only — the answered ``TurnRecord`` and the
+    content-verified ``PreparedGuidedJsonPayload`` — rather than by re-probing
+    the reconstructed ``Turn`` mapping. There is therefore no ``Mapping``
+    membership test and no new trust boundary here: everything read is either a
+    frozen dataclass ELSPETH constructs or a payload whose content address was
+    re-derived on load and is re-derived again below.
+
+    ``covered_deferred_intent_ids`` is empty by construction: confirmation
+    refuses while any retained instruction remains, so a completed session has
+    no pending intent a graph decision could be attributed to.
+    """
+
+    if type(guided) is not GuidedSession:
+        raise AuditIntegrityError("guided committed graph authority requires an exact guided session")
+    terminal = guided.terminal
+    if type(terminal) is not TerminalState or terminal.kind is not TerminalKind.COMPLETED:
+        raise AuditIntegrityError("guided committed graph authority requires a completed terminal state")
+    if guided.active_proposal is not None:
+        raise AuditIntegrityError("guided committed graph authority still carries an active proposal")
+    if type(current_payload) is not PreparedGuidedJsonPayload or current_payload.purpose != "turn":
+        raise AuditIntegrityError("guided committed graph authority requires an exact prepared turn payload")
+    if not guided.history:
+        raise AuditIntegrityError("guided committed graph authority has no persisted turn record")
+    record = guided.history[-1]
+    if record.turn_type is not TurnType.CONFIRM_WIRING or record.step is not GuidedStep.STEP_4_WIRE:
+        raise AuditIntegrityError("guided committed graph authority final record is not a wire confirmation")
+    if record.response_hash is None:
+        raise AuditIntegrityError("guided committed graph authority final record is unanswered")
+    if record.payload_hash != current_payload.payload_id:
+        raise AuditIntegrityError("guided committed graph authority turn payload differs from durable custody")
+    if current_payload.payload_id != guided_json_payload_id("turn", current_payload.payload):
+        raise AuditIntegrityError("guided committed graph authority payload hash differs from durable custody")
+    # Membership form, not ``.get()``: a CONFIRM_WIRING payload missing either
+    # binding key has already failed durable custody, so absence is an audit
+    # anomaly to name rather than a default to compare against.
+    if "proposal_id" not in current_payload.payload or "draft_hash" not in current_payload.payload:
+        raise AuditIntegrityError("guided committed graph authority payload has no proposal binding")
+    return GuidedAdvisoryGraphAuthority(
+        turn_type=TurnType.CONFIRM_WIRING,
+        payload_id=current_payload.payload_id,
+        proposal_id=current_payload.payload["proposal_id"],
+        draft_hash=current_payload.payload["draft_hash"],
+        covered_deferred_intent_ids=(),
+        payload=current_payload.payload,
+    )
+
+
 async def run_guided_chat_provider_attempt(
     *,
     session_id: UUID,
@@ -389,6 +615,48 @@ async def run_guided_chat_provider_attempt(
     sink = _current_sink(guided)
     sink_output_indices = _current_sink_output_indices(guided)
     revision_form = _active_component_revision_kind(guided, step)
+    if guided.terminal is not None:
+        # A completed session has no unanswered turn and no wizard controls:
+        # chat is advisory over the frozen wire record the user confirmed. One
+        # provider call, no tools, no deferred-intent management (there is
+        # nothing pending on a settled build), no transition.
+        if step is not GuidedStep.STEP_4_WIRE:
+            raise AuditIntegrityError("guided completed chat provider call escaped the wire step")
+        if current_turn is None or current_payload is None:
+            raise AuditIntegrityError("guided completed chat provider call has no frozen wire authority")
+        committed_authority = _guided_committed_graph_authority(guided=guided, current_payload=current_payload)
+        committed_context = build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            # No "Applied source/output" projection on a settled build: the
+            # frozen wire authority below describes every component the user
+            # confirmed, while that projection names at most one source and
+            # would otherwise render "none yet." above it.
+            current_source=None,
+            current_sink=None,
+            current_sink_output_indices=None,
+            state=state,
+            deferred_intents=guided.deferred_intents,
+            authoritative_revision_form=None,
+            graph_authority=committed_authority,
+            committed_build=True,
+        )
+        committed_advisory = await solve_step_chat_with_auto_drop(
+            site="post_guided_chat",
+            session_id=str(session_id),
+            user_id=user.user_id,
+            model=settings.composer_model,
+            step=GuidedStep.STEP_4_WIRE,
+            user_message=message,
+            temperature=settings.composer_temperature,
+            seed=settings.composer_seed,
+            recorder=recorder,
+            timeout_seconds=settings.composer_timeout_seconds,
+            context_block=committed_context,
+            api_base=endpoint_base_url,
+            api_key=endpoint_api_key,
+            reasoning_effort=settings.composer_discovery_reasoning_effort,
+        )
+        return GuidedStepChatOnlyResult(chat=committed_advisory)
     graph_authority: GuidedAdvisoryGraphAuthority | None = None
     if step in {GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE}:
         if current_turn is None or current_payload is None:
@@ -724,25 +992,18 @@ def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
     pressing Continue on that form would have submitted.
     """
     prefilled = form_turn["payload"]["prefilled"]
-    # KEEP ``isinstance(..., Mapping)``: this reads a payload the server wrote
-    # and read back, which ADR-032 puts in the parse-what-we-do-not-own domain
-    # regardless of who authored the bytes. Both ``form_turn`` producers hand
-    # over an EXACT dict today — ``guided._finalize_guided_turn`` and
-    # ``guided._load_durable_current_turn`` each build the payload as
-    # ``dict(deep_thaw(...))``, and ``deep_thaw`` recurses, so the nested
-    # prefill is a plain dict on the replay path too (measured 2026-08-29).
-    # The tolerant ABC form is kept so this reject-gate's correctness does not
-    # rest on that producer detail: the frozen ``MappingProxyType`` that
-    # ``prepare_guided_json_payload`` holds inside ``PreparedGuidedJsonPayload``
-    # is one moved thaw away, and for it BOTH ``type(x) is dict`` and
-    # ``isinstance(x, dict)`` are False. That is a latent robustness argument,
-    # not a live population.
-    if not isinstance(prefilled, Mapping):
+    # Exact ``dict``: both ``form_turn`` producers — ``guided._finalize_guided_turn``
+    # and ``guided._load_durable_current_turn`` — build the payload as
+    # ``dict(deep_thaw(...))`` with recursive thaw, so the server-held prefill
+    # is a plain dict on live and replay paths alike (measured 2026-08-29).
+    # Serialization and read-back do not demote first-party authorship; a
+    # Mapping-tolerant read here would be latent recovery from a hypothetical
+    # future producer bug (a moved thaw), which is exactly the defensive
+    # pattern the tier model forbids. Anything but an exact dict is
+    # first-party corruption and crashes.
+    if type(prefilled) is not dict:
         raise AuditIntegrityError("source schema form has no server-held prefill to bind")
-    options = deep_thaw(prefilled)
-    if type(options) is not dict:  # pragma: no cover - deep_thaw of a Mapping is a dict
-        raise AuditIntegrityError("source schema form prefill did not thaw to an exact dict")
-    return options
+    return cast("dict[str, object]", deep_thaw(prefilled))
 
 
 def _prepare_step_1_uploaded_source_bind(
@@ -977,7 +1238,8 @@ async def post_guided_chat_schema8(
         payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
         if descriptor.next_turn is not None:
             payloads = (load_guided_json_payload(payload_store, payload_id=descriptor.next_turn.payload_id, purpose="turn"),)
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GuidedChatResponse:
             raise AuditIntegrityError("Guided Chat projection returned the wrong response type")
         return response
@@ -1019,8 +1281,58 @@ async def post_guided_chat_schema8(
         guided = state.guided_session
         if guided is None:
             raise HTTPException(status_code=400, detail="Session is not in guided mode. Use /api/sessions/{id}/messages.")
-        if guided.terminal is not None:
+        if guided.terminal is not None and guided.terminal.kind is not TerminalKind.COMPLETED:
+            # EXITED_TO_FREEFORM keeps its verbatim refusal, ahead of every
+            # other check: the guided channel is gone until /guided/reenter
+            # restores the session, whatever else is true about it.
             raise HTTPException(status_code=409, detail="Guided session is already terminal.")
+        # Uniform across every admissible session, terminal or not: a full
+        # transcript is a capacity limit on the request, not a server defect.
+        _require_chat_transcript_capacity(guided, message=body.message)
+        if guided.terminal is not None:
+            # A COMPLETED session keeps its conversation. There is no current
+            # unanswered turn to bind to, so the channel is bound to the
+            # confirmation that closed the build instead.
+            if body.turn_token != guided_completed_chat_token(guided):
+                raise HTTPException(status_code=409, detail="turn_token does not identify the confirmed pipeline.")
+            committed_turn, committed_payload = guided_route._load_durable_committed_wire_turn(
+                guided,
+                payload_store=payload_store,
+            )
+            # Bind the advice to the pipeline that is actually there. A direct
+            # POST /messages compose can add, remove, or rewire components
+            # under a completed guided session; explaining the frozen wire
+            # record would then describe a graph that no longer exists.
+            # Prompt-template patches from an interpretation Accept do not
+            # touch this subset, so post-Accept chat stays admitted.
+            drifted = HTTPException(
+                status_code=409,
+                detail={
+                    "code": "guided_chat_committed_graph_changed",
+                    "detail": "The committed pipeline was changed outside guided mode; open the freeform editor to continue.",
+                },
+            )
+            try:
+                projection = guided_structure_projection(state)
+                committed_structure = _wire_payload_structure(committed_payload.payload)
+            except GuidedStructureUnprojectable as exc:
+                # A head that cannot be projected at all is drift too, not a
+                # server fault: it is certainly not the state this session's
+                # wire review was built from. The mirror read is inside the same
+                # arm because a behavior naming a component the frozen record
+                # does not contain leaves the two halves incomparable, and an
+                # incomparable pair must refuse exactly like an unequal one
+                # rather than reaching the client as a 500.
+                raise drifted from exc
+            if projection != committed_structure:
+                raise drifted
+            return _ChatPreflight(
+                state_record=state_record,
+                state=state,
+                guided=guided,
+                current_turn=committed_turn,
+                current_payload=committed_payload,
+            )
         if guided.step not in {
             GuidedStep.STEP_1_SOURCE,
             GuidedStep.STEP_2_SINK,
@@ -1111,6 +1423,7 @@ async def post_guided_chat_schema8(
                 message_id=attempt_message_id,
                 content=body.message,
             )
+            progress_started = False
             progress_registry = _get_composer_progress_registry(request)
             try:
                 progress_sink = _composer_progress_sink(
@@ -1128,6 +1441,7 @@ async def post_guided_chat_schema8(
                         likely_next="ELSPETH will prepare a bounded guided response.",
                     ),
                 )
+                progress_started = True
                 settings = request.app.state.settings
                 started_at = datetime.now(UTC)
                 async with _cancel_on_client_disconnect(request):
@@ -1373,17 +1687,53 @@ async def post_guided_chat_schema8(
                     current_guided = current_state.guided_session
                     if current_guided is None:
                         raise AuditIntegrityError("Guided Chat head lost its guided checkpoint")
-                    prospective, current_turn, planned_current = guided_route._schema8_prospective_occurrence(
-                        current_state,
-                        current_guided,
-                        catalog=catalog,
-                        shield_available=shield_available,
-                        payload_store=payload_store,
-                    )
-                    if body.turn_token != guided_turn_token(prospective) or planned_current.payload_id != frozen.current_payload.payload_id:
-                        raise AuditIntegrityError("Guided Chat turn custody changed after provider work")
+                    settled_terminal = current_guided.terminal
+                    terminal_chat = settled_terminal is not None
+                    prospective: Any
+                    current_turn: Turn
+                    planned_current: PreparedGuidedJsonPayload
+                    if settled_terminal is not None:
+                        # A completed session has no prospective occurrence to
+                        # re-derive: its wire turn is already answered, so
+                        # ``_schema8_prospective_occurrence`` and
+                        # ``guided_turn_token`` would both refuse it. Re-verify
+                        # the committed custody instead, against the same three
+                        # facts the preflight admitted on.
+                        if (
+                            settled_terminal.kind is not TerminalKind.COMPLETED
+                            or body.turn_token != guided_completed_chat_token(current_guided)
+                            or current_guided.history[-1].payload_hash != frozen.current_payload.payload_id
+                        ):
+                            raise AuditIntegrityError("Guided Chat committed custody changed after provider work")
+                        prospective = current_guided
+                        current_turn = frozen.current_turn
+                        planned_current = frozen.current_payload
+                        # The wire occurrence was emitted and answered long
+                        # before this chat turn. A True here would emit a
+                        # second ``guided_turn_emitted`` for it.
+                        occurrence_was_prospective = False
+                        if deferred_actions or deferred_management_action is not None or deferred_clarification:
+                            # The terminal provider arm returns only
+                            # GuidedStepChatOnlyResult, and a settled build has
+                            # nothing pending to manage. Name the impossibility
+                            # rather than let the shared application below
+                            # silently mutate a completed session.
+                            raise AuditIntegrityError("Guided Chat completed settlement cannot carry deferred intent work")
+                    else:
+                        prospective, current_turn, planned_current = guided_route._schema8_prospective_occurrence(
+                            current_state,
+                            current_guided,
+                            catalog=catalog,
+                            shield_available=shield_available,
+                            payload_store=payload_store,
+                        )
+                        if (
+                            body.turn_token != guided_turn_token(prospective)
+                            or planned_current.payload_id != frozen.current_payload.payload_id
+                        ):
+                            raise AuditIntegrityError("Guided Chat turn custody changed after provider work")
 
-                    occurrence_was_prospective = not (current_guided.history and current_guided.history[-1].response_hash is None)
+                        occurrence_was_prospective = not (current_guided.history and current_guided.history[-1].response_hash is None)
                     # On a resolve+retain pair, the disposition copy from
                     # apply_deferred_request must not displace the message the
                     # resolution half produced — both applications (or the
@@ -1584,8 +1934,15 @@ async def post_guided_chat_schema8(
                     )
                     resulting_state = _replace(current_state, guided_session=prospective)
                     planned_response: PreparedGuidedJsonPayload | None = None
-                    next_turn: Turn | None = current_turn
-                    prepared_next: PreparedGuidedJsonPayload | None = planned_current
+                    # A terminal session answers with ``next_turn: null``: the
+                    # replay projection refuses a terminal response that also
+                    # carries a turn, and there is nothing left for the user to
+                    # answer. Every dispatch arm below is unreachable on this
+                    # path (no resolution, no reselection, no upload bind, and
+                    # ``_transition_request`` returns None without one), so the
+                    # pair stays None through to the descriptor.
+                    next_turn: Turn | None = None if terminal_chat else current_turn
+                    prepared_next: PreparedGuidedJsonPayload | None = None if terminal_chat else planned_current
                     transition_succeeded = False
                     rewound = False
                     intermediate_occurrences: tuple[_IntermediateOccurrence, ...] = ()
@@ -1925,9 +2282,47 @@ async def post_guided_chat_schema8(
                         if current_record is not None and current_record.composer_meta is not None
                         else {}
                     )
+                    # A guided chat settles a new checkpoint while leaving any
+                    # pending proposal under review: the transcript lives
+                    # inside ``composer_meta``, so there is no chat-only write
+                    # channel and the row always advances. The proposal's
+                    # anchor therefore has to follow the row being written
+                    # (elspeth-ed67eb9d0d). A rewind that CLEARS the proposal
+                    # supplies ``invalidated_pending_proposal`` instead and
+                    # leaves no carried proposal here — the settlement refuses
+                    # a command carrying both.
+                    chat_rebase = carried_pending_proposal_rebase(
+                        resulting_guided,
+                        from_state_id=(current_record.id if current_record is not None else None),
+                        base_composition_content_hash=(composition_content_hash(current_state) if current_record is not None else None),
+                        reason="advisory_chat",
+                    )
                     existing_meta["guided_session"] = resulting_guided.to_dict()
                     state_dict = resulting_state.to_dict()
-                    is_valid, validation_errors = guided_route._guided_persisted_validity(resulting_state, catalog=catalog)
+                    is_valid: bool
+                    validation_errors: list[str] | None
+                    if terminal_chat:
+                        # The authored content of this row is byte-identical to
+                        # the head — the settlement's content-hash fence above
+                        # proves it, and a completed chat turn writes only the
+                        # transcript, which lives in composer_meta. The head's
+                        # persisted verdict is therefore exact for this row.
+                        # Re-deriving it would silently reclassify a state
+                        # another writer (e.g. the interpretation-accept path)
+                        # authored the validity for.
+                        #
+                        # Only the FLAG is carried: the closed status text is
+                        # re-derived from it here, exactly as
+                        # ``with_guided_response_descriptor`` will re-derive it
+                        # during settlement, so a head row that another writer
+                        # left in a non-guided validation shape cannot
+                        # propagate into a row the replay projection would then
+                        # refuse.
+                        is_valid = current_record.is_valid
+                        closed_status = guided_validation_errors(is_valid=is_valid)
+                        validation_errors = list(closed_status) if closed_status is not None else None
+                    else:
+                        is_valid, validation_errors = guided_route._guided_persisted_validity(resulting_state, catalog=catalog)
                     state_data = CompositionStateData(
                         sources=state_dict["sources"],
                         nodes=state_dict["nodes"],
@@ -1988,6 +2383,7 @@ async def post_guided_chat_schema8(
                             retained_deferred_intent_ids=retained_intent_ids,
                             deferred_intent_action=settled_management_action,
                             invalidated_pending_proposal=invalidated_pending_proposal,
+                            rebased_pending_proposal=chat_rebase,
                         ),
                         payload_store=payload_store,
                         session_operation_context=reserved.session_operation_context,
@@ -2008,7 +2404,7 @@ async def post_guided_chat_schema8(
             except GuidedOperationFenceLostError:
                 rejoin_after_lock = True
             except asyncio.CancelledError as exc:
-                with contextlib.suppress(Exception):
+                try:
                     await asyncio.shield(
                         service.fail_guided_operation_with_audit(
                             GuidedOperationFailureCommand(
@@ -2024,13 +2420,40 @@ async def post_guided_chat_schema8(
                             session_operation_context=reserved.session_operation_context,
                         )
                     )
-                with contextlib.suppress(Exception):
-                    await asyncio.shield(
-                        _publish_progress(
-                            progress_sink,
-                            event=client_cancelled_progress_event(),
+                except GuidedOperationFenceLostError:
+                    # Fence lost during cancellation settlement: another
+                    # worker owns the operation's durable outcome, so this
+                    # request has nothing left to record and keeps unwinding
+                    # as cancelled.
+                    pass
+                except Exception as settlement_exc:
+                    # The failure settlement is a durable audit write. A
+                    # failed write must surface — riding silently under the
+                    # cancellation response would report 499 while the
+                    # operation row is left unsettled with no recorded cause.
+                    raise AuditIntegrityError("Guided Chat could not record its cancellation settlement") from settlement_exc
+                if progress_started:
+                    try:
+                        await asyncio.shield(
+                            _publish_progress(
+                                progress_sink,
+                                event=client_cancelled_progress_event(),
+                            )
                         )
-                    )
+                    except Exception as progress_exc:
+                        # First-party progress sink: a failed cancelled-phase
+                        # publication can leave an active-phase snapshot
+                        # visible until session archival clears the registry,
+                        # so the failure is recorded rather than silent while
+                        # the cancellation stays the declared outcome.
+                        _log_last_resort_diagnostic(
+                            slog.error,
+                            "guided.cancelled_progress_publish_failed",
+                            session_id=str(session_id),
+                            exc_class=type(progress_exc).__name__,
+                            site="post_guided_chat.cancelled_progress",
+                            frames=_safe_frame_strings(progress_exc),
+                        )
                 if _is_client_disconnect_cancel(exc):
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise
@@ -2050,20 +2473,20 @@ async def post_guided_chat_schema8(
                     if isinstance(exc, (AuditIntegrityError, InvariantError))
                     else "operation_failed"
                 )
-                with contextlib.suppress(Exception):
-                    slog.error(
-                        "guided.operation_terminal_failure",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        exc_class=type(exc).__name__,
-                        site="post_guided_chat",
-                        frames=_safe_frame_strings(exc),
-                        # See ``guided.py``'s post_guided_start site (R2-F16b):
-                        # correlates this log line to the response's
-                        # X-Request-ID; lenient read so a missing middleware
-                        # cannot break the error path.
-                        request_id=_failure_log_request_id(request),
-                    )
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "guided.operation_terminal_failure",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    site="post_guided_chat",
+                    frames=_safe_frame_strings(exc),
+                    # See ``guided.py``'s post_guided_start site (R2-F16b):
+                    # correlates this log line to the response's
+                    # X-Request-ID; lenient read so a missing middleware
+                    # cannot break the error path.
+                    request_id=_failure_log_request_id(request),
+                )
                 try:
                     failed = await service.fail_guided_operation_with_audit(
                         GuidedOperationFailureCommand(

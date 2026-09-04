@@ -675,7 +675,28 @@ def _extract_error_codes_from_entries(entries: Any) -> list[str]:
 
 
 def _validation_error_codes(state: Any) -> list[str]:
-    """Extract structured runtime validation error codes from scorer state."""
+    """Extract structured runtime validation error codes from scorer state.
+
+    TWO PRODUCERS FEED THIS AND THEY DISAGREE, which decides whether the
+    allowance in ``_relaxed_invalid_state_reason`` is decidable at all:
+
+    - The mocked-LLM harness (``tests/unit/evals/
+      test_convergence_scenarios_mocked_llm.py::_state_dict_for_scoring``)
+      builds ``validation_errors`` as dicts carrying ``error_code``, precisely
+      so scoring can read codes. Codes are readable.
+    - The HTTP / persisted shape does not. ``CompositionStateResponse
+      .validation_errors`` is ``list[str] | None`` (``web/sessions/schemas.py``)
+      and the protocol records agree, so every entry is a bare message and
+      ``_extract_error_codes_from_entries`` ignores it by design. Codes are
+      NOT readable, and no amount of reading harder here recovers them —
+      the structure is discarded upstream (elspeth-8fe09316ab).
+
+    ``errors`` and ``runtime_preflight`` are read for the harness's benefit;
+    neither is a field of ``CompositionStateResponse``.
+
+    An empty return therefore means "this state made no codes observable",
+    never "the run raised no coded error". The caller must not conflate them.
+    """
     if not isinstance(state, dict):
         return []
     codes: list[str] = []
@@ -696,8 +717,15 @@ def _relaxed_invalid_state_reason(red: dict[str, Any], state: Any) -> str | None
 
     observed = _validation_error_codes(state)
     if not observed:
+        # Say what the SCORER could see, not what the pipeline did. A state whose
+        # validation_errors are message strings — the CompositionStateResponse
+        # shape — reaches this branch even when the run raised coded errors, so
+        # "no codes were present" would be a claim about the pipeline that the
+        # scorer has no standing to make.
         return (
-            f"final composition state has is_valid=false but no structured validation error codes were present (allowed: {sorted(allowed)})"
+            f"final composition state has is_valid=false and carried no structurally readable validation error "
+            f"codes, so the declared allowance could not be checked (allowed: {sorted(allowed)}) — this reports "
+            f"what the state made observable, not that the run raised no coded error"
         )
 
     disallowed = sorted({code for code in observed if code not in allowed})

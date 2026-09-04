@@ -248,6 +248,147 @@ def test_guided_chat_advisory_authority_fails_closed_on_binding_mismatch(mismatc
         )
 
 
+_COMMITTED_CONFIRMATION_HASH = "c" * 64
+
+
+def _completed_wire_guided(**overrides: object) -> GuidedSession:
+    """A COMPLETED session whose final record answered the empty wire turn."""
+
+    return replace(
+        GuidedSession(
+            step=GuidedStep.STEP_4_WIRE,
+            history=(
+                TurnRecord(
+                    step=GuidedStep.STEP_4_WIRE,
+                    turn_type=TurnType.CONFIRM_WIRING,
+                    payload_hash=guided_json_payload_id("turn", _empty_wire_payload()),
+                    response_hash=_COMMITTED_CONFIRMATION_HASH,
+                    emitter="server",
+                    summary="Guided pipeline wiring confirmed.",
+                ),
+            ),
+            terminal=TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}\n"),
+        ),
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def test_guided_committed_graph_authority_binds_the_confirmed_wire_record() -> None:
+    """Post-commit advice is bound to the record the user actually confirmed."""
+
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    chat_solver = importlib.import_module("elspeth.web.composer.guided.chat_solver")
+    payload = _empty_wire_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+
+    authority = guided_chat._guided_committed_graph_authority(
+        guided=_completed_wire_guided(),
+        current_payload=prepared,
+    )
+
+    assert type(authority) is chat_solver.GuidedAdvisoryGraphAuthority
+    assert authority.turn_type is TurnType.CONFIRM_WIRING
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+    assert authority.proposal_id == str(_GUIDED_PROPOSAL_ID)
+    assert authority.draft_hash == _GUIDED_PROPOSAL_DRAFT_HASH
+    # Confirmation refuses while any retained instruction remains, so nothing
+    # is pending for a graph decision to be attributed to.
+    assert authority.covered_deferred_intent_ids == ()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "unanswered",
+        "wrong_turn_type",
+        "wrong_step",
+        "empty_history",
+        "record_payload_hash",
+        "payload_tampered_after_load",
+        "active_proposal",
+        "terminal_absent",
+        "terminal_exited",
+        "inexact_session",
+        "inexact_payload",
+        "wrong_payload_purpose",
+    ],
+)
+def test_guided_committed_graph_authority_fails_closed_on_binding_mismatch(mismatch: str) -> None:
+    """Every way the committed binding can be wrong must refuse, not degrade.
+
+    The authority is what makes a post-commit answer honest: it is the sole
+    proof that the frozen payload about to be described to the provider is the
+    one this session's confirmation settled on. A soft failure here would let a
+    tampered or substituted record be explained to the user as their pipeline.
+    """
+
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _empty_wire_payload()
+    prepared: Any = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    guided: Any = _completed_wire_guided()
+    record = guided.history[-1]
+    if mismatch == "unanswered":
+        guided = _completed_wire_guided(history=(replace(record, response_hash=None),))
+    elif mismatch == "wrong_turn_type":
+        guided = _completed_wire_guided(history=(replace(record, turn_type=TurnType.REVIEW_COMPONENTS),))
+    elif mismatch == "wrong_step":
+        guided = _completed_wire_guided(history=(replace(record, step=GuidedStep.STEP_3_TRANSFORMS),))
+    elif mismatch == "empty_history":
+        guided = _completed_wire_guided(history=())
+    elif mismatch == "record_payload_hash":
+        guided = _completed_wire_guided(history=(replace(record, payload_hash="f" * 64),))
+    elif mismatch == "payload_tampered_after_load":
+        # Corrupt the frozen custody object AFTER construction so the boundary
+        # must exercise its own content re-derivation rather than merely reject
+        # an inexact stand-in type.
+        object.__setattr__(prepared, "payload", {**payload, "can_confirm": False})
+    elif mismatch == "active_proposal":
+        # GuidedSession's own invariant forbids this pairing, so it is forced
+        # in after construction: the authority must not rely on that invariant
+        # having run.
+        object.__setattr__(guided, "active_proposal", _guided_proposal_ref())
+    elif mismatch == "terminal_absent":
+        guided = _completed_wire_guided(terminal=None)
+    elif mismatch == "terminal_exited":
+        guided = _completed_wire_guided(
+            terminal=TerminalState(
+                kind=TerminalKind.EXITED_TO_FREEFORM,
+                reason=TerminalReason.USER_PRESSED_EXIT,
+                pipeline_yaml=None,
+            )
+        )
+    elif mismatch == "inexact_session":
+        guided = SimpleNamespace(
+            terminal=TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}\n"),
+            active_proposal=None,
+            history=(record,),
+        )
+    elif mismatch == "inexact_payload":
+        prepared = SimpleNamespace(
+            payload_id=prepared.payload_id,
+            purpose="turn",
+            payload=payload,
+        )
+    else:
+        prepared = PreparedGuidedJsonPayload(
+            payload_id=guided_json_payload_id("turn_response", payload),
+            purpose="turn_response",
+            payload=payload,
+        )
+
+    with pytest.raises(AuditIntegrityError):
+        guided_chat._guided_committed_graph_authority(guided=guided, current_payload=prepared)
+
+
 _MALFORMED_CURRENT_TURNS: tuple[tuple[GuidedStep, TurnType, Mapping[str, object]], ...] = (
     (
         GuidedStep.STEP_1_SOURCE,

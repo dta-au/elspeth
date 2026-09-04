@@ -38,12 +38,20 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
+import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
 import {
   hasCompositionContent,
   sortedSourceEntries,
   sourceComponentId,
 } from "@/utils/compositionState";
+import {
+  branchEntries,
+  DISCARD_CONNECTION,
+  publishedSuccessConnection,
+  FAN_IN_NODE_TYPES,
+} from "@/lib/graphTopology";
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
 import { Button, TypeBadge } from "@/components/ui";
@@ -83,104 +91,6 @@ const PARALLEL_EDGE_TYPE = "parallel-lane";
 const PARALLEL_EDGE_LANE_GAP = 22;
 const PARALLEL_HANDLE_INSET = 16;
 
-/**
- * Node kinds whose INBOUND topology is declared by `branches` — an
- * alias -> connection-name mapping — rather than by the scalar `input`, which
- * carries only the backend-compatible first-branch placeholder.
- *
- * Both kinds share this shape in the RUNTIME; they do NOT share it on the
- * wire. `branches` is legally a list as well as a map, and the composer
- * normalises list -> identity mapping only for row_union
- * (composer/state.py `_row_union_normalized_branches`), while
- * `_serialize_branches` deliberately "preserves list-vs-mapping semantics"
- * for a coalesce. So a coalesce reaches this component still holding a list,
- * and `branchEntries` below applies the rule rather than assuming it away.
- *
- * Only row_union was ever read through `branches` at all, so a coalesce fell
- * through to ordinary `input` inference and rendered a single arm from
- * whichever producer happened to own the placeholder connection
- * (elspeth-625e85c59b). `coalesce` is the kind the composer's planner
- * actually authors — every fan-in node in the saved corpus is one, and no
- * saved session has ever held a row_union. That is a COVERAGE fact, not a
- * disuse one: row_union is taught to the planner
- * (composer/planner_authoring_aids.py ships a fork_row_union exemplar), is
- * used by examples/row_union_ab_experiment, and reaches this component
- * directly through Import YAML. Neither arm is dead; only one is exercised.
- *
- * This set governs INBOUND inference only. The outbound-semantics rewrite
- * below stays row_union-scoped on purpose — see the comment there.
- */
-// Node kinds that publish their success output IMPLICITLY, under their own
-// node id, when they declare no `on_success`. A downstream node reaches them
-// by naming the node id in its `input`.
-//
-// This mirrors `_producer_resolver.published_success_connection`, which is the
-// backend authority and the ONLY place the rule is decided:
-//
-//     if node.on_success is not None: return node.on_success
-//     if node.node_type in {"queue", "coalesce", "aggregation"}: return node.id
-//     return None
-//
-// `aggregation` is in that set for the same reason coalesce is:
-// `AggregationSettings.on_success` is `str | None = None`, and
-// `core/dag/builder.py` registers `agg_settings.name` when it is omitted.
-// It was missed on the first pass here and in the Python.
-//
-// Do not re-derive it from `on_success` here. `CoalesceSettings.on_success` is
-// OPTIONAL ("Required when coalesce is terminal"), and a queue never declares
-// one at all, so asking `node.on_success` directly reports a correctly-wired
-// node as publishing nothing — which drew a working fork/coalesce pipeline as
-// two disconnected fragments (session 3f02c8fa). row_union and collector both
-// REQUIRE on_success and so are deliberately NOT here: giving them an implicit
-// id would invent a connection the DAG builder does not resolve.
-const IMPLICIT_SELF_PUBLISHING_NODE_TYPES: ReadonlySet<string> = new Set([
-  "queue",
-  "coalesce",
-  "aggregation",
-]);
-
-function publishedSuccessConnection(node: {
-  id: string;
-  node_type: string;
-  on_success: string | null;
-}): string | null {
-  if (node.on_success !== null && node.on_success !== undefined) {
-    return node.on_success;
-  }
-  return IMPLICIT_SELF_PUBLISHING_NODE_TYPES.has(node.node_type)
-    ? node.id
-    : null;
-}
-
-const FAN_IN_NODE_TYPES: ReadonlySet<string> = new Set([
-  "row_union",
-  "coalesce",
-]);
-
-/**
- * A fan-in node's alias -> connection pairs, in declaration order.
- *
- * The list form is not a second meaning, it is shorthand for the identity
- * mapping: `CoalesceSettings.normalize_branches` (core/config.py:991-1005)
- * returns `{b: b for b in v}`, so `["a","b"]` IS `{a: "a", b: "b"}`. That
- * rule belongs to the runtime; this reads it rather than restating it, and
- * rather than declining it — bailing out on a list silently reproduced the
- * very defect this machinery exists to fix, on a composition that validates
- * green.
- *
- * A duplicate entry is an authoring error the backend rejects
- * (normalize_branches raises); here the alias-key dedup in phase 1 collapses
- * it to one arm rather than drawing two identical ones.
- */
-function branchEntries(
-  branches: string[] | Record<string, string> | null | undefined,
-): [string, string][] {
-  if (branches === null || branches === undefined) return [];
-  return Array.isArray(branches)
-    ? branches.map((name) => [name, name])
-    : Object.entries(branches);
-}
-
 const EDGE_LABEL_MAP: Record<string, string> = {
   on_success: "success",
   on_error: "error",
@@ -206,6 +116,115 @@ function inferredEdgeId(kind: string, ...parts: string[]): string {
 }
 
 type EdgeFlowType = "success" | "error";
+
+function edgeSemanticIdentity(
+  source: string,
+  target: string,
+  label: string,
+  flowType: EdgeFlowType,
+): string {
+  return [source, target, label, flowType]
+    .map((part) => `${part.length}:${part}`)
+    .join("|");
+}
+
+function inferredSemanticEdgeId(
+  kind: string,
+  source: string,
+  target: string,
+  label: string,
+  flowType: EdgeFlowType,
+): string {
+  return inferredEdgeId(kind, source, target, label, flowType);
+}
+
+// Producer registry: connection_point_name → producers.
+// ELSPETH allows MANY producers to publish one connection name ONLY when a
+// declared queue node consumes it (structural fan-in, ADR-028). So this is a
+// MULTIMAP, not one-producer-per-connection: overwriting would silently drop
+// every producer but the last and misrender the intentional fan-in.
+type ProducerInfo = {
+  nodeId: string;
+  edgeType: EdgeFlowType;
+  label: string;
+  origin: "success" | "error" | "route" | "fork";
+};
+
+export function buildProducerRegistry(
+  compositionState: CompositionState,
+): Map<string, ProducerInfo[]> {
+  const connectionProducers = new Map<string, ProducerInfo[]>();
+  function registerProducer(connection: string, producer: ProducerInfo): void {
+    const producers = connectionProducers.get(connection) ?? [];
+    producers.push(producer);
+    connectionProducers.set(connection, producers);
+  }
+
+  // Each source produces on its on_success connection
+  for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
+    if (source.on_success) {
+      registerProducer(source.on_success, {
+        nodeId: sourceComponentId(sourceName),
+        edgeType: "success",
+        label: "success",
+        origin: "success",
+      });
+    }
+  }
+
+  // Each node can produce on on_success, on_error, or routes. Queue nodes have
+  // none of these (their output is implicit under their own id), so they
+  // register nothing here.
+  for (const node of compositionState.nodes) {
+    const published = publishedSuccessConnection(node);
+    if (published) {
+      registerProducer(published, {
+        nodeId: node.id,
+        edgeType: "success",
+        label: "success",
+        origin: "success",
+      });
+    }
+    // Collector failure is a structural whole-group verdict. The universal
+    // CompositionState shape can carry malformed legacy on_error data, but
+    // drawing it would promise a runtime route that does not exist.
+    if (node.node_type !== "collector" && node.on_error) {
+      registerProducer(node.on_error, {
+        nodeId: node.id,
+        edgeType: "error",
+        label: "error",
+        origin: "error",
+      });
+    }
+    if (node.routes) {
+      for (const [routeLabel, targetConn] of Object.entries(node.routes)) {
+        registerProducer(targetConn, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: routeLabel,
+          origin: "route",
+        });
+      }
+    }
+    if (
+      node.node_type === "gate"
+      && node.routes
+      && Object.values(node.routes).includes("fork")
+      && node.fork_to
+    ) {
+      for (const branchConnection of node.fork_to) {
+        registerProducer(branchConnection, {
+          nodeId: node.id,
+          edgeType: "success",
+          label: branchConnection,
+          origin: "fork",
+        });
+      }
+    }
+  }
+
+  return connectionProducers;
+}
 
 interface PipelineEdgeData extends Record<string, unknown> {
   flowType: EdgeFlowType;
@@ -233,7 +252,29 @@ type PipelineGraphNodeModel = Node<
 
 type PipelineGraphEdgeModel = Edge<PipelineEdgeData> & {
   data: PipelineEdgeData;
+  label: string;
 };
+
+function edgeModelSemanticIdentity(edge: PipelineGraphEdgeModel): string {
+  return edgeSemanticIdentity(
+    edge.source,
+    edge.target,
+    edge.label,
+    edge.data.flowType,
+  );
+}
+
+function deduplicateSemanticEdges(
+  edges: PipelineGraphEdgeModel[],
+): PipelineGraphEdgeModel[] {
+  const seen = new Set<string>();
+  return edges.filter((edge) => {
+    const identity = edgeModelSemanticIdentity(edge);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
 
 type ParallelLaneEdgeModel = Edge<
   ParallelLaneEdgeData,
@@ -649,6 +690,9 @@ function selectedComponentConfig(
         policy: node.policy,
         merge: node.merge,
         timeout_seconds: node.timeout_seconds,
+        scope_name: node.scope_name,
+        scope_opener: node.scope_opener,
+        scope_policy: node.scope_policy,
       }),
       options: node.options,
     };
@@ -663,7 +707,9 @@ function selectedComponentConfig(
       typeLabel: "sink",
       plugin: output.plugin,
       pluginKind: "sink",
-      connections: {},
+      connections: withoutNullishFields({
+        on_write_failure: output.on_write_failure,
+      }),
       options: output.options,
     };
   }
@@ -793,6 +839,27 @@ export function GraphView() {
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const selectNode = useSessionStore((s) => s.selectNode);
+  // Guided pre-commit projection (elspeth-9f0873426a, IA-1 / V-1): what the
+  // learner has reviewed or is being asked to approve. The pending decision
+  // comes from the guided turn payload; the reviewed ledger is the SERVER's
+  // projection (elspeth-f2a8550b3d), published on `guided_session` and read
+  // through `selectGuidedReviewedComponents` — not folded from turns, so a
+  // reload mid-build still draws the confirmed components. Both selectors
+  // return stable references (the ledger is the wire object itself).
+  const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
+  const guidedReviewedComponents = useSessionStore(
+    (s) => s.guidedReviewedComponents,
+  );
+  const guidedTerminal = useSessionStore((s) => s.guidedTerminal);
+  const guidedProjection = useMemo(
+    () =>
+      projectGuidedGraph({
+        nextTurn: guidedNextTurn,
+        reviewed: guidedReviewedComponents,
+        terminal: guidedTerminal,
+      }),
+    [guidedNextTurn, guidedReviewedComponents, guidedTerminal],
+  );
   const { resolvedTheme } = useTheme();
 
   const validationResult = useExecutionStore((s) => s.validationResult);
@@ -1152,8 +1219,18 @@ export function GraphView() {
     const sourceIds = new Set(Object.keys(compositionState.sources));
     const toGraphNodeId = (id: string): string =>
       sourceIds.has(id) ? sourceComponentId(id) : id;
+    const collectorIds = new Set(
+      compositionState.nodes
+        .filter((node) => node.node_type === "collector")
+        .map((node) => node.id),
+    );
 
-    const explicitEdges = compositionState.edges;
+    // Collector on_error is inexpressible. A universal/legacy composition
+    // shape can still carry a stale explicit edge, but projecting it would
+    // promise group-failure routing the runtime never performs.
+    const explicitEdges = compositionState.edges.filter(
+      (edge) => edge.edge_type !== "on_error" || !collectorIds.has(edge.from_node),
+    );
     const rfEdges: PipelineGraphEdgeModel[] = explicitEdges.map((edge, i) => ({
       id: `e-${edge.from_node}-${edge.to_node}-${i}`,
       source: toGraphNodeId(edge.from_node),
@@ -1171,10 +1248,18 @@ export function GraphView() {
     }));
     const explicitRfEdgeIds = new Set(rfEdges.map((edge) => edge.id));
 
-    // Build a set of existing edge connections to avoid duplicates
+    // The runtime is a MultiDiGraph: equal endpoints do not make two routing
+    // facts equal. Preserve every distinct label/flow pair while still
+    // suppressing an exact render-hint duplicate.
     const existingConnections = new Set(
-      rfEdges.map(e => `${e.source}->${e.target}`)
+      rfEdges.map(edgeModelSemanticIdentity),
     );
+    function rebuildExistingConnections(): void {
+      existingConnections.clear();
+      for (const edge of rfEdges) {
+        existingConnections.add(edgeModelSemanticIdentity(edge));
+      }
+    }
     const explicitEdgeIndexesByConnection = new Map<string, number[]>();
     for (const [index, edge] of rfEdges.entries()) {
       const connectionKey = `${edge.source}->${edge.target}`;
@@ -1229,6 +1314,45 @@ export function GraphView() {
       return true;
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
+    const outputIds = new Set(compositionState.outputs.map((output) => output.name));
+    function addDirectOutputErrorEdge(
+      kind: string,
+      sourceId: string,
+      targetId: string | undefined,
+    ): void {
+      if (
+        !targetId
+        || targetId === DISCARD_CONNECTION
+        || !outputIds.has(targetId)
+      ) {
+        return;
+      }
+      const semanticKey = edgeSemanticIdentity(
+        sourceId,
+        targetId,
+        "error",
+        "error",
+      );
+      if (existingConnections.has(semanticKey)) return;
+
+      rfEdges.push({
+        id: inferredSemanticEdgeId(
+          kind,
+          sourceId,
+          targetId,
+          "error",
+          "error",
+        ),
+        source: sourceId,
+        target: targetId,
+        label: "error",
+        data: { flowType: "error" },
+        animated: true,
+        style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
+        labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
+      });
+      existingConnections.add(semanticKey);
+    }
 
     // Always infer missing edges from connection properties.
     // ELSPETH uses a NAMED CONNECTION POINT model:
@@ -1242,22 +1366,7 @@ export function GraphView() {
     // 3. For direct sink references (on_success/on_error/routes pointing to sink names),
     //    create edges directly since sinks are in nodeIds
 
-    // Producer registry: connection_point_name → producers.
-    // ELSPETH allows MANY producers to publish one connection name ONLY when a
-    // declared queue node consumes it (structural fan-in, ADR-028). So this is a
-    // MULTIMAP, not one-producer-per-connection: overwriting would silently drop
-    // every producer but the last and misrender the intentional fan-in.
-    type ProducerInfo = {
-      nodeId: string;
-      edgeType: EdgeFlowType;
-      label: string;
-    };
-    const connectionProducers = new Map<string, ProducerInfo[]>();
-    function registerProducer(connection: string, producer: ProducerInfo): void {
-      const producers = connectionProducers.get(connection) ?? [];
-      producers.push(producer);
-      connectionProducers.set(connection, producers);
-    }
+    const connectionProducers = buildProducerRegistry(compositionState);
 
     // Declared queue ids: a queue is the SOLE canonical producer of its own
     // connection for ordinary downstream lookup, and every producer publishing
@@ -1295,66 +1404,11 @@ export function GraphView() {
       authoritativeRowUnionOutboundSemantics.set(connectionKey, semantics);
     }
 
-    // Each source produces on its on_success connection
-    for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
-      if (source.on_success) {
-        registerProducer(source.on_success, {
-          nodeId: sourceComponentId(sourceName),
-          edgeType: "success",
-          label: "success",
-        });
-      }
-    }
-
-    // Each node can produce on on_success, on_error, or routes. Queue nodes have
-    // none of these (their output is implicit under their own id), so they
-    // register nothing here.
-    for (const node of compositionState.nodes) {
-      const published = publishedSuccessConnection(node);
-      if (published) {
-        registerProducer(published, {
-          nodeId: node.id,
-          edgeType: "success",
-          label: "success",
-        });
-      }
-      if (node.on_error) {
-        registerProducer(node.on_error, {
-          nodeId: node.id,
-          edgeType: "error",
-          label: "error",
-        });
-      }
-      if (node.routes) {
-        for (const [routeLabel, targetConn] of Object.entries(node.routes)) {
-          registerProducer(targetConn, {
-            nodeId: node.id,
-            edgeType: "success",
-            label: routeLabel,
-          });
-        }
-      }
-      if (
-        node.node_type === "gate"
-        && node.routes
-        && Object.values(node.routes).includes("fork")
-        && node.fork_to
-      ) {
-        for (const branchConnection of node.fork_to) {
-          registerProducer(branchConnection, {
-            nodeId: node.id,
-            edgeType: "success",
-            label: branchConnection,
-          });
-        }
-      }
-    }
-
     // Phase 1: draw every producer → fan-in edge from the authoritative
     // alias→connection mapping. NodeSpec.input is only the backend-compatible
     // first-branch placeholder for a fan-in node; it is deliberately ignored
     // so the graph cannot invent a duplicate unlabelled input edge.
-    const inferredBranchAliases = new Set<string>();
+    const inferredBranchSemantics = new Set<string>();
     // Fan-in nodes whose aliases phase 1 actually enumerated. Recorded here,
     // at the one place the predicate is evaluated, so the phase-1b and phase-3
     // guards can never drift from "phase 1 spoke for this node's inbound
@@ -1373,35 +1427,61 @@ export function GraphView() {
               nodeId: connection,
               edgeType: "success",
               label: "success",
+              origin: "success",
             }]
           : [...(connectionProducers.get(connection) ?? [])]
               .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+        const producerCountByNodeAndFlow = new Map<string, number>();
+        for (const producer of producers) {
+          const key = `${producer.nodeId.length}:${producer.nodeId}|${producer.edgeType}`;
+          producerCountByNodeAndFlow.set(
+            key,
+            (producerCountByNodeAndFlow.get(key) ?? 0) + 1,
+          );
+        }
         for (const producer of producers) {
           if (producer.nodeId === fanIn.id) continue;
           const connectionKey = `${producer.nodeId}->${fanIn.id}`;
-          const aliasKey = `${connectionKey}:${alias}`;
-          if (inferredBranchAliases.has(aliasKey)) continue;
+          const producerGroupKey =
+            `${producer.nodeId.length}:${producer.nodeId}|${producer.edgeType}`;
+          // A single producer for a branch keeps the consumer's useful alias.
+          // When one gate contributes several semantics to the same branch,
+          // retain each route label; the fork arm itself still reads as the
+          // branch alias. This mirrors the runtime's branch+route collision
+          // handling without sacrificing the established fan-in vocabulary.
+          const edgeLabel =
+            (producerCountByNodeAndFlow.get(producerGroupKey) ?? 0) > 1
+              ? producer.origin === "fork" ? alias : producer.label
+              : alias;
+          const semanticKey = edgeSemanticIdentity(
+            producer.nodeId,
+            fanIn.id,
+            edgeLabel,
+            producer.edgeType,
+          );
+          if (inferredBranchSemantics.has(semanticKey)) continue;
           if (
             claimExplicitBranchAlias(
               connectionKey,
-              alias,
+              edgeLabel,
               producer.edgeType,
             )
           ) {
-            inferredBranchAliases.add(aliasKey);
+            inferredBranchSemantics.add(semanticKey);
             continue;
           }
           const isError = producer.edgeType === "error";
           rfEdges.push({
-            id: inferredEdgeId(
+            id: inferredSemanticEdgeId(
               "fan-in",
               producer.nodeId,
               fanIn.id,
-              alias,
+              edgeLabel,
+              producer.edgeType,
             ),
             source: producer.nodeId,
             target: fanIn.id,
-            label: alias,
+            label: edgeLabel,
             data: { flowType: producer.edgeType },
             animated: isError,
             style: {
@@ -1410,11 +1490,16 @@ export function GraphView() {
             },
             labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
           });
-          inferredBranchAliases.add(aliasKey);
-          existingConnections.add(connectionKey);
+          inferredBranchSemantics.add(semanticKey);
+          existingConnections.add(semanticKey);
         }
       }
     }
+
+    // Phase 1 can rewrite explicit labels and flow types in place. Re-derive
+    // the semantic ledger once from the resulting edge models so subsequent
+    // inference never consults the pre-rewrite identity.
+    rebuildExistingConnections();
 
     // Phase 1b: once phase 1 has spoken, `branches` is the ONLY route into an
     // alias-mapped fan-in node — every inbound lane, of every edge_type, comes
@@ -1454,10 +1539,7 @@ export function GraphView() {
       rfEdges.splice(index, 1);
     }
     if (staleFanInEdgeIndexes.length > 0) {
-      existingConnections.clear();
-      for (const edge of rfEdges) {
-        existingConnections.add(`${edge.source}->${edge.target}`);
-      }
+      rebuildExistingConnections();
     }
 
     // Phase 2: draw every producer → queue edge. Deterministic (sorted by
@@ -1475,10 +1557,22 @@ export function GraphView() {
         if (rowUnionIds.has(producer.nodeId)) {
           registerAuthoritativeRowUnionOutbound(connectionKey, producer);
         }
-        if (existingConnections.has(connectionKey)) continue;
+        const semanticKey = edgeSemanticIdentity(
+          producer.nodeId,
+          queueId,
+          producer.label,
+          producer.edgeType,
+        );
+        if (existingConnections.has(semanticKey)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
-          id: inferredEdgeId("queue-in", producer.nodeId, queueId),
+          id: inferredSemanticEdgeId(
+            "queue-in",
+            producer.nodeId,
+            queueId,
+            producer.label,
+            producer.edgeType,
+          ),
           source: producer.nodeId,
           target: queueId,
           label: producer.label,
@@ -1490,7 +1584,7 @@ export function GraphView() {
           },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(connectionKey);
+        existingConnections.add(semanticKey);
       }
     }
 
@@ -1509,9 +1603,21 @@ export function GraphView() {
       // sources (which would be a dishonest producer → consumer bypass).
       if (queueIds.has(node.input)) {
         if (node.input === node.id) continue; // the queue's own implicit output
-        if (!existingConnections.has(`${node.input}->${node.id}`)) {
+        const semanticKey = edgeSemanticIdentity(
+          node.input,
+          node.id,
+          "success",
+          "success",
+        );
+        if (!existingConnections.has(semanticKey)) {
           rfEdges.push({
-            id: inferredEdgeId("queue-out", node.input, node.id),
+            id: inferredSemanticEdgeId(
+              "queue-out",
+              node.input,
+              node.id,
+              "success",
+              "success",
+            ),
             source: node.input,
             target: node.id,
             label: "success",
@@ -1519,7 +1625,7 @@ export function GraphView() {
             style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
             labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
           });
-          existingConnections.add(`${node.input}->${node.id}`);
+          existingConnections.add(semanticKey);
         }
         continue;
       }
@@ -1533,12 +1639,30 @@ export function GraphView() {
         if (rowUnionIds.has(producer.nodeId)) {
           registerAuthoritativeRowUnionOutbound(connectionKey, producer);
         }
-        if (existingConnections.has(connectionKey)) continue;
+        const semanticKey = edgeSemanticIdentity(
+          producer.nodeId,
+          node.id,
+          producer.label,
+          producer.edgeType,
+        );
+        if (existingConnections.has(semanticKey)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
-            ? inferredEdgeId("row-union-out", producer.nodeId, node.id)
-            : inferredEdgeId("conn", producer.nodeId, node.id),
+            ? inferredSemanticEdgeId(
+                "row-union-out",
+                producer.nodeId,
+                node.id,
+                producer.label,
+                producer.edgeType,
+              )
+            : inferredSemanticEdgeId(
+                "conn",
+                producer.nodeId,
+                node.id,
+                producer.label,
+                producer.edgeType,
+              ),
           source: producer.nodeId,
           target: node.id,
           label: producer.label,
@@ -1550,20 +1674,35 @@ export function GraphView() {
           },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(connectionKey);
+        existingConnections.add(semanticKey);
       }
     }
 
     // Handle source → sink direct edges (no transforms in between)
     for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
       const sourceId = sourceComponentId(sourceName);
+      const semanticKey = source.on_success
+        ? edgeSemanticIdentity(
+            sourceId,
+            source.on_success,
+            "success",
+            "success",
+          )
+        : null;
       if (
         source.on_success &&
         nodeIds.has(source.on_success) &&
-        !existingConnections.has(`${sourceId}->${source.on_success}`)
+        semanticKey !== null &&
+        !existingConnections.has(semanticKey)
       ) {
         rfEdges.push({
-          id: inferredEdgeId("sink", sourceId, source.on_success),
+          id: inferredSemanticEdgeId(
+            "sink",
+            sourceId,
+            source.on_success,
+            "success",
+            "success",
+          ),
           source: sourceId,
           target: source.on_success,
           label: "success",
@@ -1571,8 +1710,14 @@ export function GraphView() {
           style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(`${sourceId}->${source.on_success}`);
+        existingConnections.add(semanticKey);
       }
+
+      addDirectOutputErrorEdge(
+        "source-validation-failure",
+        sourceId,
+        source.on_validation_failure,
+      );
     }
 
     // Handle direct sink references (on_success/on_error/routes pointing to sink names)
@@ -1589,15 +1734,27 @@ export function GraphView() {
           nodeId: node.id,
           edgeType: "success",
           label: "success",
+          origin: "success",
         });
       }
       if (
         node.on_success &&
         nodeIds.has(node.on_success) &&
-        !existingConnections.has(successConnectionKey)
+        !existingConnections.has(edgeSemanticIdentity(
+          node.id,
+          node.on_success,
+          "success",
+          "success",
+        ))
       ) {
         rfEdges.push({
-          id: inferredEdgeId("sink", node.id, node.on_success),
+          id: inferredSemanticEdgeId(
+            "sink",
+            node.id,
+            node.on_success,
+            "success",
+            "success",
+          ),
           source: node.id,
           target: node.on_success,
           label: "success",
@@ -1605,7 +1762,12 @@ export function GraphView() {
           style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(successConnectionKey);
+        existingConnections.add(edgeSemanticIdentity(
+          node.id,
+          node.on_success,
+          "success",
+          "success",
+        ));
       }
 
       // on_error → sink
@@ -1619,15 +1781,28 @@ export function GraphView() {
           nodeId: node.id,
           edgeType: "error",
           label: "error",
+          origin: "error",
         });
       }
       if (
+        node.node_type !== "collector" &&
         node.on_error &&
         nodeIds.has(node.on_error) &&
-        !existingConnections.has(errorConnectionKey)
+        !existingConnections.has(edgeSemanticIdentity(
+          node.id,
+          node.on_error,
+          "error",
+          "error",
+        ))
       ) {
         rfEdges.push({
-          id: inferredEdgeId("sink", node.id, node.on_error, "error"),
+          id: inferredSemanticEdgeId(
+            "sink",
+            node.id,
+            node.on_error,
+            "error",
+            "error",
+          ),
           source: node.id,
           target: node.on_error,
           label: "error",
@@ -1636,7 +1811,12 @@ export function GraphView() {
           style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(errorConnectionKey);
+        existingConnections.add(edgeSemanticIdentity(
+          node.id,
+          node.on_error,
+          "error",
+          "error",
+        ));
       }
 
       // Gate routes → sink
@@ -1648,11 +1828,24 @@ export function GraphView() {
               nodeId: node.id,
               edgeType: "success",
               label: routeLabel,
+              origin: "route",
             });
           }
-          if (nodeIds.has(targetId) && !existingConnections.has(routeConnectionKey)) {
+          const semanticKey = edgeSemanticIdentity(
+            node.id,
+            targetId,
+            routeLabel,
+            "success",
+          );
+          if (nodeIds.has(targetId) && !existingConnections.has(semanticKey)) {
             rfEdges.push({
-              id: inferredEdgeId("sink", node.id, targetId, routeLabel),
+              id: inferredSemanticEdgeId(
+                "sink",
+                node.id,
+                targetId,
+                routeLabel,
+                "success",
+              ),
               source: node.id,
               target: targetId,
               label: routeLabel,
@@ -1660,10 +1853,21 @@ export function GraphView() {
               style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
               labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
             });
-            existingConnections.add(routeConnectionKey);
+            existingConnections.add(semanticKey);
           }
         }
       }
+    }
+
+    // Source validation and sink write failure are engine-level routes to
+    // configured outputs. They are not named-connection producers, so they
+    // stay out of buildProducerRegistry and are projected directly here.
+    for (const output of compositionState.outputs) {
+      addDirectOutputErrorEdge(
+        "output-write-failure",
+        output.name,
+        output.on_write_failure,
+      );
     }
 
     // DELIBERATE EXCLUSION: this outbound rewrite stays row_union-scoped and
@@ -1752,9 +1956,15 @@ export function GraphView() {
     // Direction markers last: every construction and rewrite phase above has
     // settled data.flowType by now, so the arrowhead colour cannot disagree
     // with the stroke it points along (elspeth-ddae27dff1).
+    // Keep the first edge for an exact semantic duplicate. Explicit render
+    // hints are seeded before inferred edges, so a late authority rewrite
+    // retains the explicit hint's rendered id and removes only the
+    // now-redundant inferred copy; distinct labels or flow types remain
+    // independent lanes.
+    const semanticallyDistinctEdges = deduplicateSemanticEdges(rfEdges);
     const parallelGeometry = assignParallelEdgeLanes(
       rfNodes,
-      withDirectionMarkers(rfEdges),
+      withDirectionMarkers(semanticallyDistinctEdges),
     );
     return layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
   }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
@@ -1842,6 +2052,18 @@ export function GraphView() {
   // tabpanel, and the message is a state, not a document section. The
   // explicit {" "} keeps the two sentences one whitespace-normalised string
   // for text-content assertions.
+  //
+  // Guided builds first (elspeth-9f0873426a): a pending proposal or wire
+  // stage is what the learner is deciding on, so it is drawn even over a
+  // committed composition (a re-entered session keeps its old graph until
+  // the new one is confirmed — and the proposal card no longer draws its
+  // own copy). The weaker reviewed-components ledger only fills the void.
+  if (
+    guidedProjection !== null &&
+    (guidedProjection.stage !== "reviewed" || nodes.length === 0)
+  ) {
+    return <GuidedGraphPane projection={guidedProjection} />;
+  }
   if (nodes.length === 0) {
     return (
       <div className="empty-state graph-view-empty">

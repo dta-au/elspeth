@@ -92,7 +92,10 @@ class _BatchStats:
 class BatchOutlierAnnotatorConfig(TransformDataConfig):
     """Configuration for batch outlier annotator transform."""
 
-    value_field: str = Field(description="Name of the numeric field to annotate")
+    value_field: Annotated[
+        str,
+        EmittedToOutput("batch_outlier_annotator copies this configured input-field name into every emitted annotation row"),
+    ] = Field(description="Name of the numeric field to annotate")
     output_prefix: Annotated[
         str,
         EmittedToOutput(
@@ -103,12 +106,18 @@ class BatchOutlierAnnotatorConfig(TransformDataConfig):
         default="outlier",
         description="Prefix used for emitted annotation fields",
     )
-    z_threshold: float = Field(
+    z_threshold: Annotated[
+        float,
+        EmittedToOutput("batch_outlier_annotator copies this configured threshold into every emitted annotation row"),
+    ] = Field(
         default=3.0,
         gt=0,
         description="Absolute sample z-score threshold for outlier annotation",
     )
-    robust_z_threshold: float = Field(
+    robust_z_threshold: Annotated[
+        float,
+        EmittedToOutput("batch_outlier_annotator copies this configured threshold into every emitted annotation row"),
+    ] = Field(
         default=3.5,
         gt=0,
         description="Absolute modified z-score threshold based on median absolute deviation",
@@ -152,9 +161,10 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bf754e8259e6102f"
+    source_file_hash: str | None = "sha256:9b1f674f2a7a098d"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
+    preserves_input_values = True
     usage_when_to_use: str = (
         "Use for window-local z-score and robust-z annotations on finite numeric rows, preserving each valid "
         "source row with added outlier fields."
@@ -247,6 +257,10 @@ class BatchOutlierAnnotator(BaseTransform):
             adds_fields=True,
         )
         self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a finite batch so the value-preservation harness reaches emission."""
+        return [self._augment_invariant_probe_row(probe, field_name=self._value_field, value=value) for value in (1.0, 1.0, 1.0)]
 
     def _reject_explicit_output_field_collision(self, cfg: BatchOutlierAnnotatorConfig) -> None:
         """Reject explicit schemas that would always collide with annotations."""

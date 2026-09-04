@@ -24,6 +24,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
+from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -307,6 +308,66 @@ class TestListComposerBlobs:
 
 
 class TestWireBlobInlineRef:
+    @pytest.mark.parametrize(
+        ("node_type", "overrides"),
+        (
+            ("gate", {"condition": "True", "routes": {"true": "classified", "false": "classified"}}),
+            ("coalesce", {"branches": ("left", "right"), "policy": "require_all", "merge": "union", "on_success": "classified"}),
+            ("row_union", {"input": "left", "branches": {"left": "left", "right": "right"}, "on_success": "unioned"}),
+            ("queue", {"input": "structural"}),
+        ),
+    )
+    def test_rejects_structural_node_without_runtime_plugin_options(
+        self,
+        blob_env: dict[str, Any],
+        node_type: str,
+        overrides: dict[str, Any],
+    ) -> None:
+        """A successful wire must survive into the canonical runtime dict.
+
+        Structural nodes do not have plugin options in runtime YAML. Before
+        this guard, gate/coalesce markers vanished during lowering while
+        row_union/queue markers left an invalid state behind after the tool
+        had already reported success.
+        """
+        blob = _create_blob(blob_env, content="structural-node marker")
+        fields: dict[str, Any] = {
+            "id": "structural",
+            "node_type": node_type,
+            "plugin": None,
+            "input": "rows",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        state = replace(_inline_ref_state(), nodes=(NodeSpec(**{**fields, **overrides}),))
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": "node:structural.options.payload",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.nodes[0].options == {}
+        assert result.data["error"] == (
+            "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
+        )
+
     def test_candidate_runs_canonical_review_invariant_before_publication(
         self,
         blob_env: dict[str, Any],
@@ -537,6 +598,10 @@ class TestWireBlobInlineRef:
         assert result.updated_state is state
         assert "resolved_prompt_template_hash" in result.data["error"]
         assert "runtime-owned" in result.data["error"]
+        assert "field_path" in result.data["error"]
+        assert "patch_node_options" in result.data["error"]
+        assert "upsert_node" in result.data["error"]
+        assert "retry wire_blob_inline_ref" not in result.data["error"]
 
     def test_rejects_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -557,7 +622,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_rejects_non_llm_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -584,7 +650,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_rejects_source_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -605,7 +672,34 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
+
+    @pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    def test_rejects_source_server_owned_root_field_path(
+        self,
+        blob_env: dict[str, Any],
+        field_name: str,
+    ) -> None:
+        blob = _create_blob(blob_env, content="forged source metadata")
+        state = _inline_ref_state()
+
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {
+                "field_path": f"source.options.{field_name}",
+                "blob_id": blob.data["blob_id"],
+            },
+            state,
+            _catalog(),
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert field_name in result.data["error"]
+        assert "set_source_from_blob" in result.data["error"]
 
     def test_rejects_output_interpretation_requirements_field_path(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, content="forged review metadata")
@@ -626,7 +720,8 @@ class TestWireBlobInlineRef:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements" in result.data["error"]
-        assert "resolve_interpretation_event" in result.data["error"]
+        assert "request_interpretation_review" in result.data["error"]
+        assert "resolve_interpretation_event" not in result.data["error"]
 
     def test_unrelated_wire_rejects_preexisting_output_interpretation_requirements(
         self,
@@ -865,3 +960,42 @@ def test_tool_definitions_include_inline_blob_authoring_tools() -> None:
     assert definitions["wire_blob_inline_ref"]["parameters"]["required"] == ["field_path", "blob_id"]
     assert definitions["wire_blob_inline_ref"]["parameters"]["additionalProperties"] is False
     assert definitions["delete_blob"]["parameters"]["additionalProperties"] is False
+
+
+def test_set_nested_option_rejects_non_object_segment_collision() -> None:
+    """A field_path segment that collides with an existing non-object value in the
+    web-authored container must be rejected, never coerced into an object."""
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"segment 'a' already exists and is not an object"):
+        _set_nested_option({"a": 5}, ["a", "b"], "marker")
+
+
+def test_set_nested_option_rejects_empty_field_path() -> None:
+    from elspeth.web.composer.tools.blobs import _set_nested_option
+
+    with pytest.raises(ValueError, match=r"at least one \.options\.<field> segment"):
+        _set_nested_option({}, [], "marker")
+
+
+def test_state_options_reference_blob_crashes_on_non_str_blob_ref() -> None:
+    """A present-but-non-str blob_ref in frozen state options is audited-state
+    corruption: the reference guard must escalate, not read it as unbound."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    with pytest.raises(AuditIntegrityError, match="non-str blob_ref"):
+        _state_options_reference_blob(
+            {"blob_ref": 7},
+            "0be5905a-3e69-49a5-a8e9-9617b691c665",
+            "blobs/session/file.csv",
+            owner="source 'input'",
+        )
+
+
+def test_state_options_reference_blob_finds_nested_reference() -> None:
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    blob_id = "0be5905a-3e69-49a5-a8e9-9617b691c665"
+    options = {"outer": {"items": ({"blob_ref": blob_id},)}}
+    assert _state_options_reference_blob(options, blob_id, "blobs/session/file.csv", owner="node 'n1'")

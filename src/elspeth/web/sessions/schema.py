@@ -31,7 +31,7 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 48
+_COORDINATION_HARD_CUT_EPOCH = 51
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
@@ -181,12 +181,22 @@ def probe_current_schema(bind: Engine | Connection) -> bool:
     the only connection in a bounded pool cannot deadlock on a second checkout.
     """
 
+    # The partial-index dialect-symmetry check is a MODEL-layer contract on
+    # our own Index declarations — it inspects no database state. Run it
+    # outside the probe's verdict handler so a first-party declaration bug
+    # crashes here instead of being converted into a "stale DB" verdict that
+    # tells the operator to delete a healthy session DB.
+    _validate_partial_index_dialect_symmetry()
     supplied_connection = bind if isinstance(bind, Connection) else None
     supplied_connection_was_idle = supplied_connection is not None and not supplied_connection.in_transaction()
     try:
         _assert_schema_sentinels(bind)
         _validate_current_schema(bind)
     except SessionSchemaError:
+        # The probe's declared negative verdict: the DATABASE does not carry
+        # the current schema (missing sentinels, table/column drift). Model
+        # declaration bugs cannot reach this handler — the symmetry check
+        # above already ran un-guarded.
         return False
     finally:
         if supplied_connection_was_idle and supplied_connection is not None and supplied_connection.in_transaction():
@@ -359,8 +369,8 @@ def _validate_coordination_hard_cut_metadata() -> None:
 
     The generic metadata/live-schema comparison catches deployment drift, but
     cannot catch an accidental edit that removes the same table or expiry index
-    from the declared metadata. Epoch 48 (the multi-replica hard cut, 44 on the original lane) names this exact coordination
-    substrate, so startup also verifies the model-side release contract.
+    from the declared metadata. Epoch 51 (the multi-replica hard cut, 44 then 48 on the original lane) names this exact
+    coordination substrate, so startup also verifies the model-side release contract.
     """
 
     if SESSION_SCHEMA_EPOCH != _COORDINATION_HARD_CUT_EPOCH:

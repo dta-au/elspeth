@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { authedContext, setShowAdvanced, tokenFromStorageState } from "./helpers/api";
 import {
   boxWidth,
+  expectComposerFrameContract,
   expectDesktopWorkspaceGeometry,
   expectDialogGeometry,
   expectIntendedPaneScrollers,
@@ -97,19 +98,22 @@ async function assertScenario(
       await expect(composer.catalogButton()).toHaveCount(0);
       break;
     case "validation-audit-issues": {
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: 24 errors",
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        "Checks: 25 issues",
       );
       const beforeAuthoring = await boxWidth(composer.authoringPane());
       const beforeArtifact = await boxWidth(composer.artifactRegion());
-      const runBefore = await composer.runPipeline().boundingBox();
-      await composer.validationStatus().click();
-      await expect(composer.inspector()).toBeVisible();
+      await composer.checksTab().click();
+      await expect(
+        page.getByRole("region", { name: "Audit readiness" }),
+      ).toBeVisible();
+      // Selecting the Checks tab swaps panel content only — the pane grid
+      // must not move (the retired drawer reserved a strip; the tab reserves
+      // nothing).
       expect(await boxWidth(composer.authoringPane())).toBeCloseTo(beforeAuthoring, 0);
       expect(await boxWidth(composer.artifactRegion())).toBeCloseTo(beforeArtifact, 0);
-      await expectIntendedPaneScrollers(page, { inspectorMustScroll: true });
-      await expectDrawerAboveTheBottomBar(page, composer, runBefore!);
-      await composer.inspector().getByRole("button", { name: "Close" }).click();
+      await expectIntendedPaneScrollers(page, {});
+      await composer.artifactTab("Graph").click();
       break;
     }
     case "pending-acknowledgement":
@@ -148,10 +152,7 @@ async function assertScenario(
       expect(
         workspaceScenarioTelemetry(page).tallDialogLivePreflightChecked,
       ).toBe(true);
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: Passed",
-      );
-      await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
+      await expect(composer.checksTab()).toHaveAccessibleName("Checks: Ready");
       const invoker = composer.runPipeline();
       await expect(invoker).toBeEnabled();
       await invoker.focus();
@@ -164,6 +165,12 @@ async function assertScenario(
       break;
     }
   }
+
+  // Every scenario, unconditionally. The frame contract is a property of a
+  // correct build, not of any one scenario — and the defect it guards
+  // (elspeth-ecf973fb9f) surfaced through ordinary composer chrome, so the
+  // scenario that will catch its return is not knowable in advance.
+  await expectComposerFrameContract(page);
 }
 
 /**
@@ -250,46 +257,6 @@ function expectBottomRowContract(
   const barCentre = (edges.bar.top + edges.bar.bottom) / 2;
   expect(Math.abs(collapseCentre - barCentre)).toBeLessThanOrEqual(1);
   expect(edges.authoringBandContent).toBe("none");
-}
-
-/**
- * The inspector drawer occupies the PANE row only (elspeth-b4e88f0f8c): it
- * stops at the bottom bar's rule and the bar runs its full width beneath it.
- * While the drawer spanned the workspace's full height the bar's artifact cell
- * reserved the drawer's 512px strip and the bar wrapped to three or four lines
- * under an open drawer at every width up to 1600 — a wrap the whole row then
- * paid for in height. Asserted rendered, against the Run button's position
- * BEFORE the drawer opened: opening the drawer must not move the bar's right
- * edge or its line at all.
- */
-async function expectDrawerAboveTheBottomBar(
-  page: ComposerPage["page"],
-  composer: ComposerPage,
-  runBefore: { x: number; y: number; width: number; height: number },
-): Promise<void> {
-  const edges = await workspaceBottomRow(page);
-  expect(edges).not.toBeNull();
-  const drawer = await composer.inspector().boundingBox();
-  expect(drawer).not.toBeNull();
-  // The drawer ends where the bar row begins — on the rule, not under it.
-  expect(Math.abs(drawer!.y + drawer!.height - edges!.row.top)).toBeLessThanOrEqual(1);
-  // The bar's right edge and line are untouched by the drawer above it.
-  const runAfter = await composer.runPipeline().boundingBox();
-  expect(runAfter).not.toBeNull();
-  expect(Math.abs(runAfter!.x + runAfter!.width - (runBefore.x + runBefore.width))).toBeLessThanOrEqual(1);
-  expect(Math.abs(runAfter!.y - runBefore.y)).toBeLessThanOrEqual(1);
-  // And Run is still clickable, not under the drawer: elementFromPoint at its
-  // centre resolves to the button, so the drawer is not merely drawn above
-  // the row while still covering it.
-  const hitIsRun = await composer.runPipeline().evaluate((element) => {
-    const bounds = element.getBoundingClientRect();
-    const hit = document.elementFromPoint(
-      bounds.left + bounds.width / 2,
-      bounds.top + bounds.height / 2,
-    );
-    return hit === element || element.contains(hit);
-  });
-  expect(hitIsRun).toBe(true);
 }
 
 test.describe("Composer deterministic workspace geometry", () => {
@@ -692,11 +659,13 @@ test.describe("Composer deterministic workspace geometry", () => {
       // Same line: the button's vertical extent overlaps the action bar's.
       expect(restoreBox!.y).toBeLessThan(barBox!.y + barBox!.height);
       expect(restoreBox!.y + restoreBox!.height).toBeGreaterThan(barBox!.y);
-      // …but the bar's first chip starts clear of the button (the bar
-      // reserves the slot via padding-left), not underneath it.
-      const validationBox = await composer.validationStatus().boundingBox();
-      expect(validationBox).not.toBeNull();
-      expect(validationBox!.x).toBeGreaterThanOrEqual(
+      // …but the bar's first control starts clear of the button (the bar
+      // reserves the slot via padding-left), not underneath it. With the
+      // status chips retired to the Checks tab, the completion group's
+      // first verb is the bar's first member.
+      const firstVerbBox = await composer.saveForReview().boundingBox();
+      expect(firstVerbBox).not.toBeNull();
+      expect(firstVerbBox!.x).toBeGreaterThanOrEqual(
         restoreBox!.x + restoreBox!.width,
       );
       // No visible banner text: the status node stays in the tree for AT
@@ -736,10 +705,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       // auto-waiting locator resolves post-mount — every button assertion
       // passes and only the reason's wrapped height is wrong.
       await expect(composer.importYaml()).toBeVisible();
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: Passed",
-      );
-      await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
+      await expect(composer.checksTab()).toHaveAccessibleName("Checks: Ready");
       const actionBar = composer.actionBar();
       const actions = [
         composer.saveForReview(),
@@ -776,32 +742,21 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
-  /* elspeth-15e8cff7a5 and elspeth-97db9c22e5, which the row above could not
-     catch for two independent reasons — both worth stating, because either one
-     alone would have been enough to let the bug ship.
+  /* elspeth-15e8cff7a5 and elspeth-97db9c22e5 lineage, recut for the
+     Checks-tab move (the status chips left the bar for the artifact tab
+     strip, so the bar's only group is the completion group).
 
-     STATE: that test asserts "Validation: Passed" first, so it runs against a
-     VALIDATED pipeline. ExecuteButton renders its block-reason line only when
-     Run is gated, so in that scenario the line does not exist, .completion-bar
-     is a single --size-control row exactly like the status group, and neither
-     defect can arise. The bug lives in the DEFAULT state of an unvalidated
-     pipeline — which is why it was reported as "even blank ones".
-
-     SCOPE: that test compares saveForReview/runPipeline/importYaml against each
-     other. All three are members of the same flex line inside .completion-bar,
-     so they are aligned by construction and the assertion cannot fail. The
-     elements that actually move are the status chips in the OTHER group.
-
-     So this test exercises the gated state and pins the cross-group facts: the
-     chips share the buttons' top edge, and the application's bottom rule is ONE
-     row spanning both columns with the collapse control registered on its
-     first line beside the chips (elspeth-9c94a58500 — before it, the two
-     halves of that rule were separate elements whose agreement was asserted
-     here as a rendered fact, because a source-string test could not observe
-     that the bar had grown past the band's formula, elspeth-27dc483116). Still
-     asserted as RENDERED geometry, not by snapshot — --update-snapshots
-     rewrites only failing files, and a sub-threshold offset passes silently. */
-  test("a gated Run keeps the status chips and the bottom rule registered with the completion buttons", async ({
+     STATE still matters: the row above runs against a VALIDATED pipeline, so
+     ExecuteButton renders no block-reason line and .completion-bar is a
+     single control row — the defect family lives in the DEFAULT state of an
+     unvalidated pipeline ("even blank ones"). This test exercises the gated
+     state and pins the cross-element facts that remain: the reason line
+     shares the verbs' line, and the application's bottom rule is ONE row
+     spanning both columns with the collapse control registered against it
+     (elspeth-9c94a58500 / elspeth-27dc483116). Still asserted as RENDERED
+     geometry, not by snapshot — --update-snapshots rewrites only failing
+     files, and a sub-threshold offset passes silently. */
+  test("a gated Run keeps the reason line and the bottom rule registered with the completion buttons", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
@@ -825,25 +780,24 @@ test.describe("Composer deterministic workspace geometry", () => {
       // trivially, so a green run would be evidence of nothing.
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: Not checked",
-      );
+      // Gated default state, asserted: an empty composition keeps the Checks
+      // tab disabled (nothing to check yet), so Run's gate reason is the
+      // bar's live signal here.
+      await expect(composer.checksTab()).toBeDisabled();
 
-      const [chip, save, importYaml, run, reasonBox] = await Promise.all([
-        composer.validationStatus().boundingBox(),
+      const [save, importYaml, run, reasonBox] = await Promise.all([
         composer.saveForReview().boundingBox(),
         composer.importYaml().boundingBox(),
         composer.runPipeline().boundingBox(),
         reason.boundingBox(),
       ]);
-      for (const box of [chip, save, importYaml, run, reasonBox]) {
+      for (const box of [save, importYaml, run, reasonBox]) {
         expect(box).not.toBeNull();
       }
 
-      // The status chips belong to the bar's first line, with the buttons.
-      expect(Math.abs(chip!.y - save!.y)).toBeLessThanOrEqual(1);
-      expect(Math.abs(chip!.y - importYaml!.y)).toBeLessThanOrEqual(1);
-      expect(Math.abs(chip!.y - run!.y)).toBeLessThanOrEqual(1);
+      // One line: all three verbs share a top edge.
+      expect(Math.abs(save!.y - importYaml!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(save!.y - run!.y)).toBeLessThanOrEqual(1);
 
       // The reason line sits to Run's LEFT, on the same line, vertically
       // centred against it (operator decision 2026-08-16). Centre-to-centre,
@@ -866,36 +820,34 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(barBox!.height).toBeLessThanOrEqual(64);
 
       // One bottom row, full width, the bar's exact height, the collapse
-      // control centred on the bar — which on this one-line bar is the chips'
-      // own top edge, asserted here as such so the registration is a rendered
-      // fact and not only a consequence of the centring.
+      // control centred on the bar — which on this one-line bar is the
+      // verbs' own top edge, asserted here as such so the registration is a
+      // rendered fact and not only a consequence of the centring.
       const bottomRow = await workspaceBottomRow(page);
       expect(bottomRow).not.toBeNull();
       expectBottomRowContract(bottomRow!);
-      expect(Math.abs(bottomRow!.collapse!.top - chip!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(bottomRow!.collapse!.top - save!.y)).toBeLessThanOrEqual(1);
     } finally {
       await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
     }
   });
 
-  /* elspeth-b4e88f0f8c. The completion group used to be a wrapping flex row,
-     and flex breaks lines by each item's MAX-content — so at 1280 the whole
-     group (Save, Import, the reason line, Run) moved under the chips as one
-     item before the reason had yielded a pixel, and the bar row doubled from
-     61px to 113px in the DEFAULT state of every unvalidated session, with the
-     authoring column showing that height as empty band under the collapse
-     control. The group is now a one-row grid whose reason column is the only
-     flexible member, and the OUTER bar reads the group's minimum size (the
-     buttons plus a 16ch reason floor) when deciding whether it fits beside the
-     chips. This pins the rendered outcome at 1280 with the default 360px pane:
-     one control line, the reason wrapped within its column BESIDE Run rather
-     than the group wrapped under the chips, and the bar no taller than a
-     control row plus the two-line reason's slack. Both the width and the pane
-     are the ticket's own numbers, and both are close to the floor's edge (the
-     reason column is 142px here against a 128px floor), which is exactly why
-     it is asserted rendered: a stylesheet pin cannot see 14px of slack. */
-  test("a gated Run at 1280 keeps the bar to one control line with the reason wrapped beside Run", async ({
+  /* elspeth-b4e88f0f8c, recut when the status chips left the bar for the
+     Checks tab. The completion group used to share the bar with the chips: a
+     wrapping flex row broke by MAX-content and moved the whole group under
+     them at 1280, doubling the bar from 61px to 113px in the DEFAULT state of
+     every unvalidated session. The grid recut fixed that, and this row pinned
+     the squeezed outcome — the reason wrapped within a 142px column beside
+     Run. With the chips gone the group is the bar's ONLY group, the 1fr
+     reason column inherits their width up to its 44ch cap, and the gating
+     copy fits on ONE line at 1280 with the default 360px pane — the squeeze
+     this row used to exercise cannot occur here any more (the widened-pane
+     row below now owns the wrapped state). What this row still pins is the
+     grid's rendered contract in the new default: one control line, the
+     reason on the same line BESIDE Run, clear of the left cluster, and the
+     bar no taller than a single control row. */
+  test("a gated Run at 1280 keeps the bar to one control line with the reason on one line beside Run", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -915,43 +867,40 @@ test.describe("Composer deterministic workspace geometry", () => {
       await expect(composer.importYaml()).toBeVisible();
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: Not checked",
-      );
+      // Gated default state, asserted the same way the 1600 row asserts it.
+      await expect(composer.checksTab()).toBeDisabled();
       // The default pane at this width; a widened pane is a different, wider
-      // bar-cell budget and legitimately wraps the group under the chips.
+      // bar-cell budget.
       await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
 
-      const [chip, save, importYaml, run, reasonBox] = await Promise.all([
-        composer.validationStatus().boundingBox(),
+      const [save, importYaml, run, reasonBox] = await Promise.all([
         composer.saveForReview().boundingBox(),
         composer.importYaml().boundingBox(),
         composer.runPipeline().boundingBox(),
         reason.boundingBox(),
       ]);
-      for (const box of [chip, save, importYaml, run, reasonBox]) {
+      for (const box of [save, importYaml, run, reasonBox]) {
         expect(box).not.toBeNull();
       }
       const centre = (b: { y: number; height: number }) => b.y + b.height / 2;
 
-      // One line: chips and all three verbs share a top edge.
-      expect(Math.abs(chip!.y - save!.y)).toBeLessThanOrEqual(1);
-      expect(Math.abs(chip!.y - importYaml!.y)).toBeLessThanOrEqual(1);
-      expect(Math.abs(chip!.y - run!.y)).toBeLessThanOrEqual(1);
+      // One line: all three verbs share a top edge.
+      expect(Math.abs(save!.y - importYaml!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(save!.y - run!.y)).toBeLessThanOrEqual(1);
 
-      // The reason wrapped WITHIN its column — more than one line of text —
-      // and stayed beside Run, centred against it, clear of Import. Asserted,
-      // because a reason that fitted on one line here would mean the test was
-      // not exercising the squeeze at all.
-      expect(reasonBox!.height).toBeGreaterThan(20);
+      // The reason renders on ONE line — asserted, because a wrapped reason
+      // here would mean the chips' width had NOT reached the reason column
+      // (measured 18px against 44px buttons). It stays beside Run, centred
+      // against it, clear of Import.
+      expect(reasonBox!.height).toBeLessThanOrEqual(24);
       expect(Math.abs(centre(reasonBox!) - centre(run!))).toBeLessThanOrEqual(1);
       expect(reasonBox!.x + reasonBox!.width).toBeLessThanOrEqual(run!.x + 1);
       expect(reasonBox!.x).toBeGreaterThanOrEqual(
         importYaml!.x + importYaml!.width - 1,
       );
 
-      // And the bar is one control row: the two-line reason (36px) is shorter
-      // than the 44px buttons, so nothing grew. 64 is the same bound the 1600
+      // And the bar is one control row: the one-line reason is shorter than
+      // the 44px buttons, so nothing grew. 64 is the same bound the 1600
       // test uses; the wrapped-under state this replaces measured 112.
       const barBox = await composer.actionBar().boundingBox();
       expect(barBox).not.toBeNull();
@@ -966,25 +915,26 @@ test.describe("Composer deterministic workspace geometry", () => {
   });
 
   /* The registration contract under a reason TALLER than a control row
-     (elspeth-b4e88f0f8c). The 1600 and 1280 tests above run against the
-     default two-line reason, which is shorter than the 44px buttons, so the
-     completion group is one control row tall and every alignment value the bar
-     could carry resolves identically — they cannot tell align-items: center
-     from flex-start. This scenario's reason ("Fix the validation errors shown
-     in the Audit panel before running.") wraps to three lines in the 1280
-     column, the group is taller than the chips, and the chips, the verbs and
-     the collapse control must all sit on ONE centre: the bar centres its
-     groups, the group centres its members, the row centres the control. With
-     the bar back on flex-start the chips (and the control) would sit above the
-     buttons by half the difference — the elspeth-15e8cff7a5 misregistration
-     from the other side. 900 tall so the density regime does not widen the
-     column and hand the reason two lines instead of three. Measured against
-     the TECHNICAL-MODE three-verb bar: the three-line wrap is a property of
-     the reason column's width, and Wave 2 gates Import YAML on show_advanced,
-     so the DEFAULT bar is a two-verb bar whose wider reason column wraps to
-     two lines (36px) and cannot exercise the alignment at all. The flag is
-     seeded here exactly as the sibling tests seed it. */
-  test("a three-line reason keeps the chips, the verbs and the collapse control on one centre", async ({
+     (elspeth-b4e88f0f8c, recut when the status chips left the bar for the
+     Checks tab). The rows above run against reasons shorter than the 44px
+     buttons, so the completion group is one control row tall and every
+     alignment value the bar could carry resolves identically — they cannot
+     tell align-items: center from flex-start. Only a reason taller than the
+     buttons exercises the registration: the bar centres its group, the group
+     centres its members, and the bottom row centres the collapse control
+     against the bar — with flex-start anywhere in that chain the control (or
+     the verbs) would sit above the taller group's centre by half the
+     difference, the elspeth-15e8cff7a5 misregistration from the other side.
+     Getting a tall reason takes a real squeeze now: with the chips gone the
+     1fr reason column reaches its 44ch cap at the default 360px pane, where
+     this scenario's validation copy balances onto two lines (36px) — so the
+     authoring pane is widened to its 640px max via the separator's keyboard
+     End, which shrinks the artifact column toward ARTIFACT_MIN and the
+     reason column below the cap until the copy takes three lines and the
+     group outgrows the buttons. 900 tall so the density regime is not also
+     toggled; TECHNICAL-MODE so the bar carries its full three verbs and the
+     column stays as narrow as the product allows. */
+  test("a three-line reason keeps the verbs and the collapse control on one centre", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -999,35 +949,36 @@ test.describe("Composer deterministic workspace geometry", () => {
       // before anything is measured, and Import YAML mounts only when
       // fetchUserComposerPreferences() resolves.
       await expect(composer.importYaml()).toBeVisible();
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: 24 errors",
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        "Checks: 25 issues",
       );
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toHaveText(
-        "Fix the validation errors shown in the Audit panel before running.",
+        "Fix the validation errors shown in the Checks tab before running.",
       );
       await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
+      // Apply the squeeze: pane to its 640 max, artifact column to its floor.
+      await composer.separator().focus();
+      await composer.separator().press("End");
+      await expect.poll(() => boxWidth(composer.authoringPane())).toBe(640);
 
-      const [chip, save, run, reasonBox, collapse] = await Promise.all([
-        composer.validationStatus().boundingBox(),
+      const [save, run, reasonBox, collapse] = await Promise.all([
         composer.saveForReview().boundingBox(),
         composer.runPipeline().boundingBox(),
         reason.boundingBox(),
         composer.collapseAuthoring().boundingBox(),
       ]);
-      for (const box of [chip, save, run, reasonBox, collapse]) {
+      for (const box of [save, run, reasonBox, collapse]) {
         expect(box).not.toBeNull();
       }
       // Asserted, not assumed: the reason is taller than the buttons here, so
-      // the group is taller than the chips and the alignment is exercised.
+      // the group is taller than a control row and the alignment is exercised.
       expect(reasonBox!.height).toBeGreaterThan(run!.height);
       const centre = (b: { y: number; height: number }) => b.y + b.height / 2;
-      expect(Math.abs(centre(chip!) - centre(run!))).toBeLessThanOrEqual(1);
       expect(Math.abs(centre(save!) - centre(run!))).toBeLessThanOrEqual(1);
       expect(Math.abs(centre(reasonBox!) - centre(run!))).toBeLessThanOrEqual(1);
       expect(Math.abs(centre(collapse!) - centre(run!))).toBeLessThanOrEqual(1);
-      // Still one line — the reason grew downward within its column, and the
-      // group did not drop under the chips.
+      // Still one line — the reason grew downward within its column.
       expect(reasonBox!.x).toBeGreaterThan(save!.x);
       const bottomRow = await workspaceBottomRow(page);
       expect(bottomRow).not.toBeNull();
@@ -1038,29 +989,23 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
-  /* A steady-state check proves the row's contract held ONCE. The bar's height
-     is not constant — narrow enough, it wraps its two groups onto separate
-     flex lines and roughly doubles — and the reason this row exists is that
-     every earlier construction held at 1600 and broke somewhere else: a token
-     formula was right in the ungated state and wrong by 27px in the gated one;
-     an observer was right whenever it fired. So the contract is asserted
-     through a WRAP and back — a viewport resize, because that is a real thing
-     users do and it drives the browser's own relayout — and it must hold at
-     all three points without anything having to fire: the row is a
-     content-sized grid track, so the bar's new height IS the row's new height
-     in the same layout pass. Polling is still used after each resize, but only
-     for the bar itself to have wrapped (a resize is asynchronous to the test),
-     never for a second element to catch up.
+  /* A steady-state check proves the row's contract held ONCE. The reason
+     this row exists is that every earlier construction held at 1600 and broke
+     somewhere else: a token formula was right in the ungated state and wrong
+     by 27px in the gated one; an observer was right whenever it fired. So the
+     contract is asserted through a real viewport resize and back — the
+     browser's own relayout — and it must hold at all three points without
+     anything having to fire: the row is a content-sized grid track, so the
+     bar's new height IS the row's new height in the same layout pass.
 
-     The wrap width is 1024, not 1280: since elspeth-b4e88f0f8c the group
-     stays beside the chips at 1280 (the test above pins that), and it wraps
-     under them only once the bar's cell cannot hold the buttons plus the
-     reason's 16ch floor — 1024 with the 360px pane leaves the bar 632px inner
-     against a 874px need. Still desktop mode (the narrow breakpoint is 960),
-     and the height stays 900 so the short-screen density regime is not also
-     toggled. In the wrapped state the collapse control centres between the
-     two lines — the contract is centre-to-centre for exactly this reason. */
-  test("the bottom row is exactly the action bar's height through a wrap and back, with the collapse control centred on it", async ({
+     Historically this journey crossed the bar's two-group WRAP at 1024 (the
+     status chips plus the completion group could not share a line there).
+     The chips left the bar for the Checks tab, so the bar holds one group
+     and no longer wraps at these widths; the taller-bar state is exercised
+     by the three-line-reason row above, and this row keeps the relayout
+     journey itself honest. 1024 is still desktop mode (narrow is 960) and
+     the height stays 900 so the density regime is not also toggled. */
+  test("the bottom row is exactly the action bar's height through a resize and back, with the collapse control centred on it", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
@@ -1077,27 +1022,28 @@ test.describe("Composer deterministic workspace geometry", () => {
       expectBottomRowContract(wide!);
 
       await page.setViewportSize({ width: 1024, height: 900 });
+      // Relayout has landed when the bar row's width tracks the viewport —
+      // polled because a resize is asynchronous to the test.
       await expect
-        .poll(async () => (await workspaceBottomRow(page))?.bar.height ?? 0)
-        .toBeGreaterThan(wide!.bar.height);
+        .poll(async () => {
+          const row = (await workspaceBottomRow(page))?.row;
+          return row === undefined ? 0 : row.right - row.left;
+        })
+        .toBeLessThanOrEqual(1024);
 
-      const wrapped = await workspaceBottomRow(page);
-      expect(wrapped).not.toBeNull();
-      expectBottomRowContract(wrapped!);
-      // Genuinely wrapped: the chips and Save are on different lines. Without
-      // this the poll above could be satisfied by a reason that merely grew
-      // taller within its column.
-      const [chip, save] = await Promise.all([
-        composer.validationStatus().boundingBox(),
-        composer.saveForReview().boundingBox(),
-      ]);
-      expect(save!.y).toBeGreaterThan(chip!.y + chip!.height - 1);
+      const narrowed = await workspaceBottomRow(page);
+      expect(narrowed).not.toBeNull();
+      expectBottomRowContract(narrowed!);
 
-      // ...and back, so a row that merely stayed large could not pass.
+      // ...and back, so a contract that held only in one landed layout could
+      // not pass.
       await page.setViewportSize({ width: 1600, height: 900 });
       await expect
-        .poll(async () => (await workspaceBottomRow(page))?.bar.height ?? 0)
-        .toBeLessThan(wrapped!.bar.height);
+        .poll(async () => {
+          const row = (await workspaceBottomRow(page))?.row;
+          return row === undefined ? 0 : row.right - row.left;
+        })
+        .toBeGreaterThan(1024);
 
       const restored = await workspaceBottomRow(page);
       expect(restored).not.toBeNull();
@@ -1117,25 +1063,20 @@ test.describe("Composer deterministic workspace geometry", () => {
       try {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
-        await expect(composer.validationStatus()).toHaveAccessibleName(
-          "Validation: Passed",
-        );
-        await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
-        // Two registers, both pinned: the artifact toolbar runs at the
-        // 36px compact rung, while the action-bar status chips were
-        // PROMOTED to the 44px --size-control rung (elspeth-5413e4221e,
-        // ux-polish wave B) so the whole bottom strip shares one register
-        // with the completion buttons. This spec asserted a single flat 36
-        // long after that promotion — a stale pin, not the design.
+        await expect(composer.checksTab()).toHaveAccessibleName("Checks: Ready");
+        // One register here now: every artifact-toolbar control runs at the
+        // 36px compact rung. The 44px --size-control rows left this matrix
+        // with the action-bar status chips (retired to the Checks tab); the
+        // bar's own buttons keep that register via the bottom-row contract
+        // tests.
         const controls: Array<[ReturnType<ComposerPage["catalogButton"]>, number]> = [
           [composer.artifactTab("Graph"), 36],
           [composer.artifactTab("Spec"), 36],
           [composer.artifactTab("YAML"), 36],
+          [composer.checksTab(), 36],
           [composer.artifactTab("Run"), 36],
           [composer.catalogButton(), 36],
           [page.getByRole("button", { name: "Focus graph" }), 36],
-          [composer.validationStatus(), 44],
-          [composer.auditStatus(), 44],
         ];
         const boxes = await Promise.all(
           controls.map(([control]) => control.boundingBox()),

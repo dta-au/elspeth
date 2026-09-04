@@ -35,15 +35,13 @@ describe("AuditCharacteristicIcon", () => {
     expect(el.closest("[title]")?.getAttribute("title")).toMatch(/sink/i);
   });
 
-  it("renders unknown flags as a fallback chip with the raw flag string", () => {
-    render(<AuditCharacteristicIcon flag="future_flag_2027" />);
-    expect(screen.getByText("future_flag_2027")).toBeInTheDocument();
-  });
-
-  it("applies an 'audit-icon-unknown' class for unknown flags", () => {
-    const { container } = render(
-      <AuditCharacteristicIcon flag="future_flag_2027" />,
-    );
-    expect(container.firstChild).toHaveClass("audit-icon-unknown");
+  it("renders nothing for a flag outside the closed vocabulary — drift is the parity test's job, not a chip's (elspeth-0bfd019f68)", () => {
+    // future_characteristic, not the deleted tests' future_flag_2027. The
+    // digit-free rationale is RETIRED (2026-08-31): SNAKE_RE admits digits
+    // now, so either spelling is equally visible to the pin. The name stays
+    // as it is to keep one flag spelling across the wave; it makes no
+    // difference to toBeEmptyDOMElement here either way.
+    const { container } = render(<AuditCharacteristicIcon flag="future_characteristic" />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

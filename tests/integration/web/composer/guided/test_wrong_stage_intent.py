@@ -74,7 +74,12 @@ from tests.integration.web.composer.guided.test_respond import (
     _outputs_path as _respond_outputs_path,
 )
 from tests.integration.web.composer.guided.test_respond_schema8_atomic import _respond_operation_count
-from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session
+from tests.integration.web.composer.guided.test_step_chat import (
+    _SEED_INTENT,
+    _SEEDED_TURNS,
+    TestStepChatCrossStep,
+    _create_session,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -465,7 +470,10 @@ def test_initial_topology_planner_receives_verified_deferred_user_instruction(
     session_id = created.json()["id"]
     started = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        # Goal-first (elspeth-378cfa0e18): every profile roots its session.
+        # This test's subject is the DEFERRED instruction reaching the
+        # planner, so the root is kept deliberately generic.
+        json={"profile": "tutorial", "intent": "Build a pipeline from this CSV.", "operation_id": str(uuid4())},
     )
     assert started.status_code == 200, started.json()
     initial = started.json()
@@ -514,7 +522,16 @@ def test_initial_topology_planner_receives_verified_deferred_user_instruction(
         component_action={"action": "finish", "component_kind": "output"},
     )
     assert rejected.status_code == 500
-    assert captured["intent"] == instruction
+    # [root, deferred…] — the deferred prose reaches the planner verbatim, and
+    # the session's goal leads it (goal-first, elspeth-378cfa0e18). This is the
+    # FIRST run, where the goal IS the request being made, so it belongs in
+    # ``intent``. Contrast the step-3 revision run, where a later instruction
+    # supersedes part of the goal and the goal therefore rides beside the
+    # request as the named ``root_goal`` fact instead — see
+    # test_proposal_revision_keeps_verified_deferred_instruction_in_planner_intent
+    # below. The two paths differ deliberately; neither is a stale copy of the
+    # other.
+    assert captured["intent"] == f"Build a pipeline from this CSV.\n\n{instruction}"
 
 
 def test_proposal_revision_keeps_verified_deferred_instruction_in_planner_intent(
@@ -550,7 +567,15 @@ def test_proposal_revision_keeps_verified_deferred_instruction_in_planner_intent
     revised_payload = revised.json()["next_turn"]["payload"]
     assert revised_payload["component_counts"]["nodes"] == 1
     assert [node["plugin"]["id"] for node in revised_payload["nodes"]] == ["passthrough"]
+    # [deferred, revision] — the retained obligation survives a later revision,
+    # and the revision is the REQUEST. The session's goal rides beside it as
+    # the named ``root_goal`` fact (goal-first, elspeth-378cfa0e18): prepending
+    # it here would make a revision that narrows the goal argue against the
+    # goal inside the one field that means "what is being asked for now", and
+    # would feed the request guards that parse that field a threshold the
+    # author may have just withdrawn.
     assert captured["intent"] == f"Later retain the topology constraint.\n\n{revision}"
+    assert captured["root_goal"] == _SEED_INTENT
 
 
 def test_wire_confirmation_refuses_to_complete_with_an_uncovered_deferred_intent(
@@ -1103,11 +1128,10 @@ def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
 
     ``/guided/chat`` is admitted at step 3 exactly when a deferred intent is
     pending, so a chat turn and a prose revision can interleave at the same
-    step. Every other R2-F6 test starts from an empty transcript, where a
-    wrong-seq-base regression is invisible (0 is 0 either way). This one pins a
-    non-zero base: the step-1 deferral writes seq 0/1, the step-3 chat writes
-    2/3, and the revision must continue at 4/5 in one strictly increasing,
-    correctly attributed sequence.
+    step. This pins a non-zero seq base end to end: the goal-first start
+    seeds 0/1, the step-1 deferral writes 2/3, the step-3 chat writes 4/5, and
+    the revision must continue at 6/7 in one strictly increasing, correctly
+    attributed sequence.
     """
     from elspeth.web.composer.guided.protocol import GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
 
@@ -1115,7 +1139,7 @@ def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
     session_id, retained, staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
     proposal = staged["next_turn"]["payload"]
     base = _guided(client, session_id)
-    assert base.chat_turn_seq == 2, "the step-1 deferral must already have written a user/assistant pair"
+    assert base.chat_turn_seq == _SEEDED_TURNS + 2, "the step-1 deferral must already have written a user/assistant pair"
 
     # A binding mismatch (right token, wrong intent id) is deliberately NOT
     # applied, so the session stays at step 3 with its proposal intact and the
@@ -1143,7 +1167,7 @@ def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
     assert chatted.json()["assistant_message_kind"] == "synthetic_failure"
     after_chat = _guided(client, session_id)
     assert after_chat.step.value == "step_3_transforms"
-    assert after_chat.chat_turn_seq == 4
+    assert after_chat.chat_turn_seq == _SEEDED_TURNS + 4
     assert after_chat.active_proposal is not None
 
     instruction = "Add a deduplication transform before the output."
@@ -1164,18 +1188,24 @@ def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
     assert [node["plugin"]["id"] for node in revised_payload["nodes"]] == ["passthrough"]
     guided = _guided(client, session_id)
     assert [(turn.role.value, turn.seq, turn.step.value) for turn in guided.chat_history] == [
+        # The goal-first seed.
         ("user", 0, "step_1_source"),
         ("assistant", 1, "step_1_source"),
-        ("user", 2, "step_3_transforms"),
-        ("assistant", 3, "step_3_transforms"),
+        # The step-1 deferral chat.
+        ("user", 2, "step_1_source"),
+        ("assistant", 3, "step_1_source"),
+        # The step-3 chat, then the prose revision.
         ("user", 4, "step_3_transforms"),
         ("assistant", 5, "step_3_transforms"),
+        ("user", 6, "step_3_transforms"),
+        ("assistant", 7, "step_3_transforms"),
     ]
-    assert guided.chat_history[2].content == chat_message
-    assert guided.chat_history[4].content == instruction
-    assert guided.chat_history[5].content == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
-    assert guided.chat_history[5].assistant_message_kind == "assistant"
-    assert guided.chat_turn_seq == 6
+    assert guided.chat_history[0].content == _SEED_INTENT
+    assert guided.chat_history[4].content == chat_message
+    assert guided.chat_history[6].content == instruction
+    assert guided.chat_history[7].content == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+    assert guided.chat_history[7].assistant_message_kind == "assistant"
+    assert guided.chat_turn_seq == _SEEDED_TURNS + 6
 
 
 def test_management_provider_api_error_completes_unavailable_turn_without_mutating_intent_or_active_proposal(
@@ -1231,7 +1261,10 @@ def test_management_provider_api_error_completes_unavailable_turn_without_mutati
             .one()
         )
     assert proposal["status"] == "pending"
-    assert events == ["proposal.created"]
+    # elspeth-ed67eb9d0d: reaching the wire review carried this still-pending
+    # proposal across a new checkpoint, moving its anchor there. The move is a
+    # non-terminal lifecycle event; the row is untouched otherwise.
+    assert events == ["proposal.created", "proposal.rebased"]
     assert operation["status"] == "completed"
     assert operation["result_state_id"] is not None
 
@@ -1361,7 +1394,7 @@ def test_schema8_passed_output_edit_preserves_stable_id_and_rewinds_reviewed_pen
             .all()
         )
     assert proposal_row["status"] == "rejected"
-    assert events == ["proposal.created", "proposal.rejected"]
+    assert events == ["proposal.created", "proposal.rebased", "proposal.rejected"]
 
 
 @pytest.mark.parametrize("fault_point", ("proposal_event", "proposal_update"))

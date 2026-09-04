@@ -236,16 +236,49 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        CHECK constraint in place, so pre-release policy remains delete-
 #        and-recreate for stale session databases (sessions.db only —
 #        auth.db is never touched).
-#   48 -> persistent session-operation authority, compatible-generation
+#   48 -> ``interpretation_events.choice`` closed enum gains ``superseded``
+#        (elspeth-dbc39dd367, un-deferred by elspeth-d73139155a): a
+#        composition-state commit that extinguishes a reviewed site now
+#        terminally retires the persisted PENDING row in the same
+#        transaction instead of leaving a zombie card that gates Run
+#        forever. ABANDONED was adjudicated semantically wrong for
+#        supersession (the session continues; the review was obsoleted).
+#        SQLite cannot ALTER a CHECK constraint in place, so pre-release
+#        policy remains delete-and-recreate for stale session databases
+#        (sessions.db only — auth.db is never touched).
+#   49 -> ``composition_rejection_events`` table added (elspeth-3e28029d2f):
+#        durable session-side record of composer mutation-tool rejections —
+#        the unredacted reason the planner saw, keyed to session + the
+#        composition state current at rejection. Operator ruling 2026-09-02:
+#        session data, not Landscape data. New table ships by DB recreation
+#        (sessions.db only — auth.db is never touched).
+#   50 -> ``ck_proposal_events_type`` widened with ``proposal.rebased``
+#        (elspeth-ed67eb9d0d): a guided settlement that carries a pending
+#        proposal across the checkpoint it writes must re-pin the
+#        proposal's forward-declared base, and that rebinding is an
+#        appended immutable lifecycle event plus a lifecycle-managed
+#        ``composition_proposals.base_state_id``. Without it the carried
+#        base kept naming the previous checkpoint and every later binding
+#        check failed closed — an unreadable guided session that the
+#        frontend silently reopened in freeform. SQLite cannot ALTER a
+#        CHECK constraint in place, so pre-release policy remains
+#        delete-and-recreate for stale session databases (sessions.db
+#        only — auth.db is never touched).
+#   51 -> persistent session-operation authority, compatible-generation
 #        membership/run-start coordination, cross-replica ticket/progress/rate
 #        state, bounded cleanup claims, monotonic user-secret row versions, and
-#        durable proposal blob-effect receipts. Epoch 47 cannot represent these
+#        durable proposal blob-effect receipts. Epoch 50 cannot represent these
 #        authorities or receipts and is rejected outright; no migration exists.
 #        The composer_inflight_requests / composer_progress_snapshots tables
-#        drafted for cross-replica composer progress were removed before epoch
-#        48 shipped (John 2026-08-31: progress persistence is deferred to the
-#        cross-replica ticket work; the epoch number is unchanged).
-SESSION_SCHEMA_EPOCH = 48
+#        drafted for cross-replica composer progress were removed before this
+#        substrate shipped (John 2026-08-31: progress persistence is deferred
+#        to the cross-replica ticket work). The substrate carried the number
+#        44 and then 48 on the original multi-replica lane and shipped under
+#        neither; it lands here as 51 because both of those numbers already
+#        name different schemas on the release line, and the epoch sentinel is
+#        enforced by exact equality, so one integer must name exactly one
+#        shape.
+SESSION_SCHEMA_EPOCH = 51
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -626,8 +659,18 @@ composition_states_table = Table(
     # Operational/audit metadata produced by the composer pipeline that
     # describes *how this state was reached* (distinct from ``metadata_``,
     # which carries the user-facing PipelineMetadata name/description).
-    # Currently only ``repair_turns_used`` is surfaced; absence (NULL) is
-    # honest for revert/fork paths where no compose produced this version.
+    # Surfaced keys: ``repair_turns_used``, and ``validation_lane``
+    # (elspeth-67c6fa691d) — which predicate produced this row's
+    # ``is_valid``: "authoring_only" (mid-turn compose writer: Stage-1
+    # ``validate()`` narrowed by pending interpretation-review sites; no
+    # plugin config instantiation, no runtime preflight) or "strict"
+    # (turn-end writer: authoring + runtime preflight via
+    # ``_composer_persisted_validation``). Two writers share the
+    # ``is_valid`` column, so rows with byte-identical content can differ
+    # in validity across lanes; the marker makes that transition legible
+    # to an auditor. Absence (NULL composer_meta or missing key) is honest
+    # for writer paths that predate the marker or copy an existing row
+    # (revert, fork, guided checkpoint copies).
     Column("composer_meta", JSON, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column(
@@ -1137,7 +1180,8 @@ proposal_events_table = Table(
     Column("payload", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', "
+        "'trust_mode.changed', 'auto_commit.revoked', 'proposal.rebased')",
         name="ck_proposal_events_type",
     ),
 )
@@ -1302,7 +1346,7 @@ interpretation_events_table = Table(
     # (c) updating the closed-enum tests, and (d) a writer-path audit.
     # NO SILENT EXTENSION. See composition_states governance block above.
     CheckConstraint(
-        "choice IN ('pending', 'accepted_as_drafted', 'amended', 'opted_out', 'abandoned')",
+        "choice IN ('pending', 'accepted_as_drafted', 'amended', 'opted_out', 'abandoned', 'superseded')",
         name="ck_interpretation_events_choice",
     ),
     # Closed enum on interpretation_source. Adding a value requires the same
@@ -1414,6 +1458,61 @@ Index(
 Index(
     "ix_interpretation_events_composition_state",
     interpretation_events_table.c.composition_state_id,
+)
+
+# ``composition_rejection_events_table`` (elspeth-3e28029d2f — durable
+# rejection reasons).
+#
+# One row per composer mutation-tool REJECTION within a compose turn. The
+# persisted ``tool`` chat row collapses every free-text diagnostic under the
+# closed redaction allowlist, so before this table the reason a payload was
+# refused reached the planner in full and the operator NOWHERE. Operator
+# ruling 2026-09-02: the reason lives in the SESSION as session data — it is
+# authoring-session history, not Landscape data (Landscape relates to the
+# pipeline and the data traversing it).
+#
+# ``planner_payload`` is the EXACT serialized tool response the planner saw —
+# text and reasoning, unredacted. That is deliberate and mirrors
+# ``chat_messages.raw_content`` (B2): the session store is the private
+# audit-attribution surface; redaction governs the public projections, not
+# this table. ``error_code`` / ``message`` are extracted columns for
+# queryability (first coded validation entry, else the failure class).
+#
+# ``composition_state_id`` is the state that was CURRENT when the tool was
+# refused — a rejection commits no state of its own, so the linkage names the
+# version the operator would inspect to reproduce. NULL when the session had
+# no committed state yet. Written only by ``persist_compose_turn`` inside the
+# same transaction as the turn's chat rows.
+composition_rejection_events_table = Table(
+    "composition_rejection_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    # Same-session ownership, mirroring interpretation_events: a rejection in
+    # session B cannot reference a composition state owned by session A.
+    Column("composition_state_id", String, nullable=True),
+    Column("tool_call_id", String, nullable=False),
+    Column("tool_name", String, nullable=False),
+    Column("error_code", String, nullable=True),
+    Column("message", Text, nullable=False),
+    Column("planner_payload", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["composition_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_composition_rejection_events_state_session",
+    ),
+)
+Index(
+    "ix_composition_rejection_events_session_created",
+    composition_rejection_events_table.c.session_id,
+    composition_rejection_events_table.c.created_at,
 )
 
 # ``composer_completion_events_table`` (Phase 6A — completion gestures).

@@ -7,7 +7,7 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
-import type { FieldTier } from "./guided";
+import type { FieldTier, VisibilityPredicate } from "./guided";
 import type { FailedTurn } from "./recovery";
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -416,8 +416,8 @@ export interface ComposerProgressSnapshot {
  * PluginSummary with a typo'd flag. Forward compatibility for unknown
  * wire values is preserved by the lookup boundary at
  * ``lookupAuditCharacteristic(flag: string)``, which still accepts
- * ``string`` and returns ``null`` (rendering the grey "unknown" chip)
- * for a flag outside the union.
+ * ``string`` and returns ``null`` (rendering nothing — PluginCard
+ * filters the flag out before render) for a flag outside the union.
  */
 export interface PluginSummary {
   name: string;
@@ -442,7 +442,11 @@ export interface PluginSummary {
  *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
  *  knows but does not tier reads as "common" (see `optionTier` in
  *  components/chat/guided/optionTiers.ts): visible, never demoted. */
-export type CatalogKnobField = { name: string; tier?: FieldTier };
+export type CatalogKnobField = {
+  name: string;
+  tier?: FieldTier;
+  visible_when?: VisibilityPredicate;
+};
 
 /** Detailed plugin schema info including configuration JSON Schema. */
 export interface PluginSchemaInfo {
@@ -1061,6 +1065,7 @@ export interface RunOutputArtifactPreview {
   preview_text: string;
   truncated: boolean;
   total_size_bytes: number;
+  /** Complete logical records included; CSV/TSV counts include the header. */
   row_count_preview: number | null;
 }
 

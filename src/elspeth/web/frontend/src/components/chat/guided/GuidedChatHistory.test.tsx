@@ -442,3 +442,233 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
     expect(container.querySelector(".bubble-system--stage")).not.toBeNull();
   });
 });
+
+// ── "After confirmation" divider (elspeth-986801d218) ────────────────────────
+//
+// A completed guided session keeps its conversation, and every post-commit
+// question is submitted under ONE token — the confirmation hash. The divider
+// marks where the build ended.
+//
+// Discrimination: the boundary is the TOKEN, never the step. Post-commit
+// turns are persisted with step="step_4_wire", identical to the pre-commit
+// wire turns, so the stage divider cannot mark it — a test that only seeded
+// post-commit turns would pass against an implementation that keyed on the
+// step and shipped a divider before every pre-commit wire turn too.
+describe("GuidedChatHistory — After confirmation divider", () => {
+  const CONFIRMATION_HASH = "c".repeat(64);
+  const LIVE_TURN_TOKEN = "a".repeat(64);
+
+  function wireTurn(overrides: Partial<ChatTurn>): ChatTurn {
+    return {
+      role: "user",
+      content: "…",
+      seq: 0,
+      step: "step_4_wire",
+      ts_iso: "2026-09-03T12:00:00+00:00",
+      assistant_message_kind: null,
+      synthetic_failure_reason: null,
+      turn_token: null,
+      ...overrides,
+    };
+  }
+
+  /** Pre-commit wire question, post-commit question, and its reply. */
+  const HISTORY: ChatTurn[] = [
+    wireTurn({ seq: 0, content: "why is node-2 here?", turn_token: LIVE_TURN_TOKEN }),
+    wireTurn({ seq: 1, role: "assistant", content: "It reshapes rows.", assistant_message_kind: "assistant" }),
+    wireTurn({ seq: 2, content: "what does node-2 do?", turn_token: CONFIRMATION_HASH }),
+    wireTurn({ seq: 3, role: "assistant", content: "It calls the model once per row.", assistant_message_kind: "assistant" }),
+    wireTurn({ seq: 4, content: "and the output?", turn_token: CONFIRMATION_HASH }),
+  ];
+
+  function dividerLabels(container: HTMLElement): string[] {
+    return Array.from(
+      container.querySelectorAll(".bubble-system--stage"),
+    ).map((node) => node.textContent ?? "");
+  }
+
+  it("opens the divider at the FIRST turn carrying the confirmation token", () => {
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={HISTORY}
+        afterConfirmationToken={CONFIRMATION_HASH}
+      />,
+    );
+
+    const labels = dividerLabels(container);
+    // Stage divider for the wire step, then exactly one boundary divider.
+    expect(labels.filter((l) => l.includes("After confirmation"))).toHaveLength(1);
+    expect(screen.getByText("After confirmation")).toBeInTheDocument();
+  });
+
+  it("places the divider AFTER the pre-confirmation turns and BEFORE the first post-commit one", () => {
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={HISTORY}
+        afterConfirmationToken={CONFIRMATION_HASH}
+      />,
+    );
+
+    const rows = Array.from(container.querySelectorAll(".message-row"));
+    const dividerIndex = rows.findIndex(
+      (row) => row.textContent === "After confirmation",
+    );
+    const preCommitIndex = rows.findIndex((row) =>
+      (row.textContent ?? "").includes("why is node-2 here?"),
+    );
+    const postCommitIndex = rows.findIndex((row) =>
+      (row.textContent ?? "").includes("what does node-2 do?"),
+    );
+    expect(dividerIndex).toBeGreaterThan(preCommitIndex);
+    expect(dividerIndex).toBeLessThan(postCommitIndex);
+  });
+
+  it("does not repeat the divider on later post-commit turns", () => {
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={HISTORY}
+        afterConfirmationToken={CONFIRMATION_HASH}
+      />,
+    );
+
+    // Two user turns carry the confirmation hash (seq 2 and seq 4); the
+    // divider is a one-shot boundary, not a per-turn badge.
+    expect(
+      dividerLabels(container).filter((l) => l.includes("After confirmation")),
+    ).toHaveLength(1);
+  });
+
+  it("renders no divider on a live session (token null) even at the wire step", () => {
+    const { container } = render(<GuidedChatHistory chatHistory={HISTORY} />);
+
+    expect(
+      dividerLabels(container).some((l) => l.includes("After confirmation")),
+    ).toBe(false);
+  });
+
+  it("renders no divider when no turn carries the token", () => {
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={[HISTORY[0], HISTORY[1]]}
+        afterConfirmationToken={CONFIRMATION_HASH}
+      />,
+    );
+
+    expect(
+      dividerLabels(container).some((l) => l.includes("After confirmation")),
+    ).toBe(false);
+  });
+
+  it("never opens on an ASSISTANT turn that happens to carry the token", () => {
+    // Assistant turns carry a null token on the wire; this pins the role
+    // guard so a future shape change cannot draw the boundary one row early.
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={[
+          wireTurn({
+            seq: 0,
+            role: "assistant",
+            content: "reply",
+            assistant_message_kind: "assistant",
+            turn_token: CONFIRMATION_HASH,
+          }),
+        ]}
+        afterConfirmationToken={CONFIRMATION_HASH}
+      />,
+    );
+
+    expect(
+      dividerLabels(container).some((l) => l.includes("After confirmation")),
+    ).toBe(false);
+  });
+
+  it("applies in replay mode too", () => {
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={HISTORY}
+        afterConfirmationToken={CONFIRMATION_HASH}
+        replay
+      />,
+    );
+
+    expect(screen.getByRole("group", { name: "Guided build conversation" })).toBeInTheDocument();
+    expect(
+      dividerLabels(container).filter((l) => l.includes("After confirmation")),
+    ).toHaveLength(1);
+  });
+});
+
+// ── 9. The seeded goal pair (goal-first, elspeth-378cfa0e18) ─────────────────
+
+describe("GuidedChatHistory seeded goal opening", () => {
+  // A started or converted session's transcript now OPENS with two seeded
+  // turns: the goal the user stated, and one server line acknowledging it and
+  // handing off to the source question. Both are stamped step_1_source, so
+  // they must ride under the existing "Source stage" divider like any other
+  // step-1 turns. The failure this pins is a SECOND divider — a "goal stage"
+  // that does not exist in the step vocabulary — or the pair rendering out of
+  // order, which would read as the assistant answering before being asked.
+  const SEEDED_GOAL: ChatTurn[] = [
+    {
+      ...TURN_USER,
+      seq: 0,
+      step: "step_1_source",
+      content: "Summarise each page and save the results as JSON.",
+    },
+    {
+      ...TURN_ASSISTANT,
+      seq: 1,
+      step: "step_1_source",
+      content:
+        "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?",
+    },
+  ];
+
+  it("renders the pair under ONE Source stage divider, in seq order", () => {
+    const { container } = render(<GuidedChatHistory chatHistory={SEEDED_GOAL} />);
+
+    const dividers = container.querySelectorAll(".bubble-system--stage");
+    expect(dividers).toHaveLength(1);
+    expect(dividers[0].textContent).toBe("Source stage");
+
+    const rows = Array.from(container.querySelectorAll(".message-row"));
+    const goalRow = rows.findIndex((row) =>
+      row.textContent?.includes("Summarise each page"),
+    );
+    const ackRow = rows.findIndex((row) =>
+      row.textContent?.includes("Goal saved."),
+    );
+    expect(goalRow).toBeGreaterThanOrEqual(0);
+    expect(ackRow).toBeGreaterThan(goalRow);
+  });
+
+  it("keeps the goal on the user side and the acknowledgement on ELSPETH's", () => {
+    const { container } = render(<GuidedChatHistory chatHistory={SEEDED_GOAL} />);
+
+    const goalRow = Array.from(container.querySelectorAll(".message-row")).find(
+      (row) => row.textContent?.includes("Summarise each page"),
+    );
+    expect(goalRow?.classList.contains("message-row--user")).toBe(true);
+    const ackRow = Array.from(container.querySelectorAll(".message-row")).find(
+      (row) => row.textContent?.includes("Goal saved."),
+    );
+    expect(ackRow?.classList.contains("message-row--assistant")).toBe(true);
+  });
+
+  it("still opens a second divider when the transcript reaches the output step", () => {
+    // Non-vacuous counterpart: the single divider above must be a consequence
+    // of the pair sharing a step, not of dividers having stopped working.
+    const { container } = render(
+      <GuidedChatHistory
+        chatHistory={[
+          ...SEEDED_GOAL,
+          { ...TURN_USER, seq: 2, step: "step_2_sink", content: "what about outputs?" },
+        ]}
+      />,
+    );
+
+    const dividers = container.querySelectorAll(".bubble-system--stage");
+    expect(dividers).toHaveLength(2);
+    expect(dividers[1].textContent).toBe("Output stage");
+  });
+});

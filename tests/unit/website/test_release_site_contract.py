@@ -47,14 +47,14 @@ def test_changelog_describes_release_boundaries_precisely() -> None:
     assert "sink-effect-v1" not in release
 
 
-def test_changelog_keeps_071_historical_and_assigns_current_epoch_to_072() -> None:
+def test_changelog_keeps_071_historical_and_assigns_current_epoch_to_080() -> None:
     changelog = _text(ROOT / "CHANGELOG.md")
-    release_072 = changelog.split("## 0.7.2", maxsplit=1)[1].split("## 0.7.1", maxsplit=1)[0]
+    release_080 = changelog.split("## 0.8.0", maxsplit=1)[1].split("## 0.7.1", maxsplit=1)[0]
     release_071 = changelog.split("## 0.7.1", maxsplit=1)[1].split("## 0.7.0", maxsplit=1)[0]
 
-    assert f"SESSION_SCHEMA_EPOCH` advances from 35\nto {SESSION_SCHEMA_EPOCH}" in release_072
-    assert "retryable" in release_072 and "blob deletion" in release_072.lower()
-    assert "install\n0.7.2" in release_072
+    assert f"SESSION_SCHEMA_EPOCH` advances from 35\nto {SESSION_SCHEMA_EPOCH}" in release_080
+    assert "retryable" in release_080 and "blob deletion" in release_080.lower()
+    assert "install 0.8.0" in " ".join(release_080.split())
 
     assert "SESSION_SCHEMA_EPOCH` advances from 26\nto 35" in release_071
     assert "install\n0.7.1" in release_071
@@ -80,17 +80,17 @@ def test_every_page_has_description_favicon_and_current_navigation() -> None:
 def test_every_page_advertises_current_release() -> None:
     for name in PAGES:
         html = _text(WEBSITE / name)
-        assert "Changelog · v0.7.2" in html, name
-        assert "ELSPETH 0.7.2" in html, name
+        assert "Changelog · v0.8.0" in html, name
+        assert "ELSPETH 0.8.0" in html, name
 
 
 def test_home_surfaces_current_and_predecessor_releases_without_invented_counts() -> None:
     html = _text(WEBSITE / "index.html")
 
-    assert "Current version: 0.7.2" in html
+    assert "Current version: 0.8.0" in html
     assert "0.7.0" in html and "LLM-primary" in html
     assert "0.7.1" in html and "recoverable publication" in html.lower()
-    assert "0.7.2" in html and "release hardening" in html.lower()
+    assert "0.8.0" in html and "unified lineage" in html.lower()
     assert "240 rows" not in html
     assert "pre-1.0" in html
 
@@ -150,7 +150,7 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "elspeth composer users add" in html and "--password" in html
     assert "SESSION_SCHEMA_EPOCH" in html and f"35 → {SESSION_SCHEMA_EPOCH}" in html
     assert f"guided schema changes 10 → {GUIDED_SESSION_SCHEMA_VERSION}" in html
-    assert "SQLITE_SCHEMA_EPOCH" in html and "29 → 35" in html
+    assert "SQLITE_SCHEMA_EPOCH" in html and "29 → 36" in html
     assert "aws-ecs-deployment.md" in html
 
 

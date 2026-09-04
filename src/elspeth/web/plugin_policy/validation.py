@@ -387,7 +387,11 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_id=component_id,
                 component_type="source",
                 plugin_id=PluginId.for_name("source", source.plugin),
-                options=(deep_thaw(source.options) if isinstance(source.options, Mapping) else {}),
+                # SourceSpec.options is a Tier-1/2 owned Mapping (frozen at
+                # construction); a corrupted shape must crash in deep_thaw,
+                # not be silently replaced with {} — which would erase the
+                # authored options and disable every downstream policy check.
+                options=deep_thaw(source.options),
                 source_on_validation_failure=source.on_validation_failure,
             )
         )

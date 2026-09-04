@@ -59,6 +59,7 @@ import {
   decodeGuidedRespondResponse,
   decodeGuidedStartOperationReconciliation,
 } from "./guidedDecoder";
+import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
   InterpretationOptOutResponse,
@@ -755,7 +756,7 @@ export async function fetchUserComposerPreferences(): Promise<UserComposerPrefer
   const response = await fetch("/api/composer-preferences", {
     headers: authHeaders(),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** Partial-update the user's account-level composer preferences. */
@@ -767,7 +768,7 @@ export async function updateUserComposerPreferences(
     headers: authHeaders("application/json"),
     body: JSON.stringify(payload),
   });
-  return parseResponse<UserComposerPreferencesPayload>(response);
+  return decodeUserComposerPreferences(await parseResponse<unknown>(response));
 }
 
 /** List composition proposals for a session. */
@@ -909,10 +910,21 @@ export async function getTutorialSample(
  * SERVER constructs the concrete profile object and persists the GuidedSession.
  * Idempotent (D16): a second call for a session that already has a persisted
  * guided session returns the existing session unchanged.
+ *
+ * `intent` is required for BOTH profiles (goal-first start, elspeth-378cfa0e18
+ * / elspeth-13579d1110). It is the session's visible root intent: the goal the
+ * user typed on the goal card, or — for the tutorial — the frozen lesson prompt
+ * the shell seeds, which is the same shape a live goal takes. The server 400s a
+ * start with no intent for every profile, so a planner run can never be reached
+ * without one. The old `profile === "live"` conditional that STRIPPED intent for
+ * the tutorial is gone; sending it is not a tutorial-special path, it is the one
+ * path (ADR-031).
  */
-type GuidedStartCommand =
-  | { profile: "live"; intent: string; operationId: string }
-  | { profile: "tutorial"; operationId: string };
+interface GuidedStartCommand {
+  profile: "live" | "tutorial";
+  intent: string;
+  operationId: string;
+}
 
 export async function startGuidedSession(
   sessionId: string,
@@ -924,7 +936,7 @@ export async function startGuidedSession(
     headers: authHeaders("application/json"),
     body: JSON.stringify({
       profile: command.profile,
-      ...(command.profile === "live" ? { intent: command.intent } : {}),
+      intent: command.intent,
       operation_id: command.operationId,
     }),
     signal,
@@ -1013,18 +1025,25 @@ export async function reenterGuided(
  * passive freeform-probe on session select). This POST is the explicit
  * conversion: it seeds a FRESH wizard as a new composition-state version,
  * setting the freeform pipeline aside (recoverable from version history), and
- * returns the same envelope shape as GET /guided. Idempotent — a session that
- * is already guided (including a terminal one) is returned unchanged.
+ * returns the same envelope shape as GET /guided.
+ *
+ * `intent` is REQUIRED (goal-first, elspeth-378cfa0e18): the converted wizard is
+ * rooted on the goal the user stated in the mode-switch card, exactly as a live
+ * start is. A convert is no longer idempotent-by-silence for an already-guided
+ * session — the server 409s `guided_already_started` rather than discarding the
+ * client's goal — so callers must probe GET /guided first (the store's GET-first
+ * `enterGuided` does) and only convert on the documented 400.
  */
 export async function convertToGuided(
   sessionId: string,
+  intent: string,
   operationId: string,
   signal?: AbortSignal,
 ): Promise<GetGuidedResponse> {
   const response = await fetch(`/api/sessions/${sessionId}/guided/convert`, {
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId }),
+    body: JSON.stringify({ operation_id: operationId, intent }),
     signal,
   });
   return decodeGetGuidedResponse(await parseResponse<unknown>(response));

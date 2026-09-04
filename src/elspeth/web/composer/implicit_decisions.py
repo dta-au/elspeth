@@ -23,6 +23,7 @@ from elspeth.web.interpretation_state import (
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
     SOURCE_AUTHORING_KEY,
     parse_interpretation_requirements,
+    resolved_source_data_contract_fields,
 )
 from elspeth.web.plugin_policy.validation import _PROFILE_LOWERING_METADATA_OPTION_KEYS
 
@@ -119,7 +120,7 @@ def _source_entries(source: SourceSpec) -> list[ImplicitDecisionEntry]:
             value,
             category=_category_for_source_option(source, field_path),
             provenance=_source_provenance(source, field_path, value),
-            note=_note_for_source_option(source, field_path),
+            note=_note_for_source_option(source, field_path, value),
         )
         for field_path, value in _flatten_options(
             source.options,
@@ -361,8 +362,8 @@ def _is_structural_blob_rows_guarantee(source: SourceSpec, field_path: str) -> b
     )
 
 
-def _is_user_acknowledged_guarantee(source: SourceSpec, field_path: str) -> bool:
-    """Detect a ``schema.guaranteed_fields`` stamped by a data-contract answer.
+def _acknowledged_guarantee_fields(source: SourceSpec, field_path: str) -> frozenset[str]:
+    """Return the coherent subset stamped by a data-contract answer.
 
     The structural marker is the resolved ``source_data_contract``
     interpretation requirement the resolve arm upserts beside the stamp
@@ -375,27 +376,55 @@ def _is_user_acknowledged_guarantee(source: SourceSpec, field_path: str) -> bool
     changes.
     """
     if field_path not in ("schema.guaranteed_fields", "schema_config.guaranteed_fields"):
-        return False
+        return frozenset()
     requirements = parse_interpretation_requirements(source.options)
-    return requirements is not None and any(
-        InterpretationKind(row["kind"]) is InterpretationKind.SOURCE_DATA_CONTRACT and row["status"] == "resolved" for row in requirements
-    )
+    if requirements is None:
+        return frozenset()
+    for row in requirements:
+        if InterpretationKind(row["kind"]) is not InterpretationKind.SOURCE_DATA_CONTRACT:
+            continue
+        acknowledged = resolved_source_data_contract_fields(row)
+        if acknowledged is not None:
+            return frozenset(acknowledged)
+    return frozenset()
+
+
+def _string_field_set(value: object) -> frozenset[str] | None:
+    if not isinstance(value, (list, tuple)) or not all(isinstance(field, str) for field in value):
+        return None
+    return frozenset(value)
+
+
+def _is_user_acknowledged_guarantee(source: SourceSpec, field_path: str, value: object) -> bool:
+    acknowledged = _acknowledged_guarantee_fields(source, field_path)
+    declared = _string_field_set(value)
+    return bool(acknowledged) and declared == acknowledged
 
 
 def _source_provenance(source: SourceSpec, field_path: str, value: object) -> DecisionProvenance:
-    if _is_user_acknowledged_guarantee(source, field_path):
+    if _is_user_acknowledged_guarantee(source, field_path, value):
         return "user_acknowledged"
     if _is_content_derived_guarantee(source, field_path) or _is_structural_blob_rows_guarantee(source, field_path):
         return "derived_from_content"
     return _provenance_for_path(f"source.{field_path}", value)
 
 
-def _note_for_source_option(source: SourceSpec, field_path: str) -> str | None:
-    if _is_user_acknowledged_guarantee(source, field_path):
+def _note_for_source_option(source: SourceSpec, field_path: str, value: object) -> str | None:
+    if _is_user_acknowledged_guarantee(source, field_path, value):
         return (
             "Guaranteed fields stamped from the user's data-contract "
             "acknowledgement — the user's answer, not the planner, is the "
             "evidence for this claim; enforced per-row at runtime (ADR-016)."
+        )
+    acknowledged = _acknowledged_guarantee_fields(source, field_path)
+    declared = _string_field_set(value)
+    if acknowledged and declared is not None and acknowledged < declared:
+        acknowledged_text = ", ".join(sorted(acknowledged))
+        authored_text = ", ".join(sorted(declared - acknowledged))
+        return (
+            f"The user's data-contract acknowledgement covers only: {acknowledged_text}. "
+            f"Independently composer-authored guarantees: {authored_text}. Every declared guarantee "
+            "is enforced per-row at runtime (ADR-016)."
         )
     if _is_content_derived_guarantee(source, field_path):
         return (
@@ -451,8 +480,14 @@ def _provenance_for_path(path: str, value: object) -> DecisionProvenance:
 
 
 def _routing_provenance(value: object) -> DecisionProvenance:
+    # "discard" reaches NodeSpec/OutputSpec/SourceSpec through the composer
+    # tool layer's default-fill (tools/transforms.py, tools/outputs.py,
+    # tools/_common.py), which erases whether the planner asked for it — so
+    # the disclosure layer cannot claim the value was picked. "default" is
+    # the honest label until the default-fill is removed
+    # (elspeth-0aace271b4 I4); a named sink can only come from the planner.
     if value == "discard":
-        return "picked"
+        return "default"
     return "composer_selected"
 
 

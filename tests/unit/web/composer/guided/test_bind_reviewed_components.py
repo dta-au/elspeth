@@ -941,7 +941,7 @@ def _fork_coalesce_pipeline() -> dict[str, object]:
                 "branches": {"branch_a": "tone_done", "branch_b": "usage_done"},
                 "policy": "require_all",
                 "merge": "union",
-                "options": {"schema": {"mode": "observed"}},
+                "options": {},
             },
             {
                 "id": "shape_output",
@@ -1670,11 +1670,20 @@ def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
     }
 
 
-def test_bind_selected_llm_preserves_withheld_profile_prompt_schema_and_options() -> None:
+def test_bind_selected_llm_overlays_the_published_prompt_and_preserves_withheld_options() -> None:
+    """A node-scoped correction on an llm node may change exactly what the
+    review card publishes for it — model, system prompt, prompt template
+    (I-2, design review 2026-09-02) — and nothing else: the withheld profile,
+    response field and schema come back from the predecessor whatever the
+    candidate says. Until I-2 the llm allowlist was empty, so a correction
+    could not touch the prompt at all; the card's "Edit prompt" routes a
+    correction here, and this is the seam that makes it real."""
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()
     selected = candidate["nodes"][1]
     selected["input"] = "revised_high_value_rows"
+    selected["options"]["prompt_template"] = "Summarize {row[amount]} in two sentences."
+    selected["options"]["system_prompt"] = "You are a careful reviewer."
 
     bound = bind_guided_reviewed_components(
         candidate,
@@ -1686,8 +1695,45 @@ def test_bind_selected_llm_preserves_withheld_profile_prompt_schema_and_options(
         ),
     )
 
+    before = predecessor.to_dict()["nodes"][1]["options"]
     assert bound["nodes"][1]["input"] == "revised_high_value_rows"
-    assert bound["nodes"][1]["options"] == predecessor.to_dict()["nodes"][1]["options"]
+    assert bound["nodes"][1]["options"] == {
+        **before,
+        "prompt_template": "Summarize {row[amount]} in two sentences.",
+        "system_prompt": "You are a careful reviewer.",
+    }
+    # The candidate's invented profile and response field never land.
+    assert bound["nodes"][1]["options"]["profile"] == "task-role"
+    assert bound["nodes"][1]["options"]["response_field"] == "summary"
+
+
+def test_bind_selected_llm_correction_that_omits_a_published_key_drops_it() -> None:
+    """The published keys are overlaid as a set: a correction candidate that
+    omits the system prompt removes the predecessor's, exactly as a
+    field_mapper correction that omits ``select_only`` does. Withheld keys
+    are untouched by the omission."""
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][1]["options"] = {
+        "profile": "invented-profile",
+        "prompt_template": "Summarize {row[amount]} in two sentences.",
+        "response_field": "replacement",
+        "schema": {"mode": "observed"},
+    }
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target(
+            "summarize_standard",
+            stable_id="55555555-5555-4555-8555-555555555555",
+        ),
+    )
+
+    before = predecessor.to_dict()["nodes"][1]["options"]
+    assert "system_prompt" not in before
+    assert bound["nodes"][1]["options"] == {**before, "prompt_template": "Summarize {row[amount]} in two sentences."}
 
 
 def test_bind_rejects_selected_node_identity_replacement() -> None:
@@ -1928,7 +1974,7 @@ def _coalesce_correction_predecessor() -> CompositionState:
                 input="branches",
                 on_success=None,
                 on_error=None,
-                options={"schema": {"mode": "observed"}},
+                options={},
                 condition=None,
                 routes=None,
                 fork_to=None,
@@ -2541,6 +2587,197 @@ def test_source_correction_changes_only_selected_route_and_may_add_topology() ->
     assert bound["nodes"][-1]["id"] == "screen_rows"
 
 
+def test_source_correction_admits_every_node_key_the_advertised_schema_admits() -> None:
+    """The binder's ``nodes`` allowlist must derive from the canonical node schema.
+
+    A hand-written literal lagged the schema by four keys (``description``,
+    ``scope_name``, ``scope_opener``, ``scope_policy``): a collector node on a
+    source-correction turn passed the Draft 2020-12 pre-check and then died in
+    the binder with ``unexpected_keys`` — the WS6 parity sweep missed this
+    ``node_type`` dispatch site (elspeth-68721c71d7, workflow finding).
+    Probing every canonical key individually keeps the test derived: a key
+    the schema adds later is covered without editing this test.
+    """
+    canonical_node_keys = sorted(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert "scope_policy" in canonical_node_keys  # the motivating collector key is part of the probe
+    rejected_for_unexpected_keys: list[str] = []
+    for key in canonical_node_keys:
+        node: dict[str, object] = {
+            "id": "screen_rows",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "screen_input",
+            "on_success": "amount_gate",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+        node.setdefault(key, None)
+        try:
+            materialize_guided_authorized_candidate(
+                {
+                    "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                    "nodes": [node],
+                    "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+                },
+                authority=_source_correction_target(),
+                guided=_guided(),
+                current_state=_correction_predecessor(),
+            )
+        except guided_planning.GuidedCandidateBindingRejected as exc:
+            if "unexpected_keys" in exc.connectivity:
+                rejected_for_unexpected_keys.append(key)
+    assert rejected_for_unexpected_keys == []
+
+
+@pytest.mark.parametrize("key", ["not_a_canonical_node_key", "stable_id", "secret_ref"])
+def test_source_correction_refuses_a_node_key_the_advertised_schema_does_not_admit(key: str) -> None:
+    """The derived allowlist is pinned from BOTH sides: nothing non-canonical is admitted.
+
+    The sibling test proves every canonical key binds; without this one a
+    widened derivation (``canonical | {"stable_id", "secret_ref"}``) survives
+    every test (final red-team F4, mutant P6b — hence those two keys are
+    probed by name, not only a made-up one). The canonical pre-check masks
+    this in production, so the binder check is defense-in-depth — but it is
+    the check this branch changed, and the change must be pinned exactly.
+    """
+    canonical_node_keys = set(guided_planning._canonical_schema_properties()["nodes"]["items"]["properties"])
+    assert key not in canonical_node_keys
+    node: dict[str, object] = {
+        "id": "screen_rows",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "screen_input",
+        "on_success": "amount_gate",
+        "on_error": "discard",
+        "options": {"schema": {"mode": "observed"}},
+        key: None,
+    }
+    with pytest.raises(guided_planning.GuidedCandidateBindingRejected) as excinfo:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+                "nodes": [node],
+                "edges": [{"id": "source_to_screen", "from_node": "source", "to_node": "screen_rows", "edge_type": "on_success"}],
+            },
+            authority=_source_correction_target(),
+            guided=_guided(),
+            current_state=_correction_predecessor(),
+        )
+    assert excinfo.value.error_code == "guided_delta_authority_violation"
+    assert excinfo.value.connectivity["unexpected_keys"] == [key]
+
+
+class _LabelLookalike(str):
+    """A str subclass: structurally a string, nominally not one."""
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"inner": 1}, [{"k": 2}], ["a", {"k": 1}], ("a", "b"), _LabelLookalike("x"), [_LabelLookalike("x")], 1.5, {"a"}],
+    ids=["dict", "list-of-dict", "mixed-list", "tuple", "str-subclass", "list-of-str-subclass", "float", "set"],
+)
+def test_guided_rejection_refuses_a_fact_value_that_is_not_a_closed_label(value: object) -> None:
+    """A fact value is admitted nominally at construction, where it is built.
+
+    The ``GuidedFactValue`` annotation does not bind a value typed ``Any`` or
+    laundered through a ``cast``; a nested record built that way would reach
+    the planner with inner keys nothing teaches (final red-team, fourth
+    round). Exact types only (ADR-032): a str subclass is refused too.
+    """
+    with pytest.raises(AuditIntegrityError, match="not a closed label"):
+        GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity={"extra": value})
+
+
+def test_guided_rejection_admits_every_closed_label_type() -> None:
+    facts = {"s": "x", "i": 3, "b": True, "n": None, "l": ["a", "b"], "e": []}
+    rejection = GuidedCandidateBindingRejected("m", error_code="guided_delta_authority_violation", connectivity=facts)
+    assert rejection.connectivity == facts
+    # The admitted list is our own copy: the caller's object is never aliased in.
+    assert rejection.connectivity["l"] is not facts["l"]
+
+
+def test_node_correction_rejects_an_edge_id_reusing_a_non_incident_edge_under_its_own_key() -> None:
+    """The id-reuse fault ships ``reused_edge_id``, not ``edge_id``, at the production site.
+
+    ``guided_delta_nonincident_route`` covers two faults the prose teaches
+    apart; only a binder-level run pins the key the real site emits (final
+    red-team F3 — the fingerprint test builds its own rejections, so
+    reverting the site's key survived it).
+    """
+    predecessor = replace(
+        _correction_predecessor(),
+        edges=(
+            EdgeSpec(id="gate_to_summarize", from_node="amount_gate", to_node="summarize_standard", edge_type="route_true", label="true"),
+        ),
+    )
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "node_patch": {"stable_id": _format_node_correction_target().requested.stable_id},
+                # Endpoints touch the selected node, so the incident check passes;
+                # the id belongs to an existing edge touching no owner.
+                "edges": [{"id": "gate_to_summarize", "from_node": "format_high_value", "to_node": "output", "edge_type": "on_success"}],
+            },
+            authority=_format_node_correction_target(),
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert raised.value.error_code == "guided_delta_nonincident_route"
+    assert raised.value.connectivity == {"reused_edge_id": "gate_to_summarize", "incident_owners": ["format_high_value"]}
+
+
+def test_source_correction_binds_a_collector_with_its_scope_keys() -> None:
+    """The motivating case for the derived allowlist: a real collector on a source-correction turn.
+
+    The key-probe test above proves no canonical key is rejected as unexpected;
+    this one proves the collector's scope keys bind through to a candidate the
+    canonical model accepts, so the derived allowlist admits nothing the
+    downstream binder then mishandles (red-team finding on bc8b9e237).
+    """
+    from elspeth.web.composer.pipeline_planner import SetPipelineArgumentsModel
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+            "nodes": [
+                {
+                    "id": "explode",
+                    "node_type": "transform",
+                    "plugin": "line_explode",
+                    "input": "screen_input",
+                    "on_success": "lines",
+                    "on_error": "discard",
+                    "options": {"field": "color_name", "schema": {"mode": "observed"}},
+                    "description": "split lines",
+                },
+                {
+                    "id": "regroup",
+                    "node_type": "collector",
+                    "plugin": "join_lines",
+                    "input": "lines",
+                    "on_success": "amount_gate",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                    "scope_name": "lines_group",
+                    "scope_opener": "explode",
+                    "scope_policy": "require_all",
+                },
+            ],
+            "edges": [
+                {"id": "source_to_explode", "from_node": "source", "to_node": "explode", "edge_type": "on_success"},
+                {"id": "explode_to_regroup", "from_node": "explode", "to_node": "regroup", "edge_type": "on_success"},
+            ],
+        },
+        authority=_source_correction_target(),
+        guided=_guided(),
+        current_state=_correction_predecessor(),
+    )
+    collector = next(node for node in bound["nodes"] if node["id"] == "regroup")
+    assert (collector["scope_name"], collector["scope_opener"], collector["scope_policy"]) == ("lines_group", "explode", "require_all")
+    validated = SetPipelineArgumentsModel.model_validate(bound).model_dump()
+    assert any(node["id"] == "regroup" and node["node_type"] == "collector" for node in validated["nodes"])
+
+
 def test_node_correction_materializer_preserves_every_unselected_node_byte() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()
@@ -2623,6 +2860,26 @@ def _public_node_correction_target(
     )
 
 
+def test_collector_node_correction_schema_does_not_expose_on_error() -> None:
+    stable_id = "99999999-9999-4999-8999-999999999999"
+    target = _public_node_correction_target(
+        "page_stitcher",
+        stable_id=stable_id,
+        node_type="collector",
+        plugin="batch_stats",
+        behavior={
+            "kind": "collector",
+            "opener_stable_id": "66666666-6666-4666-8666-666666666666",
+            "policy": "require_all",
+        },
+    )
+
+    patch_schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)["properties"]["node_patch"]
+
+    assert "on_error" not in patch_schema["properties"]
+    assert {"input", "on_success", "scope_name", "scope_opener", "scope_policy"} <= set(patch_schema["properties"])
+
+
 def test_node_patch_overlays_gate_condition_without_reauthoring_hidden_routes() -> None:
     predecessor = _correction_predecessor()
     stable_id = "66666666-6666-4666-8666-666666666666"
@@ -2652,6 +2909,46 @@ def test_node_patch_overlays_gate_condition_without_reauthoring_hidden_routes() 
     assert bound["nodes"][0]["routes"] == before["routes"]
     assert bound["nodes"][0].get("fork_to") == before.get("fork_to")
     assert bound["nodes"][0]["options"] == before["options"]
+
+
+def test_node_patch_overlays_llm_prompt_without_reauthoring_withheld_options() -> None:
+    """The node-patch delta route of the same correction (I-2): the advertised
+    patch schema admits exactly the published llm keys, so a prompt patch
+    lands on the reviewed node while the withheld profile, response field and
+    schema are carried from the predecessor; a patch naming a withheld key is
+    refused as an authority violation."""
+    predecessor = _correction_predecessor()
+    stable_id = "55555555-5555-4555-8555-555555555555"
+    target = _public_node_correction_target(
+        "summarize_standard",
+        stable_id=stable_id,
+        node_type="transform",
+        plugin="llm",
+        behavior={"kind": "transform"},
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {
+            "node_patch": {"stable_id": stable_id, "options": {"prompt_template": "Summarize {row[amount]} in two sentences."}},
+            "edges": [],
+        },
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][1]["options"]
+    assert bound["nodes"][1]["options"] == {**before, "prompt_template": "Summarize {row[amount]} in two sentences."}
+    assert bound["nodes"][1]["input"] == "high_value"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {"node_patch": {"stable_id": stable_id, "options": {"profile": "invented-profile"}}, "edges": []},
+            authority=target,
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert raised.value.error_code == "guided_delta_authority_violation"
 
 
 def test_node_patch_overlays_coalesce_policy_without_reauthoring_hidden_branches() -> None:
@@ -3709,3 +4006,141 @@ def test_a_session_still_mid_review_still_gets_its_repairable_rejection() -> Non
     # Only the REVIEWED name is offered: a pending component has no reviewed
     # name to name, and inventing one would be a fact the operator never set.
     assert raised.value.connectivity == {"component_kind": "sources", "reviewed_source_names": ["source"]}
+
+
+@pytest.mark.parametrize(
+    "malformed_entry",
+    [
+        "not a node dict",
+        {"node_type": "transform", "plugin": "passthrough", "input": "in", "on_success": "out"},
+        {"id": 7, "node_type": "transform", "plugin": "passthrough", "input": "in", "on_success": "out"},
+    ],
+    ids=["non_dict", "missing_id", "non_string_id"],
+)
+def test_bind_prose_amend_records_unidentifiable_node_entry_as_malformed(malformed_entry: object) -> None:
+    """A node entry without a string ``id`` cannot be adjudicated against the amend contract.
+
+    It must be recorded as ``node_entry_malformed`` (and the candidate
+    rejected), never silently classified as an added node — the silent
+    classification laundered id-less dicts past the amend contract.
+    """
+    candidate = _minimal_amend_reconstruction()
+    nodes = candidate["nodes"]
+    assert isinstance(nodes, list)
+    nodes.append(malformed_entry)
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert {"violation": "node_entry_malformed"} in list(result.violations)
+    # The malformed entry never reaches the deterministic rejected-candidate
+    # topology either: it is neither an existing reconstruction nor an
+    # admissible added node.
+    assert malformed_entry not in result.pipeline["nodes"]
+
+
+# ---------------------------------------------------------------------------
+# Display-only options are never a correction authority (red-team F1, 2026-09-02)
+# ---------------------------------------------------------------------------
+
+_WEB_SCRAPE_STABLE_ID = "88888888-8888-4888-8888-888888888888"
+
+
+def _web_scrape_predecessor() -> CompositionState:
+    """A reviewed web_scrape node whose ``http`` object carries the SSRF policy
+    beside the two identity members the card renders."""
+    http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "public_only",
+        "timeout": 30,
+        "max_body_bytes": 1_000_000,
+    }
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="scrape",
+                options={"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="scrape",
+                node_type="transform",
+                plugin="web_scrape",
+                input="scrape",
+                on_success="output",
+                on_error="discard",
+                options={"url_field": "url", "http": http, "schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="output", plugin="json", options={"path": "rows.jsonl"}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_node_patch_cannot_touch_the_display_only_http_object() -> None:
+    """The card shows web_scrape's contact and reason from the ``http`` object,
+    but that object also holds the SSRF host allowlist, timeout and body cap.
+    It lives in the DISPLAY-ONLY table, so the node-patch schema advertises
+    no ``http`` member and a patch naming it is refused as an authority
+    violation — the policy can never be rewritten behind an unchanged card."""
+    predecessor = _web_scrape_predecessor()
+    target = _public_node_correction_target(
+        "scrape",
+        stable_id=_WEB_SCRAPE_STABLE_ID,
+        node_type="transform",
+        plugin="web_scrape",
+        behavior={"kind": "transform"},
+    )
+
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)["properties"]["node_patch"]
+    # No correctable keys at all: the patch schema advertises no options
+    # member for web_scrape, so there is nothing for a provider to name.
+    assert "options" not in schema["properties"]
+
+    hostile_http = {
+        "abuse_contact": "ops@example.org",
+        "scraping_reason": "catalogue refresh",
+        "allowed_hosts": "allow_private",
+        "timeout": 1,
+        "max_body_bytes": 1,
+    }
+    delta = {"node_patch": {"stable_id": _WEB_SCRAPE_STABLE_ID, "options": {"http": hostile_http}}, "edges": []}
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(delta, authority=target, guided=_guided(), current_state=predecessor)
+    assert raised.value.error_code == "guided_delta_authority_violation"
+
+
+def test_full_candidate_correction_that_omits_http_keeps_the_reviewed_block() -> None:
+    """A full-candidate node correction overlays only the correctable keys.
+    ``http`` is display-only, so a candidate that restates the node without
+    it neither deletes nor rewrites the reviewed block: it comes back from
+    the predecessor intact, policy included."""
+    predecessor = _web_scrape_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"][0]["options"] = {"url_field": "url", "schema": {"mode": "observed"}}
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target("scrape", stable_id=_WEB_SCRAPE_STABLE_ID),
+    )
+
+    assert bound["nodes"][0]["options"]["http"] == predecessor.to_dict()["nodes"][0]["options"]["http"]

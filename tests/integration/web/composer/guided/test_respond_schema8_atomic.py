@@ -83,10 +83,31 @@ def file_composer_test_client(composer_test_client: TestClient, tmp_path: Path) 
         engine.dispose()
 
 
-def _create_session(client: TestClient) -> str:
+_GOAL_FIRST_INTENT = "Summarize each row and save the summaries as JSON"
+
+
+def _create_session(client: TestClient, *, intent: str | None = None) -> str:
+    """Create a session, optionally rooting it in a goal.
+
+    Rootless by DEFAULT here, unlike the walk-oriented helpers: most of this
+    module pins what a respond settlement writes from a genuinely empty
+    session — "no persisted state yet", exact version and message counts — and
+    a start would put a checkpoint and a root row there before the test began.
+
+    Pass ``intent`` for the walks that reach the Step-2 finish: goal-first
+    (elspeth-378cfa0e18) refuses a planner run without one.
+    """
+
     response = client.post("/api/sessions", json={"title": "schema-8 respond"})
     assert response.status_code == 201, response.json()
-    return response.json()["id"]
+    session_id = response.json()["id"]
+    if intent is not None:
+        started = client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={"profile": "live", "intent": intent, "operation_id": str(uuid4())},
+        )
+        assert started.status_code == 200, started.json()
+    return session_id
 
 
 def _with_active_step3(guided: GuidedSession, active: GuidedProposalRef) -> GuidedSession:
@@ -110,14 +131,15 @@ def _with_active_step3(guided: GuidedSession, active: GuidedProposalRef) -> Guid
 def _start(client: TestClient, session_id: str) -> dict:
     response = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        json={"profile": "tutorial", "intent": _GOAL_FIRST_INTENT, "operation_id": str(uuid4())},
     )
     assert response.status_code == 200, response.json()
     return response.json()
 
 
 def _stage_proposal(client: TestClient, *, filename: str) -> tuple[str, dict]:
-    session_id = _create_session(client)
+    # This walk runs the Step-2 finish, so the session must carry a goal.
+    session_id = _create_session(client, intent=_GOAL_FIRST_INTENT)
     staged = _Step2Journey()._stage_proposal(client, session_id, filename=filename)
     return session_id, staged
 

@@ -155,6 +155,20 @@ def test_reject_malformed_interpretation_requirements_raises_400() -> None:
     assert "not_a_kind" not in exc_info.value.detail
 
 
+def test_reject_malformed_source_interpretation_requirements_raises_400() -> None:
+    """Source review rows cross the same YAML boundary as node rows."""
+    from fastapi import HTTPException
+
+    from elspeth.web.sessions.routes.composer.state import _reject_malformed_interpretation_requirements
+
+    state = _single_source_state({"interpretation_requirements": [{"kind": "not_a_kind", "status": "pending"}]})
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_malformed_interpretation_requirements(state)
+    assert exc_info.value.status_code == 400
+    assert "source" in exc_info.value.detail
+    assert "not_a_kind" not in exc_info.value.detail
+
+
 def test_reject_malformed_interpretation_requirements_passes_staged_rows() -> None:
     """Rows shaped like the importer's own auto-stagers pass the gate."""
     from elspeth.web.sessions.routes.composer.state import _reject_malformed_interpretation_requirements
@@ -173,87 +187,68 @@ def test_reject_malformed_interpretation_requirements_passes_staged_rows() -> No
     _reject_malformed_interpretation_requirements(state)
 
 
-@pytest.mark.asyncio
-async def test_surface_imported_reviews_skips_writer_rejected_rows() -> None:
-    """The interpretation-event writer boundary rejects a mismatched
-    requirement row by raising ``ValueError`` — pinned with ``pytest.raises``
-    — and the import surfacer converts that raise into a fail-closed SKIP
-    (the state already persisted; a propagated raise would 500 the import).
-    Resolved rows and pending rows without a string draft never reach the
-    writer; only surviving pending rows surface (elspeth-ae5160c3cb)."""
-    from uuid import uuid4
+def _marked_export_yaml(marker_line: str) -> str:
+    return f"{marker_line}\nsources:\n  source:\n    plugin: csv\n    options: {{}}\n"
 
-    from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
-    from elspeth.web.sessions.routes.composer.state import _surface_imported_interpretation_review_events
 
-    surfaced: list[dict] = []
+def test_redaction_marker_source_names_parses_only_exporter_marker_lines() -> None:
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _redaction_marker_source_names
 
-    class _Service:
-        async def create_pending_interpretation_event(self, **kwargs):
-            if kwargs["user_term"] == "llm_model_choice:score":
-                raise ValueError("writer boundary rejected the requirement binding")
-            surfaced.append(kwargs)
+    text = (
+        f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path\n"
+        f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}other_source stripped=path\n"
+        "# redacted-source: two tokens stripped=path\n"  # multi-token name: ignored
+        "# some unrelated comment\n"
+        "sources: {}\n"
+    )
+    assert _redaction_marker_source_names(text) == frozenset({"source", "other_source"})
+    assert _redaction_marker_source_names("sources: {}\n") == frozenset()
 
-    service = _Service()
-    with pytest.raises(ValueError):
-        await service.create_pending_interpretation_event(user_term="llm_model_choice:score")
 
-    state = _llm_node_state_with_requirements(
-        [
-            # Well-formed pending row: surfaces.
-            {
-                "id": "prompt_template_review:score",
-                "kind": "llm_prompt_template",
-                "user_term": "llm_prompt_template:score",
-                "status": "pending",
-                "draft": "Score this: {{ row.value }}",
-            },
-            # Well-formed pending row the writer boundary rejects: skipped
-            # fail-closed, never propagated.
-            {
-                "id": "model_choice_review:score",
-                "kind": "llm_model_choice",
-                "user_term": "llm_model_choice:score",
-                "status": "pending",
-                "draft": "anthropic/claude-haiku-4.5",
-            },
-            # Pending row without a string draft: never reaches the writer.
-            {
-                "id": "vague:score",
-                "kind": "vague_term",
-                "user_term": "cool",
-                "status": "pending",
-                "draft": None,
-            },
-            # Resolved row: never reaches the writer.
-            {
-                "id": "resolved:score",
-                "kind": "llm_prompt_template",
-                "user_term": "old",
-                "status": "resolved",
-                "draft": "old draft",
-                "accepted_value": "old draft",
-            },
-        ]
+def test_reject_redacted_sources_without_rebind_400s_path_absent_shape() -> None:
+    """The path-ABSENT redacted-export shape gets re-bind guidance, not a raw
+    Pydantic 'path Field required' from the strict lane (elspeth-06f92da0d9)."""
+    from fastapi import HTTPException
+
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    state = _single_source_state({"schema": {"mode": "observed"}})
+    yaml_text = _marked_export_yaml(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_redacted_sources_without_rebind(state, yaml_text=yaml_text)
+
+    assert exc_info.value.status_code == 400
+    assert "custody-redacted" in exc_info.value.detail
+    assert "source_blob_ids" in exc_info.value.detail
+
+
+def test_reject_redacted_sources_passes_rebound_and_repathed_sources() -> None:
+    from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    yaml_text = _marked_export_yaml(f"{PUBLIC_EXPORT_REDACTED_SOURCE_MARKER_PREFIX}source stripped=blob_ref,path")
+
+    # blob_ref restored by _state_with_imported_source_blobs: bound, passes.
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"blob_ref": "20b944e3-fd46-434f-b9a2-4fb508db30f0", "path": "/data/x.csv"}),
+        yaml_text=yaml_text,
+    )
+    # Hand-re-added path option: passes here; path guards police the value.
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"path": "inputs/x.csv"}),
+        yaml_text=yaml_text,
     )
 
-    session_id = uuid4()
-    await _surface_imported_interpretation_review_events(
-        service,  # type: ignore[arg-type]
-        session_id=session_id,
-        state=state,
-        composition_state_id=uuid4(),
-        session_operation_context=SessionOperationContext(
-            fence=SessionOperationFence(
-                session_id=str(session_id),
-                operation_id="yaml-import",
-                lease_token="yaml-import-token",
-                operation_epoch=1,
-            ),
-            operation_kind=SessionOperationKind.COMPOSE,
-        ),
-    )
 
-    assert [call["user_term"] for call in surfaced] == ["llm_prompt_template:score"]
-    assert surfaced[0]["llm_draft"] == "Score this: {{ row.value }}"
-    assert surfaced[0]["model_identifier"] == "yaml_import"
+def test_reject_redacted_sources_is_inert_without_a_marker() -> None:
+    from elspeth.web.sessions.routes.composer.state import _reject_redacted_sources_without_rebind
+
+    # Hand-written path-absent YAML with no exporter marker: pre-existing
+    # behaviour stands (strict preflight refuses; persists is_valid=False).
+    _reject_redacted_sources_without_rebind(
+        _single_source_state({"schema": {"mode": "observed"}}),
+        yaml_text="sources:\n  source:\n    plugin: csv\n    options: {}\n",
+    )

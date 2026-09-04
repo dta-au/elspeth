@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.7.2"
+version = "0.8.0"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -452,6 +452,16 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "-m", "not slow and not stress and not performance and not testcontainer and not live_provider",  # Remote-provider evidence is separately operator-gated
+    # The default selection IS the pre-merge gate (AGENTS.md), so it has to be
+    # a run somebody can actually sit through: serial, this suite measured
+    # ~42 tests/min against 44,399 collected — about 17 HOURS. At -n 12 it is
+    # ~20 minutes. A gate nobody can run is not a gate, so parallelism is the
+    # default rather than a flag each caller has to remember.
+    #
+    # Override for a single test or a debugger with `-n 0`, which runs
+    # in-process: worker startup dominates a small selection, and pdb/-s do not
+    # work through xdist.
+    "-n", "12",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -468,6 +478,7 @@ markers = [
     "live_azure: marks protected tests that cross a real Azure service boundary",
     "live_dataverse: marks protected tests that cross a real Dataverse boundary",
     "live_chroma: marks protected tests that cross a real Chroma service boundary",
+    "terraform: marks tests that shell out to the terraform binary (deselect with '-m \"not terraform\"')",
 ]
 # Load .env file for integration tests (API keys)
 env_files = [".env"]

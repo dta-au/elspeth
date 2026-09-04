@@ -21,7 +21,7 @@ from elspeth.web.composer.tools._dispatch import execute_tool, get_tool_definiti
 from elspeth.web.composer.tools.transforms import _execute_splice_transform
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 
@@ -56,7 +56,7 @@ def _state() -> CompositionState:
         source=SourceSpec(
             plugin="csv",
             on_success="rows",
-            options={"path": "rows.csv", "schema": {"mode": "observed"}},
+            options={"path": "rows.csv", "schema": {"mode": "flexible", "fields": ["text: str"]}},
             on_validation_failure="discard",
         ),
         nodes=(
@@ -133,6 +133,77 @@ def test_splice_transform_public_node_id_schema_matches_runtime_contract() -> No
     assert {key: node_id_schema[key] for key in runtime_schema} == runtime_schema
 
 
+def test_splice_transform_public_dispatch_rejects_llm_runtime_hash_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
+            "resolved_prompt_template_hash": None,
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+
+    context = _context()
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert "resolved_prompt_template_hash" in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+
+
+def test_splice_transform_public_dispatch_rejects_resolver_owned_review_atomically() -> None:
+    state = _state()
+    arguments = _arguments(
+        options={
+            "provider": "openrouter",
+            "model": "openai/gpt-4o",
+            "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+            "prompt_template": "Summarise {{ row.text }}.",
+            "required_input_fields": ["text"],
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "llm_prompt_template",
+                    "user_term": "llm_prompt_template:inserted",
+                    "draft": "Summarise {{ row.text }}.",
+                    "status": "resolved",
+                }
+            ],
+            "schema": {"mode": "observed"},
+        }
+    )
+    arguments["node"]["plugin"] = "llm"  # type: ignore[index]
+    context = _context()
+
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert INTERPRETATION_REQUIREMENTS_KEY in result.data["error"]
+    assert "retry splice_transform" in result.data["error"]
+    assert "request_interpretation_review" in result.data["error"]
+    assert "resolve_interpretation_event" not in result.data["error"]
+
+
 def test_splice_transform_manifest_is_type_driven() -> None:
     entry = MANIFEST["splice_transform"]
 
@@ -194,9 +265,10 @@ def test_splice_transform_identical_review_staged_replay_is_same_object() -> Non
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
             "on_error": "discard",
@@ -225,10 +297,24 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                "prompt_template": "Summarise using {{interpretation:summary_style}}: {{ row.text }}.",
+                # The server derives prompt_template from the parts (a pending
+                # ref renders as "pending interpretation"); the submitted
+                # literal must match the derivation or the replay projection
+                # diverges.
+                "prompt_template": "Summarise using pending interpretation: {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
+                # Wired form: with a vague_term row staged, only a
+                # prompt_template_parts interpretation_ref counts as wiring
+                # (the ref names the id the server synthesizes for the shell:
+                # user_term + ":" + node id).
+                PROMPT_TEMPLATE_PARTS_KEY: [
+                    {"kind": "text", "text": "Summarise using "},
+                    {"kind": "interpretation_ref", "requirement_id": "summary_style:inserted"},
+                    {"kind": "text", "text": ": {{ row.text }}."},
+                ],
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
                         "kind": "vague_term",
@@ -255,6 +341,13 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
         }
         for requirement in inserted.options[INTERPRETATION_REQUIREMENTS_KEY]
     ]
+    # A coherent trusted-id rewrite also rewrites the prompt_template_parts
+    # interpretation_ref that names the vague_term row: rows and refs move
+    # together, or the wired review would dangle.
+    trusted_parts = [
+        {**part, "requirement_id": custom_ids["vague_term"]} if part.get("kind") == "interpretation_ref" else dict(part)
+        for part in inserted.options[PROMPT_TEMPLATE_PARTS_KEY]
+    ]
     retained = replace(
         first.updated_state,
         nodes=(
@@ -264,13 +357,29 @@ def test_splice_transform_replay_preserves_all_trusted_requirement_ids() -> None
                 options={
                     **inserted.options,
                     INTERPRETATION_REQUIREMENTS_KEY: trusted_requirements,
+                    PROMPT_TEMPLATE_PARTS_KEY: trusted_parts,
                 },
             ),
             after,
         ),
     )
 
-    replay = _execute_splice_transform(arguments, retained, _context())
+    # The realistic replay payload is the server's own round-trip
+    # (get_pipeline_state), whose parts carry the trusted ref verbatim; row
+    # shells stay id-free and recover the trusted id via authored-id
+    # continuity against the existing node.
+    replay_arguments = {
+        **arguments,
+        "node": {
+            **arguments["node"],
+            "options": {
+                **arguments["node"]["options"],
+                PROMPT_TEMPLATE_PARTS_KEY: trusted_parts,
+            },
+        },
+    }
+
+    replay = _execute_splice_transform(replay_arguments, retained, _context())
 
     assert replay.success, replay.data
     assert replay.data["already_applied"] is True
@@ -288,9 +397,10 @@ def test_splice_transform_identical_replay_rejects_noncanonical_retained_require
             "plugin": "llm",
             "options": {
                 "provider": "openrouter",
-                "model": "openai/gpt-4o-mini",
+                "model": "openai/gpt-4o",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Summarise {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
             "on_error": "discard",

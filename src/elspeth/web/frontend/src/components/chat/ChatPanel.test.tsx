@@ -9,6 +9,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatPanel,
@@ -20,7 +21,14 @@ import {
   looksLikeData,
   parseProposedRowsFromUserInput,
 } from "./ChatPanel";
-import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
+import {
+  GUIDED_EXPLAIN_MESSAGE,
+  GUIDED_EXPLAIN_PIPELINE_MESSAGE,
+} from "./guided/explainPrompt";
+import {
+  _resetSubscriptionsForTesting,
+  initStoreSubscriptions,
+} from "@/stores/subscriptions";
 import { useSessionStore } from "@/stores/sessionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
@@ -39,6 +47,7 @@ import type {
   Session,
 } from "@/types/api";
 import type {
+  ChatTurn as GuidedWireChatTurn,
   GuidedChatResponse,
   GuidedProposalReviewState,
   GuidedSession,
@@ -46,9 +55,11 @@ import type {
   TerminalState,
   TurnPayload,
   TurnRecord,
+  WireStageData,
 } from "@/types/guided";
 import { COMPOSE_TIMEOUT_ABORT_REASON } from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX } from "@/types/interpretation";
 
 vi.mock("@/hooks/useComposer", () => ({
   useComposer: vi.fn(),
@@ -394,7 +405,16 @@ describe("ChatPanel", () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
       sessions: [session],
-      messages: [],
+      messages: [
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "Build me a pipeline",
+          tool_calls: null,
+          created_at: "2026-04-26T10:00:01Z",
+        },
+      ],
       composerProgress: progress,
     });
 
@@ -414,7 +434,7 @@ describe("ChatPanel", () => {
   // symptom (how tall the box got).
   const terminalCompleteProgress: ComposerProgressSnapshot = {
     session_id: "session-1",
-    request_id: "message-1",
+    request_id: "u1",
     phase: "complete",
     headline: "The composer has updated the pipeline.",
     evidence: ["The assistant response has been saved for this session."],
@@ -472,14 +492,135 @@ describe("ChatPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not resurrect terminal composer progress after a later system notice", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      // Validation notices are standalone system turns and can land after the
+      // assistant reply. They must not make the settled progress card return.
+      messages: [
+        chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" }),
+        chatMsg({ id: "a1", role: "assistant", content: "Done — the pipeline is saved." }),
+        chatMsg({ id: "s1", role: "system", content: "Validation passed." }),
+      ],
+      composerProgress: terminalCompleteProgress,
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("Done — the pipeline is saved.")).toBeInTheDocument();
+    expect(screen.getByText("Validation passed.")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show terminal composer progress superseded by a later user turn", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      messages: [
+        chatMsg({ id: "u0", role: "user", content: "Build the old pipeline" }),
+        chatMsg({ id: "u1", role: "user", content: "Build the current pipeline" }),
+      ],
+      composerProgress: { ...terminalCompleteProgress, request_id: "u0" },
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("Build the current pipeline")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show unrelated guided progress after exiting to freeform", () => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [soloSession],
+      messages: [],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal,
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+      composerProgress: {
+        ...terminalCompleteProgress,
+        request_id: "guided-operation-id",
+      },
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.queryByText("Last composer update")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("The composer has updated the pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["pending", "failed"] as const)(
+    "keeps terminal progress for an absent canonical id while the optimistic user row is %s",
+    (localStatus) => {
+      (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        sessions: [soloSession],
+        messages: [
+          chatMsg({
+            id: "local-u1",
+            role: "user",
+            content: "Build me a pipeline",
+            local_status: localStatus,
+          }),
+        ],
+        composerProgress: {
+          ...terminalCompleteProgress,
+          request_id: "canonical-u1",
+          phase: "cancelled",
+          headline: "Composition stopped before saving.",
+          reason: "client_cancelled",
+        },
+      });
+
+      render(<ChatPanel />);
+
+      expect(screen.getByText("Last composer update")).toBeInTheDocument();
+      expect(
+        screen.getByText("Composition stopped before saving."),
+      ).toBeInTheDocument();
+    },
+  );
+
   it("keeps terminal composer progress while the reply has not landed yet", () => {
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue(idleComposer);
     useSessionStore.setState({
       activeSessionId: "session-1",
       sessions: [soloSession],
-      // Tail is the user's row — the turn settled but no reply text exists,
-      // so the snapshot is still the only account of what happened.
-      messages: [chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" })],
+      // The latest user turn settled without reply text, so the snapshot is
+      // still the only account of what happened. A successful older turn must
+      // not cause this newer terminal outcome to be hidden.
+      messages: [
+        chatMsg({ id: "u0", role: "user", content: "Build an earlier pipeline" }),
+        chatMsg({ id: "a0", role: "assistant", content: "The earlier pipeline is ready." }),
+        chatMsg({ id: "u1", role: "user", content: "Build me a pipeline" }),
+      ],
       composerProgress: terminalCompleteProgress,
     });
 
@@ -741,6 +882,209 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Replace the pipeline.")).toBeInTheDocument();
     expect(screen.getByText("Stale proposal")).toBeInTheDocument();
   });
+
+  // ── Dock arrival mechanics (elspeth-2d1cf8908c) ──────────────────────────
+  //
+  // The dock is a scroll container by design (elspeth-ecf973fb9f), so a
+  // PendingProposalsBanner mounting below its fold is silent: no live-region
+  // announcement (the banner returns null when empty, so a role on the banner
+  // itself would mount WITH its content — the unreliable pattern) and nothing
+  // scrolling the dock to the new approval control. These pin both halves:
+  // the persistent announcer and the scroll-the-dock-BY-NAME arrival scroll
+  // (never scrollIntoView — its ancestor walk is the elspeth-ecf973fb9f bug).
+  function makeArrivalProposal(id: string): CompositionProposal {
+    return {
+      id,
+      session_id: "session-1",
+      tool_call_id: `call-${id}`,
+      tool_name: "set_pipeline",
+      status: "pending",
+      summary: "Replace the pipeline.",
+      rationale: "Requested by the current composer turn.",
+      affects: ["graph"],
+      arguments_redacted_json: {},
+      base_state_id: null,
+      committed_state_id: null,
+      audit_event_id: `event-${id}`,
+      created_at: "2026-05-14T00:00:00Z",
+      updated_at: "2026-05-14T00:00:00Z",
+    };
+  }
+
+  function renderIdleFreeformPanel() {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+    });
+    const { container } = render(<ChatPanel />);
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    return dock as HTMLElement;
+  }
+
+  it("scrolls the dock by name when a new actionable proposal arrives", async () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+    // The banner must be the scroll target's reason — and the mechanism must
+    // be the named dock, never an ancestor-walking scrollIntoView.
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+
+    // Arrival-keyed, not identity-keyed: an unrelated store change re-renders
+    // the panel (and rebuilds the derived proposal arrays) but must not
+    // re-scroll a banner the operator may have scrolled away from.
+    act(() => {
+      useSessionStore.setState({
+        messages: [
+          {
+            id: "msg-1",
+            session_id: "session-1",
+            role: "user",
+            content: "hello",
+            tool_calls: null,
+            created_at: "2026-05-14T00:00:02Z",
+          },
+        ],
+      });
+    });
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not scroll the dock when the arriving proposal is stale", () => {
+    const dock = renderIdleFreeformPanel();
+    const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+        staleProposalIds: ["proposal-1"],
+      });
+    });
+
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it("downgrades the arrival scroll to behavior:'auto' under prefers-reduced-motion (elspeth-5b42a9ae1e)", async () => {
+    // The imperative scrollTo API is NOT auto-downgraded by the OS
+    // preference the way CSS animations behind the media query are — every
+    // JS scroll must consult it via preferredScrollBehavior(). This pins
+    // one representative site; the helper's own spec pins the mechanism.
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+      media: query,
+    })) as unknown as typeof window.matchMedia;
+    try {
+      const dock = renderIdleFreeformPanel();
+      const scrollSpy = vi.spyOn(dock, "scrollTo");
+
+      act(() => {
+        useSessionStore.setState({
+          compositionProposals: [makeArrivalProposal("proposal-1")],
+        });
+      });
+
+      await waitFor(() => expect(scrollSpy).toHaveBeenCalledTimes(1));
+      expect(scrollSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ behavior: "auto" }),
+      );
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  it("reveals a pending proposal when the freeform surface returns from guided mode", () => {
+    // A proposal already pending while the GUIDED surface is up: the dock is
+    // not mounted there, so the arrival was never surfaced. Returning to
+    // freeform mounts the dock — a fresh scroll container with no operator
+    // scroll state to respect — and must reveal the waiting decision.
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+      compositionProposals: [makeArrivalProposal("proposal-1")],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: {
+        type: "single_select",
+        step_index: 0,
+        turn_token: "a".repeat(64),
+        payload: {
+          question: "Which source plugin should we use?",
+          options: [{ id: "csv", label: "CSV", hint: null }],
+          allow_custom: false,
+          source_blob_compatible_option_ids: ["csv"],
+        },
+      },
+    });
+    const { container } = render(<ChatPanel />);
+    expect(container.querySelector(".chat-panel-dock")).toBeNull();
+
+    // The dock element does not exist until the switch commit, so the scroll
+    // must be observed at the prototype and attributed by receiver.
+    const protoScrollSpy = vi.spyOn(Element.prototype, "scrollTo");
+    try {
+      act(() => {
+        useSessionStore.setState({ guidedSession: null, guidedNextTurn: null });
+      });
+
+      const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+      expect(dock).not.toBeNull();
+      expect(protoScrollSpy.mock.contexts).toContain(dock);
+      expect(
+        screen.getByTestId("pending-proposals-live-region"),
+      ).toHaveTextContent("1 pending change needs your approval");
+    } finally {
+      protoScrollSpy.mockRestore();
+    }
+  });
+
+  it("announces a proposal arrival through the persistent live region", () => {
+    renderIdleFreeformPanel();
+
+    // The region pre-exists its content — that is the property that makes the
+    // 0→1 announcement reliable.
+    const region = screen.getByTestId("pending-proposals-live-region");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveTextContent("");
+
+    act(() => {
+      useSessionStore.setState({
+        compositionProposals: [makeArrivalProposal("proposal-1")],
+      });
+    });
+
+    expect(region).toHaveTextContent("1 pending change needs your approval");
+  });
 });
 
 // ── Mode discriminator tests (Task 8.1) ─────────────────────────────────────────
@@ -772,7 +1116,20 @@ describe("ChatPanel mode discriminator", () => {
     // readiness gate is open and guided sends (sendGuidedChat →
     // runComposeWithTimeout) proceed. resetStore clears it to the fail-closed
     // false default; the per-test setState calls merge over this.
-    useSessionStore.setState({ composeTimeoutReady: true });
+    //
+    // A STARTED guided session also carries a persisted composition state, and
+    // the guided-active tests below are all about a started one. Goal-first
+    // (elspeth-378cfa0e18) made that distinction load-bearing in the panel: a
+    // null composition state now means "this session has stated no goal yet"
+    // and renders the goal card in place of the decision card, so seeding a
+    // live turn on top of a null state describes a session that cannot exist.
+    // Seeded here rather than in ~50 individual setState calls; the tests that
+    // are ABOUT the pre-goal or freeform surfaces set `compositionState: null`
+    // explicitly and merge over this.
+    useSessionStore.setState({
+      composeTimeoutReady: true,
+      compositionState: makeComposition(1),
+    });
     mockedChatInputUpload.blob = null;
     mockedChatInputUpload.requests = [];
     mockedChatInputUpload.completedRequestIds = [];
@@ -803,6 +1160,7 @@ describe("ChatPanel mode discriminator", () => {
       terminal: null,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     };
   }
@@ -1758,12 +2116,10 @@ describe("ChatPanel mode discriminator", () => {
     });
   });
 
-  it("keeps the live Review wiring primary on the tutorial revision proposal review", () => {
+  it("keeps the live Review wiring primary on the tutorial proposal review", () => {
     // The tutorial proposal is a REAL planner proposal (no canned exhibit
     // exists post-7.1); the learner advances by accepting it, so the primary
-    // must stay live while the off-script reject/revise stay withheld. The
-    // primary is live only on the frozen-prompt REVISION proposal
-    // (supersedes_draft_hash set) — the pre-Send auto-proposal withholds it.
+    // must stay live while the off-script reject/revise stay withheld.
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -1784,11 +2140,16 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
   });
 
-  it("withholds the tutorial Review wiring primary on the pre-Send auto-proposal", () => {
-    // Tutorial run 18: accepting the transition auto-proposal (planned before
-    // the frozen transforms prompt is sent) commits a source→sink
-    // passthrough. The null supersedes_draft_hash identifies it; the learner
-    // is directed to Send instead.
+  it("offers the tutorial Review wiring primary on the FIRST proposal, which carries no supersedes hash", () => {
+    // Goal-first (elspeth-378cfa0e18) retires the pre-Send auto-proposal this
+    // test used to pin as withheld. The frozen transforms prompt is now the
+    // session's ROOT INTENT, stated at /guided/start, so the step-2 finish
+    // plans once from it and the single proposal the learner sees IS the one
+    // to review — with supersedes_draft_hash null, exactly the value the old
+    // withhold keyed on. Keeping that gate would strand the learner on a card
+    // with no forward affordance (the tutorial hides reject/revise and the
+    // step-3 locked prompt is gone), which is why the arm is deleted rather
+    // than re-pointed.
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -1801,17 +2162,11 @@ describe("ChatPanel mode discriminator", () => {
     render(<ChatPanel isTutorial />);
 
     expect(screen.getByText("Review pipeline proposal")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
-    expect(screen.getByText(/press Send/i)).toBeVisible();
-    // The withheld primary must leave a live path forward: the docked
-    // composer's Send is the ONLY advance on this turn (it re-plans the
-    // proposal as the frozen-prompt revision) — without it this turn is a
-    // dead end, strictly worse than the wrong-completion it prevents.
-    // ChatInput is mocked in this suite; its stub mirrors the live enabled
-    // state via data-disabled, and the region landmark is the same one the
-    // staging drivers target for the Send.
-    expect(screen.getByRole("region", { name: "Describe what you want" })).toBeVisible();
-    expect(screen.getByTestId("chat-input")).toHaveAttribute("data-disabled", "false");
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    // The retired "starting sketch" copy directed the learner to Send a
+    // step-3 prompt that no longer exists.
+    expect(screen.queryByText(/press Send/i)).toBeNull();
+    expect(screen.queryByText(/starting sketch/i)).toBeNull();
   });
 
   it("anchors tutorial proposal activity once in the Current Decision footer", () => {
@@ -2054,6 +2409,458 @@ describe("ChatPanel mode discriminator", () => {
     expect(css).not.toMatch(/\.guided-workflow-index[^{]*\{[^}]*display:\s*none/s);
   });
 
+  it("the settled tick's disclosure button carries no UA chrome (elspeth-f2a8550b3d)", () => {
+    // A `variant="bare"` Button emits ONLY the caller's class, so a rule that
+    // failed to strip the UA border/background would render four grey OS boxes
+    // across a band whose entire visual language is "no container box in any
+    // state" — the exact shape classNames.test.ts calls "never allowlistable"
+    // and records as having shipped twice. Cascade question, not existence:
+    // the class HAS a rule either way.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/guided/guided.css"),
+      "utf8",
+    );
+    const rule = /\.guided-workflow-step-button\s*\{([^}]*)\}/s.exec(css);
+    expect(rule).not.toBeNull();
+    expect(rule![1]).toMatch(/border:\s*0/);
+    expect(rule![1]).toMatch(/background:\s*none/);
+    // And the stack the <li> used to own has to move ONTO the button, or the
+    // indicator and label collapse side by side inside a 64px cell.
+    expect(rule![1]).toMatch(/flex-direction:\s*column/);
+  });
+
+  // ── Decision sheets (elspeth-f2a8550b3d, slice E first landing) ───────────
+  //
+  // The behaviour under test is that a tick is settled because the SERVER has
+  // a decision on record for that stage, not because its index sits below the
+  // current step, and that a settled tick opens a read-only record of it with
+  // no request.
+
+  const reviewedSource = {
+    stable_id: "00000000-0000-4000-8000-00000000f001",
+    name: "pages",
+    plugin: "csv_file",
+    status: "reviewed" as const,
+  };
+  const reviewedOutput = {
+    stable_id: "00000000-0000-4000-8000-00000000f002",
+    name: "results",
+    plugin: "csv_file",
+    status: "reviewed" as const,
+  };
+
+  function guidedChatTurn(
+    overrides: Partial<GuidedWireChatTurn> & { seq: number },
+  ): GuidedWireChatTurn {
+    return {
+      role: "user",
+      content: "read the pages CSV",
+      step: "step_1_source",
+      ts_iso: "2026-09-03T00:00:00Z",
+      assistant_message_kind: null,
+      synthetic_failure_reason: null,
+      turn_token: null,
+      ...overrides,
+    };
+  }
+
+  it("reads a tick as settled from the server ledger, not from walk position", () => {
+    // Standing at Source with an Output already settled: the index rule this
+    // replaces would call that Output "not started" because it now sits
+    // DOWNSTREAM of the current step, which is exactly the shape a stage
+    // rewind produces.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        reviewed_components: {
+          sources: [reviewedSource],
+          outputs: [reviewedOutput],
+        },
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    // The current step holds a decision too, and stays CURRENT rather than
+    // becoming a disclosure: you cannot look back at the stage you are on.
+    expect(screen.getByRole("listitem", { current: "step" })).toHaveTextContent(
+      "Source",
+    );
+    expect(screen.queryByRole("button", { name: /^Source/ })).toBeNull();
+    // The settled downstream stage is a button, and says it is completed.
+    const outputTick = screen.getByRole("button", { name: /^Output/ });
+    expect(outputTick).toHaveAccessibleName("Output, completed");
+    expect(outputTick).toHaveAttribute("aria-expanded", "false");
+    // INSIDE the existing list item, not in place of it: the stepper's
+    // structure (li state class + the indicator/label stack, which staging
+    // Playwright locators read) is what the disclosure wraps, not replaces.
+    const outputItem = outputTick.closest("li");
+    expect(outputItem?.className).toContain("guided-workflow-step--complete");
+    expect(outputTick.querySelector(".guided-workflow-check")).not.toBeNull();
+    expect(outputTick.querySelector(".guided-workflow-label")).not.toBeNull();
+    // Nothing the server has no decision for is offered.
+    expect(screen.queryByRole("button", { name: /^Transforms/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Wire/ })).toBeNull();
+  });
+
+  it("a closed tick emits no aria-controls, and the open one points at the sheet", async () => {
+    // One sheet is mounted at a time, so aria-controls on a closed tick would
+    // be a dangling IDREF into a document that has no such element.
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_2_sink",
+        chat_history: [guidedChatTurn({ seq: 1 })],
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    const sourceTick = screen.getByRole("button", { name: /^Source/ });
+    expect(sourceTick).not.toHaveAttribute("aria-controls");
+
+    await user.click(sourceTick);
+
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(sourceTick).toHaveAttribute("aria-expanded", "true");
+    expect(sourceTick.getAttribute("aria-controls")).toBe(
+      sheet.getAttribute("id"),
+    );
+  });
+
+  it("opens the stage's decision record with NO request, and gives it focus", async () => {
+    const respondGuidedSpy = vi.fn();
+    const chatGuidedSpy = vi.fn();
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_2_sink",
+        chat_history: [
+          guidedChatTurn({ seq: 1, content: "read the pages CSV" }),
+          guidedChatTurn({
+            seq: 2,
+            step: "step_2_sink",
+            content: "write results to a CSV",
+          }),
+        ],
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      },
+      guidedNextTurn: singleSelectTurn(),
+      respondGuided: respondGuidedSpy,
+      chatGuided: chatGuidedSpy,
+    });
+
+    render(<ChatPanel />);
+    await user.click(screen.getByRole("button", { name: /^Source/ }));
+
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(sheet).toHaveFocus();
+    // The component settled there, by name and plugin display name.
+    expect(within(sheet).getByText("pages")).toBeInTheDocument();
+    expect(within(sheet).getByText("CSV File")).toBeInTheDocument();
+    // That stage's own turns, and only those.
+    expect(within(sheet).getByText("read the pages CSV")).toBeInTheDocument();
+    expect(within(sheet).queryByText("write results to a CSV")).toBeNull();
+    // Looking back is free: nothing was asked of the server.
+    expect(respondGuidedSpy).not.toHaveBeenCalled();
+    expect(chatGuidedSpy).not.toHaveBeenCalled();
+  });
+
+  it("closes from the tick and from the sheet, returning focus to the tick", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_2_sink",
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    const sourceTick = screen.getByRole("button", { name: /^Source/ });
+
+    await user.click(sourceTick);
+    await user.click(sourceTick);
+    expect(screen.queryByRole("region", { name: "Source — decided" })).toBeNull();
+    expect(sourceTick).toHaveAttribute("aria-expanded", "false");
+
+    await user.click(sourceTick);
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("region", { name: "Source — decided" })).toBeNull();
+    // Focus must not fall to <body> when the panel the user was reading goes
+    // away — it goes back to the control they pressed to open it.
+    expect(sourceTick).toHaveFocus();
+  });
+
+  it("closes an open sheet when the walk moves to another step", async () => {
+    // A sheet records a SETTLED stage; once the step moves, what is settled
+    // moves with it and the open panel stops being the answer to the question
+    // the user asked.
+    const user = userEvent.setup();
+    const session = {
+      ...activeGuidedSession(),
+      step: "step_2_sink" as const,
+      reviewed_components: { sources: [reviewedSource], outputs: [] },
+    };
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: session,
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    await user.click(screen.getByRole("button", { name: /^Source/ }));
+    expect(
+      screen.getByRole("region", { name: "Source — decided" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      useSessionStore.setState({
+        guidedSession: {
+          ...session,
+          step: "step_3_transforms",
+          reviewed_components: {
+            sources: [reviewedSource],
+            outputs: [reviewedOutput],
+          },
+        },
+      });
+    });
+    expect(screen.queryByRole("region", { name: "Source — decided" })).toBeNull();
+  });
+
+  it("completed session: all four ticks open read-only sheets, post-commit chat excluded", async () => {
+    const user = userEvent.setup();
+    const terminal: TerminalState = {
+      kind: "completed",
+      reason: null,
+      pipeline_yaml: "source:\n  plugin: csv\n",
+    };
+    const confirmationHash = "c".repeat(64);
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      compositionState: makeComposition(3),
+      guidedSession: {
+        step: "step_4_wire",
+        history: [
+          {
+            step: "step_4_wire",
+            turn_type: "confirm_wiring",
+            payload_hash: "p".repeat(64),
+            response_hash: confirmationHash,
+            summary: "Guided pipeline wiring confirmed.",
+            emitter: "server",
+          },
+        ],
+        terminal,
+        chat_history: [
+          guidedChatTurn({
+            seq: 1,
+            step: "step_4_wire",
+            content: "does this wiring look right?",
+          }),
+          guidedChatTurn({
+            seq: 2,
+            step: "step_4_wire",
+            content: "what does this pipeline do?",
+            turn_token: confirmationHash,
+          }),
+        ],
+        chat_turn_seq: 2,
+        reviewed_components: {
+          sources: [reviewedSource],
+          outputs: [reviewedOutput],
+        },
+        profile: null,
+      },
+      guidedTerminal: terminal,
+      guidedNextTurn: null,
+    });
+
+    render(<ChatPanel />);
+
+    for (const name of [/^Source/, /^Output/, /^Transforms/, /^Wire/]) {
+      expect(screen.getByRole("button", { name })).toBeInTheDocument();
+    }
+
+    // Transforms comes from the COMMITTED graph — the wire card is gone once
+    // the session is terminal, so nothing else survives to name the nodes.
+    await user.click(screen.getByRole("button", { name: /^Transforms/ }));
+    // Named ONCE: this node's author-chosen id is its own plugin name, so a
+    // row that printed both would read "Select Columns · Select Columns".
+    expect(
+      within(
+        screen.getByRole("region", { name: "Transforms — decided" }),
+      ).getByText("Select Columns"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^Wire/ }));
+    const wireSheet = screen.getByRole("region", { name: "Wire — decided" });
+    expect(
+      within(wireSheet).getByText("Guided pipeline wiring confirmed."),
+    ).toBeInTheDocument();
+    // Post-commit questions are persisted with step="step_4_wire" too, so a
+    // stage filter alone would replay the whole advisory conversation as part
+    // of the wiring decision.
+    expect(
+      within(wireSheet).getByText("does this wiring look right?"),
+    ).toBeInTheDocument();
+    expect(
+      within(wireSheet).queryByText("what does this pipeline do?"),
+    ).toBeNull();
+  });
+
+  it("mounts the sheet outside the transcript's live log", async () => {
+    // GuidedChatHistory's replay mode is a static group, but the placement
+    // matters too: nested inside the transcript's role=log, an appended sheet
+    // would announce settled turns as if they had just arrived.
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_2_sink",
+        chat_history: [guidedChatTurn({ seq: 1 })],
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    await user.click(screen.getByRole("button", { name: /^Source/ }));
+
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(sheet.closest("[role='log']")).toBeNull();
+    expect(sheet.closest(".guided-authoring-scroll")).toBeNull();
+    expect(sheet.querySelector("[aria-live]")).toBeNull();
+    // Between the stepper and the transcript, in DOM order: focus and reading
+    // order both run stepper → the panel the tick opened → conversation.
+    const nav = screen.getByRole("navigation", {
+      name: /guided workflow progress/i,
+    });
+    const scroller = screen
+      .getByRole("group", { name: "Conversation" })
+      .closest(".guided-authoring-scroll");
+    expect(
+      nav.compareDocumentPosition(sheet) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      sheet.compareDocumentPosition(scroller!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("offers no rewind control anywhere in a sheet (lane E2 owns that)", async () => {
+    // Scope pin: the read-only landing must not ship a "Change this" button
+    // before the operator has ruled on fork-vs-supersede for a stage rewind.
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_2_sink",
+        reviewed_components: { sources: [reviewedSource], outputs: [] },
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    await user.click(screen.getByRole("button", { name: /^Source/ }));
+
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(within(sheet).queryByRole("button", { name: /change/i })).toBeNull();
+    expect(within(sheet).getAllByRole("button")).toHaveLength(1);
+  });
+
+  // ── WHICH ledger the sheets read (the one state where it matters) ─────────
+  //
+  // Two readable ledgers exist and they diverge in EXACTLY one state. The
+  // store's `guidedReviewedComponents` is emptied on the refresh-required arm
+  // (sessionStore.ts, pinned by sessionStore.guided.test.ts) so the right-pane
+  // graph stops drawing pre-failure nodes beside the reload banner; the
+  // published `guidedSession.reviewed_components` is never emptied, because
+  // the settlement SUCCEEDED and only the follow-up refresh failed.
+  //
+  // The stepper and its sheets bind to the published session, with the rest of
+  // this surface: the step, the transcript and the history all render from the
+  // same stale-but-true snapshot, and a stepper that forgot along with the
+  // graph would tell the user their finished stages had never happened while
+  // the transcript right below it still replays those very reviews.
+  //
+  // The state is REACHABLE, which is why this pin exists: the refresh-required
+  // arm nulls `guidedNextTurn`, and at step_3_transforms `isGuidedBuildActive`
+  // holds without a turn — so the guided surface, stepper included, still
+  // renders. This is the single test that discriminates the two ledgers; if
+  // the sheets are ever switched to the store copy it goes red.
+  it("keeps the ticks settled from the published session when the store's graph ledger has been emptied", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_3_transforms",
+        chat_history: [guidedChatTurn({ seq: 1 })],
+        reviewed_components: {
+          sources: [reviewedSource],
+          outputs: [reviewedOutput],
+        },
+      },
+      // The refresh-required arm's three effects, seeded directly (the arm
+      // itself is exercised in sessionStore.guided.test.ts; the exact banner
+      // copy is pinned there, not duplicated here).
+      guidedNextTurn: null,
+      guidedReviewedComponents: { sources: [], outputs: [] },
+      error: "Your answer was accepted. Refresh to re-enter the build.",
+    });
+
+    render(<ChatPanel />);
+
+    // Precondition, asserted rather than assumed: the store copy really is
+    // empty, so a sheet reading it would have nothing to show.
+    expect(useSessionStore.getState().guidedReviewedComponents).toEqual({
+      sources: [],
+      outputs: [],
+    });
+
+    const sourceTick = screen.getByRole("button", { name: /^Source/ });
+    expect(sourceTick).toHaveAccessibleName("Source, completed");
+    expect(screen.getByRole("button", { name: /^Output/ })).toBeVisible();
+
+    await user.click(sourceTick);
+
+    const sheet = screen.getByRole("region", { name: "Source — decided" });
+    expect(within(sheet).getByText("pages")).toBeVisible();
+  });
+
   it("lays the guided workflow stepper out one column per step, with a mobile breakpoint", () => {
     const css = readFileSync(
       join(process.cwd(), "src/components/chat/guided/guided.css"),
@@ -2108,6 +2915,30 @@ describe("ChatPanel mode discriminator", () => {
       screen.getByRole("heading", {
         level: 2,
         name: /choose the input and confirm what elspeth can read/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("names step 3 as a REVIEW of what the assistant proposed from the goal", () => {
+    // Goal-first (elspeth-378cfa0e18). The old copy — "Review the transform
+    // stages that turn source data into the output" — described a stage the
+    // user was expected to author here. What actually happens is that the
+    // planner ran once at the step-2 finish, from the goal stated at the
+    // start, and this step reviews its proposal.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "Review the processing steps the assistant proposed from your goal.",
       }),
     ).toBeInTheDocument();
   });
@@ -2544,7 +3375,7 @@ describe("ChatPanel mode discriminator", () => {
       session_id: "session-guided",
       composition_state_id: "state-1",
       affected_node_id: "rate_node",
-      tool_call_id: "backend_auto_surface:abc",
+      tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}abc`,
       user_term: "llm_model_choice:rate_node",
       kind: "llm_model_choice",
       llm_draft: "anthropic/claude-sonnet-4.6",
@@ -2649,20 +3480,160 @@ describe("ChatPanel mode discriminator", () => {
     );
   });
 
-  it("renders the per-step placeholder for STEP_4_WIRE", () => {
-    useSessionStore.setState({
-      activeSessionId: "session-guided",
-      sessions: [guidedSessionFixture],
-      messages: [],
-      guidedSession: { ...activeGuidedSession(), step: "step_4_wire" },
-      guidedNextTurn: singleSelectTurn(),
+  // ── Step 4: the caption is live state, not a constant ────────────────────
+  //
+  // elspeth-e4c2ebb697. `GUIDED_CHAT_PLACEHOLDERS` no longer carries a
+  // `step_4_wire` key (its type Excludes it): the wire caption is a function of
+  // what is actually blocking the confirm, computed by `wireStagePlaceholder`
+  // from the SAME two memos the card's own blockers panel renders. The retired
+  // wording named the acknowledgement stack unconditionally, so on the common
+  // path — nothing pending, nothing invalid — it told the learner to clear a
+  // stack that was not there.
+  //
+  // ONE TEST PER ARM, deliberately not one test: a single-arm test lets the
+  // others rot. The caption also reads the wire card's OWN verdict
+  // (`can_confirm` / `blockers`) — the usual reason Confirm is off at step 4,
+  // since the pre-commit guided composition is empty-by-design and contributes
+  // no `wireValidationIssues` — so the arm that names it gets its own seeding
+  // (`wireTurn`) rather than riding on the non-wire `singleSelectTurn`.
+  describe("renders the per-step placeholder for STEP_4_WIRE", () => {
+    function pendingAcknowledgementCard(id: string): InterpretationEvent {
+      return {
+        id,
+        session_id: "session-guided",
+        composition_state_id: "state-1",
+        affected_node_id: "select_columns",
+        tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}${id}`,
+        user_term: `llm_model_choice:${id}`,
+        kind: "llm_model_choice",
+        llm_draft: "anthropic/claude-sonnet-4.6",
+        accepted_value: null,
+        // The two fields isPendingAcknowledgement discriminates on.
+        choice: "pending",
+        interpretation_source: "user_approved",
+        created_at: "2026-06-22T00:00:00Z",
+        resolved_at: null,
+        actor: "system:composer",
+        model_identifier: "anthropic/claude-opus-4-7",
+        model_version: "anthropic/claude-opus-4-7",
+        provider: "anthropic",
+        composer_skill_hash: "0".repeat(64),
+        arguments_hash: null,
+        hash_domain_version: null,
+        runtime_model_identifier_at_resolve: null,
+        runtime_model_version_at_resolve: null,
+        resolved_prompt_template_hash: null,
+      };
+    }
+
+    // The describe's beforeEach resets BOTH stores, so neither the seeded cards
+    // nor the seeded validation errors leak into a sibling test.
+    function seedWireStep(validationErrors: string[] | null): void {
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: { ...activeGuidedSession(), step: "step_4_wire" },
+        guidedNextTurn: singleSelectTurn(),
+        compositionState: makeComposition(1, {
+          validation_errors: validationErrors,
+        }),
+      });
+    }
+
+    /** The step-4 card itself: the only carrier of the SERVER's verdict.
+     *  Structurally minimal — the placeholder reads `can_confirm` and
+     *  `blockers` and nothing else — but a real `WireStageData`, so a field
+     *  the payload stops carrying breaks this rather than silently widening. */
+    function wireTurn(overrides: Partial<WireStageData> = {}): TurnPayload {
+      const payload: WireStageData = {
+        proposal_id: "00000000-0000-4000-8000-000000000001",
+        draft_hash: "d".repeat(64),
+        sources: [],
+        nodes: [],
+        outputs: [],
+        connections: [],
+        semantic_contracts: [],
+        warnings: [],
+        blockers: [],
+        can_confirm: true,
+        ...overrides,
+      };
+      return {
+        type: "confirm_wiring",
+        step_index: 3,
+        turn_token: "e".repeat(64),
+        payload,
+      };
+    }
+
+    it("names the pending acknowledgement cards while any are open", () => {
+      useInterpretationEventsStore.setState({
+        pendingBySession: {
+          "session-guided": {
+            "card-1": pendingAcknowledgementCard("card-1"),
+            "card-2": pendingAcknowledgementCard("card-2"),
+          },
+        },
+      });
+      // Both blockers at once: the acknowledgement arm takes precedence,
+      // matching the blockers panel's own ordering (the nearer, self-service
+      // blocker first).
+      seedWireStep(["Sink 'out' is missing a required field."]);
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Resolve the 2 pending acknowledgement cards, then press Confirm wiring.",
+      );
     });
 
-    render(<ChatPanel />);
+    it("names the card's issues when the persisted composition is invalid", () => {
+      seedWireStep(["Sink 'out' is missing a required field."]);
 
-    expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
-      "Clear pending acknowledgements, then press Confirm wiring on the decision card.",
-    );
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Fix the issues named on the card, then press Confirm wiring.",
+      );
+    });
+
+    it("names the two real controls when nothing is blocking the confirm", () => {
+      seedWireStep(null);
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Press Confirm wiring on the card, or use its form to change a component.",
+      );
+    });
+
+    it("names the card's issues when the SERVER refuses the confirm", () => {
+      // The wire card's own verdict, which `seedWireStep`'s non-wire next turn
+      // does not carry: `can_confirm` / `blockers` are the usual reason
+      // Confirm is off at step 4 (the pre-commit guided composition is
+      // empty-by-design, so `validationIssues` stays 0), and a caption blind
+      // to them told the learner to press a disabled button.
+      seedWireStep(null);
+      useSessionStore.setState({ guidedNextTurn: wireTurn({ can_confirm: false }) });
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Fix the issues named on the card, then press Confirm wiring.",
+      );
+    });
+
+    it("keeps naming the controls when the wire card confirms cleanly", () => {
+      seedWireStep(null);
+      useSessionStore.setState({ guidedNextTurn: wireTurn() });
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "Press Confirm wiring on the card, or use its form to change a component.",
+      );
+    });
   });
 
   it("renders the per-step placeholder for STEP_3_TRANSFORMS", () => {
@@ -2679,6 +3650,84 @@ describe("ChatPanel mode discriminator", () => {
     expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
       "Describe what each row should become, or how to fix the proposed transforms…",
     );
+  });
+
+  // ── Pre-goal surface (goal-first, elspeth-378cfa0e18) ─────────────────────
+  //
+  // With no composition state the store has adopted the lazy GET /guided stub
+  // and NOTHING is persisted for this session. The panel must ask for the goal
+  // instead of showing the stub's first decision: answering that decision is
+  // not what this Send does (it establishes the root intent), and the stub's
+  // chips would have the user choosing a source plugin two steps early.
+  describe("before the session has a goal", () => {
+    function seedPreGoalSession(): void {
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: activeGuidedSession(),
+        guidedNextTurn: singleSelectTurn(),
+        compositionState: null,
+      });
+    }
+
+    it("asks for the goal instead of the per-step source caption", () => {
+      seedPreGoalSession();
+
+      render(<ChatPanel />);
+
+      expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
+        "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…",
+      );
+    });
+
+    it("renders the goal card in place of the decision card, with no stub chips", () => {
+      seedPreGoalSession();
+
+      const { container } = render(<ChatPanel />);
+
+      expect(
+        screen.getByRole("heading", {
+          name: "What should this pipeline produce?",
+        }),
+      ).toBeVisible();
+      expect(container.querySelector(".guided-goal-prompt")).not.toBeNull();
+      // Strictly either/or: the decision card owns a role=log live region and
+      // the heading id, so rendering both would nest live regions and
+      // duplicate an id.
+      expect(container.querySelector(".guided-current-decision")).toBeNull();
+      expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "CSV" })).toBeNull();
+    });
+
+    it("suppresses Explain, whose canned question would otherwise BECOME the goal", () => {
+      // Explain routes sendGuidedChat(GUIDED_EXPLAIN_MESSAGE) down the same
+      // path the goal takes, and pre-start that path is /guided/start. Pinned
+      // as behaviour rather than left to fall out of the card swap: a later
+      // refactor that hoists Explain out of the decision section would
+      // otherwise silently reintroduce it here.
+      seedPreGoalSession();
+
+      render(<ChatPanel />);
+
+      expect(
+        screen.queryByRole("button", { name: "Explain this step" }),
+      ).toBeNull();
+    });
+
+    it("restores the decision card once the session has a composition state", () => {
+      // The counterpart to the three assertions above: the goal card must not
+      // outlive the pre-start window.
+      seedPreGoalSession();
+      useSessionStore.setState({ compositionState: makeComposition(1) });
+
+      const { container } = render(<ChatPanel />);
+
+      expect(container.querySelector(".guided-goal-prompt")).toBeNull();
+      expect(container.querySelector(".guided-current-decision")).not.toBeNull();
+      screen.getByRole("button", { name: "CSV" });
+      screen.getByRole("button", { name: "Explain this step" });
+    });
   });
 
   it("non-tutorial guided: docks the intent box BELOW the editable form (chat-window layout)", () => {
@@ -2720,7 +3769,7 @@ describe("ChatPanel mode discriminator", () => {
       session_id: "session-guided",
       composition_state_id: "state-1",
       affected_node_id: "rate_node",
-      tool_call_id: "backend_auto_surface:workspace",
+      tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}workspace`,
       user_term: "llm_model_choice:rate_node",
       kind: "llm_model_choice",
       llm_draft: "anthropic/claude-sonnet-4.6",
@@ -3679,6 +4728,7 @@ describe("ChatPanel mode discriminator", () => {
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -3686,10 +4736,13 @@ describe("ChatPanel mode discriminator", () => {
 
     const { container } = render(<ChatPanel isTutorial />);
 
-    // The completed branch has NO internal scroll region — tutorial.css keys
-    // its overflow escape (.tutorial-shell--guided .chat-panel--completed)
-    // on this modifier class; without it the guided shell's overflow:hidden
-    // frame would strand the completion content off-screen.
+    // The modifier class is the tutorial shell's frame hook
+    // (.tutorial-shell--guided .chat-panel--completed in tutorial.css). It
+    // predates the completed surface having an internal scroller — since
+    // elspeth-986801d218 the branch DOES mount .guided-authoring-scroll, so
+    // the shell's overflow escape is belt-and-braces rather than the only
+    // thing keeping the content on screen. The class stays load-bearing for
+    // the band/gutter rules pinned in completionSurface.test.ts.
     const chatMain = container.querySelector("#chat-main");
     expect(chatMain?.classList.contains("chat-panel--completed")).toBe(true);
     // Stepper (all steps done → "Ready") + the completion outcome render.
@@ -3721,6 +4774,7 @@ describe("ChatPanel mode discriminator", () => {
       terminal,
       chat_history: [],
       chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
       profile: null,
     };
     useSessionStore.setState({
@@ -3987,6 +5041,7 @@ describe("ChatPanel mode discriminator", () => {
             },
           ],
           chat_turn_seq: 2,
+          reviewed_components: { sources: [], outputs: [] },
         },
         next_turn: singleSelectTurn("b".repeat(64)),
         terminal: null,
@@ -4240,6 +5295,7 @@ assistant_message_kind: "synthetic_failure",
           },
         ],
         chat_turn_seq: 2,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       };
     }
@@ -4317,6 +5373,68 @@ assistant_message_kind: "synthetic_failure",
       });
     });
 
+    it("resyncs instead of replaying a PARENT session's confirmation hash, and still marks the boundary", async () => {
+      // Two halves of the same settlement shape (review round 1, 2026-09-03):
+      // a fork of a completed session — and a `/guided/reenter` whose content
+      // changed under the exit — clears `terminal` while keeping
+      // `chat_history` and the answered confirm_wiring record. So a LIVE
+      // session can carry post-commit turns.
+      //   (a) Their token is the parent's confirmation hash, which this live
+      //       channel does not accept: resending it submits a dead occurrence.
+      //   (b) They are still after-confirmation turns; without the boundary
+      //       they read as ordinary build conversation under a step_4_wire
+      //       stage divider sitting AHEAD of the session's current step.
+      const CONFIRMATION_HASH = "c".repeat(64);
+      const startGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const forked = guidedSessionWithSyntheticFailure();
+      const [userTurn, failureTurn] = forked.chat_history;
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: {
+          ...forked,
+          history: [
+            {
+              step: "step_4_wire",
+              turn_type: "confirm_wiring",
+              payload_hash: "p".repeat(64),
+              response_hash: CONFIRMATION_HASH,
+              summary: "Wiring confirmed",
+              emitter: "server",
+            },
+          ],
+          chat_history: [
+            {
+              ...userTurn,
+              content: "what does node-2 do?",
+              step: "step_4_wire",
+              turn_token: CONFIRMATION_HASH,
+            },
+            { ...failureTurn, step: "step_4_wire" },
+          ],
+        },
+        // A live turn, under a token of its own: the retry must not silently
+        // become "resend whatever the current token is" either.
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
+        startGuided: startGuidedSpy,
+        chatGuided: chatGuidedSpy,
+      });
+
+      render(<ChatPanel />);
+      expect(screen.getByText("After confirmation")).toBeInTheDocument();
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Retry" }).click();
+      });
+
+      await waitFor(() => {
+        expect(startGuidedSpy).toHaveBeenCalledWith("session-guided");
+      });
+      expect(chatGuidedSpy).not.toHaveBeenCalled();
+    });
+
     it("Retry falls back to refetching guided state when the preceding user turn carries no occurrence token", async () => {
       // A token-less user turn (transcript-only pair, or any shape outside
       // the chat submission path) proves nothing about which occurrence the
@@ -4370,6 +5488,7 @@ assistant_message_kind: "synthetic_failure",
           },
         ],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       };
       useSessionStore.setState({
@@ -4778,6 +5897,140 @@ assistant_message_kind: "synthetic_failure",
     ).toBeNull();
   });
 
+  // ── The locked-prompt "already sent" predicate (goal-first) ───────────────
+  //
+  // It used to be "this step carries ANY user turn that isn't the Explain
+  // question". Goal-first (elspeth-378cfa0e18) breaks that: a started session's
+  // transcript now OPENS with the seeded goal turn, which the server stamps
+  // step_1_source. Under the old predicate that turn alone marked step 1 as
+  // sent — so the locked source box flipped to the static "Sent" line before
+  // the learner had sent anything, and the single-select the tutorial
+  // suppresses came back as a rival driver. The predicate is a TRIMMED EXACT
+  // match against the step's locked prompt, which is what it always meant and
+  // which subsumes the Explain exclusion as a special case.
+  it("tutorial: the seeded goal turn does NOT mark the source step sent", () => {
+    const lockedSource = "Summarise these pages:\nhttps://example.gov.au/page-1";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        chat_history: [
+          {
+            // The goal, seeded by /guided/start at seq 0 and stamped with the
+            // step the session opens on.
+            role: "user",
+            content: "Summarise each page and save the results as JSON.",
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "assistant",
+            content:
+              "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:01Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: lockedSource }} />);
+
+    // The locked box survives with the source prompt still to send…
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input").dataset.value).toBe(lockedSource);
+    expect(
+      screen.queryByText(/your request is in the transcript above/i),
+    ).toBeNull();
+    // …and the rival single-select stays suppressed until it IS sent.
+    expect(screen.queryByRole("button", { name: "CSV" })).toBeNull();
+  });
+
+  it("tutorial: a multi-line locked prompt still matches after ChatInput's trim", () => {
+    // ChatInput trims on send, so the transcript copy of a prompt with
+    // trailing whitespace is not byte-identical to the constant. An untrimmed
+    // equality would leave the box live forever, re-offering a Send the
+    // learner has already made.
+    const lockedSource = "Summarise these pages:\nhttps://example.gov.au/page-1\n";
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_1_source",
+        chat_history: [
+          {
+            role: "user",
+            content: lockedSource.trim(),
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: lockedSource }} />);
+
+    expect(
+      screen.getByText(/your request is in the transcript above/i),
+    ).toBeInTheDocument();
+  });
+
+  it("tutorial: a confirm-only step with no locked prompt is never marked sent", () => {
+    // step_3 joins step_4 as confirm-only (the tutorial's transforms prompt is
+    // the root intent now). With no locked prompt the trimmed comparison is
+    // against "", which no real user turn can equal — the empty read-only box
+    // stays, exactly as it always has at the wire step.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        step: "step_3_transforms",
+        chat_history: [
+          {
+            role: "user",
+            content: "Summarise each page and save the results as JSON.",
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: "create the source" }} />);
+
+    expect(screen.getByTestId("chat-input")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input").dataset.value).toBe("");
+    expect(
+      screen.queryByText(/your request is in the transcript above/i),
+    ).toBeNull();
+  });
+
   it("tutorial: exposes an Add-created source picker after the stage prompt was sent", async () => {
     const respondGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
@@ -4980,6 +6233,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -5004,8 +6258,18 @@ assistant_message_kind: "synthetic_failure",
     expect(chatMain).not.toBeNull();
     expect(chatMain?.classList.contains("chat-panel--completed")).toBe(true);
 
-    // Freeform surface suppressed.
-    expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
+    // The FREEFORM body is suppressed — but the guided composer is not: a
+    // completed session keeps its conversation (elspeth-986801d218), so the
+    // docked "Describe what you want" region is present with the completion
+    // placeholder. The discriminator is the placeholder + the guided region,
+    // not the presence of a box.
+    expect(
+      screen.getByRole("region", { name: "Describe what you want" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("chat-input")).toHaveAttribute(
+      "data-placeholder",
+      "Ask about the pipeline you just built — a step, a route, or what a check means.",
+    );
     expect(screen.queryByTestId("inline-run-results")).toBeNull();
     expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
@@ -5033,6 +6297,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -5045,7 +6310,7 @@ assistant_message_kind: "synthetic_failure",
             session_id: "session-guided",
             composition_state_id: "22222222-2222-2222-2222-222222222222",
             affected_node_id: "summarize_page",
-            tool_call_id: "backend_auto_surface:1",
+            tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}1`,
             user_term: "llm_prompt_template:summarize_page",
             kind: "llm_prompt_template",
             llm_draft: "Summarise {{ row.page_content }}",
@@ -5090,6 +6355,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -5138,6 +6404,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -5177,7 +6444,11 @@ assistant_message_kind: "synthetic_failure",
     ).toBeInTheDocument();
   });
 
-  it("'Switch to guided' button calls enterGuided() when clicked from the freeform body", async () => {
+  it("'Switch to guided' collects a goal from the freeform body and passes it to enterGuided()", async () => {
+    // Goal-first (elspeth-378cfa0e18): the fresh-wizard direction always opens
+    // the confirm card, because the new wizard needs a goal to be rooted on and
+    // this is where the user types it. The old single-click switch produced a
+    // rootless wizard.
     const enterGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -5194,8 +6465,20 @@ assistant_message_kind: "synthetic_failure",
     await act(async () => {
       button.click();
     });
+    expect(enterGuidedSpy).not.toHaveBeenCalled();
+
+    const goalBox = screen.getByLabelText("What should this pipeline produce?");
+    fireEvent.change(goalBox, {
+      target: { value: "Summarise every page as one JSON row." },
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
+    });
 
     expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
+    expect(enterGuidedSpy).toHaveBeenCalledWith(
+      "Summarise every page as one JSON row.",
+    );
   });
 
   it("falls through to the freeform body when terminal.kind === 'exited_to_freeform'", () => {
@@ -5215,6 +6498,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -5294,6 +6578,7 @@ assistant_message_kind: "synthetic_failure",
           },
         ],
         chat_turn_seq: 2,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -5319,6 +6604,155 @@ assistant_message_kind: "synthetic_failure",
     expect(screen.queryByText(/describe the pipeline/i)).not.toBeInTheDocument();
   });
 
+  it("replays a session exited AFTER post-confirmation chat: each turn once, boundary intact (elspeth-986801d218)", () => {
+    // The sibling above replays a build that exited at Step 1, so it says
+    // nothing about the turns 1.5 added. A completed session's questions are
+    // ordinary guided chat turns: each one writes a chat_history user turn
+    // AND an ordinary chat_messages user row, exactly like a pre-confirmation
+    // send — so exiting afterwards puts a SECOND class of duplicate in front
+    // of the replay dedupe, one whose turn_token is the confirmation hash
+    // rather than an occurrence token.
+    //
+    // What this catches: a dedupe keyed on anything narrower than trimmed
+    // content — the guided step, the turn_token, the pre-terminal history
+    // prefix — which would leave every post-commit question rendered twice
+    // on the freeform surface after exit. It also pins that the "After
+    // confirmation" divider survives the exit: `completedGuidedChatToken`
+    // returns null here (the channel is closed), so the boundary can only
+    // come from `afterConfirmationChatToken`'s backwards scan, and losing
+    // that second derivation would silently merge the build conversation
+    // with the questions asked after it.
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    const confirmationHash = "e".repeat(64);
+    const buildPrompt = "Please create a CSV source for this pipeline.";
+    const questionPrompt = "What does the transform step actually do?";
+    const postGraduationPrompt = "Now rename the sink to results.json.";
+
+    function freeformRow(id: string, content: string, at: string): ChatMessage {
+      return {
+        id,
+        session_id: "session-guided",
+        role: "user",
+        content,
+        tool_calls: null,
+        created_at: at,
+      };
+    }
+
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [
+        // The guided-phase send…
+        freeformRow("message-build-user", buildPrompt, "2026-09-03T05:17:04Z"),
+        // …the post-confirmation question, which lands in chat_messages the
+        // same way…
+        freeformRow(
+          "message-question-user",
+          questionPrompt,
+          "2026-09-03T06:00:00Z",
+        ),
+        // …and an ordinary freeform send after the exit.
+        freeformRow(
+          "message-freeform-user",
+          postGraduationPrompt,
+          "2026-09-03T06:30:00Z",
+        ),
+      ],
+      guidedSession: {
+        step: "step_4_wire",
+        history: [
+          {
+            step: "step_4_wire",
+            turn_type: "confirm_wiring",
+            payload_hash: "p".repeat(64),
+            response_hash: confirmationHash,
+            summary: "Wiring confirmed",
+            emitter: "server",
+          },
+        ],
+        terminal,
+        chat_history: [
+          {
+            role: "user",
+            content: buildPrompt,
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-09-03T05:17:04Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: "a".repeat(64),
+          },
+          {
+            role: "assistant",
+            content: "Added a CSV source reading those three pages.",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-09-03T05:17:11Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+          {
+            role: "user",
+            content: questionPrompt,
+            seq: 2,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T06:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: confirmationHash,
+          },
+          {
+            role: "assistant",
+            content: "It copies every row through unchanged.",
+            seq: 3,
+            step: "step_4_wire",
+            ts_iso: "2026-09-03T06:00:06Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+        chat_turn_seq: 4,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+    });
+
+    render(<ChatPanel />);
+
+    const replayGroup = screen.getByRole("group", {
+      name: "Guided build conversation",
+    });
+    // Both assistant replies exist ONLY in chat_history, so both must come
+    // from the replay group.
+    expect(replayGroup).toHaveTextContent(
+      "Added a CSV source reading those three pages.",
+    );
+    expect(replayGroup).toHaveTextContent(
+      "It copies every row through unchanged.",
+    );
+    // Each guided user turn renders EXACTLY once — the pre-confirmation send
+    // and, the half this test exists for, the post-confirmation question.
+    expect(screen.getAllByText(buildPrompt)).toHaveLength(1);
+    expect(screen.getAllByText(questionPrompt)).toHaveLength(1);
+    expect(within(replayGroup).getByText(questionPrompt)).toBeInTheDocument();
+    // The post-exit freeform send is NOT a guided turn and still renders.
+    expect(screen.getByText(postGraduationPrompt)).toBeInTheDocument();
+    expect(within(replayGroup).queryByText(postGraduationPrompt)).toBeNull();
+    // The boundary between the build and the questions asked after it.
+    expect(
+      within(replayGroup).getAllByText("After confirmation"),
+    ).toHaveLength(1);
+  });
+
   it("keeps 'Switch to guided' enabled (reenterable) when the terminal reason is user_pressed_exit", () => {
     // Reversible operator exit — POST /guided/reenter still honours it
     // (routes/composer/guided.py post_guided_reenter). Disabling here would
@@ -5339,6 +6773,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -5380,6 +6815,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -5395,7 +6831,18 @@ assistant_message_kind: "synthetic_failure",
       button.click();
     });
 
+    // A RESUME asks for no goal: the saved wizard already has its root
+    // (goal-first, elspeth-378cfa0e18). Only the fresh-wizard direction
+    // collects one, so the card here is the ordinary two-step confirm.
+    expect(
+      screen.queryByLabelText("What should this pipeline produce?"),
+    ).toBeNull();
+    await act(async () => {
+      screen.getByRole("button", { name: "Confirm switch to guided" }).click();
+    });
+
     expect(enterGuidedSpy).toHaveBeenCalledTimes(1);
+    expect(enterGuidedSpy).toHaveBeenCalledWith(undefined);
   });
 
   it("wraps the guided turn surface in a role=log aria-live=polite region (Task 8.2 a11y)", () => {
@@ -5437,12 +6884,13 @@ assistant_message_kind: "synthetic_failure",
     expect(logRegion?.contains(exitButton)).toBe(false);
   });
 
-  it("does not add a log region on the completed surface (regression pin for Task 8.2 a11y scope)", () => {
-    // The completed branch shows a static summary — no new turns ever arrive,
-    // so there must be no aria-live log region.  This test prevents an
-    // over-zealous future refactor from rehoisting the log wrapper above the
-    // discriminator and announcing the completion summary as if it were a
-    // turn arrival event.
+  it("adds no log region on a completed surface with an EMPTY transcript", () => {
+    // Narrowed honestly (elspeth-986801d218): the completed branch now keeps
+    // its conversation, so a NON-empty transcript does mount a log — see the
+    // sibling test below, which pins that there is exactly one and that the
+    // completion summary sits outside it. What survives from the Task 8.2
+    // a11y pin is the empty case: GuidedChatHistory returns null on an empty
+    // history, so nothing announces the completion summary as a turn arrival.
     const terminal: TerminalState = {
       kind: "completed",
       reason: null,
@@ -5459,6 +6907,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedTerminal: terminal,
@@ -5468,6 +6917,445 @@ assistant_message_kind: "synthetic_failure",
 
     // No live region on the completed surface.
     expect(screen.queryByRole("log")).toBeNull();
+  });
+
+  // ── A completed session keeps its conversation (elspeth-986801d218) ───────
+  //
+  // After Confirm wiring the build is over, but the chat channel stays open:
+  // the user can ask what the committed pipeline does. The surface therefore
+  // grows a live transcript, an "Explain this pipeline" button, the pending
+  // strip, and the SAME docked composer every other guided stage has —
+  // text-only, since there is nothing left to author from a file.
+  //
+  // No `isTutorial` branch appears anywhere in this block: the composer is
+  // editable in the tutorial dwell too, because a locked prompt is an
+  // ACTIVE-stage script concept (ADR-031 — the tutorial inherits the general
+  // surface).
+  describe("completed surface — the conversation survives the commit", () => {
+    // The heading test below wires the REAL cross-store subscribers. Tearing
+    // them down here rather than at the end of that test body means a FAILING
+    // assertion cannot leave a live subscriber (holding a stale composition
+    // snapshot) wired into every subsequent test in this 9k-line file.
+    afterEach(() => {
+      _resetSubscriptionsForTesting();
+    });
+
+    const CONFIRMATION_HASH = "c".repeat(64);
+    const LIVE_TURN_TOKEN = "a".repeat(64);
+
+    const completedTerminal: TerminalState = {
+      kind: "completed",
+      reason: null,
+      pipeline_yaml: "source:\n  plugin: csv\n",
+    };
+
+    function confirmRecord(overrides: Partial<TurnRecord> = {}): TurnRecord {
+      return {
+        step: "step_4_wire",
+        turn_type: "confirm_wiring",
+        payload_hash: "p".repeat(64),
+        response_hash: CONFIRMATION_HASH,
+        summary: "Wiring confirmed",
+        emitter: "server",
+        ...overrides,
+      };
+    }
+
+    function wireChatTurn(overrides: Partial<GuidedWireChatTurn>): GuidedWireChatTurn {
+      return {
+        role: "user",
+        content: "…",
+        seq: 0,
+        step: "step_4_wire",
+        ts_iso: "2026-09-03T12:00:00+00:00",
+        assistant_message_kind: null,
+        synthetic_failure_reason: null,
+        turn_token: null,
+        ...overrides,
+      };
+    }
+
+    function completedSession(
+      overrides: Partial<GuidedSession> = {},
+    ): GuidedSession {
+      return {
+        step: "step_4_wire",
+        history: [confirmRecord()],
+        terminal: completedTerminal,
+        chat_history: [
+          wireChatTurn({
+            seq: 0,
+            content: "why is node-2 here?",
+            turn_token: LIVE_TURN_TOKEN,
+          }),
+          wireChatTurn({
+            seq: 1,
+            role: "assistant",
+            content: "It reshapes each row.",
+            assistant_message_kind: "assistant",
+          }),
+        ],
+        chat_turn_seq: 2,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+        ...overrides,
+      };
+    }
+
+    function seedCompleted(
+      overrides: Partial<Parameters<typeof useSessionStore.setState>[0]> = {},
+      session: GuidedSession = completedSession(),
+    ) {
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: session,
+        guidedTerminal: session.terminal,
+        ...overrides,
+      });
+    }
+
+    it("renders exactly one live log, with the summary and live region OUTSIDE it", () => {
+      seedCompleted();
+
+      const { container } = render(<ChatPanel />);
+
+      const logs = screen.getAllByRole("log");
+      expect(logs).toHaveLength(1);
+      const log = screen.getByRole("log", { name: "Step chat history" });
+      expect(log).toHaveTextContent("why is node-2 here?");
+      expect(log).toHaveTextContent("It reshapes each row.");
+
+      // CompletionSummary stays a DIRECT child of .chat-panel--completed (the
+      // `> .guided-completion` gutter rule is pinned in completionSurface.test)
+      // and outside the log — a heading is not a turn arrival.
+      const completion = container.querySelector(".guided-completion");
+      expect(completion).not.toBeNull();
+      expect(completion!.parentElement?.classList.contains("chat-panel--completed")).toBe(true);
+      expect(log.contains(completion)).toBe(false);
+
+      // The acknowledgement live region must not nest inside another live
+      // region (double-announce).
+      // The always-mounted acknowledgement announcer is a sibling of the
+      // scroller, never nested in another live region (double-announce).
+      const ackLive = container.querySelector(
+        ".chat-panel--completed > [role='status'].visually-hidden",
+      );
+      expect(ackLive).not.toBeNull();
+      expect(log.contains(ackLive)).toBe(false);
+
+      // The conversation column is mounted and is NOT itself a live region.
+      const scroller = screen.getByRole("group", { name: "Conversation" });
+      expect(scroller.querySelector(".guided-chat-bubbles")).not.toBeNull();
+    });
+
+    it("docks the composer with the completion placeholder, editable and upload-free", () => {
+      seedCompleted();
+
+      render(<ChatPanel />);
+
+      expect(
+        screen.getByRole("region", { name: "Describe what you want" }),
+      ).toBeInTheDocument();
+      const input = screen.getByTestId("chat-input");
+      expect(input).toHaveAttribute(
+        "data-placeholder",
+        "Ask about the pipeline you just built — a step, a route, or what a check means.",
+      );
+      // lockedValue=null → an ordinary editable draft box.
+      expect(input).toHaveAttribute("data-read-only", "false");
+      expect(input).toHaveAttribute("data-value", "");
+      // Upload is OFF: no handlers are wired and the affordance is disabled.
+      // An upload here would orphan the blob (nothing is left to author) and
+      // post "resolve this file" as an ordinary provider message.
+      expect(screen.getByTestId("chat-input-upload")).toBeDisabled();
+    });
+
+    it("keeps the composer editable in the TUTORIAL dwell (no isTutorial lock)", () => {
+      // A locked prompt is an ACTIVE-stage script concept; there is no stage
+      // left to script, and hiding/locking the box would remove exactly the
+      // affordance this step delivers.
+      seedCompleted();
+
+      render(<ChatPanel isTutorial lockedChatPrompt={{ step_1_source: "scripted" }} />);
+
+      const input = screen.getByTestId("chat-input");
+      expect(input).toHaveAttribute("data-read-only", "false");
+      expect(input).toHaveAttribute("data-value", "");
+    });
+
+    it("routes a Send on the completed composer through chatGuided", async () => {
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      seedCompleted({ chatGuided: chatGuidedSpy } as never);
+
+      render(<ChatPanel />);
+
+      await act(async () => {
+        screen.getByTestId("chat-input").click();
+      });
+
+      await waitFor(() => {
+        expect(chatGuidedSpy).toHaveBeenCalledWith(
+          "test-chat-message",
+          expect.any(AbortSignal),
+        );
+      });
+    });
+
+    it("sends the canned pipeline question from 'Explain this pipeline'", async () => {
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      seedCompleted({ chatGuided: chatGuidedSpy } as never);
+
+      render(<ChatPanel />);
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Explain this pipeline" }).click();
+      });
+
+      await waitFor(() => {
+        expect(chatGuidedSpy).toHaveBeenCalledWith(
+          GUIDED_EXPLAIN_PIPELINE_MESSAGE,
+          expect.any(AbortSignal),
+        );
+      });
+      // The per-STEP Explain copy is a different question (it asks about the
+      // current step, of which there is none) — the two must not be merged.
+      expect(chatGuidedSpy).not.toHaveBeenCalledWith(
+        GUIDED_EXPLAIN_MESSAGE,
+        expect.any(AbortSignal),
+      );
+    });
+
+    it("keeps the pending strip OUTSIDE the log while a chat is in flight", () => {
+      seedCompleted({ guidedChatPending: true } as never);
+
+      const { container } = render(<ChatPanel />);
+
+      const strip = container.querySelector(".guided-pending-strip");
+      const log = screen.getByRole("log", { name: "Step chat history" });
+      expect(strip).not.toBeNull();
+      expect(log.contains(strip)).toBe(false);
+      expect(
+        screen.getByRole("group", { name: "Conversation" }).contains(strip),
+      ).toBe(true);
+    });
+
+    it("opens the 'After confirmation' divider at the first post-commit turn", () => {
+      seedCompleted(
+        {},
+        completedSession({
+          chat_history: [
+            wireChatTurn({
+              seq: 0,
+              content: "why is node-2 here?",
+              turn_token: LIVE_TURN_TOKEN,
+            }),
+            wireChatTurn({
+              seq: 1,
+              role: "assistant",
+              content: "It reshapes each row.",
+              assistant_message_kind: "assistant",
+            }),
+            wireChatTurn({
+              seq: 2,
+              content: "what does node-2 do?",
+              turn_token: CONFIRMATION_HASH,
+            }),
+          ],
+          chat_turn_seq: 3,
+          reviewed_components: { sources: [], outputs: [] },
+        }),
+      );
+
+      const { container } = render(<ChatPanel />);
+
+      const rows = Array.from(container.querySelectorAll(".message-row"));
+      const dividerIndex = rows.findIndex(
+        (row) => row.textContent === "After confirmation",
+      );
+      expect(dividerIndex).toBeGreaterThanOrEqual(0);
+      const preCommitIndex = rows.findIndex((row) =>
+        (row.textContent ?? "").includes("why is node-2 here?"),
+      );
+      const postCommitIndex = rows.findIndex((row) =>
+        (row.textContent ?? "").includes("what does node-2 do?"),
+      );
+      expect(dividerIndex).toBeGreaterThan(preCommitIndex);
+      expect(dividerIndex).toBeLessThan(postCommitIndex);
+    });
+
+    it("reveals a newly appended transcript row on the completed surface", () => {
+      // The chat-growth reveal effect finds nothing unless the scroller is
+      // mounted — the reason the scroller is a SHARED builder rather than a
+      // copy in the active branch only.
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      seedCompleted();
+
+      const { rerender } = render(<ChatPanel />);
+      scrollIntoView.mockClear();
+
+      act(() => {
+        useSessionStore.setState({
+          guidedSession: completedSession({
+            chat_history: [
+              ...completedSession().chat_history,
+              wireChatTurn({
+                seq: 2,
+                content: "what does node-2 do?",
+                turn_token: CONFIRMATION_HASH,
+              }),
+            ],
+            chat_turn_seq: 3,
+            reviewed_components: { sources: [], outputs: [] },
+          }),
+        });
+      });
+      rerender(<ChatPanel />);
+
+      // block:"start" is the REVEAL call specifically (the step-advance and
+      // rejection presenters use block:"nearest"), and it is issued on the
+      // last [data-seq] row found INSIDE the scroller — so a completed branch
+      // that dropped the scroller would find no rows and never make it.
+      expect(scrollIntoView).toHaveBeenCalledWith(
+        expect.objectContaining({ block: "start" }),
+      );
+    });
+
+    it("retries a PRE-confirmation synthetic failure by resyncing, not by replaying a stale token", async () => {
+      // The completed channel accepts only the confirmation hash; replaying a
+      // live-turn occurrence token would spend a round trip to earn a 409.
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const startGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      seedCompleted(
+        { chatGuided: chatGuidedSpy, startGuided: startGuidedSpy } as never,
+        completedSession({
+          chat_history: [
+            wireChatTurn({
+              seq: 0,
+              content: "why is node-2 here?",
+              turn_token: LIVE_TURN_TOKEN,
+            }),
+            wireChatTurn({
+              seq: 1,
+              role: "assistant",
+              content: "The model is unavailable.",
+              assistant_message_kind: "synthetic_failure",
+              synthetic_failure_reason: "unavailable",
+            }),
+          ],
+          chat_turn_seq: 2,
+          reviewed_components: { sources: [], outputs: [] },
+        }),
+      );
+
+      render(<ChatPanel />);
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Retry" }).click();
+      });
+
+      expect(startGuidedSpy).toHaveBeenCalledWith("session-guided");
+      expect(chatGuidedSpy).not.toHaveBeenCalled();
+    });
+
+    it("retries a POST-confirmation synthetic failure by resending the confirmation token", async () => {
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const startGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      seedCompleted(
+        { chatGuided: chatGuidedSpy, startGuided: startGuidedSpy } as never,
+        completedSession({
+          chat_history: [
+            wireChatTurn({
+              seq: 0,
+              content: "what does node-2 do?",
+              turn_token: CONFIRMATION_HASH,
+            }),
+            wireChatTurn({
+              seq: 1,
+              role: "assistant",
+              content: "The model is unavailable.",
+              assistant_message_kind: "synthetic_failure",
+              synthetic_failure_reason: "unavailable",
+            }),
+          ],
+          chat_turn_seq: 2,
+          reviewed_components: { sources: [], outputs: [] },
+        }),
+      );
+
+      render(<ChatPanel />);
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Retry" }).click();
+      });
+
+      await waitFor(() => {
+        expect(chatGuidedSpy).toHaveBeenCalledWith(
+          "what does node-2 do?",
+          expect.any(AbortSignal),
+          undefined,
+          CONFIRMATION_HASH,
+        );
+      });
+      expect(startGuidedSpy).not.toHaveBeenCalled();
+    });
+
+    it("keeps the heading at 'Pipeline ready' across a content-equal version bump", async () => {
+      // The end-to-end reason compositionContentEqual exists: a post-completion
+      // chat settles a byte-identical composition row. If the version-keyed
+      // subscribers treat that as an edit, the verdict is cleared, readiness
+      // drops and the heading flips to "Pipeline updated" — the pipeline reads
+      // as un-verified because the user asked a question about it.
+      _resetSubscriptionsForTesting();
+      const composition = makeComposition(1, {
+        id: "state-1",
+        session_id: "session-guided",
+        is_valid: true,
+      });
+      useExecutionStore.setState({
+        validate: vi.fn().mockResolvedValue(undefined),
+        validationResult: {
+          is_valid: true,
+          errors: [],
+          warnings: [],
+          readiness: {
+            authoring_valid: true,
+            execution_ready: true,
+            completion_ready: true,
+            blockers: [],
+          },
+        },
+      } as never);
+      seedCompleted({ compositionState: null } as never);
+      initStoreSubscriptions();
+      // The version-clear subscriber only compares against a version it has
+      // SEEN (`previousVersion` starts null and the first write merely seeds
+      // it), so version 1 must land as its own store write or the bump below
+      // would be the seeding write and clear nothing — the test would pass
+      // against any implementation.
+      await act(async () => {
+        useSessionStore.setState({ compositionState: composition });
+        await Promise.resolve();
+      });
+
+      render(<ChatPanel />);
+      expect(
+        screen.getByRole("heading", { name: "Pipeline ready" }),
+      ).toBeInTheDocument();
+
+      await act(async () => {
+        useSessionStore.setState({
+          compositionState: { ...composition, id: "state-2", version: 2 },
+        });
+        await Promise.resolve();
+      });
+
+      expect(
+        screen.getByRole("heading", { name: "Pipeline ready" }),
+      ).toBeInTheDocument();
+    });
   });
 
   it("falls through to the freeform body when guidedSession is active but guidedNextTurn is null", () => {
@@ -5560,6 +7448,7 @@ assistant_message_kind: "synthetic_failure",
         terminal,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: null,
@@ -5588,6 +7477,11 @@ describe("ChatPanel guided step-advance focus (spec §7.4)", () => {
     vi.resetAllMocks();
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    // These are all STARTED sessions being advanced through their steps, so
+    // they carry a persisted composition state; without it the panel renders
+    // the pre-goal card (goal-first, elspeth-378cfa0e18) and there is no turn
+    // widget to take focus.
+    useSessionStore.setState({ compositionState: makeComposition(1) });
     (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
       sendMessage: vi.fn(),
       retryMessage: vi.fn(),
@@ -5605,7 +7499,15 @@ describe("ChatPanel guided step-advance focus (spec §7.4)", () => {
   };
 
   function activeGuidedSession(): GuidedSession {
-    return { step: "step_1_source", history: [], terminal: null, chat_history: [], chat_turn_seq: 0, profile: null };
+    return {
+      step: "step_1_source",
+      history: [],
+      terminal: null,
+      chat_history: [],
+      chat_turn_seq: 0,
+      reviewed_components: { sources: [], outputs: [] },
+      profile: null,
+    };
   }
 
   // Options are intentionally distinct per step so that test 2's assertion at
@@ -7414,6 +9316,7 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
         terminal: null,
         chat_history: [],
         chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
         profile: null,
       },
       guidedNextTurn: {
@@ -7660,6 +9563,654 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       event.id,
       { choice: "accepted_as_drafted" },
     );
+  });
+
+  // ── elspeth-51ed4fd8d5: anchoring and survival ────────────────────────────
+  //
+  // The confirmation used to be ChatPanel-local state appended to a list and
+  // rendered after the whole turn stream. Append order WAS the position, so
+  // the bubble was permanently last: resolve a card, send another message, and
+  // "Got it" sat below that message reading as a reply to it, with several
+  // resolutions piling up as a block at the tail. It was also never hydrated,
+  // so a reload erased the operator's approvals from the transcript entirely.
+  //
+  // Both tests below fail against that implementation, and neither is
+  // satisfied by "a confirmation is somewhere on screen" — the two assertions
+  // the old tests made.
+
+  function messagesRaisingToolCall(toolCallId: string): ChatMessage[] {
+    const mk = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: sessionFixture.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-05-18T10:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    return [
+      mk({ id: "u1", role: "user", content: "make me a leads csv" }),
+      mk({
+        id: "a1",
+        role: "assistant",
+        tool_calls: [
+          {
+            id: toolCallId,
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+      }),
+      mk({ id: "a2", role: "assistant", content: "Pipeline update ready." }),
+      mk({ id: "u2", role: "user", content: "now rate each lead" }),
+    ];
+  }
+
+  it("anchors the confirmation to the turn that raised the term, not the tail", () => {
+    // The resolved row arrives the way refreshAll delivers it on load.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "inline_source_data",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/inline_source_data/);
+
+    // Document order is the assertion — MessageBubble is mocked in this file,
+    // so its wrapper classes are not available to anchor on and would be a
+    // mock artefact if they were.
+    //
+    // The reported defect exactly: the confirmation must come BEFORE the user
+    // turn that was sent afterwards, or it reads as a reply to that turn.
+    const laterUserTurn = screen.getByText("now rate each lead");
+    expect(
+      confirmation.compareDocumentPosition(laterUserTurn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // …and AFTER the turn that raised it, so it reads as that turn's closure
+    // rather than as a preamble to it.
+    const agentTurn = screen.getByText("Pipeline update ready.");
+    expect(
+      agentTurn.compareDocumentPosition(confirmation) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("rebuilds confirmations from the store, so a reload does not erase them", () => {
+    // No interaction at all — this is a fresh mount reading what refreshAll
+    // fetched, i.e. the state after a page reload. The old implementation
+    // rendered nothing here: its list was seeded [] and only ever appended to
+    // by an onResolved callback that a reload never fires.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-1",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "quality",
+              choice: "accepted_as_drafted",
+            }),
+            makeInterpretationEvent({
+              id: "evt-2",
+              session_id: sessionFixture.id,
+              // No anchor available: still shown, after the stream, rather
+              // than dropped — an approval the operator gave is not discarded
+              // for want of a place to put it.
+              tool_call_id: null,
+              user_term: "rate_lead_quality",
+              choice: "amended",
+            }),
+            makeInterpretationEvent({
+              id: "evt-3",
+              session_id: sessionFixture.id,
+              // Opt-out rows carry no term and must stay silent — the opt-out
+              // flow has its own confirm dialog.
+              tool_call_id: null,
+              user_term: null,
+              choice: "opted_out",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(2);
+    expect(confirmations.map((node) => node.textContent).join(" ")).toMatch(
+      /quality[\s\S]*rate_lead_quality/,
+    );
+  });
+
+  it("stays silent for surface-specific auto_interpreted_opt_out rows even though they carry a term and an anchor (elspeth-3a8a843c47)", () => {
+    // The dangerous shape: when the session has opted out of interpretation
+    // review and the composer LLM later calls request_interpretation_review,
+    // the backend writes a born-resolved row that
+    // ck_interpretation_events_opt_out_shape REQUIRES to carry a non-null
+    // user_term AND tool_call_id — the audit trail must record what was baked
+    // without review. Field presence therefore marks a DECLINED review, not
+    // an approval; rendering "Got it — using your interpretation of <term>."
+    // for it asserts an approval the operator explicitly refused to give.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-auto-baked",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "engagement",
+              choice: "opted_out",
+              interpretation_source: "auto_interpreted_opt_out",
+              accepted_value: "trendy",
+              resolved_at: "2026-05-18T10:05:00Z",
+              actor: "composer-llm",
+            }),
+            // A genuine approval alongside it: the fix must classify by
+            // choice, not blanket-suppress the confirmation surface.
+            makeInterpretationEvent({
+              id: "evt-approved",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "lead_quality",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(1);
+    expect(confirmations[0].textContent).toMatch(/lead_quality/);
+    expect(
+      confirmations.map((node) => node.textContent).join(" "),
+    ).not.toMatch(/engagement/);
+  });
+
+  // ── elspeth-52be5924d7: same term approved twice under one turn ───────────
+  //
+  // The backend guarantees this shape arrives on DISTINCT tool_call_ids: the
+  // staging dedup is scoped per (kind, user_term, affected_node_id), so the
+  // same term against two nodes is two pending events, and the
+  // uq_interpretation_events_pending_tool_call index forbids two pendings
+  // sharing a call id. pipeline_decision terms make it deterministic — every
+  // raw-HTML-cleanup review on every field_mapper uses the literal constant
+  // 'drop_raw_html_fields'. The old key `${turn.id}:${userTerm}` discarded
+  // exactly that differentiator.
+
+  function messagesRaisingTwoToolCalls(
+    callIdA: string,
+    callIdB: string,
+  ): ChatMessage[] {
+    const mk = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: sessionFixture.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-05-18T10:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    return [
+      mk({ id: "u1", role: "user", content: "clean both scraped sources" }),
+      mk({
+        id: "a1",
+        role: "assistant",
+        tool_calls: [
+          {
+            id: callIdA,
+            type: "function",
+            function: {
+              name: "request_interpretation_review",
+              arguments: "{}",
+            },
+          },
+          {
+            id: callIdB,
+            type: "function",
+            function: {
+              name: "request_interpretation_review",
+              arguments: "{}",
+            },
+          },
+        ],
+      }),
+      mk({ id: "a2", role: "assistant", content: "Both cleanups staged." }),
+    ];
+  }
+
+  function seedSameTermApprovedOnTwoNodes() {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-clean-main",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-clean-main",
+              affected_node_id: "cleanup_html_main",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-clean-comments",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-clean-comments",
+              affected_node_id: "cleanup_html_comments",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingTwoToolCalls(
+        "call-clean-main",
+        "call-clean-comments",
+      ),
+    });
+  }
+
+  it("keys same-term approvals under one turn distinctly — no React duplicate-key error", () => {
+    // Fails if the anchored key reverts to `${turn.id}:${userTerm}`: React
+    // logs "Encountered two children with the same key" through
+    // console.error for the two same-term siblings.
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    seedSameTermApprovedOnTwoNodes();
+    render(<ChatPanel />);
+
+    expect(
+      screen.getAllByTestId("interpretation-review-confirmation"),
+    ).toHaveLength(2);
+    const duplicateKeyErrors = consoleError.mock.calls.filter((args) =>
+      args.some(
+        (arg) =>
+          typeof arg === "string" &&
+          arg.includes("two children with the same key"),
+      ),
+    );
+    expect(duplicateKeyErrors).toHaveLength(0);
+  });
+
+  it("labels each anchored confirmation with the node the approval bound to", () => {
+    // Two approvals of the same term are two audit-distinct events; without
+    // the node on the card the operator cannot tell which approval echoed
+    // which review. Fails if InterpretationConfirmation renders only the
+    // term.
+    seedSameTermApprovedOnTwoNodes();
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmations).toHaveLength(2);
+    // flatMap order follows the turn's aggregatedToolCalls order.
+    expect(confirmations[0].textContent).toMatch(/cleanup_html_main/);
+    expect(confirmations[0].textContent).not.toMatch(/cleanup_html_comments/);
+    expect(confirmations[1].textContent).toMatch(/cleanup_html_comments/);
+    expect(confirmations[1].textContent).not.toMatch(/cleanup_html_main/);
+  });
+
+  it("labels a tail confirmation with its node", () => {
+    // The tail path always had unique keys but the same missing node
+    // identity. A row with no tool_call_id still carries the node the
+    // approval bound to.
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-tail",
+              session_id: sessionFixture.id,
+              tool_call_id: null,
+              affected_node_id: "rater",
+              user_term: "lead_quality",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/lead_quality/);
+    expect(confirmation.textContent).toMatch(/rater/);
+  });
+
+  // ── elspeth-3574f87208: the labeled approvals section ─────────────────────
+  //
+  // Three structural classes can never anchor: backend-auto-surfaced rows
+  // (the sentinel tool_call_id matches no provider call by construction),
+  // guided-raised rows (guided turns persist no assistant chat rows), and
+  // seed/revert/import rows (bound to states no chat row references). For a
+  // session with LLM nodes these are the NORMAL case, not residue — and
+  // unsectioned they rendered as assistant bubbles below the newest turn,
+  // reading as replies to it, one per resolution, rehydrated on every load.
+  // The fix is the REGISTER: a labeled section plus a non-assistant row
+  // style. Every test here fails against the pre-ruling implementation.
+
+  it("routes a resolved backend-auto-surfaced confirmation into the labeled approvals section, off the assistant register", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-sentinel",
+              session_id: sessionFixture.id,
+              // The exact previously-uncovered shape: a RESOLVED row whose
+              // non-null tool_call_id is absent from every rendered turn.
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}11111111`,
+              affected_node_id: "summarize",
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              llm_draft: "Summarise {{ row.page_content }}",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    const confirmation = within(section).getByTestId(
+      "interpretation-review-confirmation",
+    );
+    expect(confirmation.textContent).toMatch(/llm_prompt_template:summarize/);
+    // The register IS the fix: the row must not assert assistant speech.
+    expect(confirmation.className).not.toMatch(/message-row--assistant/);
+    expect(confirmation.querySelector(".bubble-assistant")).toBeNull();
+    // The section still follows the whole stream — honesty comes from the
+    // labeled register, not from moving the block.
+    const laterUserTurn = screen.getByText("now rate each lead");
+    expect(
+      laterUserTurn.compareDocumentPosition(section) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("labels the approvals section with the count and lists every unanchorable approval", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-s1",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}aa`,
+              affected_node_id: "summarize",
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:06:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-s2",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}bb`,
+              affected_node_id: "rate",
+              user_term: "llm_model_choice:rate",
+              kind: "llm_model_choice",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:07:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-vanished",
+              session_id: sessionFixture.id,
+              // Provider-style id absent from rendered turns: the
+              // onScreen-miss branch, not the null branch.
+              tool_call_id: "call-vanished",
+              affected_node_id: "cleaner",
+              user_term: "drop_raw_html_fields",
+              kind: "pipeline_decision",
+              choice: "amended",
+              resolved_at: "2026-05-18T10:08:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    expect(
+      within(section).getByRole("heading", {
+        name: "Interpretation approvals (3)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(section).getAllByTestId("interpretation-review-confirmation"),
+    ).toHaveLength(3);
+  });
+
+  it("keeps the anchored confirmation in the approval register too, and mounts no section when nothing is unanchorable", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-anchored",
+              session_id: sessionFixture.id,
+              tool_call_id: "call-set-pipeline",
+              user_term: "inline_source_data",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: messagesRaisingToolCall("call-set-pipeline"),
+    });
+
+    render(<ChatPanel />);
+
+    const confirmation = screen.getByTestId(
+      "interpretation-review-confirmation",
+    );
+    // One component, one register — the anchored echo is a system
+    // attestation exactly as much as the tail one.
+    expect(confirmation.className).toMatch(
+      /message-row--interpretation-approval/,
+    );
+    expect(confirmation.className).not.toMatch(/message-row--assistant/);
+    expect(confirmation.querySelector(".bubble-assistant")).toBeNull();
+    expect(
+      screen.queryByTestId("interpretation-approvals-section"),
+    ).toBeNull();
+  });
+
+  it("shows guided-raised approvals in the approvals section on a graduated session", () => {
+    // Class (B): guided turns persist zero assistant chat rows, so a
+    // guided-raised approval has no turn to anchor to. A session that
+    // exited to freeform falls through to the freeform body (the completed
+    // branch early-returns before it), where the approval must surface in
+    // the labeled section rather than as a fake assistant reply.
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-guided",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}wire-confirm`,
+              affected_node_id: "rate_node",
+              user_term: "llm_model_choice:rate_node",
+              kind: "llm_model_choice",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:09:00Z",
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal,
+        chat_history: [],
+        chat_turn_seq: 0,
+        reviewed_components: { sources: [], outputs: [] },
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+    });
+
+    render(<ChatPanel />);
+
+    const section = screen.getByTestId("interpretation-approvals-section");
+    expect(
+      within(section).getByTestId("interpretation-review-confirmation")
+        .textContent,
+    ).toMatch(/rate_node/);
+  });
+
+  it("stamps a confirmation with its resolved_at time and omits the stamp when unresolved metadata is absent", () => {
+    act(() => {
+      useInterpretationEventsStore.setState({
+        resolvedBySession: {
+          [sessionFixture.id]: [
+            makeInterpretationEvent({
+              id: "evt-stamped",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}cc`,
+              user_term: "llm_prompt_template:summarize",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: "2026-05-18T10:05:00Z",
+            }),
+            makeInterpretationEvent({
+              id: "evt-unstamped",
+              session_id: sessionFixture.id,
+              tool_call_id: `${BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}dd`,
+              user_term: "llm_prompt_template:rate",
+              kind: "llm_prompt_template",
+              choice: "accepted_as_drafted",
+              resolved_at: null,
+            }),
+          ],
+        },
+      });
+    });
+    useSessionStore.setState({
+      activeSessionId: sessionFixture.id,
+      sessions: [sessionFixture],
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    const confirmations = screen.getAllByTestId(
+      "interpretation-review-confirmation",
+    );
+    const stamped = confirmations.find((node) =>
+      /summarize/.test(node.textContent ?? ""),
+    );
+    const unstamped = confirmations.find((node) =>
+      /rate/.test(node.textContent ?? ""),
+    );
+    expect(stamped).toBeDefined();
+    expect(unstamped).toBeDefined();
+    const time = stamped!.querySelector("time");
+    expect(time).not.toBeNull();
+    expect(time!.getAttribute("datetime")).toBe("2026-05-18T10:05:00Z");
+    expect(unstamped!.querySelector("time")).toBeNull();
   });
 });
 
@@ -8215,16 +10766,151 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
   });
 
   it("keeps the pill's jump behaviour through the new structure", () => {
-    renderScrolledUpPanel();
+    const { scroll } = renderScrolledUpPanel();
 
     const pill = screen.getByRole("button", { name: "Scroll to bottom" });
     fireEvent.click(pill);
 
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
-      behavior: "smooth",
-    });
+    // The transcript lands at its end (the helper stubs scrollHeight 1000).
+    expect(scroll.scrollTop).toBe(1000);
     expect(
       screen.queryByRole("button", { name: "Scroll to bottom" }),
     ).toBeNull();
+  });
+
+  it("scrolls the transcript BY NAME, never by walking ancestors", () => {
+    // This assertion is the whole defect, so it is worth stating plainly:
+    // scrollIntoView scrolls every scrollable ancestor of its target, and
+    // `overflow: hidden` does not make a box unscrollable — it only hides the
+    // scrollbar. All three freeform call sites used to fire it at a sentinel
+    // inside the transcript, and whenever the docked chrome pushed
+    // .chat-panel's content past its own box the call scrolled the PANEL:
+    // measured in Chrome at scrollTop 0 -> 130, .chat-panel-header carried to
+    // -49, the composer left floating above a void that no re-render could
+    // clear because a scroll offset is not React state. Only a reload fixed it.
+    //
+    // Asserting "the transcript ended up at the bottom" would NOT catch that —
+    // the old code satisfied it too, on its way past. The observable that
+    // separates a correct scroll from the defect is the INSTRUMENT: a scroller
+    // named directly cannot move anything above it. So this pins zero
+    // scrollIntoView calls on the freeform path, and it is the assertion that
+    // fails if anyone reaches for the convenient API again.
+    const walkSpy = vi.fn();
+    Element.prototype.scrollIntoView = walkSpy;
+
+    const { scroll } = renderScrolledUpPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Scroll to bottom" }));
+
+    expect(walkSpy).not.toHaveBeenCalled();
+    expect(scroll.scrollTop).toBe(1000);
+  });
+
+  it("pins the panel as a clip box and the dock as the yielding claimant", () => {
+    // jsdom computes no layout, so the two rules that make the fix structural
+    // are unobservable to a DOM test — same stylesheet-reading idiom as the
+    // positioning-contract test above, for the same reason.
+    // Comments are stripped first: both rules below CARRY a comment that
+    // quotes the declaration it replaced, so a naive match reads the prose as
+    // the code and the negative assertion below inverts.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/chat.css"),
+      "utf8",
+    ).replace(/\/\*[\s\S]*?\*\//g, "");
+    // EVERY body for the selector, not the first. A regex that stops at the
+    // first match would miss a later override — inside an @media block, say —
+    // which is precisely the regression these assertions exist to catch.
+    const ruleBodies = (selector: string): string[] => {
+      const bodies: string[] = [];
+      const pattern = new RegExp(`(^|[\\s,}])${selector}\\s*\\{([^{}]*)\\}`, "gm");
+      for (const match of css.matchAll(pattern)) bodies.push(match[2]);
+      return bodies;
+    };
+    const declaration = (bodies: string[], property: string): string | null => {
+      // The LAST declaration across all matching rules is the one that wins,
+      // which also lets a `hidden`-then-`clip` progressive-enhancement pair be
+      // written correctly in future without failing this test.
+      // The value class must admit functional notation — `min(160px, 30%)`
+      // is a value this stylesheet actually ships, and a narrower class
+      // silently skips it and reports an EARLIER declaration as the winner.
+      const pattern = new RegExp(`(?:^|[;{\\s])${property}:\\s*([^;{}]+?);`, "g");
+      let winner: string | null = null;
+      for (const body of bodies) {
+        for (const match of body.matchAll(pattern)) winner = match[1].trim();
+      }
+      return winner;
+    };
+
+    // `clip` is load-bearing, not a synonym for `hidden`: a clip box is not a
+    // scroll container, so no ancestor walk — scrollIntoView, focus(),
+    // find-in-page, an AT caret — can give this panel a scroll offset at all.
+    // Reverting this one word restores the defect even with the call sites
+    // fixed, because the panel becomes scrollable again.
+    const panelRules = ruleBodies("\\.chat-panel");
+    expect(panelRules.length).toBeGreaterThan(0);
+    expect(declaration(panelRules, "overflow")).toBe("clip");
+
+    // The dock absorbs the deficit so .chat-input never does. overflow-y:auto
+    // is the mechanism — it zeroes the dock's automatic minimum size AND
+    // keeps every docked surface reachable while the box is squeezed. Drop it
+    // and the composer is pushed through the panel's bottom edge again
+    // (measured 944px below it at a short panel, clipped away entirely).
+    const dock = ruleBodies("\\.chat-panel-dock");
+    expect(declaration(dock, "flex")).toBe("0 1 auto");
+    expect(declaration(dock, "overflow-y")).toBe("auto");
+    // Scroll chaining out of the dock into the transcript, same treatment as
+    // .chat-panel > .ack-stack.
+    expect(declaration(dock, "overscroll-behavior")).toBe("contain");
+
+    // The composer never yields — DECLARED. Without this, .chat-input is
+    // shrinkable (flex-shrink defaults to 1) and survives only on
+    // min-height:auto freezing it at its content minimum. Adding this
+    // codebase's own `min-height: 0` idiom to that rule collapsed it from
+    // 169px to 54px with every other test still green.
+    expect(declaration(ruleBodies("\\.chat-input"), "flex-shrink")).toBe("0");
+
+    // The transcript never reaches zero. `flex: 1` carries a zero basis, so
+    // this region contributes NOTHING to shrinking and is driven to 0 before
+    // the dock yields a pixel — leaving the operator approving a pipeline
+    // mutation with no visible conversation. The min() clamp is load-bearing:
+    // a bare 160px floor overflowed the panel at 367px.
+    const regionFloor = declaration(
+      ruleBodies("\\.chat-panel-messages-region"),
+      "min-height",
+    );
+    expect(regionFloor).toMatch(/^min\(/);
+  });
+
+  it("docks every optional surface, and never the composer, inside the dock", () => {
+    // The dock only settles the budget if the composer is OUTSIDE it: a
+    // .chat-input that shrank with the dock would be squeezed away instead of
+    // pushed away — the same operator-facing loss by a different route.
+    const { container } = renderScrolledUpPanel();
+
+    const panel = container.querySelector<HTMLElement>("#chat-main");
+    const dock = container.querySelector<HTMLElement>(".chat-panel-dock");
+    expect(dock).not.toBeNull();
+    expect(dock!.parentElement).toBe(panel);
+
+    const input = screen.getByTestId("chat-input");
+    expect(dock!.contains(input)).toBe(false);
+    // …and it renders BELOW the dock. Document order rather than
+    // lastElementChild: the ChatInput mock in this file returns a fragment, so
+    // the panel's last element child is an artefact of the mock's shape.
+    //
+    // Order is NOT why the dock is what gets squeezed — flex shrinkage is
+    // simultaneous and proportional to flex-shrink x flex-basis, then
+    // redistributed as items freeze at their clamps. The dock yields because
+    // its floor is 0 (it is a scroll container) while .chat-input's is
+    // declared flex-shrink: 0. Both facts are asserted in the stylesheet test.
+    expect(
+      dock!.compareDocumentPosition(input) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // The optional surfaces are inside it. The composer-progress card is the
+    // one that grows without bound (its details default OPEN on a terminal
+    // phase), so it is the load-bearing member of the group.
+    const indicator = panel!.querySelector(".composing-indicator");
+    if (indicator !== null) expect(dock!.contains(indicator)).toBe(true);
   });
 });

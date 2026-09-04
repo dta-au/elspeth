@@ -130,7 +130,11 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     name="list_secret_refs",
     handler=_handle_list_secret_refs,
     kind=ToolKind.SECRET_DISCOVERY,
-    description="List available secret references (API keys, credentials). Shows names and scopes, never values.",
+    description=(
+        "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+        "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
+        "does not); never values."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 
@@ -170,7 +174,10 @@ _VALIDATE_SECRET_REF_DECLARATION = ToolDeclaration(
     name="validate_secret_ref",
     handler=_handle_validate_secret_ref,
     kind=ToolKind.SECRET_DISCOVERY,
-    description="Check if a secret reference exists and is accessible to the current user.",
+    description=(
+        "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
+        "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -251,13 +258,14 @@ def _execute_wire_secret_ref(
         node = next((n for n in state.nodes if n.id == target_id), None)
         if node is None:
             return _failure_result(state, f"Node '{target_id}' not found.")
-        if node.node_type not in ("transform", "aggregation") or node.plugin is None:
+        if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
             return _failure_result(
                 state,
-                "Secret references can only be wired into source, transform, aggregation, or output plugin options.",
+                "Secret references can only be wired into source, transform, aggregation, collector, or output plugin options.",
             )
-        # ``"transform"`` covers aggregation nodes too — the same vocabulary
-        # ``_secret_ref_placement_error`` uses for this arm below.
+        # ``"transform"`` covers aggregation and collector nodes too — the
+        # same vocabulary ``_secret_ref_placement_error`` and centralized
+        # authored-state admission use for this arm below.
         authorization_error = secret_wiring_authorization_error(
             context.secret_wiring_policy,
             secret_name=name,

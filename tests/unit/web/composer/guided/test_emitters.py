@@ -14,6 +14,7 @@ from elspeth.web.composer.guided.emitters import (
     build_initial_step_1_turn,
     build_step_1_schema_form_turn,
     build_step_1_schema_form_turn_from_resolved,
+    build_step_2_multi_select_turn,
     build_step_2_schema_form_turn,
     build_step_4_wire_turn,
 )
@@ -456,6 +457,8 @@ class TestBuildSchemaFormTurns:
             "label": "On Write Failure",
             "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
             "kind": "text",
+            # KnobField requires a tier; the synthesized wrapper knob carries
+            # "common" like the catalog's own wrapper-synthesized knobs.
             "tier": "common",
             "required": False,
             "nullable": False,
@@ -680,6 +683,69 @@ class TestStep4WireEmitter:
             {"key": "select_only", "value": "unmapped fields pass through", "tier": "common"},
         ]
 
+    def test_llm_options_summary_carries_model_and_prompts_before_commit(self) -> None:
+        # I-2 (design review 2026-09-02): the wire card must show what the
+        # model is asked to do; the prompt was invisible until the post-commit
+        # approval card. Nothing adjacent — credentials, endpoints, prompt file
+        # paths, sampling knobs — and nothing row-shaped (D1) rides along.
+        turn = _wire_turn(
+            _field_mapper_state(
+                plugin="llm",
+                options={
+                    "schema": {"mode": "observed"},
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                    "system_prompt": "You are a careful reviewer.",
+                    "prompt_template": "Summarise {{ row.body }} in one sentence.",
+                    "temperature": 0.7,
+                    "api_key": "sk-live-SECRET",
+                    "base_url": "https://gateway.internal/v1",
+                    "prompt_template_source": "/private/prompts/summarise.j2",
+                    "observed": {"samples": [{"body": "ROW-SAMPLE-TEXT"}]},
+                },
+            )
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
+        assert node["node_options_summary"] == [
+            {"key": "model", "value": "anthropic/claude-sonnet-4", "tier": "common"},
+            {"key": "system_prompt", "value": "You are a careful reviewer.", "tier": "common"},
+            {"key": "prompt_template", "value": "Summarise {{ row.body }} in one sentence.", "tier": "common"},
+        ]
+        rendered = str(turn)
+        for private in ("sk-live", "gateway.internal", "/private/", "ROW-SAMPLE-TEXT", "0.7"):
+            assert private not in rendered
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_web_scrape_options_summary_carries_only_the_scraping_identity(self) -> None:
+        # I-2: the abuse contact and scraping reason are the post-commit
+        # identity review's material; they show before commit through the
+        # DISPLAY-ONLY table (never correctable — red-team F1, 2026-09-02).
+        # The rest of the http policy (SSRF allowlist, timeout, body cap)
+        # stays off the wire.
+        turn = _wire_turn(
+            _field_mapper_state(
+                plugin="web_scrape",
+                options={
+                    "schema": {"mode": "observed"},
+                    "url_field": "url",
+                    "http": {
+                        "abuse_contact": "ops@example.org",
+                        "scraping_reason": "catalogue refresh",
+                        "allowed_hosts": ["10.0.0.0/8"],
+                        "timeout": 5,
+                    },
+                },
+            )
+        )
+
+        node = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "web_scrape")
+        assert node["node_options_summary"] == [
+            {"key": "http", "value": "contact: ops@example.org; reason: catalogue refresh", "tier": "common"},
+        ]
+        assert "10.0.0.0" not in str(turn)
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
     def test_options_summary_is_empty_for_a_plugin_outside_the_allowlist(self) -> None:
         turn = _wire_turn(
             _field_mapper_state(
@@ -843,6 +909,35 @@ class TestStep4WireEmitter:
             "expected_output_count": None,
         }
 
+    def test_unbound_llm_probe_preserves_degraded_cardinality_fallback(self) -> None:
+        """An invalid draft without profile/provider/model still renders safely."""
+
+        node = NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="results",
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "prompt_template": "Summarise this row.",
+                "response_field": "summary",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+        assert _node_cardinality(node, executable_node=node) == {
+            "input": "one",
+            "output": "zero_or_many",
+            "expected_output_count": None,
+        }
+
     @staticmethod
     def _gate_node(*, condition: str, routes: dict[str, str], fork_to: tuple[str, ...] | None = None) -> NodeSpec:
         return NodeSpec(
@@ -935,11 +1030,11 @@ class TestStep4WireEmitter:
         assert wire_gate["behavior"]["condition"] == "row['score'] >= 9"
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
-    def test_profile_bound_authored_fallback_renders_degraded_cardinality_without_raising(self) -> None:
-        # inv-f6 F6 hardening: an authored-only validation_state (operator
-        # profile options never lowered because authored validation already
-        # errs) must render a degraded wire review — the row-cardinality
-        # probe must not crash on the plugin's runtime config rejection.
+    def test_profile_bound_authored_probe_renders_runtime_cardinality(self) -> None:
+        # Profile-authored LLM options are projected through the same inert
+        # provider/model binding used by Stage-1 validation. The probe now
+        # constructs the real transform contract instead of falling back to
+        # a degraded cardinality claim.
         state = CompositionState(
             source=None,
             sources={
@@ -992,7 +1087,7 @@ class TestStep4WireEmitter:
         llm = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
         assert llm["row_cardinality"] == {
             "input": "one",
-            "output": "zero_or_many",
+            "output": "one",
             "expected_output_count": None,
         }
 
@@ -1174,3 +1269,37 @@ class TestSchemaFormPathMask:
         )
         turn = build_step_1_schema_form_turn_from_resolved(source, _Catalog())
         assert turn["payload"]["prefilled"]["path"] == "data/input.json"
+
+
+class TestStep2FieldsTurnDefaultGesture:
+    """I-3 (design review 2026-09-02): the fields turn pre-pins nothing.
+
+    The turn is asked at Step 2, before any transform exists, so the fields the
+    pipeline is about to produce are never among its options. Pre-selecting the
+    source's columns made the one-click answer pin the sink to the source
+    schema; the designed answer for a transform-bearing pipeline is pass-through
+    (what the staging driver clicks). Pinning must be a deliberate tick, so the
+    emitted default selection is empty and the pass-through escape is always
+    offered. The keep semantics themselves are adjudicated in
+    docs/plans/2026-08-19-invert-guided-sink-field-keep.md and are not changed
+    here — only the default gesture is.
+    """
+
+    def test_no_source_column_is_pre_pinned(self) -> None:
+        turn = build_step_2_multi_select_turn(("url", "title"))
+
+        assert turn["type"] == TurnType.MULTI_SELECT_WITH_CUSTOM.value
+        payload = turn["payload"]
+        assert [option["id"] for option in payload["options"]] == ["url", "title"]
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
+        assert validate_payload(TurnType.MULTI_SELECT_WITH_CUSTOM, payload) is None
+
+    def test_pass_through_is_offered_even_with_no_observed_columns(self) -> None:
+        turn = build_step_2_multi_select_turn(())
+
+        payload = turn["payload"]
+        assert payload["options"] == []
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
+        assert validate_payload(TurnType.MULTI_SELECT_WITH_CUSTOM, payload) is None

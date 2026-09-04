@@ -147,6 +147,11 @@ class ActiveLangfuseTracer:
         if system_prompt is not None:
             messages.append(ChatMessage(role="system", content=system_prompt))
         messages.append(ChatMessage(role="user", content=prompt))
+        # First-party projection (OUR CODE) runs BEFORE the try: a failure in
+        # audit_messages is a bug and crashes instead of being contained as a
+        # provider trace failure. Bytes-free — tracing is an audit-adjacent
+        # boundary.
+        traced_input = audit_messages(messages)
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -160,7 +165,7 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=audit_messages(messages),  # bytes-free — tracing is an audit-adjacent boundary
+                    input=traced_input,
                 ) as generation,
             ):
                 generation.update(**update_kwargs)
@@ -200,6 +205,11 @@ class ActiveLangfuseTracer:
         if system_prompt is not None:
             messages.append(ChatMessage(role="system", content=system_prompt))
         messages.append(ChatMessage(role="user", content=prompt))
+        # First-party projection (OUR CODE) runs BEFORE the try: a failure in
+        # audit_messages is a bug and crashes instead of being contained as a
+        # provider trace failure. Bytes-free — tracing is an audit-adjacent
+        # boundary.
+        traced_input = audit_messages(messages)
 
         # Langfuse SDK calls (EXTERNAL boundary — catch SDK/transport errors)
         try:
@@ -213,7 +223,7 @@ class ActiveLangfuseTracer:
                     as_type="generation",
                     name="llm_call",
                     model=model,
-                    input=audit_messages(messages),  # bytes-free — tracing is an audit-adjacent boundary
+                    input=traced_input,
                 ) as generation,
             ):
                 generation.update(**update_kwargs)

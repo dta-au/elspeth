@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
 import importlib
 import importlib.util
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+
+import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.web.composer.audit import llm_call_audit_envelope
@@ -259,3 +262,77 @@ def test_zero_call_replay_does_not_reuse_prior_request_count(monkeypatch) -> Non
 
     attributes = {"surface": "guided", "status": "completed"}
     assert request_calls.points == [(1, attributes), (0, attributes)]
+
+
+def _capture_projection_failures(module, monkeypatch) -> list[tuple[str, str]]:
+    failures: list[tuple[str, str]] = []
+
+    def _capture(*, operation: str, error_type: str) -> None:
+        failures.append((operation, error_type))
+
+    monkeypatch.setattr(module, "_log_projection_failure", _capture)
+    return failures
+
+
+def test_reused_token_pairing_bug_propagates_instead_of_being_recorded(monkeypatch) -> None:
+    """A second finish against a spent token is a broken begin/finish pairing.
+
+    That is first-party bookkeeping, not a metric-emission fault, so it must
+    reach the caller with its own type rather than be logged and abstained:
+    swallowing it leaves the bug invisible and the aggregate silently wrong.
+    """
+    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
+    request_duration = _Instrument()
+    monkeypatch.setattr(module, "_REQUEST_DURATION", request_duration)
+    monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", _Instrument())
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+    failures = _capture_projection_failures(module, monkeypatch)
+
+    token = module.begin_composer_request_metrics(surface="freeform")
+    module.finish_composer_request_metrics(token, status="completed")
+    request_duration.points.clear()
+
+    with pytest.raises(RuntimeError):
+        module.finish_composer_request_metrics(token, status="completed")
+
+    assert failures == []
+    assert request_duration.points == []
+
+
+def test_cross_context_token_propagates_with_its_own_type(monkeypatch) -> None:
+    """A token minted in another context never resolves to a silent abstention."""
+    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
+    monkeypatch.setattr(module, "_REQUEST_DURATION", _Instrument())
+    monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", _Instrument())
+    failures = _capture_projection_failures(module, monkeypatch)
+
+    foreign = contextvars.copy_context().run(module.begin_composer_request_metrics, surface="freeform")
+
+    with pytest.raises(ValueError):
+        module.finish_composer_request_metrics(foreign, status="completed")
+
+    assert failures == []
+
+
+def test_metric_emission_failure_stays_subordinate_to_the_settled_request(monkeypatch) -> None:
+    """The emission guard survives: an exporter fault is still recorded and abstains.
+
+    Pins the boundary between the two paths — the pairing check above fails
+    loud, while the histogram writes it protects stay subordinate to a request
+    whose audit rows have already settled.
+    """
+    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
+
+    class _BrokenExporter:
+        def record(self, value: int | float, attributes: dict[str, str]) -> None:
+            raise RuntimeError("exporter pipeline is down")
+
+    monkeypatch.setattr(module, "_REQUEST_DURATION", _BrokenExporter())
+    monkeypatch.setattr(module, "_REQUEST_PROVIDER_CALLS", _Instrument())
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+    failures = _capture_projection_failures(module, monkeypatch)
+
+    token = module.begin_composer_request_metrics(surface="freeform")
+
+    assert module.finish_composer_request_metrics(token, status="completed") is None
+    assert failures == [("request", "RuntimeError")]

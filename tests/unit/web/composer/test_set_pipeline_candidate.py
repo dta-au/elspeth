@@ -7,6 +7,7 @@ inline-blob effects, not private control flow.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
@@ -172,6 +173,161 @@ def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path
     assert result.data["error_code"] == "plugin_options_invalid"
     assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected_container", "expects_blob_advice", "expects_round_trip_gap"),
+    [
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            False,
+            False,
+            id="singular-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "inputs/orders.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            False,
+            id="named-plugin-backed",
+        ),
+        pytest.param(
+            {
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "`source` configuration",
+            True,
+            False,
+            id="singular-blob-bound",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="named-blob-backed-round-trip-unavailable",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="order_rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": "11111111-1111-4111-8111-111111111111",
+                        "mode": "bind_source",
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "customers": SourceSpec(
+                    plugin="csv",
+                    on_success="customer_rows",
+                    options={"path": "inputs/customers.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+            },
+            "named `sources` map",
+            False,
+            True,
+            id="multiple-sources-with-blob-round-trip-unavailable",
+        ),
+    ],
+)
+def test_no_source_internal_defense_uses_prior_source_shape_for_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    sources: dict[str, SourceSpec],
+    expected_container: str,
+    expects_blob_advice: bool,
+    expects_round_trip_gap: bool,
+) -> None:
+    """The handler's defensive branch stays accurate behind schema admission."""
+    validated_without_source = sessions_tools.SetPipelineArgumentsModel.model_construct(
+        source=None,
+        sources=None,
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata=None,
+    )
+    monkeypatch.setattr(
+        sessions_tools.SetPipelineArgumentsModel,
+        "model_validate",
+        classmethod(lambda cls, value: validated_without_source),
+    )
+    state = CompositionState(
+        sources=sources,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    candidate = build_set_pipeline_candidate(
+        {"nodes": [], "edges": [], "outputs": []},
+        state,
+        _trained_context(),
+    )
+
+    error = candidate.result.data["error"]
+    assert expected_container in error
+    assert ("blob_id" in error) is expects_blob_advice
+    assert ("inline_blob" in error) is expects_blob_advice
+    if expects_round_trip_gap:
+        assert error == (
+            "set_pipeline requires exactly one non-null source or sources object. "
+            "This tool is a full replacement; omission or null never keeps existing source configuration. "
+            "The existing named `sources` map cannot be represented as lossless set_pipeline arguments: "
+            "get_pipeline_state(component='set_pipeline_arguments') returns error_code `round_trip_unavailable`. "
+            "Inspect the current configuration with get_pipeline_state(component='source'); do not fabricate source fields "
+            "or blob identities, and do not rebind any source. If the requested change is limited to existing source options, "
+            "use patch_source_options with the current source_name; use the matching narrow patch tool for node/output-only "
+            "changes. For a true full rebuild, surface the `round_trip_unavailable` gap and stop instead of guessing."
+        )
+        assert "Re-supply the complete existing" not in error
+    else:
+        assert "complete existing" in error
+        assert "round_trip_unavailable" not in error
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in error
+        assert "get_pipeline_state(component='source')" not in error
 
 
 def _trained_context(*, data_dir: Path | None = None, **kwargs: Any) -> ToolContext:
@@ -433,6 +589,41 @@ def _named_reviewed_pipeline(tmp_path: Path, facts: dict[str, Any]) -> dict[str,
     )
     pipeline["sources"] = {reviewed["name"]: source}
     return pipeline
+
+
+def test_reviewed_source_authority_rejects_non_mapping_reviewed_sources() -> None:
+    """Present-but-malformed reviewed_sources is corruption, not absence."""
+    facts = {"reviewed_sources": "not-a-mapping"}
+    with pytest.raises(AuditIntegrityError, match="reviewed_sources must be a mapping"):
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+
+
+def test_reviewed_source_authority_returns_none_for_absent_reviewed_sources() -> None:
+    facts: dict[str, object] = {"other": "facts"}
+    assert (
+        resolve_reviewed_source_authority(
+            engine=None,
+            session_id="session",
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+        )
+        is None
+    )
+
+
+def test_authoring_content_hash_rejects_non_mapping_authoring_metadata() -> None:
+    from elspeth.web.composer.reviewed_source_authority import _authoring_content_hash
+    from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+    with pytest.raises(AuditIntegrityError, match="source authoring metadata must be a mapping"):
+        _authoring_content_hash({SOURCE_AUTHORING_KEY: "bad"}, stable_id="s1")
 
 
 def test_reviewed_source_authority_resolves_only_ready_owned_current_anchor(tmp_path: Path) -> None:
@@ -975,6 +1166,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.page_content }}",
+                    "required_input_fields": ["page_content"],
                     "interpretation_requirements": [_short_form_shield_review()],
                 },
             },
@@ -1248,6 +1440,7 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     args["nodes"] = []
     args["edges"] = []
     if rejected:
+        del args["source"]
         args["sources"] = {}
     state = _empty_state()
     context, catalog = _final_validation_rejecting_context(data_dir=tmp_path)
@@ -1284,6 +1477,7 @@ def test_normalizer_skips_revalidation_for_a_withheld_rejection_across_snapshots
     from the untouched ``updated_state`` under the new snapshot.
     """
     args = _linear_args(tmp_path)
+    del args["source"]
     args["sources"] = {}
     state = _empty_state()
     context, _catalog = _final_validation_rejecting_context(data_dir=tmp_path)
@@ -1411,7 +1605,7 @@ def _fork_coalesce_args(tmp_path: Path) -> dict[str, Any]:
             "merge": "nested",
             "on_success": "main",
             "on_error": "discard",
-            "options": {"schema": {"mode": "observed"}},
+            "options": {},
         },
     ]
     args["edges"] = []
@@ -1464,6 +1658,14 @@ def _aggregation_args(tmp_path: Path) -> dict[str, Any]:
 
 def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
     args = _linear_args(tmp_path)
+    # The llm node's prompt_template reads ``row.text``, so its
+    # required_input_fields names ``text`` and the source must guarantee it.
+    # Same shape as ``_secret_bearing_structured_fork_coalesce_args``.
+    args["source"]["options"]["schema"] = {
+        "mode": "flexible",
+        "fields": ["text: str"],
+        "guaranteed_fields": ["text"],
+    }
     args["nodes"] = [
         {
             "id": "classify",
@@ -1478,6 +1680,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
                 "prompt_template": "Classify {{ row.text }}",
+                "required_input_fields": ["text"],
                 # Multi-query execution must use the pooled path so capacity
                 # retries are bounded by the configured pool controller.
                 "pool_size": 2,
@@ -1596,10 +1799,12 @@ def _multi_output_args(tmp_path: Path) -> dict[str, Any]:
 _EXPECTED_STATE_HASHES = {
     "linear": "21dbf5afc36a0cc402394e1c59bfbb58304ea5564930998ab8b1b8851b78d1e9",
     "named_multi_source_queue": "965e2b3991d2347b633baf4e54e71e37995c10bc386356b547b7a207f8b65f9c",
-    "fork_coalesce": "2b055404018c9bfdf8a688af962e05e7a93c4ba9f4891cba718dfd0cc78e0a5b",  # gate renamed fork -> fork_gate (reserved name)
+    # Structural coalesces carry no plugin options; the gate is named
+    # fork_gate because the bare token "fork" is reserved.
+    "fork_coalesce": "21fef020c5ef5d8c9d9b5319446795a57c257ef366d6ddb1c63cfee24d5a4315",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
-    "structured_llm": "80d31be6e69ef6937144e9ba5305aa90eaa1f1f8046040c3bb5e17567322f964",
+    "structured_llm": "c324e56c54db6abba0c1eac06fd720ef3cbbd84502b389c0285b32371ecbf31f",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
@@ -1612,11 +1817,10 @@ _EXPECTED_WARNINGS = {
     # W3 now derives the answer from published_success_connection rather than
     # testing `on_success is not None` by hand, so the accusation is gone.
     #
-    # ``_structured_llm_args`` builds ONE llm node and no fetch step of any
-    # kind, so the remote-content draft's claims ("between the external-content
-    # fetch step and this LLM", "routes internet-controlled text") are false for
-    # this graph. The advisory is chosen by provenance (interpretation_state.py
-    # ``_llm_untrusted_remote_content_producers``), so the local-content sibling
+    # ``_structured_llm_args`` builds ONE llm node and no declared untrusted-
+    # content producer, so a producer-specific draft would be false for this
+    # graph. The advisory is chosen by provenance (interpretation_state.py
+    # ``_llm_untrusted_content_producers``), so the local-content sibling
     # is the correct one here. Referenced, never re-typed: this table inlining
     # the prose is what let it drift silently past the constant it mirrors.
     "structured_llm": (
@@ -1628,6 +1832,23 @@ _EXPECTED_WARNINGS = {
             "severity": "medium",
         },
     ),
+}
+
+# S1 (elspeth-0aace271b4 I5): on_error="discard" no longer counts as error
+# routing, so every discard-only fixture (which is what set_pipeline's
+# default-fill produces) now carries the advisory retention nudge. Cases with
+# a gate (`fork_coalesce`, `gate`) stay quiet via the has_gate arm.
+_S1_RETENTION_SUGGESTION = {
+    "component": "pipeline",
+    "message": "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+    "severity": "low",
+}
+_EXPECTED_SUGGESTIONS = {
+    "linear": (_S1_RETENTION_SUGGESTION,),
+    "named_multi_source_queue": (_S1_RETENTION_SUGGESTION,),
+    "aggregation": (_S1_RETENTION_SUGGESTION,),
+    "structured_llm": (_S1_RETENTION_SUGGESTION,),
+    "multi_output": (_S1_RETENTION_SUGGESTION,),
 }
 
 
@@ -1683,7 +1904,7 @@ def test_current_executor_normalizes_supported_pipeline_shapes(
     assert result.validation.is_valid is True
     assert result.validation.errors == ()
     assert tuple(item.to_dict() for item in result.validation.warnings) == _EXPECTED_WARNINGS.get(case, ())
-    assert result.validation.suggestions == ()
+    assert tuple(item.to_dict() for item in result.validation.suggestions) == _EXPECTED_SUGGESTIONS.get(case, ())
     assert result.validation.semantic_contracts == ()
     assert result.to_dict()["validation"]["is_valid"] is True
     assert result.to_dict()["validation"]["graph_repair_suggestions"] == []
@@ -1824,7 +2045,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "manual_blob_ref",
             manual_blob_ref,
             _trained_context(data_dir=tmp_path),
-            "Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
+            "Source 'source': Use set_source_from_blob, source.blob_id, or source.inline_blob to bind a blob to the source. set_pipeline "
             "must not be called with 'blob_ref' in source.options because it cannot enforce that 'path' equals the "
             "blob's canonical storage_path.",
             None,
@@ -1841,8 +2062,10 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             stale_review,
             _trained_context(data_dir=tmp_path),
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
-            "'resolved'. Composer tool input may stage pending review requirements only; resolved review metadata may "
-            "only be written by resolve_interpretation_event.",
+            "'resolved'. Composer tool input may stage pending review requirements only. Omit resolver-owned fields "
+            "and retry set_pipeline with exactly kind, user_term, and draft. Then call request_interpretation_review "
+            "for an authorable staged site; backend-owned review kinds are surfaced automatically. The user resolves "
+            "the card and ELSPETH writes resolved review metadata.",
             "interpretation_requirements_invalid",
         ),
     ]
@@ -2298,6 +2521,9 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "mime_type": "text/csv",
         "size_bytes": len(content.encode("utf-8")),
         "content_hash": content_hash(content.encode("utf-8")),
+        # Self-authorship marker (elspeth-47eba5cced): the blob's bytes came
+        # from this call's own inline_blob argument.
+        "originated_in": "this_tool_call",
     }
     assert deep_thaw(result.data) == {"inline_blob": expected_inline_payload}
     assert result.updated_state.to_dict()["sources"]["source"] == {
@@ -2970,3 +3196,149 @@ def test_component_rejections_are_bounded_and_report_what_they_withheld(tmp_path
     # Truncation is reported, never silent: eleven components failed, eight
     # are listed, and the remaining three are counted.
     assert candidate.result.data["components_withheld"] == 3
+
+
+# The validation-component ref each semantic-failure case's rejection is
+# about, keyed by case name. Every case's message may or may not carry a
+# ``Node 'x': `` prefix — ``manual_blob_ref`` and ``credential_policy`` do
+# not — and the subject must arrive structurally either way.
+_REJECTED_COMPONENT_BY_CASE: dict[str, str] = {
+    "unknown_plugin": "node:copy",
+    "blocked_plugin": "node:copy",
+    "profile_validation": "node:copy",
+    "invalid_options": "node:copy",
+    "escaping_path": "output:main",
+    "invalid_gate": "node:threshold",
+    "manual_blob_ref": "source",
+    "credential_policy": "node:classify",
+    "resolver_owned_interpretation_review": "node:classify",
+}
+
+
+@pytest.mark.parametrize("case_index", range(9))
+def test_component_rejection_carries_its_subject_structurally(tmp_path: Path, case_index: int) -> None:
+    """A ``rejected_mutation`` entry names WHICH component was rejected in ``rejected_component``.
+
+    ``component`` stays the literal ``rejected_mutation`` discriminator; the
+    subject used to live only in the message prefix, which the planner parsed
+    back with a regex and the model had to match by prose on a
+    multi-component rejection (elspeth-e405ad7cd2, F10). The set_pipeline
+    component loop stamps it from its loop variable, so it is present whether
+    or not the producer prefixed the message — two of these cases do not.
+    """
+    case, args, context, _expected_error, _expected_error_code = _semantic_failure_cases(tmp_path)[case_index]
+
+    result = _execute_set_pipeline(args, _empty_state(), context)
+
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component == _REJECTED_COMPONENT_BY_CASE[case], (case, entry)
+    wire = result.to_dict()["validation"]["errors"][0]
+    assert wire["rejected_component"] == _REJECTED_COMPONENT_BY_CASE[case]
+
+
+def test_two_component_rejection_names_each_subject_structurally(tmp_path: Path) -> None:
+    """One merged rejection envelope, one ``rejected_component`` per defective component.
+
+    Wire sample 12 on elspeth-e405ad7cd2: both entries carried
+    ``component: "rejected_mutation"`` and only the message text (one
+    prefixed, one not) said which component each was about, while
+    ``data.error`` carried only the first. The model repairs by
+    ``rejected_component`` now, never by prose.
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"][0]["options"] = {}
+    args["outputs"][0]["options"]["path"] = "/etc/candidate-escape.json"
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    rejections = [entry for entry in result.validation.errors if entry.component == "rejected_mutation"]
+    assert [entry.rejected_component for entry in rejections] == ["node:copy", "output:main"]
+    wire = [entry for entry in result.to_dict()["validation"]["errors"] if entry["component"] == "rejected_mutation"]
+    assert [entry["rejected_component"] for entry in wire] == ["node:copy", "output:main"]
+
+
+def test_rejection_outside_a_component_loop_is_not_stamped(tmp_path: Path) -> None:
+    """A rejection with no component subject carries no ``rejected_component``.
+
+    Fail-closed contract: consumers treat absence as "unattributable" rather
+    than parsing the message, so the stamp must never be invented for a
+    whole-candidate rejection.
+    """
+    args = _linear_args(tmp_path)
+    args["sources"] = {}
+    args.pop("source", None)
+
+    result = _execute_set_pipeline(args, _empty_state(), _trained_context(data_dir=tmp_path))
+
+    assert result.success is False
+    entry = result.validation.errors[0]
+    assert entry.component == "rejected_mutation"
+    assert entry.rejected_component is None
+    assert "rejected_component" not in result.to_dict()["validation"]["errors"][0]
+
+
+def _builder_rejection_calls() -> list[tuple[str, ast.Call, bool]]:
+    """Every rejection-constructor call in ``build_set_pipeline_candidate``.
+
+    Returns ``(callee, call, inside_component_body)`` where the third value is
+    True when the call sits lexically inside a ``for`` loop body or inside the
+    ``_legacy_source_rejection`` helper — the two places a rejection is about
+    ONE component.
+    """
+    tree = ast.parse(Path(sessions_tools.__file__).read_text(encoding="utf-8"))
+    builder = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "build_set_pipeline_candidate")
+    calls: list[tuple[str, ast.Call, bool]] = []
+
+    def visit(node: ast.AST, in_component: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_in_component = in_component
+            if isinstance(child, (ast.For, ast.AsyncFor)):
+                child_in_component = True
+            if isinstance(child, ast.FunctionDef) and child.name == "_legacy_source_rejection":
+                child_in_component = True
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id in {"_failure_result", "_plugin_policy_failure"}
+            ):
+                calls.append((child.func.id, child, in_component))
+            visit(child, child_in_component)
+
+    visit(builder, False)
+    return calls
+
+
+def test_every_component_rejection_names_its_subject_and_no_other_rejection_does() -> None:
+    """The structural tripwire behind ``rejected_component`` (elspeth-e405ad7cd2, F10 round 2).
+
+    The subject is carried EXPLICITLY at every rejection constructor call —
+    the keyword is required, so mypy refuses a call that omits it — but a
+    required keyword can be satisfied with ``None``. This pins the rule the
+    keyword exists for: a rejection built inside a per-component loop body
+    (or the legacy single-source helper) names its subject with a non-None
+    expression, and a rejection built anywhere else says ``None`` out loud.
+    The closure this replaced left a fifth per-node loop unattributed and
+    stamped a stale subject when a reset was dropped; neither can recur
+    without this test naming the exact call.
+    """
+    calls = _builder_rejection_calls()
+    assert len(calls) >= 40, f"expected the builder's rejection sites, found {len(calls)}"
+    # The one rejection inside a component body with nothing to name: a blank
+    # ``sources`` key. Its subject IS the missing name, so ``None`` is the
+    # honest value; listed by message so a second such site cannot hide here.
+    subjectless_in_body = {"set_pipeline sources keys must be non-empty source names."}
+    wrong: list[str] = []
+    for callee, call, in_component in calls:
+        keyword = next((kw for kw in call.keywords if kw.arg == "rejected_component"), None)
+        assert keyword is not None, f"{callee} at line {call.lineno} passes no rejected_component="
+        says_none = isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+        message = call.args[1] if len(call.args) > 1 else None
+        if in_component and says_none and isinstance(message, ast.Constant) and message.value in subjectless_in_body:
+            continue
+        if in_component and says_none:
+            wrong.append(f"line {call.lineno}: {callee} inside a component body says rejected_component=None")
+        if not in_component and not says_none:
+            wrong.append(f"line {call.lineno}: {callee} outside any component body names a subject")
+    assert not wrong, "\n".join(wrong)

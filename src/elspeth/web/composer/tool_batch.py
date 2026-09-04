@@ -18,7 +18,7 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
@@ -26,6 +26,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -33,6 +34,9 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedToolBatch,
     _AdmittedToolCall,
     _AdmittedToolFunction,
+    _AdvisorCallSuccess,
+    _AdvisorFirstPartyFailure,
+    _AdvisorProviderFailure,
     _CallModelOutcome,
     _DispatchOutcome,
     _ToolBatchCancellationRequested,
@@ -155,6 +159,52 @@ if TYPE_CHECKING:
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
 
 
+class _ProposalPayload(TypedDict):
+    """The ``data`` payload of an APPROVAL_REQUIRED tool result, in wire order.
+
+    No ``success`` inside the payload: the envelope's own ``success`` already
+    says it, and ``status`` is the discriminator a reader keys on
+    (elspeth-e405ad7cd2, F1).
+
+    Constructed inline as the ``data=`` argument in ``run_tool_batch`` and never
+    bound to a name: that — not the type — is what stops a later re-shaping,
+    because there is no local, alias, ``cast`` widening or callee for a store to
+    travel through (verify-gate VG-F1 measured all three escaping both mypy and
+    the previous name-based gate). The type's own job is the constructor call:
+    mypy refuses an extra, missing or mistyped key there. The envelope gate pins
+    the call's keyword order to the wire order and to this class's keys.
+    """
+
+    status: Literal["APPROVAL_REQUIRED"]
+    proposal_id: str
+    tool_name: str
+    summary: str
+    message: str
+
+
+class _PrevalidationRejectedStatus(TypedDict):
+    """The status fields merged onto a PREVALIDATION_REJECTED payload, in wire order.
+
+    The payload itself is the candidate's own ``data`` (its ``error`` /
+    ``error_code``) plus these; they are merged through a TypedDict constructor
+    rather than a bare dict literal so mypy refuses an extra key at the merge —
+    a ``"success": True`` added here is the F1 twin returning eleven lines from
+    the payload that pins it out, and nothing in the tree killed that mutant
+    (red-team RED-R3-2, mutant G6).
+
+    No ``applied_version``. The result now carries the unapplied state on its
+    envelope, so the envelope's ``version`` IS the applied version and a second
+    copy under ``data`` would be a twin (systems seat SYS-R3-3).
+    ``candidate_version`` stays: it is the only carrier of a fact the envelope
+    does not have.
+    """
+
+    status: Literal["PREVALIDATION_REJECTED"]
+    applied: Literal[False]
+    candidate_version: int
+    message: str
+
+
 _MISSING_TOOL_CALL_FIELD = object()
 
 
@@ -274,6 +324,17 @@ async def _try_finalize_proposal_custody(
     return "ready"
 
 
+@trust_boundary(
+    tier=3,
+    source="frozen ToolResult.data of a prevalidation-rejected candidate (external authorship retained through freezing)",
+    source_param="candidate_data",
+    suppresses=("R5",),
+    invariant=(
+        "never raises on malformed input: a Mapping is returned as-is, None yields an empty seed, and any "
+        "other shape is carried structurally under the 'candidate_data' key rather than dropped or coerced"
+    ),
+    non_raising=True,
+)
 def _prevalidation_feedback_seed(candidate_data: Any) -> Mapping[str, Any]:
     """Seed the PREVALIDATION_REJECTED feedback payload from a candidate's data.
 
@@ -315,8 +376,9 @@ def _replace_llm_tool_call_arguments(
     The compose loop appends the provider-authored assistant message before
     dispatch.  A subsequent provider turn must not receive raw inline bytes
     from that history after ELSPETH has intercepted them for proposal custody.
+    ``arguments`` are always the flat internal semantic shape; set_pipeline is
+    re-enveloped only while serializing the provider transcript.
     """
-    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     for message in reversed(llm_messages):
         if "role" not in message or message["role"] != "assistant":
             continue
@@ -331,6 +393,11 @@ def _replace_llm_tool_call_arguments(
             function = call["function"] if "function" in call else None
             if type(function) is not dict:
                 raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            if "name" not in function or type(function["name"]) is not str:
+                raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            function_name = function["name"]
+            provider_arguments: Mapping[str, Any] = {"pipeline": arguments} if function_name == "set_pipeline" else arguments
+            encoded = json.dumps(provider_arguments, sort_keys=True, separators=(",", ":"))
             function["arguments"] = encoded
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
@@ -644,6 +711,7 @@ async def run_tool_batch(
     tool_outcomes: list[_ToolOutcome] = []
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
+    advisor_failure: Exception | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     ctx.service._phase3_last_expected_current_state_id = pre_state_id
@@ -818,7 +886,55 @@ async def run_tool_batch(
             all_cache_hits = False
             continue
 
-        arguments = cast(dict[str, Any], decoded_arguments)
+        if tool_name == "set_pipeline":
+            pipeline_arguments = decoded_arguments["pipeline"] if "pipeline" in decoded_arguments else None
+            if set(decoded_arguments) != {"pipeline"} or type(pipeline_arguments) is not dict:
+                turn_has_mutation = True
+                audit_arguments = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": "TypeError",
+                }
+                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                _replace_llm_tool_call_arguments(
+                    llm_messages,
+                    tool_call_id=tool_call.id,
+                    arguments=audit_arguments,
+                )
+                audit = begin_dispatch(
+                    tool_call.id,
+                    tool_name,
+                    audit_arguments,
+                    version_before=state.version,
+                    actor=actor,
+                )
+                error_payload = {"error": "Tool 'set_pipeline' arguments must contain exactly one 'pipeline' object field."}
+                recorder.record(
+                    finish_arg_error(
+                        audit,
+                        error_class="TypeError",
+                        error_message="invalid provider argument envelope",
+                        error_payload=error_payload,
+                    )
+                )
+                _append_tool_outcome(
+                    response=None,
+                    error_class="TypeError",
+                    error_message="invalid provider argument envelope",
+                    post_version=state.version,
+                )
+                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(error_payload),
+                    }
+                )
+                all_cache_hits = False
+                continue
+            arguments = cast(dict[str, Any], pipeline_arguments)
+        else:
+            arguments = cast(dict[str, Any], decoded_arguments)
         if unknown_audit_arguments is not None:
             audit_arguments = unknown_audit_arguments
         elif tool_name == "set_pipeline":
@@ -1242,20 +1358,55 @@ async def run_tool_batch(
                             # _prevalidation_feedback_seed for the full contract.
                             feedback_data = dict(_prevalidation_feedback_seed(finalized_candidate_result.data))
                             feedback_data.update(
-                                {
-                                    "status": "PREVALIDATION_REJECTED",
-                                    "applied": False,
-                                    "applied_version": state.version,
-                                    "candidate_version": finalized_candidate_result.updated_state.version,
-                                    "message": (
+                                _PrevalidationRejectedStatus(
+                                    status="PREVALIDATION_REJECTED",
+                                    applied=False,
+                                    candidate_version=finalized_candidate_result.updated_state.version,
+                                    message=(
                                         "The candidate pipeline failed prevalidation, was not applied, and was not "
                                         "submitted for approval. Repair the reported validation errors and retry."
                                     ),
-                                }
+                                )
                             )
+                            # ``updated_state=state``: nothing was applied, so the
+                            # envelope's ``version`` — which the skill teaches as
+                            # "the state version after the call" — must be the
+                            # unapplied one. Keeping the candidate's state made the
+                            # wire say the mutation landed while the audit
+                            # (``_version_after``), the loop (which refuses the
+                            # candidate state) and ``_append_tool_outcome`` all
+                            # recorded that it had not (systems seat SYS-R3-3).
+                            # Contained to this result: it reaches only
+                            # ``_do_dispatch`` -> ``dispatch_with_audit`` ->
+                            # ``_serialize_tool_result`` / ``_append_tool_outcome``,
+                            # and ``pipeline_commit`` builds its own candidate from
+                            # the proposal rather than reading this one.
+                            #
+                            # ``prior_validation=None`` and ``affected_nodes=()``
+                            # for the same reason: both describe CHANGES, and
+                            # nothing changed. ``to_dict`` emits
+                            # ``validation_delta`` only when ``prior_validation``
+                            # is set, and the delta it emitted was measurably
+                            # false — on a real compose loop it reported
+                            # ``resolved_errors`` naming the two errors the
+                            # unapplied state still had, next to a ``version``
+                            # saying nothing was applied, while the skill tells
+                            # the model to act on the delta and never re-read
+                            # state to check it (LLM seat LLM-R3B-1). The
+                            # candidate's own ``affected_nodes`` said the same
+                            # thing in the other direction: components touched by
+                            # a state that was discarded. ``validation`` stays the
+                            # candidate's — it is the rejection the model repairs
+                            # from, and the skill says whose it is. This is now
+                            # the APPROVAL_REQUIRED envelope's shape on the same
+                            # path: unapplied state, empty affected_nodes, no
+                            # delta.
                             prevalidated_unapplied_result = replace(
                                 finalized_candidate_result,
                                 data=feedback_data,
+                                updated_state=state,
+                                prior_validation=None,
+                                affected_nodes=(),
                             )
                             # Route the rejected result through canonical
                             # dispatch/outcome without proposal publication.
@@ -1401,14 +1552,6 @@ async def run_tool_batch(
                         tool_arguments_hash=audit.binding_arguments_hash,
                     )
                 proposals_this_turn += 1
-                proposal_payload = {
-                    "success": True,
-                    "status": "APPROVAL_REQUIRED",
-                    "proposal_id": str(proposal.id),
-                    "tool_name": proposal_tool_name,
-                    "summary": proposal.summary,
-                    "message": "The requested pipeline change is pending human approval and has not been applied.",
-                }
                 proposal_result = ToolResult(
                     success=True,
                     updated_state=state,
@@ -1422,7 +1565,19 @@ async def run_tool_batch(
                         )
                     ),
                     affected_nodes=(),
-                    data=proposal_payload,
+                    # Built inline and never bound to a name, so nothing stands between
+                    # construction and the freeze in ``ToolResult.__post_init__``: there is no
+                    # local, alias, ``cast`` widening or callee that could re-shape it.
+                    # No ``success`` inside the payload: the envelope's own ``success`` already
+                    # says it, and ``status`` is the discriminator a reader keys on
+                    # (elspeth-e405ad7cd2, F1).
+                    data=_ProposalPayload(
+                        status="APPROVAL_REQUIRED",
+                        proposal_id=str(proposal.id),
+                        tool_name=proposal_tool_name,
+                        summary=proposal.summary,
+                        message="The requested pipeline change is pending human approval and has not been applied.",
+                    ),
                 )
                 recorder.record(
                     finish_success(
@@ -1621,7 +1776,7 @@ async def run_tool_batch(
             advisor_calls_used += 1
 
             try:
-                guidance, advisor_meta = await ctx.service._call_advisor_with_audit(
+                advisor_outcome = await ctx.service._call_advisor_for_tool(
                     arguments,
                     recorder=recorder,
                     timeout=effective_advisor_timeout,
@@ -1690,20 +1845,16 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
-            except Exception as advisor_exc:
-                # Tier 3 boundary: outbound LLM call failed. Convert
-                # to a structured tool-result error so the composer
-                # LLM gets feedback rather than a silent stall. The
-                # inner ComposerLLMCall record was already fired by
-                # _call_advisor_with_audit's finally block, so the
-                # audit trail captures the failure mode regardless.
-                # Budget was already consumed above (F2) — the
-                # outbound call attempt counts whether or not it
-                # produced guidance.
+
+            if type(advisor_outcome) is _AdvisorProviderFailure:
+                # The service owns the Tier-3 provider taxonomy and returns
+                # this explicit recoverable outcome. Budget was already
+                # consumed above: the outbound attempt counts whether or not
+                # it produced guidance.
                 advisor_error_payload = {
                     "status": "ADVISOR_ERROR",
                     "error": "Advisor call failed; no guidance returned.",
-                    "error_class": type(advisor_exc).__name__,
+                    "error_class": advisor_outcome.error_class,
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
@@ -1735,6 +1886,27 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
+
+            if type(advisor_outcome) is _AdvisorFirstPartyFailure:
+                # A controlled-code fault is not provider feedback. Close the
+                # outer dispatch truthfully, carry it through P4, and let the
+                # driver re-raise this exact exception object after the tool
+                # row has been published.
+                first_party_exc = advisor_outcome.original_exc
+                recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
+                _append_tool_outcome(
+                    response=None,
+                    error_class=type(first_party_exc).__name__,
+                    error_message=type(first_party_exc).__name__,
+                    post_version=state.version,
+                )
+                advisor_failure = first_party_exc
+                break
+
+            if type(advisor_outcome) is not _AdvisorCallSuccess:
+                raise AuditIntegrityError("Advisor call returned an unknown owned outcome")
+            guidance = advisor_outcome.guidance
+            advisor_meta = advisor_outcome.metadata
 
             success_payload = {
                 "status": "SUCCESS",
@@ -2344,6 +2516,7 @@ async def run_tool_batch(
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
+        advisor_failure=advisor_failure,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,

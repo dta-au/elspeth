@@ -5,16 +5,17 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import get_sink_config_model, get_source_config_model
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin, build_component_review_turn
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE, WorkflowProfileKind, profile_for_kind
-from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, Turn, validate_current_turn
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX, GUIDED_GOAL_ACKNOWLEDGEMENT, Turn, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
@@ -44,6 +45,7 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_INTEGRITY_ERRORS,
     SourceInspectionBlobLifecycleError,
@@ -62,10 +64,12 @@ from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS, allowed_sink_director
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.guided_replay import (
+    guided_completed_chat_token,
     guided_turn_token,
     load_guided_json_payload,
     parse_guided_response_descriptor,
     project_guided_response,
+    project_reviewed_components,
 )
 from elspeth.web.sessions.protocol import (
     GuidedAuditEvidence,
@@ -104,6 +108,7 @@ from .._helpers import (
     CompositionState,
     CompositionStateData,
     CompositionStateRecord,
+    CompositionStateResponse,
     ControlSignal,
     Depends,
     GetGuidedResponse,
@@ -135,6 +140,8 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
     _inspect_latest_ready_session_blob,
+    _log_last_resort_diagnostic,
+    _named_guided_custody_projection,
     _replace,
     _request_plugin_policy_context,
     _safe_frame_strings,
@@ -165,6 +172,7 @@ from .._helpers import (
 )
 from .guided_plan import _guided_full_failure_code
 from .guided_plan import router as guided_plan_router
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 from .pipeline_settlement import (
     _GUIDED_ATOMIC_SETTLEMENT_COMPLETED,
     _GUIDED_ATOMIC_SETTLEMENT_FAILURE,
@@ -182,6 +190,14 @@ _COMPLETED_TERMINAL_BEFORE_EXIT_META_KEY = "guided_completed_terminal_before_use
 # unchanged. Scrub first, then truncate: truncation is a bound, never a
 # redaction mechanism (mirrors execution.service's operator diagnostic).
 _CONTRACT_REJECTION_EXC_MESSAGE_CHARS = 500
+
+# Upper bound on consecutive fence-loss rejoin attempts in the guided START
+# settlement loop. A lost fence is an expected concurrency signal (another
+# worker won, or our lease expired under load) and one rejoin normally
+# resolves it by joining the winner; losing the fence this many times in a
+# row is pathological lease churn and terminates in AuditIntegrityError
+# instead of an unbounded retry.
+_GUIDED_FENCE_REJOIN_ATTEMPTS = 5
 
 
 def _resolve_shield_available(snapshot: PluginAvailabilitySnapshot) -> bool:
@@ -289,6 +305,55 @@ def _load_durable_current_turn(
             or turn["payload"]["draft_hash"] != active_proposal.draft_hash
         ):
             raise AuditIntegrityError("Persisted guided proposal turn does not match active proposal authority")
+    return turn, prepared
+
+
+def _load_durable_committed_wire_turn(
+    guided: GuidedSession,
+    *,
+    payload_store: Any,
+) -> tuple[Turn, PreparedGuidedJsonPayload]:
+    """Load the answered wire occurrence a COMPLETED session was built from.
+
+    Sibling of :func:`_load_durable_current_turn` for the terminal case. After
+    ``confirm_wiring`` there is no current *unanswered* turn, so the only
+    durable graph authority a completed session still owns is the frozen
+    CONFIRM_WIRING payload the user reviewed and confirmed.
+    :func:`guided_completed_chat_token` owns admission (completed terminal,
+    every record answered, the last one an answered STEP_4 confirmation);
+    ``load_guided_json_payload`` re-derives the content address, so the loaded
+    bytes are bound to the history record rather than trusted from it.
+
+    The active-proposal cross-check its sibling performs is deliberately
+    inverted here: confirmation nulls ``active_proposal``, so a completed
+    session that still carries one is an audit anomaly, not a binding to
+    verify.
+    """
+
+    guided_completed_chat_token(guided)
+    if guided.active_proposal is not None:
+        raise AuditIntegrityError("Completed guided session retains an active proposal binding")
+    record = guided.history[-1]
+    prepared = load_guided_json_payload(
+        payload_store,
+        payload_id=record.payload_hash,
+        purpose="turn",
+    )
+    step_index = {
+        GuidedStep.STEP_1_SOURCE: 0,
+        GuidedStep.STEP_2_SINK: 1,
+        GuidedStep.STEP_3_TRANSFORMS: 2,
+        GuidedStep.STEP_4_WIRE: 3,
+    }[record.step]
+    turn = Turn(
+        type=record.turn_type.value,
+        step_index=step_index,
+        payload=dict(deep_thaw(prepared.payload)),
+    )
+    try:
+        validate_current_turn(record.step, turn)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Persisted confirmed-wiring turn is invalid: {exc}") from exc
     return turn, prepared
 
 
@@ -806,7 +871,18 @@ async def get_guided(
                 raise AuditIntegrityError("guided proposal reference differs from private authority")
             if type(proposal.base) is not PresentBase:
                 raise AuditIntegrityError("guided proposal authority has a non-present base")
-            if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(state):
+            # Currency is asked of the proposal's ANCHOR, not of
+            # ``proposal.base``: the base is hashed into ``draft_hash`` and
+            # so is the reviewed artifact's immutable identity (checked
+            # against the checkpoint reference just above), while the anchor
+            # is the lifecycle-managed binding a guided settlement legally
+            # moves forward when it carries the proposal across a new
+            # checkpoint (elspeth-ed67eb9d0d). The comparison itself is
+            # unchanged — an exact id match against the head, plus content.
+            current_base = active_authority.current_base
+            if type(current_base) is not PresentBase:
+                raise AuditIntegrityError("guided proposal authority has a non-present anchor")
+            if current_base.state_id != state_record_out.id or current_base.composition_content_hash != composition_content_hash(state):
                 raise AuditIntegrityError("guided proposal base differs from current checkpoint")
             if active_authority.row.status != "pending":
                 # elspeth-4dc78b3897: a terminal row behind a still-active
@@ -913,6 +989,10 @@ async def get_guided(
         # missing occurrence and payload hash until a fenced mutation persists it.
         terminal = guided.terminal
         shield_available = _resolve_shield_available(plugin_snapshot)
+        composition_state_out: CompositionStateResponse | None = None
+        if state_record_out is not None:
+            with _named_guided_custody_projection():
+                composition_state_out = _state_response(state_record_out, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -948,6 +1028,7 @@ async def get_guided(
                     for t in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(turn, guided=guided, shield_available=shield_available),
@@ -958,7 +1039,7 @@ async def get_guided(
             )
             if terminal is not None
             else None,
-            composition_state=_state_response(state_record_out, policy_catalog=catalog) if state_record_out is not None else None,
+            composition_state=composition_state_out,
         )
 
 
@@ -1045,7 +1126,8 @@ async def post_guided_reenter(
                     purpose="turn",
                 ),
             )
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GetGuidedResponse:
             raise AuditIntegrityError("Guided re-entry projection returned the wrong response type")
         return response
@@ -1160,6 +1242,26 @@ async def post_guided_reenter(
                 status_code=409,
                 detail="Guided session cannot be re-entered because no current turn record exists.",
             )
+        # Re-entry makes the retained review ACTIVE authoring authority again
+        # (on both the restored-COMPLETED and the active branch below), so it
+        # must bind to the tip's sources exactly as the write gate demands of
+        # an active session; a degraded (custody_unavailable) projection is
+        # never re-entered. Reviewed sources stay intact on refusal — a
+        # /state/revert to a bindable version re-enables re-entry.
+        custody_probe = guided.to_dict()
+        custody_probe["terminal"] = None
+        try:
+            assert_guided_custody_persistable(deep_thaw(state_record.sources), {"guided_session": custody_probe})
+        except GuidedCustodyIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "guided_reenter_custody_unbindable",
+                    "detail": "Guided mode can't resume: the files it reviewed are no longer the files "
+                    "this pipeline uses. Restore an earlier version from Composition history, or keep "
+                    "working in freeform.",
+                },
+            ) from exc
         existing_meta: dict[str, Any] = {}
         if state_record.composer_meta is not None:
             existing_meta = dict(deep_thaw(state_record.composer_meta))
@@ -1378,6 +1480,54 @@ async def reconcile_guided_start_operation(
     raise AuditIntegrityError("guided-start reconciliation returned an unsupported outcome")
 
 
+def _seed_guided_goal_transcript(guided: GuidedSession, *, intent: str) -> GuidedSession:
+    """Open a freshly rooted session's transcript on the goal and one server line.
+
+    The goal-first entry (elspeth-378cfa0e18): ``/guided/start`` and
+    ``/guided/convert`` both take the author's goal, and both must show it
+    back. Without this the goal was durable only as a private root row and the
+    operator opened a guided session on an empty transcript, with no evidence
+    that the thing they typed had been kept.
+
+    Uses the R2-F6 transcript idiom exactly — a verbatim user turn plus one
+    server-authored acknowledgement on the same ``chat_history`` channel
+    ``/guided/chat`` writes, at the step the author is on. No audit twin, no
+    schema change, and ``assistant_message_kind`` stays ``"assistant"``: the
+    vocabulary is closed to ``{"assistant", "synthetic_failure"}`` and widening
+    it is a schema change this change does not make.
+
+    Both turns share one timestamp because they are one event.
+    """
+
+    from datetime import UTC, datetime
+
+    from .._helpers import ChatRole, ChatTurn
+
+    seeded_ts_iso = datetime.now(UTC).isoformat()
+    return _replace(
+        guided,
+        chat_history=(
+            *guided.chat_history,
+            ChatTurn(
+                role=ChatRole.USER,
+                content=intent,
+                seq=guided.chat_turn_seq,
+                step=guided.step,
+                ts_iso=seeded_ts_iso,
+            ),
+            ChatTurn(
+                role=ChatRole.ASSISTANT,
+                content=GUIDED_GOAL_ACKNOWLEDGEMENT,
+                seq=guided.chat_turn_seq + 1,
+                step=guided.step,
+                ts_iso=seeded_ts_iso,
+                assistant_message_kind="assistant",
+            ),
+        ),
+        chat_turn_seq=guided.chat_turn_seq + 2,
+    )
+
+
 @router.post("/{session_id}/guided/start", response_model=GetGuidedResponse)
 async def post_guided_start(
     session_id: UUID,
@@ -1440,11 +1590,14 @@ async def post_guided_start(
             detail=(f"Unknown profile discriminator. Valid values: {sorted(k.value for k in WorkflowProfileKind)}."),
         ) from exc
     profile = profile_for_kind(profile_kind)
-    if profile_kind is WorkflowProfileKind.LIVE:
-        if body.intent is None:
-            raise HTTPException(status_code=400, detail="Live guided start requires a visible intent.")
-    elif body.intent is not None:
-        raise HTTPException(status_code=400, detail="Tutorial guided start forbids a client intent.")
+    # Goal-first, for EVERY profile (elspeth-378cfa0e18). A guided session with
+    # no root intent cannot reach the planner at all — the Step-2 finish
+    # refuses with ``guided_planner_intent_required`` — so a start that carries
+    # no goal only creates a session that is already stuck. The tutorial takes
+    # its frozen lesson prompt through this same door: ADR-031 forbids a
+    # tutorial-only path, and forbidding a tutorial intent WAS one.
+    if body.intent is None:
+        raise HTTPException(status_code=400, detail="Guided start requires a visible intent.")
 
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.sessions.protocol import (
@@ -1484,6 +1637,10 @@ async def post_guided_start(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1513,6 +1670,7 @@ async def post_guided_start(
                     for chat_turn in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(
@@ -1521,7 +1679,7 @@ async def post_guided_start(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _verify_start_root(record: CompositionStateRecord) -> None:
@@ -1530,17 +1688,13 @@ async def post_guided_start(
             raise AuditIntegrityError("Guided start result state has no guided checkpoint")
         if guided.profile != profile:
             raise GuidedOperationSettlementConflictError()
-        if profile_kind is WorkflowProfileKind.TUTORIAL:
-            if guided.root_intent_message_id is not None:
-                raise AuditIntegrityError("Tutorial guided start unexpectedly owns a client root intent")
-            return
         if guided.root_intent_message_id is None:
-            raise AuditIntegrityError("Live guided start is missing its durable root intent")
+            raise AuditIntegrityError("Guided start is missing its durable root intent")
         matches = [
             message for message in await service.get_messages(session_id, limit=None) if str(message.id) == guided.root_intent_message_id
         ]
         if len(matches) != 1 or matches[0].role != "user" or matches[0].writer_principal != "route_user_message":
-            raise AuditIntegrityError("Live guided start root intent failed session/role/content custody")
+            raise AuditIntegrityError("Guided start root intent failed session/role/content custody")
         if matches[0].content != body.intent:
             raise GuidedOperationSettlementConflictError()
 
@@ -1586,7 +1740,17 @@ async def post_guided_start(
         else:
             observed_head = None
 
-    while True:
+    # Bounded fence-loss rejoin (was ``while True``): every iteration either
+    # returns a durable result, raises, or observes a lost fence and retries
+    # through ``reserve_or_replay_guided_operation`` (which joins the winner
+    # or performs the sole takeover). Repeated losses mean pathological lease
+    # churn, and the loop must terminate in an explicit integrity failure
+    # rather than retry forever.
+    for _fence_rejoin_attempt in range(_GUIDED_FENCE_REJOIN_ATTEMPTS):
+        # ``GuidedOperationExpired`` joins the fresh-reservation path with
+        # ``None``: an expired lease is not a joinable winner, so the takeover
+        # must go back through ``reserve_or_replay_guided_operation`` rather
+        # than be adopted as ``reserved`` and left unreachable.
         if pending is None or isinstance(pending, GuidedOperationExpired):
             reserved = await reserve_or_replay_guided_operation(
                 service=service,
@@ -1642,9 +1806,7 @@ async def post_guided_start(
                     raise AuditIntegrityError("Guided start head disappeared after preflight")
 
                 root_message = (
-                    GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent)
-                    if profile_kind is WorkflowProfileKind.LIVE and body.intent is not None
-                    else None
+                    GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent) if body.intent is not None else None
                 )
                 new_state = _initial_composition_state_with_guided_session(profile=profile)
                 seeded_guided = new_state.guided_session
@@ -1668,6 +1830,8 @@ async def post_guided_start(
                     turn=seed_turn,
                     payload_store=request.app.state.payload_store,
                 )
+                if root_message is not None:
+                    seeded_guided = _seed_guided_goal_transcript(seeded_guided, intent=root_message.content)
                 seed_evidence = _turn_emission_evidence(
                     step=seeded_guided.step,
                     turn_type=seed_turn_type,
@@ -1755,12 +1919,24 @@ async def post_guided_start(
                 if isinstance(exc, AuditIntegrityError)
                 else "operation_failed"
             )
-            if isinstance(exc, AuditIntegrityError):
+            if failure_code != "stale_conflict":
+                # Every failure that terminates this route, not just the
+                # integrity ones. The durable row records THAT the operation
+                # failed and the coded response stays exactly replayable, but
+                # neither carries where it broke: before this widened, an
+                # unclassified first-party bug settled as ``operation_failed``
+                # and its traceback was discarded, leaving no server-side
+                # record of the defect at all. ``stale_conflict`` is excluded
+                # deliberately — a settlement conflict is an expected
+                # concurrency outcome with its own 409 contract, not a fault
+                # to page on. ``_safe_frame_strings`` emits file/line/function
+                # only, never exception values.
                 slog.error(
                     "guided.operation_terminal_failure",
                     session_id=str(session_id),
                     user_id=user.user_id,
                     exc_class=type(exc).__name__,
+                    failure_code=failure_code,
                     site="post_guided_start",
                     frames=_safe_frame_strings(exc),
                     # R2-F16b: the response carries ``X-Request-ID`` but this
@@ -1784,6 +1960,7 @@ async def post_guided_start(
             raise_guided_operation_failure(failed)
         finally:
             await lease_guard.finish_active_exception()
+    raise AuditIntegrityError("Guided START lost its operation fence on every rejoin attempt without a joinable winner")
 
 
 @router.post("/{session_id}/guided/convert", response_model=GetGuidedResponse)
@@ -1815,14 +1992,21 @@ async def post_guided_convert(
     import. A system message records the switch and names the recoverable
     version.
 
-    Idempotent and safe for every entry state, so "Switch to guided" can route
-    through it unconditionally:
-      * no persisted state (empty session) -> persist a fresh wizard checkpoint
-        so the operation has an immutable replay locator.
-      * ``guided_session`` already present -> return it UNCHANGED, including any
-        terminal (so a completed / solver-exhausted / protocol-violation surface
-        still renders — enterGuided routes those non-exit terminals here).
+    The conversion REQUIRES the author's goal (``intent``) and writes it as the
+    session's durable root intent inside the settlement transaction, exactly as
+    ``/guided/start`` does — a wizard with no root cannot reach the planner at
+    all. The transcript is seeded with that goal and one server acknowledgement
+    so the converted session opens on the same surface a started one does.
+
+    Entry states:
+      * no persisted state (empty session) -> persist a fresh rooted wizard
+        checkpoint so the operation has an immutable replay locator.
       * persisted state with ``guided_session is None`` -> the conversion.
+      * ``guided_session`` already present -> 409 ``guided_already_started``.
+        Returning it unchanged would silently discard the goal this request
+        carries; the client's GET-first probe makes this reachable only in a
+        cross-tab race, where the loser refetches. Same-``operation_id``
+        retries never reach the branch — they replay the settled response.
 
     Raises 404 if the session does not exist or belong to the requesting user.
     """
@@ -1867,6 +2051,10 @@ async def post_guided_convert(
             if terminal is not None
             else None
         )
+        # A replay serves the operation's stored state row, which can predate
+        # the write gate; name a custody projection failure instead of a 500.
+        with _named_guided_custody_projection():
+            composition_state = _state_response(record, policy_catalog=catalog)
         return GetGuidedResponse(
             guided_session=GuidedSessionResponse(
                 step=guided.step.value,
@@ -1896,6 +2084,7 @@ async def post_guided_convert(
                     for chat_turn in guided.chat_history
                 ],
                 chat_turn_seq=guided.chat_turn_seq,
+                reviewed_components=project_reviewed_components(guided),
                 profile=_workflow_profile_response(guided),
             ),
             next_turn=_turn_payload_response(
@@ -1904,7 +2093,7 @@ async def post_guided_convert(
                 shield_available=_resolve_shield_available(plugin_snapshot),
             ),
             terminal=terminal_response,
-            composition_state=_state_response(record, policy_catalog=catalog),
+            composition_state=composition_state,
         )
 
     async def _replay(result: object) -> GetGuidedResponse:
@@ -1914,6 +2103,12 @@ async def post_guided_convert(
         return _response_from_record(replay_record)
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
+    # Terminal-replay probe, deliberately BEFORE any session authority is
+    # taken: ``reserve_if_absent=False`` allocates no operation row and
+    # ``takeover_expired=False`` refuses to seize an expired lease, so an
+    # already-settled conversion is answered without this replica acquiring
+    # anything. Anything else (no row, a joinable lease, an expired lease)
+    # falls through to the classification and reservation below.
     pending = await reserve_or_replay_guided_operation(
         service=service,
         session_id=session_id,
@@ -1933,7 +2128,33 @@ async def post_guided_convert(
         kind="guided_convert",
         request=body,
         replay=_replay,
+        reserve_if_absent=False,
     )
+    if reserved is None:
+        # Branch 2, classified BEFORE an operation row is allocated — the same
+        # shape post_guided_reenter and post_guided_start use for an invalid
+        # mode transition. A session that is already guided cannot adopt the
+        # goal this request carries: returning it unchanged would silently
+        # discard what the author typed, so this is an ordinary coded 409 that
+        # leaves no retry artefact behind. A same-``operation_id`` retry never
+        # reaches the classification — the lookup above replays it.
+        async with compose_lock:
+            candidate_record = await service.get_current_state(session_id)
+            if candidate_record is not None and _state_from_record(candidate_record).guided_session is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "guided_already_started",
+                        "detail": "This session is already in guided mode. Reload it to see its current state.",
+                    },
+                )
+        reserved = await reserve_or_replay_guided_operation(
+            service=service,
+            session_id=session_id,
+            kind="guided_convert",
+            request=body,
+            replay=_replay,
+        )
     if reserved is None:  # pragma: no cover - reserve_if_absent defaults true
         raise AuditIntegrityError("Guided conversion operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
@@ -1944,9 +2165,10 @@ async def post_guided_convert(
         async with compose_lock:
             state_record = await service.get_current_state(session_id)
 
-            # Branch 2: already guided (idempotent double-click, cross-tab race,
-            # or a terminal session reached via enterGuided's non-exit branch).
-            # Return the existing session unchanged and settle its exact head.
+            # A conversion that won the classification above can still lose the
+            # race to a start or a competing convert before this lock. That is
+            # an ordinary settlement conflict — the caller reloads and sees the
+            # guided session — not a fault to page on.
             if state_record is not None and _state_from_record(state_record).guided_session is not None:
                 settled_record = await service.complete_existing_state_guided_operation(
                     reserved.fence,
@@ -1959,11 +2181,17 @@ async def post_guided_convert(
                 )
                 return _response_from_record(settled_record)
 
-            # Branches 1 & 3: seed a fresh guided wizard.
+            # Branches 1 & 3: seed a fresh guided wizard rooted in the author's
+            # goal, the same shape ``/guided/start`` seeds.
+            root_message = GuidedOriginatingUserMessageDraft(message_id=uuid4(), content=body.intent)
             new_state = _initial_composition_state_with_guided_session()
             seeded_guided = new_state.guided_session
             if seeded_guided is None:  # pragma: no cover — helper always attaches a guided session
                 raise InvariantError("post_guided_convert: initial state has no guided_session")
+            seeded_guided = _replace(
+                seeded_guided,
+                root_intent_message_id=str(root_message.message_id),
+            )
             seed_turn = _build_get_guided_turn(new_state, seeded_guided, catalog=catalog)
             if seed_turn is None:  # pragma: no cover - initial STEP_1 always emits
                 raise InvariantError("post_guided_convert: initial guided session has no first turn")
@@ -1977,6 +2205,7 @@ async def post_guided_convert(
                 turn=seed_turn,
                 payload_store=request.app.state.payload_store,
             )
+            seeded_guided = _seed_guided_goal_transcript(seeded_guided, intent=root_message.content)
             seed_evidence = _turn_emission_evidence(
                 step=seeded_guided.step,
                 turn_type=seed_turn_type,
@@ -2016,6 +2245,7 @@ async def post_guided_convert(
                 system_message=system_message,
                 payloads=(prepared_seed_turn,),
                 audit_evidence=seed_evidence,
+                originating_message=root_message,
                 payload_store=request.app.state.payload_store,
                 session_operation_context=reserved.session_operation_context,
             )
@@ -2028,12 +2258,18 @@ async def post_guided_convert(
             if isinstance(exc, AuditIntegrityError)
             else "operation_failed"
         )
-        if isinstance(exc, AuditIntegrityError):
+        if failure_code != "stale_conflict":
+            # Widened with post_guided_start, and for the same reason: an
+            # unclassified first-party bug used to settle as
+            # ``operation_failed`` with its traceback discarded and no
+            # server-side record of where it broke. ``stale_conflict`` stays
+            # out as an expected concurrency outcome.
             slog.error(
                 "guided.operation_terminal_failure",
                 session_id=str(session_id),
                 user_id=user.user_id,
                 exc_class=type(exc).__name__,
+                failure_code=failure_code,
                 site="post_guided_convert",
                 frames=_safe_frame_strings(exc),
                 # See the post_guided_start site (R2-F16b): correlates this log
@@ -2050,6 +2286,26 @@ async def post_guided_convert(
         raise_guided_operation_failure(failed)
     finally:
         await lease_guard.finish_active_exception()
+
+
+def _has_planner_intent(guided: GuidedSession) -> bool:
+    """Report whether this session has an author-supplied intent to plan from.
+
+    The planner's brief is assembled from exactly two author-owned sources —
+    the root intent written at start/convert and any intents retained from a
+    step chat — so their union is the whole answer to "is there anything to
+    plan from". A session with neither cannot reach the provider with a real
+    request; before this predicate existed the Step-2 finish substituted a
+    server-authored sentence ("Build the complete pipeline from the reviewed
+    guided components...") and the LLM planned from ELSPETH's words, not the
+    author's.
+
+    Pure and total over owned dataclass attributes: no I/O, no ``getattr``, no
+    Protocol dispatch. Deliberately does NOT verify custody — the callers that
+    plan re-derive the root row through ``get_verified_guided_root_intent``.
+    """
+
+    return guided.root_intent_message_id is not None or bool(guided.deferred_intents)
 
 
 def _schema8_unsupported_stage(step: GuidedStep) -> HTTPException:
@@ -2133,7 +2389,10 @@ def _schema8_permitted_plugins(turn: Turn) -> tuple[str, ...]:
         raise InvariantError("single-select turn has no server-held option list")
     plugins: list[str] = []
     for option in options:
-        if not isinstance(option, Mapping) or "id" not in option or type(option["id"]) is not str:
+        # Exact ``dict``, matching the producers' recursive thaw named above:
+        # a Mapping-tolerant read here would be latent recovery from a
+        # first-party producer bug, not a live population.
+        if type(option) is not dict or "id" not in option or type(option["id"]) is not str:
             raise InvariantError("single-select turn contains a malformed option")
         plugins.append(option["id"])
     return tuple(plugins)
@@ -2241,7 +2500,13 @@ def _schema8_schema_authority(
     payload = turn["payload"]
     knobs = payload["knobs"]
     prefilled = payload["prefilled"]
-    if not isinstance(knobs, Mapping) or not isinstance(prefilled, Mapping):
+    # Exact ``dict``: both Turn producers (``_finalize_guided_turn`` and
+    # ``_load_durable_current_turn``) build the payload as
+    # ``dict(deep_thaw(...))`` with recursive thaw, so the server-held form
+    # authority is an exact dict on live and replay paths alike. A
+    # Mapping-tolerant read would be latent recovery from a first-party
+    # producer bug; anything but an exact dict is corruption and crashes.
+    if type(knobs) is not dict or type(prefilled) is not dict:
         raise InvariantError("schema-form turn is missing server-held form authority")
     server_options = _schema8_server_options(prefilled)
     merged = dict(deep_thaw(options))
@@ -2309,6 +2574,19 @@ class SinkAdmissionRejectedError(HTTPException):
         super().__init__(status_code=400, detail=detail)
 
 
+@trust_boundary(
+    tier=3,
+    source="client-authored GuidedRespondRequest.edited_values from the guided RESPOND HTTP body",
+    source_param="body",
+    suppresses=("R5",),
+    invariant=(
+        "returns without admission judgment when edited_values is not the closed "
+        "{plugin, options} shape for this plugin — closed-shape violations are the "
+        "schema transition contract's to reject; only well-shaped submissions are "
+        "forwarded to the deployment sink admission gate"
+    ),
+    non_raising=True,
+)
 def _schema8_require_runnable_sink_form(
     body: GuidedRespondRequest,
     *,
@@ -2790,7 +3068,8 @@ async def post_guided_respond(
         payloads: tuple[PreparedGuidedJsonPayload, ...] = ()
         if descriptor.next_turn is not None:
             payloads = (load_guided_json_payload(payload_store, payload_id=descriptor.next_turn.payload_id, purpose="turn"),)
-        response = project_guided_response(record, payloads=payloads)
+        with _named_guided_custody_projection():
+            response = project_guided_response(record, payloads=payloads)
         if type(response) is not GuidedRespondResponse:
             raise AuditIntegrityError("Guided RESPOND projection returned the wrong response type")
         return response
@@ -3340,54 +3619,66 @@ async def post_guided_respond(
             # rejection code — without it the operator sees only
             # "invalid_guided_response ValueError" and never learns that
             # policy, not the author, refused the selection.
-            with contextlib.suppress(Exception):
-                if isinstance(exc, WebSurfacePolicyRejectedError):
-                    slog.warning(
-                        "guided.respond_turn_contract_rejected",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        step=observed_guided.step.value,
-                        turn_type=current_turn["type"],
-                        rejection_code=WebSurfacePolicyRejectedError.rejection_code,
-                        exc_class=type(exc).__name__,
-                        exc_message=scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS],
-                    )
-                else:
-                    slog.warning(
-                        "guided.respond_turn_contract_rejected",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        step=observed_guided.step.value,
-                        turn_type=current_turn["type"],
-                        rejection_code="invalid_guided_response",
-                        exc_class=type(exc).__name__,
-                    )
+            # Field assembly runs un-suppressed (the branch, the owned reads
+            # like ``observed_guided.step.value`` / ``current_turn["type"]``,
+            # and the scrubber all crash honestly on first-party bugs); only
+            # the last-resort emission is guarded inside the helper.
+            rejection_fields: dict[str, object] = {
+                "session_id": str(session_id),
+                "user_id": user.user_id,
+                "step": observed_guided.step.value,
+                "turn_type": current_turn["type"],
+                "exc_class": type(exc).__name__,
+            }
+            if isinstance(exc, WebSurfacePolicyRejectedError):
+                rejection_fields["rejection_code"] = WebSurfacePolicyRejectedError.rejection_code
+                rejection_fields["exc_message"] = scrub_text_for_audit(str(exc))[:_CONTRACT_REJECTION_EXC_MESSAGE_CHARS]
+            else:
+                rejection_fields["rejection_code"] = "invalid_guided_response"
+            _log_last_resort_diagnostic(slog.warning, "guided.respond_turn_contract_rejected", **rejection_fields)
             raise HTTPException(
                 status_code=400,
                 detail="Guided response does not satisfy the current turn contract.",
             ) from exc
         projected_guided = projected_state.guided_session
-        requires_planner = (
+        requires_planner = False
+        if (
             observed_guided.step is GuidedStep.STEP_2_SINK
             and projected_guided is not None
             and projected_guided.step is GuidedStep.STEP_3_TRANSFORMS
             and projected_guided.terminal is None
-        )
+        ):
+            requires_planner = True
+            if not _has_planner_intent(projected_guided):
+                # No planner run without an intent (elspeth-13579d1110).
+                # Refused HERE — inside the preflight, before rate admission
+                # and before any operation row is reserved — so the session
+                # stays exactly where it is, on its unanswered
+                # ``review_components`` turn, with no retry artefact and no
+                # provider call. The settlement carries the same predicate as
+                # defence in depth; reaching THAT one is a server bug.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "guided_planner_intent_required",
+                        "detail": "Tell the assistant what this pipeline should produce before finishing outputs.",
+                    },
+                )
         return inspection_facts, fallback_blob_inspection, requires_planner
 
     async def _preflight_or_sanitize(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
         try:
             return await _preflight_attempt(attempt_stable_id)
         except (AuditIntegrityError, *SOURCE_INSPECTION_INTEGRITY_ERRORS, InvariantError) as exc:
-            with contextlib.suppress(Exception):
-                slog.error(
-                    "guided.invariant_violated",
-                    session_id=str(session_id),
-                    user_id=user.user_id,
-                    exc_class=type(exc).__name__,
-                    site="post_guided_respond.preflight",
-                    frames=_safe_frame_strings(exc),
-                )
+            _log_last_resort_diagnostic(
+                slog.error,
+                "guided.invariant_violated",
+                session_id=str(session_id),
+                user_id=user.user_id,
+                exc_class=type(exc).__name__,
+                site="post_guided_respond.preflight",
+                frames=_safe_frame_strings(exc),
+            )
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -3616,6 +3907,19 @@ async def post_guided_respond(
                             ),
                             chat_turn_seq=base_guided.chat_turn_seq + len(instruction_turns) + 1,
                         )
+                        # This settlement advances the head while leaving the
+                        # proposal under review, so the proposal's anchor has
+                        # to follow the checkpoint being written or every
+                        # later currency check names a stale row
+                        # (elspeth-ed67eb9d0d).
+                        settled_rebase = carried_pending_proposal_rebase(
+                            settled_guided,
+                            from_state_id=(current_state_record.id if current_state_record is not None else None),
+                            base_composition_content_hash=(
+                                composition_content_hash(current_state) if current_state_record is not None else None
+                            ),
+                            reason="revision_declined",
+                        )
                         settled_state = _replace(current_state, guided_session=settled_guided)
                         settled_state_dict = settled_state.to_dict()
                         settled_is_valid, settled_validation_errors = _guided_persisted_validity(settled_state, catalog=catalog)
@@ -3666,6 +3970,7 @@ async def post_guided_respond(
                                     planner_attempts=llm_recorder.planner_attempts,
                                     chat_turns=llm_recorder.chat_turns,
                                 ),
+                                rebased_pending_proposal=settled_rebase,
                             ),
                             payload_store=payload_store,
                             session_operation_context=session_operation_context,
@@ -3889,14 +4194,33 @@ async def post_guided_respond(
                             )
                             if authority.row.user_message_id != expected_originating_message_id and predecessor_correction is None:
                                 raise AuditIntegrityError("guided proposal revision user-message lineage drifted")
-                            if (
-                                authority.row.user_message_id == expected_originating_message_id
-                                and expected_originating_message_id is not None
-                            ):
-                                await service.get_verified_guided_root_intent(
+                            # The goal stays the planner's ROOT through every
+                            # revision. Before this, a revision brief carried
+                            # only the deferred intents plus the new
+                            # instruction, so "make it faster" re-planned the
+                            # pipeline against no stated outcome and the goal
+                            # silently stopped being a constraint after the
+                            # first proposal. Verified, never read off the
+                            # checkpoint: the custody helper re-derives the row
+                            # from its immutable start/convert operation — and
+                            # it now runs whenever a root exists, not only when
+                            # the superseded proposal happened to name it.
+                            #
+                            # It rides as the NAMED ``root_goal`` fact, never
+                            # prepended to the intent: ``intent`` means the
+                            # request being made now, and a revision that
+                            # narrows or withdraws part of the goal must not
+                            # have to argue against the goal inside that one
+                            # field — nor feed a stated threshold the author
+                            # has already revoked to the request guards that
+                            # parse it.
+                            root_planner_intent = ""
+                            if expected_originating_message_id is not None:
+                                root_intent_record = await service.get_verified_guided_root_intent(
                                     session_id=session_id,
                                     root_message_id=expected_originating_message_id,
                                 )
+                                root_planner_intent = root_intent_record.content
                             message_ids = {
                                 *(intent.originating_message_id for intent in planning_guided.deferred_intents),
                                 *((str(predecessor_correction.message_id),) if predecessor_correction is not None else ()),
@@ -3967,6 +4291,7 @@ async def post_guided_respond(
                                 progress=planner_progress,
                                 correction_target=correction_target,
                                 revision_authority=revision_authority,
+                                root_goal=root_planner_intent or None,
                             )
                             if isinstance(outcome, GuidedPlannerDecline):
                                 assistant_text = outcome.decline_text.strip() or _empty_decline_fallback
@@ -4228,6 +4553,21 @@ async def post_guided_respond(
                             active_proposal=guided.active_proposal,
                             active_edit_target=None,
                         )
+                        # Advancing into wire review keeps the proposal under
+                        # review while writing a new checkpoint, so its anchor
+                        # follows here too. Before elspeth-ed67eb9d0d this hop
+                        # went unrebound and was absorbed by the one-hop
+                        # ``derived_from`` tolerance in
+                        # ``back_edit_guided_pipeline_proposal`` — which meant
+                        # it SPENT that tolerance, and the next carrying
+                        # settlement at Step 4 killed the "edit this
+                        # component" affordance outright.
+                        reviewed_rebase = carried_pending_proposal_rebase(
+                            final_guided,
+                            from_state_id=state_record.id,
+                            base_composition_content_hash=composition_content_hash(state),
+                            reason="wire_review_entry",
+                        )
                         reviewed_state = _replace(state, guided_session=final_guided)
                         emit_turn_answered(
                             recorder,
@@ -4289,6 +4629,7 @@ async def post_guided_respond(
                                 ),
                                 payloads=(prepared_response, prepared_wire),
                                 audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                                rebased_pending_proposal=reviewed_rebase,
                             ),
                             payload_store=payload_store,
                             session_operation_context=reserved.session_operation_context,
@@ -5014,11 +5355,21 @@ async def post_guided_respond(
                                 planner_messages_by_id[deferred.originating_message_id].content
                                 for deferred in resulting_guided.deferred_intents
                             )
-                            planner_intent = (
-                                "\n\n".join(planner_intent_parts)
-                                if planner_intent_parts
-                                else "Build the complete pipeline from the reviewed guided components and deferred constraints."
-                            )
+                            if not planner_intent_parts:
+                                # Defence in depth for the preflight's coded 409
+                                # (elspeth-13579d1110) — the same condition
+                                # ``_has_planner_intent`` tests, re-stated over
+                                # the assembled brief so an empty brief can
+                                # never reach the provider. The literal that used to
+                                # stand here made ELSPETH the author of the
+                                # planner's brief whenever the session had no
+                                # intent — a server-authored request the LLM then
+                                # planned from. There is no honest sentence to
+                                # substitute: reaching this line means the
+                                # preflight predicate was bypassed, so fail the
+                                # operation instead of inventing a goal.
+                                raise AuditIntegrityError("guided planner run requires a root or deferred intent")
+                            planner_intent = "\n\n".join(planner_intent_parts)
                             originating_message = PlannerOriginatingMessage(
                                 session_id=str(session_id),
                                 message_id=str(root_message.id) if root_message is not None else None,
@@ -5362,19 +5713,19 @@ async def post_guided_respond(
                     if isinstance(exc, PipelinePlannerError)
                     else "operation_failed"
                 )
-                with contextlib.suppress(Exception):
-                    slog.error(
-                        "guided.operation_terminal_failure",
-                        session_id=str(session_id),
-                        user_id=user.user_id,
-                        exc_class=type(exc).__name__,
-                        site="post_guided_respond",
-                        frames=_safe_frame_strings(exc),
-                        # See the post_guided_start site (R2-F16b): correlates
-                        # this log line to the response's X-Request-ID; lenient
-                        # read so a missing middleware cannot break the error path.
-                        request_id=_failure_log_request_id(request),
-                    )
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "guided.operation_terminal_failure",
+                    session_id=str(session_id),
+                    user_id=user.user_id,
+                    exc_class=type(exc).__name__,
+                    site="post_guided_respond",
+                    frames=_safe_frame_strings(exc),
+                    # See the post_guided_start site (R2-F16b): correlates
+                    # this log line to the response's X-Request-ID; lenient
+                    # read so a missing middleware cannot break the error path.
+                    request_id=_failure_log_request_id(request),
+                )
                 try:
                     failed = await service.fail_guided_operation_with_audit(
                         GuidedOperationFailureCommand(
@@ -5394,16 +5745,16 @@ async def post_guided_respond(
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 except Exception as failure_exc:
-                    with contextlib.suppress(Exception):
-                        slog.error(
-                            "guided.operation_failure_record_failed",
-                            session_id=str(session_id),
-                            user_id=user.user_id,
-                            exc_class=type(failure_exc).__name__,
-                            site="post_guided_respond.fail_guided_operation",
-                            frames=_safe_frame_strings(failure_exc),
-                        )
-                    raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from None
+                    _log_last_resort_diagnostic(
+                        slog.error,
+                        "guided.operation_failure_record_failed",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        exc_class=type(failure_exc).__name__,
+                        site="post_guided_respond.fail_guided_operation",
+                        frames=_safe_frame_strings(failure_exc),
+                    )
+                    raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from failure_exc
                 else:
                     # R2-F4: the exact lease persisted the planner's known
                     # output gap in the closed failure envelope before this

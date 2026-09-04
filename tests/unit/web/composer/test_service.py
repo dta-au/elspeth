@@ -211,6 +211,124 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
     )
 
 
+def _reviewed_guided_for_revision() -> GuidedSession:
+    """A step-3 guided session with one reviewed source and output."""
+
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "22222222-2222-4222-8222-222222222222"
+    return GuidedSession(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        root_intent_message_id="33333333-3333-4333-8333-333333333333",
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="input",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("id",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="results",
+                plugin="json",
+                options={"path": "/data/results.jsonl"},
+                required_fields=("id",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            )
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside_its_intent(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session's goal reaches a revision as a NAMED fact with a precedence rule.
+
+    ``intent`` means the request being made now. Concatenating the standing
+    goal into it made a revision that narrows, changes, or withdraws part of
+    the goal argue against the goal inside that one field — and fed the
+    deterministic guards that parse it (``_stated_threshold_for_planner_request``,
+    ``_intent_selected_schema_keys``) words the author had already superseded.
+    The goal therefore rides in ``reviewed_planner_context`` with the sentence
+    that orders the two, the same idiom ``unproducible_output_fields_usage``
+    uses.
+
+    The fresh-candidate run at the step-2 finish is the other half of the rule:
+    there the goal IS the request, so naming it separately is refused rather
+    than silently accepted as a second copy.
+    """
+
+    guided = _reviewed_guided_for_revision()
+    predecessor = _empty_state()
+    captured: dict[str, Any] = {}
+
+    async def capture_plan_pipeline(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
+    session_id = uuid4()
+    goal = "Route rows scoring over 8 to the review sink and everything else to the archive."
+    instruction = "Actually put everything in one sink; no routing."
+
+    def call(**overrides: Any):
+        return composer_service_with_real_sessions.plan_guided_pipeline(
+            intent=instruction,
+            current_state=predecessor,
+            guided=guided,
+            originating_message=PlannerOriginatingMessage(
+                session_id=str(session_id),
+                message_id=str(uuid4()),
+                content=instruction,
+                user_id="test-user",
+            ),
+            base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
+            user_id="test-user",
+            supersedes_draft_hash="f" * 64,
+            recorder=BufferingRecorder(),
+            operation_fence=GuidedOperationFence(
+                session_id=session_id,
+                operation_id=str(uuid4()),
+                lease_token=uuid4().hex,
+                attempt=1,
+            ),
+            **overrides,
+        )
+
+    await call(
+        revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
+        root_goal=goal,
+    )
+
+    assert captured["intent"] == instruction
+    reviewed_context = captured["reviewed_planner_context"]
+    assert reviewed_context["root_goal"] == goal
+    assert "the current instruction is the request" in reviewed_context["root_goal_usage"]
+
+    # Neither authority: this is a fresh-candidate request, where the goal is
+    # the intent. A second, named copy is refused before any planner work.
+    captured.clear()
+    with pytest.raises(ValueError, match="root_goal names the standing goal"):
+        await call(root_goal=goal)
+    assert captured == {}
+
+    # Exact-type, non-empty: an owned parameter is nominally typed (ADR-032).
+    for bad_goal in ("", cast(str, 17)):
+        with pytest.raises(TypeError, match="root_goal must be a non-empty exact str"):
+            await call(
+                revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
+                root_goal=bad_goal,
+            )
+    assert captured == {}
+
+
 @pytest.mark.asyncio
 async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_repair(
     composer_service_with_real_sessions: ComposerServiceImpl,
@@ -840,6 +958,25 @@ def test_freeform_planner_context_does_not_override_self_contained_current_inten
     assert context is None
 
 
+def test_freeform_planner_context_present_but_invalid_authorship_marker_crashes() -> None:
+    """The marker is NotRequired[Literal[True]]: absence skips the entry, but a
+    PRESENT non-True value (e.g. None) is a broken first-party contract and must
+    raise instead of being folded into the absent path by a ``.get()`` default."""
+    from elspeth.web.composer.guided.errors import InvariantError
+
+    with pytest.raises(InvariantError, match="user-authorship marker is malformed"):
+        _freeform_planner_conversation_context(
+            "Build the requested pipeline.",
+            [
+                {
+                    "role": "user",
+                    "content": "Route rows with amount > 500 to high_value.",
+                    COMPOSER_HISTORY_USER_AUTHORED_KEY: None,  # type: ignore[typeddict-item]
+                }
+            ],
+        )
+
+
 class TestComposerTextOnlyResponse:
     @pytest.mark.asyncio
     async def test_non_build_text_only_returns_immediately(self) -> None:
@@ -1084,6 +1221,8 @@ class TestComposerSingleToolCall:
         assert proposals[0].composer_provider == "test"
         assert proposals[0].composer_skill_hash == composer_service_with_real_sessions._composer_skill_hash
         assert proposals[0].tool_arguments_hash == stable_hash(proposals[0].arguments_json)
+        assert "pipeline" not in proposals[0].arguments_json
+        assert {"source", "nodes", "edges", "outputs", "metadata"}.issubset(proposals[0].arguments_json)
         assert result.tool_outcomes[0].post_version == state.version
 
     @pytest.mark.asyncio
@@ -1556,7 +1695,7 @@ class TestComposerSingleToolCall:
                 "on_success": "source_out",
                 "options": {
                     "column": "text",
-                    "schema": {"mode": "observed", "guaranteed_fields": ["text"]},
+                    "schema": {"mode": "flexible", "fields": ["text: str"], "guaranteed_fields": ["text"]},
                 },
                 "inline_blob": {
                     "filename": "input.txt",
@@ -2174,6 +2313,7 @@ def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() ->
         recorder=BufferingRecorder(),
         repair_turns_used=0,
         persisted_assistant_message_id=None,
+        persisted_assistant_content=None,
         persisted_tool_call_turn=False,
         runtime_preflight=None,
         outstanding_findings=None,

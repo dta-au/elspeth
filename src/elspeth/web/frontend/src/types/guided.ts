@@ -136,6 +136,15 @@ export interface GuidedSession {
   terminal: TerminalState | null;
   chat_history: ChatTurn[];
   chat_turn_seq: number;
+  /**
+   * Server-projected reviewed-component ledger (elspeth-f2a8550b3d): the
+   * components settled so far, in authored order. Present on EVERY guided
+   * response — including a completed session, whose `next_turn` is `null`.
+   * This replaced a client-side fold over `next_turn`, which necessarily saw
+   * an empty ledger after any reload and on every completed session, and
+   * which was reconstructed rather than authoritative.
+   */
+  reviewed_components: GuidedReviewedComponents;
   /** Server-owned WorkflowProfile, or `null` for the empty/live-guided profile. */
   profile: WorkflowProfile | null;
 }
@@ -564,6 +573,23 @@ export interface ComponentReviewPayload {
 }
 
 /**
+ * Wire: `GuidedSessionResponse.reviewed_components`
+ * (schemas.py `GuidedReviewedComponentsResponse`) — what the server says has
+ * been settled, per kind, in authored order.
+ *
+ * The entries are `ComponentReviewItem`s BY DESIGN, not by coincidence: the
+ * server projects this ledger and the `review_components` card from one
+ * derivation (`state_machine.reviewed_component_ledger`), so the field set is
+ * closed at identity + display. Reviewed option values, inspected columns and
+ * samples, storage paths and content anchors are deliberately absent — they
+ * stay in the schema-8 checkpoint under `composition_state.composer_meta`.
+ */
+export interface GuidedReviewedComponents {
+  readonly sources: readonly ComponentReviewItem[];
+  readonly outputs: readonly ComponentReviewItem[];
+}
+
+/**
  * Closed, non-executable projection of a durable pipeline proposal. There are
  * no plugin options, paths, prompts, secret values, or model-authored text in
  * this surface.
@@ -659,6 +685,18 @@ export type ProposalNodeBehavior =
       policy: "require_all" | "best_effort";
     };
 
+/** Closed node-kind vocabulary of the proposal and wire-stage surfaces. The
+ *  strict wire decoder (guidedDecoder.ts decodeProposalNodeType) narrows BOTH
+ *  surfaces' `node_type` to this set at runtime; the type says so. */
+export type ProposalNodeType =
+  | "transform"
+  | "gate"
+  | "aggregation"
+  | "queue"
+  | "coalesce"
+  | "row_union"
+  | "collector";
+
 export interface ProposePipelinePayload {
   proposal_id: string;
   draft_hash: string;
@@ -695,14 +733,7 @@ export interface ProposePipelinePayload {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type:
-      | "transform"
-      | "gate"
-      | "aggregation"
-      | "queue"
-      | "coalesce"
-      | "row_union"
-      | "collector";
+    node_type: ProposalNodeType;
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
     node_options_summary: NodeOptionSummary[];
@@ -779,7 +810,7 @@ export interface WireStageData {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: string;
+    node_type: ProposalNodeType;
     plugin: string | null;
     behavior: ProposalNodeBehavior;
     required_fields: string[];

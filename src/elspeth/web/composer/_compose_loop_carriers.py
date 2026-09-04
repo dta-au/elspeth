@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
-from elspeth.contracts.errors import FailedTurnMetadata
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
@@ -124,6 +124,34 @@ class _AdvisorReviewState:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "previous_findings", "successful_mutating_actions")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorCallSuccess:
+    """Successfully admitted advisor guidance and its accounting metadata."""
+
+    guidance: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorProviderFailure:
+    """Recognised Tier-3 provider failure that may become tool feedback."""
+
+    error_class: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdvisorFirstPartyFailure:
+    """Unclassified controlled-code failure that must propagate after P4."""
+
+    original_exc: Exception
+
+
+_AdvisorCallOutcome = _AdvisorCallSuccess | _AdvisorProviderFailure | _AdvisorFirstPartyFailure
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +271,11 @@ class _DispatchOutcome:
     plugin_crash: ComposerPluginCrashError | None
     plugin_crash_cause: BaseException | None
 
+    # First-party advisor failure — unlike plugin_crash this keeps the
+    # original exception type, but follows the same persist-before-propagate
+    # discipline so the request_advisor_hint row is never left OPEN.
+    advisor_failure: Exception | None
+
     # Advisor-tool compose timeout — the tool envelope is already closed in
     # P3, but P4 must persist/redact the current assistant+tool turn before the
     # driver raises the ordinary convergence-timeout recovery carrier.
@@ -283,9 +316,50 @@ class _PersistOutcome:
 
     current_state_id: str | None
     persisted_assistant_message_id: str | None
+    # The assistant content actually committed for that row — not the turn's
+    # prose. The two diverge on the advisor-repair branch, which persists a
+    # fixed public message with ``raw_content=None``
+    # (``service._persist_turn_audit``). The turn-end writer compares against
+    # this to avoid re-emitting a row it already committed
+    # (elspeth-d581b3da7f); comparing against the turn prose would miss that
+    # branch. REQUIRED (no default) so a threading site that adds the id
+    # without it fails at construction rather than silently duplicating.
+    persisted_assistant_content: str | None
     persisted_tool_call_turn: bool
+    # True only when P4 persisted the current dispatch's assistant prose
+    # without substituting backend-owned content. REQUIRED (no default): P5
+    # must not infer turn identity from row presence or byte equality.
+    persisted_assistant_matches_current_dispatch: bool
     unwind_audit_failed: bool
     failed_turn: FailedTurnMetadata | None
+
+    def __post_init__(self) -> None:
+        # Biconditional, not a one-way check: the id names a row and the
+        # content is what that row holds, so one without the other is a
+        # half-threaded state. Setting the id alone is the dangerous
+        # direction (the turn-end writer can no longer tell a re-emission
+        # from genuine later prose, and duplicates); the reverse is
+        # incoherent. Both are unrepresentable here.
+        if (self.persisted_assistant_message_id is None) != (self.persisted_assistant_content is None):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome pairing invariant violated — "
+                "persisted_assistant_message_id and persisted_assistant_content "
+                "must be set or unset together. The id names the committed "
+                "assistant row and the content is what that row holds; a "
+                "half-threaded pair leaves the turn-end writer unable to "
+                "distinguish a re-emission of that row from genuine later "
+                "prose (elspeth-d581b3da7f). "
+                f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
+                f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
+            )
+        if self.persisted_assistant_matches_current_dispatch and (
+            self.persisted_assistant_message_id is None or self.persisted_assistant_content is None or not self.persisted_tool_call_turn
+        ):
+            raise AuditIntegrityError(
+                "Tier 1: _PersistOutcome current-dispatch invariant violated — "
+                "persisted_assistant_matches_current_dispatch requires a complete "
+                "persisted assistant pair and persisted_tool_call_turn=True."
+            )
 
 
 @dataclass(frozen=True, slots=True)

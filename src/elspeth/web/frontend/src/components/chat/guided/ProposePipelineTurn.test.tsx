@@ -2,7 +2,12 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
 import { usePreferencesStore } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
   GuidedProposalReviewState,
@@ -12,7 +17,12 @@ import { ProposePipelineTurn } from "./ProposePipelineTurn";
 
 // The components list gates advanced-tier option pairs on show_advanced, so
 // this turn is a preferences-store reader; the store is a module singleton.
-beforeEach(() => resetStore(usePreferencesStore));
+// The Show-graph pointer reads activeSessionId from the session store, so
+// that singleton is reset too.
+beforeEach(() => {
+  resetStore(usePreferencesStore);
+  resetStore(useSessionStore);
+});
 
 const IDS = {
   proposal: "00000000-0000-4000-8000-000000000401",
@@ -223,7 +233,38 @@ function activeReview(): GuidedProposalReviewState {
 }
 
 describe("ProposePipelineTurn", () => {
-  it("renders the full DAG, stable edge identities, virtual discard, routes, queues, aggregations, fan-in, sources, and outputs", () => {
+  // The DAG itself is drawn by the Pipeline pane from the same payload
+  // (guidedGraphProjection → GraphView); the card keeps the textual summary
+  // and controls and points at the pane (elspeth-9f0873426a, IA-1/V-1).
+  it("points at the Graph pane instead of drawing the DAG, and Show graph requests that tab for the active session", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    const received: RequestArtifactViewDetail[] = [];
+    const listener = (event: Event): void => {
+      received.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    try {
+      const { container } = render(
+        <ProposePipelineTurn
+          payload={payload()}
+          reviewState={activeReview()}
+          onSubmit={vi.fn()}
+        />,
+      );
+      expect(container.querySelector(".guided-readonly-graph")).toBeNull();
+      expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+
+      await user.click(screen.getByRole("button", { name: "Show graph" }));
+      expect(received).toEqual([
+        { tab: "graph", focusMode: false, sessionId: "session-1" },
+      ]);
+    } finally {
+      window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    }
+  });
+
+  it("renders the counts, routes, queues, aggregations, fan-in, sources, and outputs textually", () => {
     const { container } = render(
       <ProposePipelineTurn
         payload={payload()}
@@ -232,9 +273,9 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
-    expect(container.querySelector(`[data-edge-id="${edgeId(6)}"]`)).not.toBeNull();
-    expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
+    expect(container.querySelector(".guided-readonly-graph")).toBeNull();
     expect(screen.getByText("2 sources · 4 nodes · 13 routes · 2 outputs")).toBeVisible();
     // F11: the gate summary carries the authored predicate verbatim plus each
     // author-visible route key resolved to its destination — with the ordinal
@@ -255,7 +296,11 @@ describe("ProposePipelineTurn", () => {
     // the ordinal alias visible.
     expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/when false \(route-2\)/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
+    // The routes list is the card's structural view now that the DAG is drawn
+    // in the pane; each route row carries its stable edge identity.
+    expect(container.querySelector(`[data-edge-id="${edgeId(10)}"]`)).toHaveTextContent(
+      "node-3 → discard — on error",
+    );
     // elspeth-ca456d9d8d: the components list names a plugin by its display
     // label ("JSON", "CSV"), not its raw catalog id.
     expect(screen.getByText("source-2 · JSON")).toBeVisible();
@@ -361,6 +406,121 @@ describe("ProposePipelineTurn", () => {
     ).toBeVisible();
   });
 
+  // I-2 (design review 2026-09-02): the llm node's prompt and model — the
+  // decision the user is approving — were invisible until the post-commit
+  // approval card. They render on the proposal card before any approval, and
+  // Edit routes back through the existing node-scoped revise so the planner
+  // stays the author of the change (composer invariant 1).
+  const LONG_PROMPT = Array.from(
+    { length: 12 },
+    (_, index) => `Step ${index + 1}: consider the passage carefully.`,
+  ).join("\n");
+
+  function llmPayload(overrides: Partial<ProposePipelinePayload> = {}): ProposePipelinePayload {
+    const base = payload();
+    return {
+      ...base,
+      component_counts: { sources: 0, nodes: 1, edges: 0, outputs: 0 },
+      graph: { sources: [], edges: [] },
+      nodes: [
+        {
+          stable_id: IDS.aggregation,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "llm" },
+          behavior: { kind: "transform" },
+          node_options_summary: [
+            { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
+            { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
+            { key: "prompt_template", value: LONG_PROMPT, tier: "common" },
+          ],
+        },
+      ],
+      outputs: [],
+      edit_targets: [{ kind: "node", stable_id: IDS.aggregation }],
+      ...overrides,
+    };
+  }
+
+  it("shows the llm node's model and prompts before approval, long prompt collapsed to its first lines", async () => {
+    const user = userEvent.setup();
+    render(<ProposePipelineTurn payload={llmPayload()} reviewState={activeReview()} onSubmit={vi.fn()} />);
+
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.getByText(/You are a careful reviewer\./)).toBeVisible();
+    expect(screen.getByText(/Step 1: consider the passage carefully\./)).toBeVisible();
+    // Not detail-level gated: a decision input, not technical detail.
+    expect(screen.getByText(/Step 1: consider/).closest("details")).toBeNull();
+    expect(screen.queryByText(/Step 12: consider/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show full prompt for node-1" }));
+    expect(screen.getByText(/Step 12: consider the passage carefully\./)).toBeVisible();
+  });
+
+  it("Edit on the prompt pre-targets that node in the revise flow and submits a node-scoped revise", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<ProposePipelineTurn payload={llmPayload()} reviewState={activeReview()} onSubmit={onSubmit} />);
+
+    await user.click(screen.getByRole("button", { name: "Edit prompt for node-1" }));
+    const feedback = screen.getByRole("textbox", { name: "What should change?" });
+    expect(feedback).toHaveFocus();
+    expect(screen.getByText("Revision for")).toHaveTextContent("Revision for node-1");
+    await user.type(feedback, "Ask for a two-sentence summary instead of one.");
+    await user.click(screen.getByRole("button", { name: "Send revision request" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith({
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: IDS.proposal,
+      draft_hash: "d".repeat(64),
+      edit_target: { kind: "node", stable_id: IDS.aggregation },
+      correction_feedback: "Ask for a two-sentence summary instead of one.",
+      control_signal: null,
+    });
+  });
+
+  it("disables Edit while the review controls are locked, like the Revise buttons it opens", () => {
+    render(
+      <ProposePipelineTurn
+        payload={llmPayload()}
+        reviewState={{ ...activeReview(), status: "submitting" }}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Edit prompt for node-1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Revise node-1" })).toBeDisabled();
+  });
+
+  it("withholds Edit where no node revise target exists or the revise flow is hidden (tutorial)", () => {
+    const { rerender } = render(
+      <ProposePipelineTurn
+        payload={llmPayload({ edit_targets: [] })}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();
+
+    // The tutorial hides Reject/Revise today (slice F, step 3.2, will stop
+    // hiding them); the prompt itself is NOT tutorial-special — it still
+    // shows (ADR-031). Only the Edit that would open the hidden flow is
+    // withheld alongside it.
+    rerender(
+      <ProposePipelineTurn
+        payload={llmPayload({ supersedes_draft_hash: "e".repeat(64) })}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+        isTutorial
+      />,
+    );
+    expect(screen.getByText("Model: anthropic/claude-sonnet-4")).toBeVisible();
+    expect(screen.getByText(/Step 1: consider the passage carefully\./)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Edit prompt/ })).toBeNull();
+  });
+
   it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
     const rowUnionPayload = payload();
     rowUnionPayload.nodes[3] = {
@@ -387,9 +547,6 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(
-      container.querySelector('[data-node-kind="row_union"]'),
-    ).not.toBeNull();
     // The components list names the node type in the reader's register, never
     // the raw union member, with the raw token recoverable from `title` — the
     // same derivation the sibling wire-stage row uses.
@@ -399,18 +556,13 @@ describe("ProposePipelineTurn", () => {
     expect(componentRow).not.toBeNull();
     expect(componentRow!.textContent).toBe("node-4 · Row Union");
     expect(
-      container.querySelector(
-        ".guided-readonly-graph__node--row_union",
-      ),
-    ).not.toBeNull();
-    expect(
       screen.getByText(
         /waits for branch-1, branch-2, then forwards every row without merging records; timeout 12.5s/i,
       ),
     ).toBeVisible();
-    expect(
-      screen.getAllByText(/after row union → output-1/i).length,
-    ).toBeGreaterThan(0);
+    expect(container.querySelector(`[data-edge-id="${edgeId(11)}"]`)).toHaveTextContent(
+      "node-4 → output-1 — after row union",
+    );
   });
 
   it("distinguishes parallel row-union revision controls by gate-fork flow", async () => {
@@ -484,11 +636,40 @@ describe("ProposePipelineTurn", () => {
       />,
     );
 
-    expect(screen.getByText("A complete pipeline is ready for review.")).toBeVisible();
+    // Headline derived from the node count (goal-first, elspeth-378cfa0e18).
+    // The fixture carries 4 nodes.
+    expect(
+      screen.getByText("The assistant proposed 4 processing steps from your goal."),
+    ).toBeVisible();
     expect(
       screen.getByText("Review its structure, routes, and blockers before checking the detailed wiring."),
     ).toBeVisible();
     expect(screen.queryByText("guided.proposal.rationale.review_required.v1")).toBeNull();
+  });
+
+  // The headline was a FIXED sentence — "A complete pipeline is ready for
+  // review." — regardless of what the planner actually built. It made a claim
+  // the card could not support, most visibly on a zero-node pass-through,
+  // which is a legitimate proposal when the stated goal names no processing.
+  it.each([
+    [0, "The assistant proposes no processing steps — rows pass straight from your source to your output."],
+    [1, "The assistant proposed 1 processing step from your goal."],
+    [4, "The assistant proposed 4 processing steps from your goal."],
+  ])("derives the headline from a node count of %i", (nodes, expected) => {
+    const base = payload();
+    render(
+      <ProposePipelineTurn
+        payload={{
+          ...base,
+          component_counts: { ...base.component_counts, nodes },
+        }}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(expected)).toBeVisible();
+    expect(screen.queryByText("A complete pipeline is ready for review.")).toBeNull();
   });
 
   it("collects exact feedback before submitting a proposal-bound node revision", async () => {
@@ -670,7 +851,11 @@ describe("ProposePipelineTurn", () => {
       );
 
       expect(screen.getByRole("alert")).toHaveTextContent(/response was not received/i);
-      const controls = screen.getAllByRole("button");
+      // Show graph is a navigation pointer, not a proposal action: it stays
+      // enabled in every review state and is excluded from the count.
+      const controls = screen.getAllByRole("button", {
+        name: (name) => name !== "Show graph",
+      });
       expect(controls.filter((control) => !control.hasAttribute("disabled"))).toHaveLength(1);
       expect(screen.getByRole("button", { name: enabledName })).toBeEnabled();
     },
@@ -757,7 +942,8 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
     expect(screen.getByText("source-1 · CSV")).toBeVisible();
     expect(screen.getByText(/press Review wiring to continue/i)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
@@ -777,14 +963,19 @@ describe("ProposePipelineTurn", () => {
     ]);
   });
 
-  it("withholds Review wiring on the tutorial pre-Send auto-proposal and tells the learner to press Send", () => {
-    // Tutorial run 18 (session 07e8a3a8): the step-2→step-3 transition
-    // auto-plans a first proposal from the degenerate fallback intent before
-    // the learner's frozen transforms prompt is sent — a source→sink
-    // passthrough. Accepting it commits a transform-less pipeline that the
-    // tutorial launch gate then 409s. The auto-proposal is identified by
-    // supersedes_draft_hash === null; withhold the primary and direct the
-    // learner to Send so the revision re-plan carries the real scenario.
+  it("offers Review wiring on the tutorial's single proposal, whose supersedes hash is null", () => {
+    // The withheld arm this replaces existed for the pre-Send auto-proposal:
+    // the step-2 finish used to plan a source-to-sink pass-through from a
+    // degenerate fallback intent before the learner's frozen transforms prompt
+    // was sent, and accepting it committed a transform-less pipeline the
+    // tutorial launch gate then 409'd (run 18, session 07e8a3a8). Goal-first
+    // (elspeth-378cfa0e18) removes that proposal at the source — the frozen
+    // prompt is the session's root intent from /guided/start, so the one
+    // planner run produces real steps. Its supersedes_draft_hash is null, the
+    // exact value the withhold keyed on, so the gate now has to go: it would
+    // hide the only forward affordance on the card the learner must accept
+    // (reject/revise stay withheld, and there is no step-3 locked prompt to
+    // Send any more).
     const onSubmit = vi.fn();
     render(
       <ProposePipelineTurn
@@ -794,11 +985,19 @@ describe("ProposePipelineTurn", () => {
         isTutorial
       />,
     );
-    expect(screen.getByRole("img", { name: /pipeline proposal graph/i })).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Review wiring" })).toBeNull();
+    expect(payload().supersedes_draft_hash).toBeNull();
+    expect(screen.getByText("The proposed structure is drawn in the Graph pane.")).toBeVisible();
+    expect(screen.queryByRole("img", { name: /pipeline proposal graph/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
+    // Off-script affordances stay withheld for the passive learner.
     expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
     expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
-    expect(screen.getByText(/press Send/i)).toBeVisible();
+    // The retired copy pointed at a step-3 Send that no longer exists.
+    expect(screen.queryByText(/press Send/i)).toBeNull();
+    expect(screen.queryByText(/starting sketch/i)).toBeNull();
+    expect(
+      screen.getByText(/The assistant planned this pipeline from your prompt\./),
+    ).toBeVisible();
     expect(onSubmit).not.toHaveBeenCalled();
   });
 

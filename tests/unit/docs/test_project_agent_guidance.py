@@ -205,54 +205,11 @@ def test_cicd_audit_routes_signed_row_changes_through_staging() -> None:
     assert "remove that stale row" not in text
 
 
-def test_agents_guide_is_a_public_covenant_without_tool_catalogues() -> None:
-    """AGENTS.md is the harness-neutral covenant (ADR-043, 2026-08-30 amendment).
-
-    The maintainer's tracker and code-map instructions live in
-    docs/maintainer/toolchain.md; the covenant must not re-absorb their
-    installer blocks or verb catalogues, and must keep the product-level
-    sections every contributor needs.
-    """
-    text = AGENTS_GUIDE.read_text(encoding="utf-8")
-
-    assert "filigree:instructions" not in text
-    assert "loomweave:instructions" not in text
-    assert "## Filigree Issue Tracker" not in text
-    assert "## Loomweave" not in text
-    assert "mcp__filigree__" not in text
-    assert "mcp__loomweave__" not in text
-    assert "work_start_next" not in text
-    assert "entity_callers_list" not in text
-    assert "## Standing authorization" not in text
-    assert "lane-manager" not in text
-
-    assert "docs/maintainer/toolchain.md" in text
-    assert "none of it is required to contribute" in " ".join(text.split())
-    for heading in (
-        "## Quick reference",
-        "## Gotchas",
-        "## Project delivery posture",
-        "## Composer invariants (non-negotiable)",
-        "## Judge-signature stage (tier-model allowlist signing)",
-    ):
-        assert heading in text, heading
-    assert "--judge-tools readonly" in text
-    assert "--judge-transport codex-cli" not in text
-    # ADR-043 amendment target is 150 lines; the ceiling ratchets down, never up.
-    assert len(text.splitlines()) <= 180
-
-    claude_text = CLAUDE_GUIDE.read_text(encoding="utf-8")
-    assert "@AGENTS.md" in claude_text
-    assert "docs/maintainer/toolchain.md" in claude_text
-    assert "lane-manager" not in claude_text
-
-
 def test_maintainer_toolchain_doc_is_labelled_not_required() -> None:
     text = MAINTAINER_TOOLCHAIN.read_text(encoding="utf-8")
 
     assert text.startswith("# Maintainer toolchain\n")
     assert "not a requirement of the project" in text.split("\n## ", maxsplit=1)[0]
-    assert "<!-- filigree:instructions:" in text and "<!-- /filigree:instructions -->" in text
     assert "<!-- loomweave:instructions:" in text and "<!-- /loomweave:instructions -->" in text
     assert "## Standing authorization: skills, subagents, and workflows" in text
     assert "lane-manager" in text

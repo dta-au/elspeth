@@ -778,6 +778,19 @@ class TestR4BroadExcept:
 
         assert len([f for f in findings if f.rule_id == "R4"]) == 1
 
+    def test_scalar_method_result_appended_to_errors_still_fires_r4(self) -> None:
+        """A method call on a scalar does not construct a closed-vocabulary record."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except Exception as exc:
+                    errors.append(str(exc).strip())
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R4"]) == 1
+
 
 # =============================================================================
 # R6: Silent specific exception handling
@@ -895,6 +908,20 @@ class TestR6SilentExcept:
 
         assert [f for f in findings if f.rule_id == "R6"] == []
 
+    def test_error_entry_keyword_on_attribute_factory_survives_local_binding(self) -> None:
+        """The explicit ``error_code=`` proof follows a handler-local binding."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    entry = factories.make(error_code="bad_thing", blocking=True)
+                    errors.append(entry)
+        """)
+        findings = parse_and_visit(source)
+
+        assert [f for f in findings if f.rule_id == "R6"] == []
+
     def test_private_factory_appended_to_errors_accumulator_is_explicit(self) -> None:
         """The live composer shape: ``errors.append(_err(component, str(exc), "high", code))``."""
         source = dedent("""
@@ -921,6 +948,19 @@ class TestR6SilentExcept:
 
         assert [f for f in findings if f.rule_id == "R6"] == []
 
+    def test_capitalized_method_on_name_appended_to_errors_still_fires_r6(self) -> None:
+        """Capitalization cannot prove that a name receiver is a module."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    errors.append(scalar.Title())
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
     def test_builtin_call_appended_to_errors_accumulator_still_fires_r6(self) -> None:
         """Adversarial twin: ``errors.append(str(exc))`` records no closed-vocabulary entry."""
         source = dedent("""
@@ -929,6 +969,33 @@ class TestR6SilentExcept:
                     run()
                 except ValueError as exc:
                     errors.append(str(exc))
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
+    def test_scalar_method_result_appended_to_errors_still_fires_r6(self) -> None:
+        """A method call on a scalar does not construct a closed-vocabulary record."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    errors.append(str(exc).strip())
+        """)
+        findings = parse_and_visit(source)
+
+        assert len([f for f in findings if f.rule_id == "R6"]) == 1
+
+    def test_name_bound_scalar_method_appended_to_errors_still_fires_r6(self) -> None:
+        """A lowercase method on a name is not a qualified record constructor."""
+        source = dedent("""
+            def validate(errors):
+                try:
+                    run()
+                except ValueError as exc:
+                    message = str(exc)
+                    errors.append(message.strip())
         """)
         findings = parse_and_visit(source)
 

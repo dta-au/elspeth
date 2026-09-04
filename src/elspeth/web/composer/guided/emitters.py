@@ -56,6 +56,7 @@ from elspeth.web.composer.guided.protocol import (
     node_options_summary,
 )
 from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
+from elspeth.web.composer.guided.state_machine import reviewed_component_ledger
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
 
 if TYPE_CHECKING:
@@ -298,7 +299,11 @@ def build_step_2_schema_form_turn(
     prefilled: dict[str, Any] = {"schema": {"mode": "observed"}}
     if prefilled_options is not None:
         prefilled.update(deep_thaw(prefilled_options))
-    prefilled.setdefault("on_write_failure", "discard")
+    # Seed the wrapper knob's default only when the staged chat-resolution
+    # options did not carry one: an explicit first-wins choice, not a hidden
+    # missing-key recovery — the form renders the value for operator review.
+    if "on_write_failure" not in prefilled:
+        prefilled["on_write_failure"] = "discard"
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": plugin,
@@ -323,6 +328,10 @@ def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
                 "label": "On Write Failure",
                 "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
                 "kind": "text",
+                # ``tier`` is required on KnobField; "common" matches the
+                # catalog's own wrapper-synthesized knobs, so this core
+                # write-failure route renders untucked like every required
+                # wrapper knob instead of shipping an untiered projection.
                 "tier": "common",
                 "required": False,
                 "nullable": False,
@@ -357,6 +366,10 @@ def build_component_review_turn(
     if len(order) > 1:
         actions.append("remove")
     actions.extend(("reorder", "finish"))
+    # One derivation for the card and the wire ledger: the same entries this
+    # card publishes are what ``reviewed_components`` carries on every guided
+    # response (guided_replay.project_reviewed_components), so the two
+    # surfaces cannot name different components, orders, or plugins.
     return Turn(
         type=TurnType.REVIEW_COMPONENTS.value,
         step_index=_step_index(expected_step),
@@ -364,18 +377,35 @@ def build_component_review_turn(
             "component_kind": component_kind,
             "items": [
                 {
-                    "stable_id": stable_id,
-                    "name": reviewed[stable_id].name,
-                    "plugin": reviewed[stable_id].plugin,
-                    "status": "reviewed",
+                    "stable_id": entry.stable_id,
+                    "name": entry.name,
+                    "plugin": entry.plugin,
+                    "status": entry.status,
                 }
-                for stable_id in order
+                for entry in reviewed_component_ledger(guided, component_kind)
             ],
             "allowed_actions": actions,
         },
     )
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "reviewed source options carried on SourceResolved: free-form plugin configuration authored through "
+        "the composer (planner tool calls or the schema_form), stored verbatim and never schema-validated by "
+        "the composer, so 'blob_ref' and 'path' presence and shape are not guaranteed here"
+    ),
+    source_param="source",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "renders the authored options into the schema_form prefill unchanged (still externally authored, for "
+        "the form and downstream validation to adjudicate) except that a blob-backed source's absolute "
+        "storage path is masked behind the stable blob:<ref> sentinel — only when both 'blob_ref' is present "
+        "and 'path' is a string, so an operator-typed path knob is left untouched; absence of either is a "
+        "normal non-blob shape, and this emitter never raises on malformed source options"
+    ),
+)
 def build_step_1_schema_form_turn_from_resolved(
     source: SourceResolved,
     catalog: CatalogServiceProtocol,
@@ -459,9 +489,19 @@ def build_step_2_multi_select_turn(
     """Build a ``multi_select_with_custom`` Turn for declaring required fields.
 
     Emitted after the user fills in sink options (Step 2 ``schema_form``).
-    The options are pre-populated from Step 1's observed columns; the user
-    ticks which fields must appear in the output, adds custom fields, or
-    clicks the escape label to let the source decide.
+    The options are Step 1's observed columns; the user ticks which fields
+    must be present on every output row, adds custom fields, or clicks the
+    escape label to let the source decide.
+
+    Nothing is pre-pinned (``default_chosen`` is empty; design review
+    2026-09-02 I-3). This turn runs before any transform exists, so the
+    fields the pipeline is about to produce are never among its options, and
+    a pre-ticked source column made the one-click answer assert a per-row
+    presence contract derived from a bounded inspection sample — the
+    "validation theatre" elspeth-1318049ffe rejects. Pass-through is the
+    designed default; pinning is a deliberate tick. What "keep" means once a
+    field is pinned is adjudicated in
+    docs/plans/2026-08-19-invert-guided-sink-field-keep.md and unchanged here.
 
     ``escape_label`` wire contract (elspeth-948eb9c0b8 C-3(a)): clicking the
     escape action MUST submit ``control_signal: "passthrough"`` (see
@@ -487,7 +527,7 @@ def build_step_2_multi_select_turn(
     payload: MultiSelectWithCustomPayload = {
         "question": "Which fields must appear in the output?",
         "options": options,
-        "default_chosen": list(observed_columns),
+        "default_chosen": [],
         "escape_label": "Let source decide (pass all fields through)",
     }
     return Turn(

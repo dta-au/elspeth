@@ -9,7 +9,7 @@ import io
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Final, TypedDict
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -44,6 +44,10 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools._common import (
     _DEFAULT_SOURCE_VALIDATION_FAILURE,
+    _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE,
+    _SERVER_OWNED_SOURCE_OPTION_KEYS,
+    _SOURCE_BLOB_REF_OPTION_KEY,
+    _SOURCE_BLOBS_OPTION_KEY,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     PendingCustodyBlobView,
@@ -70,6 +74,7 @@ from elspeth.web.composer.tools._common import (
     _validate_source_path,
     _vf_destination_note,
     canonicalize_source_validation_failure,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
@@ -101,6 +106,12 @@ _INLINE_CSV_HEADER_READ_BYTES = 64 * 1024
 _CSV_FIELD_MAX_CHARS = 64 * 1024
 _CSV_MAX_COLUMNS = 4096
 _INLINE_CSV_CANDIDATE_SCAN_LIMIT = 50
+_SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
+    " Server/resolver-owned source option roots are not settable: "
+    + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, source.blob_id, or source.inline_blob."
+    + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
+)
 
 
 class _CsvContentBoundaryError(ValueError):
@@ -219,7 +230,10 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
                     "runtime matches strings, not graph topology."
                 ),
             },
-            "options": {"type": "object", "description": "Plugin-specific config."},
+            "options": {
+                "type": "object",
+                "description": "Plugin-specific config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+            },
             "on_validation_failure": {
                 "type": "string",
                 "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
@@ -580,6 +594,150 @@ def _drop_echoed_source_authoring(
     return {key: value for key, value in options.items() if key != SOURCE_AUTHORING_KEY}, True
 
 
+_GUARANTEE_SCHEMA_OPTION_KEYS: Final[tuple[str, str]] = ("schema", "schema_config")
+
+
+def _supplied_guarantee_fields(options: Mapping[str, Any], schema_key: str) -> tuple[bool, Any]:
+    """Return (present, value) for ``options[schema_key]["guaranteed_fields"]``."""
+    raw_schema = _schema_block(options, schema_key)
+    if raw_schema is None or "guaranteed_fields" not in raw_schema:
+        return False, None
+    return True, raw_schema["guaranteed_fields"]
+
+
+def _effective_schema_entry(
+    key: str,
+    supplied_schema: Mapping[str, Any],
+    stored_schema: Mapping[str, Any] | None,
+) -> Any:
+    """Merge-patch view of one schema entry: supplied wins, ``None`` deletes."""
+    if key in supplied_schema:
+        return supplied_schema[key]
+    if stored_schema is not None and key in stored_schema:
+        return stored_schema[key]
+    return None
+
+
+@observation_boundary(
+    tier=3,
+    source="a source options mapping (planner-supplied, or persisted composer state re-read verbatim) whose schema block shape is unproven",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns the mapping-shaped schema block or None for every absent or malformed shape; never raises",
+)
+def _schema_block(options: Mapping[str, Any] | None, schema_key: str) -> Mapping[str, Any] | None:
+    """Return ``options[schema_key]`` when it is a mapping, else ``None``."""
+    if options is None or schema_key not in options:
+        return None
+    raw_schema = options[schema_key]
+    return raw_schema if isinstance(raw_schema, Mapping) else None
+
+
+@observation_boundary(
+    tier=3,
+    source="LLM-supplied source options/patch mapping (Tier-3) merged over stored composer state",
+    source_param="supplied_options",
+    suppresses=("R5",),
+    invariant="pure shape classification: returns False for every malformed or explicit-contract shape; never raises",
+)
+def _guarantee_stamp_is_card_owned(
+    supplied_options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+    schema_key: str,
+) -> bool:
+    """Whether the ask-the-user data-contract flow owns this guarantee stamp.
+
+    The dual of the card-eligibility shape rules
+    (:func:`_schema_options_with_guarantees` / ``backtraced_source_demand``):
+    only an OBSERVED-mode schema with no declared ``fields`` — on options
+    without ``columns``/``field_mapping`` — can carry the user-promise stamp
+    a data-contract card writes, so only that shape is planner-forbidden.
+    An explicit schema contract (``fields`` declared, or a non-observed
+    mode) is a different evidence class: the runtime enforces it per row,
+    the demand backtrace never asks a card for it, and Stage-1 validation
+    owns its honesty — the sanctioned authoring lane the guided emitters
+    prefill and the exemplars teach. Judged on the MERGE-PATCH RESULT
+    (supplied wins, explicit ``None`` deletes), so a patch cannot dodge the
+    guard by omitting context the stored options already carry.
+    """
+    for structural_key in ("columns", "field_mapping"):
+        if structural_key in supplied_options:
+            if supplied_options[structural_key] is not None:
+                return False
+        elif stored_options is not None and structural_key in stored_options:
+            return False
+    supplied_schema = _schema_block(supplied_options, schema_key)
+    if supplied_schema is None:
+        return False
+    stored_schema = _schema_block(stored_options, schema_key)
+    if _effective_schema_entry("fields", supplied_schema, stored_schema) is not None:
+        return False
+    effective_mode = _effective_schema_entry("mode", supplied_schema, stored_schema)
+    return effective_mode is None or effective_mode == "observed"
+
+
+def _planner_guarantee_stamp_error(
+    supplied_options: Mapping[str, Any],
+    *,
+    stored_options: Mapping[str, Any] | None,
+    llm_authored: bool,
+    tool_name: str,
+) -> str | None:
+    """Reject a planner-authored OBSERVED-mode guarantee stamp on non-hash-bound content.
+
+    Evidence class decides who may declare ``schema.guaranteed_fields``
+    (John's ruling, 2026-08-27 — :func:`_options_with_derived_guarantees`,
+    and the three-lane model ``guided/emitters.py`` encodes):
+
+    * LLM-authored content — exact bytes are content-hash-bound; the
+      author's schema claim stands (``llm_authored=True`` exempts).
+    * An explicit schema contract (``fields`` declared / non-observed
+      mode) — runtime-enforced per row, card-ineligible; validation owns
+      it, the guard abstains (:func:`_guarantee_stamp_is_card_owned`).
+    * An OBSERVED-mode stamp on uploaded or path-bound content — the
+      header is a SAMPLE and the stamp is the USER'S recorded promise,
+      written server-side when the source_data_contract review is
+      acknowledged — never by the planner. A planner-authored stamp here
+      silently extinguishes the ask-the-user demand (elspeth-1dddcfee3a):
+      landing after ``request_interpretation_review`` it kills the review
+      site under a persisted pending card (elspeth-d73139155a); landing
+      before it, no card is ever minted and the user acknowledges nothing.
+
+    Echo tolerance (the elspeth-c67fbbbd83 posture): a supplied value that
+    ``stable_hash``-matches the STORED stamp under the same schema key
+    asserts nothing new — a planner doing read-modify-write over serialized
+    state echoes the acknowledged stamp verbatim — and passes. Any other
+    supplied value (a deletion via explicit ``None`` included) rejects.
+    """
+    if llm_authored:
+        return None
+    for schema_key in _GUARANTEE_SCHEMA_OPTION_KEYS:
+        present, supplied_value = _supplied_guarantee_fields(supplied_options, schema_key)
+        if not present:
+            continue
+        if not _guarantee_stamp_is_card_owned(
+            supplied_options,
+            stored_options=stored_options,
+            schema_key=schema_key,
+        ):
+            continue
+        if stored_options is not None:
+            stored_present, stored_value = _supplied_guarantee_fields(stored_options, schema_key)
+            if stored_present and stable_hash(deep_thaw(supplied_value)) == stable_hash(deep_thaw(stored_value)):
+                continue
+        return (
+            f"{tool_name} must not author '{schema_key}.guaranteed_fields' on this source: its content is "
+            "not LLM-authored (uploaded or path-bound), so its header is a sample and the observed-mode "
+            "guarantee stamp is the user's own recorded promise. Either request the data-contract review "
+            "with request_interpretation_review (kind=source_data_contract) and let the user acknowledge "
+            "it (the stamp is written server-side on acknowledgement), or declare an explicit runtime "
+            "contract instead (schema mode 'flexible'/'fixed' with 'fields'), which validation enforces "
+            "per row."
+        )
+    return None
+
+
 def _reject_manual_source_blobs(
     options: Mapping[str, Any],
     *,
@@ -594,10 +752,10 @@ def _reject_manual_source_blobs(
     the key is reserved everywhere except resolver output (run admission
     independently re-verifies modality and entry facts as the backstop).
     """
-    if "blobs" not in options:
+    if _SOURCE_BLOBS_OPTION_KEY not in options:
         return None
     return (
-        f"{tool_name} must not be called with 'blobs' in source options. "
+        f"{tool_name} must not be called with '{_SOURCE_BLOBS_OPTION_KEY}' in source options. "
         "The plural blob binding is resolved from session blob records by set_source_from_blobs; "
         "bind or rebind blobs through that tool instead of authoring the list directly."
     )
@@ -664,14 +822,20 @@ def _resolve_source_blob(
     existing_options: Mapping[str, Any] | None = None,
 ) -> _ResolvedSourceBlob | ToolResult:
     """Resolve an existing ready blob into authoritative source options."""
+    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
+    if manual_authoring_error is not None:
+        return _failure_result(state, manual_authoring_error)
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name=tool_name)
+    if manual_blob_ref_error is not None:
+        return _failure_result(state, manual_blob_ref_error)
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name=tool_name)
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
-    if manual_authoring_error is not None:
-        return _failure_result(state, manual_authoring_error)
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     # Deferred inline custody (elspeth-282f392fae): the planner's custody-safe
     # revalidation runs BEFORE the atomic staging settlement materializes the
@@ -702,12 +866,20 @@ def _resolve_source_blob(
         plugin, mime_extra = _MIME_TO_SOURCE[blob["mime_type"]]
 
     creation_modality = CreationModality(blob["creation_modality"])
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        caller_options,
+        stored_options=existing_options,
+        llm_authored=is_llm_authored_creation_modality(creation_modality),
+        tool_name=tool_name,
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     merged_options: Mapping[str, Any] = {
         **caller_options,
         **mime_extra,
         **_delimiter_extra_for_csv_blob(plugin, blob["filename"], caller_options),
         "path": blob["storage_path"],
-        "blob_ref": blob["id"],
+        _SOURCE_BLOB_REF_OPTION_KEY: blob["id"],
         "mode": "bind_source",
         **_source_authoring_options(creation_modality, blob["content_hash"]),
     }
@@ -781,7 +953,12 @@ def _resolve_source_blob(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     return _ResolvedSourceBlob(
         plugin=plugin,
@@ -799,7 +976,7 @@ def _manual_source_blob_ref_error(*, tool_name: str, inline_blob_supported: bool
         bind_path = "set_source_from_blob"
     return (
         f"Use {bind_path} to bind a blob to the source. "
-        f"{tool_name} must not be called with 'blob_ref' in source.options "
+        f"{tool_name} must not be called with '{_SOURCE_BLOB_REF_OPTION_KEY}' in source.options "
         "because it cannot enforce that 'path' equals the blob's canonical storage_path."
     )
 
@@ -811,7 +988,7 @@ def _reject_manual_source_blob_ref(
     inline_blob_supported: bool = False,
 ) -> str | None:
     """Reject caller-supplied blob_ref outside authoritative blob-binding tools."""
-    if "blob_ref" not in options:
+    if _SOURCE_BLOB_REF_OPTION_KEY not in options:
         return None
     return _manual_source_blob_ref_error(tool_name=tool_name, inline_blob_supported=inline_blob_supported)
 
@@ -917,6 +1094,14 @@ def _execute_set_source(
     manual_blobs_error = _reject_manual_source_blobs(options, tool_name="set_source")
     if manual_blobs_error is not None:
         return _failure_result(state, manual_blobs_error)
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        options,
+        stored_options=stored_source_options,
+        llm_authored=stored_source_options is not None and SOURCE_AUTHORING_KEY in stored_source_options,
+        tool_name="set_source",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
@@ -951,7 +1136,12 @@ def _execute_set_source(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     source = SourceSpec(
         plugin=plugin,
@@ -1117,16 +1307,17 @@ def _resolve_source_blobs(
     UTF-8 decoded here; no content is read at all (run admission re-resolves
     the records and web execution stages the bytes for the payload store).
     """
-    if session_engine is None or session_id is None:
-        return _failure_result(state, "Blob tools require session context.")
     manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
-    if "blobs" in caller_options:
-        return _failure_result(
-            state,
-            "set_source_from_blobs resolves the 'blobs' list from session records; do not author or edit it directly.",
-        )
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name="set_source_from_blobs")
+    if manual_blob_ref_error is not None:
+        return _failure_result(state, manual_blob_ref_error)
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name="set_source_from_blobs")
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
+    if session_engine is None or session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
     seen_ids: set[str] = set()
     for blob_id in blob_ids:
         blob_id_error = _blob_id_uuid_validation_error(blob_id)
@@ -1181,7 +1372,7 @@ def _resolve_source_blobs(
         )
         payloads.append(_source_blob_payload(blob))
 
-    merged_options: dict[str, Any] = {**caller_options, "blobs": entries}
+    merged_options: dict[str, Any] = {**caller_options, _SOURCE_BLOBS_OPTION_KEY: entries}
     # A source guarantees what it knows: blob_rows fabricates EVERY row as a
     # literal dict of exactly the plugin's five fixed custody fields
     # (blob_rows.py load(), the row construction at :226-232 over _ROW_FIELDS)
@@ -1211,7 +1402,12 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", "blob_rows"),
+        )
     return merged_options, tuple(payloads)
 
 
@@ -1265,6 +1461,18 @@ def _execute_set_source_from_blobs(
         source=True,
         existing_options=stored_source_options,
     )
+    # The plural path serves the authenticated upload/paste flow only
+    # (LLM-authored blobs are rejected below), so a caller-declared
+    # guarantee stamp is never the author's own hash-bound claim; the
+    # server derives the plugin-contract blob_rows guarantee itself.
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        caller_options,
+        stored_options=stored_source_options,
+        llm_authored=False,
+        tool_name="set_source_from_blobs",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     resolved = _resolve_source_blobs(
         blob_ids=validated.blob_ids,
@@ -1343,7 +1551,7 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
             },
             "options": {
                 "type": "object",
-                "description": ("Optional blob_rows config (e.g. schema). The 'blobs' list is resolver-owned and must not appear here."),
+                "description": ("Optional blob_rows config (e.g. schema)." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE),
             },
         },
         "required": ["blob_ids", "on_success"],
@@ -1395,6 +1603,7 @@ _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
                 "description": (
                     "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                     "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
+                    + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1615,9 +1824,11 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     handler=_execute_inspect_source,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Return bounded structural facts about a blob-backed source: source kind, observed "
-        "headers, sample row count, inferred scalar types per column, URL candidates, and "
-        "warnings. Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+        "Return bounded structural facts about a blob-backed source: `source_kind`, "
+        "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+        "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
+        "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+        "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
         "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
         "tell you which fields the source actually contains and what numeric coercion is "
         "needed before any gate or value_transform numeric op. Never returns raw row "
@@ -1669,6 +1880,15 @@ def _execute_patch_source_options(
     if source_name not in state.sources:
         return _failure_result(state, f"No source named '{source_name}' configured to patch.")
     current_source = state.sources[source_name]
+    # The plugin comes from persisted state, not from this request: resolve
+    # it through the request's policy view before anything downstream
+    # (prevalidation, the plugin_identity stamp) may assume it resolves. A
+    # plugin removed or renamed between deployments, or no longer authorized
+    # by this snapshot, is a policy rejection — the same one set_source gives
+    # — never a raise out of the schema augmentation (elspeth-e405ad7cd2 R8-fix1).
+    plugin_error = _validate_plugin_name(context, "source", current_source.plugin)
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
     patch: Mapping[str, Any] = validated.patch
 
     # Echo tolerance (elspeth-c67fbbbd83): a patch echoing the stored
@@ -1690,6 +1910,17 @@ def _execute_patch_source_options(
     manual_blobs_error = _reject_manual_source_blobs(patch, tool_name="patch_source_options")
     if manual_blobs_error is not None:
         return _failure_result(state, manual_blobs_error)
+    # Checked on the PATCH delta like the forged-requirement gate below: an
+    # echoed stamp asserts nothing new; a new or changed one is the silent
+    # stamp the evidence-class ruling forbids (elspeth-1dddcfee3a).
+    guarantee_stamp_error = _planner_guarantee_stamp_error(
+        patch,
+        stored_options=current_source.options,
+        llm_authored=SOURCE_AUTHORING_KEY in current_source.options,
+        tool_name="patch_source_options",
+    )
+    if guarantee_stamp_error is not None:
+        return _failure_result(state, guarantee_stamp_error)
     # Check the LLM-supplied PATCH delta (not the merged result): a patch that
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a
@@ -1712,7 +1943,7 @@ def _execute_patch_source_options(
         source=True,
         existing_options=current_source.options,
     )
-    if "blob_ref" in patch:
+    if _SOURCE_BLOB_REF_OPTION_KEY in patch:
         return _failure_result(
             state,
             "Cannot patch 'blob_ref' on a source. Re-bind via set_source_from_blob "
@@ -1725,7 +1956,7 @@ def _execute_patch_source_options(
     # breaks runtime path resolution and composer/runtime agreement.
     # Replace the binding via a fresh set_source_from_blob (or
     # clear_source) instead of patching it.
-    if "blob_ref" in current_source.options:
+    if _SOURCE_BLOB_REF_OPTION_KEY in current_source.options:
         forbidden_keys = {"path"} & patch.keys()
         if forbidden_keys:
             return _failure_result(
@@ -1781,7 +2012,12 @@ def _execute_patch_source_options(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", current_source.plugin),
+        )
 
     new_source = replace(current_source, options=new_options)
     proposed_state = state.with_named_source(source_name, new_source)
@@ -1791,10 +2027,10 @@ def _execute_patch_source_options(
     # PENDING and silently downgrade an already-resolved review.
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     data = None
@@ -1842,7 +2078,7 @@ _PATCH_SOURCE_OPTIONS_DECLARATION = ToolDeclaration(
             },
             "patch": {
                 "type": "object",
-                "description": "Merge-patch to apply to source options.",
+                "description": "Merge-patch to apply to source options." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
             },
         },
         "required": ["patch"],

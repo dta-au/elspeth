@@ -21,15 +21,17 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
-from elspeth.contracts.blobs import AllowedMimeType
+from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.bounded_json import bounded_json_loads
+from elspeth.web.composer.guided.state_machine import TerminalState
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
     GuidedReviewedBlobBinding,
@@ -39,6 +41,7 @@ from elspeth.web.composer.guided_blob_refs import (
 )
 from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
 from elspeth.web.composer.state import EdgeType
+from elspeth.web.composer.tool_result_envelope import TOOL_RESULT_OPTIONAL_KEYS, TOOL_RESULT_REQUIRED_KEYS, tool_result_keys
 
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
@@ -86,8 +89,14 @@ REDACTED_UNKNOWN_RESPONSE_FIELD = "_unknown_response"
 # every serialized tool result.  Implicitly known (never sentinel'd) for
 # declarative manifest entries unless a policy explicitly declares one
 # sensitive; tool payload lives under other keys (``data`` etc.) which remain
-# policy-declared and fail-closed.
-_TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset({"success", "validation", "version"})
+# policy-declared and fail-closed.  Derived from the registry
+# (``tool_result_envelope.TOOL_RESULT_REQUIRED_KEYS``): ``affected_nodes`` is
+# part of it since elspeth-e405ad7cd2 (D1) — while it was missing, every
+# declarative discovery row fired ``unknown_response_key_redacted`` on every
+# call, which made the drift counter permanently non-zero. Node ids go through
+# ``_project_untrusted_response_structure`` exactly as the type-driven path
+# projects them (text sentinels), so no new byte reaches the audit row.
+_TOOL_RESULT_ENVELOPE_KEYS: frozenset[str] = frozenset(TOOL_RESULT_REQUIRED_KEYS)
 
 # Fixed sentinel for arguments that appear in the input but are not declared in
 # a manifest entry's optional known_argument_keys allowlist. Unknown key names
@@ -148,6 +157,11 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
         ),
         "kind": frozenset(kind.value for kind in InterpretationKind),
         "pipeline_content_hash_schema": frozenset({"composer.pipeline-dispatch-result.v1"}),
+        # Blob origin on get_blob_content. Derived from the same closed
+        # vocabularies the DB CHECKs mirror, so the allowlist cannot drift
+        # from the columns it admits.
+        "created_by": BLOB_CREATORS,
+        "creation_modality": frozenset(modality.value for modality in CreationModality),
     }
 )
 _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
@@ -542,10 +556,10 @@ class TraversalNode:
       `metadata` is typed as `tuple[Any, ...]` to admit `_SensitiveMarker`
       instances in the metadata position. _SensitiveMarker is a regular
       (non-frozen) class - it holds a `summarizer` callable that we never
-      mutate after construction. The freeze-guard CI tool
-      (scripts/cicd/enforce_freeze_guards.py) only flags forbidden patterns
-      in __post_init__; this dataclass intentionally has no __post_init__
-      and no `freeze_fields()` call. The design assumption is:
+      mutate after construction. The ``immutability.freeze_guards`` lint
+      rule only flags forbidden patterns in __post_init__; this dataclass
+      intentionally has no __post_init__ and no `freeze_fields()` call. The
+      design assumption is:
         1. _SensitiveMarker instances are constructed once (at Annotated[...]
            definition time, module load) and never mutated;
         2. TraversalNode is produced inside walk_model_schema and discarded
@@ -2063,15 +2077,50 @@ class _PipelineMetadataModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _set_pipeline_source_selection_json_schema(schema: dict[str, JsonValue]) -> None:
+    """Expose the model validator's exactly-one non-null source contract.
+
+    Pydantic cannot infer cross-field JSON Schema from ``model_validator``.
+    Its ordinary schema also advertises ``null`` for these default-``None``
+    fields even though the validator rejects that value. Rewrite only those
+    two generated leaves and add the matching union so model-schema consumers
+    see the same admission contract the runtime enforces.
+    """
+    properties = schema["properties"]
+    if type(properties) is not dict:
+        raise RuntimeError("SetPipelineArgumentsModel.properties must emit a JSON Schema object")
+    for field_name in ("source", "sources"):
+        field_schema = properties[field_name]
+        if type(field_schema) is not dict:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit a JSON Schema object")
+        branches = field_schema["anyOf"]
+        if type(branches) is not list:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must emit a JSON Schema array")
+        object_branches: list[dict[str, JsonValue]] = []
+        for branch in branches:
+            if branch == {"type": "null"}:
+                continue
+            if type(branch) is not dict:
+                raise RuntimeError(f"SetPipelineArgumentsModel.{field_name}.anyOf must contain JSON Schema objects")
+            object_branches.append(branch)
+        if len(object_branches) != 1:
+            raise RuntimeError(f"SetPipelineArgumentsModel.{field_name} must emit one non-null JSON Schema branch")
+        properties[field_name] = object_branches[0]
+    schema["oneOf"] = [
+        {"required": ["source"]},
+        {"required": ["sources"]},
+    ]
+
+
 class SetPipelineArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``set_pipeline`` tool.
 
-    Mirrors the JSON schema declared at ``tools.py:940-1132`` for the
-    ``set_pipeline`` definition and its required-paths (``source``,
-    ``nodes``, ``edges``, ``outputs`` at the top level; nested required
-    fields per :class:`_SetPipelineSourceModel`, :class:`_PipelineNodeModel`,
-    :class:`_PipelineEdgeModel`, :class:`_PipelineOutputModel`).
-    ``metadata`` is optional at the top level.
+    Mirrors the JSON schema declared for ``set_pipeline`` and its
+    required-paths. Exactly one of ``source`` or ``sources`` must be supplied
+    as a non-null object; ``nodes``, ``edges``, and ``outputs`` are always
+    required. Nested required fields follow :class:`_SetPipelineSourceModel`,
+    :class:`_PipelineNodeModel`, :class:`_PipelineEdgeModel`, and
+    :class:`_PipelineOutputModel`. ``metadata`` is optional.
 
     LLM-supplied vs dispatcher-wired arguments
     ------------------------------------------
@@ -2110,7 +2159,18 @@ class SetPipelineArgumentsModel(BaseModel):
     outputs: list[_PipelineOutputModel]
     metadata: Annotated[_PipelineMetadataModel, Sensitive(summarizer=_summarize_set_metadata_patch)] | None = None
 
-    model_config = ConfigDict(extra="forbid")
+    @model_validator(mode="after")
+    def _exactly_one_source_configuration(self) -> SetPipelineArgumentsModel:
+        field_xor = ("source" in self.model_fields_set) != ("sources" in self.model_fields_set)
+        value_xor = (self.source is None) != (self.sources is None)
+        if not field_xor or not value_xor:
+            raise ValueError("set_pipeline requires exactly one non-null source or sources object")
+        return self
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_set_pipeline_source_selection_json_schema,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2359,7 +2419,11 @@ def _redact_via_policy(
         known_argument_keys = set(policy.known_argument_keys)
         unknown_keys = [key for key in arguments if key not in known_argument_keys]
         for key in unknown_keys:
-            redacted.pop(key, None)
+            # ``redacted`` is a fresh copy of ``arguments`` and ``unknown_keys``
+            # derives from the same ``arguments``, so every key is present by
+            # construction; ``del`` crashes on a breach of that first-party
+            # invariant instead of masking it with a pop default.
+            del redacted[key]
         if unknown_keys:
             redacted[REDACTED_UNKNOWN_ARGUMENTS_FIELD] = REDACTED_UNKNOWN_ARGUMENT_KEY
 
@@ -2853,7 +2917,9 @@ _CLEAR_SOURCE_REASON = HandlesNoSensitiveDataReason(
 
 
 _LIST_BLOBS_REASON = HandlesNoSensitiveDataReason(
-    sensitive_data_locations=("session blob inventory — id/filename/mime_type/size_bytes per blob, no raw content",),
+    sensitive_data_locations=(
+        "session blob inventory — id/filename/mime_type/size_bytes/created_by/creation_modality per blob, no raw content",
+    ),
     why_arguments_safe=(
         "list_blobs accepts no arguments — the JSON schema declares an empty properties "
         "object with additionalProperties=false, and redaction strips any unknown keys "
@@ -2862,7 +2928,9 @@ _LIST_BLOBS_REASON = HandlesNoSensitiveDataReason(
     why_responses_safe=(
         "Response is the blob-inventory list — operator-uploaded filenames, mime_types, "
         "and structural metadata per blob — but never the raw blob content; payload bytes "
-        "are exposed only via get_blob_content whose policy applies a length-only summary."
+        "are exposed only via get_blob_content whose policy applies a length-only summary. "
+        "created_by and creation_modality are closed server-recorded vocabularies naming "
+        "who authored each blob's bytes; they carry no model, prompt, or operator identity."
     ),
 )
 
@@ -3095,9 +3163,12 @@ class _ValidationEntryShadowModel(BaseModel):
     ``contract`` the structured schema-contract facts, emitted only for the
     schema-contract family, ``row_union_schema`` the branch declarations
     emitted only for row-union incompatibility, and ``coalesce_union_type``
-    the conflicting declaration emitted only for a union-coalesce type clash.
-    The response scalar projection preserves the closed severity value and
-    summarizes all free-form diagnostic text.
+    the conflicting declaration emitted only for a union-coalesce type clash,
+    and ``rejected_component`` the validation-component ref a
+    ``rejected_mutation`` entry is about, emitted only when the set_pipeline
+    component loop stamped it (elspeth-e405ad7cd2). The response scalar
+    projection preserves the closed severity value and summarizes all
+    free-form diagnostic text.
 
     This model is ``extra="forbid"``, so it must carry EVERY optional key
     ``ValidationEntry.to_dict()`` can emit: a missing one is not a silent
@@ -3113,6 +3184,7 @@ class _ValidationEntryShadowModel(BaseModel):
     contract: _SchemaContractDetailShadowModel | None = None
     row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
     coalesce_union_type: _CoalesceUnionTypeDetailShadowModel | None = None
+    rejected_component: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3150,7 +3222,6 @@ class _RequestInterpretationReviewPendingDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     interpretation_source: str
     message: str
@@ -3169,7 +3240,6 @@ class _RequestInterpretationReviewPendingTextDataModel(BaseModel):
 
     kind_marker: Literal["interpretation_review_pending", "interpretation_review_pending_idempotent"] = Field(alias="_kind")
     event_id: str
-    affected_node_id: str
     kind: InterpretationKind
     user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
     llm_draft: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
@@ -3243,6 +3313,14 @@ class GetBlobContentDataModel(BaseModel):
     content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
     truncated: bool
     size_bytes: int
+    # Blob origin (elspeth-47eba5cced). Not Sensitive: both are closed
+    # server-recorded vocabularies, and _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD
+    # admits only their declared members, so the persisted audit row keeps
+    # the provenance queryable while any off-vocabulary value is summarized
+    # away. They carry no model, prompt, or operator identity — the five
+    # creating_* columns stay off this wire entirely.
+    created_by: str
+    creation_modality: str
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3290,6 +3368,7 @@ class _ToolResultResponseModel(BaseModel):
     validation_delta: _SafeResponseEnvelope = None
     post_call_hints: _SafeResponseEnvelope = None
     plugin_schemas: _SafeResponseEnvelope = None
+    validation_guidance: _SafeResponseEnvelope = None
     applied_component: _SafeResponseEnvelope = None
     pipeline_content_hash_schema: Literal["composer.pipeline-dispatch-result.v1"] | None = None
     pipeline_content_hash: Annotated[str | None, Sensitive(summarizer=_summarize_external_response_value)] = None
@@ -3488,27 +3567,15 @@ def _summarize_advisor_schema_excerpt(value: str) -> str:
     return f"<advisor-schema-excerpt:{len(value)}-chars>"
 
 
-_TOOL_RESULT_REQUIRED_RESPONSE_KEYS: tuple[str, ...] = (
-    "success",
-    "validation",
-    "affected_nodes",
-    "version",
-)
-_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = (
-    "runtime_preflight",
-    "validation_delta",
-    "post_call_hints",
-    "plugin_schemas",
-    "applied_component",
-)
+# Both tables derive from the registry that ``ToolResult.to_dict`` is pinned to;
+# they were hand-maintained copies with no cross-check until elspeth-e405ad7cd2.
+_TOOL_RESULT_REQUIRED_RESPONSE_KEYS: tuple[str, ...] = TOOL_RESULT_REQUIRED_KEYS
+_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS: tuple[str, ...] = tuple(key for key in TOOL_RESULT_OPTIONAL_KEYS if key != "data")
 
 
 def _tool_result_response_keys(*, data: bool) -> tuple[str, ...]:
-    """Return the shared top-level ``ToolResult.to_dict`` response envelope."""
-    keys = _TOOL_RESULT_REQUIRED_RESPONSE_KEYS
-    if data:
-        keys = (*keys, "data")
-    return (*keys, *_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS)
+    """Return the shared top-level ``ToolResult.to_dict`` response envelope, from the registry."""
+    return tool_result_keys(data=data)
 
 
 # Manifest entries are grouped by tool family. The binding is rebuilt as a
@@ -4167,9 +4234,24 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def _projected_source_options(live_source: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a projected source's options as the base the guided masks land on.
+
+    The raw twin has already been checked to carry a dict ``options``; the
+    projection base is the same serializer output after the generic redaction,
+    which only replaces carrier values, so the shape must agree.
+    """
+    if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
+        raise AuditIntegrityError("guided blob redaction projected source options must mirror the raw source shape")
+    return dict(live_source["options"])
+
+
 def redact_guided_snapshot_storage_paths(
     sources: Mapping[str, Any] | None,
     composer_meta: Mapping[str, Any] | None,
+    *,
+    raw_sources: Mapping[str, Any] | None = None,
+    degrade_unbindable: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Redact schema-8 reviewed source paths using each source's blob binding.
 
@@ -4177,15 +4259,213 @@ def redact_guided_snapshot_storage_paths(
     it in ``guided_session.reviewed_sources``. Each reviewed snapshot is matched to
     the committed source by its persisted name and exact storage-path value. Both
     copies are redacted without mutating the persisted input dictionaries.
+
+    ``sources`` is the projection base the masks are applied onto; ``raw_sources``
+    (when given) is the persisted, pre-``redact_source_storage_path`` copy the
+    reviewed bindings are correlated against. The generic redaction masks a
+    ``blob_ref``-bearing live carrier to a literal, so correlating on its output
+    compares a reviewed private path against the literal and rejects a consistent
+    fork-rehydrated binding (elspeth-75d320fb25). Omitted, ``sources`` is both.
+
+    ``degrade_unbindable=True`` extends the terminal degrade to ACTIVE
+    sessions for read-only history surfaces (/state/versions): a custody
+    failure serves the masked, ``custody_unavailable``-named projection
+    instead of raising. Never used on a surface that feeds
+    ``guided_response_hash`` or authoring authority.
     """
     sources_out = dict(sources) if sources is not None else None
     meta_out = dict(composer_meta) if composer_meta is not None else None
+    if raw_sources is None:
+        raw_sources = sources
+    elif sources is None or set(raw_sources) != set(sources):
+        raise AuditIntegrityError("guided blob redaction raw_sources must name exactly the projected sources")
 
     if composer_meta is None or "guided_session" not in composer_meta:
         return sources_out, meta_out
     guided = composer_meta["guided_session"]
     if type(guided) is not dict:
         raise ValueError("redact_guided_snapshot_storage_paths: composer_meta.guided_session must be a dict")
+    # Persisted checkpoints always carry ``terminal``; an absent key is the
+    # pre-terminal fixture shape and means an active session.
+    terminal = TerminalState.from_dict(guided["terminal"]) if "terminal" in guided and guided["terminal"] is not None else None
+    if terminal is None and not degrade_unbindable:
+        return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
+    # A terminal session (exited to freeform, or completed) has left guided
+    # authoring, so the retained review history is no longer a binding custody
+    # claim over whatever now shares its name; it is retained for re-entry.
+    # Provenance is unprovable once the binding fails, so the degraded
+    # projection masks every carrier instead of raising (the raise was the only
+    # thing masking a guided-committed private path) and names the condition.
+    # Admission keeps its own strict direction (yaml_generator, execution).
+    try:
+        return _correlate_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
+    except GuidedCustodyIntegrityError:
+        return _degrade_guided_snapshot_storage_paths(sources, composer_meta, raw_sources)
+
+
+def assert_guided_custody_persistable(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any] | None,
+) -> None:
+    """Refuse to persist an active guided session whose custody cannot bind.
+
+    Takes the same raw serialized inputs the projection correlates on, so the
+    write gate and the read projection agree by construction: whatever this
+    admits, ``redact_guided_snapshot_storage_paths`` projects, and a pair it
+    refuses would have re-raised on every later read of the persisted tip.
+    No guided snapshot or a populated terminal passes (the projection degrades
+    a terminal pair instead); an active pair runs the strict correlation.
+
+    Custody only: a degenerate checkpoint — ``guided_session`` set to None, or
+    a dict without the schema-8 review keys — makes no custody claim and
+    passes, even though the projection rejects those shapes with
+    ValueError/KeyError on read. Shape defects stay the read side's to refuse,
+    exactly as before this gate existed.
+    """
+    if composer_meta is None or "guided_session" not in composer_meta:
+        return
+    guided = composer_meta["guided_session"]
+    if guided is None:
+        return
+    if type(guided) is not dict:
+        raise ValueError("assert_guided_custody_persistable: composer_meta.guided_session must be a dict")
+    # The custody claim lives in the schema-8 review keys; a checkpoint that
+    # carries neither makes no claim for this gate to bind (its other shape
+    # defects stay the read side's to refuse, exactly as before the gate).
+    if "reviewed_sources" not in guided or "pending_source_intents" not in guided:
+        return
+    if "terminal" in guided and guided["terminal"] is not None:
+        TerminalState.from_dict(guided["terminal"])
+        return
+    _correlate_guided_snapshot_storage_paths(sources, composer_meta, sources)
+
+
+def _mask_option_carriers(options: Mapping[str, Any]) -> dict[str, Any]:
+    masked = dict(options)
+    for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
+        if key in masked:
+            masked[key] = REDACTED_BLOB_SOURCE_PATH
+    return masked
+
+
+def _sweep_equal_strings(value: Any, needles: frozenset[str]) -> Any:
+    """Replace every string equal to a needle, anywhere in a projected structure."""
+    if type(value) is str and value in needles:
+        return REDACTED_BLOB_SOURCE_PATH
+    if type(value) is dict:
+        return {key: _sweep_equal_strings(item, needles) for key, item in value.items()}
+    if type(value) is list:
+        return [_sweep_equal_strings(item, needles) for item in value]
+    return value
+
+
+def _degrade_guided_snapshot_storage_paths(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any],
+    raw_sources: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Project a terminal session whose reviewed custody no longer binds.
+
+    Every live-source, reviewed-snapshot, and pending-intent path carrier is
+    masked unconditionally and never stamped with a sentinel; then every
+    string anywhere in the projection equal to a raw live, reviewed-snapshot,
+    or pending-intent carrier value is masked too, so a private path planted
+    under a non-carrier key cannot ride out. The projected ``guided_session`` gains ``custody_unavailable: true``.
+    Projection-only: ``GuidedSession.from_dict`` rejects the key, so it can
+    never persist.
+    """
+    guided = composer_meta["guided_session"]
+    sources_out: dict[str, Any] | None = None
+    if sources is not None:
+        sources_out = {}
+        for live_name, live_source in sources.items():
+            if type(live_source) is not dict:
+                raise ValueError("redact_guided_snapshot_storage_paths: source entries must be dicts when guided blob redaction is active")
+            if "options" not in live_source:
+                sources_out[live_name] = live_source
+                continue
+            live_options = live_source["options"]
+            if type(live_options) is not dict:
+                raise ValueError("redact_guided_snapshot_storage_paths: source.options must be a dict when guided blob redaction is active")
+            masked_source = dict(live_source)
+            masked_source["options"] = _mask_option_carriers(live_options)
+            sources_out[live_name] = masked_source
+
+    reviewed_out: dict[str, Any] = {}
+    for stable_id, snapshot in guided["reviewed_sources"].items():
+        if type(stable_id) is not str or type(snapshot) is not dict or type(snapshot["options"]) is not dict:
+            raise ValueError("redact_guided_snapshot_storage_paths: reviewed_sources entries must be string-keyed dicts")
+        snapshot_masked = dict(snapshot)
+        snapshot_masked["options"] = _mask_option_carriers(snapshot["options"])
+        reviewed_out[stable_id] = snapshot_masked
+    pending_out: dict[str, Any] = {}
+    for stable_id, intent in guided["pending_source_intents"].items():
+        if type(stable_id) is not str or type(intent) is not dict:
+            raise ValueError("redact_guided_snapshot_storage_paths: pending_source_intents entries must be string-keyed dicts")
+        intent_options = intent["options"]
+        if intent_options is None:
+            pending_out[stable_id] = intent
+            continue
+        if type(intent_options) is not dict:
+            raise ValueError(
+                f"redact_guided_snapshot_storage_paths: guided_session.pending_source_intents[{stable_id!r}].options must be a dict or None"
+            )
+        intent_masked = dict(intent)
+        intent_masked["options"] = _mask_option_carriers(intent_options)
+        pending_out[stable_id] = intent_masked
+
+    guided_degraded = dict(guided)
+    guided_degraded["reviewed_sources"] = reviewed_out
+    guided_degraded["pending_source_intents"] = pending_out
+    guided_degraded["custody_unavailable"] = True
+    meta_out = dict(composer_meta)
+    meta_out["guided_session"] = guided_degraded
+
+    if "implicit_decisions" in meta_out:
+        report = meta_out["implicit_decisions"]
+        if type(report) is not dict or "entries" not in report or type(report["entries"]) is not list:
+            raise AuditIntegrityError("guided implicit-decision projection is malformed")
+        masked_entries: list[dict[str, Any]] = []
+        for entry in report["entries"]:
+            if type(entry) is not dict:
+                raise AuditIntegrityError("guided implicit-decision entry is malformed")
+            masked_entry = dict(entry)
+            if "path" in entry and entry["path"] in {"source.path", "source.file"} and "value" in entry:
+                masked_entry["value"] = REDACTED_BLOB_SOURCE_PATH
+            masked_entries.append(masked_entry)
+        masked_report = dict(report)
+        masked_report["entries"] = masked_entries
+        meta_out["implicit_decisions"] = masked_report
+
+    carrier_values = frozenset(
+        value
+        for options in (
+            *(
+                live_source["options"]
+                for live_source in (raw_sources or {}).values()
+                if type(live_source) is dict and "options" in live_source and type(live_source["options"]) is dict
+            ),
+            *(snapshot["options"] for snapshot in guided["reviewed_sources"].values()),
+            *(intent["options"] for intent in guided["pending_source_intents"].values() if intent["options"] is not None),
+        )
+        for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
+        if key in options and type(value := options[key]) is str
+    )
+    if carrier_values:
+        sources_out = _sweep_equal_strings(sources_out, carrier_values)
+        meta_out = _sweep_equal_strings(meta_out, carrier_values)
+    return sources_out, meta_out
+
+
+def _correlate_guided_snapshot_storage_paths(
+    sources: Mapping[str, Any] | None,
+    composer_meta: Mapping[str, Any],
+    raw_sources: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Strict correlation: every reviewed binding must map to its live source."""
+    sources_out = dict(sources) if sources is not None else None
+    meta_out: dict[str, Any] | None = dict(composer_meta)
+    guided = composer_meta["guided_session"]
     reviewed_sources = guided["reviewed_sources"]
     if type(reviewed_sources) is not dict:
         raise ValueError("redact_guided_snapshot_storage_paths: guided_session.reviewed_sources must be a dict")
@@ -4208,7 +4488,7 @@ def redact_guided_snapshot_storage_paths(
         if type(name) is not str or not name:
             raise ValueError("redact_guided_snapshot_storage_paths: reviewed_sources.name must be a non-empty str")
         if name in reviewed_names:
-            raise AuditIntegrityError("guided reviewed source names must be unique")
+            raise GuidedCustodyIntegrityError("guided reviewed source names must be unique")
         reviewed_names.add(name)
         snap_options = snapshot["options"]
         if type(snap_options) is not dict:
@@ -4232,9 +4512,9 @@ def redact_guided_snapshot_storage_paths(
         changed = True
         reviewed_bindings.append((name, binding.paths))
 
-    if rebuilt_sources is not None and reviewed_bindings:
+    if rebuilt_sources is not None and raw_sources is not None and reviewed_bindings:
         live_source_options: dict[str, dict[str, Any]] = {}
-        for live_name, live_source in rebuilt_sources.items():
+        for live_name, live_source in raw_sources.items():
             if type(live_source) is not dict:
                 raise ValueError("redact_guided_snapshot_storage_paths: source entries must be dicts when guided blob redaction is active")
             if "options" not in live_source:
@@ -4260,8 +4540,8 @@ def redact_guided_snapshot_storage_paths(
                 paths for reviewed_name, paths in reviewed_bindings if reviewed_name == live_name and live_reviewed_paths <= paths
             ]
             if len(candidates) != 1:
-                raise AuditIntegrityError("guided blob source mapping is inconsistent")
-            options_redacted = dict(live_options)
+                raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
+            options_redacted = _projected_source_options(live_source)
             for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
                 if key in live_options and type(value := live_options[key]) is str and value in live_reviewed_paths:
                     private_path_projections[value] = REDACTED_BLOB_SOURCE_PATH
@@ -4270,14 +4550,14 @@ def redact_guided_snapshot_storage_paths(
             source_redacted["options"] = options_redacted
             rebuilt_sources[live_name] = source_redacted
 
-    if rebuilt_sources and sentinel_bindings:
+    if rebuilt_sources and raw_sources is not None and sentinel_bindings:
         missing_names = set(sentinel_bindings) - set(rebuilt_sources)
         if missing_names:
-            raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
+            raise GuidedCustodyIntegrityError("guided blob sentinel source mapping is inconsistent")
         for source_name, binding in sentinel_bindings.items():
-            live_source = rebuilt_sources[source_name]
+            live_source = raw_sources[source_name]
             if type(live_source) is not dict or "options" not in live_source or type(live_source["options"]) is not dict:
-                raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
+                raise GuidedCustodyIntegrityError("guided blob sentinel source mapping is inconsistent")
             live_options = live_source["options"]
             live_carriers = validate_guided_reviewed_sentinel_source_mapping(
                 binding,
@@ -4285,11 +4565,12 @@ def redact_guided_snapshot_storage_paths(
                 live_source_options={source_name: live_options},
             )
             sentinels = dict(binding.carriers)
-            redacted_options = dict(live_options)
+            live_source = rebuilt_sources[source_name]
+            redacted_options = _projected_source_options(live_source)
             for key, private_path in live_carriers:
                 sentinel = sentinels[key]
                 if private_path in private_path_projections and private_path_projections[private_path] != sentinel:
-                    raise AuditIntegrityError("guided blob sentinel path projection is ambiguous")
+                    raise GuidedCustodyIntegrityError("guided blob sentinel path projection is ambiguous")
                 private_path_projections[private_path] = sentinel
                 redacted_options[key] = sentinel
             redacted_source = dict(live_source)

@@ -25,8 +25,8 @@ one declarer, one map entry — and the map was a no-op for every plugin absent
 from it, which is how ``truncate.suffix`` and ``csv.headers`` reached artifact
 bytes (elspeth-8f0a6b3391).
 
-So the fact is declared ONCE, on the option field itself, and both enforcement
-points DERIVE from that declaration:
+So a literal-value emitter is declared ONCE, on the option field itself, and
+both enforcement points DERIVE from that declaration:
 
 .. code-block:: python
 
@@ -39,6 +39,14 @@ points DERIVE from that declaration:
 The marker is metadata only. It performs no validation itself — the enforcing
 validator lives on the plugin config base, and the loader guard reads the same
 metadata through :func:`emitted_option_fields`.
+
+Options whose value names an output field already have a separate,
+truth-tested declaration on the transform class:
+``BaseTransform.output_naming_config_keys``. The loader guard unions that
+authority with these markers, rather than duplicating every output-field list
+as annotations. Use ``EmittedToOutput`` for literal values such as separators
+and for derived naming options such as a prefix, where the configured value is
+not itself one complete output field name.
 
 **Declare on the base class, never on a redeclaration.** ``Annotated`` metadata
 is inherited, but a subclass that RE-declares the field silently drops it:
@@ -68,6 +76,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -130,6 +140,20 @@ def emitted_option_fields(model: type[BaseModel] | None) -> dict[str, str]:
     return declared
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the raw value of one plugin option from a pipeline author's settings YAML or a web-authored "
+        "config dict — an untyped str | dict | list tree ELSPETH does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only when a recognized str/dict/list-tuple shape contains an env reference; every "
+        "unsupported shape returns False; never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def env_placeholders_in(value: object) -> bool:
     """Does ``value`` contain an env reference anywhere inside it?
 

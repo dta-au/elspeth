@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace as replace_dc
 from pathlib import Path
 from typing import Any
 
@@ -262,3 +263,27 @@ async def test_execute_rejects_unreviewed_llm_prompt_template(tmp_path: Path) ->
         InterpretationKind.LLM_MODEL_CHOICE,
     }
     assert "llm_prompt_template" in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_execute_gate_ignores_persisted_is_valid_true(tmp_path: Path) -> None:
+    """FENCE (elspeth-67c6fa691d): /execute must re-derive the strict predicate
+    unconditionally — ``materialize_state_for_execution`` runs regardless of
+    what ``composition_states.is_valid`` says.
+
+    The persisted row here asserts ``is_valid=True`` (the permissive shape a
+    mid-turn authoring-lane writer could produce) while the state still
+    carries a pending interpretation review. A future "skip preflight when
+    the persisted row is valid" fast path would admit this run and turn the
+    two-writers legibility defect into a genuine safety hole; this test must
+    fail on any such change.
+    """
+    state_data = _llm_state_with_options(
+        {
+            "prompt_template": "Rate how {{ interpretation: primary colour }} this page is.",
+            "model": "stub-model",
+        }
+    )
+    exc = await _seed_and_execute(tmp_path, replace_dc(state_data, is_valid=True, validation_errors=None))
+
+    assert ("rate", InterpretationKind.VAGUE_TERM) in [(site.component_id, site.kind) for site in exc.sites]

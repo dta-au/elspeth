@@ -86,7 +86,6 @@ collectors:
     plugin: batch_stats
     input: pages
     on_success: out
-    on_error: discard
     options:
       value_field: item
       schema: {{mode: observed}}

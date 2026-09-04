@@ -45,11 +45,18 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_48(engine) -> None:
-    # 47: proposal_events.event_type gains auto_commit.revoked (elspeth-01d4c6e683 audit trail).
-    assert SESSION_SCHEMA_EPOCH == 48
+def test_blob_inline_resolutions_schema_epoch_is_51(engine) -> None:
+    # 51: the multi-replica session-operation substrate lands on top of
+    # mainline's 50 — persistent session-operation authority
+    # (session_operation_fences), compatible-generation membership and
+    # run-start coordination, cross-replica ticket/progress/rate state,
+    # bounded cleanup claims, and durable proposal blob-effect receipts,
+    # plus seven new ``runs`` ownership/cancellation columns. 48 and 50
+    # already name different shapes on the two merged lines, so the union
+    # takes the next free integer (elspeth-4d6c0dd0f5).
+    assert SESSION_SCHEMA_EPOCH == 51
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 48
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 51
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

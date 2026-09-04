@@ -64,12 +64,26 @@ def _wrapped_diagnostic_template(header: str, footer: str, *, diagnostic_slots: 
     return prefix + diagnostic_slots + postfix
 
 
+def _bare_trusted_suffix(notice: str) -> str:
+    """Single constructor for BARE (non-diagnostic) canonical finalize suffixes.
+
+    The wrapped-diagnostic family derives producer templates and recognizer
+    from one wire shape; this is the bare family's counterpart. Every bare
+    canonical suffix must be assembled through this call — the completeness
+    gate in ``test_no_tool_policy_segments`` discovers registrations by AST
+    over these call sites, so a hand-concatenated suffix has no completeness
+    proof and repeats elspeth-2ed41f0a4a R2 (an unregistered backend notice
+    rendered as model-attributable prose).
+    """
+    return _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + notice
+
+
 _EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
 _EMPTY_STATE_NOTICE_NEXT_STEP: Final = (
     "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
 )
 _EMPTY_STATE_NOTICE_BODY: Final = f"{_EMPTY_STATE_NOTICE_HEADER} {_EMPTY_STATE_NOTICE_NEXT_STEP}"
-_EMPTY_STATE_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _EMPTY_STATE_NOTICE_BODY
+_EMPTY_STATE_FINALIZE_SUFFIX = _bare_trusted_suffix(_EMPTY_STATE_NOTICE_BODY)
 _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
     _EMPTY_STATE_NOTICE_HEADER,
     _EMPTY_STATE_NOTICE_NEXT_STEP,
@@ -83,9 +97,7 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_te
     _PREFLIGHT_NOTICE_FOOTER,
     diagnostic_slots="{detail}{suggestion_block}",
 )
-_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
-    _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
-)
+_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = _bare_trusted_suffix(_PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER)
 
 # R2-F14 (elspeth-5403f346c0): the advisor end gate used to borrow
 # ``_PREFLIGHT_NOTICE_HEADER`` for a completion review that never rendered, telling the
@@ -113,7 +125,125 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
     "Composer completion is withheld. Review the pipeline; validation and the advisory review run again on your next message. "
     + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
-_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
+_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_NOTICE)
+
+# elspeth-2ae50afcd1 facet B (operator-adjudicated 2026-09-02): the FOURTH
+# preflight shape the END advisor gate can hold — ``runtime_preflight is
+# None``, i.e. no deterministic validation ran this turn (a question-only turn
+# mutates nothing, so ``_turn_runtime_preflight`` never computes one). The
+# preflight header would assert a failure that never occurred — the same
+# dishonest-header class R2-F14 closed for the green shape, observed live on a
+# build whose deterministic validation was green — and the sign-off-pending
+# notice would stay silent about readiness where the repair cohort's sibling
+# (``ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE``, elspeth-88592f5be7) already
+# states it plainly. Fail-closed STRUCTURE is unchanged (every readiness axis
+# stays withheld); only the wording stops claiming a preflight ran.
+_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE: Final = (
+    "Completion advisory review did not clear after the available attempts. "
+    "Composer completion is withheld. Pipeline readiness was not re-verified this turn; "
+    "validation and the advisory review run again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE)
+
+# elspeth-25f7b757e7 (A1, budget displacement): published when the END gate's
+# deterministic pre-scan FLAGGED the USER'S OWN chat message — the one
+# advisory-evidence surface no composer tool call can mutate. Granting the
+# model a repair-continue there injects an instruction it cannot satisfy,
+# re-fires the identical pre-scan on the next pass, and spends the whole
+# advisory budget without the LLM advisory review ever running; the gate now
+# terminal-blocks on the first pass instead, and this copy names the one
+# action that clears the block. Fixed operator-authored prose: the flagged
+# message text is never interpolated (the notice's information content
+# derives entirely from control state).
+#
+# Fix round 1 (N1): the copy is SHAPE-AWARE, mirroring the gate's four
+# preflight arms — one uniform notice asserted "No pipeline change is
+# needed" over a red, absent, or pending-handoff preflight, the same
+# false-pipeline-claim class R2-F14 / facet B / ac85b0ab0e each closed on
+# one shape. The shared header states only what the gate knows on every
+# shape; each variant adds only what its own preflight shape supports.
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER: Final = (
+    "Completion advisory review flagged this turn's chat message: it matched the advisor-instruction "
+    "injection screen, and a chat message is not something the composer can change. Composer completion "
+    "is withheld."
+)
+# GREEN — the only shape where the affirmative pipeline claim is true.
+_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
+    + " No pipeline change is needed — reword your message and resend. "
+    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE)
+# ABSENT — no preflight ran this turn, so no pipeline claim at all (the
+# facet B discipline: unknown readiness is stated as unknown).
+_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
+    + " Pipeline readiness was not re-verified this turn. Reword your message and resend; validation and "
+    "the advisory review run again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE)
+# PENDING HANDOFF — a required interpretation review is still outstanding,
+# so rewording is never the only remaining step (the ac85b0ab0e class).
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE: Final = (
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER
+    + " A required interpretation review is also pending, so rewording is not the only remaining step: "
+    "reword your message and resend, then resolve the pending review cards. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE)
+# RED — the validator's leading objection rides the untrusted ``Cause:``
+# region (same trust class and treatment as the preflight wrapper's
+# interpolation): rewording a chat message cannot fix a broken pipeline, so
+# hiding the objection would tell the user with a broken pipeline there is
+# nothing to fix.
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER: Final = (
+    "Rewording alone will not make this pipeline runnable — fix the validation failure above as well. "
+    + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE = _bare_trusted_suffix(
+    _ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER
+)
+
+# elspeth-b61894d93d: the advisor-blocked RED terminals for the OTHER three
+# reasons (flagged_final_pass/flagged_no_repair, unavailable, malformed) used
+# to compose their chat copy from the SYNTHESIZED advisor-signoff validation,
+# so the ``Cause:`` interior carried the advisor wording and the validator's
+# leading objection appeared on no published surface — the user with a
+# genuinely broken pipeline was told only that the review did not clear.
+# Same treatment as the unrepairable red shape: the truthful preflight header
+# stays (it is the pre-existing R2-F14-scoped claim, and it is true), the
+# validator's objection rides the untrusted ``Cause:`` interior, and the
+# advisory situation rides a per-reason-class footer — the flagged footer
+# keeps the did-not-clear framing, the unrendered footer keeps the
+# could-not-be-obtained framing, because each is true only for its class.
+_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER: Final = (
+    "The completion advisory review also did not clear after the available attempts, so composer "
+    "completion is withheld. Fix the validation failure above; validation and the advisory review run "
+    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE = _bare_trusted_suffix(_PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER: Final = (
+    "The evidence-scoped completion advisory review could also not be obtained, so the Composer cannot "
+    "mark this turn complete. Fix the validation failure above; validation and the advisory review run "
+    "again on your next message. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
+)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE = _bare_trusted_suffix(
+    _PREFLIGHT_NOTICE_HEADER + "\n\n" + _ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER
+)
 
 # elspeth-66717f0c99: the third preflight shape the END advisor gate can hold —
 # a resolvable pending-interpretation handoff. It is neither green (so
@@ -131,9 +261,7 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
     "after the available attempts. Resolve the pending review cards; validation and the advisory "
     "review both run again on the next request. " + ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE
 )
-_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = (
-    _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
-)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
 
 # elspeth-ac85b0ab0e: the qualified variant of the pending-handoff notice.
 # Battery round 7 (g03, run 700e19d5) terminated on the bare notice above
@@ -175,7 +303,7 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnost
 _INTERPRETATION_REVIEW_HANDOFF_NOTICE: Final = (
     "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
 )
-_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _INTERPRETATION_REVIEW_HANDOFF_NOTICE
+_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX = _bare_trusted_suffix(_INTERPRETATION_REVIEW_HANDOFF_NOTICE)
 _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER: Final = (
     "Validation also found issues that must be fixed before this pipeline can run; "
     "resolving the review cards alone will not make this pipeline runnable."
@@ -206,6 +334,15 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_FLAGGED_DETAIL: Final = (
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL: Final = (
     "The evidence-scoped completion advisory review could not be obtained. The pending interpretation "
     "review remains resolvable; the advisory review runs again on the next request."
+)
+# Fix round 1 (N1): the ``flagged_unrepairable`` reason used to fall through
+# to the could-not-be-obtained arm above, producing a detail that claimed the
+# review was never obtained with the FLAGGED finding appended to the same
+# sentence — the R2-F14 self-contradiction class. The review WAS obtained: it
+# deterministically flagged the user's own chat message.
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNREPAIRABLE_DETAIL: Final = (
+    "The evidence-scoped completion advisory review flagged this turn's chat message and did not clear. "
+    "The pending interpretation review remains resolvable; reword your message and resend."
 )
 
 # Primary-model prose produced after hidden advisor findings entered its
@@ -532,6 +669,41 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return empty_with_blocker
     if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNVERIFIED_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER}"),)
+    unrepairable_red_with_detail = _split_wrapped_diagnostic(
+        suffix,
+        header=_ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
+        footer=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+    )
+    if unrepairable_red_with_detail is not None:
+        return unrepairable_red_with_detail
+    if suffix == _ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}"),)
+    flagged_red_with_detail = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+    )
+    if flagged_red_with_detail is not None:
+        return flagged_red_with_detail
+    if suffix == _ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE:
+        return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}"),)
+    unrendered_red_with_detail = _split_wrapped_diagnostic(
+        suffix,
+        header=_PREFLIGHT_NOTICE_HEADER,
+        footer=_ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+    )
+    if unrendered_red_with_detail is not None:
+        return unrendered_red_with_detail
     if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
     handoff_with_findings = _split_wrapped_diagnostic(
@@ -640,8 +812,14 @@ def first_validation_objection(runtime_result: ValidationResult) -> str | None:
     return None
 
 
-def compose_preflight_failure_message(content: str, *, runtime_result: ValidationResult) -> str:
-    """Build the user-facing message for the non-empty-state preflight-invalid path."""
+def _red_diagnostic_suffix(runtime_result: ValidationResult, *, with_detail_template: str, bare_suffix: str) -> str:
+    """One extraction of a red result's leading objection into a wrapped shape.
+
+    Shared by every composer that renders a red validation result: the
+    leading error's message and suggestion (or the first failed check's
+    detail) fill the untrusted diagnostic slots; a result with nothing
+    extractable falls back to the fixed bare shape.
+    """
     detail: str | None = None
     suggestion: str | None = None
     if runtime_result.errors:
@@ -652,14 +830,54 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
         failed_checks = [check for check in runtime_result.checks if not check.passed]
         if failed_checks:
             detail = failed_checks[0].detail
-    if detail:
-        suggestion_block = f"\n\nSuggested fix: {suggestion}" if suggestion else ""
-        suffix = _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL.format(
-            detail=detail,
-            suggestion_block=suggestion_block,
-        )
-    else:
-        suffix = _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE
+    if not detail:
+        return bare_suffix
+    suggestion_block = f"\n\nSuggested fix: {suggestion}" if suggestion else ""
+    return with_detail_template.format(detail=detail, suggestion_block=suggestion_block)
+
+
+def compose_preflight_failure_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """Build the user-facing message for the non-empty-state preflight-invalid path."""
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL,
+        bare_suffix=_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE,
+    )
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+def compose_advisor_signoff_flagged_red_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """RED preflight + a FLAGGED advisory verdict (elspeth-b61894d93d).
+
+    ``runtime_result`` is the turn's ACTUAL red preflight — never the
+    synthesized advisor-signoff validation, whose errors carry the advisor
+    wording rather than the validator's objection. The footer keeps the
+    did-not-clear framing, which is true only for this reason class.
+    """
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+    )
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+def compose_advisor_signoff_unrendered_red_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """RED preflight + an UNRENDERED advisory verdict (elspeth-b61894d93d).
+
+    Same shape as the flagged variant, but the footer keeps the
+    could-not-be-obtained framing — true only when the advisor rendered no
+    verdict (unavailable/malformed), never for a FLAG.
+    """
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+    )
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
@@ -677,6 +895,78 @@ def compose_advisor_signoff_pending_message(content: str) -> str:
     if not content:
         return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
     return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unverified_message(content: str) -> str:
+    """Build the user-facing message for an absent-preflight advisor block.
+
+    elspeth-2ae50afcd1 facet B. Deliberately NOT
+    ``compose_preflight_failure_message``: no preflight ran this turn, so a
+    "Runtime preflight failed" header would assert a failure that never
+    occurred (the same dishonest-header class R2-F14 / elspeth-5403f346c0
+    closed for the green shape). And deliberately not the sign-off-pending
+    notice: that shape rides a preflight that ran and PASSED, while this one
+    must say readiness was not re-verified. The suffix is entirely fixed
+    prose — there is no validator objection to interpolate, because no
+    validator ran.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unrepairable_message(content: str) -> str:
+    """Build the user-facing message for a user-message pre-scan block.
+
+    elspeth-25f7b757e7 (A1). The deterministic pre-scan FLAGGED the user's own
+    chat message, so the actionable step is REWORDING — not a pipeline edit,
+    and not another advisory attempt against the same unchangeable bytes. The
+    suffix is entirely fixed prose; the flagged message itself is never
+    interpolated.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unrepairable_unverified_message(content: str) -> str:
+    """ABSENT-preflight variant of the unrepairable block (fix round 1, N1).
+
+    No validation ran this turn, so the copy makes no pipeline claim at all —
+    the facet B discipline applied to the unrepairable reason.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unrepairable_handoff_message(content: str) -> str:
+    """PENDING-HANDOFF variant of the unrepairable block (fix round 1, N1).
+
+    Names the still-pending interpretation review: rewording is not the only
+    remaining step (the ac85b0ab0e class).
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX
+
+
+def compose_advisor_signoff_unrepairable_red_message(content: str, *, runtime_result: ValidationResult) -> str:
+    """RED-preflight variant of the unrepairable block (fix round 1, N1).
+
+    ``runtime_result`` is the turn's ACTUAL red preflight (never the
+    synthesized advisor-signoff validation): its leading objection rides the
+    untrusted ``Cause:`` region so the user with a broken pipeline is not
+    told there is nothing to fix.
+    """
+    suffix = _red_diagnostic_suffix(
+        runtime_result,
+        with_detail_template=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
+        bare_suffix=_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+    )
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
 
 
 def compose_advisor_pending_handoff_message(content: str, *, outstanding_findings_detail: str | None = None) -> str:
@@ -766,6 +1056,14 @@ def advisor_signoff_pending_handoff_wording(*, reason: str, findings: str, findi
     shape appends no blocker and no error, so there is no surface to carry a
     suggestion.
     """
+    if reason == "flagged_unrepairable":
+        # Fix round 1 (N1): dedicated arm — falling through to the outage
+        # wording below claimed the review was never obtained while appending
+        # its FLAGGED finding to the same sentence. ``findings`` on this
+        # reason is always the backend-authored pre-scan string.
+        if findings_backend_authored and findings:
+            return f"{_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNREPAIRABLE_DETAIL} {findings}"
+        return _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNREPAIRABLE_DETAIL
     if reason in {"flagged_final_pass", "flagged_no_repair"}:
         if findings_backend_authored and findings:
             return f"{_ADVISOR_SIGNOFF_PENDING_HANDOFF_FLAGGED_DETAIL} {findings}"

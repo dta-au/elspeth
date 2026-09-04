@@ -226,10 +226,14 @@ export interface PersistedTutorialProgress {
  *  - `run` with a recorded run identity — the run had already completed
  *    before the reload (the identity is recorded when the result renders),
  *    so resume forward at `audit`: zero re-execution.
- *  - `run` without a run identity — the reload interrupted the run itself;
- *    resume at `run` (the run turn re-fires; if the pre-reload run is still
- *    active server-side the one-active-run invariant surfaces the friendly
- *    still-finishing message).
+ *  - `run` without a run identity — the reload happened before Run was
+ *    clicked, or interrupted the run itself; the persisted fields cannot tell
+ *    the two apart. Resume at `run`: the learner lands on the Run button and
+ *    nothing executes until they click it (I-1). If a pre-reload run is
+ *    still active server-side, clicking Run surfaces the one-active-run
+ *    invariant's friendly still-finishing message, and Exit cancels it (the
+ *    cancel endpoint is idempotent, so Exit from the pre-run card is a
+ *    harmless no-op).
  *  - `audit` — requires the recorded run identity; degrades to `run` when
  *    missing (audit cannot render without it).
  *  - `graduation` — graduation counts as reached once SHOWN; resume there,

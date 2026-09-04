@@ -26,6 +26,7 @@ These tests pin the closure:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -45,11 +46,13 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
+    route_destination_facts,
 )
 from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     _PLUGIN_UNAVAILABLE_FIXES,
+    _VALIDATION_ERROR_PATTERNS,
     explain_validation_code,
 )
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
@@ -525,6 +528,7 @@ class TestClosedCodeCatalogueInvariants:
             "no_sinks_configured",
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
+            "coalesce_branch_alias_unreachable",
             "coalesce_schema_mode_mixed",
             "row_union_config_invalid",
             "row_union_name_invalid",
@@ -814,6 +818,70 @@ class TestClosedCodeCatalogueInvariants:
         assert "tutorial" not in (explanation + fix).lower()
         assert "private" not in (explanation + fix).lower()
 
+    def test_review_reconciliation_failed_is_closed_and_actionable(self) -> None:
+        """The reconciliation rejection must be explainable on BOTH surfaces.
+
+        Session f33fa7c3 (2026-09-01): ``set_pipeline`` rejected with
+        ``review_reconciliation_failed``, the planner called
+        ``explain_validation_error`` with the verbatim message, and the code
+        was in neither ``_VALIDATION_ERROR_PATTERNS`` nor the closed
+        catalogue — so the tool fell through to its no-match branch and
+        answered "does not match any known validation message or closed
+        error_code". The planner had nothing new and resubmitted an identical
+        payload. Both lookup paths are pinned here: the freeform tool matches
+        the MESSAGE, and the one-shot planner feedback
+        (``_allowlisted_candidate_feedback``) strips the message and can only
+        resolve the bare CODE.
+        """
+        code = "review_reconciliation_failed"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        # The freeform tool's primary pass matches the raw rejection message,
+        # which now carries the interpolated cause after the colon.
+        message = (
+            "Authoritative interpretation-review reconciliation failed: resolved interpretation "
+            "requirement 'model_choice_review:enrich' hash drifted. Re-inspect the exact "
+            "set_pipeline_arguments payload and retry."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
+
+    def test_vague_term_unwired_is_closed_and_actionable(self) -> None:
+        """The unwired-vague_term rejection must be explainable on both surfaces.
+
+        Session 4c42a794 (2026-09-01): ``set_pipeline`` committed a pending
+        vague_term requirement with no resolvable prompt wiring. The guard
+        that now rejects that shape must not repeat the
+        ``review_reconciliation_failed`` mistake (see the test above): a coded
+        rejection the explainer cannot resolve leaves the planner
+        blind-repeating, so the code is pinned in the closed catalogue and the
+        message is pinned against the pattern table.
+        """
+        code = "vague_term_unwired"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        # The repair is wiring, not restaging: the fix must name the
+        # structured wiring mechanism the resolver actually consumes.
+        assert "prompt_template_parts" in (explanation + fix)
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
+        message = (
+            "Pending vague_term review is not wired for resolution on node 'score_lead': "
+            "requirement 'lead quality:score_lead' (user term 'lead quality') has no resolvable prompt wiring."
+        )
+        assert any(re.search(pattern, message) for pattern, _e, _f in _VALIDATION_ERROR_PATTERNS)
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 
@@ -957,14 +1025,25 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         monkeypatch.setattr(
             planner_module,
             "coalesce_reachability_facts",
-            lambda _state: {"merge": {"produced_connections": ["left", "right"]}},
+            # A realistic fact value: the real function never emits an entry
+            # without unreachable_branches, so a double that omits it could
+            # not catch the projection dropping a field.
+            lambda _state: {
+                "merge": {
+                    "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+                    "produced_connections": ["left", "right"],
+                }
+            },
         )
         feedback = _allowlisted_candidate_feedback(result)
         assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
             "coalesce_branch_unreachable",
             "node_input_not_reachable",
         ]
-        assert feedback["validation"]["errors"][0]["connectivity"] == {"produced_connections": ["left", "right"]}
+        assert feedback["validation"]["errors"][0]["connectivity"] == {
+            "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
+            "produced_connections": ["left", "right"],
+        }
         assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
 
     def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
@@ -1134,37 +1213,123 @@ class TestCoalesceReachabilityFacts:
         facts = coalesce_reachability_facts(state)
         assert facts == {
             "merge": {
-                "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
+                # One record per broken branch, each carrying its own lure:
+                # the repair reads "this branch is broken AND this node broke
+                # it" as one fact, with no join back by connection name
+                # (guided attempt 14, session 04200b45 — the model wired
+                # branch transforms to the reviewed sink 3x with the bare
+                # facts live).
+                "unreachable_branches": [
+                    {
+                        "branch": "branch_a",
+                        "consumed_connection": "a_done",
+                        "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                    },
+                    {
+                        "branch": "branch_b",
+                        "consumed_connection": "b_done",
+                        "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                    },
+                ],
                 # Sink names and the coalesce's own published id are excluded:
                 # both pass the membership walk today but are not connections a
                 # branch value should be steered toward.
                 "produced_connections": ["branch_a", "branch_b", "rows"],
-                # The lure, named: each unreachable branch whose branch-side
-                # transform publishes to a SINK instead of the expected
-                # connection (guided attempt 14, session 04200b45 — the model
-                # wired branch transforms to the reviewed sink 3x with the
-                # bare facts live).
-                "sink_targeting_branches": [
-                    {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                    {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
-                ],
             }
         }
+
+    def test_produced_connections_are_sorted_on_a_fixture_authored_out_of_order(self) -> None:
+        """The sort pin must not depend on the hash seed.
+
+        The three-element fixtures elsewhere in this class pin
+        ``produced_connections`` sortedness only on seeds whose set iteration
+        happens to be alphabetical (an unsorted emitter survived at
+        PYTHONHASHSEED=5 under red-team mutation M6). Six connections authored
+        in non-alphabetical order make accidental agreement 1-in-720.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        aliases = ("zeta", "eta", "beta", "alpha", "gamma")
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", aliases))
+        for alias in aliases:
+            state = state.with_node(_make_transform(f"t_{alias}", alias, "main"))
+        state = state.with_node(_make_coalesce("merge", {alias: f"{alias}_done" for alias in aliases}))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+
+        facts = coalesce_reachability_facts(state)
+        produced = facts["merge"]["produced_connections"]
+        assert produced == ["alpha", "beta", "eta", "gamma", "rows", "zeta"]
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == list(aliases)
 
     def test_reachability_facts_handle_list_form_branches(self) -> None:
         from elspeth.web.composer.state import coalesce_reachability_facts
 
         state = _orphaned_coalesce_state(("a_done", "b_done"))
         facts = coalesce_reachability_facts(state)
-        # List-form branch keys are the arriving connection names themselves —
-        # nothing consumes them as an input, so no branch-side transform chain
-        # exists to attribute a sink lure to.
+        # List-form branch keys are the arriving connection names themselves,
+        # so they are identity branches and never carry a lure — see
+        # test_identity_branch_never_carries_a_sink_lure for the case where a
+        # transform DOES consume the name. The record states branch and
+        # connection as the same string outright; the old mapping form encoded
+        # this as {"a_done": "a_done"}, which reads like an alias->connection
+        # pair carrying information it does not have.
         assert facts == {
             "merge": {
-                "unreachable_branches": {"a_done": "a_done", "b_done": "b_done"},
+                "unreachable_branches": [
+                    {"branch": "a_done", "consumed_connection": "a_done"},
+                    {"branch": "b_done", "consumed_connection": "b_done"},
+                ],
                 "produced_connections": ["branch_a", "branch_b", "rows"],
             }
         }
+
+    def test_identity_branch_never_carries_a_sink_lure(self) -> None:
+        """An identity branch must not name a lure — the walk finds a CONSUMER.
+
+        ``_sink_lure`` walks from the branch NAME. For a mapped branch that
+        name is the fork alias, so the transform consuming it is the branch's
+        producer and re-pointing its on_success is the correct repair. For an
+        identity branch the name IS the consumed connection, so the walk finds
+        a node competing for the connection the coalesce awaits. Naming it
+        would make the planner set that node's on_success to its own input —
+        a self-loop rejected as ``pipeline_cycle``, burning a repair turn in
+        the payload that exists to stop exactly that.
+
+        Here ``t_a`` consumes ``a_done`` (the identity branch name) and
+        publishes to the sink, so the pre-guard code DID attribute a lure.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
+        state = state.with_node(_make_transform("t_a", "a_done", "main"))
+        state = state.with_node(_make_coalesce("merge", ("a_done", "b_done")))
+        state = state.with_node(_make_transform("tidy", "merge", "main"))
+        state = state.with_output(_make_output())
+        facts = coalesce_reachability_facts(state)
+        assert facts["merge"]["unreachable_branches"] == [
+            {"branch": "a_done", "consumed_connection": "a_done"},
+            {"branch": "b_done", "consumed_connection": "b_done"},
+        ]
+
+    def test_unreachable_branches_follow_authored_order_not_sorted_order(self) -> None:
+        """Order is the order the planner authored, never sorted.
+
+        Pinned because the list form makes order observable where the old
+        mapping's was incidental: a reader matching record N against its own
+        emitted branches must see them in the order it wrote them. The branch
+        names here sort into the opposite order, so a ``sorted()`` slipped
+        into the emitter fails this and passes a same-order fixture.
+        """
+        from elspeth.web.composer.state import coalesce_reachability_facts
+
+        state = _orphaned_coalesce_state({"branch_b": "b_done", "branch_a": "a_done"})
+        facts = coalesce_reachability_facts(state)
+        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == ["branch_b", "branch_a"]
 
     def test_sink_lure_attribution_follows_transform_chains_and_skips_non_sink_dangles(self) -> None:
         """The lure walk follows a branch's transform CHAIN to the sink hop.
@@ -1186,8 +1351,15 @@ class TestCoalesceReachabilityFacts:
         state = state.with_node(_make_transform("tidy", "merge", "main"))
         state = state.with_output(_make_output())
         facts = coalesce_reachability_facts(state)
-        assert facts["merge"]["sink_targeting_branches"] == [
-            {"node_id": "t_mid", "on_success_sink": "main", "expected_connection": "a_done"},
+        assert facts["merge"]["unreachable_branches"] == [
+            {
+                "branch": "branch_a",
+                "consumed_connection": "a_done",
+                "sink_lure": {"node_id": "t_mid", "publishes_to_sink": "main"},
+            },
+            # branch_b is unreachable but carries NO sink_lure: t_b dangles to
+            # a non-sink name, so there is no sink-publishing hop to name.
+            {"branch": "branch_b", "consumed_connection": "b_done"},
         ]
 
     def test_reachability_facts_empty_for_correctly_wired_coalesce(self) -> None:
@@ -1219,14 +1391,78 @@ class TestCoalesceReachabilityFacts:
         projected = feedback["validation"]["errors"][0]
         assert projected["error_code"] == "coalesce_branch_unreachable"
         assert "message" not in projected
+        # The one PROJECTION-level assertion for this payload: it proves the
+        # facts cross _allowlisted_candidate_feedback unmodified. The other
+        # sites call coalesce_reachability_facts directly, so only this one
+        # would catch the projection dropping or reshaping a field.
         assert projected["connectivity"] == {
-            "unreachable_branches": {"branch_a": "a_done", "branch_b": "b_done"},
-            "produced_connections": ["branch_a", "branch_b", "rows"],
-            "sink_targeting_branches": [
-                {"node_id": "t_a", "on_success_sink": "main", "expected_connection": "a_done"},
-                {"node_id": "t_b", "on_success_sink": "main", "expected_connection": "b_done"},
+            "unreachable_branches": [
+                {
+                    "branch": "branch_a",
+                    "consumed_connection": "a_done",
+                    "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
+                },
+                {
+                    "branch": "branch_b",
+                    "consumed_connection": "b_done",
+                    "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
+                },
             ],
+            "produced_connections": ["branch_a", "branch_b", "rows"],
         }
+
+    def test_route_destination_entries_ship_only_their_own_fields_keys(self) -> None:
+        """A component whose on_success AND on_error both dangle gets two entries, each with its own field's keys.
+
+        ``route_destination_facts`` merges both findings into one dict per
+        component; attaching that dict to every entry shipped
+        ``dangling_on_success`` / ``consumable_connections`` under the on_error
+        code and ``dangling_on_error`` under the on_success code — keys the
+        code's guidance never names and the teaching gate never enumerated
+        (red-team finding on bc8b9e237). The consumer now projects each entry
+        to ``route_destination_fact_keys(code)``; this pins that projection on
+        the doubly-dangling fixture the finding used.
+        """
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback, route_destination_fact_keys
+        from elspeth.web.composer.tools import ToolResult
+
+        state = _empty_state()
+        state = state.with_source(_make_source(on_success="rows"))
+        state = state.with_node(
+            NodeSpec(
+                id="t1",
+                node_type="transform",
+                plugin="value_transform",
+                input="rows",
+                on_success="nowhere",
+                on_error="ghost_sink",
+                options={"schema": {"mode": "observed"}, "operations": [{"target": "_placeholder", "expression": "row['text']"}]},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_output(_make_output())
+        validation = state.validate()
+        codes = {entry.error_code for entry in validation.errors}
+        assert {"transform_on_success_dangling", "transform_on_error_unknown_sink"} <= codes
+        # The producer really does merge: both fields' keys live in one dict.
+        assert set(route_destination_facts(state)["node:t1"]) == {
+            "dangling_on_success",
+            "declared_sinks",
+            "consumable_connections",
+            "dangling_on_error",
+        }
+
+        feedback = _allowlisted_candidate_feedback(ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=()))
+        shipped = {entry["error_code"]: set(entry["connectivity"]) for entry in feedback["validation"]["errors"] if "connectivity" in entry}
+        assert shipped["transform_on_success_dangling"] == route_destination_fact_keys("transform_on_success_dangling")
+        assert shipped["transform_on_error_unknown_sink"] == route_destination_fact_keys("transform_on_error_unknown_sink")
+        assert "dangling_on_success" not in shipped["transform_on_error_unknown_sink"]
+        assert "dangling_on_error" not in shipped["transform_on_success_dangling"]
 
     def test_allowlisted_feedback_omits_connectivity_for_other_codes(self) -> None:
         from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback

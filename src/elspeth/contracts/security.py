@@ -43,6 +43,17 @@ class SecretFingerprintError(Exception):
     pass
 
 
+def fingerprint_key_available() -> bool:
+    """Report whether a usable (present, non-empty) fingerprint key is configured.
+
+    The membership + emptiness conditions here are exactly the two absence
+    states :func:`get_fingerprint_key` raises ``ValueError`` for — callers
+    that only need to know "can I fingerprint?" ask this predicate instead of
+    catching that exception.
+    """
+    return _ENV_VAR in os.environ and bool(os.environ[_ENV_VAR])
+
+
 def get_fingerprint_key() -> bytes:
     """Get the fingerprint key from environment.
 

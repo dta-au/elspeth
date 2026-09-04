@@ -11,10 +11,16 @@
 //
 // Scope discipline (spec §10): this harness only OBSERVES the normalization gap
 // and cache-as-fakery; it does not fix them.
+//
+// Per-transition ledger (elspeth-f191ba494a / elspeth-515096e18c): every
+// guided transition (start, each respond, each chat, the run) is recorded with
+// its gestures, provider calls, planner runs and wall clock, attributed from
+// the backend's durable audit rows. The record's `transitions` field is the
+// "before" column for the 2026-09-02 remediation plan (Phase 0 → Phase 5).
 
 import { mkdirSync, writeFileSync } from "node:fs";
 
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 
 import {
   ASSUMPTION_RUBRIC,
@@ -22,7 +28,10 @@ import {
 } from "./harness/prompt-and-rubric";
 import { classifyOutcome, type StepSignal } from "./harness/classify";
 import { ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES } from "./harness/guided-driver";
+import { renderLedgerMarkdown, type TransitionLedger } from "./harness/transition-ledger";
+import { tutorialPlannerShapeViolations } from "./harness/tutorial-planner-shape";
 import type { RunRecord } from "./harness/types";
+import { TransitionLedgerRecorder } from "./helpers/transition-ledger-recorder";
 import {
   classifyPlannerEfficiency,
   fetchComposition,
@@ -41,8 +50,19 @@ import {
 
 const BATCH_ID = process.env.HARNESS_BATCH_ID ?? "skeleton";
 const BATCH_SIZE = Number(process.env.HARNESS_BATCH_SIZE ?? "1");
+// Deployment switch for the Phase 0 baseline ONLY: a deployment that predates
+// the explicit Run button (593cad72c) mounts the run turn straight into
+// POST /tutorial/run on the learner's last acknowledge click, so no Run gesture
+// exists to make. With HARNESS_LEGACY_AUTO_RUN=1 the harness accepts and
+// RECORDS that auto-fire (the ledger's run transition carries the acknowledge
+// click as its gesture) instead of asserting it away. Off by default: against
+// a current deployment the run must not fire before Run is clicked.
+const LEGACY_AUTO_RUN = process.env.HARNESS_LEGACY_AUTO_RUN === "1";
 
-type EfficiencyRunRecord = RunRecord & { efficiency: PlannerEfficiency };
+type EfficiencyRunRecord = RunRecord & {
+  efficiency: PlannerEfficiency;
+  transitions: TransitionLedger | null;
+};
 
 // Acknowledge every pending guided interpretation card currently rendered, then
 // return how many were acknowledged this pass.
@@ -53,7 +73,29 @@ type EfficiencyRunRecord = RunRecord & { efficiency: PlannerEfficiency };
 // "View prompt", then flips to "Approve the LLM prompt template". Drive those
 // primary actions as first-class unblockers; otherwise the prompt review stays
 // pending and "Confirm wiring" never enables.
-async function resolveVisibleReviews(page: Page): Promise<number> {
+//
+// Every successful click is logged as a ledger gesture (the review's ledger
+// counted View prompt / Approve / Acknowledge as learner gestures).
+//
+// Log the gesture BEFORE the click and retract it on failure: the request a
+// click fires is intercepted before the click promise resolves, so logging
+// afterwards attributes every gesture to the NEXT transition (the first
+// baseline run recorded exactly that shift).
+async function clickGesture(
+  locator: Locator,
+  label: string,
+  ledger: TransitionLedgerRecorder | null,
+): Promise<boolean> {
+  const gesture = ledger?.gesture(label) ?? null;
+  const clicked = await locator.click().then(() => true, () => false);
+  if (!clicked && gesture !== null) ledger?.retract(gesture);
+  return clicked;
+}
+
+async function resolveVisibleReviews(
+  page: Page,
+  ledger: TransitionLedgerRecorder | null = null,
+): Promise<number> {
   const primaryButtons = ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES.map((name) =>
     page.getByRole("button", { name }),
   );
@@ -69,7 +111,7 @@ async function resolveVisibleReviews(page: Page): Promise<number> {
     // current bundle uses the two-stage primary handled below.
     const toggleCount = await legacyViewToggles.count().catch(() => 0);
     for (let i = 0; i < toggleCount; i++) {
-      await legacyViewToggles.nth(i).click().catch(() => {});
+      await clickGesture(legacyViewToggles.nth(i), "View", ledger);
     }
     const regionCount = await promptRegions.count().catch(() => 0);
     for (let i = 0; i < regionCount; i++) {
@@ -87,7 +129,8 @@ async function resolveVisibleReviews(page: Page): Promise<number> {
       for (let i = 0; i < total; i++) {
         const btn = buttons.nth(i);
         if (await btn.isEnabled().catch(() => false)) {
-          await btn.click().catch(() => {});
+          const label = ((await btn.textContent().catch(() => null)) ?? "").trim() || "Acknowledge";
+          await clickGesture(btn, label, ledger);
           actions += 1;
           clicked = true;
           break;
@@ -124,22 +167,31 @@ async function resolveVisibleReviews(page: Page): Promise<number> {
 // turn mounts or the deadline trips. A driver that drove the source via a
 // plugin+schema_form instead would test a deterministic path and defeat the
 // harness's purpose (grading the real LLM-backed scenario, dims a/b/c/d).
-async function driveGuidedWalk(page: Page): Promise<void> {
+async function driveGuidedWalk(page: Page, ledger: TransitionLedgerRecorder): Promise<void> {
   const guidedPanel = page.getByLabel(/guided composer/i);
-  const runHeading = page.getByRole("heading", { name: /Running your pipeline/i });
+  // The run turn mounts on its PRE-RUN card (I-1): "Ready to run." with an
+  // explicit Run button. Nothing executes until the caller clicks it. A
+  // pre-593cad72c deployment (HARNESS_LEGACY_AUTO_RUN=1) has no such card: its
+  // run turn mounts already running, headed "Running your pipeline".
+  const runHeading = page.getByRole("heading", {
+    name: LEGACY_AUTO_RUN ? /Ready to run|Running your pipeline/i : /Ready to run/i,
+  });
   const stepChat = page.getByRole("region", { name: "Describe what you want" });
   const stepChatInput = stepChat.getByLabel("Message input");
   const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
 
-  // The tutorial is the NORMAL guided flow with the intent PRELOCKED at every
-  // phase — that lock is the ONLY difference from guided mode. The learner types
-  // nothing and never picks from a widget: on each LLM-driven phase they press
-  // Send on the prelocked worked-example prompt, and the orchestrator LLM builds
-  // THAT phase via the apply-capable /guided/chat drivers (resolve_source →
-  // resolve_sink → proposal), each extracting its part of the one prompt.
-  // We therefore drive each phase by Send (once per phase) and advance through
-  // the structured result via the stage primaries. Wait for the locked prompt to
-  // populate (synthetic URLs are fetched + appended async).
+  // The tutorial is the NORMAL guided flow with the intent PRELOCKED — that lock
+  // is the ONLY difference from guided mode. Since the goal-first change
+  // (B-2.1/2.2) the lesson's prompt is also the session's GOAL: the tutorial
+  // starts the guided session with it (POST /guided/start carries the intent for
+  // both profiles), and the learner then presses Send on the prelocked prompt at
+  // the source and output phases, where the apply-capable /guided/chat drivers
+  // (resolve_source → resolve_sink) each extract their part of it. The
+  // transforms are planned from that same goal on the step-2 finish, so the
+  // transforms phase has no Send at all.
+  // We therefore drive each driven phase by Send (once per phase) and advance
+  // through the structured result via the stage primaries. Wait for the locked
+  // prompt to populate (synthetic URLs are fetched + appended async).
   await expect(stepChatInput).toBeVisible({ timeout: 30_000 });
   await expect(stepChatInput).not.toHaveValue("", { timeout: 30_000 });
 
@@ -147,32 +199,53 @@ async function driveGuidedWalk(page: Page): Promise<void> {
   // gate (D12): it stays disabled until the stage's interpretation cards are
   // resolved, which resolveVisibleReviews handles each pass.
   //
-  // "Review wiring" carries a send-first guard (below): the step-2→step-3
-  // transition auto-plans a FIRST proposal from a fallback intent BEFORE the
-  // locked transforms prompt is sent — accepting that one commits a
-  // source→sink passthrough that the tutorial launch gate rejects (run 18,
-  // session 07e8a3a8). The primary is honored only after this driver has
-  // Sent the Transforms-phase prompt, so the proposal it accepts is the
-  // frozen-prompt revision. (The tutorial UI withholds the button on the
-  // pre-Send auto-proposal too — supersedes_draft_hash null — this guard
-  // keeps the driver correct on its own.)
-  const reviewWiring = page.getByRole("button", { name: "Review wiring", exact: true });
-  const primaries = [
-    page.getByRole("button", { name: "Confirm wiring", exact: true }),
+  // "Review wiring" carried a send-first guard until the goal-first change
+  // (B-2.1/2.2): the step-2→step-3 transition used to auto-plan a FIRST proposal
+  // from a server-authored fallback intent BEFORE the locked transforms prompt
+  // was sent, and accepting that one committed a source→sink passthrough the
+  // tutorial launch gate rejects (run 18, session 07e8a3a8). Both halves of that
+  // shape are gone: the walk states its goal at the start, the ONE planner run
+  // happens on "Finish outputs" from that goal, and a respond that would plan
+  // with no intent behind it is refused by the backend. There is no transforms
+  // Send left to order the driver against, so the guard is gone with it.
+  // Its job is now done by EVIDENCE rather than by driver order:
+  // tutorialPlannerShapeViolations (asserted in runOnce) fails the run if a
+  // planner run lands on any other transition, or if a second one appears.
+  // Each primary carries the label the ledger records as the learner's gesture.
+  const primaries: Array<{ label: string; locator: Locator }> = [
+    { label: "Confirm wiring", locator: page.getByRole("button", { name: "Confirm wiring", exact: true }) },
     // Pipeline proposal turn (propose_pipeline): the transforms phase yields a
     // REAL planner proposal; accepting it (chosen ["review_wiring"]) is the
     // only advance into the wire stage. Renders only on the proposal turn.
-    reviewWiring,
-    page.getByRole("button", { name: "Continue", exact: true }),
+    {
+      label: "Review wiring",
+      locator: page.getByRole("button", { name: "Review wiring", exact: true }),
+    },
+    // Output required-fields turn (multi_select_with_custom): the sink the LLM
+    // built is observed-mode (pass-all-through), and the real output fields come
+    // from the downstream transforms — so the correct, designed answer here is
+    // the escape, not ticking the source's `url` column. Since design review
+    // 2026-09-02 (I-3) the escape IS that turn's primary: nothing is pre-pinned,
+    // the secondary is "Pin these fields" (disabled until a chip is ticked), and
+    // the turn carries no "Continue". It is listed BEFORE "Continue" because a
+    // pre-be1dccc8d deployment (the Phase 0 baseline target) still renders that
+    // turn with `url` pre-pinned and Continue as its primary — the wrong answer
+    // the review's ledger deliberately avoided. Only renders on this one turn,
+    // so it never preempts another stage's primary.
+    {
+      label: "Let source decide (pass all fields through)",
+      locator: page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
+    },
+    { label: "Continue", locator: page.getByRole("button", { name: "Continue", exact: true }) },
     // Source inspection review (inspect_and_confirm): rendered after the
     // chat-resolved inline source is materialized into a session blob and
     // inspected — confirming the observed columns is the designed answer.
-    page.getByRole("button", { name: "Looks right", exact: true }),
+    { label: "Looks right", locator: page.getByRole("button", { name: "Looks right", exact: true }) },
     // Component review turns: once the chat-resolved source/output lands as a
     // reviewed component, the stage ends on its review turn — finishing it is
     // the designed advance (mirrors composer-guided-live).
-    page.getByRole("button", { name: "Finish sources", exact: true }),
-    page.getByRole("button", { name: "Finish outputs", exact: true }),
+    { label: "Finish sources", locator: page.getByRole("button", { name: "Finish sources", exact: true }) },
+    { label: "Finish outputs", locator: page.getByRole("button", { name: "Finish outputs", exact: true }) },
     // Transient provider failure on a step chat leaves a Retry affordance;
     // pressing it is the designed recovery. Last in priority so it never
     // preempts forward progress. Scoped HARD to the provider-unavailable
@@ -183,22 +256,23 @@ async function driveGuidedWalk(page: Page): Promise<void> {
     // phase-Send branch until the walk deadline. The frontend now withholds
     // Retry on non-final turns; this scope keeps the driver correct against
     // a stale build too.
-    page
-      .locator(".message-row")
-      .last()
-      .filter({ hasText: "I'm unavailable right now; you can still use the wizard controls." })
-      .getByRole("button", { name: "Retry", exact: true }),
-    // Output required-fields turn (multi_select_with_custom): the sink the LLM
-    // built is observed-mode (pass-all-through), and the real output fields come
-    // from the downstream transforms — so the correct, designed answer here is
-    // the escape, not ticking the source's `url` column. Only renders on this
-    // one turn, so it never preempts another stage's primary.
-    page.getByRole("button", { name: "Let source decide (pass all fields through)", exact: true }),
+    {
+      label: "Retry",
+      locator: page
+        .locator(".message-row")
+        .last()
+        .filter({ hasText: "I'm unavailable right now; you can still use the wizard controls." })
+        .getByRole("button", { name: "Retry", exact: true }),
+    },
   ];
 
-  // The phases the LLM builds from intent (source/sink/transforms). Recipe + Wire
-  // are confirm-only (no chat). Labels come from the workflow stepper.
-  const drivenPhases = new Set(["Source", "Output", "Transforms"]);
+  // The phases the learner drives with a Send. Since the goal-first change the
+  // Transforms phase is NOT one of them: the planner builds the transforms from
+  // the goal the session started with, on the step-2 finish, and the tutorial no
+  // longer locks a step-3 prompt (its step-3 box is the empty confirm-only one).
+  // Recipe + Wire were always confirm-only. Labels come from the workflow
+  // stepper.
+  const drivenPhases = new Set(["Source", "Output"]);
 
   // Active guided phase, read from the stepper's aria-current step — used to send
   // the locked prompt exactly ONCE per phase (re-sending mid-build would
@@ -242,36 +316,46 @@ async function driveGuidedWalk(page: Page): Promise<void> {
       if (!completionVisible) return;
     }
 
-    if (
-      !assertedSummary &&
-      (await page.locator(".guided-schema-summary").first().isVisible().catch(() => false))
-    ) {
-      assertedSummary = true;
-      // Capture the redesigned rationale-led read-only decision for a visual
-      // check (named, single artifact; overwritten each run).
-      await page
-        .screenshot({ path: "test-results/guided-decision-summary.png", fullPage: true })
-        .catch(() => {});
-      if ((await page.locator(".guided-schema-input").count().catch(() => 0)) > 0) {
-        throw new Error(
-          "guided decision rendered an editable form, expected a read-only summary",
-        );
+    // Observe the read-only decision summary whenever it is on screen. Checked
+    // at the top of the pass AND again right before a primary is clicked: the
+    // schema_form turn renders during resolveVisibleReviews' idle wait and its
+    // Continue is enabled at once, so a top-of-pass check alone can miss the
+    // turn entirely (the first Phase 0 baseline run failed exactly so).
+    const observeSummary = async (): Promise<void> => {
+      if (
+        !assertedSummary &&
+        (await page.locator(".guided-schema-summary").first().isVisible().catch(() => false))
+      ) {
+        assertedSummary = true;
+        // Capture the redesigned rationale-led read-only decision for a visual
+        // check (named, single artifact; overwritten each run).
+        await page
+          .screenshot({ path: "test-results/guided-decision-summary.png", fullPage: true })
+          .catch(() => {});
+        if ((await page.locator(".guided-schema-input").count().catch(() => 0)) > 0) {
+          throw new Error(
+            "guided decision rendered an editable form, expected a read-only summary",
+          );
+        }
       }
-    }
+    };
+    await observeSummary();
 
-    await resolveVisibleReviews(page);
+    // Read the stepper once per pass so every gesture below is attributed to
+    // the phase the learner was looking at (ledger `phase_before`).
+    const phase = await currentPhase();
+    ledger.notePhase(phase);
+    await resolveVisibleReviews(page, ledger);
+    await observeSummary();
 
     // 1. Advance through the structured result via an enabled stage primary.
     let advanced = false;
     for (const primary of primaries) {
-      // Send-first guard: never accept a transforms proposal before the
-      // locked Transforms prompt has been sent this walk.
-      if (primary === reviewWiring && lastDrivenPhase !== "Transforms") continue;
       if (
-        (await primary.count().catch(() => 0)) > 0 &&
-        (await primary.isEnabled().catch(() => false))
+        (await primary.locator.count().catch(() => 0)) > 0 &&
+        (await primary.locator.isEnabled().catch(() => false))
       ) {
-        await primary.click().catch(() => {});
+        await clickGesture(primary.locator, primary.label, ledger);
         advanced = true;
         break;
       }
@@ -283,10 +367,9 @@ async function driveGuidedWalk(page: Page): Promise<void> {
 
     // 2. No primary yet — drive the CURRENT LLM phase with the locked prompt. A
     //    confirm primary appears once the result renders.
-    const phase = await currentPhase();
     const canSend = await stepChatSend.isEnabled().catch(() => false);
     if (canSend && phase !== null && drivenPhases.has(phase) && phase !== lastDrivenPhase) {
-      await stepChatSend.click().catch(() => {});
+      await clickGesture(stepChatSend, "Send", ledger);
       lastDrivenPhase = phase;
       await page.waitForTimeout(2_000); // let the /guided/chat round-trip settle
       continue;
@@ -328,7 +411,7 @@ function substantiveRowCount(
 }
 
 async function runOnce(page: Page, runIndex: number): Promise<void> {
-  test.setTimeout(1_800_000); // walk (≤900s, two sequential planner runs) + draft-wait (≤420s) + run-wait (≤360s) + grading
+  test.setTimeout(1_800_000); // walk (≤900s, one planner run) + draft-wait (≤420s) + run-wait (≤360s) + grading
 
   // --- per-run state (Task 5 capture targets; all consumed in the record) ---
   let sessionId: string | null = null;
@@ -426,13 +509,35 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     if (m && !sessionId) sessionId = m[1];
   });
 
+  // Per-transition ledger (elspeth-f191ba494a). Installed before navigation
+  // so the guided/start transition is the first entry. It holds each guided
+  // response back from the browser until the backend's durable audit rows have
+  // been re-read, which is what makes per-transition attribution exact.
+  const ledgerCtx = await harnessCtx();
+  const ledger = new TransitionLedgerRecorder(page, ledgerCtx, { legacyAutoRun: LEGACY_AUTO_RUN });
+  await ledger.install();
+  let transitions: TransitionLedger | null = null;
+  let ledgerError: string | null = null;
+
   try {
     await page.goto("/");
     await expect(
       page.getByRole("main", { name: /first-run tutorial/i }),
     ).toBeVisible();
+    ledger.noteBundle(
+      await page
+        .evaluate(
+          () =>
+            document.querySelector<HTMLScriptElement>('script[src*="/assets/index-"]')?.getAttribute("src") ??
+            null,
+        )
+        .catch(() => null),
+    );
 
     // Welcome bookend → Start mounts the guided composer surface.
+    // Bookend clicks log their gesture first (see clickGesture) and let a
+    // click failure throw as before.
+    ledger.gesture("Let's go");
     await page.getByRole("button", { name: "Let's go" }).click();
     turnReached = 1;
 
@@ -441,32 +546,56 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     // TutorialGuidedShell). The compose phase is the staged source → sink →
     // recipe/transforms → wire walk over POST /guided/respond, with per-stage
     // interpretation reviews surfaced inline (D12 gate). Drive it to completion;
-    // the run auto-starts when the guided session reaches terminal=completed.
+    // the guided session reaching terminal=completed mounts the run turn's
+    // pre-run card.
     await expect(page.getByLabel(/guided composer/i)).toBeVisible({
       timeout: 60_000,
     });
     turnReached = 2;
-    await driveGuidedWalk(page);
+    await driveGuidedWalk(page, ledger);
 
-    // On guided terminal=completed, TutorialGuidedShell hands off to the run
-    // turn (which auto-starts the tutorial run). Wait for completion, continue
-    // to the audit story. Headroom for LLM-provider latency over the heavy
-    // 5-source canonical scenario plus the wire-stage advisor sign-off.
+    if (LEGACY_AUTO_RUN) {
+      // Pre-593cad72c deployment (Phase 0 baseline): the run turn mounted
+      // straight into POST /tutorial/run on the last acknowledge click. Wait
+      // for that auto-fire and let the ledger record it as the run transition
+      // whose gesture is the acknowledge that triggered it.
+      await expect
+        .poll(() => step.run.fired, {
+          message: "legacy deployment: the tutorial run should auto-fire once the guided walk completes",
+          timeout: 60_000,
+        })
+        .toBe(true);
+    } else {
+      // On guided terminal=completed, TutorialGuidedShell hands off to the run
+      // turn, which shows the committed graph and an explicit Run button (I-1)
+      // — the run NEVER auto-starts. Assert nothing fired, then click Run as
+      // the learner would.
+      expect(step.run.fired, "the tutorial run must not fire before Run is clicked").toBe(false);
+      ledger.gesture("Run");
+      await page.getByRole("button", { name: "Run", exact: true }).click();
+    }
+
+    // Wait for completion, continue to the audit story. Headroom for
+    // LLM-provider latency over the heavy 5-source canonical scenario plus
+    // the wire-stage advisor sign-off.
     await expect(page.getByRole("button", { name: "Continue" })).toBeVisible({
       timeout: 420_000,
     });
     turnReached = 3;
+    ledger.gesture("Continue (run complete)");
     await page.getByRole("button", { name: "Continue" }).click();
     turnReached = 4;
 
     // Audit story, continue.
     await expect(page.getByText(/This is the audit story/i)).toBeVisible();
+    ledger.gesture("Continue (audit story)");
     await page.getByRole("button", { name: "Continue" }).click();
     turnReached = 5;
 
     // Graduation: the staged flow saves the guided default + renames the session
     // and creates a fresh composer session on this single button (the old Turn-6
     // mode-choice radio is gone — graduation now owns the default-mode save).
+    ledger.gesture("Take me to the composer");
     await page
       .getByRole("button", { name: "Take me to the composer" })
       .click();
@@ -496,6 +625,15 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     hardError = e instanceof Error ? e.message : String(e);
     throw e; // rethrow so Playwright captures trace/video for this failed run
   } finally {
+    // Close the per-transition ledger first (its final durable read is what
+    // the unattributed-call counts derive from), then release its context.
+    try {
+      transitions = await ledger.finalize();
+    } catch (error) {
+      ledgerError = error instanceof Error ? error.message : String(error);
+    }
+    await ledgerCtx.dispose().catch(() => undefined);
+
     // --- build + write the per-run RunRecord (Task 6 + Task 7) ---
     const ctx = await harnessCtx();
     const events = sessionId
@@ -635,6 +773,9 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
           : {}),
       },
       efficiency,
+      // Per-transition ledger: gestures, provider calls, planner runs and wall
+      // clock for every guided transition, from the durable audit rows.
+      transitions,
       // Backend step evidence (the de-conflation inputs) — kept in the record so
       // a future batch is diagnosable without re-running: did each POST fire,
       // respond, with what status, in how long.
@@ -664,12 +805,52 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
       JSON.stringify(record, null, 2),
     );
     await ctx.dispose();
+    if (transitions !== null) {
+      // Human-readable copy of the ledger beside the JSON record, so a batch
+      // log reads as the review's turn-by-turn table.
+      const table = renderLedgerMarkdown(transitions);
+      writeFileSync(`${dir}/run-${String(runIndex).padStart(2, "0")}.ledger.md`, `${table}\n`);
+      console.log(`[transition-ledger] run ${runIndex}\n${table}`);
+      await test.info().attach(`transition-ledger-run-${runIndex}`, {
+        body: JSON.stringify(transitions, null, 2),
+        contentType: "application/json",
+      });
+    } else {
+      console.log(`[transition-ledger] run ${runIndex}: ledger unavailable: ${ledgerError ?? "unknown"}`);
+    }
     const efficiencyFailure = plannerEfficiencyAssertionFailure(efficiency, hardError);
     if (efficiencyFailure !== null) {
       expect(
         efficiencyFailure,
         `planner efficiency failed: ${efficiencyFailure}`,
       ).toBeNull();
+    }
+    // Per-transition invariant (elspeth-515096e18c): a transition that hands
+    // the learner a new proposal must have paid a planner call for it in THAT
+    // transition, and every transition's evidence must have been readable.
+    // Like the efficiency gate, it is the primary failure only when the walk
+    // itself did not already fail.
+    if (hardError === null) {
+      const ledgerViolations = transitions === null
+        ? [`per-transition ledger unavailable: ${ledgerError ?? "unknown"}`]
+        : transitions.violations;
+      expect(
+        ledgerViolations,
+        `per-transition ledger violations: ${ledgerViolations.join("; ")}`,
+      ).toEqual([]);
+      // Goal-first planner shape (B-2.1/2.2): exactly ONE planner run in the
+      // whole walk, on the "Finish outputs" transition, handing back the
+      // proposal — and no other transition paying a planner call. This is the
+      // per-TRANSITION half the walk-level efficiency gate above cannot see
+      // (it counts calls over the whole walk), and the check that replaces the
+      // drivers' send-first guard. Pure + unit-tested in
+      // harness/tutorial-planner-shape.test.ts; the collector scenario below
+      // is deliberately NOT graded by it.
+      const plannerShape = tutorialPlannerShapeViolations(transitions, ledgerError);
+      expect(
+        plannerShape,
+        `goal-first planner shape: ${plannerShape.join("; ")}`,
+      ).toEqual([]);
     }
   }
 }
@@ -766,11 +947,19 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
   const stepChatInput = stepChat.getByLabel("Message input");
   const stepChatSend = stepChat.getByRole("button", { name: "Send message" });
   const completion = page.getByRole("region", { name: /pipeline summary/i });
-  const drivenPhases = new Set(["Source", "Output", "Transforms"]);
-  const reviewWiring = page.getByRole("button", { name: "Review wiring", exact: true });
+  // Source and Output only, for the same reason as the tutorial walk: since the
+  // goal-first change the transforms are planned once, on the step-2 finish,
+  // from the session's goal (the scenario prompt, set on the convert below)
+  // plus whatever this walk's sends retained as deferred intents. There is no
+  // transforms Send.
+  const drivenPhases = new Set(["Source", "Output"]);
   const primaries = [
     page.getByRole("button", { name: "Confirm wiring", exact: true }),
-    reviewWiring,
+    // No send-first guard: with the pre-Send auto-proposal gone there is no
+    // unpaid-for proposal to accept early. This scenario RECORDS its ledger
+    // without grading it (COLLECTOR_BASELINE is null), so the tutorial walk's
+    // per-transition planner assertions deliberately do not apply here.
+    page.getByRole("button", { name: "Review wiring", exact: true }),
     page.getByRole("button", { name: "Continue", exact: true }),
     page.getByRole("button", { name: "Looks right", exact: true }),
     page.getByRole("button", { name: "Finish sources", exact: true }),
@@ -790,10 +979,6 @@ async function driveCollectorScenarioWalk(page: Page): Promise<void> {
     await resolveVisibleReviews(page);
     let advanced = false;
     for (const primary of primaries) {
-      // Send-first guard (same defect class as the tutorial walk's run-18
-      // fallback proposal): never accept a transforms proposal before the
-      // collector prompt has been sent this walk.
-      if (primary === reviewWiring && lastDrivenPhase !== "Transforms") continue;
       if (
         (await primary.count().catch(() => 0)) > 0 &&
         (await primary.isEnabled().catch(() => false))
@@ -883,12 +1068,20 @@ test.describe("collector-authoring scenario (ordinary guided surface)", () => {
     // FRESH guided session: create + convert via the API (the same
     // POST /guided/convert the "Switch to guided" affordance calls), then
     // deep-link it by hash (#/{sessionId}).
+    //
+    // The convert carries the scenario prompt as the session's GOAL: since the
+    // goal-first change no guided session starts without a visible intent, and
+    // the "Switch to guided" card the affordance renders now collects one. The
+    // scenario prompt is this walk's fixed input, so it is also its goal — the
+    // same relationship the tutorial's frozen lesson prompt has to the tutorial
+    // session. The driver still sends it at the source and output phases, where
+    // the chat solvers extract their halves of it.
     const entry = await harnessCtx();
     const created = await entry.post("/api/sessions", { data: {} });
     if (!created.ok()) throw new Error(`create session failed ${created.status()}: ${await created.text()}`);
     const sessionId = ((await created.json()) as { id: string }).id;
     const converted = await entry.post(`/api/sessions/${sessionId}/guided/convert`, {
-      data: { operation_id: crypto.randomUUID() },
+      data: { operation_id: crypto.randomUUID(), intent: COLLECTOR_SCENARIO_PROMPT },
     });
     if (!converted.ok()) throw new Error(`guided convert failed ${converted.status()}: ${await converted.text()}`);
     await entry.dispose();

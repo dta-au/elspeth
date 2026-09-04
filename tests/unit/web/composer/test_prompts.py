@@ -592,7 +592,12 @@ class TestBuildSystemPrompt:
         assert "three or more components" in flattened
         assert "two or more workflow patterns" in flattened
         assert "submit one `set_pipeline`" in flattened
-        assert "Do not build complex new pipelines tool-by-tool" in flattened
+        assert "Do not build a complex new pipeline tool-by-tool" in flattened
+        # The prohibition is scoped to new builds so the edit table's
+        # add/rewire row cannot read as licence for a construction loop
+        # (elspeth-ee89aca5d0); the steer itself must survive that scoping.
+        assert "governs NEW builds only" in flattened
+        assert "Editing a pipeline that already exists is not a new build" in flattened
         assert "`classify -> enrich -> route`" in flattened
         assert "`classify -> aggregate -> cross-tab`" in flattened
         assert "`split/expand -> gate-route per branch`" in flattened
@@ -1459,3 +1464,83 @@ class TestServerOwnedMetadataProjection:
         assert carried["event_id"] == "event-1"
         note = result.data["server_owned_metadata_note"]
         assert "interpretation_requirements" in note
+
+
+class TestReplyRegisterRule:
+    """The freeform brief tells the model to summarise in the reader's terms
+    (elspeth-4bf65fe149). Observed live (session 39578c6f): the final reply
+    echoed ``is_valid: true``, ``options.profile`` and ``require_all/union``.
+    That is a brief defect — the fix is instruction, never server-side
+    rewriting (Composer invariant 1) and never a tutorial branch (ADR-031)."""
+
+    def test_brief_carries_the_reply_register_section(self) -> None:
+        assert "## Reply Register" in SYSTEM_PROMPT
+
+    def test_brief_names_the_three_identifier_classes_it_forbids_in_prose(self) -> None:
+        section = SYSTEM_PROMPT.split("## Reply Register", 1)[1].split("\n## ", 1)[0]
+        for phrase in (
+            "tool-argument keys",
+            "validation payload fields",
+            "enum values",
+            "Spec and YAML tabs",
+            "display label",
+            # The failure half. A rule that supplies a replacement phrase for
+            # the SUCCESS case only ("validation passed", not is_valid: true)
+            # leaves the model no instructed form for a failure, and the
+            # nearest compliant behaviour is vagueness. Pin the clause that
+            # forbids that, not just the ones that forbid the tokens.
+            "whether validation passed or failed",
+        ):
+            assert phrase in section, phrase
+
+    def test_brief_states_the_rules_as_imperatives_not_just_vocabulary(self) -> None:
+        """The vocabulary pins above survive a POLARITY INVERSION.
+
+        Editing "Do not echo tool-argument keys..." to "Echo tool-argument keys
+        where helpful..." keeps every noun phrase in place, so the other tests
+        in this class stay green while the rule means its opposite. Pinning the
+        imperative stems verbatim makes an inverting edit delete pinned
+        wording instead (python M1).
+
+        This is a narrow strengthening, not a change of posture: these are
+        still declaration tests, pinning what the brief SAYS rather than what
+        the model does with it.
+        """
+        section = SYSTEM_PROMPT.split("## Reply Register", 1)[1].split("\n## ", 1)[0]
+        for stem in (
+            "Do not echo tool-argument keys",
+            "never by node id",
+            "Do not paste an ASCII topology tree",
+        ):
+            assert stem in section, stem
+
+    def test_termination_checklist_includes_the_register_line(self) -> None:
+        checklist = SYSTEM_PROMPT.split("## Termination States", 1)[1]
+        assert "no tool-argument keys, validation fields, or enum values in prose" in checklist
+
+
+class TestMutationEchoOperatingContract:
+    """The high-salience freeform contract prevents post-success reread loops."""
+
+    def test_operating_contract_names_the_echo_and_remaining_validation_authorities(self) -> None:
+        section = SYSTEM_PROMPT.split("## Operating Contract — read first", 1)[1].split("## Skill Router", 1)[0]
+
+        assert "`applied_component`" in section
+        assert "authoritative post-change state" in section
+        assert "`validation` / `validation_delta`" in section
+
+    def test_operating_contract_forbids_confirmation_rereads(self) -> None:
+        section = SYSTEM_PROMPT.split("## Operating Contract — read first", 1)[1].split("## Skill Router", 1)[0]
+
+        assert "Never call `get_pipeline_state` to confirm components named in that echo" in " ".join(section.split())
+
+    def test_review_handoff_recovery_uses_mutation_echo_before_state_read(self) -> None:
+        section = SYSTEM_PROMPT.split("If review handoff fails for a staged requirement", 1)[1].split(
+            "`interpretation_requirements` is always a JSON array", 1
+        )[0]
+        flattened = " ".join(section.split())
+
+        assert "latest successful mutation's `applied_component`" in flattened
+        assert "Only when that mutation omitted the echo or its echo does not cover the affected component" in flattened
+        assert "Read `get_pipeline_state`" not in flattened
+        assert "Read the current pipeline state" not in flattened

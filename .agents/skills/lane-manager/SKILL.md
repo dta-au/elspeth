@@ -41,6 +41,39 @@ Worktree discipline from AGENTS.md applies to every lane (one worktree per
 lane; `.venv` and `PYTHONPATH` rules). Brief each lane with an explicit test
 parallelism ceiling — CPUs do not multiply across lanes.
 
+## Phase 0 — Fit check (before any init)
+
+**Invoking this skill means "do complex orchestration well." The phased
+process below is an exemplar for one topology of task — independent,
+file-disjoint tickets — not a mandate to run that shape.** An invocation,
+even a direct one from the operator, directs you at the standard of work
+(evidence over claims, deliberate dispatch, verified merges); the operator
+may not have considered this task's specific shape. Choose the orchestration
+shape yourself against the actual topology; when the exemplar fails to fit,
+say so and propose the narrower shape before initialising a run.
+
+The exemplar topology fits when tickets are independent, file-disjoint, each
+large enough to justify a worktree, and each verifiable by its own test
+command.
+
+Signals it does not fit — raise them, don't run through them:
+
+- lanes would edit the **same file** (a shared allowlist, generated manifest,
+  one config) — concurrent branches manufacture merge conflicts;
+- many tickets are **tiny** — a worktree + branch + dispatch per ten-line
+  change is overhead exceeding work; consolidate into batched lanes first;
+- tickets are **sequentially coupled** (one consumes another's interface) —
+  that is a pipeline, not a fanout;
+- the work is one **uniform migration** where review depth matters more than
+  wall-clock — fewer, larger lanes beat many shallow ones.
+
+The remedy is a different shape, not a lower standard: consolidate tickets
+into fewer lanes, cap concurrency, run lanes serially, or drop to a single
+implementer under direct review — carrying the evidence discipline (verify,
+ladder, report) into whatever shape you choose, at whatever width it
+supports. When the fit is ambiguous and the cost of guessing wrong is high,
+ask the operator — one clarifying question beats a conflicted merge train.
+
 ## Phase 1 — Init
 
 Write a ticket list and initialise the run. Every lane gets a deterministic

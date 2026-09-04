@@ -52,7 +52,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
+from elspeth.web.composer.no_tool_policy import ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE, is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.service import (
@@ -61,6 +61,7 @@ from elspeth.web.composer.service import (
     ComposerServiceImpl,
     _pending_interpretation_review_repair_message,
 )
+from elspeth.web.composer.source_demand import SOURCE_DATA_CONTRACT_USER_TERM
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -168,7 +169,10 @@ def _fake_response_with_tool_calls(
                         tool_calls=[
                             _ToolCall(
                                 str(call["id"]),
-                                _Func(str(call["name"]), json.dumps(call["arguments"])),
+                                _Func(
+                                    str(call["name"]),
+                                    json.dumps({"pipeline": call["arguments"]} if call["name"] == "set_pipeline" else call["arguments"]),
+                                ),
                             )
                             for call in tool_calls
                         ],
@@ -376,6 +380,48 @@ def _state_with_prompt_template_review_node() -> CompositionState:
     )
 
 
+def _state_with_source_data_contract(csv_path: Path) -> CompositionState:
+    """Uploaded observed source whose graph demands one acknowledged field."""
+    csv_path.write_text("colour\nred\n", encoding="utf-8")
+    return CompositionState(
+        source=None,
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": str(csv_path), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="select_colour",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="selected",
+                on_error="discard",
+                options={
+                    "mapping": {"colour": "colour"},
+                    "select_only": True,
+                    "required_input_fields": ["colour"],
+                    "schema": {"mode": "observed"},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
 def _state_with_source_review() -> CompositionState:
     return CompositionState(
         source=SourceSpec(
@@ -529,7 +575,7 @@ def _set_pipeline_with_pending_interpretation_args(term: str = "cool") -> dict[s
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": f"Rate how {{{{interpretation:{term}}}}} this row is.",
                     "schema": {"mode": "observed"},
@@ -652,9 +698,10 @@ def _set_pipeline_clean_llm_node_args() -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "provider": "openrouter",
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-4o",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }} in one sentence.",
+                    "required_input_fields": ["text"],
                     "schema": {"mode": "observed"},
                 },
             }
@@ -840,8 +887,13 @@ async def test_pipeline_decision_draft_mismatch_returns_arg_error_not_crash(
     assert len(invocations) == 1
     assert invocations[0].tool_name == "request_interpretation_review"
     assert invocations[0].status.value == "arg_error"
-    # No pending row was minted for the mismatched echo.
-    assert await sessions_service.list_interpretation_events(session_id, status="all") == []
+    # The mismatched echo was not minted. Frozen-state finalization still
+    # publishes the exact staged requirement through the honest backend
+    # surfacer, so the user can review it without another model turn.
+    events = await sessions_service.list_interpretation_events(session_id, status="all")
+    assert len(events) == 1
+    assert events[0].llm_draft == "Drop the scraped raw HTML and fingerprint fields before saving the JSON output."
+    assert events[0].tool_call_id.startswith("backend_auto_surface:")
 
 
 @pytest.mark.asyncio
@@ -1728,9 +1780,9 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     """The fail-closed orphan result labels component_type per interpretation kind.
 
     The gate fires for every kind ``_missing_pending_interpretation_review_sites``
-    can surface, not just legacy vague_term tokens. An ``INVENTED_SOURCE`` site is
-    a source-level handoff (component_id ``"source"``, component_type ``"source"``)
-    while every other kind is transform-level. The persisted ValidationError /
+    can surface, not just legacy vague_term tokens. ``INVENTED_SOURCE`` and
+    ``SOURCE_DATA_CONTRACT`` sites are source-level handoffs while every other
+    kind is transform-level. The persisted ValidationError /
     readiness blocker must carry the correct component_type into the audit trail,
     and ``affected_nodes`` must exclude source sites (mirroring the runtime
     preflight's ``InterpretationReviewPending`` handling).
@@ -1740,6 +1792,7 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     result = _orphaned_interpretation_review_validation(
         (
             ("source", "inline_source_url_list", InterpretationKind.INVENTED_SOURCE),
+            ("source:uploaded", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),
             ("rate_node", "cool", InterpretationKind.VAGUE_TERM),
         )
     )
@@ -1750,11 +1803,11 @@ def test_orphaned_interpretation_validation_derives_component_type_per_kind() ->
     assert result.readiness.completion_ready is False
     assert result.readiness.execution_ready is False
 
-    # component_type derived per-site: source for invented_source, transform otherwise.
+    # component_type derived per-site: source for source-level kinds, transform otherwise.
     error_by_component = {error.component_id: error.component_type for error in result.errors}
-    assert error_by_component == {"source": "source", "rate_node": "transform"}
+    assert error_by_component == {"source": "source", "source:uploaded": "source", "rate_node": "transform"}
     blocker_by_component = {blocker.component_id: blocker.component_type for blocker in result.readiness.blockers}
-    assert blocker_by_component == {"source": "source", "rate_node": "transform"}
+    assert blocker_by_component == {"source": "source", "source:uploaded": "source", "rate_node": "transform"}
     assert {blocker.code for blocker in result.readiness.blockers} == {"interpretation_review_orphaned"}
 
     # affected_nodes excludes the source site (transform-only, per validation.py).
@@ -1911,6 +1964,7 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
             progress=None,
             repair_turns_used=0,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
             session_operation_context=_compose_ctx,
@@ -2116,6 +2170,54 @@ async def test_budget_exhaustion_finalize_auto_surfaces_prompt_template(
 
 
 @pytest.mark.asyncio
+async def test_budget_exhaustion_repeated_synthesized_prose_is_not_same_turn(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """B-4D-3 may repeat persisted bytes on a later, synthesized model turn."""
+    composer = _build_composer(tmp_path, sessions_service, max_composition_turns=1)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Repeated synthesized prose session",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    prose = "I prepared the pipeline for review."
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_clean_llm_node_args(),
+                content=prose,
+            ),
+            _fake_text_response(prose),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="summarise each row",
+    )
+
+    assert len(llm.messages) == 2
+    assert result.persisted_assistant_content == prose
+    assert result.raw_assistant_content == prose
+    assert result.assistant_message.startswith(prose)
+    assert result.assistant_message != prose
+    assert result.persisted_assistant_matches_terminal_model_turn is False
+
+
+@pytest.mark.asyncio
 async def test_budget_exhaustion_finalize_fails_closed_on_bare_token_orphan(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
@@ -2264,7 +2366,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     assert pt_b[0].llm_draft == prompt_b
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[pt_a[0].id].choice is InterpretationChoice.ABANDONED
+    assert by_id[pt_a[0].id].choice is InterpretationChoice.SUPERSEDED
 
 
 @pytest.mark.asyncio
@@ -2359,7 +2461,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
     assert len(pending) == 1
     assert pending[0].id != event_a.id
@@ -2456,7 +2558,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     pending = [event for event in all_events if event.choice is InterpretationChoice.PENDING]
     assert len(pending) == 1
     assert pending[0].id != event_a.id
@@ -3399,6 +3501,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             progress=None,
             repair_turns_used=0,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
             session_operation_context=_compose_ctx,
@@ -3408,6 +3511,118 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     assert advisor_mock.await_count >= 1, "END advisor gate must fire for a PT-only pipeline"
     # CLEAN verdict falls through to finalize; it did NOT advisor-block/continue.
     assert outcome.action == "return"
+
+
+@pytest.mark.asyncio
+async def test_no_tool_finalizer_auto_surfaces_source_data_contract_without_model_repair(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """A server-computable data-contract card must not consume a model repair turn.
+
+    The graph-derived review has the same frozen-final-state property as the
+    prompt-template card: the backend can derive and persist its exact draft.
+    Treating it as model-repairable delays the user-action handoff and spends
+    the finite repair budget without changing pipeline state.
+    """
+
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    sites = await composer._missing_pending_interpretation_review_sites(state, session_id=str(session_id))
+    assert sites == (("source", SOURCE_DATA_CONTRACT_USER_TERM, InterpretationKind.SOURCE_DATA_CONTRACT),)
+
+    advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    composer._run_advisor_checkpoint = advisor_mock  # type: ignore[method-assign]
+
+    class _AssistantMessage:
+        content = "Done — the pipeline is ready for review."
+
+    llm_messages: list[dict[str, Any]] = []
+    async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
+        outcome = await composer._try_terminate_no_tools(
+            assistant_message=_AssistantMessage(),
+            message="Select the colour column.",
+            llm_messages=llm_messages,
+            state=state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            initial_version=1,
+            user_id="alice",
+            last_runtime_preflight=None,
+            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            session_scope=str(session_id),
+            mutation_success_seen=True,
+            recorder=BufferingRecorder(),
+            progress=None,
+            repair_turns_used=0,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            advisor_checkpoint_passes_used=0,
+            session_operation_context=_compose_ctx,
+        )
+
+    assert outcome.action == "return"
+    assert llm_messages == []
+    assert advisor_mock.await_count >= 1
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    contracts = [event for event in events if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert len(contracts) == 1
+    assert contracts[0].affected_node_id == "source"
+    assert contracts[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+@pytest.mark.asyncio
+async def test_advisor_final_flag_terminal_return_surfaces_source_data_contract(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """Advisor-blocked P2 still persists the server-computable data-contract card."""
+
+    from elspeth.web.composer.audit import BufferingRecorder
+
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_source_data_contract(tmp_path / "uploaded.csv")
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+        AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the source contract")
+    )
+
+    class _AssistantMessage:
+        content = "Done — the pipeline is ready for review."
+
+    async with acquire_compose_context(sessions_service, session_id) as _compose_ctx:
+        outcome = await composer._try_terminate_no_tools(
+            assistant_message=_AssistantMessage(),
+            message="Select the colour column.",
+            llm_messages=[],
+            state=state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            initial_version=1,
+            user_id="alice",
+            last_runtime_preflight=None,
+            runtime_preflight_cache=composer._new_runtime_preflight_cache(),
+            session_scope=str(session_id),
+            mutation_success_seen=True,
+            recorder=BufferingRecorder(),
+            progress=None,
+            repair_turns_used=2,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
+            session_operation_context=_compose_ctx,
+        )
+
+    assert outcome.action == "return"
+    events = await sessions_service.list_interpretation_events(session_id, status="pending")
+    contracts = [event for event in events if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT]
+    assert len(contracts) == 1
+    assert contracts[0].tool_call_id.startswith("backend_auto_surface:")
 
 
 @pytest.mark.asyncio
@@ -3542,6 +3757,7 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
             progress=None,
             repair_turns_used=0,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
             session_operation_context=_compose_ctx,
@@ -3626,6 +3842,7 @@ async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
             progress=None,
             repair_turns_used=0,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             # Force last-pass so (used + 1) >= max_passes -> the final-FLAG return.
             advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
@@ -3757,6 +3974,7 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
             # blocked-return path under test).
             repair_turns_used=2,
             persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
             persisted_tool_call_turn=False,
             advisor_checkpoint_passes_used=0,
             session_operation_context=_compose_ctx,
@@ -3846,3 +4064,342 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
     )
     materialized = materialize_state_for_execution(head)
     assert not isinstance(materialized, InterpretationReviewPending), materialized
+
+
+# ---------------------------------------------------------------------------
+# elspeth-d581b3da7f — which mechanism duplicates the planner's turn text?
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_TURN_PROSE = "Surfacing the review card now."
+# Distinctive text on a scripted response the loop should NEVER reach. If a
+# second generation produced the duplicate, the loop would have consumed this.
+_UNREACHED_THIRD_TURN_PROSE = "A THIRD PROVIDER TURN WAS REQUESTED."
+
+
+@pytest.mark.asyncio
+async def test_review_handoff_prose_is_generated_once_and_already_persisted(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """Decide between the two proposed mechanisms for the msg4/msg5 duplication.
+
+    Session 891b7b1e persisted the planner's prose twice 99ms apart, the second
+    copy carrying a ``trusted_system_notice``. Two mechanisms were proposed and
+    this test discriminates them:
+
+    * **Double generation** — the backend makes a SECOND provider call that
+      re-renders the same prose. The scripted LLM holds a third response with
+      distinctive text; a second generation consumes it. Refuted when the
+      provider-call count stays at 2 and that text appears nowhere.
+    * **Server re-emission** — ONE provider call renders the prose, the compose
+      loop persists it mid-loop alongside its ``tool_calls``, and the turn-end
+      writer then persists the SAME prose again with the handoff suffix
+      appended. Confirmed by the assertions below.
+
+    The staged-handoff branch terminates the batch at the successful review
+    call, so the model's LAST prose IS the tool-call turn's prose — which the
+    compose loop has already committed. ``result.assistant_message`` re-carries
+    it because ``_append_interpretation_review_handoff_message`` augments the
+    model's rendered text rather than emitting the notice alone.
+    """
+    from elspeth.web.sessions.models import chat_messages_table
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Review handoff duplication mechanism",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+            _fake_text_response(_UNREACHED_THIRD_TURN_PROSE),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # Instrument guard: without reaching the staged-handoff branch the rest
+    # would pass vacuously.
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+
+    # --- Double generation is REFUTED -------------------------------------
+    # One provider call per loop iteration and no more. The third scripted
+    # response was never requested, so nothing re-rendered the review prose.
+    assert len(llm.messages) == 2
+    assert _UNREACHED_THIRD_TURN_PROSE not in result.assistant_message
+
+    # --- Server re-emission is CONFIRMED ----------------------------------
+    with sessions_service._engine.begin() as conn:
+        assistant_rows = [
+            row
+            for row in conn.execute(chat_messages_table.select().order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            if row["role"] == "assistant"
+        ]
+
+    # The compose loop already committed the model's prose for this turn, with
+    # the tool_calls envelope that produced the review card.
+    carrying_prose = [row for row in assistant_rows if row["content"] == _REVIEW_TURN_PROSE]
+    assert len(carrying_prose) == 1, [row["content"] for row in assistant_rows]
+    assert carrying_prose[0]["tool_calls"], "the mid-loop row must carry its tool_calls envelope"
+    assert carrying_prose[0]["writer_principal"] == "compose_loop"
+
+    # And the turn-end writer is handed that same prose back with the notice
+    # appended — persisting ``assistant_message`` verbatim is what produced the
+    # second copy in session 891b7b1e.
+    assert result.raw_assistant_content == _REVIEW_TURN_PROSE
+    assert result.assistant_message.startswith(_REVIEW_TURN_PROSE)
+    assert result.assistant_message != _REVIEW_TURN_PROSE
+
+
+@pytest.mark.asyncio
+async def test_staged_handoff_threads_the_persisted_row_content_to_the_route(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """The loop must hand the route what it already committed, not just its id.
+
+    elspeth-d581b3da7f. The turn-end writers cannot recognise their own
+    re-emission from ``persisted_assistant_message_id`` alone: that id is
+    carried across loop iterations while ``_persist_turn_audit`` runs only on
+    the tool-dispatch path, so it can point at an earlier row than the one
+    ``message`` was rendered from. The content of the committed row is what
+    makes the comparison sound, so the loop has to thread it.
+
+    Pins the compose-loop half of the fix; the route half is
+    ``test_send_message_does_not_re_emit_the_already_persisted_turn_prose``.
+    """
+    from elspeth.web.sessions.models import chat_messages_table
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Review handoff threading",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # Instrument guard: without reaching the staged-handoff branch this would
+    # pass vacuously.
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+
+    with sessions_service._engine.begin() as conn:
+        assistant_rows = [
+            row
+            for row in conn.execute(chat_messages_table.select().order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            if row["role"] == "assistant"
+        ]
+
+    # One row per tool-dispatch iteration: the set_pipeline turn (no prose)
+    # then the review turn. The threading must track the LATEST persist, not
+    # the first — the set_pipeline row's empty content would make the route's
+    # prefix test match anything.
+    assert len(assistant_rows) == 2
+    assert assistant_rows[0]["content"] == ""
+
+    # The threaded content is the bytes actually committed — the route
+    # subtracts exactly these to keep only the backend-authored suffix.
+    assert result.persisted_assistant_content == assistant_rows[-1]["content"]
+    assert result.persisted_assistant_content == _REVIEW_TURN_PROSE
+    assert result.assistant_message.startswith(result.persisted_assistant_content)
+    assert result.persisted_assistant_matches_terminal_model_turn is True
+
+
+@pytest.mark.asyncio
+async def test_advisor_repair_staged_handoff_does_not_claim_substituted_row_matches_terminal_turn(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """A P4 advisor-repair substitution is not the terminal model prose."""
+    composer = _build_composer(tmp_path, sessions_service)
+    composer._run_advisor_checkpoint = _AdvisorCheckpointFake(  # type: ignore[method-assign]
+        AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: review the interpretation before completion")
+    )
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Advisor repair staged handoff",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    assert len(llm.messages) == 2
+    assert result.persisted_assistant_content == ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
+    assert result.persisted_assistant_content != _REVIEW_TURN_PROSE
+    assert result.persisted_assistant_matches_terminal_model_turn is False
+
+
+@pytest.mark.asyncio
+async def test_staged_handoff_without_current_persist_keeps_same_turn_identity_false(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """P5 cannot mint row identity when the current P4 outcome has no row."""
+    from elspeth.web.composer._compose_loop_carriers import _PersistOutcome
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Review handoff without current persist",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    original_persist = composer._persist_turn_audit
+    persist_calls = 0
+
+    async def _drop_second_persist(**kwargs: Any) -> _PersistOutcome:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 1:
+            return await original_persist(**kwargs)
+        return _PersistOutcome(
+            current_state_id=kwargs["current_state_id"],
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            persisted_assistant_matches_current_dispatch=False,
+            unwind_audit_failed=False,
+            failed_turn=None,
+        )
+
+    composer._persist_turn_audit = _drop_second_persist  # type: ignore[method-assign]
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content=_REVIEW_TURN_PROSE,
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    assert persist_calls == 2
+    assert result.persisted_assistant_content is None
+    assert result.persisted_assistant_matches_terminal_model_turn is False

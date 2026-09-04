@@ -51,7 +51,9 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
     "description": (
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload."
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
+        "this call, not uploaded)."
     ),
     "parameters": {
         "type": "object",
@@ -82,7 +84,10 @@ _EXPECTED_CREATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
     "name": "update_blob",
-    "description": "Update the content of an existing blob (file). Overwrites the file content while preserving metadata.",
+    "description": (
+        "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
+        "Returns the new `content_hash` and `size_bytes`."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -103,7 +108,7 @@ _EXPECTED_UPDATE_BLOB_DEFINITION: dict[str, object] = {
 
 _EXPECTED_DELETE_BLOB_DEFINITION: dict[str, object] = {
     "name": "delete_blob",
-    "description": "Delete a blob (file) and its storage.",
+    "description": "Delete a blob (file) and its storage. Returns `deleted`: true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -186,6 +191,7 @@ class TestSetSourceFromBlobMigration:
             _DEFAULT_SOURCE_VALIDATION_FAILURE,
             _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
         )
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
 
         expected = {
             "name": "set_source_from_blob",
@@ -226,6 +232,7 @@ class TestSetSourceFromBlobMigration:
                         "description": (
                             "Plugin-specific config (merged with blob path). Required fields vary by plugin: "
                             "text sources need 'column' (output field name) and 'schema' (e.g., {mode: 'observed'})."
+                            + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                 },
@@ -361,7 +368,13 @@ class TestStep3DiscoveryTierMigration:
     def test_get_plugin_schema(self) -> None:
         assert self._get("get_plugin_schema") == {
             "name": "get_plugin_schema",
-            "description": "Get the full configuration schema for a plugin.",
+            "description": (
+                "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+                "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+                "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+                "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
+                "author raw options, author `options.profile` instead)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -383,7 +396,7 @@ class TestStep3DiscoveryTierMigration:
     def test_get_expression_grammar(self) -> None:
         assert self._get("get_expression_grammar") == {
             "name": "get_expression_grammar",
-            "description": "Get the gate expression syntax reference.",
+            "description": "Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -391,7 +404,9 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("explain_validation_error") == {
             "name": "explain_validation_error",
             "description": "Get a human-readable explanation of a validation error "
-            "with suggested fixes. Pass the exact error text from a validation result.",
+            "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+            "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+            "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -412,12 +427,15 @@ class TestStep3DiscoveryTierMigration:
                 "Retrieve plugin-owned guidance for a source, transform, or sink. "
                 "Two modes by ``issue_code``:\n"
                 "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
-                "    — a summary of the plugin and composer_hints. (The same hints "
+                "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
                 "    are also carried on list_sources / list_transforms / list_sinks / "
                 "    get_plugin_schema responses; this tool is the explicit path.)\n"
                 "  * Pass an ``issue_code`` (validators emit these as requirement_code "
                 "    on semantic_contracts entries) to get failure-time guidance — "
-                "    summary, suggested_fixes, and example before/after configurations."
+                "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
+                "    `before` and `after` configurations it contrasts.\n"
+                "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+                "guidance returns `summary` null and empty lists."
             ),
             "parameters": {
                 "type": "object",
@@ -453,7 +471,11 @@ class TestStep3DiscoveryTierMigration:
             "returns matching model IDs (capped at limit). For provider='openrouter/' "
             "the returned slugs are normalised to OpenRouter's HTTP API form "
             "(without the litellm-internal 'openrouter/' routing prefix) — these "
-            "are the values to put directly in `model:`.",
+            "are the values to put directly in `model:`. Result `data` carries "
+            "`providers` (provider name → model count) with `total_models` and a "
+            "`hint` on narrowing the query when no filter is given, or `models` with "
+            "`count` (matches found) and `truncated` (true when the limit cut the "
+            "list) with a filter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -482,8 +504,10 @@ class TestStep3DiscoveryTierMigration:
                 "Landscape, or 'how do I record what the pipeline did'. Audit is "
                 "mandatory and operator-managed; the composer cannot configure the "
                 "backend (security boundary — see yaml_generator.py:179, fix S1). "
-                "Returns enabled status, composer_modifiable flag, and a canonical "
-                "summary to paraphrase. Does NOT return the audit URL/path/DSN — "
+                "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+                "`summary` to paraphrase, and `audit_export_summary` (the optional "
+                "operator-configured export feature, also not composer-controllable). "
+                "Does NOT return the audit URL/path/DSN — "
                 "that is operator-internal and intentionally not surfaced to the LLM."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -497,7 +521,14 @@ class TestStep3DiscoveryTierMigration:
             "an applied_component field, that field is already the post-change state "
             "of everything that mutation touched — read it there, and call this tool "
             "for what it does not cover: a component the change did not touch, or "
-            "the whole document.",
+            "the whole document. A node or output request returns just `node` or "
+            '`output`; `component="source"` returns the `sources` map; '
+            "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+            "full-state read (no component, or an alias) returns the whole document "
+            "with an `inspection` block: `requested_component` (what you asked for), "
+            "`resolved_component` (always `full` here — the request matched a "
+            "full-state alias), and `accepted_full_state_aliases` (the exact strings "
+            "that do).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -519,10 +550,27 @@ class TestStep3DiscoveryTierMigration:
     def test_preview_pipeline(self) -> None:
         assert self._get("preview_pipeline") == {
             "name": "preview_pipeline",
-            "description": "Preview the current pipeline configuration — returns "
-            "validation status, source summary, and node/output overview "
-            "without executing. Use this to confirm the pipeline is set up "
-            "correctly before running.",
+            "description": "Preview the current pipeline without executing it. The "
+            "envelope's `validation` is the authoring check and `runtime_preflight` "
+            "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+            "`preview_is_valid` (true only when the authoring check, the runtime "
+            "check and the source proof all pass), `preview_errors` (entries only "
+            "the preview stage produces, such as `runtime_preflight_not_run`), "
+            "`edge_contracts` (one entry per producer->consumer pair that was "
+            "checked, and a pair is checked only where the consumer REQUIRES "
+            "fields — through `required_fields`, through a fixed/flexible schema's "
+            "declared fields, or, "
+            "for a sink, through an option naming the field it writes from — so an "
+            "edge requiring none has no entry and an empty "
+            "list is not proof of a satisfied contract: `from`, `to` which is "
+            "`output:<name>` for a sink, the `producer_guarantees` and "
+            "`consumer_requires` field names, the `missing_fields` between them, "
+            "and `satisfied`), `proof_diagnostics`, "
+            "`structural_preview` when present (an advisory re-check whose "
+            "`is_valid` is not the verdict), and a read-only overview: `sources` "
+            "(keyed by source name, each with `plugin`, `on_success` and "
+            "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+            "`output_count`.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -530,8 +578,13 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
             "description": "Show what changed since the session was loaded or created. "
-            "Returns added, removed, and modified nodes/edges/outputs, "
-            "plus warnings introduced or resolved.",
+            "On success `data` carries `from_version` (the baseline; the version it "
+            "changed TO is the envelope's own `version`), `sources_changed`, "
+            "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+            "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+            "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
+            "baseline (no session loaded or created yet) it fails with `error` and "
+            "`error_code` only.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -657,6 +710,8 @@ class TestStep3MutationTierMigration:
         }
 
     def test_patch_source_options(self) -> None:
+        from elspeth.web.composer.tools.sources import _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("patch_source_options") == {
             "name": "patch_source_options",
             "description": "Apply a shallow merge-patch to a named source's options. "
@@ -668,7 +723,7 @@ class TestStep3MutationTierMigration:
                     "source_name": {"type": "string", "description": "Source root name to patch. Defaults to 'source'."},
                     "patch": {
                         "type": "object",
-                        "description": "Merge-patch to apply to source options.",
+                        "description": "Merge-patch to apply to source options." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                 },
                 "required": ["patch"],
@@ -706,13 +761,17 @@ class TestStep3MutationTierMigration:
     def test_set_pipeline_required_top_level(self) -> None:
         """set_pipeline.required is exactly ['nodes', 'edges', 'outputs'].
 
-        Multi-source: a caller may supply either the singular ``source`` or the
-        ``sources`` map (both are optional properties), so neither is required.
+        A caller supplies either singular ``source`` or the ``sources`` map,
+        so neither is unconditionally required; ``oneOf`` enforces the union.
         """
         defn = self._get("set_pipeline")
         params = defn["parameters"]
         assert isinstance(params, dict)
         assert params["required"] == ["nodes", "edges", "outputs"]
+        assert params["oneOf"] == [
+            {"required": ["source"]},
+            {"required": ["sources"]},
+        ]
 
     def test_narrow_edit_tool_descriptions_are_explicit(self) -> None:
         set_pipeline = self._get("set_pipeline")
@@ -726,6 +785,19 @@ class TestStep3MutationTierMigration:
             assert intent_word in str(splice["description"])
         assert "option-only" in str(patch_node["description"])
 
+    def test_set_pipeline_names_every_narrow_edit_tool_it_defers_to(self) -> None:
+        """The narrow-edit steer names tools, not "the dedicated patch tool".
+
+        A planner that reads an unnamed route has to probe for it. Session
+        891b7b1e spent a turn doing exactly that and then fell back to a full
+        replace (elspeth-ee89aca5d0).
+        """
+        description = str(self._get("set_pipeline")["description"])
+
+        for named_tool in ("patch_node_options", "splice_transform", "upsert_node", "upsert_edge"):
+            assert named_tool in description
+        assert "dedicated patch tool" not in description
+
     def test_core_skill_routes_each_edit_shape_to_one_supported_tool(self) -> None:
         skill = (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8")
 
@@ -735,6 +807,43 @@ class TestStep3MutationTierMigration:
         assert "`patch_node_options`" in skill
         assert "intentional full rebuild" in skill
         assert "`set_pipeline`" in skill
+        # Adding/rewiring a node in an EXISTING pipeline is its own row. Without
+        # it the planner has no named route for that shape and falls back to a
+        # full replace (elspeth-ee89aca5d0).
+        assert "Add or rewire a node in an existing pipeline" in skill
+        assert "`upsert_node` / `upsert_edge`" in skill
+
+    def test_core_skill_teaches_the_fail_closed_source_data_contract(self) -> None:
+        """Planner guidance must not contradict ADR-016's runtime contract."""
+        skill = " ".join(
+            (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
+        )
+
+        assert "records failed boundary evidence and stops the run" in skill
+        assert "both row data and the emitted row contract" in skill
+        assert "Rows the source quarantines during its own validation never reach this check" in skill
+        assert "rows missing a promised column quarantine; the run continues" not in skill
+
+    def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
+        """The new edit row must not read as licence for tool-by-tool NEW builds.
+
+        The 2026-07-22 stress test (planner_authoring_aids:13-14) found 0 of 6
+        cold planners converged constructing a new pipeline tool-by-tool, which
+        is why the batching section exists. Widening the edit table must leave
+        that steer intact and explicitly bounded to new builds.
+        """
+        # Prose is hard-wrapped, so match on whitespace-normalized text: a
+        # reflow must not read as a doctrine change.
+        skill = " ".join(
+            (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
+        )
+
+        assert "governs NEW builds only" in skill
+        assert "Do not build a complex new pipeline tool-by-tool" in skill
+        assert "not by switching into a one-component-at-a-time construction loop" in skill
+        # The carve-out is what keeps the prohibition from reading as general.
+        assert "Editing a pipeline that already exists is not a new build" in skill
+        assert "A new build never walks this table row by row" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")
@@ -784,7 +893,10 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_list_blobs(self) -> None:
         assert self._get("list_blobs") == {
             "name": "list_blobs",
-            "description": "List uploaded/created files (blobs) in this session with metadata.",
+            "description": (
+                "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
@@ -793,7 +905,8 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "list_composer_blobs",
             "description": (
                 "List ready blobs available for audited inline-content authoring. "
-                "Returns only blob_id, mime_type, size_bytes, content_hash, and filename; never content bytes."
+                "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
+                "and `filename`; never content bytes."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -804,7 +917,7 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_metadata(self) -> None:
         assert self._get("get_blob_metadata") == {
             "name": "get_blob_metadata",
-            "description": "Get metadata for a specific blob (file) by ID.",
+            "description": "Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -818,7 +931,12 @@ class TestStep3BlobDiscoveryTierMigration:
     def test_get_blob_content(self) -> None:
         assert self._get("get_blob_content") == {
             "name": "get_blob_content",
-            "description": "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters.",
+            "description": (
+                "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+                "(`truncated` is true when so; `size_bytes` is the full size). "
+                "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
+                "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -836,9 +954,11 @@ class TestStep3BlobDiscoveryTierMigration:
         assert self._get("inspect_source") == {
             "name": "inspect_source",
             "description": (
-                "Return bounded structural facts about a blob-backed source: source kind, observed "
-                "headers, sample row count, inferred scalar types per column, URL candidates, and "
-                "warnings. Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+                "Return bounded structural facts about a blob-backed source: `source_kind`, "
+                "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
+                "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+                "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
                 "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
                 "tell you which fields the source actually contains and what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
@@ -864,11 +984,14 @@ class TestStep3BlobDiscoveryTierMigration:
         assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "inspect_source"}
 
     def test_wire_blob_inline_ref(self) -> None:
+        from elspeth.web.composer.tools._common import _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
+
         assert self._get("wire_blob_inline_ref") == {
             "name": "wire_blob_inline_ref",
             "description": (
                 "Author a widened blob_ref inline_content marker at a canonical field_path. "
-                "Composer pins sha256 from blob metadata; callers must not pass content bytes."
+                "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+                "Returns the `field_path` that was wired."
             ),
             "parameters": {
                 "type": "object",
@@ -877,7 +1000,8 @@ class TestStep3BlobDiscoveryTierMigration:
                         "type": "string",
                         "description": (
                             "Canonical path: source.options.<field>, source:<name>.options.<field>, "
-                            "node:<node_id>.options.<field>, or output:<name>.options.<field>."
+                            "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
+                            "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                         ),
                     },
                     "blob_id": {
@@ -911,14 +1035,21 @@ class TestStep3SecretTierMigration:
     def test_list_secret_refs(self) -> None:
         assert self._get("list_secret_refs") == {
             "name": "list_secret_refs",
-            "description": "List available secret references (API keys, credentials). Shows names and scopes, never values.",
+            "description": (
+                "List available secret references (API keys, credentials). Each entry carries the reference name, its "
+                "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
+                "does not); never values."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
     def test_validate_secret_ref(self) -> None:
         assert self._get("validate_secret_ref") == {
             "name": "validate_secret_ref",
-            "description": "Check if a secret reference exists and is accessible to the current user.",
+            "description": (
+                "Check if a secret reference exists and is accessible to the current user. Returns `available` (true when "
+                "it resolves for you) with its `scope` and `source_kind`, or `reason` when it does not."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

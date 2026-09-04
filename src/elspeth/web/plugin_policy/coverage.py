@@ -353,14 +353,19 @@ def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
     return frozenset({response_field})
 
 
-def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:
-    if node.plugin is None:
+def transform_plugin_has_capability(plugin: str | None, capability: PluginCapability) -> bool:
+    """Resolve a transform capability through the nominal plugin registry."""
+    if plugin is None:
         return False
     try:
-        plugin_cls = get_shared_plugin_manager().get_transform_by_name(node.plugin)
+        plugin_cls = get_shared_plugin_manager().get_transform_by_name(plugin)
     except PluginNotFoundError:
         return False
     return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)
+
+
+def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:
+    return transform_plugin_has_capability(node.plugin, capability)
 
 
 def source_has_capability(source: SourceSpec, capability: PluginCapability) -> bool:

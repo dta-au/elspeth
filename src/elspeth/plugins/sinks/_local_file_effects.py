@@ -345,14 +345,15 @@ def cleanup_stale_local_effect_building_files(
             break
         try:
             result = path.lstat()
-        except OSError:
+        except FileNotFoundError:
+            # A concurrent sweep already removed this entry — its goal is met.
+            # Every other OSError (permission, I/O) on a code-owned building
+            # name is an anomaly and propagates instead of reading as a clean
+            # sweep that found nothing.
             continue
         if not stat.S_ISREG(result.st_mode) or current_time - result.st_mtime < older_than_seconds:
             continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
+        path.unlink(missing_ok=True)
         removed += 1
     return removed
 
@@ -382,14 +383,19 @@ def _plan_hash(
 
 
 def _remove_exact_staging(path: Path, snapshot: _FileSnapshot) -> None:
-    """Best-effort cleanup for a prepare that cannot produce a durable plan."""
-    try:
-        current = _snapshot(path)
-        if current == snapshot:
-            path.unlink()
-            _fsync_directory(path.parent)
-    except (LocalFileEffectError, OSError):
+    """Remove the staged body left by a failed prepare while it is still ours.
+
+    A staged path that is already gone needs nothing, and one whose snapshot
+    no longer matches is not ours to unlink. Every other failure — permission,
+    I/O, a non-regular file standing where our regular staging body stood —
+    is an anomaly in the code-owned staging namespace and propagates, chaining
+    over the primary prepare error instead of being silently discarded.
+    """
+    current = _snapshot(path)
+    if not current.exists or current != snapshot:
         return
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
 
 
 def prepare_local_effect(

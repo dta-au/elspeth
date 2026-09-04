@@ -53,7 +53,11 @@ repetition window but does not un-supply anything already read: a fact stays
 supplied for the whole request, so repair through step 3's structured-repair
 reads, which carry what a re-read cannot. Where your palette also carries
 state-mutating tools, a turn's calls apply in order against the state each one
-leaves behind, so a mutation and the read that confirms it may share one turn.
+leaves behind. When a successful mutation result includes `applied_component`,
+that field is the authoritative post-change state of everything it names; do
+not call `get_pipeline_state` to confirm those components. Use
+`get_pipeline_state` only for an untouched component, a whole-document
+question, or a successful mutation that omits the echo.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
@@ -90,7 +94,11 @@ are the routing contract: a producer's `on_success`, `routes`, or `fork_to`
 value must match a downstream node's `input` or an output's `sink_name`.
 Error policies are narrower: transform/aggregation/gate `on_error` may be
 `discard` or an output `sink_name`, never a downstream processing input. Node
-ids identify components; they are not implicit connections.
+ids ordinarily identify components rather than connections. The only implicit
+self-publishing node kinds are `aggregation`, `queue`, and `coalesce`: when
+`on_success` is omitted, each publishes under its own node id, and a downstream
+consumer sets `input` to that id. Every other node id identifies only a
+component; `row_union` requires an explicit `on_success` connection.
 
 - [capability-node:transform] A `transform` applies a policy-visible plugin.
   It can preserve, add, rename, parse, expand, or otherwise shape row fields as
@@ -156,11 +164,12 @@ ids identify components; they are not implicit connections.
   (quarantining the source row) when the scope is outermost — there is no
   `on_group_failure` field. One scope per collector and per
   opener; `on_success` names the flush destination (a sink or a consumed
-  connection); `on_error` is optional (`discard` or a sink name — omitted, the
-  route derives from the scope's group machinery). Omit gate, coalesce, and
-  aggregation fields. At runtime every member of the opener's expansion holds
-  at the collector until the group's roster settles (arrived or lost), then the
-  plugin runs once over the members in expansion order and its output flows to
+  connection). A collector does not accept `on_error`: plugin failure is a
+  whole-group verdict settled through the same structural scope machinery,
+  never a per-row error edge. Omit gate, coalesce, aggregation, and error-route
+  fields. At runtime every member of the opener's expansion holds at the
+  collector until the group's roster settles (arrived or lost), then the plugin
+  runs once over the members in expansion order and its output flows to
   `on_success`.
 - [capability-node:row_union] A `row_union` is a plugin-free, correlated
   barrier that waits for every declared fork branch, then releases the

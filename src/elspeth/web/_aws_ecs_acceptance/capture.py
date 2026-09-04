@@ -771,8 +771,10 @@ def provision_storage() -> dict[str, object]:
         raise check_error_with_cause("storage_settings", exc) from None
     if os.geteuid() != _CONTAINER_RUNTIME_UID or os.getegid() != _CONTAINER_RUNTIME_GID:
         raise AcceptanceCheckError("storage_identity")
-    if not isinstance(data_dir, Path) or not isinstance(payload_root, Path):
-        raise AcceptanceCheckError("storage_settings")
+    # data_dir and payload_root are Tier-1/2 owned values: WebSettings declares
+    # data_dir as Path and get_payload_store_path() returns Path on every
+    # branch (web/config.py). A contract breach here must crash, not be
+    # laundered into a "storage_settings" acceptance verdict (ADR-032).
     if data_dir.is_symlink() or not data_dir.is_dir():
         raise AcceptanceCheckError("storage_root")
     blob_root = data_dir / "blobs"

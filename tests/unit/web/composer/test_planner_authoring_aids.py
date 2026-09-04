@@ -4,10 +4,10 @@ The aids exist because the 2026-07-22 pack stress test showed cold planners
 fabricating ``blob_id`` values and missing the source options contract: the
 pack had rules but no worked exemplars, and the ``no_deployment_plugin_facts``
 gate (correctly) forbids plugin literals in the static prompts. These tests
-enforce the self-verifying-teaching contract: the exact exemplar objects the
-planner prompt carries are run through ``build_set_pipeline_candidate``
-against the real catalog, so a drifting exemplar fails CI instead of teaching
-planners an invalid shape.
+enforce the self-verifying-teaching contract: the exact flat canonical
+documents nested in the prompt's provider envelopes are run through
+``build_set_pipeline_candidate`` against the real catalog, so a drifting
+exemplar fails CI instead of teaching planners an invalid shape.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import Any, get_args
 from uuid import uuid4
 
 import pytest
+from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
@@ -663,8 +664,28 @@ def _assert_operator_ruled_topology(args: dict[str, Any]) -> None:
 
 
 class TestForkCoalesceExemplar:
+    def test_llm_exemplar_teaches_source_to_target_mapping_direction(self, tmp_path: Path) -> None:
+        """At least one rename key is an arriving LLM response field.
+
+        Identity-only mappings are direction-blind: they let an author reverse
+        ``source -> target`` without any visible difference.  The worked LLM
+        exemplar must keep a real rename whose key is produced by an LLM arm
+        and whose value is the tidied output name (elspeth-d4ae04b374).
+        """
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        llm_response_fields = {node["options"]["response_field"] for node in args["nodes"] if node.get("plugin") == "llm"}
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        renames = {source: target for source, target in cleanup["options"]["mapping"].items() if source != target}
+
+        assert renames
+        assert set(renames) <= llm_response_fields
+        assert set(renames.values()).isdisjoint(llm_response_fields)
+
     def test_fork_coalesce_exemplar_validates_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        """The exact fork -> two-llm -> coalesce exemplar bytes must build."""
+        """The exemplar builds with derived producer and authored consumer contracts."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _profile_view(tmp_path)
         args = fork_coalesce_exemplar_args(view)
@@ -676,6 +697,25 @@ class TestForkCoalesceExemplar:
 
         rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
         assert candidate.acceptable is True, f"fork/coalesce exemplar rejected: {rejection}"
+        state = candidate.result.updated_state
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        cleanup = next(node for node in state.nodes if node.plugin == "field_mapper")
+        output = state.outputs[0]
+
+        # The structural node contributes no authored producer claim. Its
+        # require-all/union guarantees are instead derived from branch plugin
+        # contracts, and validate() proves those guarantees satisfy the
+        # cleanup's declared input contract.
+        assert coalesce.options == {}
+        branch_output_fields = {node.options["response_field"] for node in state.nodes if node.plugin == "llm"}
+        assert branch_output_fields <= set(cleanup.options["schema"]["guaranteed_fields"])
+        assert state.validate().is_valid
+
+        # Exact emitted shape remains planner-authored at the consumer seam.
+        assert cleanup.options["select_only"] is True
+        assert output.options["schema"]["mode"] == "fixed"
+        sink_fields = [field.partition(":")[0] for field in output.options["schema"]["fields"]]
+        assert sink_fields == list(cleanup.options["mapping"].values())
 
     def test_fork_coalesce_exemplar_has_the_operator_ruled_topology(self, tmp_path: Path) -> None:
         """Two separate LLM transform nodes + coalesce merge — never a queries map."""
@@ -693,6 +733,22 @@ class TestForkCoalesceExemplar:
         assert len({llm["options"]["prompt_template"] for llm in llms}) == 2
         assert len({llm["options"]["response_field"] for llm in llms}) == 2
         assert all("queries" not in llm["options"] for llm in llms)
+
+    def test_field_mapper_exemplar_teaches_source_to_target_rename_direction(self, tmp_path: Path) -> None:
+        """A real rename keeps mapping direction visible across both contracts."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+        mapping = cleanup["options"]["mapping"]
+        assert mapping["sentiment"] == "ticket_sentiment"
+        assert any(source != target for source, target in mapping.items())
+
+        input_guarantees = set(cleanup["options"]["schema"]["guaranteed_fields"])
+        sink_fields = {field.partition(":")[0].strip() for field in args["outputs"][0]["options"]["schema"]["fields"]}
+        assert input_guarantees == set(mapping)
+        assert sink_fields == set(mapping.values())
 
     def test_forked_exemplar_still_builds_with_controls_inserted(self, tmp_path: Path) -> None:
         """Inserting the control nodes must not break the exemplar's topology.
@@ -859,11 +915,27 @@ class TestForkRowUnionExemplar:
         assert "policy" not in union
         assert "merge" not in union
 
+    def test_exemplar_carries_a_non_discard_failure_route_to_a_declared_sink(self) -> None:
+        """elspeth-0aace271b4 I2: the aids corpus must not be a discard monoculture.
+
+        Before this exemplar, every failure edge in every worked exemplar was
+        'discard' (15/15), teaching silent row loss as the house style. This
+        pins the one retention-shaped counter-exemplar: a transform on_error
+        naming a sink that the same exemplar declares in outputs.
+        """
+        view, _snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        declared_sinks = {output["sink_name"] for output in args["outputs"]}
+        non_discard_routes = {node["on_error"] for node in args["nodes"] if "on_error" in node and node["on_error"] != "discard"}
+        assert non_discard_routes, "row_union exemplar lost its non-discard failure route"
+        assert non_discard_routes <= declared_sinks
+
     def test_authoring_aids_publish_row_union_rules_and_exemplar(self) -> None:
         view, _snapshot = _trained_view()
         payload = build_planner_authoring_aids(view)
 
-        assert payload["fork_row_union"]["set_pipeline_exemplar"] == planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert payload["fork_row_union"]["set_pipeline_exemplar"] == {"pipeline": planner_authoring_aids.fork_row_union_exemplar_args(view)}
         rendered = " ".join(payload["fork_row_union"]["rules"])
         assert "require_all" in rendered
         assert "N-to-N" in rendered
@@ -969,7 +1041,7 @@ class TestForkRowUnionExemplar:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
 
 
 class TestSelectedControlProfile:
@@ -1101,7 +1173,7 @@ class TestExemplarDomainDisjointness:
         payload = build_planner_authoring_aids(view)
 
         section = payload["fork_coalesce"]
-        assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+        assert section["set_pipeline_exemplar"] == {"pipeline": fork_coalesce_exemplar_args(view)}
         rules = " ".join(section["rules"])
         assert "SHAPE SELECTION" in rules  # run-3 E1: selection rule, not preference
         assert "queries map (multi_query)" in rules  # run-3 E1: both shapes taught, selection by input variance
@@ -1779,13 +1851,40 @@ class TestExpressionGrammarAid:
 
 
 class TestAuthoringAidsPayload:
+    def test_set_pipeline_exemplars_match_the_web_provider_argument_envelope(self) -> None:
+        """Prompt examples wrap flat canonical documents exactly as the web tool does."""
+        from elspeth.web.composer.service import ComposerServiceImpl
+
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+        semantic_exemplars = (
+            source_custody_exemplar_args(view),
+            fork_coalesce_exemplar_args(view),
+            planner_authoring_aids.fork_row_union_exemplar_args(view),
+        )
+        prompt_exemplars = (
+            payload["source_custody"]["set_pipeline_exemplar_inline_blob"],
+            payload["fork_coalesce"]["set_pipeline_exemplar"],
+            payload["fork_row_union"]["set_pipeline_exemplar"],
+        )
+        service = object.__new__(ComposerServiceImpl)
+        provider_tool = next(tool for tool in service._get_litellm_tools() if tool["function"]["name"] == "set_pipeline")
+        provider_schema = provider_tool["function"]["parameters"]
+        validator = Draft202012Validator(provider_schema)
+
+        assert all(exemplar is not None and "pipeline" not in exemplar for exemplar in semantic_exemplars)
+        assert len(prompt_exemplars) == len(semantic_exemplars) == 3
+        for prompt_args, semantic in zip(prompt_exemplars, semantic_exemplars, strict=True):
+            assert prompt_args == {"pipeline": semantic}
+            validator.validate(prompt_args)
+
     def test_payload_carries_the_custody_exemplar_and_the_closed_provenance_rule(self) -> None:
         view, _snapshot = _trained_view()
 
         payload = build_planner_authoring_aids(view)
 
         custody = payload["source_custody"]
-        assert custody["set_pipeline_exemplar_inline_blob"] == source_custody_exemplar_args(view)
+        assert custody["set_pipeline_exemplar_inline_blob"] == {"pipeline": source_custody_exemplar_args(view)}
         blob_variant = source_custody_exemplar_args(view, blob_id=PLACEHOLDER_BLOB_ID)
         assert blob_variant is not None
         assert custody["existing_blob_source_binding"] == blob_variant["source"]
@@ -1887,9 +1986,8 @@ class TestPromptShieldRules:
         assert "web_scrape" in rendered
         assert "llm" in rendered
         # Shielded deployment: the attachment point is the wiring, not a card.
-        # Producer-neutral wording — "the fetch step" misdescribed a document
-        # extraction producer once aws_textract_document_analysis joined the
-        # untrusted set.
+        # Producer-neutral wording applies equally to fetched, generated,
+        # retrieved, and document-extracted untrusted content.
         assert "between that producer node and" in rendered
 
         from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
@@ -1907,19 +2005,29 @@ class TestPromptShieldRules:
         whether a producer is taught. Document extraction is in that set:
         Textract returns whatever text the uploaded document carried.
         """
+        from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
         from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
-        from elspeth.web.interpretation_state import _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
 
-        assert "aws_textract_document_analysis" in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+        untrusted_producer_names = untrusted_content_transform_names()
+        assert "aws_textract_document_analysis" in untrusted_producer_names
 
         rendered = "\n".join(
             _prompt_shield_rules(
                 shield_plugin="aws_bedrock_prompt_shield",
-                untrusted_producers=tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS)),
+                untrusted_producers=tuple(sorted(untrusted_producer_names)),
             )
         )
-        for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+        for producer in untrusted_producer_names:
             assert producer in rendered
+
+    def test_non_fetch_producer_rules_make_no_fetch_or_remote_provenance_claim(self) -> None:
+        """RAG content is untrusted without being an HTTP-fetch transform."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("rag_retrieval",)))
+
+        assert "untrusted or externally controlled upstream content" in rendered
+        assert all(term not in rendered.casefold() for term in ("fetch", "internet", "remote"))
 
     def test_textract_is_shielded_but_never_taught_web_scrape_cleanup(self) -> None:
         """Document text is untrusted input, not raw HTML with a fingerprint field."""
@@ -2071,6 +2179,32 @@ class TestModelCustody:
         assert "llm_response" in rules
         assert "multi_query" in rules
         assert "does NOT create row fields" in rules
+
+    def test_known_business_columns_are_declared_at_the_sink_not_left_to_row_one(self) -> None:
+        """The planner must not promise a stable output shape and author an observed sink.
+
+        ``guaranteed_fields`` is a producer-presence contract, a coalesce has
+        no authored schema option, and a sink consumes rows rather than
+        producing them.  The stable CSV header therefore belongs in the
+        sink's explicit ``fields`` declaration (with an exact projection when
+        the user asked for exactly those columns), never in copied guarantee
+        metadata on every downstream component.
+        """
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "first accepted row" in rules
+        assert "sink schema.fields" in rules
+        assert "plugin-free coalesce" in rules
+        assert "guaranteed_fields on a sink" in rules
+
+    def test_llm_usage_and_model_columns_are_named_as_operational_not_audit_fields(self) -> None:
+        """Runtime row columns must not be conflated with separate audit metadata."""
+        view, _snapshot = _trained_view()
+
+        rules = " ".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "operational row fields" in rules
+        assert "_usage / _model audit fields" not in rules
 
 
 class TestLlmSourceGenerationAid:
@@ -2254,6 +2388,15 @@ class TestCoalesceVocabulary:
         coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
         assert coalesce["input"] in set(coalesce["branches"].values())
 
+    def test_exemplar_does_not_put_a_noop_schema_on_the_structural_coalesce(self, tmp_path: Path) -> None:
+        """CoalesceSettings has no schema field; export drops NodeSpec options."""
+        view, _snapshot = _profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        coalesce = next(node for node in args["nodes"] if node["node_type"] == "coalesce")
+        assert coalesce["options"] == {}
+
 
 class TestNamedButMissingFile:
     """Suite run 1 singleton: honesty must not lose to fabrication."""
@@ -2423,6 +2566,117 @@ class TestRun5PackEdits:
         digest = discovery_digest(view)
         llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
         assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+
+
+class TestSession891b7b1eLiveReviewEdits:
+    """Live-review session 891b7b1e closures (epic elspeth-cce536a2ba), pinned."""
+
+    def test_llm_output_rules_teach_enum_constrained_join_keys(self) -> None:
+        """elspeth-85df4312b7: exact-match consumers get enum output_fields.
+
+        A free-text 'reply with only the category word' prompt fed
+        reference_join key_field with on_error: discard — one off-vocabulary
+        reply silently drops the row. The API-native constraint existed and
+        was untaught, as was the single-prompt field-naming fact (top-level
+        output_fields land UNPREFIXED, named exactly by suffix).
+        """
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "'enum'" in rendered
+        assert "reference_join" in rendered
+        assert "UNPREFIXED" in rendered
+        assert "no normalization" in rendered
+
+    def test_llm_output_rules_steer_any_narrowing_to_type_coerce(self) -> None:
+        """elspeth-8762d9b666: narrow at type_coerce, never widen consumers."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        assert "type_coerce" in rendered
+        assert "never by widening" in rendered
+
+    def test_custody_rules_state_full_replacement_source_resupply(self) -> None:
+        """elspeth-6cadbff05f: source: null never means 'keep the source'."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        replacement_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
+        mutation_rule = next(rule for rule in rules if rule.startswith("ORDINARY/FREEFORM MUTATION SURFACE"))
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+
+        assert "source: null never means" in replacement_rule
+        assert "Plugin-backed sources must be preserved" in replacement_rule
+        assert "do not assume the current source is blob-bound" in replacement_rule
+        assert "source.blob_id only for an existing singular blob-bound source whose block carries one" in replacement_rule
+        assert "source.inline_blob only when intentionally supplying new literal data" in replacement_rule
+
+        assert "complete existing `source` configuration" in mutation_rule
+        assert "named `sources` map" in mutation_rule
+        assert "get_pipeline_state(component='set_pipeline_arguments')" in mutation_rule
+        assert "round_trip_unavailable" in mutation_rule
+        assert "never fabricate or rebind source custody" in mutation_rule
+        assert "advertised narrow patch tool" in mutation_rule
+        assert "surface the named gap" in mutation_rule
+
+        assert "current-state context" in proposal_rule
+        assert "only tools advertised in this request" in proposal_rule
+        assert "never invoke an unadvertised inspection or mutation tool" in proposal_rule
+        assert "exact authorable source binding" in proposal_rule
+        assert "exact-source/round-trip gap" in proposal_rule
+        assert "stop instead of guessing" in proposal_rule
+
+    def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
+        """Shared aids must not teach proposal planners calls absent from their palette."""
+        from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools import get_tool_definitions
+
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+        registered_names = {definition["name"] for definition in get_tool_definitions()}
+        named_tools = {name for name in registered_names if name in proposal_rule}
+
+        for surface in PlannerSurface:
+            policy = PlannerDiscoveryPolicy.initial(surface)
+            advertised_names = {definition["function"]["name"] for definition in planner_tool_definitions(policy)}
+            assert named_tools <= advertised_names
+
+        assert "get_pipeline_state" not in proposal_rule
+        assert "patch_source_options" not in proposal_rule
+
+    def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
+        """Planner-authored samples must be an explicit, provenance-preserving exception."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
+
+        verbatim_rule = next(rule for rule in rules if rule.startswith("inline_blob.content must be"))
+        assert "verbatim source data" in verbatim_rule
+        assert "ONLY exception" in verbatim_rule
+        assert "user explicitly requested" in verbatim_rule
+        assert "planner-authored sample data" in verbatim_rule
+        assert "bind it through inline_blob" in verbatim_rule
+        assert "invented_source" in verbatim_rule
+
+    def test_custody_rules_demand_first_person_invented_source_narration(self) -> None:
+        """elspeth-47eba5cced: fabricated-at-user-request content is self-authored."""
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["source_custody"]["rules"])
+        assert "FIRST PERSON" in rendered
+        assert "invented_source" in rendered
+        assert "get_blob_content" in rendered
+
+    def test_review_registry_turn_end_promise_is_prompt_template_only(self) -> None:
+        """Ordinary no-tool finalization surfaces prompt review, not model choice."""
+        view, _snapshot = _trained_view()
+        rules = build_planner_authoring_aids(view)["review_registry"]["rules"]
+
+        timing_rules = [rule for rule in rules if "TURN END" in rule or "finalization" in rule]
+        assert len(timing_rules) == 1
+        assert all("llm_model_choice" not in rule for rule in timing_rules)
+        timing_rule = timing_rules[0]
+        assert "ordinary no-tool finalization" in timing_rule
+        assert "llm_prompt_template" in timing_rule
+        assert "not a completion signal" in timing_rule
 
 
 class TestLlmOnErrorRuleGating:

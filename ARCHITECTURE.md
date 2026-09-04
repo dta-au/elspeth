@@ -2,8 +2,8 @@
 
 C4 model documentation for the ELSPETH auditable pipeline framework.
 
-**Last Updated:** 2026-08-07 (synchronized with 0.7.2 release line)
-**Framework Version:** 0.7.2 (package metadata aligned at 0.7.2)
+**Last Updated:** 2026-08-31 (synchronized with 0.8.0 release line)
+**Framework Version:** 0.8.0 (package metadata aligned at 0.8.0)
 **Status:** Pre-release
 
 ---
@@ -705,7 +705,7 @@ C4Deployment
 | Development | SQLite | SQLite/SQLCipher | Local filesystem |
 | Supported AWS ECS profile | Aurora PostgreSQL | Aurora PostgreSQL | EFS plus task-role S3 |
 
-The 0.7.2 AWS profile supports one web task at a time. Validate-only startup,
+The 0.8.0 AWS profile supports one web task at a time. Validate-only startup,
 the deployment doctor (`elspeth doctor`), readiness checks, and schema-owner
 separation are part of the deployment contract; mixed-version rollout across the
 pre-1.0 schema cutover is not supported.
@@ -1129,7 +1129,7 @@ ongoing CI enforcement.
 - Subsystems: 11 major (20+ including sub-components)
 - Plugins: registry-discovered via `discover_all_plugins()` — the same code path as `elspeth plugins list`
 - ADRs: 38 numbered records (excluding the 000 template)
-- Status: Pre-release (0.7.2)
+- Status: Pre-release (0.8.0)
 
 All diagrams use Mermaid syntax for version control compatibility.
 

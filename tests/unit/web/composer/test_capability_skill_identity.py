@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
 from elspeth.web.composer.capability_skill import (
     CANONICAL_CAPABILITY_FIELDS,
     CAPABILITY_CORE_NODE_GUIDANCE,
@@ -96,6 +98,17 @@ def test_capability_core_explains_digest_budget_omissions() -> None:
     assert "details_via" in core
 
 
+def test_capability_core_treats_successful_mutation_echo_as_state_authority() -> None:
+    """A mutation echo replaces confirmation reads; it is not optional telemetry."""
+    discovery = load_pipeline_capability_core().split("[capability:discovery-order]", 1)[1].split("## Complete topology", 1)[0]
+    prose = " ".join(discovery.split())
+
+    assert "`applied_component`" in discovery
+    assert "authoritative post-change state" in prose
+    assert "do not call `get_pipeline_state` to confirm" in prose
+    assert "a mutation and the read that confirms it may share one turn" not in prose
+
+
 def test_guided_chat_prompts_are_interaction_only_and_advertise_no_planner_terminal() -> None:
     core = load_pipeline_capability_core()
 
@@ -159,6 +172,22 @@ def test_capability_facts_have_one_document_owner() -> None:
     assert "For `batch_stats`" not in interaction
     assert "For `batch_stats`" not in core
     assert "get_plugin_assistance" in core
+
+
+def test_capability_core_names_every_implicit_self_publisher_from_runtime_authority() -> None:
+    core = load_pipeline_capability_core()
+    normalized_core = " ".join(core.split())
+    prefix = "The only implicit self-publishing node kinds are "
+
+    assert normalized_core.count(prefix) == 1, (
+        "The topology guidance must state the bounded node-id exception once; "
+        "a blanket claim that node ids are never connections contradicts the runtime."
+    )
+    documented_clause = normalized_core.split(prefix, 1)[1].split(":", 1)[0]
+    documented_kinds = frozenset(re.findall(r"`([a-z_]+)`", documented_clause))
+
+    assert documented_kinds == _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
+    assert "`row_union` requires an explicit `on_success` connection" in normalized_core
 
 
 def test_static_planner_guidance_contains_no_deployment_plugin_facts() -> None:

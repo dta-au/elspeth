@@ -4,9 +4,10 @@ JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
 THREE-TIER TRUST MODEL:
-- JSONExplode TRUSTS that pipeline data types are correct
-- Type violations (missing field, wrong type) indicate UPSTREAM BUGS and crash
-- No TransformResult.error() for type violations - they are bugs to fix
+- A missing array field is an upstream contract violation and raises ``KeyError``
+- A present field with the wrong value type is a row-level data failure
+- Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
+  them without coercing or fabricating array elements
 """
 
 import pytest
@@ -243,12 +244,32 @@ class TestJSONExplodeHappyPath:
         )
         row = PipelineRow({"id": 1, "line_items": ["a", "b"]}, contract)
 
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
+
         result = transform.process(row, ctx)
 
         assert result.status == "success"
         assert result.rows is not None
         assert result.rows[0].to_dict() == {"id": 1, "item": "a", "item_index": 0}
         assert result.rows[1].to_dict() == {"id": 1, "item": "b", "item_index": 1}
+
+    def test_original_array_header_keeps_runtime_collision_guard(self, ctx: PluginContext) -> None:
+        from elspeth.contracts.errors import PluginContractViolation
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode({"schema": DYNAMIC_SCHEMA, "array_field": "Line Items"})
+        contract = SchemaContract(
+            mode="OBSERVED",
+            fields=(
+                make_field("line_items", object, original_name="Line Items"),
+                make_field("item", str, original_name="item"),
+            ),
+            locked=True,
+        )
+
+        with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
+            transform.process(PipelineRow({"line_items": ["a"], "item": "existing"}, contract), ctx)
 
     def test_backward_probe_rows_drop_array_field(self, ctx: PluginContext) -> None:
         """Backward invariant probe drives the real deaggregation path."""
@@ -271,12 +292,12 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Tests for type violations - these should CRASH, not return errors.
+    """Distinguish missing-field contract violations from wrong-type row failures.
 
     Per three-tier trust model:
-    - Source validates that array field exists and is a list
-    - Transform trusts source did its job
-    - Type violations are UPSTREAM BUGS that should crash
+    - A missing array field remains an upstream bug and raises ``KeyError``
+    - A present field with the wrong value type returns a non-retryable error
+    - Strings and mappings are rejected rather than iterated into fabricated rows
     """
 
     @pytest.fixture

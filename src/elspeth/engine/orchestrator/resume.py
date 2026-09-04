@@ -24,6 +24,7 @@ the resume orchestration off ``Orchestrator`` (which now delegates its public
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -121,6 +122,8 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
     from elspeth.engine.orchestrator.types import PipelineConfig, RunResult
     from elspeth.engine.spans import SpanFactory
+
+logger = logging.getLogger(__name__)
 
 
 def setup_resume_context(
@@ -486,11 +489,18 @@ def _derive_resume_failure_counter_baseline(factory: RecorderFactory, run_id: st
         _terminal_status, counters = derive_resume_terminal_status_from_audit(factory, run_id)
     except OperationalError:
         # Transient DB contention while reading the audit-cumulative baseline:
-        # degrade to resume-local partial counters (the caller treats None as
-        # partial-only). Corruption/invariant signals from the derive
-        # (AuditIntegrityError, OrchestrationInvariantError) must propagate —
-        # substituting partial counters for them would report a
-        # wrong-but-plausible FAILED result over an untrustworthy audit trail.
+        # record the degradation, then degrade to resume-local partial counters
+        # (the caller treats None as partial-only). Corruption/invariant
+        # signals from the derive (AuditIntegrityError,
+        # OrchestrationInvariantError) must propagate — substituting partial
+        # counters for them would report a wrong-but-plausible FAILED result
+        # over an untrustworthy audit trail.
+        logger.warning(
+            "Resume failure-counter baseline read hit transient DB contention for run %r; "
+            "FAILED ceremony counters degrade to resume-local partials",
+            run_id,
+            exc_info=True,
+        )
         return None
     return counters
 

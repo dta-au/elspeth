@@ -21,9 +21,9 @@ def _create_session(client: TestClient) -> str:
 
 
 def _start(client: TestClient, session_id: str, profile: str) -> None:
-    body = {"profile": profile, "operation_id": str(uuid4())}
-    if profile == "live":
-        body["intent"] = "Build the pipeline I describe."
+    # Goal-first (elspeth-378cfa0e18): every profile's start carries a goal,
+    # the tutorial included.
+    body = {"profile": profile, "intent": "Build the pipeline I describe.", "operation_id": str(uuid4())}
     resp = client.post(
         f"/api/sessions/{session_id}/guided/start",
         json=body,

@@ -1543,6 +1543,28 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="tests/unit/web/sessions/test_guided_custody_gate.py",
+        enclosing_symbol="TestWriteBoundaryGate.test_set_active_state_refuses_to_copy_a_legacy_unbindable_active_row",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Seeds a composition_states row that predates the pre-persist guided "
+            "custody gate (elspeth-4c442aaaa8) so set_active_state's refusal to "
+            "re-tip onto it can be pinned; the gate itself blocks the service path."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_routes.py",
+        enclosing_symbol="_insert_legacy_composition_state._sync",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Seeds pre-gate rows carrying deliberately invalid reviewed snapshots so "
+            "the YAML export route's read-side rejection stays pinned now that "
+            "save_composition_state refuses them (elspeth-4c442aaaa8)."
+        ),
+    ),
+    ReviewedWriter(
         path="tests/unit/web/sessions/test_service.py",
         enclosing_symbol="TestRunEvents.test_append_and_list_run_events_preserves_order_and_payload",
         table="composition_states",
@@ -1868,7 +1890,14 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # (a new direct insert added in either file) shows up as a violation.
 
 _BLOBS_ALLOWLIST_PATH = "tests/unit/web/blobs/test_service.py"
-_BLOBS_EXPECTED_LINES = (318, 377, 441, 520, 590, 656, 733, 795, 1366, 1521, 1976, 2344)
+# Re-pinned by the multi-replica merge (elspeth-4d6c0dd0f5). Mainline's fix
+# for elspeth-3db5745ba7 replaced FOUR of the platform's twelve direct
+# ``composition_states_table.insert()`` fixtures with ``_seed_active_run``,
+# which routes through the real writer ``save_composition_state``. The
+# inventory legitimately SHRINKS: fewer direct writers is the point of that
+# fix, and the four that went are exactly the ones that seeded a populated
+# bare ``source`` column no production writer has emitted since f0fd36087.
+_BLOBS_EXPECTED_LINES = (829, 888, 952, 1170, 4616, 4771, 5511, 5879)
 _COMPOSER_TOOLS_ALLOWLIST_PATH = "tests/unit/web/composer/test_tools.py"
 _COMPOSER_TOOLS_EXPECTED_LINES = (3125, 3188, 7581, 7634, 7875)
 

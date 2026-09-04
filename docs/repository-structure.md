@@ -63,7 +63,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | The runnable logic for a CI check | `scripts/cicd/` |
 | A GitHub Actions workflow | `.github/workflows/` |
 | A general dev/repo automation script | `scripts/` (or the matching `scripts/<area>/`) |
-| A build that renders a distributable PDF/artifact | `tools/<artifact>/` (the release assurance PDF set lives in `docs/release/pdf/`) |
+| A build that renders a distributable PDF/artifact | `tools/<artifact>/` |
 | A new example pipeline | `examples/<scenario>/` |
 | A design/plan/spec doc | `docs/` while active → remove from tracked active docs once implemented; maintainers may preserve it in ignored `docs-archive/` |
 | An evaluation scenario or harness change | `evals/` |
@@ -95,13 +95,10 @@ either has a stated boundary (✓) or a flagged problem (⚠, see
 that produce *distributable artifacts*. A helper that emits a deliverable PDF is a
 tool; a helper that lints, tests, deploys, or generates fixtures is a script.
 
-### PDF pipelines: tools/pdf/ vs docs/release/pdf/
+### PDF pipeline
 
-✓ Distinct by *output*: `docs/release/pdf/` builds the **release assurance set**
-(executive-summary, architecture, composer, guarantees, data-trust); `tools/pdf/`
-builds the **architecture presentation pack** (`build-arch-pack.sh`). The stale
-2026-05-03 composer briefing/walkthrough builders were archived 2026-06-28, so the
-two pipelines no longer overlap.
+✓ `tools/pdf/` builds the **architecture presentation pack**
+(`build-arch-pack.sh`). Distributable artifact builders belong under `tools/`.
 
 ### Deployment spread
 

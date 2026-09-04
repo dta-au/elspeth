@@ -22,6 +22,23 @@
 
 import type { CompositionState } from "./index";
 
+// ── Wire constants ──────────────────────────────────────────────────────────
+
+/**
+ * Provenance sentinel prefix for backend-auto-surfaced review events.
+ *
+ * Mirrors `BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX` in
+ * src/elspeth/web/interpretation_state.py. A `tool_call_id` carrying this
+ * prefix records that NO LLM tool call produced the event — it is a server
+ * obligation (auto-staged prompt-template/model-choice reviews, settlement
+ * and repair surfacing) — so it can never match a provider tool call in the
+ * transcript and must never be treated as one. Consumers that split server
+ * obligations from LLM-authored surfacing key off this prefix (the ratified
+ * rule from elspeth-558fa5a321) until provenance gets its own wire field
+ * (elspeth-1934652f57).
+ */
+export const BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX = "backend_auto_surface:";
+
 // ── Enums (closed lists) ────────────────────────────────────────────────────
 
 /**
@@ -38,13 +55,17 @@ import type { CompositionState } from "./index";
  *  - opted_out            — user clicked "stop asking" for this session.
  *  - abandoned            — session ended without resolution (page close,
  *                           timeout).  Phase 11 orphan-cleanup writes this.
+ *  - superseded           — a later composition-state commit extinguished
+ *                           the reviewed site; the state-commit sweep
+ *                           retired the card (never a user action).
  */
 export type InterpretationChoice =
   | "pending"
   | "accepted_as_drafted"
   | "amended"
   | "opted_out"
-  | "abandoned";
+  | "abandoned"
+  | "superseded";
 
 /**
  * Structural source of an interpretation event row.
@@ -99,16 +120,28 @@ export function isInterpretationKind(value: unknown): value is InterpretationKin
 /**
  * Wire mirror of `InterpretationEventResponse` (schemas.py).
  *
- * Every field's nullability matches the backend exactly.  The three
- * structural row shapes are distinguished by `interpretation_source`:
+ * Every field's nullability matches the backend exactly.  The structural
+ * row shapes are distinguished by `interpretation_source` — and, for
+ * opt-out, by which of two CHECK-permitted shapes the row takes
+ * (ck_interpretation_events_opt_out_shape, F-1/F-12):
  *
  *  - user_approved
  *      composition_state_id, affected_node_id, tool_call_id, user_term,
  *      llm_draft are all string.  accepted_value is null until resolved.
- *  - auto_interpreted_opt_out
+ *  - auto_interpreted_opt_out, session-marker shape
+ *      The row written when the operator clicks "stop asking":
  *      composition_state_id, affected_node_id, tool_call_id, user_term,
  *      llm_draft are all null.  No LLM was consulted; provenance fields
  *      are also null.
+ *  - auto_interpreted_opt_out, surface-specific shape
+ *      Written when the composer LLM calls request_interpretation_review
+ *      on an opted-out session: born resolved with choice='opted_out' and
+ *      REQUIRED non-null surface fields (composition_state_id,
+ *      affected_node_id, tool_call_id, user_term, llm_draft,
+ *      accepted_value) plus full LLM provenance — the audit trail records
+ *      exactly what was baked without review.  A populated user_term on
+ *      this shape marks a DECLINED review, not an approval
+ *      (elspeth-3a8a843c47).
  *  - auto_interpreted_no_surfaces
  *      Surface fields (composition_state_id, affected_node_id, tool_call_id,
  *      user_term, llm_draft) are all null.  LLM provenance
@@ -116,16 +149,22 @@ export function isInterpretationKind(value: unknown): value is InterpretationKin
  *      IS populated — the LLM produced the auto-bake; provenance is
  *      required for audit purposes.
  *
- * Discriminating on `interpretation_source` at the rendering boundary is
- * the right move; this widened shape preserves the wire contract so
- * narrowing works inside the component switch.
+ * Discriminating at the rendering boundary is the right move — and the
+ * discriminator for "did the operator approve this?" is `choice`
+ * (accepted_as_drafted | amended), owned by
+ * `selectApprovedInterpretations` in interpretationEventsStore.  Field
+ * presence is never a classification signal: both a user_approved row and
+ * a surface-specific opt-out row carry a user_term.  This widened shape
+ * preserves the wire contract so narrowing works inside the component
+ * switch.
  */
 export interface InterpretationEvent {
   id: string;
   session_id: string;
-  // Null for auto_interpreted_opt_out and auto_interpreted_no_surfaces rows.
+  // Null for session-marker opt-out and no-surfaces rows; non-null for
+  // user_approved AND surface-specific opt-out rows (see shape doc above).
   composition_state_id: string | null;
-  // Null for opt-out / no-surfaces rows.
+  // Same nullability split as composition_state_id.
   affected_node_id: string | null;
   tool_call_id: string | null;
   user_term: string | null;
@@ -133,7 +172,8 @@ export interface InterpretationEvent {
   // specific surfaced assumption.
   kind: InterpretationKind | null;
   llm_draft: string | null;
-  // Null until the row is resolved; also null for opt-out rows.
+  // Null until the row is resolved and for session-marker/no-surfaces
+  // rows; non-null on surface-specific opt-out rows (= the baked draft).
   accepted_value: string | null;
   choice: InterpretationChoice;
   created_at: string;
@@ -143,8 +183,9 @@ export interface InterpretationEvent {
   actor: string;
   interpretation_source: InterpretationSource;
   // ── LLM provenance bound to the draft author ─────────────────────────────
-  // Null for auto_interpreted_opt_out rows (no LLM was consulted).
-  // Required for user_approved and auto_interpreted_no_surfaces rows.
+  // Null for session-marker opt-out rows (no LLM was consulted).
+  // Required for user_approved, auto_interpreted_no_surfaces, and
+  // surface-specific opt-out rows.
   model_identifier: string | null;
   model_version: string | null;
   provider: string | null;

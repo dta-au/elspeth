@@ -1,8 +1,18 @@
-import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
+import {
+  pluginDisplayName,
+  titleCaseLabel,
+} from "@/components/catalog/pluginDisplayName";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { OptionRows } from "@/components/inspector/OptionRows";
+import { DISCARD_CONNECTION } from "@/lib/graphTopology";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
+import {
+  buildConnectionIndex,
+  routingPhrase,
+  type ConnectionIndex,
+} from "./specRouting";
 
 interface SpecRow {
   id: string;
@@ -17,6 +27,8 @@ interface SpecRow {
 interface SpecSectionProps {
   name: "Sources" | "Nodes" | "Outputs";
   rows: SpecRow[];
+  state: CompositionState;
+  index: ConnectionIndex;
 }
 
 function displayValue(value: unknown): string {
@@ -45,30 +57,87 @@ const ROUTING_LABELS: Record<string, string> = {
 };
 
 function routingLabel(field: string): string {
-  return ROUTING_LABELS[field] ?? field;
+  // A field absent from the map is still an author-visible <dt>; title-case
+  // it rather than printing bare snake_case. ROUTING_LABELS is believed
+  // exhaustive over the fields *Rows() projects today, so this is a guard
+  // against a future field being added to a builder and not to the map —
+  // exactly the drift the Wave 1 live check found on the <dd> side.
+  return ROUTING_LABELS[field] ?? titleCaseLabel(field);
 }
 
-function routingValue(field: string, value: unknown): string {
-  if (value === "discard") return "dropped (recorded in the audit trail)";
-  if (Array.isArray(value)) return value.map(String).join(", ");
-  // A coalesce/row_union's `branches` map and a gate's `routes` map are both
-  // alias→target objects; render both as prose, never as a JSON string
-  // outside <code>/<details> (elspeth-b9ebdf9011 live-check fix: `branches`
-  // was missing here, so a coalesce's fan-in map rendered as a raw
-  // `{"branch_a":"target_a",...}` string in a plain <dd>). `branches` can
-  // also arrive as a bare string[] (fan-in with no aliasing) — that shape is
-  // already handled by the Array.isArray branch above.
-  if ((field === "routes" || field === "branches") && typeof value === "object" && value !== null) {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (field === "routes" && entries.every(([, target]) => target === "fork")) {
-      return "every row continues to all branches";
-    }
-    return entries.map(([when, target]) => `${when} → ${String(target)}`).join("; ");
+/** Fields whose value is an author-chosen NAME (not a connection, not an
+ *  enum): rendered title-cased with the raw in `title`, same rule as ids. */
+const AUTHOR_NAME_FIELDS: ReadonlySet<string> = new Set(["scope_name"]);
+
+/**
+ * The raw wire token beside the phrase, rendered ONLY with the Advanced
+ * detail level on (elspeth-f49e1611ab). Until this existed the raw form of a
+ * card heading or a routing value lived in `title` alone at BOTH detail
+ * levels — a mouse-only recovery, and no recovery at all on touch, so the
+ * Advanced toggle did not in fact reveal the identifiers this wave hides.
+ * `title` stays where it is: it is the sighted-mouse convenience beside this
+ * <code>, never instead of it.
+ *
+ * <code> is the identifier register the pin already exempts
+ * (test/defaultDomPins.ts IDENTIFIER_SURFACES), the same register
+ * UnavailableComponentRow and DiagnosticValue use — so a raw token here can
+ * never be mistaken for prose, and the default-level pins are untouched
+ * because at the default level nothing is rendered at all.
+ */
+function IdentifierSecondary({ raw }: { raw: string }): JSX.Element | null {
+  const showAdvanced = useShowAdvanced();
+  if (!showAdvanced) return null;
+  return (
+    <>
+      {" "}
+      <code>{raw}</code>
+    </>
+  );
+}
+
+/**
+ * One routing <dd>. The reader-register phrase comes from specRouting, which
+ * resolves a connection name to the component on the other end (and carries
+ * the elspeth-b9ebdf9011 branches-as-prose fix: a `branches`/`routes` map
+ * renders as prose, never as a raw JSON string in a plain <dd>). A null
+ * phrase means the value is not a connection or an enum, and the rules below
+ * apply.
+ */
+function RoutingDd({
+  state,
+  index,
+  field,
+  value,
+}: {
+  state: CompositionState;
+  index: ConnectionIndex;
+  field: string;
+  value: unknown;
+}): JSX.Element {
+  if (value === DISCARD_CONNECTION) return <dd>dropped (recorded in the audit trail)</dd>;
+  const phrase = routingPhrase(state, index, field, value);
+  if (phrase !== null) {
+    // The identifier register: `text` IS the raw wire value, because nobody
+    // has phrased it (specRouting's open scope_policy map). It renders as
+    // code — the DiagnosticValue treatment — so it cannot read as a phrase
+    // the product chose, and it needs no Advanced secondary or `title`
+    // because the raw form is already what is on screen.
+    if (phrase.register === "identifier") return <dd><code>{phrase.text}</code></dd>;
+    return (
+      <dd title={phrase.raw}>
+        {phrase.text}
+        <IdentifierSecondary raw={phrase.raw} />
+      </dd>
+    );
   }
-  return displayValue(value);
+  if (AUTHOR_NAME_FIELDS.has(field) && typeof value === "string") {
+    return <dd title={value}>{titleCaseLabel(value)}</dd>;
+  }
+  if (Array.isArray(value)) return <dd>{value.map(String).join(", ")}</dd>;
+  return <dd>{displayValue(value)}</dd>;
 }
 
-function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
+function SpecSection({ name, rows, state, index }: SpecSectionProps): JSX.Element {
   const singular = name.slice(0, -1);
   const headingId = `pipeline-spec-${name.toLowerCase()}-heading`;
   return (
@@ -92,7 +161,10 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 className="pipeline-spec-card"
                 aria-label={`${singular} ${row.id}`}
               >
-                <h4>{row.id}</h4>
+                <h4 title={row.id}>
+                  {titleCaseLabel(row.id)}
+                  <IdentifierSecondary raw={row.id} />
+                </h4>
                 {row.description !== null && row.description.trim() !== "" && (
                   <p className="pipeline-spec-step-description">
                     {row.description}
@@ -101,7 +173,7 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                 <dl>
                   <div>
                     <dt>Kind</dt>
-                    <dd>{row.kind}</dd>
+                    <dd title={row.kind}>{titleCaseLabel(row.kind)}</dd>
                   </div>
                   {row.plugin !== null && (
                     <div>
@@ -115,7 +187,7 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                   {routingEntries.map(([field, value]) => (
                     <div key={field}>
                       <dt>{routingLabel(field)}</dt>
-                      <dd>{routingValue(field, value)}</dd>
+                      <RoutingDd state={state} index={index} field={field} value={value} />
                     </div>
                   ))}
                 </dl>
@@ -196,7 +268,10 @@ function nodeRows(state: CompositionState): SpecRow[] {
       output_mode: node.output_mode ?? null,
       timeout_seconds: node.timeout_seconds ?? null,
       on_success: node.on_success,
-      on_error: node.on_error,
+      // A legacy/malformed universal NodeSpec can carry collector on_error,
+      // but collectors reject the field and runtime group failure is
+      // structural. Do not present a route that cannot execute.
+      on_error: node.node_type === "collector" ? null : node.on_error,
       routes: node.routes ?? null,
       fork_to: node.fork_to ?? null,
     },
@@ -226,6 +301,9 @@ export function PipelineSpecView(): JSX.Element {
     return <p className="empty-state">No pipeline specification yet.</p>;
   }
 
+  // One index for the whole view: every routing <dd> resolves its connection
+  // through it, in the direction its field means.
+  const index = buildConnectionIndex(compositionState);
   const name = compositionState.metadata.name ?? "Untitled pipeline";
   const description =
     compositionState.metadata.description ?? "No description provided.";
@@ -236,9 +314,24 @@ export function PipelineSpecView(): JSX.Element {
         <p>{description}</p>
         <PipelineGloss compositionState={compositionState} />
       </header>
-      <SpecSection name="Sources" rows={sourceRows(compositionState)} />
-      <SpecSection name="Nodes" rows={nodeRows(compositionState)} />
-      <SpecSection name="Outputs" rows={outputRows(compositionState)} />
+      <SpecSection
+        name="Sources"
+        rows={sourceRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
+      <SpecSection
+        name="Nodes"
+        rows={nodeRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
+      <SpecSection
+        name="Outputs"
+        rows={outputRows(compositionState)}
+        state={compositionState}
+        index={index}
+      />
     </div>
   );
 }

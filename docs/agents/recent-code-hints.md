@@ -8,6 +8,37 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-02 — `git stash` was never blocked: `pre-stash` is not a git hook, and the "blocked by a hook" rule was false for six months**
+  `AGENTS.md` and `CONTRIBUTING.md` both stated `git stash` was blocked by a hook. It was not, and never had been.
+  `.git/hooks/pre-stash` (created 2026-03-06) was broken three independent ways: (1) **git has no `pre-stash` hook** —
+  `githooks(5)` on git 2.43.0 lists no such name, so git never invoked the file at all; (2) it was not executable
+  (`-rw-rw-r--`, the only hook in the directory without an `x` bit, on both the old and new host — so this was not a
+  migration artefact); and (3) its shebang was the literal `#\!/bin/sh`, the fingerprint of authoring inside a
+  double-quoted heredoc where `\!` escaped history expansion. Evidence it was inert: `git fsck --connectivity-only`
+  found 1,076 dangling commits, **650 of them stash-shaped** (`WIP on <branch>: …`, two parents), spanning
+  2026-02 to 2026-09. Do not mistake these for pre-commit's autostash — that path is separately and deliberately
+  disabled by the `.git/hooks/pre-commit` dispatcher, which passes `--files <staged>` to keep `stash=False` and feeds a
+  sentinel path (a child of `.git/index`, which cannot exist) when nothing is staged, because `--files` with zero values
+  re-enables the stash path. The dead hook was removed and both documents now state the plain convention: do not use
+  `git stash`; use a worktree or a commit. Enforcing it would require a `reference-transaction` hook rejecting
+  `refs/stash`; that is deliberately **not** installed, because it fires on every ref update in a repo with five
+  worktrees and concurrent agent sessions.
+  See [CONTRIBUTING: Convention: repository and process hygiene](../../CONTRIBUTING.md#convention-repository-and-process-hygiene).
+
+- **2026-09-01 — secret wiring is deny-by-default at three seams, and collectors use the transform policy vocabulary** (elspeth-f3c1aafd25; 9da1b39b8, c163b6366)
+  `WebSettings.secret_wiring_allowlist` authorizes only an exact
+  `(secret, component_type, plugin, option_key)` match; an empty policy denies every wiring. The policy vocabulary is
+  `source|transform|sink`: aggregation and collector nodes both match `transform`, consistently with secret-reference
+  placement and authored-state admission. Enforce this contract (1) in `wire_secret_ref`, before writing a marker; (2)
+  in `validate_secret_evidence`, over `policy.authored_state`, so authenticated executable web paths—with their required
+  secret-service and user context—admit markers from imports and every other entry path; and (3) in `/execute`, where
+  `secret_guard` returns a 428 challenge bound to the exact authored composition state before the fanout guard or run
+  creation. The validator explicitly reports a skipped check when that context is unavailable; do not describe that mode
+  as admission. Only the authenticated execute request may return the challenge token: an LLM or composer-tool argument
+  is never approval. Keep the admission and execute walks on authored state because server-side operator-profile lowering
+  may inject credentials after admission by design.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-30 — `.agents/skills/` is the ONE canonical skills tree; every `.claude/skills/<name>` is a committed relative symlink (`git ls-files -s` mode 120000) into it, and the design pack lives at top-level `design/`** (elspeth-1e9d011295)
   Add or edit a skill under `.agents/skills/` only; a real directory under `.claude/skills/` is a regression. Pin paths in
   tests, scripts and `per-file-ignores` at `.agents/skills/...` and `design/...`. Git never sees a path *through* a
@@ -1434,6 +1465,35 @@ the same commit; the rules live there, the history lives here.
   vocabulary and stays untouched).
   See [CONTRIBUTING: Convention: audit and lineage recording](../../CONTRIBUTING.md#convention-audit-and-lineage-recording).
 
+- **2026-08-27 — secret WIRING is deny-by-default behind a server-authored
+  destination allowlist, with a THIRD execute-time 428 ack** (elspeth-f3c1aafd25).
+  The authority is `web/secrets/wiring_policy.py::secret_wiring_authorization_error`
+  (exact `(secret, component_type, plugin, option_key)` match;
+  `component_type` vocab is `source|transform|sink` — same as
+  `_secret_ref_placement_error`, aggregation nodes are `transform`); the
+  operator surface is `WebSettings.secret_wiring_allowlist` (default `()` =
+  deny everything). Enforced at THREE derived seams: (a) `wire_secret_ref`
+  (all three arms, before the marker write; `ToolContext.secret_wiring_policy`,
+  `None` = deny — a test whose wiring must SUCCEED, or that tests a LATER gate
+  like placement/endpoint policy, must pass an authorizing policy or it now
+  fails at authorization first); (b) `validate_secret_evidence` emits
+  `unauthorized_secret_ref` under the `secret_refs` blocker for markers from
+  ANY entry path — but the authorization walk runs over
+  `policy.authored_state`, NOT the lowered state: operator-profile lowering
+  injects credential markers server-side and those are exempt by design — do
+  not "fix" it to walk `policy.state`; (c) `/execute` raises
+  `ExecutionSecretApprovalRequired` → 428
+  `execution_secret_approval_required` + `secret_guard` payload
+  (`web/execution/secret_guard.py`, mirrors the fanout guard; evaluated over
+  the authored `composition_state` for the same exemption; fires BEFORE the
+  fanout guard, so a wired-secret + fanout test must acquire the secret ack
+  first and send BOTH tokens on the final execute). The composer repair loop
+  has a dedicated non-retryable notice for `unauthorized_secret_ref` — the
+  planner cannot repair operator policy; do not add advice telling it to
+  retry wiring. `_WebSettingsStub`-style settings fakes need
+  `secret_wiring_allowlist: tuple = ()` or service construction breaks.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-08-27 — server-owned option metadata is a THREE-surface parity set: planner projection, echo-tolerant write gates, and disclosure provenance** (elspeth-c67fbbbd83, elspeth-4496f61e30)
   The keys are `source_authoring`, `interpretation_requirements`, `prompt_template_parts`,
   `resolved_prompt_template_hash` — always derived from `AUTHORING_METADATA_OPTION_KEYS` /
@@ -1670,9 +1730,10 @@ the same commit; the rules live there, the history lives here.
   The R2-F15 pair (one resolve + one retain) is generalized to a GROUP at both solver sites (`chat_solver.py` step-1/step-2). `GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY` (8) caps one reply's retain calls (breach = shape error into the existing clarification-retention net); the durable bound stays `GUIDED_MAX_DEFERRED_INTENTS` (256) at settlement.
   1. The renames are TOTAL, no compat shims: `GuidedChat*Outcome.action`->`actions`, `Step{1,2}*Resolved*.deferred_action`->`deferred_actions`, `DeferredRequestRetained.retained_intent_id`->`retained_intent_ids`, `DeferredRequestAuthority.new_intent_id`->`new_intent_ids`, `GuidedStateOperationCommand.retained_deferred_intent_id`->`retained_deferred_intent_ids: tuple[UUID, ...] = ()` (absent = EMPTY TUPLE, never None). Constructing any of them with the singular name is a TypeError.
   2. `manage_deferred_intent` stays SINGULAR by design; a multi-call reply containing it is still a shape rejection. Do not fold it into the group.
-  3. `apply_deferred_request` FOLDS N actions against the EVOLVING guided state (`_apply_one_deferred_action`), so action 2 can legitimately contradict action 1 retained in the same Send; the composed chat takes the FIRST non-success disposition's status/error_class.
+  3. `apply_deferred_request` FOLDS N actions against the EVOLVING guided state (`_apply_one_deferred_action`), so action 2 can legitimately contradict action 1 retained in the same Send; the composed chat takes the FIRST non-success disposition's status/error_class. The route authority must mint EXACTLY one distinct id per action — neither a shortage nor a surplus is valid custody.
   4. Settlement custody (`service.py::_verify_guided_deferred_intent_append`) verifies K ordered appends whose ids match the claimed tuple EXACTLY; a set/count comparison is a mutation the wrong-order test kills.
-  5. The repair thread answers EVERY call id with per-call errors (`rejected_calls=`/`errors=` aligned tuples). Step-3/wire chats never offer `retain_deferred_intent`, so there is deliberately no third solver site to sweep.
+  5. The repair thread answers EVERY call id with per-call errors (`rejected_calls=`/`errors=` aligned tuples), but protocol completeness is not action custody. The solver carries one explicit closed state: `IDLE`; `RETAIN_OPEN(slots, first_error, held_resolution)`; or `RESOLUTION_OPEN(actions)`. Parsed-valid siblings live in ordered repair slots across the retry, and an admitted current-stage resolution sibling is held in an owned carrier. A targeted retry is ONLY the one corrected retain when exactly one slot was rejected. With two or more rejected slots the model must replay the complete original group; that replay preserves every known retain slot at its original index and byte-exactly matches the held resolution function name/arguments (or its absence). Settlement always uses the owned held resolution, never the retry's provider object, then atomically moves to `RESOLUTION_OPEN` and drops the slots, first error, and held call. A reply with no valid retain cohort does NOT replace `RETAIN_OPEN`: re-raise the owned first shape error so the caller durably retains the whole original Send for clarification. Never equality-deduplicate actions — two identical calls still mean two actions.
+  6. `RESOLUTION_OPEN` is immutable custody, not a convenience tuple. Only a valid corrected current-stage resolution by itself, or a full replay whose ordered actions match exactly (including duplicate count), may resolve. Prose, empty replies, retain-only replies, management, reselection, hallucinated calls, malformed or mismatched replays, and reply/discovery cap exits return the exact actions in a withheld-resolution outcome. Step-2 may execute allowed read-only discovery while the state stays open; iteration exhaustion withholds the same tuple. Step-3/wire chats never offer `retain_deferred_intent`, so there is deliberately no third solver site to sweep.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-08-26 — §7 rule 5's fork closer kinds are NOT interchangeable: a ROW_UNION-bound fork inside any bound region is a build-time rejection** (elspeth-9db785ace7)
@@ -1686,7 +1747,7 @@ the same commit; the rules live there, the history lives here.
   The guided projection now carries a closed collector behavior arm. Conventions from the parity sweep:
   1. The retired code is gone from `generation.py`'s `_CLOSED_VALIDATION_ERROR_CODES` AND from `_VALIDATION_ERROR_PATTERNS` (disjoint paths; retiring one leaves the planner served advice for a rejection that can no longer fire). Do not reintroduce the code or a binder-level collector refusal; collector defects are ordinary Stage-1 validation errors now.
   2. The proposal projection's collector behavior is `{"kind": "collector", "opener_stable_id": <the OPENER's projection stable id>, "policy": "require_all"|"best_effort"}`. `scope_name` is DELIBERATELY private. The opener is resolved to a stable id at `_build_projection`'s dispatch, and `_node_behavior` raises typed on an unresolvable opener.
-  3. A collector's `on_error` is OPTIONAL on the wire (`validate_payload` accepts one `node_success` plus AT MOST one `node_error`) because group-failure handling is structural (ADR-042 §6). Do not "fix" it to the transform/aggregation exact-two-flows rule, and do not extend the on_error->"discard" default at `_canonical_state_from_private_pipeline` or the freeform builder to collectors: an omitted collector on_error must STAY None.
+  3. **Amended 2026-09-01 (elspeth-239a31daeb):** a collector's `on_error` is INEXPRESSIBLE, not optional. `validate_payload` accepts exactly one `node_success` and no `node_error`; the correction schema and frontend decoder mirror that shape. `CollectorSettings` rejects authored YAML carrying the field, and Composer Stage 1 rejects a non-null legacy/generic `NodeSpec.on_error` before edge lowering. Group failure is a structural whole-group verdict (ADR-042 §7), so never draw or synthesize a collector error edge. The generic composition-state wire still carries `on_error: null` for its closed universal node shape; that null is not an authoring capability.
   4. Frontend: `ProposalNodeBehavior` in `types/guided.ts` gained the collector arm; the two behavior renderers (`behaviorSummary` in `ProposePipelineTurn.tsx`, `behaviorDetails` in `WireStageTurn.tsx`) are compile-forced switches, so extending the union without both arms fails `tsc`. The decoder (`guidedDecoder.ts`) mirrors `validate_payload` including the collector flow/opener reconciliation.
   5. `scope_on_group_failure` decode/type residuals are deleted from `guidedDecoder.ts` and `types/index.ts`; the wire never carries the field again, and old persisted states never carried it either (it serialised omitted-when-None).
   6. A new planner-authorable REFERENCE field must join the guided binder's dangling-reference coverage. The binder's `_collect_dangling` walk (behind `guided_route_target_unknown`) covers on_success/on_error/to_node and does NOT discover new reference fields by itself, so `scope_opener` shipped uncovered. The fix is a sibling referential check (`guided_collector_opener_unresolved`) with connectivity facts; the projection raise stays as the fail-closed last resort. Two sub-traps: the closed catalogue is CONTAINMENT-FREE (no code may be a substring of another — `guided_scope_opener_unknown` was rejected by `test_codes_are_containment_free` because Stage-1's `scope_opener_unknown` exists), and binder existence vs Stage-1 kind semantics stay split (the binder checks the id RESOLVES; validation's `scope_opener_unknown` owns opener-must-be-a-transform), both repairable in the planner loop (`build_set_pipeline_candidate` -> `acceptable` gate -> `_PipelineCandidateRejected`).
@@ -1958,13 +2019,13 @@ the same commit; the rules live there, the history lives here.
   Adding any builtin plugin fires a fixed set of whole-tree exact pins. For a new TRANSFORM the full list (all hit while landing `aws_textract_inline_analysis`, d181ee569):
   1. `tests/unit/plugins/test_discovery.py` `EXPECTED_TRANSFORM_COUNT`.
   2. `tests/unit/plugins/test_catalog_reference_content.py` — total reference count, per-kind `Counter`, `EXPECTED_BUILTIN_IDENTITIES`, and (for a non-profiled plugin) the `DIRECT_CONFIG_REFERENCES` count.
-  3. `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an EXTERNAL_CALL/NON_DETERMINISTIC transform must appear in `EXPECTED_EXTERNAL_TAGS` (exact tuple), `_REQUIRED_GUIDANCE` (casefolded substrings of the usage strings), and, when it surfaces externally-controlled text, `_REMOTE_CONTENT_PRODUCERS` ("untrusted before llm" must appear in its guidance).
+  3. `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an EXTERNAL_CALL/NON_DETERMINISTIC transform must appear in `EXPECTED_EXTERNAL_TAGS` (exact tuple) and `_REQUIRED_GUIDANCE` (casefolded substrings of the usage strings). When it surfaces externally-controlled text, declare `content_trust = ContentTrust.UNTRUSTED`; the guidance test derives its producer set from that declaration ("untrusted before llm" must appear in its guidance).
   4. `tests/unit/plugins/test_validation_path_agreement.py` — any config with a `@model_validator` needs a rejection case in `_TRANSFORM_REJECTION_CASES`.
   5. `tests/unit/web/catalog/test_service.py` serialized-summary total and the knob-schema golden `tests/golden/web/catalog/knob_schema/<kind>__<name>.json` (generate via `CatalogServiceImpl._schema_cache`).
   6. `config/cicd/contracts-whitelist.yaml` for `__init__:config` / `probe_config:return` `dict[str, Any]` params (pre-commit Check Contracts).
   7. `capability_tags` gate: a tuple of 2-6 lowercase kebab tags; a 7th tag fails.
   8. `PluginAssistance` text is scanned for credential-shaped patterns — "…token: SDK…" trips `token\s*:`, so phrase around it.
-  9. An untrusted-content producer also joins `_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS` (`src/elspeth/web/interpretation_state.py`); that set is FAIL-OPEN, so an unlisted producer silently reads as trusted.
+  9. An untrusted-content producer declares `content_trust = ContentTrust.UNTRUSTED`; Composer prompt-shield admission derives the closed producer vocabulary from registered transform declarations.
   10. Pin `source_file_hash` LAST (ruff/format edits restale it) via `scripts/cicd/plugin_hash.py`.
   Sites missed on a first pass landing `pdf_rasterize` (2026-08-25), to be added to the checklist: `tests/unit/web/catalog/test_service.py:60`, where the serialized-summary total is a bare `sum(...) == N` int literal next to the per-kind counts; `tests/unit/architecture/test_state_engine_catalog_contract.py:35` `V2_CATALOG_SHA256`, a whole-catalog proof hash to rotate LAST, only after every other v2/v3 catalog pin for the new plugin has landed (`:174-175` is what it pins against), since rotating early means rotating twice; `tests/invariants/test_input_schema_config_is_captured.py:80-87` `_EXPECTED_MUTATION_REJECTIONS` and `tests/invariants/test_transform_input_contract_is_satisfiable.py:85-92` `_EXPECTED_ARMING_REJECTIONS`, two separate allowlists both subset-asserted against the live registry, where an unlisted rejection HARD-FAILS, so a new plugin whose config rejects the synthetic mutation/arming probe must be added to BOTH; `config/cicd/contracts-whitelist.yaml` entries in both the `probe_config:return` block (`:173-177`) AND the constructor block (`:216-222`), the constructor entry's trailing segment matching the ACTUAL `__init__` parameter name (e.g. `options`, not the generic `config`); and the Python-to-TS acronym mirror, which has NO parity test — `web/composer/guided/_display.py` `_ACRONYMS` and `web/frontend/src/components/catalog/pluginDisplayName.ts` `ACRONYMS` must each be hand-edited, since a missing entry (e.g. `"pdf"`) humanises the name wrong ("Pdf Rasterize") with no test catching it.
   Sources have the same shape (see 0ec120e2d for the blob_rows list: source count/names, registry, catalog, golden, contracts whitelist). Sites missed again landing `blob_json_expand` + `blob_text_expand` (2026-08-26, b288157c3), in neither list above: `scripts/state_engine_plugin_matrix.py` `EXPECTED_COUNTS` and `EXPECTED_VARIANT_COUNT`, plus `tests/golden/state_engine/plugin_lifecycle_matrix.json` and the PB-09 cases in `docs/architecture/state_engine/proof-catalog/v3/catalog.json`; `src/elspeth/web/audit_readiness/boundary_expectations.py` `EXPECTED_TRANSFORM_DETERMINISMS`, where touching the file fires a pre-commit cohort gate demanding the trailer `telemetry-backfill: audit-readiness` in the commit message; and `tests/unit/plugins/test_state_engine_plugin_matrix.py` default-variant subjects.

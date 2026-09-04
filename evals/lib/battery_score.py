@@ -280,17 +280,64 @@ def _patch_target(call: ToolCall) -> str:
     return str(a.get("node_id") or a.get("sink_name") or a.get("output_name") or "source")
 
 
+def _approval_required(content: Mapping[str, Any]) -> bool:
+    """Whether a tool row is a proposal parked under approval custody.
+
+    The discriminator is ``data.status == "APPROVAL_REQUIRED"`` on the
+    ToolResult envelope (``tool_batch`` proposal payload); the envelope's own
+    ``success`` is the only success flag — the payload carried a duplicate
+    ``success`` until elspeth-e405ad7cd2 (F1), and this classifier read
+    ``status`` at the top level, a shape no envelope ever had. Persisted
+    tool rows redact a mutation's ``data`` wholesale, so on today's captures
+    this fires only where the capture keeps the wire payload
+    (elspeth-6aa477c78e).
+    """
+    data = content.get("data")
+    return isinstance(data, Mapping) and data.get("status") == "APPROVAL_REQUIRED"
+
+
 def _codes_from(content: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """Codes a deviation can cite, read from whatever shape the row actually has.
+
+    PERSISTED ROWS ARE THE REDACTED PROJECTION, not the wire envelope. A stored
+    tool row carries ``success`` / ``validation`` / ``version`` (plus
+    ``_unknown_response`` when a producer shipped a key the manifest never
+    learned), and ``data`` is a placeholder: ``redaction.py`` builds
+    ``_TOOL_RESULT_OPTIONAL_RESPONSE_KEYS`` by dropping ``"data"``, so nothing
+    under it survives to be read here.
+
+    What DOES survive is ``validation``, structurally — its shadow model keeps
+    ``error_code`` as "the closed machine-readable discriminant"
+    (``_ValidationEntryShadowModel``). So ``validation.errors[].error_code`` is
+    the carrier that exists on a real capture, and it is read first.
+
+    The top-level reads below are kept for wire-shaped and synthetic inputs.
+    They find nothing on a persisted row: no envelope has ever carried
+    ``error_class`` / ``code`` / ``status`` or a top-level ``errors`` list at
+    the top level (elspeth-6aa477c78e).
+    """
     if not content:
         return ()
     codes: list[str] = []
+    validation = content.get("validation")
+    if isinstance(validation, Mapping):
+        for entry in validation.get("errors") or []:
+            if isinstance(entry, Mapping):
+                code = entry.get("error_code")
+                if isinstance(code, str) and code:
+                    codes.append(code)
     for key in ("error_class", "code", "status"):
         v = content.get(key)
         if isinstance(v, str) and v:
             codes.append(v)
     for entry in content.get("errors") or []:
-        if isinstance(entry, Mapping) and isinstance(entry.get("code"), str):
-            codes.append(entry["code"])
+        if isinstance(entry, Mapping):
+            # ``error_code`` is the envelope's spelling; ``code`` is what the
+            # synthetic fixtures use. Accept both rather than silently reading
+            # neither.
+            code = entry.get("error_code") or entry.get("code")
+            if isinstance(code, str) and code:
+                codes.append(code)
     return tuple(dict.fromkeys(codes))
 
 
@@ -437,7 +484,7 @@ def score_path(capture: Capture) -> PathScore:  # one linear pass, sectioned bel
         if ev.outcome in _NOT_APPLIED:
             pending_failed = ev
             continue
-        if isinstance(ev.content, Mapping) and ev.content.get("success") is True and ev.content.get("status") == "APPROVAL_REQUIRED":
+        if isinstance(ev.content, Mapping) and ev.content.get("success") is True and _approval_required(ev.content):
             deviations.append(
                 Deviation("approval_pending", (ev.turn_seq, ev.row_seq), name, digest, ("APPROVAL_REQUIRED",), ev.audit_ordinal)
             )

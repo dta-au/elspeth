@@ -8,7 +8,7 @@ import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict, final
@@ -26,6 +26,7 @@ from elspeth.core.expression_parser import ExpressionEvaluationError, Expression
 from elspeth.plugins.infrastructure.manager import (
     PluginNotFoundError,
     get_shared_plugin_manager,
+    http_fetch_transform_names,
 )
 from elspeth.plugins.transforms.llm.model_catalog import (
     MODEL_CATALOG_OPENROUTER,
@@ -56,11 +57,12 @@ from elspeth.web.composer.state import (
     ValidationEntryDict,
     _coalesce_branch_connections,
     _is_config_probe_exception,
+    _runtime_nodes_downstream_of_connection,
     _source_options_have_schema,
     _validate_gate_expression,
 )
+from elspeth.web.composer.tool_result_envelope import ValidationCodeGuidance, ValidationGuidance
 from elspeth.web.composer.tools._common import (
-    _DATA_ERROR_KEY,
     _PLUGIN_UNAVAILABLE_EXPLANATIONS,
     ToolContext,
     ToolResult,
@@ -78,9 +80,6 @@ from elspeth.web.composer.tools.blobs import (
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
-)
-from elspeth.web.composer.tools.sessions import (
-    _authoring_validation_payload,
 )
 from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
 from elspeth.web.interpretation_state import (
@@ -268,7 +267,13 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     name="get_plugin_schema",
     handler=_handle_get_plugin_schema,
     kind=ToolKind.DISCOVERY,
-    description="Get the full configuration schema for a plugin.",
+    description=(
+        "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
+        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`web_config_authority` (`user_configurable` — author raw `options` directly; "
+        "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
+        "author raw options, author `options.profile` instead)."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -295,14 +300,18 @@ def _handle_get_expression_grammar(
     context: ToolContext,
 ) -> ToolResult:
     del context  # unused; signature uniformity with the other handlers.
-    return _discovery_result(state, get_expression_grammar())
+    # A closed one-key payload, not the bare reference string: ``ToolResult``
+    # admits only mapping / sequence / model payloads (elspeth-e405ad7cd2,
+    # D2), and a scalar was the one discovery shape that slipped past the
+    # scoped gate runs until the planner suite constructed this result.
+    return _discovery_result(state, {"grammar": get_expression_grammar()})
 
 
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
     name="get_expression_grammar",
     handler=_handle_get_expression_grammar,
     kind=ToolKind.DISCOVERY,
-    description="Get the gate expression syntax reference.",
+    description="Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
@@ -350,6 +359,11 @@ _PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
 
 
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        r"diff_baseline_unavailable|No baseline available",
+        "diff_pipeline has nothing to compare against: the session was created without a loaded baseline state.",
+        "Do not retry diff_pipeline in this session. Use get_pipeline_state to read the current state instead.",
+    ),
     (
         r"No source configured",
         "The pipeline has no data source. Every pipeline needs exactly one source to read input data from.",
@@ -399,6 +413,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"Coalesce '(.+)' is missing required field '(.+)'",
         "A coalesce node is missing a required field (branches or policy).",
         "Update the coalesce node with upsert_node, providing the missing field.",
+    ),
+    (
+        r"coalesce_config_invalid|Coalesce '(.+)' does not accept options",
+        "A coalesce is a built-in structural node; it has no runtime options contract, so authored options cannot be preserved.",
+        "Remove options from the coalesce and author only its input, branches, policy, merge, and optional timeout_seconds.",
     ),
     (
         r"row_union_config_invalid",
@@ -472,12 +491,25 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"row_union_schema_incompatible",
-        "The row_union branch declarations cannot safely feed one long-format output stream. Fixed schemas must have "
-        "the same complete declared shape; flexible schemas may add branch-only fields but shared fields cannot "
-        "declare conflicting types.",
-        "Use the row_union_schema facts: align the complete declared field sets and types for fixed branches; for "
-        "flexible branches, change only the listed conflicting shared fields to compatible types. Keep disjoint "
-        "flexible-only fields; they do not need to be deleted.",
+        "Row_union branch schemas cannot feed one long-format stream: fixed schemas must share the same complete declared "
+        "shape; flexible schemas may add branch-only fields but not conflicting types on shared fields. "
+        "'row_union_schema' facts, when present, describe the first incompatible pair. 'branches' holds exactly two "
+        "records, distinct from the row_union's branches option; each record's 'branch' is the node's branch label. "
+        "'mode' ('fixed' or 'flexible') and complete 'fields' come from the schema resolved for that branch's connection "
+        "— declared, or computed from a transform's or aggregation's options, never from the row_union itself. Each "
+        "'fields' entry carries 'name', 'field_type' (str, int, float, bool or any), 'required' and 'nullable'. "
+        "'conflicting_fields' names the fields to fix: for fixed pairs, every field on only one branch plus every field "
+        "whose 'field_type', 'required' or 'nullable' differ; for flexible pairs, only shared fields with differing "
+        "'field_type' ('any' never conflicts).",
+        "Use the row_union_schema facts; the branches option only names inputs. Resolve each 'branch' to its connection "
+        "(list entry, or mapping value), then to its publisher: on_success, on_error, a routes value, a fork_to entry, "
+        "or, for an aggregation that omits on_success, its own node id. From a gate, walk upstream from its input to that "
+        "producer and edit its schema — declared, or a transform's/aggregation's output computed from options. Both "
+        "'mode' 'fixed': for 'conflicting_fields' names missing from one branch's 'fields', add or remove; for names in "
+        "both, make 'field_type', 'required' and 'nullable' identical. Either 'mode' 'flexible': change only 'field_type' "
+        "of those names to agree, or use 'any'; disjoint flexible-only fields stay. Only the first pair is reported — "
+        "repeat per branch. Only without 'row_union_schema' facts: call preview_pipeline where it is offered — its errors "
+        "on the saved state carry the same facts — else apply these rules to each producer's schema in your candidate.",
     ),
     (
         r"fork_branch_multiple_barriers",
@@ -572,9 +604,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"guided_collector_opener_unresolved",
         "A collector's scope_opener names a node id that does not exist in your candidate, so no "
         "expansion opens the group the collector would close.",
-        "Re-emit with scope_opener set to one of the connectivity facts' candidate_node_ids — the exact "
+        "Re-emit with scope_opener set to one of the 'connectivity' facts' 'candidate_node_ids' — the exact "
         "id of the multi-row transform whose expanded rows this collector reassembles. The "
-        "dangling_scope_openers facts are the values that matched nothing.",
+        "'dangling_scope_openers' facts are the values that matched nothing.",
     ),
     (
         r"scope_opener_unknown|scope_opener '(.+)' does not name a transform",
@@ -591,6 +623,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "aggregation node outside any bound region instead.",
     ),
     (
+        r"collector_has_on_error_invalid|Collector '(.+)' does not accept 'on_error'",
+        "A collector failure is a whole-group verdict settled through the scope's group policy and nesting; "
+        "there is no per-row collector error route.",
+        "Remove on_error from the collector. Use scope_policy to choose require_all or best_effort group "
+        "arrival semantics; nesting determines whether a failed group escalates outward or terminates.",
+    ),
+    (
         r"collector_missing_plugin|Collector '(.+)' is missing required field 'plugin'",
         "A collector node needs a batch-transform plugin to reassemble its group.",
         "Set plugin on the collector node to a batch-aware transform (the same plugin contract aggregations use).",
@@ -604,7 +643,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"collector_config_invalid|Collector '(.+)' does not accept field",
         "The collector node carries fields outside its shape (gate, coalesce, or aggregation fields).",
-        "Re-emit the collector with only plugin/input/on_success/on_error/options plus its scope "
+        "Re-emit the collector with only plugin/input/on_success/options plus its scope "
         "binding fields (scope_name/scope_opener/scope_policy).",
     ),
     (
@@ -658,12 +697,34 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
         "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
         "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
-        "connectivity facts list each unreachable branches value and every connection the pipeline actually produces.",
+        "'connectivity' facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
+        "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and — only for a "
+        "MAPPED branch, whose key differs from its value — when that branch's transform chain ends by publishing to a sink, "
+        "the node that did it ('sink_lure', carrying 'node_id' and 'publishes_to_sink'). An identity branch (a list-form "
+        "entry, or a key equal to its value) never carries 'sink_lure', so its absence there says nothing about the wiring; "
+        "such a branch is unreachable only when its name is not a gate fork_to name, and 'coalesce_branch_alias_unreachable' "
+        "fires alongside. Also carried: 'produced_connections', the connections the reachability check accepts, with sink "
+        "names, the coalesce's own id and the fork keyword removed because they pass that check but are never a correct "
+        "branch value. Membership in 'produced_connections' does NOT make a value correct for a given branch: the right "
+        "value is whatever THAT branch's own transform publishes.",
         "Wire each fork branch end-to-end: the gate fork_to name is the branch transform's input; that transform's on_success "
         "must be a unique connection name (NOT a sink); the coalesce branches VALUE for that branch is exactly that connection. "
         "A branch with no transforms uses its fork branch name as the value. If a branches value names a connection nothing "
         "produces, repair that branch's transform — point its on_success at the branches value — rather than merely swapping "
-        "the branches value for one of the produced_connections.",
+        "the branches value for one of the produced_connections. Where a branch record carries 'sink_lure', that node_id IS "
+        "the transform to repair: set its on_success to that record's 'consumed_connection' instead of the sink it currently "
+        "publishes to.",
+    ),
+    (
+        r"coalesce_branch_alias_unreachable",
+        "A coalesce branches KEY — the branch alias; for list-form branches, the entry itself — is not a fork_to name on any "
+        "gate. Arrival at a coalesce is tracked by fork branch name, so a key no gate forks can never be satisfied whatever "
+        "its value names. No 'connectivity' facts accompany this code: compare every coalesce branches key against "
+        "every gate's fork_to names yourself.",
+        "Use the upstream gate's fork_to branch names, spelled exactly, as the coalesce branches keys (or list entries); do "
+        "not invent an alias. Add a name to the gate's fork_to only when that fork genuinely lacks the branch. When "
+        "'coalesce_branch_unreachable' fires for the same branch, fix the alias first — its record carries no 'sink_lure' "
+        "for an identity branch.",
     ),
     (
         r"node_input_not_reachable|input '(.+)' is not reachable",
@@ -711,16 +772,26 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"sink_locked_extras|Extra fields rejected by sink input contract",
         "The sink schema is locked (mode: fixed) and the upstream producer emits extra fields the sink does not accept. "
-        "The rejection's contract facts name the producer, the sink, and the extra field names.",
-        "Change ONLY that edge: relax the sink schema (mode: flexible), add the extra field names to the sink schema fields, "
-        "or insert a field_mapper with select_only: true before the sink to drop them.",
+        "The rejection's 'contract' facts, when present, name that edge in YOUR rejected candidate: 'producer' ('source', "
+        "'source:<name>', or a node id) is the emitting end, 'consumer' is the sink written as 'output:<sink name>' (the "
+        "sink's own name is the part after 'output:'), and 'extra_fields' are the field names the producer emits that the "
+        "sink schema does not declare.",
+        "Change ONLY that edge: relax the sink schema (mode: flexible), add every name in 'extra_fields' to the sink "
+        "schema fields, or insert a field_mapper with select_only: true before the sink to drop them.",
     ),
     (
         r"locked_input_extras|Extra fields rejected by consumer input contract",
-        "The consumer node's input schema is locked (mode: fixed) and the upstream producer emits extra fields it does not accept. "
-        "The rejection's contract facts name the producer, the consumer, and the extra field names.",
-        "Change ONLY that edge: relax the consumer schema (mode: flexible), add the extra field names to the consumer schema fields, "
-        "or insert a field_mapper with select_only: true upstream to drop them.",
+        "The consumer node's input schema is locked (mode: fixed) and the upstream producer emits fields it does not "
+        "declare. The rejection's 'contract' facts, when present, name the edge in YOUR rejected candidate: 'consumer' is "
+        "the locked node's id; 'producer' is 'source', 'source:<name>' (a named source) or a node id; 'extra_fields' are "
+        "the field names the producer emits that the consumer schema does not declare.",
+        "Change ONLY that edge: relax the consumer schema (mode: flexible), add every name in 'extra_fields' to the "
+        "consumer schema's fields, or insert a field_mapper with select_only: true upstream to drop them — except when "
+        "'consumer' is itself a field_mapper, where a second field_mapper is redundant: adjust upstream config instead so "
+        "the extras are not emitted — patch_source_options when 'producer' is a source (source_name is the part after "
+        "'source:'; bare 'source' is the default), patch_node_options when it is a node id; a row_union producer emits "
+        "what its arms emit, so change the emitting arm, not the row_union. Only without contract facts: set schema.mode: "
+        "flexible on the rejected component with patch_node_options.",
     ),
     # Rule C precedes Rule D: both headlines start "Transform ", and this pass
     # matches in list order (see the order-sensitivity note above). The two rules
@@ -745,7 +816,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"semantic_contract_violation|Semantic contract violation:|Semantic contract:",
         "A consumer requires a field to satisfy a semantic contract (content kind, framing, or value type) that its upstream "
-        "producer does not declare or actively conflicts with. The rejection's contract facts name the producer and consumer.",
+        "producer does not declare or actively conflicts with. The rejection's 'contract' facts, when present, name that "
+        "edge: 'producer' ('source', 'source:<name>', or a node id) and 'consumer' (the requiring node's id).",
         "Call get_plugin_assistance for the consumer plugin to see which producers satisfy its semantic requirements, then "
         "change ONLY that edge: swap the producer, or route through a transform that produces the required content kind.",
     ),
@@ -767,39 +839,71 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"coalesce_union_type_incompatible|[Ii]ncompatible types for field",
         "A union coalesce merges its branches into one row, so a field carried by more than one branch must have the same "
-        "type on each. Two branches carry the same field with different types, and there is no merged row shape that "
-        "satisfies both. Two things surprise authors here. 'any' is a distinct type, NOT a wildcard: 'any' against 'int' "
-        "conflicts. And a branch can carry a field it never declared, because a transform contributes its own output fields "
-        "to that branch's schema — a field_mapper or value_transform writing a target adds it as 'any' when the branch "
-        "schema does not declare it. So the named field may appear in neither branch's authored schema.",
-        "Read the conflicting field and both branch names off the rejection rather than searching your authored schemas — "
-        "the field may not appear in either. Then pick the one type the merged field should have and declare it explicitly "
-        "on every branch that carries it, which also pins any type a transform would otherwise contribute as 'any'. If the "
-        "branches genuinely carry different kinds of value, give them different field names instead, or convert the "
-        "diverging branch to the shared type in its transform before the coalesce.",
+        "type on each; here two branches carry the same field with different types. 'any' is a distinct type, NOT a "
+        "wildcard: 'any' against 'int' conflicts. A branch can also carry a field it never declared: a transform "
+        "contributes its own output fields to a branch's schema — a value_transform writing a target adds it as 'any' "
+        "when undeclared, and a field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
+        "renamed source is declared (a rename inherits the source's type when the source is declared). So the named field "
+        "may appear in neither branch's authored schema. The rejection's 'coalesce_union_type' facts name the conflict, "
+        "when present: 'field' is the shared field name; 'branch_a' and 'branch_b' are the two branch names as declared "
+        "on branches, and 'type_a'/'type_b' are the type (str, int, float, bool, or any) each branch's producer carries "
+        "for it.",
+        "Read the field and branch names off the rejection's facts, not your schemas. Resolve each branch name to its "
+        "connection (its branches entry), then to the producer publishing it: on_success, on_error, a routes value, a "
+        "fork_to entry, or, for an aggregation with no on_success, its own node id; if that producer is a gate (it has no "
+        "schema), repeat from its input. That producer's schema, never the coalesce's branches, is where type_a/type_b "
+        "come from. Declare the merged type in each such producer's schema; this also pins a type a transform would "
+        "otherwise contribute as 'any' — but not one the producer computes itself: retype a type_coerce conversion's "
+        "'to', or for a field_mapper rename declare its SOURCE field. If the branches genuinely carry different kinds of "
+        "value, rename one, or convert the diverging branch's type before the coalesce. Only without "
+        "'coalesce_union_type' facts: call preview_pipeline where it is offered — its errors carry the same facts against "
+        "the current saved state.",
     ),
     (
         r"sink_contract_violation|Schema contract violation: '.*' -> 'output:[^']+'",
-        "A sink schema requires fields that its upstream producer does not guarantee. "
-        "The rejection's contract facts name the producer, the sink, and the missing field names.",
-        "Call preview_pipeline to inspect edge_contracts, then either relax the sink schema with patch_output_options or "
-        "update the upstream schema with patch_source_options or patch_node_options and re-preview until the edge shows "
-        "satisfied=true. Declare a source guarantee ONLY for fields VERIFIED from the source's actual content (its bound "
-        "blob or inspect_source) or confirmed by the user — never the planner's intent alone: "
-        "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields "
-        "is a COMPLETE claim, so list every such field, not only the missing ones.",
+        "A sink schema requires fields that its upstream producer does not guarantee. The rejection's 'contract' facts, "
+        "when present, name that edge: 'producer' ('source', 'source:<name>', or a node id) is the guaranteeing end, "
+        "'consumer' is the sink written as 'output:<sink name>', and 'missing_fields' are the field names the sink "
+        "requires that the producer does not guarantee — required by the sink's schema block or by a sink option that "
+        "names the field it writes from (e.g. a text or document sink's 'field').",
+        "Fix 'consumer' (sink_name = after 'output:') via patch_output_options, resending the full 'schema': remove each "
+        "'missing_fields' name from required_fields and, if declared in fields, append '?' to its type; or make "
+        "'producer' guarantee it via patch_source_options ('source'/'source:<name>'; source_name is the part after "
+        "'source:') or, for a transform, aggregation or collector id, patch_node_options. A queue, row_union or "
+        "non-require_all union coalesce guarantees the INTERSECTION of its arms — find them in your own candidate (the "
+        "nodes whose routing publishes into it, or its branches' producers) and patch every one. A nested coalesce "
+        "guarantees its branch NAMES only under require_all — repoint there; else it guarantees nothing: use union merge "
+        "or require_all. Call preview_pipeline until the violation is gone: that edge_contracts row stops being a "
+        "violation once EVERY 'missing_fields' name is gone from what the sink REQUIRES — it then reads satisfied "
+        "true, or disappears entirely where the sink is left requiring nothing. Emptying required_fields is not the "
+        "whole repair: a name the sink still requires through its 'fields', or through a writing option such as a "
+        "text or document sink's 'field', keeps the violation standing. A source guarantee names only "
+        "VERIFIED fields, never intent: "
+        "patch_source_options(patch={'schema':{'mode':'observed','guaranteed_fields':[...]}}), a COMPLETE list. Only "
+        "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
     ),
     (
         r"schema_contract_violation|Schema contract violation:",
-        "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source with no "
-        "guaranteed_fields guarantees NOTHING, and a plugin-free gate/coalesce producer only passes through what its own "
-        "upstream guarantees. The rejection's contract facts name the producer, the consumer, and the missing field names.",
-        "Call preview_pipeline to inspect edge_contracts, then update the upstream schema with patch_source_options or "
-        "patch_node_options and re-preview until the edge shows satisfied=true. Declare a source guarantee ONLY for fields "
-        "VERIFIED from the source's actual content (its bound blob or inspect_source) or confirmed by the user — never "
-        "the planner's intent alone: "
-        "patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': [...]}}) — guaranteed_fields is a "
-        "COMPLETE claim, so list every such field, not only the missing ones.",
+        "A downstream node requires fields that its upstream producer does not guarantee. An observed-mode source "
+        "guarantees only its declared guaranteed_fields (text and llm sources add their own output fields); a plugin-free "
+        "gate only passes through what its upstream guarantees. The rejection's 'contract' facts, when present, name the "
+        "edge in YOUR rejected candidate: 'producer' ('source', 'source:<name>', or a node id — transform, aggregation, "
+        "collector, queue, row_union, or coalesce), 'consumer' (the requiring node's id), and 'missing_fields' — the "
+        "names the consumer requires (explicitly, via a fixed/flexible schema's non-optional fields, or via an option "
+        "naming an input column) that the producer does not guarantee. A queue or row_union guarantees only the "
+        "INTERSECTION of its arms; a union coalesce the intersection of its participating branches, or their UNION under "
+        "policy require_all. A nested coalesce guarantees only its branch NAMES, only under require_all, never their "
+        "inner fields.",
+        "Make 'producer' guarantee every 'missing_fields' name (patch_source_options for a source — source_name is the "
+        "part after 'source:', bare 'source' is the default; patch_node_options for a transform, aggregation or "
+        "collector). A queue, row_union, or non-require_all union coalesce is named only by its id: find its arms in your "
+        "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
+        "repoint the requirement at a branch name; otherwise it guarantees nothing: switch it to merge: union, or set "
+        "policy: require_all AND repoint at a branch name. Where preview_pipeline is offered, re-preview until the error "
+        "is gone. Declare a source guarantee ONLY for fields VERIFIED from its content (bound blob or inspect_source) or "
+        "user-confirmed, not intent, via patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': "
+        "[...]}}), a COMPLETE claim: list every such field. Only without 'contract' facts: take 'from', 'to' and "
+        "'missing_fields' from preview_pipeline's unsatisfied edge_contracts row or errors.",
     ),
     # ── Closed structural node-shape codes ──────────────────────────────────
     # The planner repair feedback strips validation messages; these codes are
@@ -837,7 +941,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"transform_missing_on_error|Transform '(.+)' is missing required field 'on_error'",
         "Every transform must declare where failed rows go.",
-        "Set the transform's on_error — 'discard' is the simplest safe choice, or route to a quarantine sink name.",
+        "Set the transform's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
+        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
+        "quarantine sink name instead when failed rows must stay inspectable.",
     ),
     (
         r"gate_missing_condition|Gate '(.+)' is missing required field 'condition'",
@@ -886,33 +992,112 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"guided_delta_unknown_stable_id",
-        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation authority.",
-        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without inventing or substituting an identity.",
+        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation "
+        "authority, or the node the correction targets no longer resolves to exactly one node in the current pipeline. "
+        "The rejection's 'connectivity' facts locate it: 'stable_id' is the value the delta carried ('invalid' when the "
+        "entry had no string stable_id); 'delta_member', when present, names the member the binder was reading "
+        "('source_routes', 'output_targets', or 'node_patch') — a bare 'stable_id' with no 'delta_member' means the "
+        "edge_patch names an edge other than the selected one; 'known_stable_ids', when present, lists every identity "
+        "that member may legally name. When 'node_id' and 'node_occurrences' appear instead of 'known_stable_ids', the "
+        "selected node's own id ('node_id') occurs 'node_occurrences' times — never exactly once — in the current "
+        "pipeline; nothing in your delta caused that and no delta content can fix it.",
+        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without "
+        "inventing or substituting an identity. When 'known_stable_ids' is present, set the offending entry's stable_id "
+        "to the identity in it that entry was meant to bind; when 'delta_member' is absent, set the edge_patch's "
+        "stable_id to the selected edge's own stable_id. When 'node_occurrences' is present instead, do not re-emit: this "
+        "fault has no delta-side fix — report that the current pipeline holds 'node_id' 'node_occurrences' times and must "
+        "be repaired before this correction can be applied.",
     ),
     (
         r"guided_delta_duplicate_stable_id",
-        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it exactly once.",
-        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta.",
+        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it "
+        "exactly once. The rejection's 'connectivity' facts locate it: 'delta_member' names the delta array the binder "
+        "was reading ('source_routes', 'output_targets', 'edges', or 'nodes'), and exactly one of 'stable_id' (a reviewed "
+        "identity listed twice in that array), 'edge_id' (an edges[].id listed twice), or 'node_id' (a nodes[].id listed "
+        "twice, or one that already names a node in the current pipeline) carries the offending value.",
+        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta. Search the array "
+        "'delta_member' names for the value in 'stable_id', 'edge_id', or 'node_id'; when it is listed twice there, "
+        "remove the extra entry. For 'node_id', also check the current pipeline: when the id already names a node there, "
+        "either drop the entry from nodes[] together with every delta edge LEAVING that id, keeping only the edge(s) into "
+        "it (the existing node's own routing already lives in the pipeline), or give the new node a fresh id and rename "
+        "it in every edge that references it. Change nothing else.",
     ),
     (
         r"guided_delta_authority_violation",
-        "The guided proposal includes a field or component outside the current reviewed mutation authority.",
-        "Re-emit only the fields advertised by the current emit_pipeline_proposal schema; reviewed source/output configuration is installed by the server.",
+        "The guided proposal has a field/component outside the reviewed mutation authority, or its delta ('pipeline' "
+        "argument) doesn't fit the schema. 'connectivity' facts, when present, say which — two disjoint families. "
+        "Delta-reader facts key by 'delta_member', the failing part: 'delta'; object members 'edge_patch'/'node_patch' "
+        "(nested: 'node_patch.options'); array members 'source_routes'/'output_targets'/'nodes'/'edges' (joint: "
+        "'source_routes/output_targets'). Beside it: 'expected_shape' ('array'/'object') on a shape mismatch; "
+        "'missing_keys', top-level members missing from the delta; 'allowed_keys', the only keys that part (or entry, for "
+        "an array member) may carry — alone, it wasn't an object; 'unexpected_keys', keys you wrote outside it; "
+        "'required_keys', keys that entry needs as strings ('edge_id' names it if known, else check every entry); "
+        "'missing_source_stable_ids'/'missing_output_stable_ids', reviewed ids absent once each from "
+        "source_routes/output_targets. 'owner_kind' ('source'/'node'/'output') beside delta_member 'edge_patch' alone: no "
+        "writable routing field — no edge_patch can retarget it. Binder facts key by 'component_kind' "
+        "('sources'/'outputs'/'nodes'), the refused candidate collection. 'sources': 'reviewed_source_names' is the "
+        "required name order; 'candidate_source_names' is what you sent; 'source_name'+'required_keys' flags one "
+        "correctly-keyed source missing a field. 'outputs': 'reviewed_output_names' fixes the entry count; "
+        "'candidate_output_count' is how many you sent. 'nodes': 'predecessor_node_ids' must each appear once; 'node_id' "
+        "with 'node_occurrences' (0=dropped, 2+=duplicated) and 'selected_node' (true = correction target) names which "
+        "and how; 'node_id' with 'candidate_node_type'/'candidate_plugin' means you edited its type or plugin.",
+        "Re-emit only schema-advertised fields; reviewed source/output config is server-owned. Repair only the "
+        "'delta_member' part: match 'expected_shape'; add 'missing_keys' members; drop 'unexpected_keys'. If "
+        "'allowed_keys' arrives alone the part wasn't an object: 'edge_patch' needs exactly {stable_id, to_node}; "
+        "'node_patch' needs 'stable_id' plus only the fields you mean to change — 'allowed_keys' is the menu, not a "
+        "requirement; extras are written through too. Give the entry at fault ('edge_id' if known, else all) "
+        "'required_keys' as strings. Add one entry per id in 'missing_source_stable_ids'/'missing_output_stable_ids'. "
+        "Facts only 'edge_patch'+'owner_kind': no edge_patch succeeds — decline in plain text, using the decline prefix "
+        "when this session taught one. 'sources'+'reviewed_source_names': key by exactly those names, in order — never "
+        "rename/add/drop. 'sources'+'source_name'+'required_keys': fix only that source's missing field. 'outputs': one "
+        "object per 'reviewed_output_names' entry — sink_name is yours, the server remaps it. 'nodes': keep each "
+        "'predecessor_node_ids' id present once; bad 'node_id': re-add if 'node_occurrences'=0, drop extra if 2+; "
+        "'selected_node' true: only that node's edits are yours, others restore server-side; "
+        "'candidate_node_type'/'candidate_plugin': keep type/plugin from current_state, edit only options. Only without "
+        "'connectivity' facts: give the selected node an 'options' object.",
     ),
     (
         r"guided_delta_nonincident_route",
-        "A correction delta changes routing that is not incident to the selected component.",
-        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology named by this correction.",
+        "A correction delta changes routing that is not incident to the selected component. The rejection's "
+        "'connectivity' facts name the offending edge under exactly one of two keys. 'edge_id' with 'incident_owners': "
+        "that list holds the ids an emitted edge must carry as its from_node or to_node — the selected component plus "
+        "any node this delta adds — and the named edge's own from_node and to_node are both outside it. "
+        "'reused_edge_id' with 'incident_owners' (node corrections only): the emitted edge's endpoints are fine, but "
+        "its id reuses an existing pipeline edge that touches none of those ids. When correcting an output, touching "
+        "is not enough: every edge must END at the selected output, and an edge that reaches it only as from_node is "
+        "rejected with 'edge_id' alone and no 'incident_owners'.",
+        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology "
+        "named by this correction. For 'edge_id' with 'incident_owners': re-point the edge so one endpoint is in that "
+        "list — for an output correction, set its to_node to the selected output — or remove it. For 'reused_edge_id': "
+        "keep the edge's endpoints and give it a fresh id that no existing pipeline edge uses. When 'incident_owners' "
+        "is absent, the edge already has the selected output as its from_node: reverse it — set from_node to the "
+        "producer (the source name or node id that feeds the output) and to_node to the selected output — or remove "
+        "it; setting only to_node leaves an output-to-output edge that fails the next turn. Change nothing else.",
     ),
     (
         r"guided_delta_unknown_reference",
-        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor.",
-        "Use an exact existing source or node id from current_state and one of the route fields admitted by the selected correction schema.",
+        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor. "
+        "The rejection's 'connectivity' facts echo the rejected edge: 'from_node' is its origin and 'edge_type' its route "
+        "kind. The binder admits only an existing source name with 'edge_type' 'on_success', or a node id that exactly "
+        "one node in the current pipeline carries with 'edge_type' 'on_success' or 'on_error'; the pair is rejected as a "
+        "whole, so either value alone may be the fault.",
+        "Re-emit with 'from_node' set to an exact existing source name or node id from current_state and 'edge_type' set "
+        "to a route kind that origin owns ('on_success' for a source; 'on_success' or 'on_error' for a node); leave "
+        "whichever of the two is already correct unchanged. Change nothing else.",
     ),
     (
         r"guided_delta_reviewed_failure_route_required",
-        "A reviewed source/output failure policy names a destination that is not present in the reviewed output authority. The planner cannot rewrite that reviewed policy.",
-        "Return to the reviewed source/output settings form and add or correct the required failure sink before planning topology again.",
+        "A reviewed source's on_validation_failure or a reviewed output's on_write_failure names a destination that "
+        "matches no reviewed output. The planner cannot rewrite that reviewed policy, and this check runs before your "
+        "delta is read, so no re-emitted topology can clear it. The rejection's 'connectivity' facts carry 'routes': the "
+        "sorted set of those unresolved on_validation_failure / on_write_failure destinations (an unset route or "
+        "'discard' never appears there).",
+        "Do not re-emit: no delta can clear this check, and you have no tool that edits a reviewed failure policy — a "
+        "repeat notice on this code is expected and does not mean try again. Tell the user that each destination in "
+        "'routes' is a reviewed on_validation_failure or on_write_failure setting naming no reviewed output, and that "
+        "they must return to the reviewed source/output settings form to edit that reviewed source or output — pointing "
+        "the route at an existing reviewed output or 'discard', or adding a reviewed output with that name — before "
+        "topology planning can continue.",
     ),
     (
         r"guided_route_target_unknown",
@@ -948,11 +1133,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"reviewed_output_projection_conflict",
-        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output contract. "
-        "For field_mapper, retained output names are the VALUES in options.mapping; the rejection's missing_fields facts list "
-        "the reviewed names absent from those values.",
-        "Add every name in missing_fields as an options.mapping value while preserving the intended projection, or return to "
-        "the reviewed output form and change its required-field contract. Do not silently drop a reviewed field.",
+        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output "
+        "contract. For field_mapper, retained output names are the VALUES in options.mapping. The rejection's "
+        "'connectivity' facts carry the reviewed names absent from those values as 'missing_fields'.",
+        "Add every name in 'missing_fields' as an options.mapping value while preserving the intended projection, or "
+        "return to the reviewed output form and change its required-field contract. Do not silently drop a reviewed "
+        "field.",
     ),
     (
         r"gate_on_error_unknown_sink",
@@ -1020,6 +1206,34 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Apply the requested change under revision_authority: preserve existing nodes and use only insertion rewiring in amend mode, or perform the explicitly requested replacement in replace mode, then re-emit the complete pipeline.",
     ),
     (
+        r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
+        "An interpretation review on this pipeline was already APPROVED, and the submitted payload does not reconcile "
+        "with the server's authoritative record of it. The specific invariant is named in the rejection message after "
+        "the colon — read it: it identifies the requirement or node at fault (a drifted artifact hash, a duplicate "
+        "review identity, a resolved row missing its event_id or accepted_value, or a vague-term review that cannot "
+        "round-trip without prompt_template_parts). The reviewed material itself is server-owned; a rebuilt-from-memory "
+        "payload that drops or re-words it will not reconcile.",
+        "Do NOT resubmit the same payload — it will be rejected identically. Call get_pipeline_state with "
+        'component="set_pipeline_arguments" to obtain the exact round-trippable payload for the CURRENT state, apply '
+        "only the change you intend to that payload, and re-emit it as the full set_pipeline call. Never author the "
+        "server-owned review fields (id, status, event_id, accepted_value, resolved_prompt_template_hash); each "
+        "interpretation_requirements entry you send carries only {kind, user_term, draft}.",
+    ),
+    (
+        r"vague_term_unwired|Pending vague_term review is not wired for resolution",
+        "The pipeline stages a pending vague_term interpretation requirement that nothing can resolve: no "
+        "prompt_template_parts interpretation_ref references the requirement's id. A legacy "
+        "{{interpretation:...}} placeholder does NOT count once a requirement row is staged — the staged row "
+        "disables the legacy fallback, so the mixed form is unresolvable by construction. Committed, it would "
+        "produce a review the operator can approve but never resolve, and the execution gate would block Run "
+        "on it forever with no card offered.",
+        "Wire the requirement into the node's prompt: author prompt_template_parts as an ordered list of parts "
+        'where exactly one entry is {"kind": "interpretation_ref", "requirement_id": "<the requirement id named '
+        'in the rejection>"} and the surrounding text lives in {"kind": "text", "text": ...} parts. '
+        "Alternatively drop the interpretation_requirements row and keep exactly one legacy "
+        "{{interpretation:<user_term>}} placeholder. Do not restage the review; the repair is wiring.",
+    ),
+    (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
         "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
         "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
@@ -1046,8 +1260,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"no_source_configured|No source configured",
-        "The pipeline has no source; every pipeline reads rows from exactly one configured source (or named sources).",
-        "Include a source block in the set_pipeline call — plugin, on_success connection, and options with a schema.",
+        "The pipeline has no source; every pipeline reads rows from exactly one configured source (or named sources). "
+        "set_pipeline is a full replacement, so source: null never means 'keep the existing source'.",
+        "Include a source block in the set_pipeline call — plugin, on_success connection, and options with a schema. "
+        "Rebuilding an already-sourced pipeline: re-supply the existing source by copying its blob_id (from "
+        "get_pipeline_state or list_blobs) into source.blob_id, or resend inline_blob.",
     ),
     (
         r"no_sinks_configured|No sinks configured",
@@ -1108,7 +1325,9 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"aggregation_missing_on_error|Aggregation '(.+)' is missing required field 'on_error'",
         "Every aggregation must declare where failed rows go.",
-        "Set the aggregation's on_error — 'discard' is the simplest safe choice, or route to a quarantine sink name.",
+        "Set the aggregation's on_error explicitly. 'discard' costs the failed row's CONTENT, not the record of it — the "
+        "audit trail keeps the drop's terminal outcome, but nothing reaches a sink to inspect later. Route to a declared "
+        "quarantine sink name instead when failed rows must stay inspectable.",
     ),
     (
         r"aggregation_output_mode_invalid",
@@ -1215,8 +1434,13 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "unknown_node_type",
     "coalesce_on_success_must_be_sink",
     "coalesce_missing_branches",
+    "coalesce_config_invalid",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
+    # Branch ALIASES must be gate fork_to names — the coalesce twin of
+    # row_union_branch_alias_unreachable, and the code that co-fires whenever
+    # an identity branch is coalesce_branch_unreachable.
+    "coalesce_branch_alias_unreachable",
     "row_union_config_invalid",
     "row_union_name_invalid",
     "row_union_branches_invalid",
@@ -1310,6 +1534,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # facts before the candidate ever reaches validation or projection.
     "guided_collector_opener_unresolved",
     "collector_has_trigger_invalid",
+    "collector_has_on_error_invalid",
     "collector_missing_plugin",
     "collector_plugin_not_batch_aware",
     "collector_config_invalid",
@@ -1344,6 +1569,17 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # 'validation_error' placeholder while the actionable message was redacted.
     "interpretation_review_contract_unsatisfied",
     "interpretation_review_draft_malformed",
+    # ── Unwired vague_term guard (session 4c42a794, 2026-09-01) ────────────
+    # set_pipeline committed a pending vague_term with no resolvable prompt
+    # wiring; the review was approvable but never resolvable and the execution
+    # gate blocked Run forever. The staging tool's guard now also runs at the
+    # node-authoring doors, and its rejection carries this code.
+    "vague_term_unwired",
+    # ── Authoritative review reconciliation (session f33fa7c3, 2026-09-01) ─
+    # Ten invariants inside reconcile_authoritative_reviews shared one opaque
+    # message and no code, so explain_validation_error fell through to its
+    # no-match branch and the planner blind-repeated an identical payload.
+    "review_reconciliation_failed",
     "file_sink_write_policy_invalid",
     # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
     # A revision candidate netting zero transform nodes drew one coded nudge
@@ -1451,6 +1687,85 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
     return None
 
 
+# Static usage line, never per-request data. Live planners called
+# explain_validation_error with junk ({"error_text": "ValidationError"})
+# because nothing said the exact code string is the lookup key. Kept
+# deliberately free of topology hints — mid-repair suggestions have derailed
+# otherwise-converging repairs.
+#
+# Public because BOTH repair surfaces advertise the tool with these exact
+# bytes: the planner's redacted feedback (pipeline_planner) and the freeform
+# tool envelope (tools._dispatch). Two copies would drift, and the parity
+# suite pins the string.
+EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+"""Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
+
+EXPLAIN_TOOL_GUIDANCE: Final[str] = (
+    "An entry whose error_code has no entry under 'validation_guidance.codes' — or that has no error_code "
+    "at all — can be expanded by calling explain_validation_error with the entry's error_code, or with its "
+    "full message when it has none."
+)
+"""Freeform-envelope pointer (``validation_guidance.explain_tool``): names the container the codes live in,
+so the model knows which codes the call can still add something for (elspeth-e405ad7cd2)."""
+
+
+def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
+    """Resolve a failed envelope's error codes to inline catalogue guidance.
+
+    The freeform twin of the planner's ``_allowlisted_candidate_feedback``
+    enrichment: the two surfaces read the SAME closed catalogue, so a model
+    on either one gets the repair text without spending a turn on
+    ``explain_validation_error``. Same rationale as the ``plugin_schemas``
+    augmentation that already rides these envelopes.
+
+    Every value is STATIC catalogue text — a public constant, never
+    per-request data. :func:`_augment_with_expected_hint` is deliberately NOT
+    applied, for the reason :func:`explain_validation_code` gives: there is
+    no ``error_text`` here to mine an ``Expected …`` hint from, only the bare
+    code. The mapping is also keyed BY code, so one entry serves every error
+    sharing it; splicing a per-entry message span into a per-code entry would
+    make N colliding entries whose text depended on which one was visited
+    last. Static text keeps the freeform and guided surfaces reading
+    identical catalogue bytes.
+
+    Custody: this rides ``ToolResult.validation_guidance``, declared
+    ``_SafeResponseEnvelope`` in the redaction manifest, so the audit
+    projection collapses it to ``<redacted-response-mapping>`` exactly as it
+    collapses ``validation.errors[].message``. The provider sees the full
+    text; persistence sees a placeholder.
+
+    ``explain_tool`` is advertised only while some code arrived WITHOUT inline
+    guidance, which is exactly when the call can still add something: for an
+    already-enriched code the tool returns byte-equivalent text and the turn
+    is wasted (elspeth-41b406c9fc). An unresolved code is still worth the
+    call on this surface — the tool also matches on the full validator
+    message, which this envelope carries and the code lookup cannot use.
+
+    Returns ``None`` for an envelope with no error entries at all, so a
+    success carries no key.
+    """
+    resolved: dict[str, ValidationCodeGuidance] = {}
+    saw_entry = False
+    any_unresolved = False
+    for code in codes:
+        saw_entry = True
+        if code is None:
+            any_unresolved = True
+            continue
+        guidance = explain_validation_code(code)
+        if guidance is None:
+            any_unresolved = True
+            continue
+        explanation, suggested_fix = guidance
+        resolved[code] = ValidationCodeGuidance(explanation=explanation, suggested_fix=suggested_fix)
+    if not saw_entry:
+        return None
+    payload = ValidationGuidance(codes=resolved)
+    if any_unresolved:
+        payload["explain_tool"] = EXPLAIN_TOOL_GUIDANCE
+    return payload
+
+
 # Static text, never per-request data — the same public-constant posture as
 # every catalogue entry above, so it cannot re-open the message boundary the
 # planner's allowlist protects.
@@ -1532,7 +1847,11 @@ def _execute_explain_validation_error(
                 },
             )
     # No match at all — teach usage instead of an unhelpful generic. The codes
-    # are a public static catalogue, so listing them leaks nothing.
+    # are a public static catalogue, so listing them leaks nothing — but ONLY
+    # inside ``suggested_fix``: a ``known_codes`` array here (117 entries)
+    # exceeds RESPONSE_PROJECTION_MAX_CONTAINER_WIDTH (64) and collapses the
+    # whole persisted audit row to a ``response_projection_limit`` stub
+    # (elspeth-3e28029d2f). The planner reads the same codes from the string.
     return ToolResult(
         success=True,
         updated_state=state,
@@ -1546,7 +1865,6 @@ def _execute_explain_validation_error(
                 "feedback's validation.errors[].error_code. Closed codes: " + ", ".join(_CLOSED_VALIDATION_ERROR_CODES) + ".",
                 error_text,
             ),
-            "known_codes": list(_CLOSED_VALIDATION_ERROR_CODES),
         },
     )
 
@@ -1556,7 +1874,9 @@ _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
     description="Get a human-readable explanation of a validation error "
-    "with suggested fixes. Pass the exact error text from a validation result.",
+    "with suggested fixes. Pass the entry's `message`, or its `error_code` when "
+    "that is all you have. Returns the `error_text` echoed, an `explanation`, a "
+    "`suggested_fix`, and — when the text matched a closed code — the `error_code`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1686,12 +2006,15 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Retrieve plugin-owned guidance for a source, transform, or sink. "
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
-        "    — a summary of the plugin and composer_hints. (The same hints "
+        "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
         "    are also carried on list_sources / list_transforms / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.)\n"
         "  * Pass an ``issue_code`` (validators emit these as requirement_code "
         "    on semantic_contracts entries) to get failure-time guidance — "
-        "    summary, suggested_fixes, and example before/after configurations."
+        "    `summary`, `suggested_fixes`, and `examples` — each a `title` with the "
+        "    `before` and `after` configurations it contrasts.\n"
+        "Every result names the `plugin_name` and `plugin_type` it describes; a plugin with no published "
+        "guidance returns `summary` null and empty lists."
     ),
     json_schema={
         "type": "object",
@@ -1779,8 +2102,10 @@ _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
         "Landscape, or 'how do I record what the pipeline did'. Audit is "
         "mandatory and operator-managed; the composer cannot configure the "
         "backend (security boundary — see yaml_generator.py:179, fix S1). "
-        "Returns enabled status, composer_modifiable flag, and a canonical "
-        "summary to paraphrase. Does NOT return the audit URL/path/DSN — "
+        "Returns `enabled`, the `composer_modifiable` flag, a canonical "
+        "`summary` to paraphrase, and `audit_export_summary` (the optional "
+        "operator-configured export feature, also not composer-controllable). "
+        "Does NOT return the audit URL/path/DSN — "
         "that is operator-internal and intentionally not surfaced to the LLM."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
@@ -1895,7 +2220,11 @@ _LIST_MODELS_DECLARATION = ToolDeclaration(
     "returns matching model IDs (capped at limit). For provider='openrouter/' "
     "the returned slugs are normalised to OpenRouter's HTTP API form "
     "(without the litellm-internal 'openrouter/' routing prefix) — these "
-    "are the values to put directly in `model:`.",
+    "are the values to put directly in `model:`. Result `data` carries "
+    "`providers` (provider name → model count) with `total_models` and a "
+    "`hint` on narrowing the query when no filter is given, or `models` with "
+    "`count` (matches found) and `truncated` (true when the limit cut the "
+    "list) with a filter.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2370,6 +2699,18 @@ def _probe_transform_output_declared_field_names(plugin: str, options: Mapping[s
         transform.close()
 
 
+@trust_boundary(
+    tier=3,
+    source="value_transform NodeSpec options (composer/user-authored config re-read from persisted session state)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (the field-preservation proof abstains) for absent, non-sequence, or "
+        "non-mapping operations shapes and for any operation targeting the field; never raises "
+        "on malformed node options"
+    ),
+    non_raising=True,
+)
 def _value_transform_preserves_field(node: NodeSpec, field_name: str) -> bool:
     # ``node.options`` is composer/user-authored config re-read from persisted
     # session state — Tier-3 origin. Membership form (not ``.get``) records the
@@ -2863,8 +3204,9 @@ def _compute_proof_diagnostics_for_source(
         normalization or field_mapping resolution failed before schema
         comparison could proceed.
       * ``text_source_url_without_web_scrape`` — text source whose blob
-        content is a single URL but no web_scrape node downstream. The
-        URL string itself reaches sinks instead of the URL's content.
+        content is a single URL but no compatible HTTP-fetch transform is
+        downstream. The URL string itself reaches sinks instead of the URL's
+        content. The stable historical code is retained for API compatibility.
       * ``gate_expression_type_mismatch_against_source_schema`` — observed
         CSV source values are still strings, and a gate reached through a
         provably field-preserving path fails against sampled rows before runtime.
@@ -3159,22 +3501,24 @@ def _compute_proof_diagnostics_for_source(
             )
         )
 
-    # 3. Text source containing a single URL but no web_scrape downstream.
+    # 3. Text source containing a single URL but no compatible HTTP fetcher
+    #    reachable from this source. An unrelated fetch branch does not count.
     if facts.source_kind == "text" and facts.url_candidates:
-        node_plugins = {(n.plugin or "").lower() for n in state.nodes}
-        if "web_scrape" not in node_plugins:
+        fetch_transform_names = http_fetch_transform_names()
+        downstream_nodes = _runtime_nodes_downstream_of_connection(source.on_success, state.nodes)
+        if not any(node.plugin in fetch_transform_names for node in downstream_nodes):
             diagnostics.append(
                 _blocking_diagnostic(
                     code="text_source_url_without_web_scrape",
                     message=(
                         f"Source blob contains URL(s) {list(facts.url_candidates)} but no "
-                        "web_scrape transform is wired downstream. The URL string itself will "
-                        "flow to sinks, not the URL's content."
+                        "compatible HTTP fetch transform is wired downstream from this source. "
+                        "The URL string itself will flow to sinks, not the URL's content."
                     ),
                     suggested_repair=(
-                        "upsert_node({node_type: 'transform', plugin: 'web_scrape', "
-                        "input: <source on_success>, options: {url_field: '<column>'}}) and route "
-                        "the source on_success to it."
+                        "Discover an available compatible HTTP fetch transform, wire its input to "
+                        "this source's on_success connection, configure its URL field, and route "
+                        "the source through it."
                     ),
                     evidence_locator={
                         "source": "blob",
@@ -3258,9 +3602,10 @@ def _attribute_proof_diagnostic_to_source(
     source_name: str,
 ) -> Mapping[str, Any]:
     """Attach the authored source identity to one detector-owned diagnostic."""
+    # ``diagnostic`` is detector-owned Tier-1 data (every producer builds
+    # ``evidence_locator`` as a mapping literal); the ``{**evidence}`` splat
+    # crashes with TypeError on corruption, so no defensive shape re-check.
     evidence = diagnostic["evidence_locator"]
-    if not isinstance(evidence, Mapping):
-        raise RuntimeError("proof diagnostic evidence_locator must be a mapping")
     return {
         **diagnostic,
         "evidence_locator": {**evidence, "source_name": source_name},
@@ -3374,8 +3719,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
     """Build the marker naming an un-run Stage 2 in a preview's error channel.
 
     A fresh dict per call: the entry is handed to the caller inside
-    ``data["errors"]``, so a shared module constant would let one consumer's
-    mutation leak into every later preview.
+    ``data["preview_errors"]``, so a shared module constant would let one
+    consumer's mutation leak into every later preview.
 
     Deliberately NOT registered in ``_CLOSED_VALIDATION_ERROR_CODES`` — that
     tuple is a claim about the codes the planner's redacted repair feedback
@@ -3387,8 +3732,8 @@ def _runtime_preflight_not_run_error() -> ValidationEntryDict:
         message=(
             "The runtime preflight stage did not run for this preview, so this pipeline has not been "
             "checked against the real engine at all (path allowlist, plugin instantiation, graph "
-            "structure, schema compatibility, secret refs, policy gates). is_valid is false because no "
-            "verdict on those checks exists, not because one of them failed. This is a server wiring "
+            "structure, schema compatibility, secret refs, policy gates). preview_is_valid is false because "
+            "no verdict on those checks exists, not because one of them failed. This is a server wiring "
             "omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it — "
             "report that preview_pipeline returned runtime_preflight_not_run."
         ),
@@ -3487,27 +3832,38 @@ def _execute_preview_pipeline(
 ) -> ToolResult:
     """Preview pipeline configuration — dry-run validation with source summary.
 
-    Returns ``authoring_validation`` (Stage 1), ``runtime_preflight``
-    (Stage 2 from the caller-supplied callback), and ``proof_diagnostics``
-    (Stage 3 — operator-input-aware proof against the observed source
-    blob). The presence of any blocking ``proof_diagnostics`` entry means
-    ``is_valid=False`` even when authoring + runtime checks pass.
+    Three checks, each on its own surface: the authoring check rides on the
+    envelope's own ``validation``; the runtime preflight (the caller-supplied
+    callback) on the envelope's ``runtime_preflight``; the operator-input-aware
+    proof against the observed source blob under ``data["proof_diagnostics"]``.
+    ``data["preview_is_valid"]`` is their conjunct — any blocking
+    ``proof_diagnostics`` entry makes it false even when authoring + runtime
+    pass.
+
+    ``data`` carries only what the preview stage itself produces: the
+    conjunct, ``preview_errors`` (entries the preview stage mints — never a
+    copy of the authoring errors, which the envelope already carries),
+    ``edge_contracts`` (the one authoring fact the envelope does not carry),
+    the proof diagnostics, and a read-only overview. Hoisting the authoring
+    verdict here again put byte-twins of ``validation`` on the wire under a
+    second name and made ``is_valid`` a homonym (elspeth-e405ad7cd2 R4).
 
     An un-run stage never rides the success side: with no runtime callback
-    wired, ``is_valid`` is false and ``errors`` carries an explicit
-    ``runtime_preflight_not_run`` entry naming the stage that did not run.
+    wired, ``preview_is_valid`` is false and ``preview_errors`` carries an
+    explicit ``runtime_preflight_not_run`` entry naming the stage that did
+    not run.
     """
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
         1,
         {"outcome": "valid" if validation.is_valid else "invalid"},
     )
-    authoring_payload = _authoring_validation_payload(state, validation)
     runtime_result = context.runtime_preflight(state) if context.runtime_preflight is not None else None
     # Wired only when the caller's strict Stage-2 verdict is handoff-shaped
     # (elspeth-229e9e8195). Additive advisory block: it never joins the
-    # ``is_valid`` conjunct below — folding tolerant findings into the strict
-    # verdict would misreport a review-pending state as a validator objection.
+    # ``preview_is_valid`` conjunct below — folding tolerant findings into the
+    # strict verdict would misreport a review-pending state as a validator
+    # objection.
     structural_preview = (
         _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
     )
@@ -3519,10 +3875,10 @@ def _execute_preview_pipeline(
     )
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
-    is_valid = validation.is_valid
-    summary_errors = authoring_payload["errors"]
+    preview_is_valid = validation.is_valid
+    preview_errors: list[ValidationEntryDict] = []
     if runtime_result is not None:
-        is_valid = is_valid and runtime_result.is_valid
+        preview_is_valid = preview_is_valid and runtime_result.is_valid
     else:
         # Three live callers wire Stage 2 for preview: the operator channel
         # precomputes it per call (tool_batch.py), the stdio MCP server wires
@@ -3536,24 +3892,19 @@ def _execute_preview_pipeline(
         # an un-run stage must not ride the success side of the conjunct: fail
         # closed and name the stage, because ``runtime_preflight: null`` alone
         # cannot tell a caller "not computed" apart from "nothing to report".
-        is_valid = False
-        # A fresh list, never an in-place append: this list object IS
-        # ``authoring_payload["errors"]``, which the summary also embeds as
-        # ``authoring_validation`` — Stage 1's own report must stay Stage-1-true.
-        summary_errors = [*summary_errors, _runtime_preflight_not_run_error()]
+        preview_is_valid = False
+        preview_errors.append(_runtime_preflight_not_run_error())
     if has_blocking_proof:
-        is_valid = False
+        preview_is_valid = False
 
     summary: dict[str, Any] = {
-        "is_valid": is_valid,
-        "errors": summary_errors,
-        "warnings": authoring_payload["warnings"],
-        "suggestions": authoring_payload["suggestions"],
-        "edge_contracts": authoring_payload["edge_contracts"],
-        "semantic_contracts": authoring_payload["semantic_contracts"],
-        "graph_repair_suggestions": authoring_payload["graph_repair_suggestions"],
-        "authoring_validation": authoring_payload,
-        "runtime_preflight": runtime_result.model_dump() if runtime_result is not None else None,
+        "preview_is_valid": preview_is_valid,
+        "preview_errors": preview_errors,
+        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
+        # No nested ``runtime_preflight`` copy: the same value rides on the
+        # envelope's own ``runtime_preflight`` field (set below), and a
+        # byte-identical twin under ``data`` was two keys the model had to be
+        # taught were one (elspeth-e405ad7cd2, F9).
         "proof_diagnostics": proof_diagnostics,
         "sources": {
             name: {
@@ -3585,10 +3936,27 @@ _PREVIEW_PIPELINE_DECLARATION = ToolDeclaration(
     name="preview_pipeline",
     handler=_execute_preview_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Preview the current pipeline configuration — returns "
-    "validation status, source summary, and node/output overview "
-    "without executing. Use this to confirm the pipeline is set up "
-    "correctly before running.",
+    description="Preview the current pipeline without executing it. The "
+    "envelope's `validation` is the authoring check and `runtime_preflight` "
+    "(top-level, when a runtime check ran) is the dry-run. `data` carries "
+    "`preview_is_valid` (true only when the authoring check, the runtime "
+    "check and the source proof all pass), `preview_errors` (entries only "
+    "the preview stage produces, such as `runtime_preflight_not_run`), "
+    "`edge_contracts` (one entry per producer->consumer pair that was "
+    "checked, and a pair is checked only where the consumer REQUIRES "
+    "fields — through `required_fields`, through a fixed/flexible schema's "
+    "declared fields, or, "
+    "for a sink, through an option naming the field it writes from — so an "
+    "edge requiring none has no entry and an empty "
+    "list is not proof of a satisfied contract: `from`, `to` which is "
+    "`output:<name>` for a sink, the `producer_guarantees` and "
+    "`consumer_requires` field names, the `missing_fields` between them, "
+    "and `satisfied`), `proof_diagnostics`, "
+    "`structural_preview` when present (an advisory re-check whose "
+    "`is_valid` is not the verdict), and a read-only overview: `sources` "
+    "(keyed by source name, each with `plugin`, `on_success` and "
+    "`has_schema_config`), `nodes`, `outputs`, `node_count`, "
+    "`output_count`.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )
@@ -3613,12 +3981,13 @@ def _execute_diff_pipeline(
     baseline = context.baseline
     current_validation = context.current_validation
     if baseline is None:
-        return _discovery_result(
+        # A failure, not a success carrying an ``error`` key: ``error`` is a
+        # failure-only key on every surface (elspeth-e405ad7cd2 D5). The
+        # current version already rides the envelope's ``version``.
+        return _failure_result(
             state,
-            {
-                _DATA_ERROR_KEY: "No baseline available. Load or create a session first.",
-                "current_version": state.version,
-            },
+            "No baseline available. Load or create a session first.",
+            error_code="diff_baseline_unavailable",
         )
 
     baseline_validation = context.catalog.validate_composition_state(baseline).validation
@@ -3636,8 +4005,13 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
     description="Show what changed since the session was loaded or created. "
-    "Returns added, removed, and modified nodes/edges/outputs, "
-    "plus warnings introduced or resolved.",
+    "On success `data` carries `from_version` (the baseline; the version it "
+    "changed TO is the envelope's own `version`), `sources_changed`, "
+    "`metadata_changed`, `total_changes`, `warnings_introduced`, "
+    "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
+    "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
+    "baseline (no session loaded or created yet) it fails with `error` and "
+    "`error_code` only.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,
 )

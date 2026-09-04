@@ -145,6 +145,21 @@ def normalize_field_name(raw: str) -> str:
     return normalized
 
 
+def is_normalized_field_name(name: str) -> bool:
+    """Return whether ``name`` is a normalization fixed point.
+
+    A fixed point names a row key construction-time contract math can state.
+    A non-fixed-point may instead be an original-header spelling whose actual
+    row key is known only from runtime lineage, so callers must abstain rather
+    than use the literal as a removal name. Headers that normalize to nothing
+    cannot name a row key and return ``False``.
+    """
+    try:
+        return normalize_field_name(name) == name
+    except ExternalHeaderError:
+        return False
+
+
 def check_normalization_collisions(raw_headers: list[str], normalized_headers: list[str]) -> None:
     """Check for collisions after normalization.
 

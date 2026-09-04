@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 import structlog
@@ -24,6 +24,14 @@ from elspeth.contracts.trust_boundary import observation_boundary, trust_boundar
 from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver
 from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
+
+# The wire projection's OWN derivations of the three head-derived facts the
+# post-commit drift gate compares. Imported rather than reimplemented: the gate
+# is only meaningful if its live half computes what the frozen record was built
+# with, and a second derivation here would 409 on its own rounding. All three
+# are total functions of authored options or a plugin id, and all three already
+# carry their Tier-3 boundary metadata at the definition site.
+from elspeth.web.composer.guided.emitters import _source_cardinality, _structured_output_fields, _wire_schema
 from elspeth.web.composer.guided.protocol import (
     PROPOSAL_RATIONALE_TEMPLATE,
     PROPOSAL_SUMMARY_TEMPLATE,
@@ -871,6 +879,42 @@ def resolve_guided_correction_target(
     )
 
 
+class _GuidedCorrectionWirePayload(TypedDict):
+    """Closed wire-review envelope normalized from a Step-3 proposal projection."""
+
+    sources: list[Any]
+    nodes: list[Any]
+    connections: list[Any]
+    outputs: list[Any]
+
+
+def _guided_proposal_correction_wire_payload(proposal_payload: Mapping[str, Any]) -> _GuidedCorrectionWirePayload:
+    """Normalize the Step-3 proposal envelope to the wire-review collection names.
+
+    ``proposal_payload`` is the server-built PROPOSE_PIPELINE projection — a
+    first-party turn payload built by ``build_guided_proposal_projection`` and
+    passed either directly or from durable custody (``current_turn["payload"]``)
+    — so its envelope is a fixed Tier-1 contract. Required keys are read
+    directly and any deviation crashes as an audit-integrity break instead of
+    being defaulted around.
+    """
+    if "graph" not in proposal_payload or "nodes" not in proposal_payload or "outputs" not in proposal_payload:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    graph = proposal_payload["graph"]
+    nodes = proposal_payload["nodes"]
+    outputs = proposal_payload["outputs"]
+    if type(graph) is not dict or "sources" not in graph or "edges" not in graph:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    if type(graph["sources"]) is not list or type(graph["edges"]) is not list or type(nodes) is not list or type(outputs) is not list:
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    return {
+        "sources": graph["sources"],
+        "nodes": nodes,
+        "connections": graph["edges"],
+        "outputs": outputs,
+    }
+
+
 def resolve_guided_proposal_correction_target(
     *,
     requested: ComponentTarget,
@@ -886,25 +930,9 @@ def resolve_guided_proposal_correction_target(
     is added to the provider-visible target.
     """
 
-    graph = proposal_payload.get("graph")
-    nodes = proposal_payload.get("nodes")
-    outputs = proposal_payload.get("outputs")
-    if (
-        type(graph) is not dict
-        or type(graph.get("sources")) is not list
-        or type(graph.get("edges")) is not list
-        or type(nodes) is not list
-        or type(outputs) is not list
-    ):
-        raise AuditIntegrityError("guided proposal correction projection is malformed")
     return resolve_guided_correction_target(
         requested=requested,
-        wire_payload={
-            "sources": graph["sources"],
-            "nodes": nodes,
-            "connections": graph["edges"],
-            "outputs": outputs,
-        },
+        wire_payload=_guided_proposal_correction_wire_payload(proposal_payload),
         predecessor=predecessor,
     )
 
@@ -982,24 +1010,8 @@ def require_guided_proposal_correction_target_changed(
 ) -> None:
     """Apply the exact correction-change proof to a Step-3 proposal projection."""
 
-    graph = proposal_payload.get("graph")
-    nodes = proposal_payload.get("nodes")
-    outputs = proposal_payload.get("outputs")
-    if (
-        type(graph) is not dict
-        or type(graph.get("sources")) is not list
-        or type(graph.get("edges")) is not list
-        or type(nodes) is not list
-        or type(outputs) is not list
-    ):
-        raise AuditIntegrityError("guided proposal correction projection is malformed")
     require_guided_correction_target_changed(
-        {
-            "sources": graph["sources"],
-            "nodes": nodes,
-            "connections": graph["edges"],
-            "outputs": outputs,
-        },
+        _guided_proposal_correction_wire_payload(proposal_payload),
         target,
         successor,
     )
@@ -1218,6 +1230,22 @@ def guided_redacted_current_state_context(state: CompositionState) -> dict[str, 
     }
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "reviewed sink options carried on SinkOutputResolved: free-form plugin configuration authored through "
+        "the composer (planner tool calls or the schema_form), stored verbatim and never schema-validated by "
+        "the composer, so the 'schema' block's interior shape is not guaranteed here"
+    ),
+    source_param="options",
+    suppresses=("R1",),
+    invariant=(
+        "merges declared output fields into options['schema'].required_fields only when the authored schema "
+        "block and its required_fields are the expected dict/list-of-str shapes; returns the options unchanged "
+        "(still externally authored, for candidate validation to reject as contract_config_invalid) for any "
+        "malformed schema block, and never raises on malformed source_param shape"
+    ),
+)
 def _sink_options_with_declared_required_fields(
     options: dict[str, JsonValue],
     declared_fields: Sequence[str],
@@ -1246,12 +1274,15 @@ def _sink_options_with_declared_required_fields(
     schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
     raw_schema = options.get(schema_key)
     if raw_schema is None:
+        # A fresh server-seeded block: "required_fields" is absent by
+        # construction, so the authored-fields read below starts from None.
         schema: dict[str, JsonValue] = {"mode": "observed"}
+        existing: JsonValue | None = None
     elif type(raw_schema) is dict:
         schema = raw_schema
+        existing = raw_schema.get("required_fields")
     else:
         return options
-    existing = schema.get("required_fields")
     if existing is None:
         authored: list[str] = []
     elif type(existing) is list and all(type(item) is str for item in existing):
@@ -1356,6 +1387,30 @@ def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, 
     return tuple(sorted(names))
 
 
+# A guided rejection fact is a closed structural label or a list of them —
+# never a nested record. The teaching gate enumerates one level of keys, and an
+# AST walk cannot bound a mapping reached through a name or a helper call, so
+# the TYPE is what refuses a nested record however it is built (final red-team,
+# elspeth-68721c71d7). Adding a mapping arm here is a change to the gate too.
+GuidedFactValue = str | int | bool | None | list[str]
+_GUIDED_FACT_SCALARS: Final[tuple[type, ...]] = (str, int, bool, type(None))
+
+
+def _require_guided_fact_value(key: str, value: object) -> GuidedFactValue:
+    """Nominally admit one fact value at construction, where the value is built.
+
+    The annotation alone does not bind a value that arrives as ``Any`` or
+    through a ``cast`` (ADR-032: validate by trust domain — exact types, no
+    subclasses), so a nested record is refused HERE however it was built,
+    before it can reach the planner untaught (final red-team, fourth round).
+    """
+    if type(value) in _GUIDED_FACT_SCALARS:
+        return cast(GuidedFactValue, value)
+    if type(value) is list and all(type(item) is str for item in value):
+        return list(value)  # our own copy: the caller's list is never aliased into the rejection
+    raise AuditIntegrityError(f"guided rejection fact {key!r} is not a closed label: {type(value).__name__}")
+
+
 class GuidedCandidateBindingRejected(AuditIntegrityError):
     """Typed repairable candidate-shape rejection from the reviewed-component binder.
 
@@ -1369,16 +1424,16 @@ class GuidedCandidateBindingRejected(AuditIntegrityError):
     this type still classifies it as repairable, never a terminal 500.
     """
 
-    def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, JsonValue]) -> None:
+    def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, GuidedFactValue]) -> None:
         super().__init__(message)
         self.error_code = error_code
-        self.connectivity: dict[str, JsonValue] = dict(connectivity)
+        self.connectivity: dict[str, GuidedFactValue] = {key: _require_guided_fact_value(key, value) for key, value in connectivity.items()}
 
 
 def _guided_delta_rejection(
     error_code: str,
     *,
-    facts: Mapping[str, JsonValue] | None = None,
+    facts: Mapping[str, GuidedFactValue] | None = None,
 ) -> GuidedCandidateBindingRejected:
     return GuidedCandidateBindingRejected(
         "guided planner candidate delta violates reviewed mutation authority",
@@ -1462,7 +1517,7 @@ def _guided_node_patch_schema(
         ),
         "coalesce": ("input", "on_success", "policy", "merge", "timeout_seconds"),
         "row_union": ("input", "on_success", "timeout_seconds"),
-        "collector": ("input", "on_success", "on_error", "scope_name", "scope_opener", "scope_policy"),
+        "collector": ("input", "on_success", "scope_name", "scope_opener", "scope_policy"),
     }
     fields = (
         public_fields_by_kind[public.behavior_kind]
@@ -1634,7 +1689,7 @@ def _exact_delta_members(value: object, *, allowed: set[str], subject: str) -> M
             "guided_delta_authority_violation",
             facts={
                 "delta_member": subject,
-                "allowed_keys": cast(JsonValue, sorted(allowed)),
+                "allowed_keys": sorted(allowed),
             },
         )
     unexpected = set(value) - allowed
@@ -1643,8 +1698,8 @@ def _exact_delta_members(value: object, *, allowed: set[str], subject: str) -> M
             "guided_delta_authority_violation",
             facts={
                 "delta_member": subject,
-                "unexpected_keys": cast(JsonValue, sorted(unexpected)),
-                "allowed_keys": cast(JsonValue, sorted(allowed)),
+                "unexpected_keys": sorted(unexpected),
+                "allowed_keys": sorted(allowed),
             },
         )
     return cast(dict[str, Any], deep_thaw(value))
@@ -1671,8 +1726,8 @@ def _stable_delta_entries(
                 "guided_delta_unknown_stable_id",
                 facts={
                     "delta_member": subject,
-                    "stable_id": cast(JsonValue, stable_id if type(stable_id) is str else "invalid"),
-                    "known_stable_ids": cast(JsonValue, sorted(known_ids)),
+                    "stable_id": stable_id if type(stable_id) is str else "invalid",
+                    "known_stable_ids": sorted(known_ids),
                 },
             )
         if stable_id in entries:
@@ -1698,7 +1753,7 @@ def _require_reviewed_failure_routes(guided: GuidedSession) -> None:
     if unresolved:
         raise _guided_delta_rejection(
             "guided_delta_reviewed_failure_route_required",
-            facts={"routes": cast(JsonValue, sorted(unresolved))},
+            facts={"routes": sorted(unresolved)},
         )
 
 
@@ -1723,7 +1778,7 @@ def _incident_edges(
         if type(edge_id) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "edges", "required_keys": cast(JsonValue, ["id"])},
+                facts={"delta_member": "edges", "required_keys": ["id"]},
             )
         if edge_id in ids:
             raise _guided_delta_rejection(
@@ -1740,13 +1795,13 @@ def _incident_edges(
                 facts={
                     "delta_member": "edges",
                     "edge_id": edge_id,
-                    "required_keys": cast(JsonValue, ["edge_type", "from_node", "to_node"]),
+                    "required_keys": ["edge_type", "from_node", "to_node"],
                 },
             )
         if origin not in owners and destination not in owners:
             raise _guided_delta_rejection(
                 "guided_delta_nonincident_route",
-                facts={"edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
+                facts={"edge_id": edge_id, "incident_owners": sorted(owners)},
             )
         edges.append(
             _IncidentEdge(
@@ -1883,9 +1938,13 @@ def _merge_incident_edge_patches(
             continue
         previous = pipeline.edges[positions[edge_id]]
         if previous["from_node"] not in owners and previous["to_node"] not in owners:
+            # A different fault from the endpoints check above, under one code:
+            # the emitted edge's own endpoints are fine, its ID is what collides.
+            # Its own key keeps the two shapes apart in the repeat fingerprint
+            # and lets the prose teach them apart (elspeth-68721c71d7, final red-team).
             raise _guided_delta_rejection(
                 "guided_delta_nonincident_route",
-                facts={"edge_id": edge_id, "incident_owners": cast(JsonValue, sorted(owners))},
+                facts={"reused_edge_id": edge_id, "incident_owners": sorted(owners)},
             )
         pipeline.edges[positions[edge_id]] = cast(dict[str, Any], deep_thaw(patch.members))
 
@@ -1977,7 +2036,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted(required_members - admitted.keys())),
+                    "missing_keys": sorted(required_members - admitted.keys()),
                 },
             )
         routes = _stable_delta_entries(
@@ -1997,8 +2056,8 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "source_routes/output_targets",
-                    "missing_source_stable_ids": cast(JsonValue, sorted(source_ids - set(routes))),
-                    "missing_output_stable_ids": cast(JsonValue, sorted(output_ids - set(targets))),
+                    "missing_source_stable_ids": sorted(source_ids - set(routes)),
+                    "missing_output_stable_ids": sorted(output_ids - set(targets)),
                 },
             )
         for array_member in ("nodes", "edges"):
@@ -2040,7 +2099,7 @@ def materialize_guided_authorized_candidate(
         if set(admitted) != {"edge_patch"}:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "delta", "missing_keys": cast(JsonValue, ["edge_patch"])},
+                facts={"delta_member": "delta", "missing_keys": ["edge_patch"]},
             )
         edge_patch = _exact_delta_members(admitted["edge_patch"], allowed={"stable_id", "to_node"}, subject="edge_patch")
         stable_id = edge_patch["stable_id"] if "stable_id" in edge_patch else None
@@ -2048,12 +2107,12 @@ def materialize_guided_authorized_candidate(
         if stable_id != authority.requested.stable_id:
             raise _guided_delta_rejection(
                 "guided_delta_unknown_stable_id",
-                facts={"stable_id": cast(JsonValue, stable_id if type(stable_id) is str else "invalid")},
+                facts={"stable_id": stable_id if type(stable_id) is str else "invalid"},
             )
         if type(destination) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "edge_patch", "required_keys": cast(JsonValue, ["to_node"])},
+                facts={"delta_member": "edge_patch", "required_keys": ["to_node"]},
             )
         _apply_selected_edge_route_patch(
             predecessor,
@@ -2078,7 +2137,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"source_routes", "nodes", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"source_routes", "nodes", "edges"} - set(admitted)),
                 },
             )
         stable_ids = frozenset(
@@ -2095,7 +2154,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "source_routes",
-                    "missing_source_stable_ids": cast(JsonValue, sorted(stable_ids - set(routes))),
+                    "missing_source_stable_ids": sorted(stable_ids - set(routes)),
                 },
             )
         if type(admitted["nodes"]) is not list:
@@ -2112,41 +2171,26 @@ def materialize_guided_authorized_candidate(
         if type(route) is not str:
             raise _guided_delta_rejection(
                 "guided_delta_authority_violation",
-                facts={"delta_member": "source_routes", "required_keys": cast(JsonValue, ["on_success"])},
+                facts={"delta_member": "source_routes", "required_keys": ["on_success"]},
             )
         raw_sources[authority.owner_key]["on_success"] = route
         existing_ids = {node["id"] for node in raw_nodes}
         addition_ids: set[str] = set()
         additions: list[_AdmittedNode] = []
+        # The admitted key set is the advertised canonical node schema's,
+        # exactly as node_patch derives its own below. A hand-written literal
+        # here lagged that schema by four keys (description and the collector's
+        # scope_*), so a collector passed the Draft 2020-12 pre-check and died
+        # in this binder with unexpected_keys (elspeth-68721c71d7).
+        canonical_addition_item = cast(dict[str, Any], cast(dict[str, Any], _canonical_schema_properties()["nodes"])["items"])
+        addition_properties = cast(dict[str, Any], canonical_addition_item["properties"])
         for raw_node in admitted["nodes"]:
-            node = _exact_delta_members(
-                raw_node,
-                allowed={
-                    "id",
-                    "node_type",
-                    "plugin",
-                    "input",
-                    "on_success",
-                    "on_error",
-                    "options",
-                    "condition",
-                    "routes",
-                    "fork_to",
-                    "branches",
-                    "policy",
-                    "merge",
-                    "trigger",
-                    "output_mode",
-                    "expected_output_count",
-                    "timeout_seconds",
-                },
-                subject="nodes",
-            )
+            node = _exact_delta_members(raw_node, allowed=set(addition_properties), subject="nodes")
             node_id = node["id"] if "id" in node else None
             if type(node_id) is not str:
                 raise _guided_delta_rejection(
                     "guided_delta_authority_violation",
-                    facts={"delta_member": "nodes", "required_keys": cast(JsonValue, ["id"])},
+                    facts={"delta_member": "nodes", "required_keys": ["id"]},
                 )
             if node_id in existing_ids or node_id in addition_ids:
                 raise _guided_delta_rejection(
@@ -2172,7 +2216,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"node_patch", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"node_patch", "edges"} - set(admitted)),
                 },
             )
         canonical_nodes = cast(dict[str, Any], _canonical_schema_properties()["nodes"])
@@ -2187,8 +2231,8 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_unknown_stable_id",
                 facts={
                     "delta_member": "node_patch",
-                    "stable_id": cast(JsonValue, patched_stable_id if type(patched_stable_id) is str else "invalid"),
-                    "known_stable_ids": cast(JsonValue, [authority.requested.stable_id]),
+                    "stable_id": patched_stable_id if type(patched_stable_id) is str else "invalid",
+                    "known_stable_ids": [authority.requested.stable_id],
                 },
             )
         raw_nodes = predecessor.nodes
@@ -2220,8 +2264,8 @@ def materialize_guided_authorized_candidate(
                     "guided_delta_authority_violation",
                     facts={
                         "delta_member": "node_patch.options",
-                        "unexpected_keys": cast(JsonValue, sorted(unexpected_option_keys)),
-                        "allowed_keys": cast(JsonValue, sorted(allowed_option_keys)),
+                        "unexpected_keys": sorted(unexpected_option_keys),
+                        "allowed_keys": sorted(allowed_option_keys),
                     },
                 )
             private_options = cast(dict[str, Any], private_node["options"])
@@ -2242,7 +2286,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "delta",
-                    "missing_keys": cast(JsonValue, sorted({"output_targets", "edges"} - set(admitted))),
+                    "missing_keys": sorted({"output_targets", "edges"} - set(admitted)),
                 },
             )
         stable_ids = frozenset(
@@ -2259,7 +2303,7 @@ def materialize_guided_authorized_candidate(
                 "guided_delta_authority_violation",
                 facts={
                     "delta_member": "output_targets",
-                    "missing_output_stable_ids": cast(JsonValue, sorted(stable_ids - set(targets))),
+                    "missing_output_stable_ids": sorted(stable_ids - set(targets)),
                 },
             )
         edges = _incident_edges(admitted["edges"], owners=frozenset({authority.owner_key}))
@@ -2309,7 +2353,7 @@ def materialize_guided_authorized_candidate(
         "this reads them"
     ),
     source_param="bound",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns only the node ids, connection names, and branch connection names actually present in "
         "well-formed list/dict entries under bound['nodes']; a candidate whose 'nodes' (or a node's "
@@ -2633,7 +2677,7 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "sources",
-                    "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                    "reviewed_source_names": list(reviewed_source_names),
                 },
             )
         source_id = guided.source_order[0]
@@ -2645,8 +2689,8 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "sources",
-                    "candidate_source_names": cast(JsonValue, [candidate_source_name] if type(candidate_source_name) is str else []),
-                    "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                    "candidate_source_names": [candidate_source_name] if type(candidate_source_name) is str else [],
+                    "reviewed_source_names": list(reviewed_source_names),
                 },
             )
         raw_sources = {source.name: singular}
@@ -2658,8 +2702,8 @@ def bind_guided_reviewed_components(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "sources",
-                "candidate_source_names": cast(JsonValue, [name for name in raw_sources if type(name) is str]),
-                "reviewed_source_names": cast(JsonValue, list(reviewed_source_names)),
+                "candidate_source_names": [name for name in raw_sources if type(name) is str],
+                "reviewed_source_names": list(reviewed_source_names),
             },
         )
     rebound_sources: dict[str, GuidedBoundSource] = {}
@@ -2673,7 +2717,7 @@ def bind_guided_reviewed_components(
                 connectivity={
                     "component_kind": "sources",
                     "source_name": reviewed.name,
-                    "required_keys": cast(JsonValue, ["on_success"]),
+                    "required_keys": ["on_success"],
                 },
             )
         rebound_sources[reviewed.name] = {
@@ -2695,7 +2739,7 @@ def bind_guided_reviewed_components(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "outputs",
-                "reviewed_output_names": cast(JsonValue, list(reviewed_output_names)),
+                "reviewed_output_names": list(reviewed_output_names),
             },
         )
     expected_output_names = [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]
@@ -2716,7 +2760,7 @@ def bind_guided_reviewed_components(
             connectivity={
                 "component_kind": "outputs",
                 "candidate_output_count": len(raw_outputs),
-                "reviewed_output_names": cast(JsonValue, list(reviewed_output_names)),
+                "reviewed_output_names": list(reviewed_output_names),
             },
         )
     node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
@@ -2748,7 +2792,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate output aliases collide with sibling outputs or topology names",
             error_code="guided_output_alias_collision",
-            connectivity={"colliding_aliases": cast(JsonValue, sorted(colliding_aliases))},
+            connectivity={"colliding_aliases": sorted(colliding_aliases)},
         )
     # The reverse direction: reviewed sink NAMES are provider-visible, but nothing
     # stops the planner authoring a node id / connection / branch value equal to one.
@@ -2768,7 +2812,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate topology names shadow reviewed sink names",
             error_code="guided_reviewed_name_shadowed",
-            connectivity={"shadowed_reviewed_names": cast(JsonValue, shadowed_reviewed_names)},
+            connectivity={"shadowed_reviewed_names": shadowed_reviewed_names},
         )
     output_rename: dict[str, str] = {}
     rebound_outputs: list[GuidedBoundOutput] = []
@@ -2845,7 +2889,7 @@ def bind_guided_reviewed_components(
                 error_code="guided_delta_authority_violation",
                 connectivity={
                     "component_kind": "nodes",
-                    "predecessor_node_ids": cast(JsonValue, list(predecessor_node_ids)),
+                    "predecessor_node_ids": list(predecessor_node_ids),
                 },
             )
         selected_node_id = correction_target.owner_key if correction_target.owner_kind == "node" else None
@@ -2867,7 +2911,7 @@ def bind_guided_reviewed_components(
                         "node_id": private_node_id,
                         "node_occurrences": len(positions),
                         "selected_node": selected,
-                        "predecessor_node_ids": cast(JsonValue, list(predecessor_node_ids)),
+                        "predecessor_node_ids": list(predecessor_node_ids),
                     },
                 )
             position = positions[0]
@@ -2916,7 +2960,7 @@ def bind_guided_reviewed_components(
         raise GuidedCandidateBindingRejected(
             "guided planner candidate exact projection omits reviewed output fields",
             error_code=projection_conflict.error_code,
-            connectivity={"missing_fields": cast(JsonValue, list(projection_conflict.missing_fields))},
+            connectivity={"missing_fields": list(projection_conflict.missing_fields)},
         )
     # Residual dangling sink references. Observed planner slip: the outputs
     # and edges use the reviewed name correctly, but one stale invented name
@@ -3003,9 +3047,9 @@ def bind_guided_reviewed_components(
             "guided planner candidate routing references unknown destinations",
             error_code="guided_route_target_unknown",
             connectivity={
-                "dangling_references": cast(JsonValue, sorted(dangling_references)),
-                "declared_sinks": cast(JsonValue, sorted(expected_output_names)),
-                "consumable_connections": cast(JsonValue, sorted(candidate_consumable_connections)),
+                "dangling_references": sorted(dangling_references),
+                "declared_sinks": sorted(expected_output_names),
+                "consumable_connections": sorted(candidate_consumable_connections),
             },
         )
     # scope_opener is a planner-authored NODE reference (not a connection), so
@@ -3036,13 +3080,34 @@ def bind_guided_reviewed_components(
             # the routing facts above.
             connectivity={
                 "component_kind": "nodes",
-                "dangling_scope_openers": cast(JsonValue, sorted(dangling_scope_openers)),
-                "candidate_node_ids": cast(JsonValue, sorted(node_ids)),
+                "dangling_scope_openers": sorted(dangling_scope_openers),
+                "candidate_node_ids": sorted(node_ids),
             },
         )
     return cast(GuidedBoundPipeline, bound)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided-planner LLM-authored prose-revision candidate pipeline (the terminal set_pipeline tool call's "
+        "topology), after server-side deep_thaw and before reviewed source/output authority is restored"
+    ),
+    source_param="pipeline",
+    suppresses=("R1",),
+    invariant=(
+        "raises GuidedCandidateBindingRejected for a candidate that cannot be bound to reviewed authority — a "
+        "non-list 'nodes' collection here, or any inner-binder rejection (unknown route target, unbindable "
+        "source/output identity) — and in amend mode returns a GuidedRevisionBindingResult whose closed "
+        "rejection_code and per-breach violations record every malformed node entry (non-dict, or missing a "
+        "string 'id'), removal, duplication, substitution, protected-field change, or rewiring outside the "
+        "insertion ports; never silently drops a candidate node or invents authority"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_bind_reviewed_components.py::test_prose_binder_non_list_nodes_names_the_predecessor_node_ids"
+    ),
+    test_fingerprint="9ca0daf1336e8f654240420ef2eea9a421a8bd2692ddb8bbea53afec21cb24c7",
+)
 def bind_guided_prose_revision_candidate(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -3097,32 +3162,38 @@ def bind_guided_prose_revision_candidate(
             error_code="guided_delta_authority_violation",
             connectivity={
                 "component_kind": "nodes",
-                "predecessor_node_ids": cast(JsonValue, [node["id"] for node in predecessor_nodes]),
+                "predecessor_node_ids": [node["id"] for node in predecessor_nodes],
             },
         )
 
-    candidate_nodes = [node for node in raw_nodes if type(node) is dict]
+    # A node entry that is not a dict carrying a string ``id`` cannot be
+    # adjudicated against predecessor authority at all; classifying it as
+    # "added" would silently launder it past the amend contract, so it is
+    # excluded here and recorded below as ``node_entry_malformed``.
+    candidate_nodes = [node for node in raw_nodes if type(node) is dict and type(node.get("id")) is str]
     malformed_node = len(candidate_nodes) != len(raw_nodes)
     added_nodes = [node for node in candidate_nodes if node.get("id") not in predecessor_by_id]
 
     def connection_values(node: Mapping[str, Any]) -> set[str]:
-        values: set[str] = set()
-        node_id = node.get("id")
-        if type(node_id) is str:
-            values.add(node_id)
-        for key in ("input", "on_success"):
-            value = node.get(key)
-            if type(value) is str:
-                values.add(value)
-        for key in ("routes", "branches"):
-            value = node.get(key)
-            if isinstance(value, Mapping):
-                values.update(item for item in value.values() if type(item) is str)
-            elif type(value) is list:
-                values.update(item for item in value if type(item) is str)
-        fork_to = node.get("fork_to")
-        if type(fork_to) is list:
-            values.update(item for item in fork_to if type(item) is str)
+        """Routing names of one serialized predecessor node.
+
+        ``predecessor_dict`` is ``CompositionState.to_dict()`` output — an
+        owned Tier-1 contract: ``id`` and ``input`` are always-present
+        strings, ``on_success`` is ``str | None``, and ``routes`` /
+        ``branches`` / ``fork_to`` are serialized (with string members) only
+        when authored. Every read is therefore direct, so corruption of owned
+        state crashes instead of silently shrinking the harvested set.
+        """
+        values: set[str] = {node["id"], node["input"]}
+        if node["on_success"] is not None:
+            values.add(node["on_success"])
+        if "routes" in node:
+            values.update(node["routes"].values())
+        if "branches" in node:
+            branches = node["branches"]
+            values.update(branches.values() if type(branches) is dict else branches)
+        if "fork_to" in node:
+            values.update(node["fork_to"])
         return values
 
     predecessor_connections = {
@@ -3162,8 +3233,8 @@ def bind_guided_prose_revision_candidate(
     if candidate_existing_order != predecessor_order:
         _record(
             "existing_node_order_changed",
-            candidate_order=cast(JsonValue, list(candidate_existing_order)),
-            predecessor_order=cast(JsonValue, list(predecessor_order)),
+            candidate_order=list(candidate_existing_order),
+            predecessor_order=list(predecessor_order),
         )
     rebuilt_by_id: dict[str, dict[str, Any]] = {}
     for private_node in predecessor_nodes:
@@ -3174,9 +3245,13 @@ def bind_guided_prose_revision_candidate(
             rebuilt_by_id[node_id] = cast(dict[str, Any], deep_thaw(private_node))
             continue
         candidate_node = matches[0]
-        if candidate_node.get("node_type") != private_node.get("node_type"):
+        # Owned side reads directly: ``node_type`` and ``plugin`` are always
+        # present on a serialized predecessor node, so a candidate that omits
+        # either compares unequal and is recorded instead of two absences
+        # silently agreeing.
+        if candidate_node.get("node_type") != private_node["node_type"]:
             _record("node_type_changed", node_id=node_id)
-        if "plugin" in candidate_node and candidate_node.get("plugin") != private_node.get("plugin"):
+        if "plugin" in candidate_node and candidate_node.get("plugin") != private_node["plugin"]:
             _record("node_plugin_changed", node_id=node_id)
         unexpected_keys = set(candidate_node) - set(private_node)
         if unexpected_keys:
@@ -3193,7 +3268,7 @@ def bind_guided_prose_revision_candidate(
             if rewiring_key not in candidate_node:
                 continue
             candidate_value = candidate_node[rewiring_key]
-            if candidate_value == private_node.get(rewiring_key):
+            if candidate_value == private_node[rewiring_key]:
                 continue
             if type(candidate_value) is str and candidate_value in insertion_connections:
                 rebuilt[rewiring_key] = candidate_value
@@ -3279,10 +3354,21 @@ def require_guided_prose_revision_successor(
     predecessor = authority.predecessor
     if authority.mode == "amend":
         successor_nodes = {node["id"]: node for node in successor.to_dict()["nodes"]}
-        bound_nodes = {node["id"]: node for node in binding.pipeline["nodes"] if type(node) is dict and type(node.get("id")) is str}
+        # A successful amend binding guarantees every emitted node is a dict
+        # carrying a string ``id``: the binder excludes and records anything
+        # else as ``node_entry_malformed``, and the rejection_code gate above
+        # has already raised for such a candidate. Index directly so residual
+        # corruption crashes instead of being filtered out of the comparison.
+        bound_nodes = {node["id"]: node for node in binding.pipeline["nodes"]}
         for predecessor_node in predecessor.to_dict()["nodes"]:
             node_id = predecessor_node["id"]
-            if successor_nodes.get(node_id) != bound_nodes.get(node_id):
+            # A clean amend binding proves every predecessor node id resolves
+            # in both indexes: the binder records a missing or duplicated
+            # emission as a violation (raised above), and its reconstruction
+            # re-emits every predecessor node. Absence here is corruption of
+            # owned state and crashes as KeyError rather than comparing two
+            # silent Nones equal.
+            if successor_nodes[node_id] != bound_nodes[node_id]:
                 raise AuditIntegrityError("guided prose revision successor differs from bound node authority")
     if set(successor.sources) != set(predecessor.sources):
         raise AuditIntegrityError("guided prose revision successor changed reviewed source identity")
@@ -3412,6 +3498,25 @@ def _ordered_gate_routes(node: NodeSpec) -> tuple[tuple[str, str], ...]:
         *((name, destination) for name, destination in routes if destination != "fork"),
         *((name, destination) for name, destination in routes if destination == "fork"),
     )
+
+
+def _gate_route_aliases(
+    node: NodeSpec,
+    *,
+    node_ids: Mapping[str, str],
+    route_aliases: Mapping[tuple[str, str], str],
+) -> dict[str, str]:
+    """Return one gate's route-key to structural-ordinal alias map.
+
+    The single reading of the topology's ``(component identity, route)`` alias
+    table for a gate. ``_guided_projection_topology`` uses it to stamp each
+    outgoing flow and :func:`_projection_node_behaviors` uses it to build the
+    gate's behavior, so a gate's flows and its published ``route_aliases``
+    cannot name a route differently.
+    """
+
+    assert node.node_type == "gate"
+    return {route: route_aliases[(node_ids[node.id], route)] for route, _destination in _ordered_gate_routes(node)}
 
 
 def _node_behavior(
@@ -3551,33 +3656,30 @@ def _projection_ids_from_payload(payload: Mapping[str, Any]) -> tuple[list[str],
     return cast(list[str], node_ids), cast(list[str], edge_ids)
 
 
-def _build_projection(
-    *,
-    proposal_id: UUID,
-    proposal: PipelineProposal,
-    guided: GuidedSession,
-    catalog_plugin_ids: Mapping[str, frozenset[str]],
-    node_stable_ids: Sequence[str] | None,
-    edge_stable_ids: Sequence[str] | None,
-) -> ProposePipelinePayload:
-    state = _state_from_proposal(proposal)
-    if [state.sources[name].plugin for name in state.sources] != [
-        guided.reviewed_sources[stable_id].plugin for stable_id in guided.source_order
-    ]:
-        raise AuditIntegrityError("guided proposal sources differ from reviewed authority")
-    if [output.plugin for output in state.outputs] != [guided.reviewed_outputs[stable_id].plugin for stable_id in guided.output_order]:
-        raise AuditIntegrityError("guided proposal outputs differ from reviewed authority")
-    if list(state.sources) != [guided.reviewed_sources[stable_id].name for stable_id in guided.source_order]:
-        raise AuditIntegrityError("guided proposal source names differ from reviewed authority")
-    if [output.name for output in state.outputs] != [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]:
-        raise AuditIntegrityError("guided proposal output names differ from reviewed authority")
+# The ordered ``(from_endpoint, to_endpoint, flow)`` triples the public
+# ``graph.edges`` — and, through them, the CONFIRM_WIRING ``connections`` —
+# are minted from. Mutable dicts by design: the edges carry them onto the wire
+# payload, which must stay JSON-serialisable.
+type _GuidedProjectionEdgeSpecs = tuple[tuple[dict[str, str], dict[str, str], dict[str, object]], ...]
 
-    resolved_node_ids = list(node_stable_ids or (str(uuid4()) for _ in state.nodes))
-    if len(resolved_node_ids) != len(state.nodes):
-        raise AuditIntegrityError("guided proposal projection node stable-id count mismatch")
-    node_ids = {node.id: resolved_node_ids[index] for index, node in enumerate(state.nodes)}
-    source_ids = {name: guided.source_order[index] for index, name in enumerate(state.sources)}
-    output_ids = {output.name: guided.output_order[index] for index, output in enumerate(state.outputs)}
+
+def _guided_projection_topology(
+    state: CompositionState,
+    *,
+    source_ids: Mapping[str, str],
+    node_ids: Mapping[str, str],
+    output_ids: Mapping[str, str],
+) -> tuple[_GuidedProjectionEdgeSpecs, Mapping[tuple[str, str], str], Mapping[str, str]]:
+    """Derive the ordered public edge specs and structural aliases for *state*.
+
+    Returns ``(edge_specs, route_aliases, branch_aliases)`` — the topology half
+    of the guided proposal projection, with the component identities supplied
+    by the caller rather than assumed. :func:`_build_projection` passes
+    per-projection stable IDs; :func:`guided_structure_projection` passes the
+    deterministic ordinal labels. Both therefore read ONE authority for what
+    connects to what, so the post-commit parity gate cannot drift away from the
+    projection it is gating.
+    """
 
     route_keys: list[tuple[str, str]] = []
     branch_names: list[str] = []
@@ -3614,10 +3716,6 @@ def _build_projection(
         for branch_key, branch_value in branch_pairs:
             if type(branch_value) is str and branch_value and branch_key in branch_aliases:
                 barrier_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
-
-    def gate_route_aliases(node: NodeSpec) -> dict[str, str]:
-        assert node.node_type == "gate"
-        return {route: route_aliases[(node_ids[node.id], route)] for route, _destination in _ordered_gate_routes(node)}
 
     try:
         consumers = canonical_connection_consumers(
@@ -3681,7 +3779,7 @@ def _build_projection(
         origin = _endpoint("node", node_ids[node.id])
         if node.node_type == "gate":
             routes = _ordered_gate_routes(node)
-            node_route_aliases = gate_route_aliases(node)
+            node_route_aliases = _gate_route_aliases(node, node_ids=node_ids, route_aliases=route_aliases)
             fork_routes = [name for name, destination in routes if destination == "fork"]
             for route, destination in routes:
                 if destination == "fork":
@@ -3715,6 +3813,8 @@ def _build_projection(
             add_targets(origin, node.on_success, {"kind": "coalesce_success", "branch": None})
         elif node.node_type == "row_union":
             add_targets(origin, node.on_success, {"kind": "row_union_success", "branch": None})
+        elif node.node_type == "collector":
+            add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
         else:
             add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
             add_targets(origin, node.on_error, {"kind": "node_error"})
@@ -3750,18 +3850,35 @@ def _build_projection(
         for index, spec in zip(positions, ordered, strict=True):
             edge_specs[index] = spec
 
-    resolved_edge_ids = list(edge_stable_ids or (str(uuid4()) for _ in edge_specs))
-    if len(resolved_edge_ids) != len(edge_specs):
-        raise AuditIntegrityError("guided proposal projection edge stable-id count mismatch")
-    edges: list[dict[str, Any]] = [
-        {
-            "stable_id": resolved_edge_ids[index],
-            "from_endpoint": origin,
-            "to_endpoint": destination,
-            "flow": flow,
-        }
-        for index, (origin, destination, flow) in enumerate(edge_specs)
-    ]
+    return tuple(edge_specs), route_aliases, branch_aliases
+
+
+def _projection_node_behaviors(
+    state: CompositionState,
+    *,
+    node_ids: Mapping[str, str],
+    route_aliases: Mapping[tuple[str, str], str],
+    branch_aliases: Mapping[str, str],
+    edge_specs: _GuidedProjectionEdgeSpecs,
+) -> tuple[dict[str, object], ...]:
+    """Return one behavior projection per node, in ``state.nodes`` order.
+
+    The single derivation of the per-node ``behavior`` mapping. The public
+    proposal projection publishes it verbatim, the CONFIRM_WIRING record
+    republishes that same mapping (``emitters._build_wire_projection`` copies
+    ``public["behavior"]``), and the post-commit parity gate recomputes it from
+    the live head through this same function — so the gate cannot compare a
+    behavior the projection would not have published.
+
+    ``node_ids`` supplies the component identities: per-projection stable IDs
+    for :func:`_build_projection`, deterministic ordinal labels for
+    :func:`guided_structure_projection`. Every other value a behavior carries
+    is either an authored ``NodeSpec`` field or a structural ordinal alias,
+    both identity-independent; the collector's ``opener_stable_id`` is the one
+    component identity inside a behavior, which is why the gate rewrites it
+    through :func:`guided_structure_facts` before comparing.
+    """
+
     # Branch aliases carried by each correlated barrier's incoming edges, in edge_specs
     # (= wire-edge = validator ``incoming_edges``) order. A barrier's behavior
     # branch_aliases is derived from THIS so it equals its incoming flows by
@@ -3779,32 +3896,92 @@ def _build_projection(
             if destination_id not in barrier_incoming_branch_aliases:
                 barrier_incoming_branch_aliases[destination_id] = []
             barrier_incoming_branch_aliases[destination_id].append(branch_alias)
+    return tuple(
+        _node_behavior(
+            node,
+            route_aliases=(_gate_route_aliases(node, node_ids=node_ids, route_aliases=route_aliases) if node.node_type == "gate" else {}),
+            branch_aliases=branch_aliases,
+            barrier_incoming_aliases=(
+                barrier_incoming_branch_aliases[node_ids[node.id]]
+                if node.node_type in ("coalesce", "row_union") and node_ids[node.id] in barrier_incoming_branch_aliases
+                else None
+            ),
+            # The opener is projected by the component identity this projection
+            # already advertises for it; an unresolvable opener fails typed
+            # inside _node_behavior (sealing requires a candidate the binder and
+            # validators accepted, so the miss is a server-side integrity
+            # failure, not a planner error).
+            collector_opener_stable_id=(
+                node_ids[node.scope_opener]
+                if node.node_type == "collector" and node.scope_opener is not None and node.scope_opener in node_ids
+                else None
+            ),
+        )
+        for node in state.nodes
+    )
+
+
+def _build_projection(
+    *,
+    proposal_id: UUID,
+    proposal: PipelineProposal,
+    guided: GuidedSession,
+    catalog_plugin_ids: Mapping[str, frozenset[str]],
+    node_stable_ids: Sequence[str] | None,
+    edge_stable_ids: Sequence[str] | None,
+) -> ProposePipelinePayload:
+    state = _state_from_proposal(proposal)
+    if [state.sources[name].plugin for name in state.sources] != [
+        guided.reviewed_sources[stable_id].plugin for stable_id in guided.source_order
+    ]:
+        raise AuditIntegrityError("guided proposal sources differ from reviewed authority")
+    if [output.plugin for output in state.outputs] != [guided.reviewed_outputs[stable_id].plugin for stable_id in guided.output_order]:
+        raise AuditIntegrityError("guided proposal outputs differ from reviewed authority")
+    if list(state.sources) != [guided.reviewed_sources[stable_id].name for stable_id in guided.source_order]:
+        raise AuditIntegrityError("guided proposal source names differ from reviewed authority")
+    if [output.name for output in state.outputs] != [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]:
+        raise AuditIntegrityError("guided proposal output names differ from reviewed authority")
+
+    resolved_node_ids = list(node_stable_ids or (str(uuid4()) for _ in state.nodes))
+    if len(resolved_node_ids) != len(state.nodes):
+        raise AuditIntegrityError("guided proposal projection node stable-id count mismatch")
+    node_ids = {node.id: resolved_node_ids[index] for index, node in enumerate(state.nodes)}
+    source_ids = {name: guided.source_order[index] for index, name in enumerate(state.sources)}
+    output_ids = {output.name: guided.output_order[index] for index, output in enumerate(state.outputs)}
+
+    edge_specs, route_aliases, branch_aliases = _guided_projection_topology(
+        state,
+        source_ids=source_ids,
+        node_ids=node_ids,
+        output_ids=output_ids,
+    )
+
+    resolved_edge_ids = list(edge_stable_ids or (str(uuid4()) for _ in edge_specs))
+    if len(resolved_edge_ids) != len(edge_specs):
+        raise AuditIntegrityError("guided proposal projection edge stable-id count mismatch")
+    edges: list[dict[str, Any]] = [
+        {
+            "stable_id": resolved_edge_ids[index],
+            "from_endpoint": origin,
+            "to_endpoint": destination,
+            "flow": flow,
+        }
+        for index, (origin, destination, flow) in enumerate(edge_specs)
+    ]
+    behaviors = _projection_node_behaviors(
+        state,
+        node_ids=node_ids,
+        route_aliases=route_aliases,
+        branch_aliases=branch_aliases,
+        edge_specs=edge_specs,
+    )
     nodes: list[dict[str, Any]] = [
         {
             "stable_id": node_ids[node.id],
             "label": proposal_component_label("node", index),
             "node_type": node.node_type,
             "plugin": ({"kind": "transform", "id": node.plugin} if node.plugin is not None else None),
-            "behavior": _node_behavior(
-                node,
-                route_aliases=gate_route_aliases(node) if node.node_type == "gate" else {},
-                branch_aliases=branch_aliases,
-                barrier_incoming_aliases=(
-                    barrier_incoming_branch_aliases[node_ids[node.id]]
-                    if node.node_type in ("coalesce", "row_union") and node_ids[node.id] in barrier_incoming_branch_aliases
-                    else None
-                ),
-                # The opener is projected by the stable id this projection
-                # already advertises for it; an unresolvable opener fails
-                # typed inside _node_behavior (sealing requires a candidate
-                # the binder and validators accepted, so the miss is a
-                # server-side integrity failure, not a planner error).
-                collector_opener_stable_id=(
-                    node_ids[node.scope_opener]
-                    if node.node_type == "collector" and node.scope_opener is not None and node.scope_opener in node_ids
-                    else None
-                ),
-            ),
+            "behavior": behaviors[index],
             # Allowlisted key options as display text (R2-F3). Same closed
             # server-owned vocabulary the wire review projects, so the proposal
             # card and the wiring card describe a node identically.
@@ -3945,6 +4122,389 @@ def build_guided_proposal_projection(
     )
 
 
+# One fact mapping flattened into a hashable, order-independent tuple of
+# ``(key, canonical value)`` pairs. Nested mappings become the same shape and
+# nested sequences become tuples, so a projection built in memory and the same
+# record read back out of the JSON payload store compare equal.
+#
+# Every level of the guided structure projection is this ONE shape — a
+# component, a connection, a behavior, a flow — and every fact inside it is
+# NAMED. That is not cosmetic: the post-commit chat gate's durable guard
+# partitions the keys the committed system projection publishes into "compared
+# by the gate" and "time-qualified", and it can only do that if the compared
+# side exposes its fact NAMES rather than a positional tuple whose meaning
+# lives in a docstring.
+type GuidedStructureFacts = tuple[tuple[str, object], ...]
+# One component of the ordinal-label structure a guided wire review advertises.
+# Keys are named to MATCH the committed system projection
+# (``chat_solver._guided_advisory_graph_projection``) one for one — ``kind``,
+# ``alias``, ``plugin``, plus ``node_type``/``behavior``/
+# ``structured_output_fields`` on a node, ``row_cardinality`` on a source and
+# ``business_schema`` on an output — so the guard compares like with like.
+type GuidedStructureComponent = GuidedStructureFacts
+# One connection, keyed ``alias``/``from_alias``/``to_alias``/``flow`` for the
+# same reason. ``to_alias`` is None for the discard endpoint, which names no
+# component.
+type GuidedStructureConnection = GuidedStructureFacts
+type GuidedStructureProjection = tuple[tuple[GuidedStructureComponent, ...], tuple[GuidedStructureConnection, ...]]
+
+
+class GuidedStructureUnprojectable(Exception):
+    """A composition state has no guided ordinal structure at all.
+
+    Raised — never returned as a partial or best-effort projection — when the
+    state carries more components than the bounded label range, a connection
+    with no canonical consumer, a barrier whose branches do not pair, or a
+    behavior naming a component this graph does not contain. It is
+    deliberately NOT an ``AuditIntegrityError``: nothing is corrupt, the state
+    simply is not one a guided wire review could have been built from, which
+    for the caller is indistinguishable from ordinary structural drift.
+    """
+
+
+# Authored SETTING values a committed build's untrusted-literal block must not
+# republish (review round 1, 2026-09-03). An options- or literal-only write
+# under a completed session — an interpretation Accept rewriting
+# ``prompt_template``, which the design REQUIRES be admitted — leaves these
+# literals in the frozen wire record describing values the live pipeline no
+# longer has. They are withheld and the context says so rather than quoting a
+# stale one.
+#
+# Keyed on the names the user-role authored-literal RECORD uses
+# (``chat_solver._GuidedAdvisoryAuthoredBehavior``), which is also why this
+# constant lives here rather than beside its only reader: it is the authority
+# the drift gate below SUBTRACTS from, and ``chat_solver`` already imports this
+# module transitively, so the dependency can only run this way.
+GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS: Final = frozenset(
+    {
+        "predicate",
+        "routes",
+        "option_summaries",
+        "count",
+        "timeout_seconds",
+        "expected_output_count",
+    }
+)
+# The record names above, mapped onto the BEHAVIOR mapping ``_node_behavior``
+# builds. Exactly two need it, and both are documented here because this is the
+# one place a reader can see the two vocabularies side by side:
+#
+# * ``predicate`` is the record's name for behavior ``condition``.
+# * ``option_summaries`` has NO behavior counterpart at all — it is minted from
+#   ``node_options_summary`` (authored plugin options), not from the behavior.
+#
+# Every other withheld name is spelled identically in both.
+_GUIDED_WITHHELD_RECORD_KEY_BEHAVIOR_NAMES: Final[Mapping[str, str | None]] = {
+    "predicate": "condition",
+    "option_summaries": None,
+}
+# Behavior keys the committed system projection publishes ANYWAY, under another
+# name, and which therefore must stay inside the gate even though the authored
+# record withholds them. ``expected_output_count`` rides at SYSTEM authority
+# inside an aggregation's ``row_cardinality``
+# (``emitters._node_cardinality``: ``output='expected_count'`` exactly when it
+# is set), so a chat admitted while it moved would state a current cardinality
+# that is false.
+_GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE: Final = frozenset({"expected_output_count"})
+# Behavior keys the post-commit drift gate does NOT compare, DERIVED from the
+# withheld-literal authority above rather than re-enumerated. Deriving is the
+# whole point: a new behavior key participates in the gate by default, and only
+# a key someone deliberately added to the withheld set — and did not publish
+# elsewhere — drops out. Re-listing the published vocabulary here instead is
+# what let ST-RT-5 happen.
+#
+# Scoped to BEHAVIOR only, never to flows: a gate_fork FLOW's ``routes`` list
+# IS published at system authority
+# (``chat_solver._guided_advisory_safe_flow``) while a gate BEHAVIOR's
+# ``routes`` alias/key pairs are withheld, so a blanket key-name exclusion
+# would blind the gate to a published fact.
+GUIDED_UNCOMPARED_BEHAVIOR_KEYS: Final[frozenset[str]] = frozenset(
+    behavior_key
+    for behavior_key in (
+        # Membership, not ``.get`` with a default: a record name that IS mapped
+        # can map to None ("no behavior counterpart"), so a default would make
+        # "unmapped" and "mapped to nothing" the same answer.
+        _GUIDED_WITHHELD_RECORD_KEY_BEHAVIOR_NAMES[key] if key in _GUIDED_WITHHELD_RECORD_KEY_BEHAVIOR_NAMES else key
+        for key in GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS - _GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE
+    )
+    if behavior_key is not None
+)
+
+
+# Behavior keys whose value is a COMPONENT identity rather than a structural
+# ordinal. The live projection identifies components by ordinal label and the
+# frozen wire record identifies them by per-projection stable ID, so this is
+# the one value that has to be rewritten through the caller's component map
+# before the two halves can be compared. Matched at every mapping depth, so a
+# future behavior arm nesting a component identity is covered by construction
+# rather than by remembering to widen this set.
+_GUIDED_STRUCTURE_COMPONENT_ID_KEYS: Final = frozenset({"opener_stable_id"})
+
+
+def _canonical_structure_fact(
+    value: Any,
+    *,
+    key: str | None,
+    label_by_component_id: Mapping[str, str],
+) -> object:
+    if key in _GUIDED_STRUCTURE_COMPONENT_ID_KEYS:
+        if type(value) is not str or value not in label_by_component_id:
+            raise GuidedStructureUnprojectable("guided structure facts name a component this graph does not contain")
+        return label_by_component_id[value]
+    # Exact types, not ``isinstance``: ``guided_structure_facts`` has already
+    # run ``deep_thaw`` over the whole mapping, so every container reaching here
+    # is a plain ``dict`` or ``list`` whichever half called in — a mapping proxy
+    # or a tuple cannot arrive. Anything else is a scalar the closed
+    # behavior/flow vocabulary carries verbatim.
+    if type(value) is dict:
+        return tuple(
+            (name, _canonical_structure_fact(value[name], key=name, label_by_component_id=label_by_component_id)) for name in sorted(value)
+        )
+    if type(value) is list:
+        return tuple(_canonical_structure_fact(item, key=None, label_by_component_id=label_by_component_id) for item in value)
+    return value
+
+
+def guided_structure_facts(
+    facts: Mapping[str, Any],
+    *,
+    label_by_component_id: Mapping[str, str],
+) -> GuidedStructureFacts:
+    """Canonicalise one component or connection mapping for the post-commit gate.
+
+    The single normalisation both halves of the gate run, over one whole
+    component (its identity plus its nested ``behavior``) or one whole
+    connection (its endpoints plus its nested ``flow``): the live projection
+    feeds it what :func:`guided_structure_projection` just derived, and the
+    mirror feeds it the same facts read back out of the frozen CONFIRM_WIRING
+    record. Because it enumerates no vocabulary — every key present is compared,
+    whatever it is — a fact cannot be published on one side and silently dropped
+    on the other, and a future behavior arm participates without an edit here.
+    The ONE subtraction is applied by the caller before nesting, in
+    :func:`guided_structure_compared_behavior`, so it cannot reach a flow.
+
+    Two deliberate normalisations make the round trip exact:
+
+    * ``deep_thaw`` runs FIRST and in exactly one place, then containers are
+      flattened to sorted tuples. The projection builds behaviors with plain
+      ``dict``/``list`` members while the durable record arrives frozen
+      (``PreparedGuidedJsonPayload`` runs ``freeze_fields``, so mapping proxies
+      holding tuples) — thawing collapses both onto one representation before
+      anything is compared, and the flattening makes key order irrelevant.
+      Absence is preserved as absence — a missing key is simply not in the
+      tuple — because ``validate_payload`` and the review surfaces both read the
+      optional members of a behavior/flow by membership, never by defaulting to
+      None.
+    * ``_GUIDED_STRUCTURE_COMPONENT_ID_KEYS`` values are rewritten through
+      *label_by_component_id*, the caller's map of the component identities it
+      uses onto ordinal labels. An identity the map does not contain raises
+      :class:`GuidedStructureUnprojectable` rather than comparing unequal by
+      accident, keeping the gate fail-closed on either side.
+
+    Every key read here is proved present and typed before it arrives: on the
+    projection side by construction, and on the mirror side by
+    ``_validate_wire_payload`` (protocol.py — ``node_keys`` at :1741 proves
+    ``behavior`` and ``_validate_node_behavior`` proves each arm's exact key
+    set, ``connection_keys`` at :1825 proves ``flow`` and
+    ``_validate_proposal_flow`` its members). This is a read of an
+    already-verified owned record, so it adds no trust boundary.
+    """
+
+    return cast(
+        GuidedStructureFacts,
+        _canonical_structure_fact(deep_thaw(facts), key=None, label_by_component_id=label_by_component_id),
+    )
+
+
+def guided_structure_compared_behavior(behavior: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the members of one node BEHAVIOR the post-commit gate compares.
+
+    Both halves of the gate call this for a behavior and NOTHING for a flow,
+    which is the whole of the scoping rule: ``routes`` names a withheld
+    alias/key table on a gate BEHAVIOR and a published route list on a gate_fork
+    FLOW (``chat_solver._guided_advisory_safe_flow``), so excluding it by key
+    name alone would blind the gate to a fact the system projection publishes.
+
+    Subtracting :data:`GUIDED_UNCOMPARED_BEHAVIOR_KEYS` — rather than listing
+    what to keep — is what stops the gate refusing a legitimate post-commit
+    edit. A committed build publishes none of those keys: the system projection
+    never carried them (``chat_solver._guided_advisory_safe_behavior``), and the
+    user-role literal record drops them
+    (``chat_solver._guided_committed_authored_records``), while the opener tells
+    the model outright that those authored settings "can be rewritten after
+    confirmation without changing the structure above". Comparing them anyway
+    made exactly that promised edit refuse the chat permanently.
+
+    The result is a plain mapping, not canonical facts: it is nested inside the
+    component mapping and canonicalised with it, so a behavior member naming a
+    component identity is still rewritten by the one canonicaliser.
+    """
+
+    return {key: value for key, value in behavior.items() if key not in GUIDED_UNCOMPARED_BEHAVIOR_KEYS}
+
+
+def guided_structure_projection(state: CompositionState) -> GuidedStructureProjection:
+    """Project *state* onto the ordinal-label structure a wire review carries.
+
+    This is the subset of the committed wire record a completed session's chat
+    context publishes to the model as CURRENT system fact — per-component
+    identity, ``behavior``, ``structured_output_fields``, ``business_schema``
+    and a source's ``row_cardinality``, plus every connection's endpoint pair
+    and ``flow`` — expressed in the deterministic ordinal labels rather than the
+    per-projection stable IDs, so it can be recomputed from a live composition
+    state long after the proposal's IDs are gone. The connection half comes from
+    :func:`_guided_projection_topology`, the same derivation the public
+    projection mints ``graph.edges`` from, and the behavior half from
+    :func:`_projection_node_behaviors`, the same derivation it mints
+    ``nodes[].behavior`` from, so neither can drift apart.
+
+    THE RULE the whole gate serves: a fact is published to the model as a
+    CURRENT fact only if this comparison covers it, and every other published
+    fact is time-qualified as recorded at confirmation. There is no third
+    category, and ``test_guided_structure_projection`` pins the partition
+    mechanically in BOTH directions — a published fact needs a compare-or-
+    qualify verdict, and a fact compared here but NOT published needs a
+    registered reason, because comparing more than is published refuses a
+    completed-session chat on a pipeline that never drifted (RT2-F2).
+
+    What that means key by key:
+
+    * ``behavior`` is compared whole, minus
+      :data:`GUIDED_UNCOMPARED_BEHAVIOR_KEYS` — see
+      :func:`guided_structure_behavior_facts`. Enumerating no vocabulary is
+      deliberate: a future behavior arm joins the gate by default instead of
+      falling silently outside it (ST-RT-5).
+    * ``flow`` is compared whole, with no exclusion at all.
+    * ``structured_output_fields`` and ``business_schema`` are re-derived
+      through the SAME emitter helpers the wire record was frozen with
+      (``emitters._structured_output_fields`` at :800,
+      ``emitters._wire_schema`` at :815). Both are pure functions of authored
+      head options with no lowering dependency, so a ``patch_node_options`` /
+      ``patch_output_options`` write that moves one is drift the gate can see
+      (RT-2).
+    * A source's ``row_cardinality`` is re-derived through
+      ``emitters._source_cardinality`` (:741), a total function of the source
+      plugin alone.
+    * A NON-transform node's ``row_cardinality`` is not re-derived here and does
+      not need to be: ``emitters._node_cardinality`` returns it from
+      ``node_type`` plus ``expected_output_count``, both of which this
+      comparison carries. Calling that helper for those arms would mean handing
+      it an ``executable_node`` this side does not have, and a future arm that
+      began reading one would then compare a plausible-but-wrong value against
+      the real frozen one and refuse every unchanged pipeline of that kind. The
+      guard test proves the dependency instead, and proves it against the
+      emitter's own arms rather than by observing a corpus: every non-transform
+      arm is called with two different lowered stand-ins and with a node
+      carrying nothing but those two facts, so an arm that starts reading
+      anything else fails there.
+
+    Two published fact families stay OUTSIDE this comparison and are TIME-QUALIFIED
+    in the projection instead (``chat_solver`` renames them to
+    ``row_cardinality_at_confirmation`` / ``schema_contract_at_confirmation``):
+    a TRANSFORM node's ``row_cardinality`` and every connection's
+    ``schema_contract``. Both are frozen from the LOWERED executable state and
+    its validation summary (``guided.py`` builds them from
+    ``catalog.validate_composition_state``; ``emitters._build_wire_projection``
+    reads ``executable_state`` at :789 and ``validation.edge_contracts`` at
+    :766), and the transform arm additionally instantiates the plugin behind an
+    environment-dependent probe fallback (:698-:721), so re-deriving them from
+    the raw head would differ with NO drift at all and 409 every
+    completed-session chat. See elspeth-986801d218.
+
+    Raises :class:`GuidedStructureUnprojectable` when *state* has no guided
+    ordinal structure at all. That is not an error the caller must diagnose: a
+    state that cannot be projected is, by construction, not the state a guided
+    wire review was built from, so the parity gate treats it as drift and
+    refuses the request rather than letting the failure reach the client as a
+    server fault.
+    """
+
+    if type(state) is not CompositionState:
+        raise TypeError("state must be an exact CompositionState")
+    try:
+        source_ids = {name: proposal_component_label("source", index) for index, name in enumerate(state.sources)}
+        node_ids = {node.id: proposal_component_label("node", index) for index, node in enumerate(state.nodes)}
+        output_ids = {output.name: proposal_component_label("output", index) for index, output in enumerate(state.outputs)}
+        edge_specs, route_aliases, branch_aliases = _guided_projection_topology(
+            state,
+            source_ids=source_ids,
+            node_ids=node_ids,
+            output_ids=output_ids,
+        )
+        behaviors = _projection_node_behaviors(
+            state,
+            node_ids=node_ids,
+            route_aliases=route_aliases,
+            branch_aliases=branch_aliases,
+            edge_specs=edge_specs,
+        )
+    except (AuditIntegrityError, KeyError, TypeError, ValueError) as exc:
+        raise GuidedStructureUnprojectable("composition state has no guided ordinal structure") from exc
+    # This side already identifies components BY ordinal label, so the map the
+    # fact canonicaliser rewrites component identities through is the identity
+    # on those labels. The mirror passes its stable-id-to-label map, and the two
+    # halves therefore land on the same labels.
+    label_by_component_id = {label: label for label in (*source_ids.values(), *node_ids.values(), *output_ids.values())}
+    components: tuple[GuidedStructureComponent, ...] = (
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "source",
+                    "alias": source_ids[name],
+                    "plugin": source.plugin,
+                    "row_cardinality": dict(_source_cardinality(source)),
+                },
+                label_by_component_id=label_by_component_id,
+            )
+            for name, source in state.sources.items()
+        ),
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "node",
+                    "alias": node_ids[node.id],
+                    "plugin": node.plugin,
+                    "node_type": node.node_type,
+                    "behavior": guided_structure_compared_behavior(behaviors[index]),
+                    # ``_structured_output_fields`` is read for llm nodes only,
+                    # exactly as the wire projection reads it (emitters :800);
+                    # any other plugin publishes the empty list.
+                    "structured_output_fields": (list(_structured_output_fields(node.options)) if node.plugin == "llm" else []),
+                },
+                label_by_component_id=label_by_component_id,
+            )
+            for index, node in enumerate(state.nodes)
+        ),
+        *(
+            guided_structure_facts(
+                {
+                    "kind": "output",
+                    "alias": output_ids[output.name],
+                    "plugin": output.plugin,
+                    "business_schema": dict(_wire_schema(output.options)),
+                },
+                label_by_component_id=label_by_component_id,
+            )
+            for output in state.outputs
+        ),
+    )
+    # ``_endpoint`` omits ``stable_id`` entirely for the discard endpoint, so
+    # membership is the discriminator on this server-constructed mapping.
+    connections: tuple[GuidedStructureConnection, ...] = tuple(
+        guided_structure_facts(
+            {
+                "alias": f"connection-{index + 1}",
+                "from_alias": origin["stable_id"],
+                "to_alias": destination["stable_id"] if "stable_id" in destination else None,
+                "flow": dict(flow),
+            },
+            label_by_component_id=label_by_component_id,
+        )
+        for index, (origin, destination, flow) in enumerate(edge_specs)
+    )
+    return components, connections
+
+
 def verify_guided_proposal_projection(
     *,
     payload: Mapping[str, Any],
@@ -3989,10 +4549,13 @@ def verified_remaining_deferred_intents(
 
 
 __all__ = [
+    "GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS",
+    "GUIDED_UNCOMPARED_BEHAVIOR_KEYS",
     "GuidedCandidateBindingRejected",
     "GuidedCorrectionTarget",
     "GuidedRevisionAuthority",
     "GuidedRevisionBindingResult",
+    "GuidedStructureUnprojectable",
     "bind_guided_prose_revision_candidate",
     "bind_guided_reviewed_components",
     "build_guided_proposal_projection",
@@ -4003,6 +4566,9 @@ __all__ = [
     "guided_redacted_planner_context",
     "guided_reviewed_sink_options",
     "guided_revision_execution_hash",
+    "guided_structure_compared_behavior",
+    "guided_structure_facts",
+    "guided_structure_projection",
     "guided_unproducible_output_field_names",
     "guided_unproducible_output_fields",
     "materialize_guided_authorized_candidate",

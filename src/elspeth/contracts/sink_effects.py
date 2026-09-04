@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, NoReturn, final
+from typing import TYPE_CHECKING, Final, NoReturn, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
 from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
@@ -198,10 +198,13 @@ def _require_utc_microsecond_timestamp(value: object, field_name: str) -> None:
 
 def _require_bounded_positive_int(value: object, field_name: str, maximum: int) -> None:
     require_int(value, field_name)
-    assert isinstance(value, int)
-    if value < 1:
+    # require_int already proved value is int — cast() records that proof for
+    # the type checker without a redundant runtime re-check of the first-party
+    # Tier-1 validation guarantee.
+    checked = cast(int, value)
+    if checked < 1:
         raise ValueError(f"{field_name} must be strictly positive")
-    if value > maximum:
+    if checked > maximum:
         raise ValueError(f"{field_name} exceeds the code-owned maximum {maximum}")
 
 
@@ -699,7 +702,11 @@ class SinkEffectIdentity:
         member_ids = tuple(self.member_ids)
         if any(type(member) is not SinkEffectMember for member in members):
             raise TypeError("members must contain exact SinkEffectMember values")
-        if any(not isinstance(member_id, str) or _LOWER_HEX_64.fullmatch(member_id) is None for member_id in member_ids):
+        # member_ids is a declared Sequence[str] on an owned frozen dataclass
+        # (Tier 1): a non-str element is a contract violation that crashes with
+        # the natural TypeError from fullmatch — no defensive type re-check
+        # converting it into the malformed-digest ValueError.
+        if any(_LOWER_HEX_64.fullmatch(member_id) is None for member_id in member_ids):
             raise ValueError("member_ids must contain lowercase SHA-256 digests")
         if self.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS:
             if not members or member_ids != tuple(member.member_effect_id for member in members):
@@ -975,6 +982,21 @@ def _verify_content_bytes(content: object, expected_hash: str, expected_size: in
         raise ValueError(f"{label} hash does not match its bound descriptor")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "bytes returned by an injected audit-export blob-storage resolver (store_resolver) — external "
+        "storage content whose decoded JSON shape is unverified until this function promotes it"
+    ),
+    source_param="content",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the bytes are not canonical JSON UTF-8 for an exact v2 manifest dict, and "
+        "TypeError when a manifest field has the wrong exact type; never accepts a manifest it cannot verify"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_signed_manifest_bytes_rejects_non_dict_json",
+    test_fingerprint="3bd157d4f24dc84a3eb08d513c06f71987484dd8d5ad0fa4424f6cda9a8a59a3",
+)
 def _verify_signed_manifest_bytes(
     content: bytes,
     binding: _AuditExportReaderBinding,

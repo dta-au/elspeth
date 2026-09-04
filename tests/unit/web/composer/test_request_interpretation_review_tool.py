@@ -799,7 +799,7 @@ async def test_only_event_for_exact_current_draft_can_settle(
     )
     all_rows = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in all_rows}
-    assert by_id[old_event.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[old_event.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[old_event.id].resolved_at is not None
     assert by_id[current_event.id].choice is InterpretationChoice.PENDING
     resolved_event, resolved_state = await service.resolve_interpretation_event(
@@ -926,10 +926,16 @@ async def test_delayed_older_surface_without_current_card_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_delayed_surface_after_review_site_removal_abandons_the_previous_card(
+async def test_delayed_surface_after_review_site_removal_receives_the_superseded_card(
     service: SessionServiceImpl,
 ) -> None:
-    """A post-commit stale surfacer must not leave an impossible card pending."""
+    """A post-commit stale surfacer must not leave an impossible card pending.
+
+    The commit that removes the review site now retires the card itself
+    (the state-commit supersession sweep, elspeth-d73139155a), so the
+    delayed surfacer finds no pending row and is handed the SUPERSEDED
+    terminal row instead of erroring — the same successful-commit contract
+    the old abandon fallback provided."""
     kind = InterpretationKind.VAGUE_TERM
     old_state, affected_node_id, user_term = _event_liveness_state(
         kind,
@@ -969,8 +975,9 @@ async def test_delayed_surface_after_review_site_removal_abandons_the_previous_c
 
     rows = await service.list_interpretation_events(session_id, status="all")
     assert reconciled.id == previous_event.id
+    assert reconciled.choice is InterpretationChoice.SUPERSEDED
     assert [(row.id, row.choice) for row in rows] == [
-        (previous_event.id, InterpretationChoice.ABANDONED),
+        (previous_event.id, InterpretationChoice.SUPERSEDED),
     ]
 
 
@@ -1047,7 +1054,7 @@ async def test_review_event_identity_supersedes_same_text_changed_artifact(
     assert event_b.id != event_a.id
     rows_after_supersession = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in rows_after_supersession}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[event_a.id].resolved_at is not None
     assert by_id[event_b.id].choice is InterpretationChoice.PENDING
 
@@ -1144,7 +1151,7 @@ async def test_structured_vague_term_identity_tracks_prompt_parts_structure(
     assert event_b.id != event_a.id
     all_rows = await service.list_interpretation_events(session_id, status="all")
     by_id = {row.id: row for row in all_rows}
-    assert by_id[event_a.id].choice is InterpretationChoice.ABANDONED
+    assert by_id[event_a.id].choice is InterpretationChoice.SUPERSEDED
     assert by_id[event_b.id].choice is InterpretationChoice.PENDING
 
     event_b_again = await service.create_pending_interpretation_event(
@@ -1352,7 +1359,6 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     assert params["properties"]["kind"]["enum"] == [
         "vague_term",
         "invented_source",
-        "llm_prompt_template",
         "pipeline_decision",
         "llm_model_choice",
         "source_data_contract",
@@ -1453,7 +1459,7 @@ async def test_02_happy_path_produces_success_and_db_row(service: SessionService
     )
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1549,7 +1555,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1633,7 +1639,7 @@ def test_05d_structured_pending_requirement_for_different_term_still_fails() -> 
 
 def test_05e_legacy_structured_pending_requirement_without_kind_defaults_to_vague_term() -> None:
     node = _structured_llm_node()
-    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])  # type: ignore[index]
+    requirement = dict(node.options[INTERPRETATION_REQUIREMENTS_KEY][0])
     del requirement["kind"]
     options = dict(node.options)
     options[INTERPRETATION_REQUIREMENTS_KEY] = [requirement]
@@ -1829,7 +1835,7 @@ async def test_request_interpretation_review_accepts_source_component_for_invent
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1864,7 +1870,7 @@ async def test_request_interpretation_review_accepts_named_source_component_for_
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == "source:orders"
+    assert result.affected_nodes == ("source:orders",)
     assert result.data["kind"] == "invented_source"
 
 
@@ -2020,7 +2026,7 @@ async def test_request_interpretation_review_invented_source_persists_with_real_
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2055,7 +2061,7 @@ async def test_request_interpretation_review_accepts_pipeline_decision_kind(serv
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "drop_raw_html"
+    assert result.affected_nodes == ("drop_raw_html",)
     assert result.data["kind"] == "pipeline_decision"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2956,7 +2962,7 @@ async def test_dedup_second_pending_restage_is_idempotent(service: SessionServic
     # Affected node + kind flow through for frontend correlation. Raw review
     # text stays in the scoped interpretation-events API, not the ToolResult
     # sent back to the LLM or persisted in chat-message audit payloads.
-    assert second.data["affected_node_id"] == "rate_node"
+    assert second.affected_nodes == ("rate_node",)
     assert second.data["kind"] == "vague_term"
     assert "user_term" not in second.data
     assert "llm_draft" not in second.data
@@ -3144,8 +3150,8 @@ def test_13_dual_registry_invariant() -> None:
     for tool_name, handler in _SESSION_AWARE_TOOL_HANDLERS.items():
         assert asyncio.iscoroutinefunction(handler), f"_SESSION_AWARE_TOOL_HANDLERS[{tool_name!r}] is not a coroutine function"
     for registry_name, registry in sync_registries.items():
-        for tool_name, handler in registry.items():
-            assert not asyncio.iscoroutinefunction(handler), (
+        for tool_name, sync_handler in registry.items():
+            assert not asyncio.iscoroutinefunction(sync_handler), (
                 f"{registry_name}[{tool_name!r}] is async; belongs in _SESSION_AWARE_TOOL_HANDLERS"
             )
 

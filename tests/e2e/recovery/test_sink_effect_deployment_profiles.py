@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Coroutine
 from concurrent.futures import Future
 from datetime import UTC, datetime
 from pathlib import Path
@@ -389,6 +390,19 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         catalog=catalog,
     )
     service.set_openrouter_catalog_snapshot(sha256="0" * 64, source="bundled")
+    # The session service is already an in-memory autospec: this profile proves
+    # the real web execution, Landscape leader, and sink-recovery seams, not the
+    # production event-loop bridge to the real session database. Run those fake
+    # async methods on a strict worker-owned loop, matching the canonical
+    # execution-service test harness. Otherwise the executor can spend its full
+    # 30-second _call_async timeout waiting on the parent loop before Landscape
+    # has even persisted the run or leader worker.
+    session_bridge_loop = asyncio.new_event_loop()
+
+    def call_fake_session_async(coro: Coroutine[Any, Any, Any]) -> Any:
+        return session_bridge_loop.run_until_complete(coro)
+
+    service._call_async = call_fake_session_async  # type: ignore[method-assign]
     valid_preflight = ValidationResult(
         is_valid=True,
         checks=[],
@@ -435,8 +449,11 @@ async def _execute_web_leader(run_id: str, settings_path: str) -> None:
         assert len(submitted) == 1
         await asyncio.wrap_future(submitted[0])
     finally:
-        await lease.close()
-        await service.shutdown()
+        try:
+            await lease.close()
+            await service.shutdown()
+        finally:
+            session_bridge_loop.close()
 
 
 def _run_web_leader_to_sink_seam(

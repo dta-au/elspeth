@@ -38,18 +38,35 @@ _UNSUPPORTED_COALESCE_FIELDS = frozenset(
         "select_branch",
     }
 )
-_ROW_UNION_FIELDS = frozenset({"name", "branches", "on_success", "timeout_seconds", "input"})
-_COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "on_error", "options"})
+# Importer-owned classification of every current runtime envelope field. These
+# sets name fields the parser actually consumes; they are deliberately NOT
+# derived from ``model_fields`` because doing so would authorize a newly added
+# runtime field before the importer had code to preserve it. The helper below
+# intersects this classification with the live runtime models, so deletions are
+# also fail-closed. Plugin-owned ``options`` values remain open, while their
+# mapping keys must obey the JSON persistence contract below.
+_CONSUMED_RUNTIME_FIELDS_BY_SECTION: dict[str, frozenset[str]] = {
+    "aggregations": frozenset(
+        {"name", "plugin", "input", "on_success", "on_error", "trigger", "output_mode", "expected_output_count", "options"}
+    ),
+    "coalesce": frozenset({"name", "branches", "policy", "merge", "timeout_seconds", "on_success"}),
+    "gates": frozenset({"name", "input", "condition", "routes", "on_error", "fork_to"}),
+    "row_unions": frozenset({"name", "branches", "on_success", "timeout_seconds"}),
+    "sinks": frozenset({"plugin", "options", "on_write_failure"}),
+    "sources": frozenset({"plugin", "on_success", "options"}),
+    "transforms": frozenset({"name", "plugin", "input", "on_success", "on_error", "options"}),
+}
+_DECLINED_RUNTIME_FIELDS_BY_SECTION: dict[str, frozenset[str]] = {
+    "coalesce": _UNSUPPORTED_COALESCE_FIELDS,
+}
+_COLLECTOR_FIELDS = frozenset({"name", "plugin", "input", "on_success", "options"})
 _SCOPE_FIELDS = frozenset({"name", "opener", "closer", "policy"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
 # (see the guard in composition_state_from_runtime_yaml).
 #
-# ``source`` is not an ``ElspethSettings`` field: it is the singular shorthand
-# the importer expands to ``sources`` below, so it is stated here rather than
-# derived.
 _PIPELINE_SECTION_KEYS = frozenset(
-    {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks", "collectors", "scopes"}
+    {"sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks", "collectors", "scopes"}
 )
 
 # Sections that are DELIBERATELY dropped, with the ratified decision that says
@@ -67,7 +84,8 @@ _INTENTIONALLY_DROPPED_SECTIONS: dict[str, str] = {
     "landscape": "the audit URL comes from the deployment at execution time (yaml_generator.py:392, security fix S1)",
 }
 
-# Sections ``ElspethSettings`` models that the composer cannot import.
+# Top-level sections the composer cannot import, including runtime-modelled
+# sections plus the explicitly invalid singular source and metadata surfaces.
 # ``CompositionState`` carries sources, nodes, edges and outputs and has no
 # field any of these could land in (its dataclass fields are nodes/edges/
 # outputs/metadata/version/guided_session/sources), so importing them would mean
@@ -90,6 +108,7 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
     "default_llm_profile": "LLM profile selection is deployment configuration",
     "depends_on": "cross-pipeline dependencies are a run concern",
     "llm_profiles": "LLM profiles are deployment configuration, not pipeline topology",
+    "metadata": "runtime pipeline YAML cannot represent Composer metadata on export",
     "max_bound_region_depth": "run-execution settings are not part of a composition",
     "max_expand_group_width": "run-execution settings are not part of a composition",
     "payload_store": "payload storage is deployment configuration",
@@ -97,6 +116,7 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
     "replay_from": "replay selection is a run invocation concern",
     "retry": "run-execution settings are not part of a composition",
     "run_mode": "run mode is a run invocation concern",
+    "source": "the singular source surface was deleted by ADR-025; use named sources",
     "telemetry": "telemetry is deployment configuration",
 }
 
@@ -107,39 +127,63 @@ _DECLINED_SECTION_REASONS: dict[str, str] = {
     source_param="doc",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises RuntimeYamlImportError naming every modelled ElspethSettings section the composer "
-        "cannot import; a section is never dropped silently"
+        "raises RuntimeYamlImportError naming every top-level key the composer neither imports nor "
+        "intentionally drops; a section is never dropped silently"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_unimportable_sections_refuses_a_declined_section_by_name",
-    test_fingerprint="83b3cec68a80483e5281976e2b7ff8927fac25e34a07d973899f479f854f4f7b",
+    test_fingerprint="4da1ef30fbf924dacfe63db077385076afcef93cca41512cb1b555d88026ab0d",
 )
-def _reject_unimportable_sections(doc: Mapping[str, object]) -> None:
-    """Refuse a document carrying a modelled section the composer cannot hold.
+def _reject_unimportable_sections(doc: Mapping[Any, object]) -> None:
+    """Refuse every top-level key the composer cannot faithfully classify.
 
     DERIVED from ``ElspethSettings.model_fields``, never restated: the previous
     hand-written subset silently discarded the fifteen sections outside it, and
     adding the missing names by hand would have rebuilt the same defect for the
-    sixteenth. A section this module has no opinion about is a hard error rather
-    than a quiet drop, so a NEW settings section cannot pass through unnoticed —
-    it arrives as a refusal naming itself until someone classifies it.
+    sixteenth. Keys outside the settings model are typos or foreign sections and
+    need the same fail-closed treatment. A section this module has no opinion
+    about is a hard error rather than a quiet drop, so either kind of new key
+    arrives as a refusal naming itself until someone classifies it.
     """
     from elspeth.core.config import ElspethSettings
 
+    keys = tuple(doc)
+    non_string = sorted(f"{key!r} ({type(key).__name__})" for key in keys if not isinstance(key, str))
+    string_keys = tuple(key for key in keys if isinstance(key, str))
     modelled = frozenset(ElspethSettings.model_fields)
-    present = [
+    unknown = sorted(
         key
-        for key in doc
-        if isinstance(key, str) and key in modelled and key not in _PIPELINE_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS
-    ]
-    if not present:
-        return
+        for key in string_keys
+        if key not in modelled
+        and key not in _PIPELINE_SECTION_KEYS
+        and key not in _INTENTIONALLY_DROPPED_SECTIONS
+        and key not in _DECLINED_SECTION_REASONS
+    )
+    declined = sorted(
+        key
+        for key in string_keys
+        if key in _DECLINED_SECTION_REASONS
+        or (key in modelled and key not in _PIPELINE_SECTION_KEYS and key not in _INTENTIONALLY_DROPPED_SECTIONS)
+    )
+    conflicts = []
+    if "source" in string_keys and "sources" in string_keys:
+        conflicts.append("conflicting keys ['source', 'sources']")
 
-    named = sorted(present)
-    details = "; ".join(f"{section} ({_DECLINED_SECTION_REASONS.get(section, 'not supported by the composer')})" for section in named)
+    parts = []
+    if non_string:
+        parts.append(f"non-string keys {non_string}")
+    if unknown:
+        parts.append(f"unknown keys {unknown}")
+    if declined:
+        details = "; ".join(
+            f"{section} ({_DECLINED_SECTION_REASONS.get(section, 'not supported by the composer')})" for section in declined
+        )
+        parts.append(f"unsupported sections [{details}]")
+    parts.extend(conflicts)
+    if not parts:
+        return
     raise RuntimeYamlImportError(
-        f"pipeline YAML contains {len(named)} section(s) the composer cannot import: {details}. "
-        f"Importing would silently discard them. Remove the section(s) to import the rest of the "
-        f"pipeline, and keep them in the runtime YAML that the composer's export is merged into."
+        f"pipeline YAML contains top-level content the composer cannot import: {'; '.join(parts)}. "
+        "Importing would silently discard or override it."
     )
 
 
@@ -147,6 +191,45 @@ class RuntimeYamlImportError(ValueError):
     """Raised when runtime YAML cannot be represented as composer state."""
 
 
+class _DuplicateYamlKeyError(yaml.YAMLError):
+    """Raised before construction can overwrite a repeated mapping key."""
+
+    def __init__(self, key: object, line: int) -> None:
+        super().__init__(f"duplicate YAML mapping key {key!r} at line {line}")
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate keys at every mapping depth."""
+
+    def construct_mapping(self, node: yaml.nodes.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)  # type: ignore[no-untyped-call]
+            try:
+                repeated = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if repeated:
+                raise _DuplicateYamlKeyError(key, key_node.start_mark.line + 1)
+            mapping[key] = self.construct_object(value_node, deep=deep)  # type: ignore[no-untyped-call]
+        return mapping
+
+
+@trust_boundary(
+    tier=3,
+    source="operator-supplied runtime pipeline YAML text (untrusted import payload)",
+    source_param="pipeline_yaml",
+    suppresses=("R5",),
+    invariant="raises yaml.composer.ComposerError on any alias event; never rewrites or drops one",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_yaml_aliases_rejects_alias_event",
+    test_fingerprint="0dcac1a023fede17e0e5ce4cc511d5310cb619f6b3e67196c8c964231f1907bd",
+)
 def _reject_yaml_aliases(pipeline_yaml: str) -> None:
     """Reject YAML anchors/aliases before safe construction.
 
@@ -173,6 +256,15 @@ def _reject_yaml_aliases(pipeline_yaml: str) -> None:
             )
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is a mapping",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_require_mapping_rejects_non_mapping_value",
+    test_fingerprint="0a4c7a1f3e60423beb80f88cfb3b1049518ae908efee57f276d68a40e24c1fc0",
+)
 def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return cast(Mapping[str, Any], value)
@@ -185,6 +277,81 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     return _require_mapping(value, path)
 
 
+def _reject_non_string_mapping_keys(value: object, path: str) -> None:
+    """Reject keys that JSON persistence would stringify ambiguously."""
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise RuntimeYamlImportError(f"{path} contains non-string mapping key {key!r}")
+            _reject_non_string_mapping_keys(item, f"{path}.{key}")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            _reject_non_string_mapping_keys(item, f"{path}[{index}]")
+
+
+def _json_mapping(value: Any, path: str) -> Mapping[str, Any]:
+    """Copy a mapping after proving every nested key is JSON-safe."""
+    mapping = dict(_optional_mapping(value, path))
+    _reject_non_string_mapping_keys(mapping, path)
+    return mapping
+
+
+def _reject_unknown_runtime_fields(
+    entry: Mapping[Any, Any],
+    *,
+    section_name: str,
+    path: str,
+    compatibility_fields: frozenset[str] = frozenset(),
+) -> None:
+    """Enforce the runtime model's closed structural vocabulary.
+
+    Plugin ``options`` remain deliberately open; this guard applies only to
+    the runtime-owned envelope around them. Compatibility fields are named at
+    each call site so an importer-only spelling cannot become accidental
+    authority.
+    """
+    from elspeth.core.config import (
+        AggregationSettings,
+        CoalesceSettings,
+        GateSettings,
+        RowUnionSettings,
+        SinkSettings,
+        SourceSettings,
+        TransformSettings,
+    )
+
+    fields_by_section: dict[str, frozenset[str]] = {
+        "aggregations": frozenset(AggregationSettings.model_fields),
+        "coalesce": frozenset(CoalesceSettings.model_fields),
+        "gates": frozenset(GateSettings.model_fields),
+        "row_unions": frozenset(RowUnionSettings.model_fields),
+        "sinks": frozenset(SinkSettings.model_fields),
+        "sources": frozenset(SourceSettings.model_fields),
+        "transforms": frozenset(TransformSettings.model_fields),
+    }
+    model_fields = fields_by_section[section_name]
+    classified_model_fields = _CONSUMED_RUNTIME_FIELDS_BY_SECTION[section_name] | _DECLINED_RUNTIME_FIELDS_BY_SECTION.get(
+        section_name, frozenset()
+    )
+    entry_fields = set(entry)
+    unknown = entry_fields - model_fields - compatibility_fields
+    unclassified_modelled = (entry_fields & model_fields) - classified_model_fields
+    rejected = sorted(unknown | unclassified_modelled, key=lambda field: (type(field).__name__, repr(field)))
+    if not rejected:
+        return
+    raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {rejected}")
+
+
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is a non-string sequence",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_require_sequence_rejects_string_value",
+    test_fingerprint="8d25f3187d9000818fbfef8dd47b2cf8734935e33273b27331cb89bcf54a79bb",
+)
 def _require_sequence(value: Any, path: str) -> Sequence[Any]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return value
@@ -207,6 +374,15 @@ def _require_str(entry: Mapping[str, Any], key: str, path: str) -> str:
     raise RuntimeYamlImportError(f"{path}.{key} must be a non-empty string")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML entry mapping (untrusted import payload)",
+    source_param="entry",
+    suppresses=("R1", "R5"),
+    invariant="raises RuntimeYamlImportError unless the key is absent (None) or holds a string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_optional_str_rejects_non_string_value",
+    test_fingerprint="efdd2f5514efb13c1b614ffeb6fca26d5274f397eefd6e8f3c20ae11f47615c8",
+)
 def _optional_str(entry: Mapping[str, Any], key: str) -> str | None:
     value = entry.get(key)
     if value is None:
@@ -258,6 +434,15 @@ def _finite_positive_timeout(entry: Mapping[str, Any], path: str) -> float | Non
     return normalized
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML route label value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless the value is True, False, or a non-empty string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_route_label_rejects_empty_label",
+    test_fingerprint="369da61cce315dbb305231a7e98fe86cf3d97e22c7ba20ae935c886fa9d10bbf",
+)
 def _route_label(value: Any) -> str:
     if value is True:
         return "true"
@@ -268,15 +453,36 @@ def _route_label(value: Any) -> str:
     raise RuntimeYamlImportError("route labels must be non-empty strings")
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML routes mapping (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless every value is a non-empty string under a valid route-label key",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_string_mapping_rejects_non_string_value",
+    test_fingerprint="28d2245ae29c56cdebda0c15b7e9e7829c06e421b245e3af3d2c615d8fdee3b7",
+)
 def _string_mapping(value: Any, path: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for raw_key, raw_value in _require_mapping(value, path).items():
         if not isinstance(raw_value, str) or not raw_value:
             raise RuntimeYamlImportError(f"{path}.{raw_key} must be a non-empty string")
-        result[_route_label(raw_key)] = raw_value
+        normalized_key = _route_label(raw_key)
+        if normalized_key in result:
+            raise RuntimeYamlImportError(f"{path} contains duplicate normalized key {normalized_key!r}")
+        result[normalized_key] = raw_value
     return result
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML string-list value (untrusted import payload)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError unless every sequence item is a non-empty string",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_string_tuple_rejects_non_string_item",
+    test_fingerprint="7fc7ae9cd28d6965855e6def717c73be9fd3d864268145cc49fba31cf5a63234",
+)
 def _string_tuple(value: Any, path: str) -> tuple[str, ...]:
     items = []
     for index, item in enumerate(_require_sequence(value, path)):
@@ -329,19 +535,30 @@ def _row_union_branches(value: Any, path: str) -> dict[str, str] | tuple[str, ..
     source_param="entry",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises RuntimeYamlImportError on non-mapping entries, missing plugin/on_success, "
-        "or inline blob_ref; a missing or malformed on_validation_failure falls back to 'discard'"
+        "raises RuntimeYamlImportError on non-mapping entries, unknown structural fields, missing "
+        "plugin/on_success, inline blob_ref, or conflicting validation-failure spellings; a single "
+        "missing or malformed on_validation_failure falls back to 'discard'"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_source_from_runtime_entry_rejects_non_mapping_entry",
     test_fingerprint="464ba44200f35d34d3eed43f62f4a50595385f53a9879dde0a9bd1e898dc8bae",
 )
 def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
-    source = _require_mapping(entry, f"sources.{source_name}")
-    options = dict(_optional_mapping(source.get("options"), f"sources.{source_name}.options"))
+    path = f"sources.{source_name}"
+    source = _require_mapping(entry, path)
+    _reject_unknown_runtime_fields(
+        source,
+        section_name="sources",
+        path=path,
+        compatibility_fields=frozenset({"on_validation_failure"}),
+    )
+    options = dict(_json_mapping(source.get("options"), f"{path}.options"))
     if "blob_ref" in options:
-        raise RuntimeYamlImportError(f"sources.{source_name}.options.blob_ref must be supplied via source_blob_ids")
+        raise RuntimeYamlImportError(f"{path}.options.blob_ref must be supplied via source_blob_ids")
     on_validation_failure = source.get("on_validation_failure")
-    option_on_validation_failure = options.pop("on_validation_failure", None)
+    has_option_on_validation_failure = "on_validation_failure" in options
+    option_on_validation_failure = options.pop("on_validation_failure") if has_option_on_validation_failure else None
+    if "on_validation_failure" in source and has_option_on_validation_failure and on_validation_failure != option_on_validation_failure:
+        raise RuntimeYamlImportError(f"{path} contains conflicting on_validation_failure values at the entry and options levels")
     if on_validation_failure is None:
         on_validation_failure = option_on_validation_failure
     if not isinstance(on_validation_failure, str):
@@ -366,9 +583,8 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
     source_param="section",
     suppresses=("R1", "R5"),
     invariant=(
-        "raises RuntimeYamlImportError on non-sequence sections, non-mapping entries, and "
-        "missing or mistyped required node fields; optional fields (routes, fork_to, "
-        "branches, trigger) are read permissively and validated when present"
+        "raises RuntimeYamlImportError on non-sequence sections, non-mapping entries, fields outside "
+        "the exact per-node runtime vocabulary, and missing or mistyped required node fields"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_nodes_from_runtime_list_rejects_non_sequence_section",
     test_fingerprint="7c2c5adda9b620f4628b42f0ece20f0b6c403e3fad0890a22ba38dacc86b0a3d",
@@ -381,6 +597,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
         path = f"{section_name}[{index}]"
         entry = _require_mapping(raw_entry, path)
         if node_type == "gate":
+            _reject_unknown_runtime_fields(entry, section_name="gates", path=path)
             routes = entry.get("routes")
             fork_to = entry.get("fork_to")
             nodes.append(
@@ -402,6 +619,12 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
             )
             continue
         if node_type == "coalesce":
+            _reject_unknown_runtime_fields(
+                entry,
+                section_name="coalesce",
+                path=path,
+                compatibility_fields=frozenset({"input"}),
+            )
             unsupported = sorted(_UNSUPPORTED_COALESCE_FIELDS & entry.keys())
             if unsupported:
                 raise RuntimeYamlImportError(
@@ -419,11 +642,10 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 raise RuntimeYamlImportError(f"{path}.branches must contain at least two input connections")
             # Runtime coalesces consume ``branches``. NodeSpec.input is not an
             # additional connection, but its required placeholder uses the
-            # first arriving branch by convention.
-            if isinstance(branch_spec, Mapping):
-                first_branch_input = next(iter(branch_spec.values()))
-            else:
-                first_branch_input = branch_spec[0]
+            # first arriving branch by convention. dict is the concrete type
+            # _string_mapping constructs, so this is owned-union dispatch on
+            # the parsed value, not a shape re-check of external data.
+            first_branch_input = next(iter(branch_spec.values())) if type(branch_spec) is dict else next(iter(branch_spec))
             if "input" in entry:
                 coalesce_input = _require_str(entry, "input", path)
                 if coalesce_input != first_branch_input:
@@ -450,12 +672,12 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
             )
             continue
         if node_type == "row_union":
-            unknown = sorted(
-                set(entry) - _ROW_UNION_FIELDS,
-                key=lambda field: (type(field).__name__, repr(field)),
+            _reject_unknown_runtime_fields(
+                entry,
+                section_name="row_unions",
+                path=path,
+                compatibility_fields=frozenset({"input"}),
             )
-            if unknown:
-                raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
             branch_spec = _row_union_branches(entry.get("branches"), f"{path}.branches")
             first_branch_input = next(iter(branch_spec.values())) if isinstance(branch_spec, Mapping) else branch_spec[0]
             if "input" in entry:
@@ -483,7 +705,9 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 )
             )
             continue
-        options = dict(_optional_mapping(entry.get("options"), f"{path}.options"))
+        runtime_section_name = "aggregations" if node_type == "aggregation" else "transforms"
+        _reject_unknown_runtime_fields(entry, section_name=runtime_section_name, path=path)
+        options = _json_mapping(entry.get("options"), f"{path}.options")
         expected_output_count = entry.get("expected_output_count")
         if expected_output_count is not None and (not isinstance(expected_output_count, int) or isinstance(expected_output_count, bool)):
             raise RuntimeYamlImportError(f"{path}.expected_output_count must be an integer when provided")
@@ -502,7 +726,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                 branches=None,
                 policy=None,
                 merge=None,
-                trigger=dict(_optional_mapping(entry.get("trigger"), f"{path}.trigger")) if entry.get("trigger") is not None else None,
+                trigger=_json_mapping(entry.get("trigger"), f"{path}.trigger") if entry.get("trigger") is not None else None,
                 output_mode=_optional_str(entry, "output_mode"),
                 expected_output_count=expected_output_count,
             )
@@ -510,6 +734,18 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
     return nodes
 
 
+@trust_boundary(
+    tier=3,
+    source="web-authored pipeline YAML collectors: section (untrusted import payload)",
+    source_param="collectors_section",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises RuntimeYamlImportError on non-sequence sections, non-mapping entries, unknown fields, "
+        "or malformed collector fields; an absent options key becomes an empty options dict on the owned NodeSpec"
+    ),
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_collector_nodes_rejects_non_sequence_collectors_section",
+    test_fingerprint="532d66389e446a09d84600c76b14ee44a2a136b866e0395d3289704efefce1a9",
+)
 def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section: Any) -> list[NodeSpec]:
     """Fold ``collectors:`` and ``scopes:`` into collector NodeSpecs.
 
@@ -530,6 +766,12 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
         for index, raw_entry in enumerate(_require_sequence(collectors_section, "collectors")):
             path = f"collectors[{index}]"
             entry = _require_mapping(raw_entry, path)
+            if "on_error" in entry:
+                collector_name = _require_nonblank_str(entry, "name", path)
+                raise RuntimeYamlImportError(
+                    f"{path} collector '{collector_name}' does not accept on_error. Collector failures are "
+                    "whole-group verdicts settled through scope policy and nesting. Remove on_error."
+                )
             unknown = sorted(set(entry) - _COLLECTOR_FIELDS, key=lambda field: (type(field).__name__, repr(field)))
             if unknown:
                 raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
@@ -540,8 +782,8 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
                     plugin=_require_str(entry, "plugin", path),
                     input=_require_str(entry, "input", path),
                     on_success=_require_str(entry, "on_success", path),
-                    on_error=_optional_str(entry, "on_error"),
-                    options=dict(_optional_mapping(entry.get("options"), f"{path}.options")),
+                    on_error=None,
+                    options=_json_mapping(entry.get("options"), f"{path}.options"),
                     condition=None,
                     routes=None,
                     fork_to=None,
@@ -578,7 +820,10 @@ def _collector_nodes_from_runtime_lists(collectors_section: Any, scopes_section:
     source="web-authored pipeline YAML sinks mapping (untrusted import payload)",
     source_param="sinks",
     suppresses=("R1", "R5"),
-    invariant=("raises RuntimeYamlImportError on non-mapping sinks, non-string sink names, and missing plugin/on_write_failure fields"),
+    invariant=(
+        "raises RuntimeYamlImportError on non-mapping sinks, non-string sink names, unknown structural "
+        "fields, and missing plugin/on_write_failure fields"
+    ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_outputs_from_runtime_sinks_rejects_non_mapping_sinks",
     test_fingerprint="b44ac151ec41c1923352de32ff62370b062c753adf1edd1a973c46aa3bef64a7",
 )
@@ -589,13 +834,15 @@ def _outputs_from_runtime_sinks(sinks: Any) -> tuple[OutputSpec, ...]:
     for sink_name, raw_entry in _require_mapping(sinks, "sinks").items():
         if not isinstance(sink_name, str) or not sink_name:
             raise RuntimeYamlImportError("sinks keys must be non-empty strings")
-        entry = _require_mapping(raw_entry, f"sinks.{sink_name}")
+        path = f"sinks.{sink_name}"
+        entry = _require_mapping(raw_entry, path)
+        _reject_unknown_runtime_fields(entry, section_name="sinks", path=path)
         outputs.append(
             OutputSpec(
                 name=sink_name,
-                plugin=_require_str(entry, "plugin", f"sinks.{sink_name}"),
-                options=dict(_optional_mapping(entry.get("options"), f"sinks.{sink_name}.options")),
-                on_write_failure=_require_str(entry, "on_write_failure", f"sinks.{sink_name}"),
+                plugin=_require_str(entry, "plugin", path),
+                options=_json_mapping(entry.get("options"), f"{path}.options"),
+                on_write_failure=_require_str(entry, "on_write_failure", path),
             )
         )
     return tuple(outputs)
@@ -676,17 +923,22 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         raise RuntimeYamlImportError("pipeline YAML exceeds the 262144 character import limit")
     try:
         _reject_yaml_aliases(pipeline_yaml)
-        parsed = yaml.safe_load(pipeline_yaml)
+        # Explicit Loader= is intentional: _UniqueKeySafeLoader subclasses
+        # SafeLoader and only tightens mapping construction.
+        parsed = yaml.load(pipeline_yaml, Loader=_UniqueKeySafeLoader)
+    except _DuplicateYamlKeyError as exc:
+        raise RuntimeYamlImportError(str(exc)) from exc
     except (yaml.YAMLError, RecursionError) as exc:
         # RecursionError: a deeply (but not textually large) nested mapping
         # chain -- e.g. ~500 levels of ``a:\n  a:\n    a:\n ...`` fits well
         # under the character cap above but exhausts CPython's default
         # recursion limit inside PyYAML's pure-Python composer/constructor.
-        # ``yaml.safe_load`` uses PyYAML's safe constructors, so this is a
+        # ``_UniqueKeySafeLoader`` uses PyYAML's safe constructors, so this is a
         # plain, catchable parser/constructor failure rather than arbitrary
         # object construction.
         raise RuntimeYamlImportError(f"YAML parse failed: {exc.__class__.__name__}") from exc
     doc = _require_mapping(parsed, "pipeline YAML")
+    _reject_unimportable_sections(doc)
     if not _PIPELINE_SECTION_KEYS & doc.keys():
         # A pasted document can be syntactically valid YAML *and* a mapping
         # (so it clears _require_mapping above) while describing nothing
@@ -698,14 +950,10 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # was there before, with no error to signal anything went wrong.
         raise RuntimeYamlImportError(
             "pipeline YAML must define at least one pipeline section "
-            "(source, sources, transforms, gates, row_unions, aggregations, coalesce, collectors, scopes, queues, or sinks)"
+            "(sources, transforms, gates, row_unions, aggregations, coalesce, collectors, scopes, queues, or sinks)"
         )
 
-    _reject_unimportable_sections(doc)
-
     raw_sources = doc.get("sources")
-    if raw_sources is None and doc.get("source") is not None:
-        raw_sources = {"source": doc["source"]}
     sources = {}
     for source_name, source_entry in _optional_mapping(raw_sources, "sources").items():
         if not isinstance(source_name, str) or not source_name:
@@ -739,19 +987,11 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         for node in nodes
     ]
 
-    metadata = PipelineMetadata()
-    if isinstance(doc.get("metadata"), Mapping):
-        raw_metadata = cast(Mapping[str, Any], doc["metadata"])
-        metadata = PipelineMetadata(
-            name=str(raw_metadata.get("name") or metadata.name),
-            description=str(raw_metadata.get("description") or metadata.description),
-        )
-
     return CompositionState(
         sources=sources,
         nodes=tuple(nodes),
         edges=(),
         outputs=_outputs_from_runtime_sinks(doc.get("sinks")),
-        metadata=metadata,
+        metadata=PipelineMetadata(),
         version=version,
     )

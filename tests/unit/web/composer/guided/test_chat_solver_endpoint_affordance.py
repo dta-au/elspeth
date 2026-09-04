@@ -284,6 +284,7 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         reviewed_outputs=outputs,
         pending_output_intents={},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 

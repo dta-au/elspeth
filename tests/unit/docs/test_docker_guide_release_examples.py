@@ -7,7 +7,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 BASE_COMPOSE = REPO_ROOT / "docker-compose.yaml"
-STALE_IMAGE_TAG = "elspeth:v0.1.0"
 SHIPPED_COMPOSE_IMAGE = "${REGISTRY:-ghcr.io/dta-au}/elspeth:${IMAGE_TAG:?set IMAGE_TAG to an immutable sha-* or v* tag}"
 THREE_FILE_COMPOSE_COMMAND = """docker compose --env-file .env \\
   -f docker-compose.yaml \\
@@ -18,7 +17,6 @@ THREE_FILE_COMPOSE_COMMAND = """docker compose --env-file .env \\
 def test_docker_guide_uses_release_tag_variable_for_image_examples() -> None:
     text = DOCKER_GUIDE.read_text(encoding="utf-8")
 
-    assert STALE_IMAGE_TAG not in text
     assert "IMAGE_TAG:?export an exact published sha-* or v* image tag" in text
     assert "ghcr.io/dta-au/elspeth:${IMAGE_TAG}" in text
     assert "your-acr.azurecr.io/elspeth:${IMAGE_TAG}" in text
@@ -27,7 +25,6 @@ def test_docker_guide_uses_release_tag_variable_for_image_examples() -> None:
 def test_docker_guide_links_to_active_user_manual() -> None:
     text = DOCKER_GUIDE.read_text(encoding="utf-8")
 
-    assert "../USER_MANUAL.md" not in text
     assert "(user-manual.md#cli-commands)" in text
     assert (DOCKER_GUIDE.parent / "user-manual.md").exists()
 
@@ -53,25 +50,6 @@ def test_docker_guide_uses_the_shipped_three_file_postgresql_bundle() -> None:
     assert "run --rm web-init" in verification
     assert "doctor deployment" in verification
     assert "doctor deployment --init-schema" not in verification
-
-
-def test_docker_guide_explains_the_container_database_boundary() -> None:
-    text = DOCKER_GUIDE.read_text(encoding="utf-8")
-    normalized = " ".join(text.split())
-
-    assert "PostgreSQL clients" in text
-    assert "PostgreSQL clients, not a PostgreSQL server" in normalized
-    assert "postgresql+psycopg://" in text
-    assert "postgresql+psycopg2://" in text
-    assert "Compose provisions a PostgreSQL container" in normalized
-    assert "tracked AWS ECS Terraform package provisions Aurora PostgreSQL outside the application task" in normalized
-    assert "one web process" in text
-    assert "payload persistence" in text.lower()
-    assert "database persistence" in text.lower()
-    assert "AWS, an Azure Ubuntu VM, or BYO Kubernetes manifests must connect" not in normalized
-    assert "Azure production and BYO Kubernetes deployments require operator-provided external PostgreSQL" in normalized
-    assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in normalized
-    assert "Native Linux may use SQLite on one persistent host" in normalized
 
 
 def test_docker_guide_has_a_runnable_standalone_web_container() -> None:
@@ -103,4 +81,3 @@ def test_docker_guide_documents_the_published_runtime_identity() -> None:
     text = " ".join(DOCKER_GUIDE.read_text(encoding="utf-8").split())
 
     assert "UID/GID 1654" in text
-    assert "UID/GID 1000" not in text

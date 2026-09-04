@@ -22,9 +22,11 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
+    parse_legacy_source_data_contract_fields,
+    parse_source_data_contract_accepted_fields,
     sample_header_for_source,
     source_data_contract_artifact_hash,
     stamp_source_options_with_guarantees,
@@ -129,6 +131,19 @@ def _interpretation_hash_domain_v2(
     return domain_dict
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored nested values persisted inside composition-state rows — "
+        "CompositionStateRecord freezes its containers but does not promote the nested "
+        "option/source shapes it couriers"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises InterpretationPlaceholderConsumedError when the value is not a mapping; never coerces or defaults",
+    test_ref=("tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_require_mapping_rejects_non_mapping"),
+    test_fingerprint="c317fd5bd9c3ee59b637d72483ee43dfddeee80883c34cecb11bd3115702f565",
+)
 def _require_mapping(value: object, *, message: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise InterpretationPlaceholderConsumedError(message)
@@ -249,6 +264,22 @@ def _validate_pipeline_decision_semantics_from_state_record(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored options.interpretation_requirements value persisted inside "
+        "composition-state node/source options and read back from sessions storage"
+    ),
+    source_param="requirements_value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError when the requirements value is not a "
+        "list/tuple, an entry is not a mapping, a user_term is not a string, or there is not "
+        "exactly one pending matching requirement; never defaults a malformed shape"
+    ),
+    test_ref=("tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_matching_pending_requirement_index_rejects_non_list"),
+    test_fingerprint="6baf14f68736f1ca77f5a1b6b3450db0aebc5d44337d6646d54f7523b75e9bc3",
+)
 def _matching_pending_requirement_index(
     requirements_value: object,
     *,
@@ -306,6 +337,68 @@ def _review_requirement_identity(
         "user_term": user_term.strip(),
         "draft": draft,
     }
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored options.interpretation_requirements value persisted inside "
+        "composition-state node/source options and read back from sessions storage"
+    ),
+    source_param="requirements_value",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError when a PRESENT requirements value is not "
+        "a list/tuple, an entry is not a mapping, or a vague_term entry's user_term is not a "
+        "string; None (absent) is the legitimate legacy/unstaged case and returns False — a "
+        "malformed value is never silently routed to the legacy arm"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_has_matching_vague_term_requirement_rejects_malformed_value"
+    ),
+    test_fingerprint="59dfeae2f6ebcac673f880e762d171bea173c3e31df18db78834d65d061c6214",
+)
+def _has_matching_vague_term_requirement(
+    requirements_value: object,
+    *,
+    user_term: str,
+    context: str,
+    require_pending: bool,
+) -> bool:
+    """Strict discriminator between the structured and legacy vague-term arms.
+
+    ``True`` — a well-formed vague_term requirement row matches ``user_term``
+    (and is pending, when ``require_pending``). ``False`` — the value is
+    absent (``None``) or holds no matching row: the legitimate legacy /
+    other-kinds case. Malformed shapes RAISE instead of reading as ``False``,
+    so corruption can never masquerade as "legacy node" and slip into the
+    ``prompt_template`` fallback (the bug class this replaces: the previous
+    inline ``isinstance(...) and any(...)`` scans silently classified a
+    non-list value or non-mapping row as legacy).
+    """
+    if requirements_value is None:
+        return False
+    if not isinstance(requirements_value, (list, tuple)):
+        raise InterpretationPlaceholderConsumedError(f"{context}: options.interpretation_requirements is not a list")
+    normalized_user_term = user_term.strip()
+    found = False
+    for requirement in requirements_value:
+        if not isinstance(requirement, Mapping):
+            raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement entry is not a mapping")
+        requirement_kind = requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value
+        if requirement_kind != InterpretationKind.VAGUE_TERM.value:
+            continue
+        requirement_term = requirement["user_term"] if "user_term" in requirement else None
+        if type(requirement_term) is not str:
+            raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement user_term is invalid")
+        if requirement_term.strip() != normalized_user_term:
+            continue
+        if require_pending:
+            requirement_status = requirement["status"] if "status" in requirement else None
+            if requirement_status != "pending":
+                continue
+        found = True
+    return found
 
 
 def _reviewed_content_identity(
@@ -366,13 +459,14 @@ def _reviewed_content_identity(
         return stable_hash(domain)
 
     if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
-        # The reviewed artifact is the backtraced demand FIELD SET alone —
-        # recomputed server-side from the state record, never read from the
-        # event text. The sample header is illustrative card evidence and is
-        # deliberately outside the identity: a re-read sample must not abandon
-        # or unstick a card whose demanded fields are unchanged. No staged
-        # requirement row participates either — the card derives from graph
-        # demand, so there may legitimately be none at surfacing time.
+        # The reviewed artifact binds the current contract version,
+        # fail-closed consequence, and backtraced demand FIELD SET — the
+        # fields are recomputed server-side from the state record, never read
+        # from the event text. The sample header is illustrative card evidence
+        # and is deliberately outside the identity: a re-read sample must not
+        # abandon or unstick a card whose demanded fields are unchanged. No
+        # staged requirement row participates either — the card derives from
+        # graph demand, so there may legitimately be none at surfacing time.
         _source_name, demand = _source_data_contract_demand_from_state_record(
             state_record,
             affected_node_id=affected_node_id,
@@ -400,14 +494,11 @@ def _reviewed_content_identity(
 
     if kind is InterpretationKind.VAGUE_TERM:
         raw_requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-        structured_match = isinstance(raw_requirements, (list, tuple)) and any(
-            isinstance(requirement, Mapping)
-            and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value)
-            == InterpretationKind.VAGUE_TERM.value
-            and "user_term" in requirement
-            and type(requirement["user_term"]) is str
-            and requirement["user_term"].strip() == user_term.strip()
-            for requirement in raw_requirements
+        structured_match = _has_matching_vague_term_requirement(
+            raw_requirements,
+            user_term=user_term,
+            context=context,
+            require_pending=False,
         )
         if structured_match:
             requirement_identity = _review_requirement_identity(
@@ -421,15 +512,15 @@ def _reviewed_content_identity(
                 raise InterpretationPlaceholderConsumedError(
                     f"{context}: structured vague-term review requires options.{PROMPT_TEMPLATE_PARTS_KEY}"
                 )
+            # ``prompt_structure_hash_from_options`` returned non-None above,
+            # which means ``_prompt_parts`` already parsed this exact value:
+            # every part is a mapping with a valid ``kind``, and every
+            # interpretation_ref part carries a non-empty ``requirement_id``
+            # (interpretation_state._prompt_parts raises otherwise). Direct
+            # reads are therefore the honest form — re-checking shapes here
+            # would be defensive revalidation of a just-proven contract.
             parts = options[PROMPT_TEMPLATE_PARTS_KEY]
-            if not any(
-                isinstance(part, Mapping)
-                and "kind" in part
-                and part["kind"] == "interpretation_ref"
-                and "requirement_id" in part
-                and part["requirement_id"] == requirement_identity["id"]
-                for part in parts
-            ):
+            if not any(part["kind"] == "interpretation_ref" and part["requirement_id"] == requirement_identity["id"] for part in parts):
                 raise InterpretationPlaceholderConsumedError(
                     f"{context}: structured vague-term review has no prompt part for its requirement"
                 )
@@ -523,6 +614,26 @@ _STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options (interpretation_requirements, prompt_template_parts) "
+        "persisted inside composition-state rows and read back from sessions storage"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError on any malformed structured-interpretation "
+        "shape (non-list requirements, non-mapping entries, invalid ids/terms, non-list "
+        "prompt_template_parts, malformed parts); returns None only for the legitimate "
+        "no-structured-state cases, never for malformed ones"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/test_interpretation_trust_boundaries.py"
+        "::test_patch_structured_interpretation_prompt_rejects_non_list_requirements"
+    ),
+    test_fingerprint="0aa1a62f40c40d1820b942378ecd90ee7eef0544d0c8a370460459c465d1cdf4",
+)
 def _patch_structured_interpretation_prompt(
     *,
     options: Mapping[str, Any],
@@ -894,15 +1005,11 @@ def _resolve_vague_term(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     requirements_value = live_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in live_options else None
-    has_structured_site = isinstance(requirements_value, (list, tuple)) and any(
-        isinstance(requirement, Mapping)
-        and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-        and "user_term" in requirement
-        and type(requirement["user_term"]) is str
-        and requirement["user_term"].strip() == user_term.strip()
-        and "status" in requirement
-        and requirement["status"] == "pending"
-        for requirement in requirements_value
+    has_structured_site = _has_matching_vague_term_requirement(
+        requirements_value,
+        user_term=user_term,
+        context="resolve_interpretation_event",
+        require_pending=True,
     )
     if not has_structured_site:
         if surfacing_state_record is None:
@@ -1352,9 +1459,17 @@ def _resolve_source_data_contract(
 
     Resolution stamps the demand into ``schema.guaranteed_fields`` (observed
     mode preserved — participate-but-open), which is what ADR-016's
-    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime: a
-    broken promise quarantines rows, it never aborts the run.
+    ``SourceGuaranteedFieldsContract`` then enforces per-row at runtime. A
+    valid source row that breaks the producer guarantee records a FAILED token
+    and source-node state before the Tier-1 violation aborts the run. Rows
+    quarantined during source validation never reach that boundary check.
     """
+    reviewed_fields = parse_source_data_contract_accepted_fields(llm_draft)
+    if reviewed_fields is None:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card uses a retired or malformed contract version; "
+            "reload the session and acknowledge the current review"
+        )
     source_name = source_name_from_component_id(affected_node_id)
     if source_name is None:
         raise InterpretationNodeMissingError(
@@ -1378,6 +1493,10 @@ def _resolve_source_data_contract(
         affected_node_id=affected_node_id,
         context="resolve_interpretation_event",
     )
+    if reviewed_fields != demand:
+        raise InterpretationPlaceholderConsumedError(
+            "resolve_interpretation_event: source_data_contract card fields no longer match the current demand"
+        )
     stamped_options = stamp_source_options_with_guarantees(options, demand)
     if stamped_options is None:
         raise InterpretationPlaceholderConsumedError(
@@ -1742,13 +1861,11 @@ class _SessionPendingInterpretationPlanner:
             )
             if kind is InterpretationKind.VAGUE_TERM:
                 requirements_value = options.get(INTERPRETATION_REQUIREMENTS_KEY)
-                has_structured_match = type(requirements_value) in (list, tuple) and any(
-                    type(requirement) in (dict, MappingProxyType)
-                    and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-                    and type(requirement.get("user_term")) is str
-                    and requirement["user_term"].strip() == user_term.strip()
-                    and requirement.get("status") == "pending"
-                    for requirement in cast("list[Any] | tuple[Any, ...]", requirements_value)
+                has_structured_match = _has_matching_vague_term_requirement(
+                    requirements_value,
+                    user_term=user_term,
+                    context="create_pending_interpretation_event",
+                    require_pending=True,
                 )
                 if has_structured_match:
                     requirements, matching_index = _matching_pending_requirement_index(
@@ -1804,20 +1921,33 @@ class _SessionPendingInterpretationPlanner:
                 context="create_pending_interpretation_event",
             )
         except InterpretationResolveError:
+            # A newer durable state can remove or structurally consume this
+            # review site while an older surfacer waits for the session lock.
+            # The stale call must not mint a card, but it still owns
+            # reconciliation of any card for the historical site.
             stale = tuple(
                 site.event.id
                 for site in snapshot.pending_sites
                 if type(site.event.user_term) is str and site.event.user_term.strip() == user_term.strip()
             )
             if not stale:
+                # The state-commit supersession sweep may have already retired
+                # this site's card in the commit that extinguished it. Return
+                # that terminal row for the same reason the supersede arm below
+                # returns one: a successful state commit's advisory surfacer
+                # must not turn into an error response.
+                for superseded_event in snapshot.superseded_events:
+                    superseded_term = superseded_event.user_term
+                    if type(superseded_term) is str and superseded_term.strip() == user_term.strip():
+                        return SessionPendingInterpretationDecision(result_event_id=superseded_event.id)
                 raise
             return SessionPendingInterpretationDecision(
                 result_event_id=stale[0],
-                abandoned_event_ids=stale,
+                superseded_event_ids=stale,
             )
 
         matching_event_id: UUID | None = None
-        rows_to_abandon: list[UUID] = []
+        rows_to_supersede: list[UUID] = []
         for site in snapshot.pending_sites:
             pending_user_term = site.event.user_term
             if type(pending_user_term) is not str:
@@ -1833,10 +1963,37 @@ class _SessionPendingInterpretationPlanner:
                 user_term=pending_user_term,
                 context="create_pending_interpretation_event",
             )
+            if kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+                pending_draft = site.event.llm_draft
+                if type(pending_draft) is not str:
+                    raise AuditIntegrityError("create_pending_interpretation_event: pending source_data_contract review has no draft")
+                current_fields = parse_source_data_contract_accepted_fields(pending_draft)
+                legacy_fields = parse_legacy_source_data_contract_fields(pending_draft)
+                if current_fields is None and legacy_fields is None:
+                    raise AuditIntegrityError(
+                        "create_pending_interpretation_event: pending source_data_contract review has a malformed draft"
+                    )
+                _pending_source_name, pending_demand = _source_data_contract_demand_from_state_record(
+                    site.surfacing_state,
+                    affected_node_id=affected_node_id,
+                    context="create_pending_interpretation_event",
+                )
+                pending_fields = current_fields if current_fields is not None else legacy_fields
+                if pending_fields != pending_demand:
+                    raise AuditIntegrityError(
+                        "create_pending_interpretation_event: pending source_data_contract review draft disagrees "
+                        "with its immutable surfacing-state demand"
+                    )
+                if legacy_fields is not None:
+                    # V1 showed a materially different consequence. Preserve it
+                    # as superseded audit history and mint a v2 card; field
+                    # equality cannot reuse old copy as current user authority.
+                    rows_to_supersede.append(site.event.id)
+                    continue
             if not snapshot.review_disabled and matching_event_id is None and pending_identity == current_identity:
                 matching_event_id = site.event.id
             else:
-                rows_to_abandon.append(site.event.id)
+                rows_to_supersede.append(site.event.id)
         if matching_event_id is None and surfacing_identity != current_identity:
             raise InterpretationPlaceholderConsumedError(
                 "create_pending_interpretation_event: reviewed content no longer matches the current composition state"
@@ -1844,13 +2001,13 @@ class _SessionPendingInterpretationPlanner:
         if matching_event_id is not None:
             return SessionPendingInterpretationDecision(
                 result_event_id=matching_event_id,
-                abandoned_event_ids=tuple(rows_to_abandon),
+                superseded_event_ids=tuple(rows_to_supersede),
             )
 
         if not snapshot.review_disabled:
             return SessionPendingInterpretationDecision(
                 result_event_id=event_id,
-                abandoned_event_ids=tuple(rows_to_abandon),
+                superseded_event_ids=tuple(rows_to_supersede),
                 insert_event=True,
                 choice=InterpretationChoice.PENDING,
                 interpretation_source=InterpretationSource.USER_APPROVED,
@@ -1962,7 +2119,7 @@ class _SessionPendingInterpretationPlanner:
         )
         return SessionPendingInterpretationDecision(
             result_event_id=event_id,
-            abandoned_event_ids=tuple(rows_to_abandon),
+            superseded_event_ids=tuple(rows_to_supersede),
             insert_event=True,
             choice=InterpretationChoice.OPTED_OUT,
             accepted_value=llm_draft,

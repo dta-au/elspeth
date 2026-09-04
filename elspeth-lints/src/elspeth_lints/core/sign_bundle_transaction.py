@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from concurrent.futures import Future
 
+from elspeth_lints.core.allowlist_similarity import normalize_rationale_for_similarity
 from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
+from elspeth_lints.core.review_bundle import DEFAULT_SIGN_BUNDLE_RATIONALE
 from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 SCHEMA_VERSION = 1
@@ -674,6 +676,13 @@ _PREFETCHABLE_KINDS = frozenset({"justify"})
 _JUDGE_GATED_KINDS = frozenset({"justify", "drift_repair"})
 
 
+def _prefetch_rationale_cohort(action: Any) -> str | None:
+    """Return the exact-rationale dependency cohort for one justify action."""
+    effective_rationale = action.draft_rationale or DEFAULT_SIGN_BUNDLE_RATIONALE
+    normalized = normalize_rationale_for_similarity(effective_rationale)
+    return normalized or None
+
+
 class _PrefetchAborted(Exception):
     """Raised inside a prefetch worker whose verdict the transaction will not use.
 
@@ -688,15 +697,18 @@ class _JudgePrefetcher:
 
     ``sign-bundle`` spends almost all of its wall time inside one judge
     subprocess per action, while every write it performs is milliseconds.
-    Up to ``concurrency`` prefetchable actions therefore run their executor in
-    a worker thread. The executor does its reads and its judge call, then
-    calls ``before_write()`` — the write gate — and parks there. The main loop
-    still visits actions in bundle order and, for each prefetched one, performs
-    the same checkpoint → ``running_action`` → journal sequence it always did;
-    it releases that one gate, waits for the worker's exit code, and verifies
-    the scoped candidate change before moving on. So at any instant at most
-    ONE action is writing to the candidate, and it is the journalled
-    ``running_action`` — the crash/resume contract is unchanged.
+    Up to ``concurrency`` prefetchable actions with distinct normalized
+    rationales therefore run their executor in a worker thread. Same-rationale
+    actions stay in one dependency cohort: the next starts only after its prior
+    future has completed its write-or-no-write decision, so its duplicate
+    evidence matches serial execution. The executor does its reads and its
+    judge call, then calls ``before_write()`` — the write gate — and parks
+    there. The main loop still visits actions in bundle order and, for each
+    prefetched one, performs the same checkpoint → ``running_action`` → journal
+    sequence it always did; it releases that one gate, waits for the worker's
+    exit code, and verifies the scoped candidate change before moving on. So at
+    any instant at most ONE action is writing to the candidate, and it is the
+    journalled ``running_action`` — the crash/resume contract is unchanged.
 
     A verdict obtained by a worker that is never released (the loop stopped
     first) is discarded exactly as an in-flight verdict is lost by a kill: it
@@ -713,36 +725,70 @@ class _JudgePrefetcher:
         execute: Callable[[Any, argparse.Namespace, Callable[[], None]], int],
         args: argparse.Namespace,
     ) -> None:
-        self._queue = [(index, action) for index, action in ordered_pending if action.kind in _PREFETCHABLE_KINDS]
-        self._next = 0
+        self._queue = [
+            (index, action, _prefetch_rationale_cohort(action)) for index, action in ordered_pending if action.kind in _PREFETCHABLE_KINDS
+        ]
         self._concurrency = concurrency
         self._execute = execute
         self._args = args
         self._futures: dict[int, Future[int]] = {}
         self._gates: dict[int, threading.Event] = {}
+        self._cohorts_by_index: dict[int, str] = {}
+        self._active_cohorts: set[str] = set()
         self._abort = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="sign-bundle-judge")
 
     def handles(self, action: Any) -> bool:
         return action.kind in _PREFETCHABLE_KINDS
 
-    def _submit_next(self) -> None:
-        index, action = self._queue[self._next]
-        self._next += 1
+    def _abort_and_release_gates(self) -> None:
+        """Fail closed before waking workers that may have reached their write gate."""
+        self._abort.set()
+        for gate in self._gates.values():
+            gate.set()
+
+    def _submit(self, index: int, action: Any, cohort: str | None) -> None:
         gate = threading.Event()
-        self._gates[index] = gate
 
         def before_write() -> None:
             gate.wait()
             if self._abort.is_set():
                 raise _PrefetchAborted(index)
 
-        self._futures[index] = self._pool.submit(self._execute, action, self._args, before_write)
+        self._gates[index] = gate
+        try:
+            future = self._pool.submit(self._execute, action, self._args, before_write)
+            self._futures[index] = future
+            if cohort is not None:
+                self._cohorts_by_index[index] = cohort
+                self._active_cohorts.add(cohort)
+        except BaseException:
+            # ``submit`` can start a worker before control returns (or raises).
+            # Abort before opening any registered gate so no possibly-started
+            # worker can mutate the candidate outside the ordered write loop.
+            self._abort_and_release_gates()
+            self._gates.pop(index, None)
+            self._futures.pop(index, None)
+            registered_cohort = self._cohorts_by_index.pop(index, None)
+            if registered_cohort is not None:
+                self._active_cohorts.discard(registered_cohort)
+            raise
 
     def _fill(self) -> None:
-        """Keep ``concurrency`` judge calls in flight: submitted but not yet consumed."""
-        while self._next < len(self._queue) and len(self._futures) < self._concurrency:
-            self._submit_next()
+        """Fill worker slots without overlapping one rationale dependency cohort."""
+        while self._queue and len(self._futures) < self._concurrency:
+            eligible_position = next(
+                (
+                    position
+                    for position, (_index, _action, cohort) in enumerate(self._queue)
+                    if cohort is None or cohort not in self._active_cohorts
+                ),
+                None,
+            )
+            if eligible_position is None:
+                return
+            index, action, cohort = self._queue.pop(eligible_position)
+            self._submit(index, action, cohort)
 
     def release_and_wait(self, index: int) -> int:
         """Open ``index``'s write gate and return its executor exit code."""
@@ -755,6 +801,9 @@ class _JudgePrefetcher:
         finally:
             del self._futures[index]
             del self._gates[index]
+            cohort = self._cohorts_by_index.pop(index, None)
+            if cohort is not None:
+                self._active_cohorts.remove(cohort)
         # Top up immediately so the next judge call overlaps this action's
         # verification and journal writes.
         self._fill()
@@ -762,9 +811,7 @@ class _JudgePrefetcher:
 
     def close(self, *, wait: bool) -> None:
         """Discard every unconsumed verdict; workers unwind without writing."""
-        self._abort.set()
-        for gate in self._gates.values():
-            gate.set()
+        self._abort_and_release_gates()
         self._pool.shutdown(wait=wait, cancel_futures=True)
 
 

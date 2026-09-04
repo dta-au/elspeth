@@ -209,9 +209,8 @@ describe("RunOutputsPanel", () => {
   // multi-artifact manifests keep the original opt-in behaviour.
 
   // row_count_preview === 1 is reachable and is the only count that exposes a
-  // hardcoded plural: the backend sets it to len(lines) when the LINE cap was
-  // not hit but the BYTE cap truncated the read, so one very long first line
-  // yields truncated=true with exactly one row.
+  // hardcoded plural: the backend reports complete logical records (including
+  // a CSV header), so a byte-capped CSV may return only its complete header.
   // A dropped final record must SAY it was dropped. Both tests below feed a
   // preview whose text stops inside a quoted field — the parser reports
   // endedInQuotes and the fragment is discarded — and assert the operator is
@@ -221,10 +220,8 @@ describe("RunOutputsPanel", () => {
   // and which does not render at all on the malformed-artifact path.
 
   it("says the final record was cut off when a TRUNCATED preview ends mid-quote", async () => {
-    // The real and common case. The backend caps the preview by PHYSICAL
-    // LINES (web/execution/preview.py:162), so on transform:llm output —
-    // multi-line prose plus a quoted `_usage` dict — the cut routinely lands
-    // inside a value.
+    // Defensive wire handling: the current backend withholds byte-cut record
+    // fragments, but a stale server or captured response may still carry one.
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
     );
@@ -247,8 +244,8 @@ describe("RunOutputsPanel", () => {
   });
 
   it("reports an unterminated quoted field when an UNtruncated preview ends mid-quote", async () => {
-    // A partially-written or malformed artifact: under both the byte and the
-    // line cap, so the backend reports truncated=false and NO footer renders.
+    // A partially-written or malformed artifact that did not hit either cap,
+    // so the backend reports truncated=false and NO footer renders.
     // Without a caveat here the record disappears with nothing on screen.
     // summarizeCsv (utils/contentStructure.ts) has always reported exactly
     // this condition; this is the same rule reaching the second consumer.
@@ -271,12 +268,27 @@ describe("RunOutputsPanel", () => {
     expect(screen.queryByText(/preview truncated/i)).not.toBeInTheDocument();
   });
 
-  // The noun is LINE, not row. This test's own comment above has always said
-  // len(LINES); the footer said "rows", and on LLM output — whose prose
-  // values span many physical lines — that asserted a record count the table
-  // beneath it visibly contradicted (a 30-record file could render 16 rows
-  // under a footer claiming 100). The count is honest; only its label was not.
-  it("says 'to 1 line' in the truncation footer, not 'to 1 lines'", async () => {
+  it("shows the malformed CSV caveat even when no complete row can render", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: false,
+        row_count_preview: null,
+        preview_text: '"unfinished header',
+      }),
+    );
+
+    const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+    expect(
+      await screen.findByText(/unterminated quoted field/i),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".structured-preview-table")).toBeNull();
+  });
+
+  it("says a singular row count and discloses that CSV counts include the header", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
     );
@@ -287,8 +299,27 @@ describe("RunOutputsPanel", () => {
     render(<RunOutputsPanel runId={RUN_ID} />);
 
     const footer = await screen.findByText(/preview truncated/i);
-    expect(footer.textContent).toContain("to 1 line");
-    expect(footer.textContent).not.toContain("to 1 lines");
+    expect(footer.textContent).toContain("to 1 row including header");
+    expect(footer.textContent).not.toContain("to 1 rows");
+  });
+
+  it("does not claim a header was included when the byte cap captured zero CSV rows", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        truncated: true,
+        row_count_preview: 0,
+        preview_text: "",
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 0 rows");
+    expect(footer.textContent).not.toContain("including header");
   });
 
   it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {
@@ -447,6 +478,25 @@ describe("RunOutputsPanel", () => {
     expect(header.getAttribute("scope")).toBe("col");
   });
 
+  it("does not render CRLF blank JSONL frames that the backend does not count", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact({ path_or_uri: "file:///data/outputs/results.jsonl" })]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        content_type: "jsonl",
+        preview_text: '{"a":1}\r\n\r\n{"a":2}\r\n',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText('{"a":1}')).toBeInTheDocument());
+    expect(screen.getByText('{"a":2}')).toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(3); // header plus two JSONL records
+  });
+
   it("renders nothing for an empty csv/jsonl preview body instead of an empty table shell", async () => {
     // buildTabularPreviewModel returns null for zero data lines; TabularPreview
     // must render nothing rather than an empty PreviewTable — this empty
@@ -557,6 +607,31 @@ describe("RunOutputsPanel", () => {
     ]);
   });
 
+  it("labels genuinely over-wide CSV rows and explains the header mismatch", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: "id,name\n1,Alice,unexpected\n",
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const headerCells = await screen.findAllByRole("columnheader");
+    expect(headerCells.map((cell) => cell.textContent)).toEqual([
+      "id",
+      "name",
+      "Unnamed column 3",
+    ]);
+    expect(
+      screen.getByText(/some rows contain more fields than the header/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("unexpected")).toBeInTheDocument();
+  });
+
   it("keeps a quoted multi-line value in one cell instead of starting a new row", async () => {
     // The shape elspeth-7f1e148ed6 was originally filed on: an
     // llm_response holding formatted JSON. `text.split("\n")` turned each
@@ -578,6 +653,59 @@ describe("RunOutputsPanel", () => {
     // header + exactly two data rows
     expect(rows).toHaveLength(3);
     expect(screen.getByText("line one line two")).toBeInTheDocument();
+  });
+
+  it("renders a final quoted empty CSV record without a terminal newline", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: 'value\n""',
+        row_count_preview: 2,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("value")).toBeInTheDocument());
+    expect(screen.getAllByRole("row")).toHaveLength(2); // header plus empty record
+  });
+
+  it("renders five complete 120-line records from a record-bounded backend preview", async () => {
+    const answers = Array.from({ length: 5 }, (_, recordIndex) =>
+      Array.from(
+        { length: 120 },
+        (_, lineIndex) => `record ${recordIndex} line ${lineIndex}`,
+      ).join("\n"),
+    );
+    const previewText =
+      "id,answer\n" +
+      answers
+        .map((answer, recordIndex) => `${recordIndex},"${answer}"\n`)
+        .join("");
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({
+        preview_text: previewText,
+        row_count_preview: 6,
+        truncated: false,
+      }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    await waitFor(() => expect(screen.getByText("id")).toBeInTheDocument());
+    const renderedRows = screen.getAllByRole("row");
+    expect(renderedRows).toHaveLength(6); // one header plus five body records
+    expect(renderedRows[1]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 0 line 0\nrecord 0 line 1",
+    );
+    expect(renderedRows[5]?.querySelectorAll("td")[1]?.textContent).toContain(
+      "record 4 line 118\nrecord 4 line 119",
+    );
   });
 
   it("escaped double quotes inside a quoted field collapse to one quote", async () => {

@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import GuidedCustodyIntegrityError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 
@@ -44,13 +44,13 @@ class GuidedReviewedBlobBinding:
 def validate_guided_reviewed_blob_ref(value: object) -> str:
     """Return a canonical UUID string or fail closed without echoing it."""
     if type(value) is not str:
-        raise AuditIntegrityError("guided reviewed source blob_ref must be a canonical UUID string")
+        raise GuidedCustodyIntegrityError("guided reviewed source blob_ref must be a canonical UUID string")
     try:
         parsed = UUID(value)
     except ValueError as exc:
-        raise AuditIntegrityError("guided reviewed source blob_ref must be a canonical UUID string") from exc
+        raise GuidedCustodyIntegrityError("guided reviewed source blob_ref must be a canonical UUID string") from exc
     if str(parsed) != value:
-        raise AuditIntegrityError("guided reviewed source blob_ref must be a canonical UUID string")
+        raise GuidedCustodyIntegrityError("guided reviewed source blob_ref must be a canonical UUID string")
     return value
 
 
@@ -67,20 +67,20 @@ def validate_guided_reviewed_blob_binding(options: Mapping[str, object]) -> Guid
             continue
         value = options[key]
         if type(value) is not str or not value or "\x00" in value:
-            raise AuditIntegrityError("guided reviewed blob source path carrier must be an exact non-empty string without NUL")
+            raise GuidedCustodyIntegrityError("guided reviewed blob source path carrier must be an exact non-empty string without NUL")
         carriers.append((key, value))
     if not carriers:
-        raise AuditIntegrityError("guided reviewed blob source is missing a string path carrier")
+        raise GuidedCustodyIntegrityError("guided reviewed blob source is missing a string path carrier")
 
     if has_sentinel:
         if any(not value.startswith(BLOB_REF_PATH_PREFIX) for _key, value in carriers):
-            raise AuditIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
+            raise GuidedCustodyIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
         sentinel_ids = {validate_guided_reviewed_blob_ref(value.removeprefix(BLOB_REF_PATH_PREFIX)) for _key, value in carriers}
         if len(sentinel_ids) != 1:
-            raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+            raise GuidedCustodyIntegrityError("guided reviewed blob sentinel and blob_ref differ")
         blob_ref = next(iter(sentinel_ids))
         if has_explicit_ref and validate_guided_reviewed_blob_ref(options["blob_ref"]) != blob_ref:
-            raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+            raise GuidedCustodyIntegrityError("guided reviewed blob sentinel and blob_ref differ")
         return GuidedReviewedBlobBinding(blob_ref=blob_ref, carriers=tuple(carriers), is_sentinel=True)
 
     blob_ref = validate_guided_reviewed_blob_ref(options["blob_ref"])
@@ -97,21 +97,21 @@ def validate_guided_reviewed_sentinel_source_mapping(
     if not binding.is_sentinel:
         raise TypeError("sentinel source mapping requires a sentinel binding")
     if source_name not in live_source_options:
-        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+        raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
     options = live_source_options[source_name]
     expected_keys = {key for key, _value in binding.carriers}
     live_keys = {key for key in GUIDED_REVIEWED_BLOB_PATH_KEYS if key in options}
     if live_keys != expected_keys:
-        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+        raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
 
     live_carriers: list[tuple[str, str]] = []
     for key, _sentinel in binding.carriers:
         value = options[key]
         if type(value) is not str or not value or "\x00" in value or value.startswith(BLOB_REF_PATH_PREFIX):
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
+            raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
         live_carriers.append((key, value))
     if "blob_ref" in options and validate_guided_reviewed_blob_ref(options["blob_ref"]) != binding.blob_ref:
-        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+        raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
     return tuple(live_carriers)
 
 
@@ -127,9 +127,9 @@ def validate_guided_reviewed_blob_source_mapping(
     for reviewed_name, reviewed_paths in reviewed_bindings:
         if reviewed_name in live_carriers:
             if reviewed_paths != live_carriers[reviewed_name]:
-                raise AuditIntegrityError("guided blob source mapping is inconsistent")
+                raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
         elif any(reviewed_paths.intersection(paths) for paths in live_carriers.values()):
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
+            raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
 
     all_reviewed_paths = frozenset(path for _name, paths in reviewed_bindings for path in paths)
     for live_name, paths in live_carriers.items():
@@ -142,7 +142,7 @@ def validate_guided_reviewed_blob_source_mapping(
             if reviewed_name == live_name and live_reviewed_paths <= reviewed_paths
         ]
         if len(candidates) != 1:
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
+            raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
 
 
 def reviewed_source_is_blob_bound(options: Mapping[str, object]) -> bool:

@@ -7,6 +7,7 @@ candidate state as a provider result.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import threading
@@ -41,6 +42,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
@@ -67,6 +69,7 @@ from elspeth.web.composer.pipeline_planner import (
     _allowlisted_candidate_feedback,
     _candidate_shape_hash,
     _derive_finalizer_owned_refs,
+    _entry_component_ref,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
     _materialize_terminal_payload,
@@ -87,6 +90,7 @@ from elspeth.web.composer.pipeline_proposal import (
 )
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
 from elspeth.web.composer.prompts import build_system_prompt
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
     CompositionState,
@@ -136,9 +140,53 @@ _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 # fail-closed cap is composer_planner_max_request_bytes, 2 MiB). It only ever
 # moves by an operator ruling: growth must be priced as deliberately-landed
 # palette additions, never absorbed by deforming a plugin contract or trimming
-# load-bearing teaching text to fit. Last re-set 2026-08-27 (John): 96 -> 100
-# KiB, paid for by reference_join + the two blob expanders (+911 B net).
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = 100 * 1024
+# load-bearing teaching text to fit. Re-set 2026-08-27 (John): 96 -> 100 KiB,
+# paid for by reference_join + the two blob expanders (+911 B net). Re-set
+# 2026-08-31 (John): 100 -> 102 KiB, paid for by the provider set-pipeline
+# envelope plus state-aware, surface-scoped source-rebuild guidance (current
+# fixed scaffold: 103,596 B). Re-set 2026-09-01 (John): 102 -> 106 KiB,
+# paid for by the runtime-owned option-field advertisement and
+# option-ownership parity work (+2,339 B palette) and the source-contract /
+# review teaching text (+1,485 B skills) landed on interim-merge-target;
+# current fixed scaffold: 107,420 B. The ceiling is not derived from any
+# provider or transport limit — it is a tripwire that makes scaffolding
+# growth a thing someone looks at, so it is set to leave working room rather
+# than to sit one edit away from tripping on noise.
+_FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
+# Standing operator ruling 2026-09-03 (John): the scaffold will rise and fall
+# as the tech-debt burn-down retires duplicated keys and teaches the surviving
+# ones, so the ratchet carries a PRE-APPROVED 10% band above the baseline
+# instead of costing an operator round-trip per edit. Move within the band on
+# the change's own merits; bring the numbers to the operator when the scaffold
+# leaves it. A shrink of more than 10% below the baseline is the other
+# boundary — it means teaching was lost rather than retired — and is a
+# judgement call for the operator, not a gate here. Measured 2026-09-03 at
+# 0dda01dfb (tool-result envelope data-key teaching, elspeth-e405ad7cd2):
+# 109,924 B; then two round-3 teaching corrections in the same lane moved it
+# before any census work did — the failure-schema and terminal-state
+# reconciliation (6da628fd3) to 109,983 B, +59 B, and diff_pipeline dropping
+# its version twin (414850e27) to 110,043 B, +60 B. Re-measured after the
+# census stopped declining comprehension-valued payloads and the eleven keys
+# it newly enumerated were taught (elspeth-e405ad7cd2 RED2-2 residue):
+# 110,328 B, +285 B on 110,043. Those two steps were reconstructed by
+# measuring every commit in between, because the entry below them recorded
+# +285 against the 109,924 above them: the arithmetic did not close and a
+# reader adding it up landed 119 B low. The chain is the record, so every
+# figure in it must be a measured predecessor of the next. The edge_contracts
+# CARDINALITY correction (elspeth-e405ad7cd2 LLM-R5-1) then moved it to
+# 110,564 B, +236 B, recording that only in its commit message; the same
+# description's REQUIREMENT-SOURCE correction (elspeth-e405ad7cd2 LLM-R5C-3)
+# moves it to 110,753 B, +189 B; deleting one false parenthetical from that
+# same correction — it scoped the schema-declared-fields route to a typed
+# source producer, which holds for a node consumer and not for a sink
+# (elspeth-e405ad7cd2 LLM-F1) — brings it back to 110,706 B, -47 B. Each figure
+# is read from this assertion in a throwaway export with the ceiling lowered to
+# 1, per commit, not inferred from a diff. Two model-facing edits in that round
+# cost nothing here and are worth knowing about: the sink_contract_violation
+# repair guidance is per-ERROR text rather than scaffolding, and
+# pipeline_composer.md is not the skill this request carries (the harness
+# renders pipeline_capabilities.md), so both measured +0 B.
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
 
 
 @dataclass
@@ -515,7 +563,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
             "on_success": "rows",
             "options": {
                 "path": str(data_dir / "blobs" / _TEST_SESSION_ID / "input.csv"),
-                "schema": {"mode": "observed"},
+                "schema": {"mode": "flexible", "fields": ["text: str"]},
             },
             "on_validation_failure": "discard",
         },
@@ -533,6 +581,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }}",
+                    "required_input_fields": ["text"],
                     "interpretation_requirements": [
                         {
                             "kind": "pipeline_decision",
@@ -2399,6 +2448,84 @@ def test_noncanonical_schema_serializer_fails_closed() -> None:
     assert payload["data"]["next_tool"] == "get_plugin_assistance"
 
 
+def _node_component_read(current_state: CompositionState) -> tuple[_ParsedToolCall, ToolResult]:
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={"node": {"id": "map-1"}},
+    )
+    call = _ParsedToolCall(
+        call_id="call-1",
+        name="get_pipeline_state",
+        raw_arguments='{"component":"map_fields"}',
+        arguments={"component": "map_fields"},
+    )
+    return call, result
+
+
+def test_malformed_projection_node_candidate_raises_instead_of_failing_closed() -> None:
+    """A node candidate in the policy-owned server-computed projection that
+    cannot honour the fixed block contract is an internal invariant failure:
+    it must raise, not be laundered into surface_projection_unavailable."""
+    current_state = _empty_state()
+    call, result = _node_component_read(current_state)
+
+    with pytest.raises(TypeError):
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"nodes": ["malformed-candidate"]},
+        )
+
+
+def test_unmatched_projection_node_read_still_fails_closed() -> None:
+    """Well-formed candidates that simply do not match the selected id keep
+    the closed surface_projection_unavailable outcome."""
+    current_state = _empty_state()
+    call, result = _node_component_read(current_state)
+
+    payload = json.loads(
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"nodes": [{"id": "other-node"}]},
+        )
+    )
+
+    assert payload["success"] is False
+    assert payload["data"]["error_code"] == "surface_projection_unavailable"
+
+
+def test_malformed_projection_output_candidate_raises_instead_of_failing_closed() -> None:
+    """Owned output candidates obey the same invariant posture as nodes."""
+    current_state = _empty_state()
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data={"output": {"sink_name": "rows"}},
+    )
+    call = _ParsedToolCall(
+        call_id="call-output",
+        name="get_pipeline_state",
+        raw_arguments='{"component":"rows"}',
+        arguments={"component": "rows"},
+    )
+
+    with pytest.raises(TypeError):
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.GUIDED_STAGED,
+            provider_current_state={"outputs": ["malformed-candidate"]},
+        )
+
+
 @pytest.mark.asyncio
 async def test_schema_fact_survives_rejection_while_issue_specific_discovery_adds_information(
     tmp_path: Path,
@@ -2647,7 +2774,11 @@ async def test_redacted_planner_preserves_canonical_failed_state_read(
     assert payload["success"] is False
     assert payload["data"].get("error_code") != "surface_projection_unavailable"
     if "unexpected" in arguments:
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # The argument rejection rides under ``data`` as ``argument_error``,
+        # never as a second ``success`` / ``validation`` beside the envelope's
+        # own (SYS-R3-1): the envelope's ``validation`` here is the STATE's.
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
     else:
         assert payload["data"]["error"] == (
             "Component 'missing-component' not found. Specify 'source', a node ID, an output name, "
@@ -2821,8 +2952,13 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
     payload = json.loads(tool_message["content"])
     assert payload["success"] is not failed
     if failed:
-        assert payload["data"]["success"] is False
-        assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+        # ``data`` carries the argument rejection under its own name. It must
+        # not restate the envelope's ``success`` (a twin) or shadow the
+        # envelope's ``validation``, which on this arm is the STATE's and whose
+        # errors are the pipeline's, not the argument's (SYS-R3-1).
+        assert set(payload["data"]) == {"argument_error"}
+        assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
+        assert payload["validation"]["errors"] != [payload["data"]["argument_error"]]
     else:
         assert isinstance(payload["data"], dict)
         assert isinstance(payload["data"]["available"], list)
@@ -2884,8 +3020,13 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         if failed:
             assert payload["success"] is False
-            assert payload["data"]["success"] is False
-            assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
+            # Same shape on the RESTRICTED surface, which is where it matters
+            # most: ``_closed_provider_discovery_payload`` strips messages from
+            # the envelope's validation and then passes ``data`` through
+            # verbatim, so a second validation envelope under ``data`` would
+            # defeat that closure (SYS-R3-1).
+            assert set(payload["data"]) == {"argument_error"}
+            assert payload["data"]["argument_error"]["error_code"] == "SCHEMA_VALIDATION"
             assert payload["data"].get("error_code") != "surface_projection_unavailable"
         else:
             assert payload["success"] is False
@@ -2898,7 +3039,7 @@ async def test_preview_pipeline_disclosure_fails_closed_when_authoritative_data_
         assert _HIDDEN_CONNECTION_COMPONENT_CANARY in tool_message["content"]
         assert _HIDDEN_EDGE_COMPONENT_CANARY in tool_message["content"]
         if not failed:
-            assert "authoring_validation" in payload["data"]
+            assert "preview_is_valid" in payload["data"]
 
 
 @pytest.mark.parametrize(
@@ -3566,13 +3707,18 @@ async def test_missing_source_candidate_fails_closed_before_full_candidate_is_ac
     feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
     assert feedback["success"] is False
     assert feedback["validation"]["is_valid"] is False
-    # The pre-application rejection carries the closed code itself; the
-    # unchanged empty state's errors are gated out of planner feedback
-    # (tutorial op 1152d7e3: they were red herrings on every OTHER semantic
-    # rejection, steering repairs toward re-authoring source/sinks).
-    assert [error["component"] for error in feedback["validation"]["errors"]] == ["rejected_mutation"]
-    assert feedback["validation"]["errors"][0]["error_code"] == "no_source_configured"
-    assert all(error["error_class"] == "ValidationError" for error in feedback["validation"]["errors"])
+    # Terminal-schema admission rejects the malformed provider response before
+    # candidate construction, so the handler-level no_source_configured
+    # defense is unreachable on this public path.
+    assert feedback["validation"]["errors"] == [
+        {
+            "component": "pipeline",
+            "severity": "high",
+            "error_code": "canonical_schema",
+            "error_class": "SchemaValidationError",
+            "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -4700,34 +4846,30 @@ _CANONICAL_SCHEMA_FEEDBACK = {
 }
 
 
-def _missing_source_feedback() -> dict[str, Any]:
-    explanation, suggested_fix = explain_validation_code("no_source_configured") or ("", "")
-    return {
-        "success": False,
-        "validation": {
-            "is_valid": False,
-            "errors": [
-                {
-                    "component": "rejected_mutation",
-                    "severity": "high",
-                    "error_code": "no_source_configured",
-                    "error_class": "ValidationError",
-                    "explanation": explanation,
-                    "suggested_fix": suggested_fix,
-                }
-            ],
-        },
-        # See _binding_rejection_expected_feedback: an enriched entry makes
-        # the explain_validation_error advertisement information-free.
-    }
+_MISSING_SOURCE_SCHEMA_FEEDBACK = {
+    "success": False,
+    "validation": {
+        "is_valid": False,
+        "errors": [
+            {
+                "component": "pipeline",
+                "severity": "high",
+                "error_code": "canonical_schema",
+                "error_class": "SchemaValidationError",
+                "schema_violations": [{"path": "pipeline", "rule": "oneOf"}],
+            }
+        ],
+    },
+}
 
 
 def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
-    """A terminal candidate naming no source at all.
+    """Script a provider response that violates the terminal source union.
 
-    Legal against the terminal schema: ``SetPipelineArgumentsModel`` leaves
-    both ``source`` and ``sources`` optional, so a re-plan "delta" candidate
-    that drops the source block validates and reaches the finalizer.
+    Providers receive the schema and should not emit this shape, but the
+    planner still validates their output rather than trusting enforcement.
+    Omitting both ``source`` and ``sources`` violates the root ``oneOf`` and
+    must be rejected before candidate materialization or finalization.
     """
     pipeline = _pipeline(data_dir)
     del pipeline["source"]
@@ -4746,11 +4888,10 @@ async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """Characterize the repair the freeform surface already produces.
+    """A noncompliant provider response gets one bounded schema repair.
 
-    Pins the exact feedback the guided surface must match — the parity the
-    planner-side guard preserves rather than replacing with a bare schema
-    complaint.
+    The source omission is rejected by the advertised/canonical ``oneOf``
+    before the set_pipeline handler can emit ``no_source_configured``.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4760,7 +4901,7 @@ async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
     proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
     assert proposal.proposal.repair_count == 1
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _MISSING_SOURCE_SCHEMA_FEEDBACK
 
 
 @pytest.mark.asyncio
@@ -4768,11 +4909,11 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """A sources-free candidate is an authoring slip, not an integrity breach.
+    """Guided planning rejects the source omission before its finalizer.
 
-    The guided binder answers that shape with ``AuditIntegrityError``; before
-    the planner-side guard that error escaped the loop as a terminal 500
-    (elspeth-bcc6bdac99) instead of one budgeted repair turn.
+    The canonical schema guard spends one repair turn, so the binder-style
+    finalizer never receives the malformed shape and cannot raise its
+    ``AuditIntegrityError`` backstop.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4788,7 +4929,7 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
     )
 
     assert proposal.proposal.repair_count == 1
-    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _MISSING_SOURCE_SCHEMA_FEEDBACK
 
 
 @pytest.mark.asyncio
@@ -4799,17 +4940,18 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
         (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
     ],
 )
-async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
+async def test_repeated_sources_omitted_candidates_each_get_schema_feedback(
     tmp_path: Path,
     tool_context: ToolContext,
     surface: PlannerSurface,
     finalizer: Any,
 ) -> None:
-    """A re-emitted sourceless candidate is told it changed nothing.
+    """Each provider-invalid source omission gets canonical schema feedback.
 
-    Rejecting the shape in the planner loop must not drop it out of rejection
-    fingerprinting: an identical rejection repeating across attempts is a
-    feedback-quality defect the loop has to name, not silently burn budget on.
+    Repetition detection is candidate-rejection behavior after canonical
+    admission. These responses never become candidates, so each attempt gets
+    the same schema violation and spends one bounded repair turn without a
+    misleading candidate-level repeat notice.
     """
     completion = _ScriptedCompletion(
         _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
@@ -4829,8 +4971,9 @@ async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
     assert proposal.proposal.repair_count == 2
     first = json.loads(completion.requests[1]["messages"][-1]["content"])
     second = json.loads(completion.requests[2]["messages"][-1]["content"])
-    assert first == _missing_source_feedback()
-    assert second == {**_missing_source_feedback(), "repeat_notice": _REPEAT_NOTICE}
+    assert first == _MISSING_SOURCE_SCHEMA_FEEDBACK
+    assert second == _MISSING_SOURCE_SCHEMA_FEEDBACK
+    assert "repeat_notice" not in second
 
 
 @pytest.mark.asyncio
@@ -4990,6 +5133,131 @@ async def test_repeated_typed_binding_rejection_draws_the_repeat_notice(
     second = json.loads(completion.requests[2]["messages"][-1]["content"])
     assert first == _binding_rejection_expected_feedback()
     assert second == {**_binding_rejection_expected_feedback(), "repeat_notice": _REPEAT_NOTICE}
+
+
+def test_repeated_terminal_binding_rejection_never_says_re_emit() -> None:
+    """A repeat of a rejection no delta can clear draws the terminal notice, not "re-emit".
+
+    Two binder shapes are unclearable by resubmission: the reviewed
+    failure-route check runs before any delta is read, and an edge_patch
+    against a correction target with no writable routing field fails whatever
+    the patch says. Their taught fixes say "do not re-emit" / "decline in
+    plain text"; the generic repeat notice appended after them says "keep
+    every other part byte-identical, and re-emit". Same message, opposite
+    imperatives (elspeth-68721c71d7, final LLM review). The terminal notice
+    names the repetition without contradicting the fix.
+    """
+    from elspeth.web.composer.pipeline_planner import _REPEAT_NOTICE_TERMINAL, _binding_rejection_feedback
+
+    def repeated(code: str, **facts: Any) -> Mapping[str, Any]:
+        rejection = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity=facts)
+        return _binding_rejection_feedback(rejection, repeated_fingerprint=True)
+
+    policy = repeated("guided_delta_reviewed_failure_route_required", routes=["quarantine"])
+    unwritable = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node")
+    for feedback in (policy, unwritable):
+        assert feedback["repeat_notice"] == _REPEAT_NOTICE_TERMINAL
+        assert "byte-identical" not in feedback["repeat_notice"]
+        assert "re-emit" not in feedback["repeat_notice"]
+
+    # Every other shape under the same code is clearable and keeps the
+    # ordinary notice: the terminal predicate matches the exact fact SHAPE,
+    # not the code, so a widened shape does not silently inherit "terminal".
+    clearable = repeated("guided_delta_authority_violation", delta_member="edge_patch", unexpected_keys=["target"])
+    widened = repeated("guided_delta_authority_violation", delta_member="edge_patch", owner_kind="node", extra="x")
+    assert clearable["repeat_notice"] == _REPEAT_NOTICE
+    assert widened["repeat_notice"] == _REPEAT_NOTICE
+
+    # A first (non-repeated) terminal rejection carries no notice at all.
+    first = _binding_rejection_feedback(
+        GuidedCandidateBindingRejected(
+            "guided planner candidate delta",
+            error_code="guided_delta_reviewed_failure_route_required",
+            connectivity={"routes": ["quarantine"]},
+        ),
+        repeated_fingerprint=False,
+    )
+    assert "repeat_notice" not in first
+
+
+def test_terminal_binding_rejections_are_exactly_the_codes_whose_fix_says_do_not_re_emit() -> None:
+    """The terminal predicate and the taught prose name the same rejections.
+
+    Derived from the catalogue, not a hand list: every registered entry
+    whose ``suggested_fix`` tells the planner not to re-emit must be
+    terminal for a bare rejection under that code, and the one sub-case
+    clause (edge_patch + owner_kind) must still be taught in the
+    ``guided_delta_authority_violation`` fix. Deleting either the prose or
+    the predicate arm turns this red.
+    """
+    from elspeth.web.composer.pipeline_planner import _binding_rejection_is_terminal
+    from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS, explain_validation_code
+
+    do_not_re_emit = {pattern for pattern, _explanation, fix in _VALIDATION_ERROR_PATTERNS if "Do not re-emit" in fix}
+    assert do_not_re_emit == {"guided_delta_reviewed_failure_route_required"}
+    for code in do_not_re_emit:
+        assert code.isidentifier(), code
+        bare = GuidedCandidateBindingRejected("guided planner candidate delta", error_code=code, connectivity={})
+        assert _binding_rejection_is_terminal(bare), code
+
+    guidance = explain_validation_code("guided_delta_authority_violation")
+    assert guidance is not None
+    assert "'edge_patch'+'owner_kind': no edge_patch succeeds" in guidance[1]
+    owner_only = GuidedCandidateBindingRejected(
+        "guided planner candidate delta",
+        error_code="guided_delta_authority_violation",
+        connectivity={"delta_member": "edge_patch", "owner_kind": "node"},
+    )
+    assert _binding_rejection_is_terminal(owner_only)
+
+
+def test_binding_rejection_fingerprint_discriminates_on_the_fact_key_set() -> None:
+    """Same code + same delta member but a different fact SHAPE is a different rejection.
+
+    ``guided_delta_authority_violation`` fires from four edge_patch shapes
+    (not-a-dict, unexpected_keys, missing to_node, owner_kind) and
+    ``guided_delta_unknown_stable_id`` from two node_patch shapes (bad
+    stable_id, node_occurrences). Discriminating on ``delta_member`` alone
+    fingerprinted them identically, so a candidate that CORRECTLY repaired
+    the first shape and then tripped the second drew the repeat notice —
+    "keep every other part byte-identical and re-emit" — beside a taught fix
+    saying the opposite (elspeth-68721c71d7, workflow finding). The key SET is
+    a structural label the binder authors, never a candidate value, so a
+    genuine repeat (same shape) still fingerprints the same.
+    """
+    from elspeth.web.composer.pipeline_planner import _binding_rejection_fingerprint
+
+    def rejection(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_authority_violation", connectivity=facts
+        )
+
+    unexpected = rejection(delta_member="edge_patch", unexpected_keys=["target"], allowed_keys=["stable_id", "to_node"])
+    owner = rejection(delta_member="edge_patch", owner_kind="node")
+    not_a_dict = rejection(delta_member="edge_patch", allowed_keys=["stable_id", "to_node"])
+    assert len({_binding_rejection_fingerprint(r) for r in (unexpected, owner, not_a_dict)}) == 3
+
+    # The same shape with different VALUES is still the same rejection: values
+    # are candidate content and must never enter the fingerprint. The keys are
+    # given in a different ORDER too: the shape is a set, not a sequence.
+    again = rejection(allowed_keys=["stable_id", "to_node"], unexpected_keys=["label"], delta_member="edge_patch")
+    assert _binding_rejection_fingerprint(again) == _binding_rejection_fingerprint(unexpected)
+
+    # Existing discriminators keep their meaning.
+    other_member = rejection(delta_member="node_patch", owner_kind="node")
+    assert _binding_rejection_fingerprint(other_member) != _binding_rejection_fingerprint(owner)
+
+    # ``guided_delta_nonincident_route`` fires for two faults the prose teaches
+    # apart — endpoints outside the owners vs an id reusing an existing edge —
+    # so they ship under different keys and fingerprint apart (final red-team F3).
+    def nonincident(**facts: Any) -> GuidedCandidateBindingRejected:
+        return GuidedCandidateBindingRejected(
+            "guided planner candidate delta", error_code="guided_delta_nonincident_route", connectivity=facts
+        )
+
+    endpoints = nonincident(edge_id="e1", incident_owners=["n1"])
+    id_reuse = nonincident(reused_edge_id="e1", incident_owners=["n1"])
+    assert _binding_rejection_fingerprint(endpoints) != _binding_rejection_fingerprint(id_reuse)
 
 
 @pytest.mark.asyncio
@@ -5156,6 +5424,45 @@ def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
         _parse_response_tool_calls(response, max_tool_calls=3)
 
     assert caught.value.code == "MALFORMED_RESPONSE"
+
+
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("\u2003", id="whitespace"),
+    ],
+)
+def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
+    response = _response_with_call_id(call_id, "list_sources", {})
+
+    with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
+        _parse_response_tool_calls(response, max_tool_calls=3)
+
+    assert caught.value.code == "MALFORMED_RESPONSE"
+
+
+def test_planner_preserves_valid_distinct_provider_tool_call_order() -> None:
+    signed_call_id = "call_1__thought__" + "eA" * 150
+    response = _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(id=signed_call_id, function=_Function("list_sources", "{}")),
+                        _ToolCall(id="second", function=_Function("list_sinks", "{}")),
+                    ],
+                )
+            )
+        ],
+        usage=_planner_usage(),
+    )
+
+    _message, calls = _parse_response_tool_calls(response, max_tool_calls=3)
+
+    assert len(signed_call_id) > 256
+    assert [call.call_id for call in calls] == [signed_call_id, "second"]
 
 
 @pytest.mark.asyncio
@@ -6767,7 +7074,7 @@ async def test_escape_hatch_retains_terminal_candidate_across_pre_custody_reject
         model_arguments["pipeline"]["source"]["plugin"] = 123
     elif rejection_kind == "missing_source":
         model_arguments["pipeline"] = _sourceless_pipeline(tmp_path)
-        expected_code = "no_source_configured"
+        expected_code = "canonical_schema"
     else:
         intent_id = "00000000-0000-4000-8000-000000000315"
         model_arguments["claimed_deferred_intent_ids"] = [intent_id]
@@ -9616,6 +9923,7 @@ def test_truncated_component_rejection_feedback_reports_what_was_withheld() -> N
                 message=f"Output 'main{index}': Invalid options for sink 'json': RAW_MESSAGE_CANARY",
                 severity="high",
                 error_code="plugin_options_invalid",
+                rejected_component=f"output:main{index}",
             )
             for index in range(1, 9)
         ),
@@ -9923,22 +10231,23 @@ def test_candidate_rejection_fingerprint_discriminates_disjoint_component_sets()
                 errors=tuple(
                     ValidationEntry(
                         component="rejected_mutation",
-                        message=f"{subject}: Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
+                        message="Invalid options for plugin 'json': RAW_MESSAGE_CANARY",
                         severity="high",
                         error_code="plugin_options_invalid",
+                        rejected_component=subject,
                     )
                     for subject in subjects
                 ),
             )
         )
 
-    disjoint_first = _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'")))
-    disjoint_second = _rejection_fingerprint(cast(Any, rejection("Output 'rows_out'", "Node 'score'")))
+    disjoint_first = _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean")))
+    disjoint_second = _rejection_fingerprint(cast(Any, rejection("output:rows_out", "node:score")))
     assert disjoint_first != disjoint_second
 
     # A genuine repeat — same components, same codes — still fingerprints the
     # same, so the notice it earns still fires.
-    assert _rejection_fingerprint(cast(Any, rejection("Source 'rows_in'", "Node 'clean'"))) == disjoint_first
+    assert _rejection_fingerprint(cast(Any, rejection("source:rows_in", "node:clean"))) == disjoint_first
 
 
 @pytest.mark.asyncio
@@ -9984,3 +10293,282 @@ async def test_disjoint_candidate_rejections_do_not_draw_the_repeat_notice(
     assert [entry["component"] for entry in second["validation"]["errors"]] == ["output:rows"]
     assert "repeat_notice" not in first
     assert "repeat_notice" not in second
+
+
+# --- Cancellation-vs-settlement control flow (tier-rem/web-composer) ---------
+#
+# The claimed invariant for both helpers: the original cancellation is
+# preserved unconditionally, and a settlement/custody failure is surfaced
+# (chained onto the re-raised cancellation) rather than silently discarded
+# or allowed to REPLACE the cancellation.
+
+
+@pytest.mark.asyncio
+async def test_await_custody_settlement_custody_failure_does_not_replace_cancellation() -> None:
+    """A non-CancelledError custody failure during the post-cancel drain must not
+    escape and replace the active cancellation (judge counterexample: the narrow
+    ``suppress(asyncio.CancelledError)`` let it through)."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def custody() -> None:
+        started.set()
+        await release.wait()
+        raise ValueError("custody write failed")
+
+    observed: list[BaseException] = []
+
+    async def runner() -> None:
+        try:
+            await pipeline_planner._await_custody_settlement(custody())
+        except BaseException as exc:
+            observed.append(exc)
+            raise
+
+    task = asyncio.create_task(runner())
+    await started.wait()
+    task.cancel()
+    # Let the cancellation reach the helper so it is inside its drain loop.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "original cancellation must be preserved unconditionally"
+    assert len(observed) == 1
+    assert isinstance(observed[0], asyncio.CancelledError)
+    # The custody failure is surfaced on the preserved cancellation, not lost.
+    assert isinstance(observed[0].__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_await_custody_settlement_lets_custody_finish_before_reraising_cancel() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def custody() -> str:
+        started.set()
+        await release.wait()
+        finished.set()
+        return "settled"
+
+    task = asyncio.create_task(pipeline_planner._await_custody_settlement(custody()))
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set(), "custody must run to completion despite the cancel"
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_settle_lifecycle_records_settlement_failure_on_preserved_cancellation() -> None:
+    """``suppress(BaseException)`` around ``task.result()`` silently discarded a
+    first-party ``on_settled`` failure; it must surface chained onto the
+    re-raised cancellation instead."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def on_settled(outcome: str) -> None:
+        started.set()
+        await release.wait()
+        raise RuntimeError("lifecycle bookkeeping failed")
+
+    lifecycle = pipeline_planner.PlannerRequestLifecycle(
+        before_start=_unused_async_callable,
+        request_scope=nullcontext,
+        on_settled=on_settled,
+        progress=None,
+    )
+
+    observed: list[BaseException] = []
+
+    async def runner() -> None:
+        try:
+            await pipeline_planner._settle_lifecycle(lifecycle, "cancelled")
+        except BaseException as exc:
+            observed.append(exc)
+            raise
+
+    task = asyncio.create_task(runner())
+    await started.wait()
+    task.cancel()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled(), "original cancellation must be preserved unconditionally"
+    assert len(observed) == 1
+    assert isinstance(observed[0], asyncio.CancelledError)
+    assert isinstance(observed[0].__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_settle_lifecycle_failure_propagates_when_not_cancelled() -> None:
+    async def on_settled(outcome: str) -> None:
+        raise RuntimeError("lifecycle bookkeeping failed")
+
+    lifecycle = pipeline_planner.PlannerRequestLifecycle(
+        before_start=_unused_async_callable,
+        request_scope=nullcontext,
+        on_settled=on_settled,
+        progress=None,
+    )
+    with pytest.raises(RuntimeError, match="lifecycle bookkeeping failed"):
+        await pipeline_planner._settle_lifecycle(lifecycle, "complete")
+
+
+async def _unused_async_callable() -> None:
+    raise AssertionError("not exercised by these tests")
+
+
+def _withheld_result(data: Any) -> Any:
+    state = _empty_state()
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=state.validate(),
+        affected_nodes=(),
+        data=data,
+    )
+
+
+def test_withheld_component_count_reads_first_party_int() -> None:
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    assert pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: 3})) == 3
+    assert pipeline_planner._withheld_component_count(_withheld_result({})) == 0
+    assert pipeline_planner._withheld_component_count(_withheld_result(None)) == 0
+
+
+def test_withheld_component_count_crashes_on_corrupt_first_party_count() -> None:
+    """COMPONENTS_WITHHELD_KEY is written only by _merge_component_rejections
+    with an int; any other present shape is envelope corruption and must crash
+    instead of silently reading as 'nothing withheld'."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.tools._common import COMPONENTS_WITHHELD_KEY
+
+    with pytest.raises(AuditIntegrityError, match="must be an int"):
+        pipeline_planner._withheld_component_count(_withheld_result({COMPONENTS_WITHHELD_KEY: "3"}))
+
+
+def test_rejection_subject_is_read_structurally_never_parsed_from_the_message() -> None:
+    """``rejected_component`` is the only source of a rejection entry's subject.
+
+    Until elspeth-e405ad7cd2 the planner recovered the subject from the
+    ``Output 'rows': …`` message prefix with a regex — the prose-parsing shape
+    that lost three ``plugin_identity`` parsers. Now an entry that carries the
+    ref is attributed to it and disclosed when the finalizer owns something
+    ELSE; an entry that does not carry it is unattributable and fails closed
+    (masked to ``pipeline``) even though its message still names the subject
+    in exactly the format the regex used to read.
+    """
+    attributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+        rejected_component="output:rows",
+    )
+    unattributed = ValidationEntry(
+        component="rejected_mutation",
+        message="Output 'rows': RAW_MESSAGE_CANARY",
+        severity="high",
+        error_code="plugin_options_invalid",
+    )
+    assert _entry_component_ref(attributed) == "output:rows"
+    assert _entry_component_ref(unattributed) is None
+
+    owns_something_else = _FinalizerOwnedRefs(config=frozenset({"source"}), routing=frozenset())
+
+    disclosed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(attributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (disclosed_entry,) = disclosed["validation"]["errors"]
+    assert disclosed_entry["component"] == "output:rows"
+    assert disclosed_entry["detail"] == "Output 'rows': RAW_MESSAGE_CANARY"
+
+    withheld = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=ValidationSummary(is_valid=False, errors=(unattributed,)), updated_state=object())),
+        finalizer_owned=owns_something_else,
+    )
+    (withheld_entry,) = withheld["validation"]["errors"]
+    assert withheld_entry["component"] == "pipeline"
+    assert "RAW_MESSAGE_CANARY" not in json.dumps(withheld_entry)
+
+
+def test_argument_rejection_projections_split_by_surface() -> None:
+    """The argument rejection has two shapes because it has two surfaces, and one entry builder.
+
+    On the repair loop it is the WHOLE tool message
+    (``_allowlisted_argument_feedback``), with nothing around it, so ``success``
+    and ``validation`` are the message's own top-level fields — the family shape
+    ``_canonical_schema_feedback`` and the other terminal-rejection builders use
+    there. On the discovery arm it rides under the ``data`` of a ``ToolResult``
+    that already carries a ``success`` and a ``validation`` of its own, so the
+    same two keys would be a twin and a homonym: the envelope's ``validation``
+    is the STATE's (its errors are the pipeline's), while this one is the
+    rejected argument (systems seat SYS-R3-1). ``_allowlisted_argument_error_payload``
+    names it ``argument_error`` instead.
+
+    Both projections carry the SAME entry, so a field added to one cannot go
+    missing from the other; the entry's own key ORDER is pinned because it is
+    the wire order on both surfaces.
+    """
+    error = ToolArgumentError(argument="plugin_type", expected="a plugin kind", actual_type="str", code="DISCOVERY_ONLY")
+    entry = pipeline_planner._allowlisted_argument_error_entry(error)
+    assert tuple(entry) == ("component", "severity", "error_code", "error_class")
+    assert entry == {
+        # ``plugin_type`` is not in the closed schema-owned label vocabulary,
+        # so ToolArgumentError canonicalizes it: what the projection carries is
+        # operator-owned whatever the raiser passed.
+        "component": "tool argument",
+        "severity": "high",
+        "error_code": "DISCOVERY_ONLY",
+        "error_class": "ToolArgumentError",
+    }
+
+    payload = pipeline_planner._allowlisted_argument_error_payload(error)
+    assert tuple(payload) == ("argument_error",)
+    assert payload["argument_error"] == entry
+    assert "success" not in payload, "the envelope's success already says the call failed"
+    assert "validation" not in payload, "a data.validation beside the envelope's is a homonym"
+
+    message = pipeline_planner._allowlisted_argument_feedback(error)
+    assert tuple(message) == ("success", "validation")
+    assert message["validation"]["errors"] == [entry]
+    assert tuple(pipeline_planner._canonical_schema_feedback()) == tuple(message), (
+        "the whole-message surface keeps one family shape; this is the sibling that pins it"
+    )
+
+
+def test_discovery_argument_rejection_builds_its_data_inline() -> None:
+    """The discovery ARG_ERROR result's ``data=`` IS the payload constructor call.
+
+    Built inline, the payload has no local, alias or ``cast`` target for a later
+    store to travel through, and ``ToolResult.__post_init__`` freezes it before
+    any other statement runs — the closure c6f857aa0 applied to the
+    APPROVAL_REQUIRED payload, for the same reason. Read from the AST rather
+    than from behaviour because what is pinned is that no OTHER shape can be
+    written here: a re-introduced ``feedback = _allowlisted_argument_feedback(exc)``
+    fed to ``data=dict(feedback)`` (the shape this replaced) reds this test
+    while shipping a payload a behavioural assertion on one example might miss.
+    """
+    tree = ast.parse(Path(pipeline_planner.__file__).read_text(encoding="utf-8"))
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "execute_one_discovery"]
+    assert len(fns) == 1, "premise: one execute_one_discovery in the planner"
+    results = [
+        node for node in ast.walk(fns[0]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ToolResult"
+    ]
+    assert len(results) == 1, "premise: the discovery arm constructs exactly one ToolResult"
+    (data_kw,) = [kw for kw in results[0].keywords if kw.arg == "data"]
+    assert isinstance(data_kw.value, ast.Call), "data= must be the payload constructor call, not a name or a dict"
+    assert isinstance(data_kw.value.func, ast.Name)
+    assert data_kw.value.func.id == "_allowlisted_argument_error_payload"
+    assert not data_kw.value.keywords and len(data_kw.value.args) == 1

@@ -238,7 +238,11 @@ class TestSetSourceFromBlobs:
         )
 
         assert not result.success
-        assert "do not author" in _first_error(result)
+        assert _first_error(result) == (
+            "set_source_from_blobs must not be called with 'blobs' in source options. "
+            "The plural blob binding is resolved from session blob records by set_source_from_blobs; "
+            "bind or rebind blobs through that tool instead of authoring the list directly."
+        )
 
     def test_llm_authored_blob_rejected_fail_closed(self, harness) -> None:
         png_id = _create_ready_blob(harness, content=_PNG, filename="p.png", mime_type="image/png")

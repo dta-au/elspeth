@@ -352,9 +352,12 @@ def test_verify_textract_probe_failure_wins_over_close_failure() -> None:
         close_error=RuntimeError("close failed"),
     )
 
-    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_start_document_analysis"):
+    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_start_document_analysis") as exc_info:
         _verify(_textract_env(), client)
     assert client.closed is True
+    assert exc_info.value.__notes__ == [
+        "acceptance resource close also failed during unwind: check=textract_resource_close cause_class=RuntimeError"
+    ]
 
 
 def _receipt_env() -> dict[str, str]:

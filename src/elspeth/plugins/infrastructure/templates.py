@@ -17,6 +17,8 @@ from jinja2.meta import find_undeclared_variables
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.visitor import NodeVisitor
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 
 class TemplateError(Exception):
     """Error in template rendering (including sandbox violations)."""
@@ -142,9 +144,32 @@ class _DefiniteBindingAnalyzer(NodeVisitor):
         self._scan(node.template, bound)
         return bound | {node.target}
 
+    @trust_boundary(
+        tier=3,
+        source=(
+            "a jinja2 FromImport AST node produced by the sandboxed template compiler "
+            "from operator-authored template text — jinja2, not ELSPETH, owns its shape"
+        ),
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "admits only str entries and (name, alias) 2-tuples with a str alias from "
+            "node.names; any other shape raises TemplateError instead of silently "
+            "mis-computing the definitely-bound name set"
+        ),
+        test_ref="tests/unit/plugins/infrastructure/test_templates.py::test_from_import_binding_rejects_malformed_names",
+        test_fingerprint="8d52b5b569a25d169595912e4e57b424b6f07c34ec5245e9b098d79e670c04e7",
+    )
     def visit_FromImport(self, node: nodes.FromImport, bound: frozenset[str]) -> frozenset[str]:
         self._scan(node.template, bound)
-        imported_names = {item[1] if isinstance(item, tuple) else item for item in node.names}
+        imported_names: set[str] = set()
+        for item in node.names:
+            if isinstance(item, str):
+                imported_names.add(item)
+            elif isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], str):
+                imported_names.add(item[1])
+            else:
+                raise TemplateError(f"jinja2 FromImport name entry has an unsupported shape: {item!r}")
         return bound | imported_names
 
     def visit_FilterBlock(self, node: nodes.FilterBlock, bound: frozenset[str]) -> frozenset[str]:

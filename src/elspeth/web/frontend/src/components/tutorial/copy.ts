@@ -7,6 +7,21 @@ export const TURN_1_PRIMARY_BUTTON = "Let's go";
 // so skip exits the whole tutorial straight to graduation rather than naming a
 // removed step.
 export const TURN_1_SKIP_BUTTON = "Skip the tutorial";
+/**
+ * The explicit Run gesture on the run turn (I-1). The pipeline never executes
+ * on mount: the learner clicks this, exactly as the composer's own Run button
+ * asks in normal use. The graduation lesson "before clicking Run" names this
+ * button.
+ */
+export const TURN_4_RUN_BUTTON = "Run";
+/**
+ * Pre-run framing on the run turn. States two checkable facts: the pipeline
+ * pane shows the graph the learner just confirmed (the workspace frame stays
+ * mounted around the run card), and nothing executes until Run is clicked.
+ */
+export const TURN_4_READY_BODY =
+  "The pipeline pane shows the graph you just confirmed. Look it over — " +
+  "nothing runs until you click Run.";
 export const TURN_4_PRIMARY_BUTTON = "Continue";
 export const TURN_5_PRIMARY_BUTTON = "Continue";
 export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";
@@ -65,7 +80,7 @@ export const TURN_7_LEARNING_BULLETS_SKIPPED = [
   {
     title: "What the composer builds is AI-generated.",
     body:
-      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The prompt it writes for itself and cleanup choices it makes are kept in the audit trail with your approval against them. You can revisit that record any time in the Audit panel beside each pipeline.",
+      "When you describe a pipeline in a sentence, an LLM interprets it and drafts the pipeline for you. The prompt it writes for itself and cleanup choices it makes are kept in the audit trail with your approval against them. You can revisit that record any time in each pipeline's Checks tab.",
   },
   {
     title: "Read before you run.",
@@ -78,7 +93,7 @@ export const TURN_7_LEARNING_BULLETS = [
   {
     title: "What you built is AI-generated.",
     body:
-      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The prompt it wrote for itself and cleanup choices such as dropping raw HTML are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in the Audit panel beside your pipeline.",
+      "The pipeline you just ran was authored by an LLM that interpreted your one-sentence description. The prompt it wrote for itself and cleanup choices such as dropping raw HTML are kept in the audit trail with your approval against them — alongside the source pages you named. You can come back to that record any time in your pipeline's Checks tab.",
   },
   {
     title: "Read before you run.",

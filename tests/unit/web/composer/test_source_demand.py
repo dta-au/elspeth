@@ -9,10 +9,15 @@ demand reaches the source through pass-through nodes), and honest abstention
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.source_demand import (
+    SOURCE_DATA_CONTRACT_DRAFT_VERSION,
     SOURCE_DATA_CONTRACT_USER_TERM,
     backtraced_source_demand,
     build_source_data_contract_draft,
@@ -34,7 +39,11 @@ def _llm_node(
 ) -> NodeSpec:
     options: dict[str, Any] = {
         "prompt_template": "Rate {{ row.colour }}",
-        "model": "gpt-test",
+        # Composer persists the public operator-profile alias; provider/model
+        # bindings stay private until lowering.  Keep this helper on the real
+        # authoring shape so Stage-1's profile probe can establish the LLM's
+        # pass-through contract.
+        "profile": "test",
         "schema": {"mode": "observed"},
     }
     if required is not None:
@@ -168,11 +177,17 @@ def _observed(*guaranteed: str) -> dict[str, Any]:
 def _fan_in_state(
     sources: dict[str, SourceSpec],
     nodes: tuple[NodeSpec, ...] = (),
+    *,
+    required: list[str] | None = None,
 ) -> CompositionState:
     return CompositionState(
         source=None,
         sources=sources,
-        nodes=(_queue_node(), _llm_node(input_name="q", required=["colour"]), *nodes),
+        nodes=(
+            _queue_node(),
+            _llm_node(input_name="q", required=required if required is not None else ["colour"]),
+            *nodes,
+        ),
         edges=(),
         outputs=(),
         metadata=PipelineMetadata(),
@@ -275,6 +290,26 @@ class TestFanInDemandAttribution:
         assert backtraced_source_demand(state, "src_a", disregard_fields=frozenset({"colour"})) == ("colour",)
         assert backtraced_source_demand(state, "src_b") == ("colour",)
 
+    def test_disregarding_the_only_guarantee_preserves_fan_in_participation(self) -> None:
+        # A resolved card's accepted field is stripped before demand is
+        # recomputed.  Stripping the last field must leave an EXPLICIT empty
+        # vote, not turn the source into an abstainer: otherwise one abstaining
+        # arm makes the queue abstain wholesale, erases the Stage-1 miss, and
+        # hides both the accepted field and a newly required field.
+        state = _fan_in_state(
+            {
+                "src_a": _csv_source(_observed("colour")),
+                "src_b": _csv_source(_observed("colour")),
+            },
+            required=["colour", "size"],
+        )
+
+        assert backtraced_source_demand(
+            state,
+            "src_a",
+            disregard_fields=frozenset({"colour"}),
+        ) == ("colour", "size")
+
     def test_composer_authored_sibling_is_never_stamped_even_when_stampable(self) -> None:
         # src_b carries the composer-authored content marker: its guarantee
         # is content-derived (invented_source flow), never a card promise, so
@@ -337,6 +372,10 @@ class TestDraftAndArtifact:
         draft = build_source_data_contract_draft(["size", "colour"], ("colour", "extra"))
         assert parse_source_data_contract_accepted_fields(draft) == ("colour", "size")
 
+        payload = json.loads(draft)
+        assert payload["contract_version"] == SOURCE_DATA_CONTRACT_DRAFT_VERSION == 2
+        assert payload["kind"] == SOURCE_DATA_CONTRACT_USER_TERM
+
     def test_draft_warns_on_demanded_fields_the_sample_lacks(self) -> None:
         draft = build_source_data_contract_draft(["colour", "size"], ("colour", "extra"))
         assert '"missing_from_sample":["size"]' in draft
@@ -346,15 +385,119 @@ class TestDraftAndArtifact:
         assert '"sample_header":null' in draft
         assert '"missing_from_sample":[]' in draft
 
-    def test_artifact_hash_binds_the_field_set_only(self) -> None:
+    def test_artifact_hash_binds_current_contract_semantics_and_field_set(self) -> None:
         # Order-insensitive over fields; sample evidence never participates.
         assert source_data_contract_artifact_hash(["b", "a"]) == source_data_contract_artifact_hash(["a", "b"])
+        assert source_data_contract_artifact_hash(["a", "a"]) == source_data_contract_artifact_hash(["a"])
         assert source_data_contract_artifact_hash(["a"]) != source_data_contract_artifact_hash(["a", "b"])
+        legacy_v1_hash = stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": ["a"]})
+        assert source_data_contract_artifact_hash(["a"]) != legacy_v1_hash
 
-    def test_parse_abstains_on_malformed_payloads(self) -> None:
-        assert parse_source_data_contract_accepted_fields("not json") is None
-        assert parse_source_data_contract_accepted_fields('{"demanded_fields": "colour"}') is None
-        assert parse_source_data_contract_accepted_fields('{"demanded_fields": [1]}') is None
+    @pytest.mark.parametrize(
+        "payload",
+        (
+            "not json",
+            {"demanded_fields": "colour"},
+            {"demanded_fields": [1]},
+            {
+                "contract_version": 1,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": "invented_source",
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": 42,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": [],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["size", "colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour", "colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": [],
+                "missing_from_sample": [],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": ["colour"],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [1],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": ["size"],
+            },
+            {
+                "contract_version": 2,
+                "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+                "demanded_fields": ["colour"],
+                "sample_header": None,
+                "missing_from_sample": [],
+                "unexpected": True,
+            },
+        ),
+        ids=(
+            "not-json",
+            "missing-shape",
+            "non-string-demand",
+            "legacy-version",
+            "wrong-kind",
+            "malformed-sample",
+            "empty-demand",
+            "unsorted-demand",
+            "duplicate-demand",
+            "sample-miss-omitted",
+            "no-sample-has-miss",
+            "malformed-missing",
+            "missing-not-demanded",
+            "extra-key",
+        ),
+    )
+    def test_parse_abstains_on_malformed_or_non_current_payloads(self, payload: object) -> None:
+        value = payload if isinstance(payload, str) else json.dumps(payload)
+        assert parse_source_data_contract_accepted_fields(value) is None
 
     def test_user_term_constant(self) -> None:
         assert SOURCE_DATA_CONTRACT_USER_TERM == "source_data_contract"

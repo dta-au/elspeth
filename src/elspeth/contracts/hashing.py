@@ -21,6 +21,8 @@ from typing import Any, TypeGuard
 
 import rfc8785
 
+from elspeth.contracts.trust_boundary import trust_boundary
+
 # Version string stored with every run for hash verification.
 # Single source of truth — core/canonical.py imports this constant.
 CANONICAL_VERSION = "sha256-rfc8785-v1"
@@ -100,6 +102,20 @@ def stable_hash(obj: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "already-malformed external data on the repr_hash quarantine fallback path — arbitrary Python "
+        "values that failed canonical_json (NaN, Infinity, non-serializable types)"
+    ),
+    source_param="obj",
+    suppresses=("R5",),
+    invariant=(
+        "returns a deterministic repr string for every input — unordered containers are sorted, anything "
+        "unrecognized falls through to repr(obj); never raises on malformed input"
+    ),
+    non_raising=True,
+)
 def _stable_repr(obj: Any) -> str:
     """Produce a deterministic repr by sorting unordered containers.
 

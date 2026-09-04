@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from contextlib import suppress
 from dataclasses import dataclass
+
+import structlog
 
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
@@ -18,7 +19,10 @@ from elspeth.plugins.transforms.aws.guardrails_client import (
     GuardrailResponseError,
     GuardrailServiceError,
     GuardrailSource,
+    _bedrock_provider_exception_types,
 )
+
+logger = structlog.get_logger(__name__)
 
 _PROFILE_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
 _PLUGIN_POLICIES: dict[str, tuple[GuardrailSource, tuple[str, ...]]] = {
@@ -108,5 +112,17 @@ def run_guardrail_live_check(
         raise GuardrailLiveCheckError("Bedrock Guardrail live check failed") from None
     finally:
         if owns_sdk_client and client is not None:
-            with suppress(Exception):
+            try:
                 client.sdk_client.close()
+            except _bedrock_provider_exception_types() as close_error:
+                # Declared botocore close failure on a client we own, after
+                # the live-check verdict is already decided: acknowledged with
+                # a bounded warning (type only — provider errors may wrap
+                # payloads) and never allowed to replace that verdict. This
+                # site has no row or operation parent for a telemetry event.
+                # Anything outside the declared botocore surface is a bug and
+                # propagates.
+                logger.warning(
+                    "guardrail_sdk_client_close_failed",
+                    error_type=type(close_error).__name__,
+                )

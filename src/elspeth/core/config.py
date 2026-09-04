@@ -1309,7 +1309,9 @@ class CollectorSettings(BaseModel):
     deliberately has NO trigger config — count/timeout/condition are
     inexpressible on a closer (a timeout on a closer converts a liveness bug
     into a silently short group; spec §5). Flush order is the opener's
-    expansion ordinal, never arrival order.
+    expansion ordinal, never arrival order. It also has no ``on_error`` route:
+    plugin failure is a whole-group verdict settled through scope policy and
+    nesting.
 
     Example YAML:
         collectors:
@@ -1317,9 +1319,6 @@ class CollectorSettings(BaseModel):
             plugin: stitch_pages
             input: pages
             on_success: assembled_out
-            # on_error is optional: omitted (None) derives the route from
-            # structure (spec §7 rule 9) — losses settle through the scope's
-            # group machinery.
     """
 
     model_config = {"frozen": True, "extra": "forbid"}
@@ -1328,15 +1327,20 @@ class CollectorSettings(BaseModel):
     plugin: str = Field(description="Batch-transform plugin name (same plugin contract as aggregations)")
     input: str = Field(description="Named input connection the bound region's members arrive on")
     on_success: str = Field(description="Connection name or sink name for the flushed group output")
-    on_error: str | None = Field(
-        default=None,
-        description=(
-            "Sink name for rows that fail batch processing, 'discard', or omitted (None): "
-            "the route derives from structure — losses settle through the scope's group "
-            "machinery (spec §7 rule 9)"
-        ),
-    )
     options: dict[str, Any] = Field(default_factory=dict, description="Plugin-specific configuration options")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_on_error(cls, data: Any) -> Any:
+        """Reject the deleted collector route with its structural replacement."""
+        if type(data) is not dict or "on_error" not in data:
+            return data
+        raw_name = data["name"] if "name" in data else None
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else "<unnamed>"
+        raise ValueError(
+            f"Collector '{name}' does not accept on_error. Collector failures are whole-group "
+            "verdicts settled through scope policy and nesting. Remove on_error."
+        )
 
     @field_validator("name")
     @classmethod
@@ -1370,19 +1374,6 @@ class CollectorSettings(BaseModel):
             raise ValueError("Collector on_success must be a connection name or sink name")
         value = v.strip()
         return _validate_connection_or_sink_name(value, field_label="Collector on_success connection name")
-
-    @field_validator("on_error")
-    @classmethod
-    def validate_on_error(cls, v: str | None) -> str | None:
-        """on_error is optional: None derives the route from structure (spec §7 rule 9)."""
-        if v is None:
-            return None
-        if not v.strip():
-            raise ValueError("Collector on_error must be a sink name, 'discard', or omitted")
-        value = v.strip()
-        if value == "discard":
-            return value
-        return _validate_connection_or_sink_name(value, field_label="Collector on_error sink name")
 
 
 class ScopeSettings(BaseModel):
@@ -2446,6 +2437,57 @@ class ElspethSettings(BaseModel):
 _ENV_VAR_PATTERN = ENV_VAR_REFERENCE_PATTERN
 
 
+def _expand_env_string(value: str) -> str:
+    """Expand ${VAR} patterns in a string."""
+    import os
+
+    def replacer(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        default = match.group(2)  # None if no default specified
+        if var_name in os.environ:
+            return os.environ[var_name]
+        if default is not None:
+            return default
+        # No env var and no default - fail fast with clear error
+        raise ValueError(
+            f"Required environment variable '{var_name}' is not set. "
+            f"Either set the variable or use ${{{{var_name}}:-default}} syntax for optional values."
+        )
+
+    return _ENV_VAR_PATTERN.sub(replacer, value)
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one value of the raw, not-yet-validated configuration tree — operator YAML or a web-authored "
+        "dict — during ${VAR} expansion before ElspethSettings validation"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when a ${VAR} reference names an unset environment variable with no default; "
+        "unrecognized scalar shapes pass through unchanged, never coerced or fabricated"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestExpandEnvValueBoundary::test_missing_env_var_without_default_raises",
+    test_fingerprint="bca4e57aab8ee1e94e9cfb9b5e03625eae52368d2598c06ae9cbd93fcbd2a3a5",
+)
+def _expand_env_value(value: Any) -> Any:
+    """Expand env vars in a single raw-config value (recursive)."""
+    if type(value) is LoweredLLMProfileAlias:
+        # Preserve only the exact nominal proof produced by the trusted
+        # profile-lowering pass immediately before environment expansion.
+        return value
+    if isinstance(value, str):
+        return _expand_env_string(value)
+    elif isinstance(value, dict):
+        return {k: _expand_env_value(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env_value(item) for item in value]
+    else:
+        return value
+
+
 def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
     """Recursively expand ${VAR} and ${VAR:-default} patterns in config values.
 
@@ -2455,42 +2497,7 @@ def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         New dict with environment variables expanded
     """
-    import os
-
-    def _expand_string(value: str) -> str:
-        """Expand ${VAR} patterns in a string."""
-
-        def replacer(match: re.Match[str]) -> str:
-            var_name = match.group(1)
-            default = match.group(2)  # None if no default specified
-            if var_name in os.environ:
-                return os.environ[var_name]
-            if default is not None:
-                return default
-            # No env var and no default - fail fast with clear error
-            raise ValueError(
-                f"Required environment variable '{var_name}' is not set. "
-                f"Either set the variable or use ${{{{var_name}}:-default}} syntax for optional values."
-            )
-
-        return _ENV_VAR_PATTERN.sub(replacer, value)
-
-    def _expand_value(value: Any) -> Any:
-        """Expand env vars in a single value."""
-        if type(value) is LoweredLLMProfileAlias:
-            # Preserve only the exact nominal proof produced by the trusted
-            # profile-lowering pass immediately before environment expansion.
-            return value
-        if isinstance(value, str):
-            return _expand_string(value)
-        elif isinstance(value, dict):
-            return {k: _expand_value(v) for k, v in value.items()}
-        elif isinstance(value, list):
-            return [_expand_value(item) for item in value]
-        else:
-            return value
-
-    return {k: _expand_value(v) for k, v in config.items()}
+    return {k: _expand_env_value(v) for k, v in config.items()}
 
 
 def _lower_llm_profile_node_options(
@@ -2517,6 +2524,106 @@ def _lower_llm_profile_node_options(
         safe_options,
         private_fields=LLM_PROFILE_PRIVATE_FIELDS,
     )
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one raw plugin-bearing component entry (sources/transforms) from operator YAML or a "
+        "web-authored dict — an untyped object before ElspethSettings validation"
+    ),
+    source_param="component",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises ValueError when an llm component's 'profile' option is not a string alias, names both "
+        "'profile' and 'provider', references an unknown profile, or references a non-server credential "
+        "scope; non-dict components and non-llm plugins are deliberately skipped for ElspethSettings "
+        "validation to classify"
+    ),
+    test_ref="tests/unit/core/test_llm_profile_catalog.py::TestBatchProfileNodeLowering::test_lower_llm_component_rejects_non_string_profile_alias",
+    test_fingerprint="2767eb57220ffddb010c79cf95a0f89dec059e52c2a263017ff782bfcda768dc",
+)
+def _lower_llm_component(
+    component: object,
+    *,
+    location: str,
+    profiles: dict[str, LLMProfileSettings],
+    materialize: bool,
+) -> None:
+    if not isinstance(component, dict) or component.get("plugin") != "llm":
+        return
+    options = component.get("options")
+    if not isinstance(options, dict):
+        return
+    # Exact nominal validation makes a second in-memory pass idempotent,
+    # while raw YAML/JSON/dict replay cannot forge audit attribution with
+    # an ordinary string under this reserved key.
+    require_lowered_llm_profile_alias(options)
+    if "profile" not in options:
+        return
+    alias = options["profile"]
+    if not isinstance(alias, str):
+        raise ValueError(f"{location} llm component 'profile' option must be a string alias")
+    if "provider" in options:
+        raise ValueError(
+            f"{location} llm component specifies both 'profile' and 'provider' — "
+            "choose exactly one: an operator profile alias, or explicit provider config"
+        )
+    try:
+        profile_settings = profiles[alias]
+    except KeyError:
+        raise ValueError(f"{location} llm component references unknown llm profile {alias!r}") from None
+    if profile_settings.credential_scope not in (None, "server"):
+        raise ValueError(
+            f"{location} llm component references profile {alias!r} with "
+            f"credential_scope {profile_settings.credential_scope!r}; batch/CLI runs have no per-user "
+            "secret store and can only use credential_scope 'server' (or scope-less, e.g. Bedrock) profiles"
+        )
+    if not materialize:
+        return
+    executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
+    if "api_key" in executable:
+        # ``lower_llm_profile_options`` is the only writer of this key and
+        # always writes the ``{"secret_ref", "secret_scope"}`` marker:
+        # ``api_key`` is a private profile field, so an authored value
+        # never reaches ``executable``. Anything else here is a lowering
+        # bug in owned data, not an input shape to tolerate.
+        api_key_marker = executable["api_key"]
+        if type(api_key_marker) is not dict:
+            raise TypeError(f"{location} llm profile {alias!r} lowered a non-marker api_key: {type(api_key_marker).__name__}")
+        # Batch/CLI never gains the web secret-store resolver; it
+        # materializes the profile's credential the same way an
+        # explicitly-authored `api_key: ${VAR}` node always has, via the
+        # existing _expand_env_vars pass run right after this one.
+        executable["api_key"] = f"${{{api_key_marker['secret_ref']}}}"
+    # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
+    # executable options so it survives into ElspethSettings and is
+    # therefore recoverable from the run's audit trail — both
+    # resolve_config()'s settings_json snapshot (core/config.py) and the
+    # DAG's per-node audit config (core/landscape/data_flow/graph.py's
+    # sanitize_node_config_for_audit) derive from exactly this dict via
+    # BaseSource.config / BaseTransform.config. Web's parallel answer to
+    # "which profile did this component use" lives in
+    # run_web_plugin_policy.selected_profile_aliases_json
+    # (a web-only Landscape table); batch has no such table, so the
+    # alias must travel inside the node's own options.
+    #
+    # Deliberately NOT keyed as "profile" (the authored selector key):
+    # A second pass over this same owned in-memory dict must be inert. If
+    # the alias rode under "profile" ALONGSIDE the now-also-present
+    # "provider" key, that pass would look identical to a genuinely
+    # ambiguous authored node and trip the "specifies both 'profile' and
+    # 'provider'" rejection above — an accidental self-collision, not a
+    # real conflict. "profile_alias" is a distinct key the ambiguity check
+    # never inspects and no provider config model or authoring surface
+    # uses, so this pass is safe to run twice over its own owned output.
+    # Serialization intentionally erases the nominal ownership proof;
+    # loading persisted YAML/JSON with a plain ``profile_alias`` is rejected
+    # rather than re-trusted. Both LLM plugin constructors consume this key
+    # before strict provider config validation — no provider model declares
+    # it — and retain only the plain opaque alias in Base*.config for audit.
+    executable["profile_alias"] = make_lowered_llm_profile_alias(alias)
+    component["options"] = executable
 
 
 @trust_boundary(
@@ -2594,91 +2701,15 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
     if default_alias is not None and default_alias not in profiles:
         raise ValueError(f"default_llm_profile {default_alias!r} does not name a configured llm_profiles entry")
 
-    def lower_component(component: object, *, location: str) -> None:
-        if not isinstance(component, dict) or component.get("plugin") != "llm":
-            return
-        options = component.get("options")
-        if not isinstance(options, dict):
-            return
-        # Exact nominal validation makes a second in-memory pass idempotent,
-        # while raw YAML/JSON/dict replay cannot forge audit attribution with
-        # an ordinary string under this reserved key.
-        require_lowered_llm_profile_alias(options)
-        if "profile" not in options:
-            return
-        alias = options["profile"]
-        if not isinstance(alias, str):
-            raise ValueError(f"{location} llm component 'profile' option must be a string alias")
-        if "provider" in options:
-            raise ValueError(
-                f"{location} llm component specifies both 'profile' and 'provider' — "
-                "choose exactly one: an operator profile alias, or explicit provider config"
-            )
-        try:
-            profile_settings = profiles[alias]
-        except KeyError:
-            raise ValueError(f"{location} llm component references unknown llm profile {alias!r}") from None
-        if profile_settings.credential_scope not in (None, "server"):
-            raise ValueError(
-                f"{location} llm component references profile {alias!r} with "
-                f"credential_scope {profile_settings.credential_scope!r}; batch/CLI runs have no per-user "
-                "secret store and can only use credential_scope 'server' (or scope-less, e.g. Bedrock) profiles"
-            )
-        if not materialize:
-            return
-        executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
-        if "api_key" in executable:
-            # ``lower_llm_profile_options`` is the only writer of this key and
-            # always writes the ``{"secret_ref", "secret_scope"}`` marker:
-            # ``api_key`` is a private profile field, so an authored value
-            # never reaches ``executable``. Anything else here is a lowering
-            # bug in owned data, not an input shape to tolerate.
-            api_key_marker = executable["api_key"]
-            if type(api_key_marker) is not dict:
-                raise TypeError(f"{location} llm profile {alias!r} lowered a non-marker api_key: {type(api_key_marker).__name__}")
-            # Batch/CLI never gains the web secret-store resolver; it
-            # materializes the profile's credential the same way an
-            # explicitly-authored `api_key: ${VAR}` node always has, via the
-            # existing _expand_env_vars pass run right after this one.
-            executable["api_key"] = f"${{{api_key_marker['secret_ref']}}}"
-        # Retain the ALIAS ONLY (never endpoint/credential_ref) in the
-        # executable options so it survives into ElspethSettings and is
-        # therefore recoverable from the run's audit trail — both
-        # resolve_config()'s settings_json snapshot (core/config.py) and the
-        # DAG's per-node audit config (core/landscape/data_flow/graph.py's
-        # sanitize_node_config_for_audit) derive from exactly this dict via
-        # BaseSource.config / BaseTransform.config. Web's parallel answer to
-        # "which profile did this component use" lives in
-        # run_web_plugin_policy.selected_profile_aliases_json
-        # (a web-only Landscape table); batch has no such table, so the
-        # alias must travel inside the node's own options.
-        #
-        # Deliberately NOT keyed as "profile" (the authored selector key):
-        # A second pass over this same owned in-memory dict must be inert. If
-        # the alias rode under "profile" ALONGSIDE the now-also-present
-        # "provider" key, that pass would look identical to a genuinely
-        # ambiguous authored node and trip the "specifies both 'profile' and
-        # 'provider'" rejection above — an accidental self-collision, not a
-        # real conflict. "profile_alias" is a distinct key the ambiguity check
-        # never inspects and no provider config model or authoring surface
-        # uses, so this pass is safe to run twice over its own owned output.
-        # Serialization intentionally erases the nominal ownership proof;
-        # loading persisted YAML/JSON with a plain ``profile_alias`` is rejected
-        # rather than re-trusted. Both LLM plugin constructors consume this key
-        # before strict provider config validation — no provider model declares
-        # it — and retain only the plain opaque alias in Base*.config for audit.
-        executable["profile_alias"] = make_lowered_llm_profile_alias(alias)
-        component["options"] = executable
-
     sources = raw_config.get("sources")
     if isinstance(sources, dict):
         for source_name, source in sources.items():
-            lower_component(source, location=f"sources[{source_name!r}]")
+            _lower_llm_component(source, location=f"sources[{source_name!r}]", profiles=profiles, materialize=materialize)
 
     transforms = raw_config.get("transforms")
     if isinstance(transforms, list):
         for index, node in enumerate(transforms):
-            lower_component(node, location=f"transforms[{index}]")
+            _lower_llm_component(node, location=f"transforms[{index}]", profiles=profiles, materialize=materialize)
     return raw_config
 
 
@@ -2714,7 +2745,17 @@ def _plugin_bearing_sections() -> dict[str, str]:
 
 
 def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
-    """Return ``{option_name: [(plugin_kind, reason), ...]}`` declared for ``plugin_name``.
+    """Return ``{option_name: [(plugin_kind, reason), ...]}`` for ``plugin_name``.
+
+    Literal values that reach output come from ``EmittedToOutput`` metadata on
+    plugin config fields. Transform options whose value names a field the
+    transform writes come from ``BaseTransform.output_naming_config_keys`` —
+    the existing authority whose declarations are checked against actual
+    created fields by the transform invariant suite. Those names are output
+    too: env expansion can turn ``${VAR}`` into a valid field name, after which
+    plugin validation accepts the host value and the transform writes it as a
+    row key and downstream artifact header. The union avoids a second
+    hand-maintained copy of every output-field option in config annotations.
 
     Unioned across all three registries, deliberately, because there is no
     name-to-kind lookup: the registries are three disjoint maps, and ``csv``,
@@ -2749,8 +2790,20 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
         for plugin_class in plugin_classes:
             if plugin_class.name != plugin_name:
                 continue
-            for option_name, reason in emitted_option_fields(plugin_class.get_config_model()).items():
+            explicitly_emitted = emitted_option_fields(plugin_class.get_config_model())
+            for option_name, reason in explicitly_emitted.items():
                 declared.setdefault(option_name, []).append((kind, reason))
+            if kind == "transform":
+                for option_name in plugin_class.output_naming_config_keys:
+                    if option_name in explicitly_emitted:
+                        continue
+                    declared.setdefault(option_name, []).append(
+                        (
+                            kind,
+                            "this option names a field the transform writes, so its value becomes "
+                            "a key in row data and a column in downstream artifacts",
+                        )
+                    )
     return declared
 
 
@@ -2764,8 +2817,9 @@ def _declared_emitted_options(plugin_name: str) -> dict[str, list[tuple[str, str
     suppresses=("R5",),
     invariant=(
         "raises ValueError when any plugin-bearing entry holds an environment-variable placeholder in an "
-        "option its plugin declares EmittedToOutput; entries whose plugin name or options are not the "
-        "expected scalar/mapping shape are skipped here and rejected by ElspethSettings validation"
+        "option its plugin declares output-reaching through EmittedToOutput or output_naming_config_keys; "
+        "entries whose plugin name or options are not the expected scalar/mapping shape are skipped here "
+        "and rejected by ElspethSettings validation"
     ),
     test_ref="tests/unit/core/test_config.py::TestEnvPlaceholderGuardIsDerived::test_rejection_message_names_the_declaring_kind",
     test_fingerprint="9652da87ae0e45512fe4a3930e051c885157bf68475824f7be22a67765204789",
@@ -2779,10 +2833,12 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     cannot be bypassed by handing it an already-expanded host value.
 
     DERIVED, NOT RESTATED. Both the sections and the forbidden fields come from
-    the system's own declarations: the sections from ``ElspethSettings``, and
-    the fields from the :class:`~elspeth.contracts.emitted_option.EmittedToOutput`
-    markers on each plugin's config model — the same declarations the plugin's
-    own validator enforces. This function names no plugin and no option.
+    the system's own declarations: the sections from ``ElspethSettings``;
+    literal output values from
+    :class:`~elspeth.contracts.emitted_option.EmittedToOutput` markers on each
+    plugin's config model; and transform output-field names from the
+    truth-tested ``BaseTransform.output_naming_config_keys`` authority. This
+    function names no plugin and no option.
 
     It replaced a hand-maintained ``{plugin: {field, ...}}`` map that held ONE
     plugin and two fields, and was therefore a no-op for every other plugin.
@@ -2798,9 +2854,10 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
     never trips on a presentation field like ``title``.
 
     Raises:
-        ValueError: An option declared ``EmittedToOutput`` holds an env
-            placeholder. The message names the declaring plugin kind, because a
-            union across registries can refuse a source option on a sink's
+        ValueError: An option declared output-reaching through
+            ``EmittedToOutput`` or ``output_naming_config_keys`` holds an env
+            placeholder. The message names the declaring plugin kind, because
+            a union across registries can refuse a source option on a sink's
             declaration and an unexplained refusal is worse than the refusal.
     """
     for section_name, shape in sorted(_plugin_bearing_sections().items()):
@@ -2840,6 +2897,96 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
                 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "one value of a raw plugin-options tree — operator YAML or a web-authored dict — during "
+        "secret fingerprinting before audit persistence"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError when a string secret field is present but no fingerprint key is "
+        "available (and dev mode is not enabled); non-secret and unrecognized shapes pass through "
+        "unchanged, never coerced"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestFingerprintSecretsBoundary::test_secret_without_key_raises",
+    test_fingerprint="8e15f3d155fb930f7cd07d1256a25e599c6a47ced4e71a8c0b92bbdbc4f2d26c",
+)
+def _fingerprint_process_value(
+    key: str,
+    value: Any,
+    *,
+    have_key: bool,
+    fail_if_no_key: bool,
+) -> tuple[str, Any, bool]:
+    """Process a single raw-options value, returning (new_key, new_value, was_secret)."""
+    from elspeth.core.security import secret_fingerprint
+
+    if isinstance(value, dict):
+        return key, _recurse(value, have_key=have_key, fail_if_no_key=fail_if_no_key), False
+    elif isinstance(value, list):
+        return (
+            key,
+            [_fingerprint_process_value("", item, have_key=have_key, fail_if_no_key=fail_if_no_key)[1] for item in value],
+            False,
+        )
+    elif isinstance(value, str) and is_secret_field(key):
+        # This is a secret field
+        if have_key:
+            fp = secret_fingerprint(value)
+            return f"{key}_fingerprint", fp, True
+        elif fail_if_no_key:
+            raise SecretFingerprintError(
+                f"Secret field '{key}' found but ELSPETH_FINGERPRINT_KEY "
+                "is not set. Either set the environment variable or use "
+                "ELSPETH_ALLOW_RAW_SECRETS=true for development "
+                "(not recommended for production)."
+            )
+        else:
+            # Dev mode: keep original value (user explicitly opted in)
+            return key, value, False
+    else:
+        return key, value, False
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one mapping node of a raw plugin-options tree — operator YAML or a web-authored dict — "
+        "during secret fingerprinting before audit persistence"
+    ),
+    source_param="d",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError when a secret field and its pre-supplied _fingerprint "
+        "counterpart are both present (fake-fingerprint injection), and (via "
+        "_fingerprint_process_value) when a secret is present with no key; other shapes pass through"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestFingerprintSecretsBoundary::test_fingerprint_collision_raises",
+    test_fingerprint="8c2d9016e282ea20471e25f39ae477b685c113b0d8bd44e3a584d0548407d753",
+)
+def _recurse(d: dict[str, Any], *, have_key: bool, fail_if_no_key: bool) -> dict[str, Any]:
+    """Fingerprint every secret field in one raw-options mapping node."""
+    # Detect collision: a secret field and its _fingerprint counterpart both present.
+    # Without this check, the pre-existing _fingerprint value would silently overwrite
+    # the computed HMAC, allowing an attacker to inject a fake fingerprint.
+    for key in d:
+        if isinstance(d[key], str) and is_secret_field(key):
+            fp_key = f"{key}_fingerprint"
+            if fp_key in d:
+                raise SecretFingerprintError(
+                    f"Config contains both '{key}' and '{fp_key}'. "
+                    f"The '{fp_key}' field is auto-generated from '{key}' during "
+                    f"fingerprinting — remove '{fp_key}' from your configuration."
+                )
+    result = {}
+    for key, value in d.items():
+        new_key, new_value, _was_secret = _fingerprint_process_value(key, value, have_key=have_key, fail_if_no_key=fail_if_no_key)
+        result[new_key] = new_value
+    return result
+
+
 def _fingerprint_secrets(
     options: dict[str, Any],
     *,
@@ -2863,59 +3010,13 @@ def _fingerprint_secrets(
         SecretFingerprintError: If secrets found but no fingerprint key available
                                 and fail_if_no_key is True
     """
-    from elspeth.core.security import get_fingerprint_key, secret_fingerprint
+    from elspeth.core.security import fingerprint_key_available
 
-    # Check if we have a fingerprint key available
-    try:
-        get_fingerprint_key()
-        have_key = True
-    except ValueError:
-        have_key = False
+    # The predicate derives from the same authority (contracts/security) that
+    # get_fingerprint_key raises from — no exception swallowing here.
+    have_key = fingerprint_key_available()
 
-    def _process_value(key: str, value: Any) -> tuple[str, Any, bool]:
-        """Process a single value, returning (new_key, new_value, was_secret)."""
-        if isinstance(value, dict):
-            return key, _recurse(value), False
-        elif isinstance(value, list):
-            return key, [_process_value("", item)[1] for item in value], False
-        elif isinstance(value, str) and is_secret_field(key):
-            # This is a secret field
-            if have_key:
-                fp = secret_fingerprint(value)
-                return f"{key}_fingerprint", fp, True
-            elif fail_if_no_key:
-                raise SecretFingerprintError(
-                    f"Secret field '{key}' found but ELSPETH_FINGERPRINT_KEY "
-                    "is not set. Either set the environment variable or use "
-                    "ELSPETH_ALLOW_RAW_SECRETS=true for development "
-                    "(not recommended for production)."
-                )
-            else:
-                # Dev mode: keep original value (user explicitly opted in)
-                return key, value, False
-        else:
-            return key, value, False
-
-    def _recurse(d: dict[str, Any]) -> dict[str, Any]:
-        # Detect collision: a secret field and its _fingerprint counterpart both present.
-        # Without this check, the pre-existing _fingerprint value would silently overwrite
-        # the computed HMAC, allowing an attacker to inject a fake fingerprint.
-        for key in d:
-            if isinstance(d[key], str) and is_secret_field(key):
-                fp_key = f"{key}_fingerprint"
-                if fp_key in d:
-                    raise SecretFingerprintError(
-                        f"Config contains both '{key}' and '{fp_key}'. "
-                        f"The '{fp_key}' field is auto-generated from '{key}' during "
-                        f"fingerprinting — remove '{fp_key}' from your configuration."
-                    )
-        result = {}
-        for key, value in d.items():
-            new_key, new_value, _was_secret = _process_value(key, value)
-            result[new_key] = new_value
-        return result
-
-    return _recurse(options)
+    return _recurse(options, have_key=have_key, fail_if_no_key=fail_if_no_key)
 
 
 def _sanitize_dsn(
@@ -3082,6 +3183,22 @@ def _reject_file_backed_template_options_for_in_memory_loader(raw_config: Mappin
     TemplateOptionMaterializer.reject_file_backed_options(raw_config)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "a raw plugin-options mapping — operator YAML or a web-authored dict — whose DSN-bearing "
+        "option may hold a resolved server/user secret"
+    ),
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "raises SecretFingerprintError (via _sanitize_dsn) when the DSN carries a password but no "
+        "fingerprint key is available and fail_if_no_key is set; absent or non-string option values are "
+        "left for plugin config validation to classify, never coerced"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestSanitizeDsnOptionBoundary::test_dsn_password_without_key_raises",
+    test_fingerprint="5ba780c9d34f540eb1e42cbd8acdecc4d41e1894e216f1dfa4dcb9ef0b6c6f4f",
+)
 def _sanitize_dsn_option_for_audit(
     options: dict[str, Any],
     *,
@@ -3324,7 +3441,11 @@ def load_settings(config_path: Path) -> ElspethSettings:
     # them into raw_config. These are legitimate runtime env vars, not typos.
     known_fields = set(ElspethSettings.model_fields.keys())
     with open(config_path) as _f:
-        _yaml_only = yaml.safe_load(_f) or {}
+        _yaml_loaded = yaml.safe_load(_f)
+    # ONLY an empty document (None) means "no keys". Every other falsy document
+    # (false, 0, "", []) is a non-mapping that must be REJECTED below — the old
+    # `or {}` coerced those into a valid-looking empty mapping (fail-open).
+    _yaml_only = {} if _yaml_loaded is None else _yaml_loaded
     if not isinstance(_yaml_only, dict):
         raise ValueError(f"Configuration file {config_path.name} must be a YAML mapping (key: value), not {type(_yaml_only).__name__}")
     yaml_keys_lower = {str(k).lower() for k in _yaml_only}
@@ -3400,6 +3521,18 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
     return ElspethSettings(**raw_config)
 
 
+@trust_boundary(
+    tier=3,
+    source=("a web-authored pipeline YAML string — user-controlled content the web execution service loads without touching disk"),
+    source_param="yaml_content",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the bounded YAML load yields anything but a mapping (and, downstream, "
+        "when ElspethSettings validation rejects the content); never coerces a non-mapping document"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestLoadSettingsFromYamlStringBoundary::test_non_mapping_yaml_document_raises",
+    test_fingerprint="9a80b4997bd2f540afead89cc5b6ce87911a2e4fc161cdfc0506aaec1d17fd12",
+)
 def load_settings_from_yaml_string(yaml_content: str, *, expand_env_vars: bool = False) -> ElspethSettings:
     """Load settings from a YAML string without touching disk.
 

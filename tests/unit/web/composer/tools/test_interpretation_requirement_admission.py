@@ -34,6 +34,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    PROMPT_TEMPLATE_PARTS_KEY,
     ServerStagedRequiredControlUserTerm,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -286,6 +287,12 @@ def test_canonical_invariant_accepts_exact_coherent_pending_rows() -> None:
             "llm_model_choice:node",
             "resolved_prompt_template_hash",
             "accepted_artifact_hash",
+        ),
+        (
+            "source_data_contract",
+            "source_data_contract",
+            "accepted_artifact_hash",
+            "resolved_prompt_template_hash",
         ),
     ),
 )
@@ -1020,7 +1027,9 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
 def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer: str) -> None:
     catalog = _catalog()
     old_prompt = "Summarise {{ row.text }}."
-    old_model = "openai/gpt-4o-mini"
+    # Must be a real openrouter catalog entry: afe354ee4 stopped short-circuiting
+    # value-source checks for deferred-secret configs, so this value is now verified.
+    old_model = "openai/gpt-4o"
     prompt_id = "trusted-prompt-review-id"
     model_id = "trusted-model-review-id"
     state = _state_with_node(
@@ -1030,6 +1039,7 @@ def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer:
             "model": old_model,
             "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
             "prompt_template": old_prompt,
+            "required_input_fields": ["text"],
             INTERPRETATION_REQUIREMENTS_KEY: [
                 _canonical_pending_requirement(
                     requirement_id=prompt_id,
@@ -1059,6 +1069,7 @@ def test_direct_llm_writers_preserve_trusted_auto_staged_requirement_ids(writer:
                 "model": old_model,
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": old_prompt,
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
             },
         }
@@ -1469,6 +1480,15 @@ def test_canonical_id_projection_normalizes_user_term_once() -> None:
             }
         ],
         catalog=catalog,
+        # A staged pending vague_term must be wired or the review contract
+        # rejects the mutation; the ref names the canonical id this test pins
+        # (trimmed user_term + ":" + node id).
+        extra_options={
+            PROMPT_TEMPLATE_PARTS_KEY: [
+                {"kind": "text", "text": "Classify as "},
+                {"kind": "interpretation_ref", "requirement_id": "alpha:candidate"},
+            ],
+        },
     )
 
     assert result.success is True, result.to_dict()

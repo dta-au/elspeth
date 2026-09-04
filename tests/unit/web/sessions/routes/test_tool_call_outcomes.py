@@ -24,7 +24,10 @@ import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
+
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.sessions.protocol import ChatMessageRecord
@@ -301,9 +304,12 @@ class TestNonToolRows:
         )
         assert outcomes == {}
 
-    def test_unparseable_content_defaults_to_completed(self) -> None:
-        outcomes = _tool_call_outcomes_by_call_id(
-            [_tool_row(tool_call_id="call-1", content="not json")],
-            state_versions_by_id={},
-        )
-        assert outcomes["call-1"].outcome is _ToolCallOutcomeKind.COMPLETED
+    def test_undecodable_content_is_tier1_corruption(self) -> None:
+        # Both tool-row writers persist JSON content, so an undecodable row
+        # is corrupted Tier-1 data: it crashes instead of silently
+        # classifying the call COMPLETED (the old defensive default).
+        with pytest.raises(AuditIntegrityError):
+            _tool_call_outcomes_by_call_id(
+                [_tool_row(tool_call_id="call-1", content="not json")],
+                state_versions_by_id={},
+            )

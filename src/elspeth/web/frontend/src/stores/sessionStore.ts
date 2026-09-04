@@ -27,6 +27,11 @@ import type {
   GuidedStartOperationReconciliation,
 } from "@/types/guided";
 import type { GuidedRetryAcquisition, GuidedRetryHandle, GuidedRetryKind } from "./guidedOperationRetry";
+import {
+  EMPTY_GUIDED_REVIEWED_COMPONENTS,
+  selectGuidedReviewedComponents,
+  type GuidedReviewedComponents,
+} from "./guidedReviewedComponents";
 import * as api from "@/api/client";
 import {
   COMPOSE_TIMEOUT_ABORT_REASON,
@@ -41,6 +46,9 @@ import {
   type WiringApprovalClientBlockers,
   type WiringApprovalOutcome,
 } from "@/components/chat/guided/wiringApproval";
+// Pure leaf (imports only types/guided): the ONE derivation of the token a
+// completed session chats under. The view binds to the same function.
+import { completedGuidedChatToken } from "@/components/chat/guided/completedChatToken";
 import { usePreferencesStore } from "./preferencesStore";
 import {
   acquireGuidedRetry,
@@ -256,6 +264,19 @@ const GUIDED_START_IN_PROGRESS_MESSAGE =
   "Guided setup is still running. Wait for it to settle, then reload to recover the result.";
 const GUIDED_START_UNKNOWN_MESSAGE =
   "Could not confirm whether guided setup settled. Reload to retry recovery before sending another request.";
+/**
+ * Store-level guard for `enterGuided()` reaching a WORKED freeform session (the
+ * documented GET 400) with no goal to root the conversion on.
+ *
+ * Unreachable from the UI — the mode-switch card requires a goal before Confirm
+ * is enabled, and every other entry lands on the stub, not the 400 — but a
+ * silent no-op here would be a dead button, and posting an intent-less convert
+ * would 400 with server copy the user cannot act on. Kept as a plain error
+ * string so the surface renders the same banner it renders for a convert
+ * failure.
+ */
+const GUIDED_GOAL_REQUIRED_MESSAGE =
+  "A goal is required to switch to guided. Describe what this pipeline should produce, then switch again.";
 // Human names for the pending action in a live custody conflict — the copy
 // must tell the user WHAT is unsettled, because "retry the same action" is
 // only actionable when they know which action it means (session 09cde460:
@@ -312,6 +333,9 @@ async function reconcileOrphanedGuidedRetry(
         guidedNextTurn: resynced.next_turn,
         guidedTerminal: resynced.terminal,
         guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          resynced.guided_session,
+        ),
         compositionState: resynced.composition_state,
       });
     }
@@ -838,6 +862,9 @@ async function resyncAfterAbortedGuidedTurn(
       guidedSession: resynced.guided_session,
       guidedNextTurn: resynced.next_turn,
       guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        resynced.guided_session,
+      ),
       guidedTerminal: resynced.terminal ?? s.guidedTerminal,
       compositionState: resynced.composition_state ?? s.compositionState,
     };
@@ -908,20 +935,26 @@ function clearedGuidedState(): Pick<
   | "guidedNextTurn"
   | "guidedTerminal"
   | "guidedProposalReview"
+  | "guidedReviewedComponents"
   | "guidedChatPending"
   | "guidedResponsePending"
   | "guidedSelfHealNotice"
   | "guidedApprovalNotice"
 > {
-  // Every caller is a full guided-context reset (initialisation or session
-  // navigation), so no in-flight respond retains ownership of the cleared
-  // pending bit across that boundary.
+  // Nulling the owner generation is safe for every caller because none of them
+  // can run while a guided mutation is in flight. Most are full guided-context
+  // resets (initialisation or session navigation), where no in-flight respond
+  // retains ownership across the boundary. The one mid-session caller —
+  // exitToFreeform's pre-goal drop of the adopted stub — is not such a reset,
+  // so it carries the in-flight gate itself and reaches here only with both
+  // pending bits false.
   guidedResponsePendingOwnerGeneration = null;
   return {
     guidedSession: null,
     guidedNextTurn: null,
     guidedTerminal: null,
     guidedProposalReview: null,
+    guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
     guidedChatPending: false,
     guidedResponsePending: false,
     guidedSelfHealNotice: null,
@@ -947,10 +980,27 @@ function clearedGuidedState(): Pick<
 // non-400 failure because guided restoration is not load-bearing there;
 // mutation callers can request propagation so a multi-request action retains
 // its operation custody until every authoritative read has succeeded.
+/**
+ * Three-way probe result (goal-first, elspeth-378cfa0e18).
+ *
+ * "stub" and "none" used to collapse into a single null. They cannot any more:
+ * a guided-DEFAULT session that has not yet received its goal persists NOTHING
+ * (`enterGuided()` adopts the in-memory stub instead of converting), so on
+ * reload the ONLY signal that it belongs on the guided surface is the stub plus
+ * the account's default-mode preference. Collapsing the two would land that
+ * reload in freeform — the very defect convert's spurious rootless checkpoint
+ * used to paper over. "none" still means a genuinely freeform-only session (the
+ * documented 400) or a probe that failed.
+ */
+type GuidedSelectProbe =
+  | { kind: "state"; response: GetGuidedResponse }
+  | { kind: "stub"; response: GetGuidedResponse }
+  | { kind: "none" };
+
 async function fetchGuidedStateForSelect(
   sessionId: string,
   unexpectedFailure: "tolerate" | "throw" = "tolerate",
-): Promise<GetGuidedResponse | null> {
+): Promise<GuidedSelectProbe> {
   try {
     const response = await api.getGuided(sessionId);
     // GET /guided is non-mutating on a session with NO persisted
@@ -959,14 +1009,18 @@ async function fetchGuidedStateForSelect(
     // composition_state: null, so a user who deliberately clicks "Switch to
     // guided" on a genuinely blank session gets an initial turn without
     // writing a spurious empty version. That stub is NOT evidence this
-    // session was ever actually in guided mode — auto-adopting it here would
-    // flip a brand-new, freeform-preferring session straight into the guided
-    // surface on its very first load, for no reason the user asked for. Only
-    // a response with a non-null composition_state confirms a REAL,
+    // session was ever actually in guided mode — adopting it unconditionally
+    // here would flip a brand-new, freeform-preferring session straight into
+    // the guided surface on its very first load, for no reason the user asked
+    // for. Only a response with a non-null composition_state confirms a REAL,
     // persisted guided_session (get_guided 400s before reaching this success
     // path whenever the persisted state's guided_session key is unset, so a
-    // real composition_state here means it was genuinely set).
-    return response.composition_state !== null ? response : null;
+    // real composition_state here means it was genuinely set). The stub is
+    // reported separately so the ONE caller that has a reason to adopt it —
+    // selectSession under a guided default mode — can, and no other does.
+    return response.composition_state !== null
+      ? { kind: "state", response }
+      : { kind: "stub", response };
   } catch (err) {
     // Only the documented 400 (session has no guided_session — a plain
     // freeform session) is an expected, silent "freeform-only" outcome.
@@ -985,7 +1039,37 @@ async function fetchGuidedStateForSelect(
           "falling back to freeform. If this session was mid-guided-build, its state was not restored.",
       );
     }
-    return null;
+    return { kind: "none" };
+  }
+}
+
+/**
+ * The persisted-state arm of a probe, or null — the shape the two callers that
+ * must NOT adopt a stub (fork hydration, version revert) consume. Both re-derive
+ * the guided surface from what a version actually IS; a lazy stub says only that
+ * the session could start guided, never that this version did.
+ */
+function persistedGuidedState(
+  probe: GuidedSelectProbe,
+): GetGuidedResponse | null {
+  return probe.kind === "state" ? probe.response : null;
+}
+
+/**
+ * True when the account's default composer mode is guided.
+ *
+ * Failure is NOT guided: `resolveDefaultMode` throws when the preferences
+ * bootstrap could not produce a mode, and session selection must not become an
+ * error (or silently flip surfaces) because a preferences read blipped. The
+ * caller's fallback — freeform — is the same one createSession degrades to.
+ */
+async function guidedDefaultModePreferred(): Promise<boolean> {
+  try {
+    return (
+      (await usePreferencesStore.getState().resolveDefaultMode()) === "guided"
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -1220,6 +1304,22 @@ interface SessionState {
   guidedTerminal: TerminalState | null;
   /** Exact proposal/hash-bound lifecycle for the current proposal controls. */
   guidedProposalReview: GuidedProposalReviewState | null;
+  /**
+   * Reviewed source/output ledger (elspeth-9f0873426a, server-projected by
+   * elspeth-f2a8550b3d): the settled components, so the Pipeline pane can
+   * draw them before a proposal exists — the pre-commit composition is empty
+   * by design.
+   *
+   * Read straight off the published `guided_session.reviewed_components`
+   * through `selectGuidedReviewedComponents`; it is NOT folded from turns any
+   * more, so a reload mid-build and a completed session (no `next_turn` to
+   * fold) both name what was agreed. Written wherever guidedSession is
+   * published — the same discipline as guidedProposalReview — and reset with
+   * the rest of the guided context. The one deliberate divergence from the
+   * published session is the refresh-required path below, which drops the
+   * ledger because this view has stopped being authoritative.
+   */
+  guidedReviewedComponents: GuidedReviewedComponents;
   // Per-step chat (Phase A slice 5).  The history itself lives on
   // `guidedSession.chat_history` (server-authoritative); only the in-flight
   // pending flag is local state.  Slice 4 carried an in-memory
@@ -1253,9 +1353,18 @@ interface SessionState {
   guidedApprovalNotice: string | null;
   // Guided-mode actions
   startGuided: (sessionId: string) => Promise<void>;
+  /**
+   * Programmatic POST /guided/start for a caller that already holds the
+   * session's root intent — today the tutorial shell, which seeds the frozen
+   * lesson prompt as the goal. `intent` is required for every profile: the
+   * server refuses an intent-less start, so a planner run can never be reached
+   * without a visible root. Retry custody is keyed on `[profileKind, intent]`,
+   * so a replayed descriptor can only ever re-fire the same start.
+   */
   seedGuided: (
     sessionId: string,
     profileKind: "tutorial",
+    intent: string,
   ) => Promise<void>;
   respondGuided: (body: GuidedRespondAction) => Promise<GuidedRespondOutcome>;
   /**
@@ -1302,21 +1411,32 @@ interface SessionState {
     expectedPublicationGeneration?: number,
   ) => Promise<boolean>;
   reenterGuided: () => Promise<void>;
-  // Convert a freeform session into guided mode (POST /guided/convert). Unlike
-  // startGuided's GET, this works for a session that has done freeform work
-  // (whose persisted state carries no guided_session and which GET rejects with
-  // 400): it seeds a fresh wizard as a new version, leaving the freeform
-  // pipeline recoverable via version history. Idempotent for already-guided
-  // sessions.
-  convertToGuided: (sessionId: string) => Promise<void>;
+  // Convert a WORKED freeform session into guided mode (POST /guided/convert).
+  // Unlike startGuided's GET, this works for a session whose persisted state
+  // carries no guided_session and which GET rejects with 400: it seeds a fresh
+  // wizard rooted on `intent` as a new version, leaving the freeform pipeline
+  // recoverable via version history. NOT idempotent any more: an already-guided
+  // session 409s rather than silently discarding the caller's goal, so this must
+  // be reached only through enterGuided's GET-first probe.
+  convertToGuided: (sessionId: string, intent: string) => Promise<void>;
   // Unified entry point bound by the "Switch to guided" button in ChatPanel's
-  // freeform body.  Branches on the current guidedSession terminal:
-  //   * terminal.kind === "exited_to_freeform" => reenterGuided
-  //   * otherwise => convertToGuided (POST). It is idempotent for empty and
-  //     already-guided sessions and does the fresh-wizard conversion for a
-  //     worked freeform session — the one case GET /guided cannot serve.
+  // freeform body and by createSession's guided-default arm. GET-FIRST
+  // (elspeth-378cfa0e18): it probes GET /guided and branches on what came back,
+  // so no path writes a rootless wizard the user never asked for.
+  //   * terminal.kind === "exited_to_freeform"   => reenterGuided
+  //   * stub (200, composition_state null), no intent
+  //                                              => adopt the stub; the panel
+  //                                                 opens on the goal card and
+  //                                                 NOTHING is persisted
+  //   * stub, with an intent                     => POST /guided/start with it
+  //   * 400 (worked freeform), with an intent    => convertToGuided(intent)
+  //   * 400, no intent                           => store guard (a goal is
+  //                                                 required); unreachable from
+  //                                                 the UI, which always
+  //                                                 collects one first
+  //   * 200 with persisted state                 => adopt it unchanged
   // The button stays a single affordance with one label regardless of branch.
-  enterGuided: () => Promise<void>;
+  enterGuided: (intent?: string) => Promise<void>;
   // `signal` aborts the underlying fetch (Stop button / client timeout) — the
   // guided mirror of sendMessage's AbortController plumbing (useComposer).
   chatGuided: (
@@ -1610,6 +1730,35 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (!guidedPublicationIsCurrent(id, selectionGeneration)) {
         return;
       }
+      let restoredGuided = persistedGuidedState(guided);
+      // A goal-first guided session persists NOTHING until the user states a
+      // goal (enterGuided adopts the stub instead of converting), so on reload
+      // the probe returns that same stub and there is no composition state to
+      // recognise it by. Under a GUIDED default mode the stub is what the user
+      // asked for — re-adopt it so the session reopens on the goal card instead
+      // of falling into freeform. Under a freeform default it stays what it has
+      // always been: not evidence of anything, and ignored.
+      //
+      // The preference alone is NOT enough. The stub is not a per-session
+      // signal: GET /guided answers with it for any session that has no
+      // composition state, which includes a worked FREEFORM session whose
+      // conversation never produced one. Adopting those would hide a real
+      // transcript behind the goal card — the guided surface renders the
+      // guided chat_history, not `messages` — and would do it retroactively to
+      // every message-only session the moment the default flipped to guided.
+      // An untouched session (the case this adoption exists for) has no
+      // messages at all, and `messages` is already loaded above, so the
+      // evidence about THIS session costs nothing.
+      if (restoredGuided === null && guided.kind === "stub" && messages.length === 0) {
+        if (await guidedDefaultModePreferred()) {
+          restoredGuided = guided.response;
+        }
+        // The preference read can await a preferences bootstrap, so re-check
+        // the selection generation before letting its result reach the store.
+        if (!guidedPublicationIsCurrent(id, selectionGeneration)) {
+          return;
+        }
+      }
       set({
         messages,
         compositionState,
@@ -1630,13 +1779,24 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         // startGuided/GET branch, which just re-observed the same terminal
         // and landed back in freeform with zero feedback — see C-4b). A
         // session that never touched guided mode still lands in freeform:
-        // `guided` is null (fetchGuidedStateForSelect's fetch-and-tolerate).
-        ...(guided !== null
+        // the probe reports "none" (fetchGuidedStateForSelect's
+        // fetch-and-tolerate), and a stub is adopted only under a guided
+        // default (see restoredGuided above).
+        ...(restoredGuided !== null
           ? {
-              guidedSession: guided.guided_session,
-              guidedNextTurn: guided.next_turn,
-              guidedTerminal: guided.terminal,
-              guidedProposalReview: proposalReviewForTurn(guided.next_turn),
+              guidedSession: restoredGuided.guided_session,
+              guidedNextTurn: restoredGuided.next_turn,
+              guidedTerminal: restoredGuided.terminal,
+              guidedProposalReview: proposalReviewForTurn(
+                restoredGuided.next_turn,
+              ),
+              // A resumed session gets the SERVER's ledger, not one folded
+              // from its current turn: the whole point of the projected
+              // field is that a reload mid-build (and a completed session,
+              // which has no turn at all) still names what was settled.
+              guidedReviewedComponents: selectGuidedReviewedComponents(
+                restoredGuided.guided_session,
+              ),
             }
           : {}),
       });
@@ -2524,6 +2684,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         clearGuidedRetry(retry);
         return;
       }
+      const forkedGuided = persistedGuidedState(guided);
       useBlobStore.getState().activateSession(result.session_id);
       let activatedChild = false;
       set((state) => {
@@ -2548,12 +2709,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           error: null,
           selectedNodeId: null,
           ...clearedGuidedState(),
-          ...(guided !== null
+          // A fork hydrates from what the CHILD version actually is; a lazy
+          // stub says only that the child could start guided, so it is not
+          // adopted here (persistedGuidedState drops it).
+          ...(forkedGuided !== null
             ? {
-                guidedSession: guided.guided_session,
-                guidedNextTurn: guided.next_turn,
-                guidedTerminal: guided.terminal,
-                guidedProposalReview: proposalReviewForTurn(guided.next_turn),
+                guidedSession: forkedGuided.guided_session,
+                guidedNextTurn: forkedGuided.next_turn,
+                guidedTerminal: forkedGuided.terminal,
+                guidedProposalReview: proposalReviewForTurn(
+                  forkedGuided.next_turn,
+                ),
+                guidedReviewedComponents: selectGuidedReviewedComponents(
+                  forkedGuided.guided_session,
+                ),
               }
             : {}),
           ...clearedRecoveryState(),
@@ -2667,6 +2836,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
+        ),
         compositionState: response.composition_state,
       });
     } catch (err) {
@@ -2688,7 +2860,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  async seedGuided(sessionId: string, profileKind: "tutorial") {
+  async seedGuided(sessionId: string, profileKind: "tutorial", intent: string) {
     const requestedSessionId = sessionId;
     const publicationGeneration = advanceGuidedPublicationGeneration();
     // Load path MUST NOT wedge on orphaned descriptors (session 09cde460:
@@ -2697,9 +2869,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // Sweep every descriptor this page load cannot replay before acquiring;
     // the seed's own authoritative response IS the state reconciliation.
     clearOrphanedGuidedRetriesForSession(sessionId);
-    let acquisition = acquireGuidedRetry("guided_start", sessionId, [profileKind]);
+    // Custody key carries the INTENT alongside the profile: the start is rooted
+    // on it, so two starts differing only in their goal are different
+    // operations and a replayed descriptor must not re-fire one as the other.
+    let acquisition = acquireGuidedRetry("guided_start", sessionId, [profileKind, intent]);
     if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_start", sessionId, [profileKind]);
+      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_start", sessionId, [profileKind, intent]);
     }
     if (acquisition.status === "conflict") {
       set(guidedRetryConflictState(acquisition.existing.kind));
@@ -2710,7 +2885,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     try {
       const response = await api.startGuidedSession(
         sessionId,
-        { profile: profileKind, operationId: retry.operationId },
+        { profile: profileKind, intent, operationId: retry.operationId },
       );
       responseReceived = true;
       if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
@@ -2746,15 +2921,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  async convertToGuided(sessionId: string) {
+  async convertToGuided(sessionId: string, intent: string) {
     // Capture the session identity before the await (stale-fetch guard,
     // mirroring startGuided). If the user switches sessions while the POST is in
     // flight, the response is dropped rather than overwriting the newly active
     // session's guided state.
     const requestedSessionId = sessionId;
-    let acquisition = acquireGuidedRetry("guided_convert", sessionId, []);
+    // Custody key carries the INTENT: the converted wizard is rooted on it, so a
+    // retained descriptor replays THAT conversion and never launders a different
+    // goal through an operation id acquired for the first one.
+    let acquisition = acquireGuidedRetry("guided_convert", sessionId, [intent]);
     if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_convert", sessionId, []);
+      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_convert", sessionId, [intent]);
     }
     if (acquisition.status === "conflict") {
       set(guidedRetryConflictState(acquisition.existing.kind));
@@ -2762,7 +2940,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
     const retry = acquisition.handle;
     try {
-      const response = await api.convertToGuided(sessionId, retry.operationId);
+      const response = await api.convertToGuided(sessionId, intent, retry.operationId);
       clearGuidedRetry(retry);
       if (get().activeSessionId !== requestedSessionId) {
         return;
@@ -2773,6 +2951,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
+        ),
         compositionState: response.composition_state,
         error: null,
       });
@@ -3024,6 +3205,29 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           releaseSubmitOwnership();
           set({
             guidedNextTurn: null,
+            // The reviewed-components ledger goes with the turn: this path
+            // tells the user to reload, and a reload re-reads the ledger from
+            // the wire. Leaving it would keep drawing the pre-failure
+            // source/output nodes beside the refresh-required banner.
+            //
+            // This is the one place the store's ledger deliberately diverges
+            // from the published `guidedSession.reviewed_components`, which
+            // stays put because the rest of the chat surface still renders
+            // from it — the transcript, and the stepper's settled ticks and
+            // the decision sheets they open (guidedDecisionStages.ts binds to
+            // the SESSION, not to this copy, and ChatPanel.test.tsx pins that
+            // in this exact state: at step_3_transforms the guided surface
+            // still renders with a null turn, so the two are on screen
+            // together). The divergence is about this VIEW's authority, not
+            // about what the server settled: the settlement succeeded, and
+            // only the refresh failed, so the held session is a stale-but-true
+            // snapshot the pane must stop drawing until it is re-fetched.
+            //
+            // The single-authority tidy-up — naming this field for the one
+            // view that reads it, or replacing the blanking with an explicit
+            // "projection suspended" flag — belongs to the graph-pane lane
+            // that owns GraphView.tsx, at rebase time.
+            guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
             guidedProposalReview: null,
             guidedResponsePending: false,
             error: GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE,
@@ -3106,6 +3310,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
               guidedNextTurn: resynced.next_turn,
               guidedTerminal: resynced.terminal,
               guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
+              guidedReviewedComponents: selectGuidedReviewedComponents(
+                resynced.guided_session,
+              ),
               compositionState: resynced.composition_state,
               guidedResponsePending: false,
               error: null,
@@ -3220,6 +3427,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             guidedSession: resynced.guided_session,
             guidedNextTurn: resynced.next_turn,
             guidedTerminal: resynced.terminal,
+            guidedReviewedComponents: selectGuidedReviewedComponents(
+              resynced.guided_session,
+            ),
             guidedProposalReview:
               proposalBinding === null
                 ? authoritativeReview
@@ -3442,13 +3652,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // This authoritative publication settles whichever respond owned the
     // pending projection it replaces. A later request cannot already own it:
     // that request would have advanced guidedPublicationGeneration and failed
-    // the currentness guard immediately above.
+    // the currentness guard immediately above. The one mutation that clears
+    // the owner generation WITHOUT advancing the publication generation —
+    // exitToFreeform's pre-goal stub drop — cannot interleave with an
+    // in-flight request either, because its own in-flight gate refuses while
+    // one is pending.
     guidedResponsePendingOwnerGeneration = null;
     set({
       guidedSession: response.guided_session,
       guidedNextTurn: response.next_turn,
       guidedTerminal: response.terminal,
       guidedProposalReview: proposalReviewForTurn(response.next_turn),
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        response.guided_session,
+      ),
       compositionState: response.composition_state,
       guidedResponsePending: false,
       error: null,
@@ -3484,6 +3701,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
+        ),
         compositionState: response.composition_state,
         error: null,
       });
@@ -3498,24 +3718,36 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  async enterGuided() {
-    // Unified "Switch to guided" entry point.  Sessions that were previously in
-    // guided and exited via the operator's "Exit to freeform" button reach a
-    // terminal of kind === "exited_to_freeform"; those go through reenterGuided,
-    // because convert would return the terminal state and leave the
-    // discriminator on freeform.
+  async enterGuided(intent?: string) {
+    // Unified "Switch to guided" / guided-default entry point, GET-FIRST
+    // (goal-first, elspeth-378cfa0e18).
     //
-    // Every other case routes through convertToGuided (POST /guided/convert),
-    // which is idempotent and safe for all entry states:
-    //   * empty / never-worked session   => lazy fresh wizard (like GET did)
-    //   * worked freeform session         => fresh-wizard conversion — the one
-    //                                        case GET /guided 400s on, and the
-    //                                        whole point of this action
-    //                                        (elspeth-e2c3dba6b5)
-    //   * already-guided, non-terminal    => returned unchanged (idempotent)
-    //   * completed terminal              => returned unchanged, so ChatPanel
-    //                                        continues to render the completion
-    //                                        summary. It is not re-entrable.
+    // It used to route every non-exited case through convertToGuided, which was
+    // idempotent and therefore looked safe. It was not: createSession's
+    // guided-default arm called it on a brand-new session, and convert's
+    // "no persisted state" branch PERSISTS a fresh rootless wizard checkpoint.
+    // After that write compositionState is non-null, so the pre-start goal card
+    // could never render and the session carried a planner-reachable wizard with
+    // no intent behind it. The probe replaces the write: GET /guided is
+    // non-mutating and tells us which of the four entry states this session is
+    // in, so nothing is persisted until the user has actually stated a goal.
+    //
+    //   * terminal exited_to_freeform => reenterGuided (convert would return the
+    //     terminal state and leave the discriminator on freeform)
+    //   * stub, no intent  => adopt it; the panel opens on the goal card and
+    //                         NOTHING is written. A reload re-probes and
+    //                         re-adopts (selectSession), so the goal-less
+    //                         session reopens where it was.
+    //   * stub, intent     => the session is empty, so the goal starts it
+    //                         directly through chatGuided's canonical live-start
+    //                         branch (POST /guided/start) and the goal card is
+    //                         skipped.
+    //   * 400, intent      => a WORKED freeform session: the one case GET cannot
+    //                         serve. Convert it, rooted on the goal.
+    //   * 400, no intent   => guard (see GUIDED_GOAL_REQUIRED_MESSAGE).
+    //   * persisted state  => adopt unchanged. A completed terminal comes back
+    //                         here too, so ChatPanel keeps rendering the
+    //                         completion summary; it is not re-entrable.
     const { activeSessionId, guidedSession } = get();
     if (activeSessionId === null) {
       throw new Error("enterGuided called without active session");
@@ -3524,7 +3756,59 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       await get().reenterGuided();
       return;
     }
-    await get().convertToGuided(activeSessionId);
+    const requestedSessionId = activeSessionId;
+    let probe: GetGuidedResponse;
+    try {
+      probe = await api.getGuided(requestedSessionId);
+    } catch (err) {
+      const apiErr = err as ApiError;
+      // Only the documented 400 means "this session has no guided_session".
+      // Anything else (500 on corrupt state, a network blip) is a failure to
+      // surface, not evidence that a conversion is the right move.
+      if (apiErr?.status !== 400) {
+        if (get().activeSessionId !== requestedSessionId) {
+          return;
+        }
+        set({
+          error:
+            apiErr?.detail ??
+            "Failed to switch to guided mode. Please try again.",
+        });
+        return;
+      }
+      if (intent === undefined) {
+        if (get().activeSessionId !== requestedSessionId) {
+          return;
+        }
+        set({ error: GUIDED_GOAL_REQUIRED_MESSAGE });
+        return;
+      }
+      await get().convertToGuided(requestedSessionId, intent);
+      return;
+    }
+    if (get().activeSessionId !== requestedSessionId) {
+      return;
+    }
+    // Atomically replace all 4 wire fields — server is authoritative (spec §7.3).
+    set({
+      guidedSession: probe.guided_session,
+      guidedNextTurn: probe.next_turn,
+      guidedTerminal: probe.terminal,
+      guidedProposalReview: proposalReviewForTurn(probe.next_turn),
+      guidedReviewedComponents: selectGuidedReviewedComponents(
+        probe.guided_session,
+      ),
+      compositionState: probe.composition_state,
+      error: null,
+    });
+    if (probe.composition_state === null && intent !== undefined) {
+      // The adopted stub is exactly the state chatGuided's cold-start branch
+      // expects (non-null guidedSession, null compositionState), so the goal
+      // goes through the ONE live-start path in the store — the same one the
+      // goal card's Send uses — rather than a second POST /guided/start site
+      // with its own custody, receipt and reconciliation handling to drift.
+      await get().chatGuided(intent);
+    }
   },
 
   async chatGuided(
@@ -3685,7 +3969,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       return;
     }
-    if (guidedNextTurn === null) {
+    // Occurrence binding, in precedence order (elspeth-ea80e34fdc + IA-6):
+    //   1. `retryTurnToken` — a Retry submits the token its message was
+    //      ORIGINALLY submitted under, never a current one.
+    //   2. `completedToken` — after Confirm wiring there is no unanswered
+    //      turn, so the channel is bound to the CONFIRMATION hash
+    //      (`history[-1].response_hash`), which is what the backend's
+    //      completed-chat admission arm re-derives and compares. Checked
+    //      before the live turn for the same reason ChatPanel checks the
+    //      completed branch first: a stale `guidedNextTurn` left beside a
+    //      completed terminal must not win.
+    //   3. the live unanswered turn's token.
+    // No token at all means there is nothing sound to submit against — the
+    // offensive guard fires here rather than letting the server reject it.
+    const completedToken = completedGuidedChatToken(guidedSession);
+    const requestedTurnToken =
+      retryTurnToken ??
+      completedToken ??
+      (guidedNextTurn === null ? null : guidedNextTurn.turn_token);
+    if (requestedTurnToken === null) {
       throw new Error("chatGuided called without a current unanswered turn");
     }
     // Step-3 proposal revision. The 7.1 planner auto-stages a pipeline proposal
@@ -3700,6 +4002,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // on the GuidedSessionResponse wire, so the gate is the proposal turn itself.)
     if (
       retryTurnToken === undefined &&
+      // A live unanswered turn is the whole premise of a proposal revision:
+      // the reroute reuses respondGuided's CURRENT turn_token custody. A
+      // completed session has no such turn (and never sits at step 3).
+      guidedNextTurn !== null &&
       guidedSession.step === "step_3_transforms" &&
       guidedNextTurn.type === "propose_pipeline"
     ) {
@@ -3727,11 +4033,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // mirroring respondGuided / startGuided).  If the user switches
     // session or the wizard advances mid-flight, the response is dropped.
     const requestedSessionId = activeSessionId;
-    // Occurrence binding (elspeth-ea80e34fdc): a Retry of a historical
-    // failure submits the token its message was ORIGINALLY submitted under,
-    // never the current one — the server's stale-turn 409 is the authority
-    // on whether that occurrence is still answerable.
-    const requestedTurnToken = retryTurnToken ?? guidedNextTurn.turn_token;
+    // `requestedTurnToken` was resolved above (retry → completed → live turn)
+    // so the reroute guard and the throw could both read it. Retry custody is
+    // keyed on it verbatim, unchanged: [turn_token, message].
     let acquisition = acquireGuidedRetry("guided_chat", requestedSessionId, [
       requestedTurnToken,
       message,
@@ -3792,6 +4096,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: response.next_turn,
         guidedTerminal: response.terminal,
         guidedProposalReview: proposalReviewForTurn(response.next_turn),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          response.guided_session,
+        ),
         compositionState: response.composition_state,
         guidedChatPending: false,
       });
@@ -3815,6 +4122,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             guidedNextTurn: resynced.next_turn,
             guidedTerminal: resynced.terminal,
             guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
+            guidedReviewedComponents: selectGuidedReviewedComponents(
+              resynced.guided_session,
+            ),
             compositionState: resynced.composition_state,
             error: apiErr.detail ?? "The guided turn changed. Review the refreshed step and try again.",
             guidedChatPending: false,
@@ -3879,6 +4189,50 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async exitToFreeform() {
+    // Goal-first (elspeth-378cfa0e18): before the goal, NOTHING is persisted —
+    // the panel is showing the adopted GET /guided stub. Responding here would
+    // write the rootless wizard the whole change exists to prevent, and write
+    // it permanently: the settled checkpoint carries an `exited_to_freeform`
+    // terminal, so `compositionState` is non-null from then on, the goal card
+    // can never render again, and a later "Finish outputs" answers the 409
+    // that asks for a goal the session no longer has any way to state.
+    // Symmetric with the stub adoption itself — nothing is written before the
+    // goal, in either direction — so the exit is a local drop of the stub.
+    //
+    // Consequence, by design and not a bug: because nothing was written, a
+    // later selectSession of this same still-empty session re-adopts the stub
+    // under a guided default and reopens the goal card. The session leaves the
+    // goal card for good once it has something of its own — a freeform message
+    // (selectSession then sees `messages`, not an untouched session) or the
+    // goal itself. The alternative is writing a rootless wizard purely to
+    // remember a refusal, which is the thing goal-first removes.
+    const { guidedSession, compositionState, guidedChatPending, guidedResponsePending } = get();
+    if (guidedSession !== null && compositionState === null) {
+      // The pre-goal exit carries the same single in-flight-mutation gate as
+      // every other guided mutation (respondGuided, chatGuided) — it is not
+      // exempt for being local. The goal card's Send runs through chatGuided's
+      // start branch, a live planner-free but multi-second round trip, and
+      // that branch has already advanced guidedPublicationGeneration and holds
+      // a guided_start retry descriptor. Dropping the stub underneath it
+      // returned "applied" — a lie — and then the settling start passed
+      // `guidedPublicationIsCurrent` and republished the very session the user
+      // had just walked away from, checkpoint and all. A synchronous check
+      // before a synchronous `set` admits no interleaving.
+      //
+      // Advancing the publication generation instead would drop the response
+      // but orphan both the retained retry descriptor and the session the
+      // server has already started, so the gate is the answer: refuse while a
+      // mutation is in flight, exactly as the post-goal path does.
+      if (guidedChatPending || guidedResponsePending) {
+        return {
+          status: "not_applied",
+          reason: "pending",
+          message: GUIDED_RESPONSE_PENDING_MESSAGE,
+        };
+      }
+      set(clearedGuidedState());
+      return { status: "applied" };
+    }
     // Sugar over respondGuided — sets control_signal and nulls all choice fields.
     // All state mutation is handled by respondGuided (via applyGuidedResponse).
     return get().respondGuided(EXIT_TO_FREEFORM_ACTION);
@@ -3932,7 +4286,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // GET /guided (non-mutating; 400 => freeform-only) and set the wire
       // fields to what the reverted version actually is, mirroring
       // selectSession's discriminator.
-      const guided = await fetchGuidedStateForSelect(activeSessionId, "throw");
+      // A lazy stub is not a version's guided state, so it is dropped here as
+      // it always was: reverting to a freeform version must land in freeform.
+      const guided = persistedGuidedState(
+        await fetchGuidedStateForSelect(activeSessionId, "throw"),
+      );
       // Stale-guard: drop the result if the active session changed while the
       // revert + probe were in flight (mirrors startGuided/selectSession).
       if (get().activeSessionId !== activeSessionId) {
@@ -3947,7 +4305,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         guidedNextTurn: guided?.next_turn ?? null,
         guidedTerminal: guided?.terminal ?? null,
         guidedProposalReview: proposalReviewForTurn(guided?.next_turn ?? null),
+        guidedReviewedComponents: selectGuidedReviewedComponents(
+          guided?.guided_session ?? null,
+        ),
       });
+      // Revert is a state-producing route: restoring an older pending
+      // interpretation requirement can mint fresh backend review events.
+      // Pull them into the independent event store so execution does not stay
+      // blocked behind an invisible card until a full session reload.
+      void refreshInterpretationEventsForSession(activeSessionId);
       clearGuidedRetry(retry);
     } catch (err) {
       if (!isAmbiguousGuidedRetryFailure(err)) {

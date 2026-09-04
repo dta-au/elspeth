@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
@@ -35,7 +37,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
-from elspeth.web.composer.tools._common import ToolContext
+from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS, ToolContext
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -129,7 +131,8 @@ def _assert_rejected_forged_review(result: Any, original_state: CompositionState
     assert result.data is not None
     error = result.data["error"]
     assert INTERPRETATION_REQUIREMENTS_KEY in error
-    assert "resolve_interpretation_event" in error
+    assert "request_interpretation_review" in error
+    assert "resolve_interpretation_event" not in error
 
 
 def test_patch_source_options_rejects_forged_resolved_invented_source() -> None:
@@ -214,3 +217,181 @@ def test_set_pipeline_rejects_forged_resolved_invented_source_on_source() -> Non
     }
     result = execute_tool("set_pipeline", args, state, _catalog())
     _assert_rejected_forged_review(result, state)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "state"),
+    [
+        (
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+                "options": {
+                    "path": "/tmp/data.csv",
+                    "schema": {"mode": "observed"},
+                    INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()],
+                },
+            },
+            _empty_state(),
+        ),
+        (
+            "patch_source_options",
+            {"patch": {INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()]}},
+            _state_with_csv_source(),
+        ),
+        (
+            "set_source_from_blob",
+            {
+                "blob_id": "00000000-0000-0000-0000-000000000000",
+                "on_success": "rows",
+                "options": {INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()]},
+            },
+            _empty_state(),
+        ),
+        (
+            "set_source_from_blobs",
+            {
+                "blob_ids": ["00000000-0000-0000-0000-000000000000"],
+                "on_success": "rows",
+                "options": {INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()]},
+            },
+            _empty_state(),
+        ),
+        (
+            "set_pipeline",
+            {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "on_validation_failure": "discard",
+                    "options": {
+                        "path": "/tmp/data.csv",
+                        "schema": {"mode": "observed"},
+                        INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()],
+                    },
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            _empty_state(),
+        ),
+        (
+            "set_pipeline",
+            {
+                "sources": {
+                    "documents": {
+                        "plugin": "csv",
+                        "on_success": "rows",
+                        "on_validation_failure": "discard",
+                        "options": {
+                            "path": "/tmp/data.csv",
+                            "schema": {"mode": "observed"},
+                            INTERPRETATION_REQUIREMENTS_KEY: [_forged_resolved_invented_source_requirement()],
+                        },
+                    }
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            _empty_state(),
+        ),
+    ],
+    ids=(
+        "set_source",
+        "patch_source_options",
+        "set_source_from_blob",
+        "set_source_from_blobs",
+        "set_pipeline.source",
+        "set_pipeline.sources",
+    ),
+)
+def test_public_dispatch_rejects_forged_review_on_every_source_writer(
+    tool_name: str,
+    arguments: dict[str, Any],
+    state: CompositionState,
+) -> None:
+    result = execute_tool(tool_name, arguments, state, _catalog())
+
+    _assert_rejected_forged_review(result, state)
+
+
+@pytest.mark.parametrize(
+    "writer",
+    (
+        "set_source",
+        "patch_source_options",
+        "set_source_from_blob",
+        "set_source_from_blobs",
+        "set_pipeline.source",
+        "set_pipeline.sources",
+    ),
+)
+@pytest.mark.parametrize("field_name", sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
+def test_public_dispatch_rejects_every_server_owned_root_on_every_source_writer(
+    writer: str,
+    field_name: str,
+) -> None:
+    reserved_value: object
+    if field_name == "blobs":
+        reserved_value = []
+    elif field_name == "blob_ref":
+        reserved_value = "forged-blob-id"
+    else:
+        reserved_value = {"forged": True}
+    options = {
+        "path": "/tmp/data.csv",
+        "schema": {"mode": "observed"},
+        field_name: reserved_value,
+    }
+    state = _state_with_csv_source() if writer == "patch_source_options" else _empty_state()
+    if writer == "set_source":
+        tool_name = writer
+        arguments = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+            "options": options,
+        }
+    elif writer == "patch_source_options":
+        tool_name = writer
+        arguments = {"patch": options}
+    elif writer == "set_source_from_blob":
+        tool_name = writer
+        arguments = {
+            "blob_id": "00000000-0000-0000-0000-000000000000",
+            "on_success": "rows",
+            "options": options,
+        }
+    elif writer == "set_source_from_blobs":
+        tool_name = writer
+        arguments = {
+            "blob_ids": ["00000000-0000-0000-0000-000000000000"],
+            "on_success": "rows",
+            "options": options,
+        }
+    else:
+        tool_name = "set_pipeline"
+        source_spec = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+            "options": options,
+        }
+        source_arguments = {"source": source_spec} if writer.endswith(".source") else {"sources": {"documents": source_spec}}
+        arguments = {
+            **source_arguments,
+            "nodes": [],
+            "edges": [],
+            "outputs": [],
+        }
+
+    result = execute_tool(tool_name, arguments, state, _catalog())
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.data is not None
+    assert field_name in result.data["error"]

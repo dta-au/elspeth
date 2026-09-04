@@ -25,12 +25,60 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcome,
 )
 from elspeth.web.composer.bounded_json import bounded_json_loads
-from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
 )
-from elspeth.web.sessions._persist_payload import RedactedToolRow
+from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions._persist_payload import RedactedToolRow, RejectionRecord
+
+
+def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[RejectionRecord, ...]:
+    """Extract one durable rejection record per refused mutation
+    (elspeth-3e28029d2f).
+
+    The chat ``tool`` row persists REDACTED; this record carries the exact
+    payload the planner saw — the text and the reasoning — for the session
+    store (operator ruling 2026-09-02: session data, not Landscape data).
+
+    Three outcome shapes (see ``_ToolOutcome``): failure envelopes with
+    ``error_class`` set (argument errors, plugin crashes); ``ToolResult``
+    with ``success=False`` (validation rejections); everything else —
+    successes and advisor mapping envelopes — records nothing.
+    """
+    records: list[RejectionRecord] = []
+    for outcome in tool_outcomes:
+        tool_name = outcome.call.function.name
+        if outcome.error_class is not None:
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=outcome.error_class,
+                    message=outcome.error_message or "",
+                    planner_payload=json.dumps(
+                        {
+                            "error_class": outcome.error_class,
+                            "error_message": outcome.error_message,
+                        }
+                    ),
+                )
+            )
+        elif isinstance(outcome.response, ToolResult) and not outcome.response.success:
+            errors = outcome.response.validation.errors
+            primary = next((entry for entry in errors if entry.error_code), errors[0] if errors else None)
+            records.append(
+                RejectionRecord(
+                    tool_call_id=outcome.call.id,
+                    tool_name=tool_name,
+                    error_code=primary.error_code if primary is not None else None,
+                    message=primary.message if primary is not None else "",
+                    planner_payload=serialize_tool_result(outcome.response),
+                )
+            )
+    return tuple(records)
+
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -44,12 +92,14 @@ async def persist_turn_audit(
     assistant_message: _AdmittedAssistantMessage,
     raw_assistant_content: str | None,
     assistant_tool_calls: tuple[_AdmittedToolCall, ...],
-    plugin_crash: ComposerPluginCrashError | None,
+    crash_pending: bool,
     session_id: str | None,
     session_operation_context: SessionOperationContext | None,
     current_state_id: str | None,
     persisted_tool_call_turn: bool,
     persisted_assistant_message_id: str | None,
+    persisted_assistant_content: str | None,
+    assistant_row_uses_current_dispatch: bool,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -68,11 +118,14 @@ async def persist_turn_audit(
        Unwind-audit invariants are checked after the persist returns;
        failures raise additional AuditIntegrityError(s).
 
-    Plugin-crash propagation (the post-persist re-raise of a
-    ``ComposerPluginCrashError`` captured in P3) is intentionally
-    *not* in this helper: the driver decides whether to raise based
-    on ``dispatch.plugin_crash is not None`` so the carrier never
-    carries a "post-crash" disposition.
+    Crash propagation is intentionally *not* in this helper. P3 supplies a
+    discriminated carrier (plugin crash or first-party advisor failure), and
+    the driver raises it only after this phase publishes the closed row.
+
+    ``assistant_row_uses_current_dispatch`` is the caller-owned P4
+    disposition for whether ``assistant_message`` still contains the current
+    dispatch's model prose. It is required because the caller performs the
+    advisor-repair substitution; row presence cannot recover that fact.
     """
     from pydantic import ValidationError as PydanticValidationError
 
@@ -129,7 +182,7 @@ async def persist_turn_audit(
                 )
         else:
             decoded_args = {"_raw_arguments": tc.function.arguments}
-        is_arg_error = tool_outcome.error_class is not None and not (plugin_crash is not None and index == len(tool_outcomes) - 1)
+        is_arg_error = tool_outcome.error_class is not None and not (crash_pending and index == len(tool_outcomes) - 1)
         if is_arg_error:
             arg_error_projection = redact_arg_error_response(
                 error_class=tool_outcome.error_class,
@@ -192,13 +245,13 @@ async def persist_turn_audit(
                     if tool_outcome.error_class is None
                     else (
                         ComposerToolStatus.PLUGIN_CRASH
-                        if plugin_crash is not None and index == len(tool_outcomes) - 1
+                        if crash_pending and index == len(tool_outcomes) - 1
                         else ComposerToolStatus.ARG_ERROR
                     )
                 ),
             ),
             composition_state_payload=(
-                phase3_self._state_payload_for_compose_turn_for_test(tool_outcome.response)
+                phase3_self._state_payload_for_compose_turn(tool_outcome.response)
                 if tool_outcome.post_version > tool_outcome.pre_version
                 else None
             ),
@@ -220,10 +273,11 @@ async def persist_turn_audit(
                 raw_content=raw_assistant_content,
                 redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                 redacted_tool_rows=redacted_tool_rows,
+                rejection_records=build_rejection_records(tool_outcomes),
                 parent_composition_state_id=current_state_id,
                 expected_current_state_id=current_state_id,
                 writer_principal="compose_loop",
-                plugin_crash_pending=plugin_crash is not None,
+                plugin_crash_pending=crash_pending,
                 session_operation_context=session_operation_context,
             )
         except AuditIntegrityError as exc:
@@ -241,7 +295,7 @@ async def persist_turn_audit(
             tool_calls_attempted=len(assistant_tool_calls),
             tool_responses_persisted=0 if audit_outcome.assistant_id is None else len(redacted_tool_rows),
         )
-        if audit_outcome.assistant_id is None and plugin_crash is None:
+        if audit_outcome.assistant_id is None and not crash_pending:
             raise AuditIntegrityError(
                 "persist_compose_turn_async returned unwind_audit_failed without an in-flight plugin crash",
                 failed_turn=failed_turn,
@@ -252,6 +306,15 @@ async def persist_turn_audit(
                 failed_turn=failed_turn,
             )
         persisted_assistant_message_id = audit_outcome.assistant_id
+        # Derived here rather than by the caller because this is the only
+        # frame that knows what reached the row: the persist call above sends
+        # ``assistant_message.content or ""``, and ``assistant_message`` is
+        # already the substituted message on the advisor-repair branch. A
+        # caller reconstructing it from the turn prose would record the wrong
+        # bytes for that branch (elspeth-d581b3da7f). Rolled back (no
+        # assistant id) means no row holds anything — the pair goes to None
+        # together.
+        persisted_assistant_content = None if audit_outcome.assistant_id is None else (assistant_message.content or "")
         # The unwind-failure outcome means the transaction rolled back: no
         # assistant or tool row survived, so the driver must retain the
         # in-flight invocation evidence on the propagated plugin crash.
@@ -259,7 +322,9 @@ async def persist_turn_audit(
     return _PersistOutcome(
         current_state_id=current_state_id,
         persisted_assistant_message_id=persisted_assistant_message_id,
+        persisted_assistant_content=persisted_assistant_content,
         persisted_tool_call_turn=persisted_tool_call_turn,
+        persisted_assistant_matches_current_dispatch=(persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch),
         unwind_audit_failed=unwind_audit_failed,
         failed_turn=failed_turn,
     )

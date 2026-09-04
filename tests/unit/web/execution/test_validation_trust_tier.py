@@ -31,9 +31,10 @@ def _production_files(execution_root: Path) -> list[str]:
 # signing ceremony. No filename/name exemption may hide any check.
 _ADJUDICATION_CANDIDATES = {
     "_validation_authoring.py": ["R5:_secret_ref_exists", "R5:review_interpretations"],
+    # The two R1 `.get()` reads on pydantic ErrorDetails were converted to
+    # the visible membership-then-subscript form (tier-remediation
+    # 2026-08-31); only the R5 shape probes remain as candidates.
     "_validation_diagnostics.py": [
-        "R1:_reframe_settings_missing_parts",
-        "R1:_reframe_settings_missing_parts",
         "R5:_reframe_settings_missing_parts",
         "R5:_infer_component_type_from_plugin_error",
     ],

@@ -344,32 +344,41 @@
   color: var(--color-text);
 }
 
-/* Narrative prose, NOT code (elspeth-ac51d2dac2). The producer
-   (src/elspeth/web/.../explain.py) emits hyphen-bulleted English sentences —
-   no code, no hashes, no column alignment — so the monospace face this rule
-   used to set carried no information and primed the reader for machine
-   output. base.css styles the bare `pre` element mono, so BOTH the family
-   and the size have to be restated here to win.
+/* Narrative prose rendered through MarkdownRenderer (elspeth-d74ab492dd). It
+   was a `<pre>`; the producer (`src/elspeth/web/audit_readiness/explain.py`)
+   emits an intro line, a blank line, then consecutive `- `-prefixed sentences
+   — i.e. a markdown LIST — so the renderer now gives screen-reader users a
+   list role, an item count and list navigation that a `<pre>` cannot provide.
 
    The measure cap is the same 74ch the chat bubbles settled on
    (chat.css:1131-1142) — this dialog is `inset: 32px`, i.e. full-bleed, and
    uncapped prose ran to roughly 150 characters per line, about twice the
    comfortable measure, so the eye lost its line on every return sweep.
-   `white-space: pre-wrap` stays: the narrative's own line breaks are
-   meaningful, and now they wrap inside a bounded column instead of the
-   viewport.
+   `white-space: pre-wrap` is gone: the renderer now owns block structure, so
+   paragraphs and list items carry the line breaks that the declaration used
+   to preserve.
 
-   Still owed, in a file this lane does not own: ExplainDialog.tsx:119
-   renders the narrative in a `<pre>`, which screen readers announce as
-   preformatted/code. The sibling drawer already made this move to `<p>` +
-   `white-space: pre-line` (ReadinessRowDetail.tsx:167-176). */
+   The family/size no longer have to out-rank base.css's bare-`pre` mono rule,
+   since there is no `<pre>` left to inherit it. But MarkdownRenderer nests a
+   `.markdown-body` (common.css:72) whose own `font-size: var(--font-size-sm)`
+   and `line-height: 1.5` would otherwise win over the md/relaxed pair set
+   here, silently shrinking this narrative one size step AND making the 74ch
+   cap above a false claim — `ch` resolves against the wrapper's md size, so a
+   smaller inner face means a measure of roughly 80+ characters, not 74. The
+   inherit pair below is what keeps both this rule and that paragraph true. */
 .explain-dialog-narrative {
   flex: 1 1 auto;
   max-width: 74ch;
   font-family: var(--font-sans);
   font-size: var(--font-size-md);
   line-height: var(--line-height-relaxed);
-  white-space: pre-wrap;
+}
+
+/* The narrative's own typography wins over the generic markdown body, so the
+   measure cap above stays honest (see the block comment). */
+.explain-dialog-narrative .markdown-body {
+  font-size: inherit;
+  line-height: inherit;
 }
 
 /* ---------------------------------------------------------------------------

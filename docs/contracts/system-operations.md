@@ -528,10 +528,11 @@ check_timeouts(coalesce_name)
 
 **Idle polling:** Coalesce timeout checks are not background timers. They fire
 when the next token arrives at the coalesce point, during source completion, and
-from the source-idle polling path when the pipeline also has time-sensitive
-aggregation triggers. Coalesce-only streaming pipelines without aggregation idle
-polling still need source-level heartbeat rows or explicit source completion to
-advance timeout checks during otherwise idle periods.
+from the source-idle polling path. Configuring a timeout on any coalesce enables
+that idle polling path even when the pipeline has no time-sensitive aggregation
+triggers. A coalesce-only streaming pipeline therefore advances timeout checks
+while waiting for the next source row; it does not need source-level heartbeat
+rows or source completion to make timeout progress while idle polling is active.
 
 ### Late Arrivals
 

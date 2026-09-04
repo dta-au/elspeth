@@ -46,8 +46,13 @@ async def _settle_dependency(
         lifecycle.append(("begin", surface))
         return token
 
-    def finish_metrics(observed_token: object, *, status: str) -> None:
-        lifecycle.append(("finish", observed_token, status))
+    def finish_metrics(
+        observed_token: object,
+        *,
+        status: str,
+        primary_error: BaseException | None,
+    ) -> None:
+        lifecycle.append(("finish", observed_token, status, primary_error))
 
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(
@@ -131,6 +136,44 @@ async def test_request_dependency_projects_closed_failure_status(
     assert lifecycle[0] == ("begin", "guided")
     assert lifecycle[1][0] == "finish"
     assert lifecycle[1][2] == status
+    assert [event for event, _session_id in registry.events] == ["begin", "end"]
+
+
+@pytest.mark.asyncio
+async def test_metrics_token_pairing_failure_does_not_replace_request_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finalizer bookkeeping bug must preserve the active request failure."""
+    from elspeth.web.composer import provider_telemetry
+
+    registry = _Registry()
+
+    monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
+
+    def begin_with_spent_token(*, surface: str) -> object:
+        token = provider_telemetry.begin_composer_request_metrics(surface=surface)
+        provider_telemetry._REQUEST_METRICS_STATE.reset(token)
+        return token
+
+    monkeypatch.setattr(
+        _helpers,
+        "begin_composer_request_metrics",
+        begin_with_spent_token,
+    )
+    monkeypatch.setattr(
+        _helpers,
+        "finish_composer_request_metrics",
+        provider_telemetry.finish_composer_request_metrics,
+    )
+    dependency = cast(
+        "AsyncGenerator[None, None]",
+        _helpers._track_compose_inflight(uuid4(), _request("/api/sessions/1/messages")),
+    )
+    await anext(dependency)
+
+    with pytest.raises(LookupError, match="primary request failure"):
+        await dependency.athrow(LookupError("primary request failure"))
+
     assert [event for event, _session_id in registry.events] == ["begin", "end"]
 
 

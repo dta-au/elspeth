@@ -1,1 +1,136 @@
 per_file_rules: []
+
+allow_hits:
+- key: testing/__init__.py:R5:make_error:fp=d4ba4ae51beb4330
+  owner: john
+  reason: |-
+    R5 `isinstance(reason, str)` in the make_error test factory. The parameter is `TransformErrorReason | str | None` and the str arm is the shorthand that lifts a bare error code into the required `{'reason': <code>}` shape, as the docstring's two examples show (make_error('llm_timeout') beside make_error({'reason': 'bad_json', ...})). Testing for str is the ONLY sound discriminator available: TransformErrorReason is a TypedDict, which at runtime is an ordinary dict and therefore cannot be told apart from any other mapping — so the check is written against the one arm that has a distinguishable runtime type, with None handled by an elif and the TypedDict as the else. Justified rather than narrowed for the same reason as make_success: no in-repo caller exists, so nothing names a surviving arm, and a three-way union collapsed by guesswork would be a fabricated fix. Invalidated if: error reasons gain an owned constructor so the shorthand disappears, or a caller appears that fixes the arm.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:19:56.992437+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `reason` has an explicit first-party union contract that includes `str`, so the `isinstance(reason, str)` branch discriminates a valid shorthand arm rather than defensively re-checking or masking a contract violation. The visible signature, docstring examples, and branch behavior together establish that the string is meaning-preservingly lifted into the required `TransformErrorReason` shape, while `None` and the TypedDict arm remain distinct. This is not an R1/R5 structural Tier-3 boundary rooted in external input, so the decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 8e202c6426b0fba0311e00d942c7c031ee7e988b250ba562146d449dbab056c2
+  judge_transport: codex_cli
+  ast_path: 'body[16]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:b32812e56eef2547ffb98ee7b5fd8e9c4b991568b41634407a5ac246ddc6a395'
+- key: testing/__init__.py:R5:make_gate_continue:fp=613ec4ec970a5195
+  owner: john
+  reason: |-
+    R5 `isinstance(data, PipelineRow)` in make_gate_continue, the first of three sibling gate factories (continue/route/fork) that share this discriminator. What it decides here: a PipelineRow argument yields row=data.to_dict() with the row's OWN contract preserved (`contract or data.contract`), while a dict is lifted through make_row and the freshly built contract wins. GateResult stores row and contract separately, so choosing the wrong contract identity produces a GateResult whose declared schema does not describe its row — the failure this branch exists to prevent. This factory's action is RoutingAction.continue_(), the no-routing case, so the contract it carries is the one the pipeline keeps using downstream, which makes contract identity matter most in this of the three siblings. config/cicd/contracts-whitelist.yaml:610 records the parameter. No in-repo caller exists, so the union is justified rather than narrowed on a guess. Invalidated if: a caller fixes the arm, or GateResult starts taking a PipelineRow directly so no dict/row lift is needed.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:24.938536+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the visible signature explicitly accepts two representations, `dict[str, Any] | PipelineRow`, and the concrete `PipelineRow` check discriminates those declared union arms rather than defensively revalidating a fixed contract. The branches preserve the corresponding row/contract pairing before constructing `GateResult`, so the check does not suppress, coerce, or fabricate a contract violation. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; it is first-party representation dispatch in a testing factory.
+  judge_signature_version: 2
+  scope_fingerprint: 6947cb60b6c802c96b8d5acffd995628fac0c35389d19004260083e3be66aeb0
+  judge_transport: codex_cli
+  ast_path: 'body[17]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:2cc0c6be663f43b659d21720fa3d47848b2e48a464a484c6314333aacbb4bfff'
+- key: testing/__init__.py:R5:make_gate_fork:fp=133661b3cc509ce4
+  owner: john
+  reason: |-
+    R5 `isinstance(data, PipelineRow)` in make_gate_fork — the fan-out sibling. Identical row/contract lift, with RoutingAction.fork_to_paths(paths) over a list of path names: a fork sends the SAME row down several paths, so every forked copy inherits the single contract chosen here, and picking the make_row-built contract over the row's own would silently re-describe every branch of the fork at once — the widest blast radius of the three siblings. config/cicd/contracts-whitelist.yaml:612 records the parameter. Justified rather than narrowed for the same evidence reason as its siblings: zero in-repo callers, so no arm can honestly be called dead. Invalidated if: a caller appears and fixes the arm, or fork routing stops sharing one contract across paths.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:24.694679+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — `data` has an explicit `dict[str, Any] | PipelineRow` parameter contract, and the nominal `isinstance(data, PipelineRow)` check is the required discriminator between those two declared representations, not a defensive re-check that hides a contract violation. The visible branches preserve the `PipelineRow` contract or construct a row from the dictionary before producing the fork result, with no silent suppression, fabrication, or coercion of malformed Tier-2 data. This testing helper is not shown as a Tier-3 external-parameter boundary, so the structural decorator contract does not apply; the rationale's caller-count claim is unnecessary to the exemption.
+  judge_signature_version: 2
+  scope_fingerprint: f47537a1296ca5846b0f8c7a677d7277ac0276f6c770e144190648bd62f702af
+  judge_transport: codex_cli
+  ast_path: 'body[19]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:919bcc1fd8eb3a9989606bf07e85973d1714dcc10baf6666393a0809e023cc18'
+- key: testing/__init__.py:R5:make_gate_route:fp=049c6f164a3396ce
+  owner: john
+  reason: |-
+    R5 `isinstance(data, PipelineRow)` in make_gate_route — the routing sibling of make_gate_continue. Same row/contract lift, but this factory additionally takes a required positional `sink` and builds RoutingAction.route(sink); the route target names a sink that must exist in the pipeline the test asserts against, so a caller usually reaches for this factory holding an already-built row from an earlier stage — which is precisely the PipelineRow arm. Passing that row back through make_row would mint a second contract and the routed GateResult would no longer match the row that produced it. config/cicd/contracts-whitelist.yaml:611 records the parameter. Justified rather than narrowed: the factory has no in-repo caller, so no evidence names the surviving arm. Invalidated if: a caller appears and fixes the arm, or the factory is retired with its tests/fixtures/factories.py re-export.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:23.147538+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.96
+  judge_rationale: |-
+    RULE MISFIRES — `make_gate_route` explicitly accepts the union `dict[str, Any] | PipelineRow`, and the concrete `PipelineRow` check discriminates the two declared input forms rather than defensively revalidating a fixed contract. The visible branches preserve an existing row's contract or construct a new row and contract from the dictionary, so the check is necessary to implement the stated union semantics without fabricating or silently recovering data. This is not a Tier-3 boundary over external data, so the structural decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: c62cbc3b9d7f312df74b9cfd831841b86a826f675a5006248399af50ae8f7af6
+  judge_transport: codex_cli
+  ast_path: 'body[18]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:a25ab55bc79a0c4df064eb65f0bda4007d5fc2a8d37dbd01a700ac05ddb4ed0f'
+- key: testing/__init__.py:R5:make_success:fp=73a3452dad771aec
+  owner: john
+  reason: |-
+    R5 `isinstance(data, dict)` in the make_success test factory, discriminating the documented convenience overload `dict[str, Any] | PipelineRow | None`. A dict is lifted through make_row; a PipelineRow is passed to TransformResult.success unwrapped, and that asymmetry is the reason the check exists — re-wrapping an existing row would build a SECOND SchemaContract instance, and contract identity (not equality) is what the result contracts compare. config/cicd/contracts-whitelist.yaml:609 already records this parameter's dict form as deliberate test-factory convenience. Kept as a justified entry rather than fixed: this factory currently has NO in-repo caller (only its own docstring examples), so there is no evidence naming which arm survives, and narrowing the union on a guess would be a fabricated fix. The docstring's 'must build PipelineRow first today' banner and its '424 call sites' claim are both stale and are reported to the hub as a separate observation. Invalidated if: a caller appears and fixes the live arm (narrow the union and delete this entry), or the factory is retired along with its tests/fixtures/factories.py re-export.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:27.877557+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — `data` has an explicit first-party union contract, and the `isinstance(data, dict)` branch discriminates its documented `dict[str, Any]` convenience arm from the `PipelineRow` arm rather than defensively rechecking a supposedly guaranteed single shape. The visible code converts only dictionaries through `make_row` and passes an existing `PipelineRow` through unchanged, consistent with the rationale's contract-identity concern and the examples in the docstring. This is not an external-parameter trust boundary, so the structural decorator does not apply; the rationale's separate claim about current callers is unnecessary to establish the exemption.
+  judge_signature_version: 2
+  scope_fingerprint: 70e111fd511666d1332afa28c71e168fa384a1468dcc45664d96be6abf888166
+  judge_transport: codex_cli
+  ast_path: 'body[14]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:b96aef93da89b8dff3854c35466d4c5081939ffbfadcd5035eca9a1fa26da4c3'
+- key: testing/__init__.py:R5:make_success_multi:fp=8a600176a0041b19
+  owner: john
+  reason: |-
+    R5 `isinstance(r, dict)` in the shared-contract build loop of make_success_multi, over the declared element union `dict[str, Any] | PipelineRow`. TransformResult.success_multi requires every row to share one SchemaContract INSTANCE, and when no contract is supplied this loop synthesises it from the union of all dict rows' keys. The isinstance is what decides which rows CONTRIBUTE keys: a dict is raw row data whose keys must go into the union, while a PipelineRow already carries a built contract and contributes nothing to a contract that is only needed because no built one was given. Skipping the PipelineRow arm is therefore intentional, not an oversight. tests/unit/testing/test_factories.py pins the union behaviour (two dict rows with disjoint keys produce one contract carrying both). Narrowing was attempted and reverted, which is why this is J and not F: this factory's one live caller passes dicts, but rewriting the parameter as the bare `list[dict[str, Any]]` trips the check-contracts gate ('make_success_multi - rows (list)' under dict[str, Any] violations) — a form the union escapes. Clearing a tier-model finding by creating a violation on another gate is not a fix, and whitelisting it there would be sealing rather than removing. The gate asymmetry is reported to the hub separately. Invalidated if: rows gains a typed element (TypedDict or dataclass) that satisfies check-contracts, at which point the union collapses and both arms of this factory go with it.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:31.069304+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the visible signature declares a first-party union of `dict[str, Any] | PipelineRow`, and the `isinstance(r, dict)` branch discriminates those two legitimate variants to implement their explicitly different contract-building semantics; it does not hide a malformed fixed-contract value. The docstring and loop show that dict rows contribute keys to the shared synthesized contract while pre-built `PipelineRow` values already carry a contract, so the rationale is site-specific and consistent with the code. This is not a Tier-3 parameter boundary eligible for the decorator, and acceptance does not depend on the separately asserted check-contracts or test-location claims.
+  judge_signature_version: 2
+  scope_fingerprint: 67b13b18e4081dd841c212014ec4f992a32414c15a70b80521185f741ea63a7d
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[2]/body[1]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:0f39b39a97f47ad2853488a36aecc164b6044c1a96a2d4cd952653d6ee8498ad'
+- key: testing/__init__.py:R5:make_success_multi:fp=c2ee51a3cd994d74
+  owner: john
+  reason: |-
+    R5 `isinstance(r, dict)` in the row-lift comprehension of make_success_multi — the same element union as the contract loop above, but deciding something different: which rows must be CONVERTED. A dict is passed through make_row(r, contract=contract) so it adopts the single shared contract; a pre-built PipelineRow is passed through untouched, because re-wrapping it would mint a second SchemaContract instance and break the identity — not equality — that success_multi requires across rows. tests/unit/testing/test_factories.py asserts exactly that identity ('result.rows[1].contract is contract'), so a change that collapsed this branch into an unconditional make_row would be caught, while one that collapsed it the other way would silently produce rows with mismatched contracts. Justified rather than fixed for the same reason as the sibling site: the bare `list[dict[str, Any]]` narrowing that would remove both arms is rejected by the check-contracts gate, and trading a tier-model finding for a contracts violation is not an honest fix. Invalidated if: the element type becomes a single typed row form, or success_multi stops requiring shared contract identity.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-11-28'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-08-30T14:21:45.415073+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the declared contract is explicitly a union of `dict[str, Any]` and `PipelineRow`, so this `isinstance(r, dict)` discriminates between two valid contract arms rather than defensively rechecking one guaranteed shape or masking a violation. The visible code establishes distinct, contract-preserving behavior: dictionaries are converted using the shared `SchemaContract`, while already-built `PipelineRow` instances remain untouched, consistent with the documented identity requirement. This is neither Tier-3 boundary handling nor a function parameter rooted in external data, so the `@trust_boundary` decorator does not apply; the rationale's test and check-gate claims are not needed to establish the exemption.
+  judge_signature_version: 2
+  scope_fingerprint: 67b13b18e4081dd841c212014ec4f992a32414c15a70b80521185f741ea63a7d
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[3]/value/elt/test'
+  judge_metadata_signature: 'hmac-sha256:v2:bb06b5d12732be3544c6293f8d69311bd6e1373974a18bc6b3e3b126257f5b70'

@@ -47,5 +47,9 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "axiom-product-management@foundryside-marketplace": false,
+    "lyra-tui-designer@foundryside-marketplace": false
   }
 }

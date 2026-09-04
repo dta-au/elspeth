@@ -14,11 +14,28 @@ maintainer's own agent toolchain (issue tracker, code map, delegation
 conventions) is described in [docs/maintainer/toolchain.md](docs/maintainer/toolchain.md);
 none of it is required to contribute.
 
+## Working Directory Discipline
+
+- The Bash tool persists its working directory across calls. Begin any script,
+  test, or build invocation with an explicit `cd <repo-root> &&` rather than
+  assuming the current directory.
+- When operating in a worktree, state the worktree path in the command; never
+  rely on an earlier `cd`.
+
+## Claims Must Be Measured
+
+- Counts, inventories, and parity checks must come from the live source of
+  truth (registry, DB query, API), never from a regex over source files.
+- After any status claim ("fix landed", "ticket closed", "branch merged"),
+  re-verify against the current HEAD before writing it into a checkpoint or
+  handoff doc.
+
 ## Quick reference
 
 ```bash
 source .venv/bin/activate      # uv-managed venv (Python 3.12+)
-pytest tests/                  # full suite; the plain default selection IS the CI-equivalent run
+pytest tests/                  # full suite (~20 min); the plain default selection IS the CI-equivalent run
+pytest tests/path::test -n 0   # ONE test: -n 0 disables the default 12 workers (needed for pdb / -s)
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
   elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
 elspeth run --settings examples/<name>/settings.yaml --execute
@@ -34,7 +51,19 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   every sibling (this has happened — 7201beeb7). Dated incident log:
   [docs/agents/recent-code-hints.md](docs/agents/recent-code-hints.md).
 - Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
-  before merging.
+  before merging. `addopts` carries `-n 12`, so the bare command IS the
+  parallel run: serial it is ~17 hours against 44,399 tests, which is why the
+  default is parallel rather than a flag you have to remember. Pass `-n 0` for
+  a single test or a debugger (`pdb` and `-s` do not work through xdist), and
+  note that xdist auto-disables `pytest-benchmark` — the `performance` marker
+  is deselected by default anyway.
+- A handful of process-death / peer-lease / resume tests are FLAKY under
+  parallelism (elspeth-0077cb7789): two runs of identical code produced
+  DISJOINT failure sets, all passing serially. Before blaming your change for
+  a red in `e2e/recovery`, `integration/pipeline`, or
+  `unit/engine/orchestrator`, re-run the named test with `-n 0`; if it passes,
+  diff your failure set against the same run on your base commit rather than
+  assuming either result.
 - `elspeth-lints check` requires an explicit `--rules` selection and exits 2
   without one (until 2026-08-07 the bare command ran zero rules and exited 0 —
   a green that certified any tree); scope `--root src/elspeth` so whole-repo
@@ -87,7 +116,12 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - The pre-commit secret scanner rescans every line of a touched file, so old
   lines can fire on unrelated edits. Append `# secret-scan: allow-this-line`
   to a false positive; do not bypass the hook with `--no-verify`.
-- `git stash` is blocked by a hook — use worktrees or commits instead.
+- Do not use `git stash` — use a worktree or a commit instead. This is a
+  convention, not an enforced gate: nothing blocks it. (A `.git/hooks/pre-stash`
+  once claimed to, but git has no such hook, so it never ran; it was removed
+  2026-09-02 along with the claim that it worked. Blocking a stash would need a
+  `reference-transaction` hook rejecting `refs/stash`, which is deliberately not
+  installed — that hook fires on every ref update in the repo.)
 - Never commit a `/home/<user>` or `/Users/<user>` path in a tracked file:
   hooks bind to `${CLAUDE_PROJECT_DIR}`, skills resolve the checkout with
   `git rev-parse --show-toplevel`, and tests pin both.
@@ -97,6 +131,33 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - Directory-scoped guides exist where the details live:
   `examples/AGENTS.md` (how to run every example) and
   `src/elspeth/plugins/transforms/AGENTS.md` (row data vs audit provenance).
+
+## Test Verification Policy
+
+- Never report test results based on `grep`, `tail`, or piped output. A pipe
+  masks the exit code and buffering hides in-progress failures.
+- Always run suites writing to a file, then check the exit code explicitly
+  (`addopts` already carries `-n 12`, so the bare command is the parallel run):
+  `pytest tests/ > "$log" 2>&1; echo "exit=$?"; tail -50 "$log"` — use a
+  unique, lane-private log path, not a shared generic filename.
+- Do not claim "zero failures", "suite green", or "passes in isolation" until
+  the process has exited and you have read its exit code.
+
+## Editing Rules
+
+- Do not use `sed`, `awk`, or scripted line-number rewrites to resolve merge
+  conflicts or perform multi-line edits. Use the Edit tool or regenerate the
+  file.
+- Never add `# noqa`, `# type: ignore`, or lint suppressions to make a gate
+  pass; fix the underlying issue or report it as blocked.
+
+## Commit Hygiene
+
+- Before every commit, run `git status --short` and confirm the staged set.
+  Never stage `.claude/lanes/`, dry-run artifacts, scratch logs, or build
+  output.
+- Run the lint gate (ruff) locally before pushing; do not rely on CI to
+  surface unused imports or formatting.
 
 ## Project delivery posture
 
@@ -155,6 +216,14 @@ Both rules are absolute in the composer's authoring path. They do not prohibit
 server-side *validation*, *rejection*, or *redaction* of what the planner
 produces, nor the required-control admission gates that protect runtime data.
 
+Standing review trigger (operator ruling 2026-09-02): any latency or cost
+optimization touching the rootless or tutorial entry path gets per-TRANSITION
+provider-call scrutiny before it lands — both prior invariant violations
+(`b073d248e`, `9700470e2`) were latency fixes on exactly this chokepoint, and
+the first evaded detection for 26 days because the gate counted calls per
+walk. If the trivial case feels too slow, that is a planner-brief defect to
+fix (see elspeth-63cf3803e6), never a reason to route around the provider.
+
 The interim guided collector guard is LIFTED (WS6, ruling 7878 on
 elspeth-88bb77953c): the guided lane authors and projects collectors like any
 other node kind, `guided_collector_not_authorable` is retired, and every
@@ -178,3 +247,41 @@ defects or drift. The operator signs once, at package completion, after churn
 has settled.
 
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
+
+<!-- filigree:instructions:v3.1.0:c1c023c3 -->
+<!-- filigree:last-writer:filigree install -->
+## Filigree Issue Tracker
+
+`filigree` tracks this project's work. Use it to find, claim, update and close
+issues: `filigree session-context` at session start, then
+`filigree start-next-work --assignee <name>`.
+
+Full reference: the **filigree-workflow** skill (patterns, priorities,
+observations, error codes), `filigree --help`, and the `mcp__filigree__*` tool
+schemas. Prefer the MCP tools when available; fall back to the CLI.
+
+Two rules `--help` will not tell you:
+
+1. Claim atomically: `work_start` / `work_start_next` (MCP) or `start-work` /
+   `start-next-work` (CLI). Never chain a claim with a separate status update;
+   that two-step form races other agents.
+2. On `SCHEMA_MISMATCH` the installed filigree is older than the project
+   database. Surface it to the user; do not retry.
+<!-- /filigree:instructions -->
+
+<!-- loomweave:instructions:v1.6.0:39edbf6d -->
+<!-- loomweave:last-writer:loomweave install -->
+## Loomweave (code structure + SEI identity)
+
+Loomweave pre-extracts this repo into a queryable map — entities, their
+call/reference/import/relation edges, and subsystems — each carrying a Stable
+Entity Identity (SEI). Ask its `mcp__loomweave__*` tools, not grep, for "what
+calls X", "what subclasses X", "where is X defined", "find the thing that
+does Y".
+
+- Never hand-construct an entity id: take it from `entity_find` / `entity_at` /
+  `entity_resolve`, and bind cross-tool records on the `sei`, not the `id`.
+- If `project_status_get` reports stale, re-index before answering.
+
+Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
+<!-- /loomweave:instructions -->

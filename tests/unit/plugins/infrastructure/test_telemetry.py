@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import FrameworkBugError, TelemetryExporterError
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed, warn_telemetry_before_start
 
 
@@ -48,3 +48,74 @@ def test_cleanup_telemetry_does_not_suppress_unsuppressible_failures(failure: Ba
             operation_id="operation-1",
             token_id=None,
         )
+
+
+@pytest.mark.parametrize("bug", [TypeError("bad signature"), AttributeError("missing attr"), KeyError("field"), NameError("symbol")])
+def test_cleanup_telemetry_reraises_programming_errors(bug: Exception) -> None:
+    """First-party bugs in the telemetry callback crash; only delivery failures are contained."""
+
+    def fail_emit(_event: object) -> None:
+        raise bug
+
+    with pytest.raises(type(bug)):
+        emit_resource_cleanup_failed(
+            fail_emit,
+            run_id="run-1",
+            component="component",
+            resource="provider",
+            error=RuntimeError("cleanup failed"),
+            suppressed=True,
+            state_id=None,
+            operation_id="operation-1",
+            token_id=None,
+        )
+
+
+@pytest.mark.parametrize("bug", [ValueError("bad event"), RuntimeError("broken projection"), AssertionError("invariant")])
+def test_cleanup_telemetry_reraises_untyped_ordinary_failures(bug: Exception) -> None:
+    """Only the typed TelemetryExporterError is a delivery failure; any other
+    ordinary exception from the callback is a first-party bug and crashes."""
+
+    def fail_emit(_event: object) -> None:
+        raise bug
+
+    with pytest.raises(type(bug)):
+        emit_resource_cleanup_failed(
+            fail_emit,
+            run_id="run-1",
+            component="component",
+            resource="provider",
+            error=RuntimeError("cleanup failed"),
+            suppressed=True,
+            state_id=None,
+            operation_id="operation-1",
+            token_id=None,
+        )
+
+
+def test_cleanup_telemetry_logs_typed_delivery_failure() -> None:
+    """The typed exporter failure is recorded as a warning and contained."""
+    logger = _RecordingLogger()
+
+    def fail_emit(_event: object) -> None:
+        raise TelemetryExporterError("all", "transport down")
+
+    emit_resource_cleanup_failed(
+        fail_emit,
+        run_id="run-1",
+        component="component",
+        resource="provider",
+        error=RuntimeError("cleanup failed"),
+        suppressed=True,
+        state_id=None,
+        operation_id="operation-1",
+        token_id=None,
+        logger=logger,
+    )
+
+    assert logger.calls == [
+        (
+            "resource_cleanup_telemetry_failed",
+            {"component": "component", "resource": "provider", "error_type": "TelemetryExporterError"},
+        )
+    ]

@@ -11,7 +11,6 @@ web.catalog, composer_mcp.session).
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import time
@@ -43,6 +42,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import yaml_generator
@@ -50,7 +50,7 @@ from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.state import CompositionState, EdgeContractDict, PipelineMetadata, ValidationEntryDict
 from elspeth.web.composer.tools import (
     _DISCOVERY_TOOLS,
     _MUTATION_TOOLS,
@@ -80,25 +80,6 @@ __all__ = ["create_server", "main"]
 logger = logging.getLogger(__name__)
 
 
-class _ValidationEntryPayload(TypedDict):
-    component: str
-    message: str
-    severity: str
-
-
-_EdgeContractPayload = TypedDict(
-    "_EdgeContractPayload",
-    {
-        "from": str,
-        "to": str,
-        "producer_guarantees": list[str],
-        "consumer_requires": list[str],
-        "missing_fields": list[str],
-        "satisfied": bool,
-    },
-)
-
-
 class _SemanticEdgeContractPayload(TypedDict):
     from_id: str
     to_id: str
@@ -111,11 +92,21 @@ class _SemanticEdgeContractPayload(TypedDict):
 
 
 class _ValidationPayload(TypedDict):
+    """The MCP session-tool error payload's validation block.
+
+    Entries and edge contracts are the composer state module's own wire
+    dicts (``ValidationEntry.to_dict()`` / ``EdgeContract.to_dict()``), not
+    mirrors of them (elspeth-e405ad7cd2, systems ledger #41/#42). This block
+    is deliberately NARROWER than ``ToolResult.to_dict()["validation"]``: it
+    carries no ``graph_repair_suggestions``, which are computed from the
+    envelope's own validation at serialization time (#43).
+    """
+
     is_valid: bool
-    errors: list[_ValidationEntryPayload]
-    warnings: list[_ValidationEntryPayload]
-    suggestions: list[_ValidationEntryPayload]
-    edge_contracts: list[_EdgeContractPayload]
+    errors: list[ValidationEntryDict]
+    warnings: list[ValidationEntryDict]
+    suggestions: list[ValidationEntryDict]
+    edge_contracts: list[EdgeContractDict]
     semantic_contracts: list[_SemanticEdgeContractPayload]
 
 
@@ -412,7 +403,7 @@ def _dispatch_tool(
     }
 
 
-def _edge_contract_to_payload(contract: Any) -> _EdgeContractPayload:
+def _edge_contract_to_payload(contract: Any) -> EdgeContractDict:
     """Serialize an edge contract without leaking a dict[str, Any] return."""
     payload = contract.to_dict()
     return {
@@ -642,9 +633,12 @@ def create_server(
         scratch_dir: Directory for session persistence.
         runtime_preflight: Async callable for runtime-equivalent preflight, or
             an explicit None. Keyword-required and without a default: an
-            omitted preflight degrades preview_pipeline into publishing
-            is_valid on authoring checks alone, so every caller must take a
-            visible position rather than inherit one.
+            omitted preflight makes every preview_pipeline call fail closed —
+            ``data["preview_is_valid"]`` is false however the authoring check
+            came out, and ``data["preview_errors"]`` carries a
+            ``runtime_preflight_not_run`` entry naming the stage that did not
+            run — so every caller must take a visible position rather than
+            inherit one.
 
             Deliberately STRICT-ONLY (elspeth-229e9e8195): the MCP surface
             wires no interpretation-tolerant ``structural_preflight``, so
@@ -908,25 +902,30 @@ def create_server(
             result_canonical: str | None
             result_hash: str | None
             version_after: int | None
+            result_canonicalization_failure: BaseException | None = None
 
             if status == ComposerToolStatus.SUCCESS and result_dict is not None:
                 # Result canonicalization happens AFTER state-mutation +
                 # redaction so the recorded result mirrors what was sent
-                # back to the LLM. Wrap in try/except per Solution-architect
-                # review H3: a non-finite float / non-serializable type in
-                # ``result_dict`` would otherwise raise from finally and
-                # mask the success return entirely. Fall back to a sentinel
-                # canonical so the audit row still lands.
+                # back to the LLM. Crash-on-anomaly, no sentinel fallback
+                # (see web.composer.audit.finish_dispatch): ``result_dict``
+                # is our own handler's output, so an un-canonicalizable
+                # value is a bug in our code — reclassify as PLUGIN_CRASH
+                # and re-raise after the audit row lands, never substitute
+                # synthesized evidence under a SUCCESS status. The sentinel
+                # form is reserved for the Tier-3 *arguments* path above.
                 try:
                     result_canonical = canonical_json(result_dict)
                     result_hash = stable_hash(result_dict)
+                    version_after = state_ref[0].version
                 except (ValueError, TypeError) as canon_result_exc:
-                    # Shared sentinel discipline — see
-                    # web.composer.audit.build_canonicalization_sentinel.
-                    sentinel = build_canonicalization_sentinel(canon_result_exc, result_dict)
-                    result_canonical = canonical_json(sentinel)
-                    result_hash = stable_hash(sentinel)
-                version_after = state_ref[0].version
+                    result_canonicalization_failure = canon_result_exc
+                    status = ComposerToolStatus.PLUGIN_CRASH
+                    error_class = type(canon_result_exc).__name__
+                    error_message = type(canon_result_exc).__name__
+                    result_canonical = None
+                    result_hash = None
+                    version_after = None
             elif status == ComposerToolStatus.ARG_ERROR and error_payload_for_audit is not None:
                 # ARG_ERROR: record the error payload that was returned to
                 # the LLM (Solution-architect H4 symmetry with web side).
@@ -964,6 +963,11 @@ def create_server(
                 if clear_session_after_audit:
                     session_id_ref[0] = None
                     session_checkout_ref[0] = None
+            if result_canonicalization_failure is not None:
+                # The client must not receive an unaudited success; the
+                # PLUGIN_CRASH row above is the durable record. Raising
+                # from ``finally`` discards the pending success return.
+                raise result_canonicalization_failure
 
     return server
 
@@ -1003,7 +1007,7 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
     session_id = uuid.uuid4().hex[:12]
 
     async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
-        return await asyncio.to_thread(
+        return await run_sync_in_worker(
             validate_pipeline,
             state,
             settings,

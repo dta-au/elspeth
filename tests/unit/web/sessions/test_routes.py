@@ -21,7 +21,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
@@ -30,10 +30,11 @@ from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
 )
-from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
@@ -60,6 +61,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
+from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
@@ -91,6 +93,7 @@ from elspeth.web.sessions._guided_step_chat import (
 )
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
@@ -795,6 +798,47 @@ def _make_progress_route_app(
     return app, service
 
 
+async def _insert_legacy_composition_state(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    state: CompositionStateData,
+    *,
+    provenance: str,
+    version: int = 1,
+) -> None:
+    """Seed a composition_states row exactly as a pre-gate deployment persisted it.
+
+    ``save_composition_state`` now refuses an active guided pair whose reviewed
+    custody cannot bind (elspeth-4c442aaaa8), so tests that pin the READ-side
+    rejection of such a row have to bypass the write boundary.
+    """
+    from elspeth.web.sessions.service import _enveloped_state_column
+
+    def _sync() -> None:
+        with service._engine.begin() as conn:
+            conn.execute(
+                insert(composition_states_table).values(
+                    id=str(uuid.uuid4()),
+                    session_id=str(session_id),
+                    version=version,
+                    source=None,
+                    sources=_enveloped_state_column(state.sources),
+                    nodes=_enveloped_state_column(state.nodes),
+                    edges=_enveloped_state_column(state.edges),
+                    outputs=_enveloped_state_column(state.outputs),
+                    metadata_=_enveloped_state_column(state.metadata_),
+                    is_valid=state.is_valid,
+                    validation_errors=deep_thaw(state.validation_errors),
+                    composer_meta=_enveloped_state_column(state.composer_meta),
+                    derived_from_state_id=None,
+                    provenance=provenance,
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+    await asyncio.get_running_loop().run_in_executor(None, _sync)
+
+
 def _make_app(
     tmp_path: Path,
     user_id: str = "alice",
@@ -1266,6 +1310,9 @@ def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkey
     assert current_state is not None
     assert current_state.composer_meta is not None
     assert current_state.composer_meta["repair_turns_used"] == 2
+    # Turn-end rows always record which predicate produced is_valid
+    # (elspeth-67c6fa691d): this writer is the strict authoring+runtime lane.
+    assert current_state.composer_meta["validation_lane"] == "strict"
     from sqlalchemy import func, select
 
     from elspeth.web.sessions.models import composition_states_table
@@ -6160,6 +6207,45 @@ class TestLiteLLMErrorRedaction:
         )
         self._assert_redacted(msg_resp, "llm_unavailable", "APIError")
 
+    def test_send_message_unclassified_compose_failure_persists_attached_llm_call(self, tmp_path) -> None:
+        """A first-party 500 must not discard the advisor LLM row built before it."""
+        llm_call = _llm_call(
+            status=ComposerLLMCallStatus.API_ERROR,
+            provider_request_id=None,
+            error_class="ValueError",
+            error_message="Provider call failed (ValueError)",
+        )
+        original = ValueError("first-party advisor admission failed")
+        cast(Any, original).llm_calls = (llm_call,)
+        mock_composer = SimpleNamespace()
+        mock_composer.surface_pending_interpretation_reviews = AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews,
+            return_value=None,
+        )
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=original)
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(resp.json()["id"])
+        msg_resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Hello"},
+        )
+
+        assert msg_resp.status_code == 500
+        loop = asyncio.new_event_loop()
+        try:
+            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
+        finally:
+            loop.close()
+        llm_rows = _llm_call_audit_rows(persisted)
+        assert len(llm_rows) == 1
+        assert llm_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.API_ERROR.value
+        assert llm_rows[0][1]["call"]["error_class"] == "ValueError"
+
     def test_send_message_bad_request_provider_detail_is_exposed_when_enabled(self, tmp_path) -> None:
         """_BadRequestLLMError must use its dedicated provider-detail carrier at the route layer."""
         mock_composer = SimpleNamespace()
@@ -6374,6 +6460,51 @@ class TestLiteLLMErrorRedaction:
 
         recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
         self._assert_redacted(recompose_resp, "llm_unavailable", "APIError")
+
+    def test_recompose_unclassified_compose_failure_persists_attached_llm_call(self, tmp_path) -> None:
+        """The recompose 500 mirror durably publishes attached advisor evidence."""
+        llm_call = _llm_call(
+            status=ComposerLLMCallStatus.API_ERROR,
+            provider_request_id=None,
+            error_class="AuditIntegrityError",
+            error_message="Provider call failed (AuditIntegrityError)",
+        )
+        original = AuditIntegrityError("first-party advisor audit failure")
+        cast(Any, original).llm_calls = (llm_call,)
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=original)
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Test"})
+        session_id = uuid.UUID(resp.json()["id"])
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                service.add_message(
+                    session_id,
+                    "user",
+                    "Build a pipeline",
+                    writer_principal="route_user_message",
+                )
+            )
+        finally:
+            loop.close()
+
+        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
+
+        assert recompose_resp.status_code == 500
+        loop = asyncio.new_event_loop()
+        try:
+            persisted = loop.run_until_complete(service.get_messages(session_id, limit=None))
+        finally:
+            loop.close()
+        llm_rows = _llm_call_audit_rows(persisted)
+        assert len(llm_rows) == 1
+        assert llm_rows[0][1]["call"]["status"] == ComposerLLMCallStatus.API_ERROR.value
+        assert llm_rows[0][1]["call"]["error_class"] == "AuditIntegrityError"
 
     def test_recompose_bad_request_provider_detail_is_exposed_when_enabled(self, tmp_path) -> None:
         """recompose must mirror send_message for _BadRequestLLMError provider detail."""
@@ -7378,6 +7509,332 @@ class TestRevertEndpoint:
         assert [message.content for message in messages] == ["Pipeline reverted to version 1."]
 
     @pytest.mark.asyncio
+    async def test_revert_resurfaces_review_cards_for_restored_pending_state(self, tmp_path: Path) -> None:
+        """Reverting to a once-pending version creates fresh consumable cards
+        even when the original version's cards are already terminal."""
+        from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
+        from elspeth.web.sessions.routes._helpers import _state_from_record
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Review revert", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        imported_id = imported.json()["id"]
+
+        original_events = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in original_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        for event in original_events:
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        assert await service.list_interpretation_events(session.id, status="pending") == []
+
+        reverted = client.post(
+            f"/api/sessions/{session.id}/state/revert",
+            json={"operation_id": str(uuid.uuid4()), "state_id": imported_id},
+        )
+
+        assert reverted.status_code == 200, reverted.text
+        fresh_events = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in fresh_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert {str(event.composition_state_id) for event in fresh_events} == {reverted.json()["id"]}
+        for event in fresh_events:
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        head = await service.get_current_state(session.id)
+        assert head is not None
+        assert not isinstance(materialize_state_for_execution(_state_from_record(head)), InterpretationReviewPending)
+
+    @pytest.mark.asyncio
+    async def test_revert_replay_repairs_cards_after_post_commit_surface_failure(self, tmp_path: Path) -> None:
+        """A retry of the same completed operation repairs the interval where
+        revert committed but post-commit card surfacing failed."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Review revert replay", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score {{ row.value }}'
+"""
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        for event in await service.list_interpretation_events(session.id, status="pending"):
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        operation_id = str(uuid.uuid4())
+
+        with patch(
+            "elspeth.web.sessions.routes.composer.state._surface_reverted_interpretation_reviews",
+            side_effect=RuntimeError("surface interrupted"),
+        ):
+            first = client.post(
+                f"/api/sessions/{session.id}/state/revert",
+                json={"operation_id": operation_id, "state_id": imported.json()["id"]},
+            )
+        assert first.status_code == 500
+        versions_after_first = await service.get_state_versions(session.id)
+
+        replay = client.post(
+            f"/api/sessions/{session.id}/state/revert",
+            json={"operation_id": operation_id, "state_id": imported.json()["id"]},
+        )
+
+        assert replay.status_code == 200, replay.text
+        versions_after_replay = await service.get_state_versions(session.id)
+        assert [record.id for record in versions_after_replay] == [record.id for record in versions_after_first]
+        replay_events = [
+            event
+            for event in await service.list_interpretation_events(session.id, status="pending")
+            if str(event.composition_state_id) == replay.json()["id"]
+        ]
+        assert {event.kind for event in replay_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+
+    @pytest.mark.asyncio
+    async def test_revert_replay_writes_nothing_when_the_stored_response_hash_mismatches(self, tmp_path: Path) -> None:
+        """Response-hash verification must precede every state_revert replay write.
+
+        The revert replay arm repairs surfacing debt, so if that repair ran
+        before the projected response was proven identical to the stored one,
+        a corrupt projection could insert new ``interpretation_events`` rows
+        and flip existing PENDING rows to SUPERSEDED -- and only afterwards
+        fail integrity verification. Both are audit-primary mutations. The
+        mismatch must abort with ZERO interpretation and state writes.
+
+        The fixture drives BOTH halves rather than merely detecting them: the
+        reverted state owes two fresh cards, and a later import leaves two
+        PENDING cards on a different state whose reviewed content the reverted
+        state no longer matches, which the repair's writer supersedes. The
+        positive control at the end proves both writes really do fire on a
+        clean replay, so the zero-write assertions above it are not vacuous.
+
+        Sibling of
+        ``guided/test_respond.py::TestStep2IntraStep::test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches``,
+        which pins the same ordering on the guided RESPOND route.
+        """
+        from elspeth.web.sessions.routes.composer import state as state_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Revert replay hash mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score {{ row.value }}'
+"""
+        superseding_yaml = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-sonnet-4.5
+    prompt_template: 'Rank {{ row.value }} carefully'
+"""
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+        assert imported.status_code == 200, imported.text
+        # Resolve the imported state's own cards so the debt this test relies
+        # on belongs to the REVERTED state, not inherited from the import.
+        for event in await service.list_interpretation_events(session.id, status="pending"):
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        # Import a DIFFERENT pipeline for the same node, and leave ITS cards
+        # pending. The repair pass reads evidence per state but supersedes
+        # PENDING rows for the site session-wide, so these are what the
+        # supersession half of the hazard would flip. Without them that half
+        # is detectable by the equality below but never actually driven.
+        superseding = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": superseding_yaml})
+        assert superseding.status_code == 200, superseding.text
+        stale_pending = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in stale_pending} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert {str(event.composition_state_id) for event in stale_pending} == {superseding.json()["id"]}
+        operation_id = str(uuid.uuid4())
+        revert_body = {"operation_id": operation_id, "state_id": imported.json()["id"]}
+
+        def _crash_between_settlement_and_surfacing(*_args: Any, **_kwargs: Any) -> None:
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        with (
+            patch.object(
+                state_module,
+                "_surface_reverted_interpretation_reviews",
+                side_effect=_crash_between_settlement_and_surfacing,
+            ),
+            pytest.raises(_SurfacingWorkerCrash),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        # NON-VACUITY PRECONDITION, one clause per way the repair can silently
+        # write nothing. (1) ``_surface_reverted_interpretation_reviews``
+        # returns early on a state whose ``metadata_`` is None. (2)
+        # ``only_missing_evidence=True`` makes the surfacer skip every site
+        # already carrying evidence in ANY resolution status, so the debt must
+        # be checked unfiltered -- a resolved or superseded row on the reverted
+        # state would make the replay a no-op. (3) the stale cards the
+        # supersession half needs must still be PENDING once the settlement has
+        # run. All three are preconditions of the ZERO-write assertions below;
+        # the positive control at the end of the test closes the loop by
+        # proving the writes really do happen when the projection is intact.
+        reverted_state = await service.get_current_state(session.id)
+        assert reverted_state is not None
+        assert reverted_state.id != uuid.UUID(imported.json()["id"])
+        assert reverted_state.metadata_ is not None, (
+            "fixture is vacuous: the surfacer returns early on a state with no metadata_, so replay would write nothing"
+        )
+        assert (await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)) == [], (
+            "fixture is vacuous: the reverted state already carries evidence, so replay would write nothing"
+        )
+        stale_ids = {event.id for event in stale_pending}
+        assert {
+            event.id for event in await service.list_interpretation_events(session.id, status="pending") if event.id in stale_ids
+        } == stale_ids, "fixture cannot drive the supersession half: the settlement already retired the stale cards"
+
+        # Corrupt the PROJECTION, not the stored row: terminal
+        # guided_operations rows are immutable by database trigger, and a
+        # corrupt projection is the failure this ordering actually guards.
+        # ``validation_errors`` is inside the hash domain and survives the
+        # strict re-validation ``guided_response_hash`` performs.
+        original_state_response = state_module._state_response
+
+        def _corrupt_projection(record: Any, **kwargs: Any) -> Any:
+            projected = original_state_response(record, **kwargs)
+            return projected.model_copy(update={"validation_errors": ["tampered"]})
+
+        events_before = sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id))
+        versions_before = [record.id for record in await service.get_state_versions(session.id)]
+
+        # The patch goes on ONLY around the replay POST: ``_state_response``
+        # also feeds the settlement path's response_hash_factory, so patching
+        # it earlier would corrupt the stored hash too and no mismatch would
+        # occur.
+        #
+        # ``match=`` pins the ONE raise this test exists for: the hash
+        # comparison in ``routes/guided_operations.py::_replay_completed``.
+        # Four other AuditIntegrityError sites in ``state.py`` alone are
+        # reachable from this POST, and each would satisfy a bare
+        # ``pytest.raises`` while leaving both zero-write assertions trivially
+        # true -- so a bare one cannot tell this test passing from this test
+        # never running the ordering at all. They divide in two:
+        #   - BEFORE the comparison, which therefore never runs: "session
+        #     unexpectedly has no current checkpoint", ``_replay``'s
+        #     "non-state result locator" guard, and "operation was not
+        #     reserved". Further reserve/lookup guards in
+        #     ``routes/guided_operations.py`` sit here too.
+        #   - AFTER a comparison that MATCHED: the locator guard in
+        #     ``_repair_reverted_surfacing_debt``, which runs as
+        #     ``after_verified`` and raises before the surfacing write. It
+        #     writes nothing either, but it proves the opposite of what this
+        #     test asserts -- that verification succeeded.
+        # ``_replay``'s guard and the repair's guard share a message, so only
+        # a match on the comparison's own message discriminates.
+        with (
+            patch.object(state_module, "_state_response", _corrupt_projection),
+            pytest.raises(AuditIntegrityError, match="response hash does not match its stored response hash"),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+
+        replay_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert [event.kind for event in replay_events] == [], (
+            "the rejected replay wrote interpretation_events before the response hash was verified"
+        )
+        # One equality over every column of every row in the session covers
+        # both halves of the hazard: no INSERT, and no PENDING row flipped to
+        # SUPERSEDED by the supersession pass inside the same window. The
+        # fixture drives both -- see the positive control below.
+        assert sorted(await service.list_interpretation_events(session.id), key=lambda e: str(e.id)) == events_before
+        assert [record.id for record in await service.get_state_versions(session.id)] == versions_before
+        current_after = await service.get_current_state(session.id)
+        assert current_after is not None and current_after.id == reverted_state.id
+
+        # POSITIVE CONTROL. Everything above is a ZERO-write assertion, which a
+        # fixture that could never write also satisfies. Re-POST the same
+        # operation with the projection intact and prove that BOTH writes the
+        # rejected replay was in a position to make do in fact happen: two
+        # fresh cards minted on the reverted state, and the two stale PENDING
+        # cards flipped to SUPERSEDED.
+        repaired = client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
+        assert repaired.status_code == 200, repaired.text
+        repaired_events = await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)
+        assert {event.kind for event in repaired_events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }, "the verified replay did not mint the cards the rejected one was refused, so the INSERT half was never driven"
+        assert [event.choice for event in await service.list_interpretation_events(session.id, status="all") if event.id in stale_ids] == [
+            InterpretationChoice.SUPERSEDED,
+            InterpretationChoice.SUPERSEDED,
+        ], "the verified replay superseded nothing, so the supersession half was never driven"
+
+    @pytest.mark.asyncio
     async def test_revert_injects_system_message(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
@@ -7939,6 +8396,441 @@ sinks:
         assert mc.user_term == "llm_model_choice:score"
 
     @pytest.mark.asyncio
+    async def test_post_state_yaml_opt_out_returns_the_final_durable_head(self, tmp_path: Path) -> None:
+        """Auto-resolution may advance the head while cards are surfaced;
+        the import response must describe that final durable state."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Opt-out import", "local")
+        async with _compose_session_operation_context(service, session.id) as opt_out_context:
+            await service.record_session_interpretation_opt_out(
+                session_id=session.id,
+                actor="user:alice",
+                session_operation_context=opt_out_context,
+            )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: score
+    options:
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 200, response.text
+        current = await service.get_current_state(session.id)
+        assert current is not None
+        assert response.json()["id"] == str(current.id)
+        assert response.json()["version"] == current.version
+        assert await service.list_interpretation_events(session.id, status="pending") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_surfaces_source_data_contract_review(self, tmp_path: Path) -> None:
+        """A YAML-bound uploaded source uses the same source-site surfacer as
+        Composer settlement, so its derived contract debt is visible and
+        resolvable instead of blocking execution behind an empty card list."""
+        from elspeth.web.composer.source_demand import build_source_data_contract_draft
+        from elspeth.web.interpretation_state import InterpretationReviewPending, materialize_state_for_execution
+        from elspeth.web.sessions.routes._helpers import _state_from_record
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Source contract import", "local")
+        blob_id = uuid.uuid4()
+        blob_path = tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv"
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
+        app.state.blob_service.get_blob.return_value = SimpleNamespace(
+            id=blob_id,
+            session_id=session.id,
+            storage_path=str(blob_path),
+        )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: source
+    options:
+      path: /old/blob.csv
+      schema:
+        mode: observed
+transforms:
+- name: consumer
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    required_input_fields: [colour]
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
+            reimported = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
+
+        assert response.status_code == 200, response.text
+        assert reimported.status_code == 200, reimported.text
+        record = await service.get_current_state(session.id)
+        assert record is not None
+        blocked = materialize_state_for_execution(_state_from_record(record))
+        assert isinstance(blocked, InterpretationReviewPending)
+        assert [(site.component_id, site.kind) for site in blocked.sites] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
+
+        events = await service.list_interpretation_events(session.id, status="pending")
+        # Same source contract on a new imported state reuses the live card;
+        # a twin would make the exactly-one resolver boundary unconsumable.
+        assert [(event.affected_node_id, event.kind) for event in events] == [("source", InterpretationKind.SOURCE_DATA_CONTRACT)]
+        event = events[0]
+        assert event.llm_draft == build_source_data_contract_draft(["colour"], ("colour", "extra"))
+        assert event.model_identifier == "yaml_import"
+
+        resolved = client.post(
+            f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+            json={"choice": "accepted_as_drafted"},
+        )
+        assert resolved.status_code == 200, resolved.text
+        current = await service.get_current_state(session.id)
+        assert current is not None
+        assert not isinstance(materialize_state_for_execution(_state_from_record(current)), InterpretationReviewPending)
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_mixed_review_order_matches_generic_surfacer(self, tmp_path: Path) -> None:
+        """Source and node review cards retain the generic surfacer's stable
+        ordering rather than a YAML-route-specific node-only projection."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Mixed review import", "local")
+        blob_id = uuid.uuid4()
+        blob_path = tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv"
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+        app.state.blob_service = MagicMock(spec=BlobServiceProtocol)
+        app.state.blob_service.get_blob.return_value = SimpleNamespace(
+            id=blob_id,
+            session_id=session.id,
+            storage_path=str(blob_path),
+        )
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: source
+    options:
+      path: /old/blob.csv
+      schema:
+        mode: observed
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.colour }}'
+    required_input_fields: [colour]
+sinks:
+  main:
+    plugin: csv
+    options:
+      path: outputs/out.csv
+    on_write_failure: discard
+"""
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            response = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": yaml_text, "source_blob_ids": {"source": str(blob_id)}},
+            )
+
+        assert response.status_code == 200, response.text
+        events = await service.list_interpretation_events(session.id, status="pending")
+        assert [(event.affected_node_id, event.kind) for event in events] == [
+            ("score", InterpretationKind.LLM_PROMPT_TEMPLATE),
+            ("source", InterpretationKind.SOURCE_DATA_CONTRACT),
+            ("score", InterpretationKind.LLM_MODEL_CHOICE),
+        ]
+        assert all(event.model_identifier == "yaml_import" for event in events)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [ValueError("writer refused"), RuntimeError("storage failed")])
+    async def test_post_state_yaml_rolls_back_state_and_event_prefix_when_event_cohort_fails(
+        self,
+        tmp_path: Path,
+        failure: Exception,
+    ) -> None:
+        """The state and every review card are one durability cohort."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Atomic import", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score this: {{ row.value }}'
+"""
+        original_prepare = service._prepare_or_create_pending_interpretation_event
+        prepared_count = 0
+
+        async def _inject_second_writer_failure(*args, **kwargs):
+            nonlocal prepared_count
+            writer = await original_prepare(*args, **kwargs)
+            prepared_count += 1
+            if prepared_count != 2:
+                return writer
+
+            def _fail(_connection):
+                raise failure
+
+            return _fail
+
+        with patch.object(
+            service,
+            "_prepare_or_create_pending_interpretation_event",
+            side_effect=_inject_second_writer_failure,
+        ):
+            response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 500
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("draft_yaml", ["null", "''"])
+    async def test_post_state_yaml_rejects_unsurfaceable_pending_site_atomically(
+        self,
+        tmp_path: Path,
+        draft_yaml: str,
+    ) -> None:
+        """Every persisted pending review site must have a consumable event.
+
+        A hand-written vague-term row without a draft is schema-valid enough
+        to block execution but cannot pass the event writer boundary. Reject
+        the whole import before writing either state or event rows.
+        """
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Unsupported review import", "local")
+        yaml_text = f"""
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: {draft_yaml}
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_vague_term_site_the_writer_cannot_surface(self, tmp_path: Path) -> None:
+        """The pure precheck must include the LLM-transform discriminator
+        enforced by the event writer, not just the requirement draft."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Writer mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_structured_vague_term_without_prompt_part(self, tmp_path: Path) -> None:
+        """A structured vague-term card must bind exactly one prompt part,
+        matching the writer's reviewed-content identity boundary."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Vague-term wiring mismatch", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    prompt_template: 'Score records from the last 30 days'
+    interpretation_requirements:
+    - id: vague:score
+      kind: vague_term
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert "cannot be surfaced" in response.json()["detail"]
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_accepts_wired_kindless_legacy_vague_term(self, tmp_path: Path) -> None:
+        """The canonical parser defaults an absent kind to vague_term; the
+        surfacer must not falsely reject that writer-valid legacy shape."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Legacy vague term", "local")
+        yaml_text = """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Score records from the last 30 days'
+    prompt_template_parts:
+    - kind: text
+      text: 'Score records from '
+    - kind: interpretation_ref
+      requirement_id: vague:score
+    interpretation_requirements:
+    - id: vague:score
+      user_term: recent
+      status: pending
+      draft: last 30 days
+"""
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 200, response.text
+        events = await service.list_interpretation_events(session.id, status="pending")
+        assert InterpretationKind.VAGUE_TERM in {event.kind for event in events}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "yaml_text",
+        [
+            pytest.param(
+                """
+transforms:
+- name: score
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    prompt_template: [not, a, string]
+    interpretation_requirements:
+    - id: prompt:score
+      kind: llm_prompt_template
+      user_term: llm_prompt_template:score
+      status: pending
+      draft: a draft
+""",
+                id="malformed-prompt-template",
+            ),
+            pytest.param(
+                """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      source_authoring:
+        content_hash: abc123
+""",
+                id="malformed-source-authoring",
+            ),
+        ],
+    )
+    async def test_post_state_yaml_sanitizes_malformed_review_metadata(
+        self,
+        tmp_path: Path,
+        yaml_text: str,
+    ) -> None:
+        """Untrusted review metadata is a named 400, never an invariant 500."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app, raise_server_exceptions=False)
+        session = await service.create_session("alice", "Malformed review metadata", "local")
+
+        response = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "Imported YAML contains malformed interpretation review metadata."
+        assert await service.get_current_state(session.id) is None
+        assert await service.list_interpretation_events(session.id, status="all") == []
+
+    @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_malformed_interpretation_requirements(self, tmp_path) -> None:
         """Hand-written interpretation_requirements rows the schema would
         refuse are rejected 400 before persistence (elspeth-ae5160c3cb)."""
@@ -8424,7 +9316,8 @@ sinks:
     async def test_post_state_yaml_rejects_non_pipeline_mapping(self, tmp_path) -> None:
         """Hardening (T-1): a syntactically valid YAML mapping that names no
         pipeline section must not silently import as an empty composition --
-        that would be a silent destructive replace of the session's prior work."""
+        that would be a silent destructive replace of the session's prior work.
+        The rejection names every unrecognised key so a typo is actionable."""
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
@@ -8434,8 +9327,72 @@ sinks:
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": not_a_pipeline})
 
         assert resp.status_code == 400
-        assert "must define at least one pipeline section" in resp.json()["detail"]
+        assert resp.json()["detail"] == (
+            "pipeline YAML contains top-level content the composer cannot import: "
+            "unknown keys ['notes', 'shopping_list']. Importing would silently discard or override it."
+        )
         # The session's current state must remain unset -- nothing was persisted.
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_unknown_key_before_persistence(self, tmp_path) -> None:
+        """A typo beside valid sections is a named 400, never a lossy import."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+
+        session = await service.create_session("alice", "Replay", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      schema:
+        mode: observed
+sinks:
+  main:
+    plugin: csv
+    on_write_failure: discard
+commencment_gates: []
+"""
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == (
+            "pipeline YAML contains top-level content the composer cannot import: "
+            "unknown keys ['commencment_gates']. Importing would silently discard or override it."
+        )
+        assert await service.get_current_state(session.id) is None
+
+    @pytest.mark.asyncio
+    async def test_post_state_yaml_rejects_json_key_collision_before_persistence(self, tmp_path) -> None:
+        """Distinct YAML keys must not collapse during session JSON storage."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+
+        session = await service.create_session("alice", "Replay", "local")
+        yaml_text = """
+sources:
+  source:
+    plugin: csv
+    on_success: main
+    options:
+      schema:
+        mode: observed
+      labels:
+        1: integer-key
+        "1": string-key
+sinks:
+  main:
+    plugin: csv
+    on_write_failure: discard
+"""
+
+        resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "sources.source.options.labels contains non-string mapping key 1"
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio
@@ -8644,6 +9601,83 @@ sinks:
         assert "path" not in exported_source_options
         assert "mode" not in exported_source_options
         assert exported_source_options["schema"] == {"mode": "observed"}
+        # elspeth-06f92da0d9: the deliberate redaction is never presented
+        # bare — the response names what was stripped (names only, no blob
+        # identity: the sidecar scrub above still holds) and the YAML text
+        # opens with the matching marker comment.
+        # The summary names custody carriers (storage paths, blob linkage);
+        # the bind_source "mode" marker is web-layer bookkeeping and stays out.
+        assert body["redaction"] == {
+            "stripped_source_options": {"source": ["blob_ref", "path"]},
+            "stripped_output_options": {"out": ["path"]},
+            "blob_linked_sources": ["source"],
+            "rebind_guidance": PUBLIC_EXPORT_REBIND_GUIDANCE,
+        }
+        assert body["yaml"].startswith(PUBLIC_EXPORT_REDACTION_HEADER)
+
+    @pytest.mark.asyncio
+    async def test_reimport_of_redacted_export_without_rebind_gets_guidance_not_pydantic(self, tmp_path: Path) -> None:
+        """Round-trip fence (elspeth-06f92da0d9): POSTing a custody-redacted
+        export back without ``source_blob_ids`` must 400 with re-bind guidance
+        instead of sailing through Stage-1 into a strict-lane
+        "path Field required"."""
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        blob_id = "98b1357d-5aab-4fb3-85b4-5ad643912e84"
+        session = await service.create_session("alice", "Redacted round trip", "local")
+        app.state.blob_service = SimpleNamespace(
+            get_blob=AsyncMock(
+                spec=BlobServiceProtocol.get_blob,
+                return_value=_ready_blob_record(
+                    blob_id=uuid.UUID(blob_id),
+                    session_id=session.id,
+                    storage_path="/data/blobs/session/contact_form_submissions.csv",
+                ),
+            )
+        )
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(
+                source={
+                    "plugin": "csv",
+                    "on_success": "out",
+                    "options": {
+                        "path": "/data/blobs/session/contact_form_submissions.csv",
+                        "blob_ref": blob_id,
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_validation_failure": "discard",
+                },
+                outputs=[
+                    {
+                        "name": "out",
+                        "plugin": "csv",
+                        "options": {"path": "outputs/out.csv", "schema": {"mode": "observed"}},
+                        "on_write_failure": "discard",
+                    }
+                ],
+                metadata_={"name": "Redacted round trip", "description": ""},
+                is_valid=True,
+            ),
+            provenance="session_seed",
+        )
+
+        async def _pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+            return ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_pass_preflight):
+            exported = client.get(f"/api/sessions/{session.id}/state/yaml")
+            assert exported.status_code == 200, exported.text
+            reimported = client.post(
+                f"/api/sessions/{session.id}/state/yaml",
+                json={"yaml": exported.json()["yaml"]},
+            )
+
+        assert reimported.status_code == 400, reimported.text
+        detail = reimported.json()["detail"]
+        assert "custody-redacted" in detail
+        assert "source_blob_ids" in detail
+        assert "path Field required" not in detail
 
     @pytest.mark.asyncio
     async def test_yaml_export_scrubs_guided_blob_from_reviewed_public_sentinel(self, tmp_path: Path) -> None:
@@ -8896,7 +9930,7 @@ sinks:
                 )
             },
         )
-        await _save_test_composition_state(
+        await _insert_legacy_composition_state(
             service,
             session.id,
             CompositionStateData(
@@ -8978,7 +10012,7 @@ sinks:
                 )
             },
         )
-        await _save_test_composition_state(
+        await _insert_legacy_composition_state(
             service,
             session.id,
             CompositionStateData(
@@ -9070,7 +10104,7 @@ sinks:
                 )
             },
         )
-        await _save_test_composition_state(
+        await _insert_legacy_composition_state(
             service,
             session.id,
             CompositionStateData(
@@ -9137,7 +10171,7 @@ sinks:
                 )
             },
         )
-        await _save_test_composition_state(
+        await _insert_legacy_composition_state(
             service,
             session.id,
             CompositionStateData(
@@ -13750,3 +14784,476 @@ def test_compose_that_authors_nothing_returns_200_with_null_state(tmp_path: Path
     assert body["proposals"] == []
     current = asyncio.run(service.get_current_state(uuid.UUID(session["id"])))
     assert current is None
+
+
+def test_send_message_refuses_an_active_unbindable_guided_tip_as_a_failed_turn(tmp_path) -> None:
+    """elspeth-4c442aaaa8 EXPECTED-1: the post-compose persist runs the custody
+    gate inside the write lock. A planner-authored source that cannot bind to the
+    retained ACTIVE review (incident v13 shape with terminal=None) is refused
+    before the row lands: the tip does not advance, the user row stays, and the
+    response is the ``audit_integrity_error`` failed-turn surface the frontend
+    already special-cases on the send path — not a bare 500."""
+    from dataclasses import replace
+
+    private = str(tmp_path / "blobs" / "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv")
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
+                observed_columns=("colour",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    composed = CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="out",
+                options={"path": private, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=2,
+        guided_session=guided,
+    )
+    app, _service = _make_app(tmp_path)
+    app.state.composer_service = _make_composer_mock(response_text="Pointed the source at colours.csv.", state=composed)
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+    assert client.get(f"/api/sessions/{session_id}/state").json() is None
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "use colours.csv"})
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "audit_integrity_error"
+    assert detail["failed_turn"] == {
+        "assistant_message_id": None,
+        "tool_calls_attempted": 0,
+        "tool_responses_persisted": 0,
+        "transcript_url": None,
+    }
+    assert private not in response.text
+    assert client.get(f"/api/sessions/{session_id}/state").json() is None
+    roles = [m["role"] for m in client.get(f"/api/sessions/{session_id}/messages").json()]
+    assert roles == ["user"]
+
+
+_LEGACY_PRIVATE_PATH = "/srv/elspeth/data/blobs/legacy/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+
+
+def _legacy_unbindable_guided_state(*, terminal: TerminalState | None) -> CompositionStateData:
+    """Incident v13 shape (elspeth-201903a286) as a pre-gate row: a retained
+    sentinel review of ``source`` re-attached to a live ``source`` bound to a
+    different blob."""
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "blob:360e1583-ae3c-4135-9240-0a26a14cf22f", "schema": {"mode": "observed"}},
+                observed_columns=("colour",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        terminal=terminal,
+    )
+    return CompositionStateData(
+        sources={
+            "source": {
+                "plugin": "csv",
+                "on_success": "out",
+                "options": {"path": _LEGACY_PRIVATE_PATH, "blob_ref": "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"},
+                "on_validation_failure": "discard",
+            }
+        },
+        nodes=[],
+        edges=[],
+        outputs=[],
+        metadata_={"name": "Legacy", "description": ""},
+        is_valid=False,
+        composer_meta={"guided_session": guided.to_dict()},
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_active_unbindable_tip_reads_are_named_409s(tmp_path) -> None:
+    """elspeth-4c442aaaa8 EXPECTED-3: a tip persisted before the write gate whose
+    ACTIVE review cannot bind still refuses to project. Every read arm names the
+    condition with a stable 409 instead of a bare 500, echoes no path, and a
+    revert onto the same row is refused by the write gate under the same name.
+    The frontend load path treats 409 like 500 today (declared non-goal)."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await _insert_legacy_composition_state(service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose")
+    tip = await service.get_current_state(session.id)
+    assert tip is not None
+
+    for path in (f"/api/sessions/{session.id}/state", f"/api/sessions/{session.id}/guided"):
+        response = client.get(path)
+        assert response.status_code == 409, (path, response.text)
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "guided_custody_projection_failed"
+        assert detail["detail"] == (
+            "This session's retained guided source review no longer matches the files this pipeline uses; "
+            "restore an earlier version from Composition history to continue."
+        )
+        assert "binds" not in detail["detail"]
+        assert _LEGACY_PRIVATE_PATH not in response.text
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": str(tip.id)},
+    )
+    assert revert.status_code == 409, revert.text
+    assert revert.json()["detail"]["error_type"] == "guided_custody_projection_failed"
+    still_tip = await service.get_current_state(session.id)
+    assert still_tip is not None
+    assert still_tip.version == tip.version
+
+
+@pytest.mark.asyncio
+async def test_legacy_exited_unbindable_tip_projects_degraded(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    legacy = _legacy_unbindable_guided_state(terminal=exited)
+    legacy = replace(
+        legacy,
+        validation_errors=["Source 'source' has no reachable output (E_GRAPH)"],
+    )
+    await _insert_legacy_composition_state(service, session.id, legacy, provenance="post_compose")
+
+    response = client.get(f"/api/sessions/{session.id}/state")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert body["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert body["validation_errors"] == ["Source 'source' has no reachable output (E_GRAPH)"]
+    assert _LEGACY_PRIVATE_PATH not in response.text
+
+
+@pytest.mark.asyncio
+async def test_guided_reenter_refuses_an_unbindable_exited_tip(tmp_path) -> None:
+    """Re-entry turns the retained review back into ACTIVE authoring authority,
+    so a tip whose review cannot bind (incident v13, exited) must be refused
+    before settlement (adversary Critical 2): 409 with a stable error_type, no
+    new version, reviewed_sources intact (a /state/revert to a bindable version
+    re-enables re-entry), and GET /state still serves the degraded projection."""
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.state_machine import TurnRecord
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    exited = TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None)
+    state_data = _legacy_unbindable_guided_state(terminal=exited)
+    guided_d = deep_thaw(state_data.composer_meta)["guided_session"]
+    guided = replace(
+        GuidedSession.from_dict(guided_d),
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    tip = await service.save_composition_state(
+        session.id,
+        replace(state_data, composer_meta={"guided_session": guided.to_dict()}),
+        provenance="post_compose",
+    )
+
+    response = client.post(f"/api/sessions/{session.id}/guided/reenter", json={"operation_id": str(uuid.uuid4())})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["error_type"] == "guided_reenter_custody_unbindable"
+    assert detail["detail"] == (
+        "Guided mode can't resume: the files it reviewed are no longer the files this pipeline uses. "
+        "Restore an earlier version from Composition history, or keep working in freeform."
+    )
+    assert "binds" not in detail["detail"]
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    current = await service.get_current_state(session.id)
+    assert current is not None
+    assert current.id == tip.id
+    persisted = GuidedSession.from_dict(deep_thaw(current.composer_meta)["guided_session"])
+    assert persisted.reviewed_sources == guided.reviewed_sources
+    assert persisted.terminal == exited
+    degraded = client.get(f"/api/sessions/{session.id}/state")
+    assert degraded.status_code == 200
+    assert degraded.json()["composer_meta"]["guided_session"]["custody_unavailable"] is True
+
+
+def test_send_message_post_persist_plain_audit_integrity_error_keeps_the_app_handler_surface(tmp_path) -> None:
+    """Only GuidedCustodyIntegrityError takes the failed-turn arm (fix round 1
+    F-A1): a plain AuditIntegrityError raised after the compose loop returned
+    falls through to the app-level handler exactly as at base, so non-custody
+    Tier-1 refusals keep their own diagnostics instead of a custody-shaped body."""
+    mock_composer = _make_composer_mock(response_text="Done.")
+    app, _service = _make_app(tmp_path)
+    app.state.composer_service = mock_composer
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Chat"}).json()["id"]
+
+    with (
+        patch(
+            "elspeth.web.sessions.routes.messages._pending_proposal_responses",
+            side_effect=AuditIntegrityError("post-persist non-custody refusal"),
+        ),
+        pytest.raises(AuditIntegrityError, match="post-persist non-custody refusal") as excinfo,
+    ):
+        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Hello"})
+    assert excinfo.value.failed_turn is None
+
+
+@pytest.mark.asyncio
+async def test_state_versions_serves_a_degraded_row_for_a_legacy_unbindable_version(tmp_path) -> None:
+    """Fix round 1 F-A2: /state/versions never 409s the whole history and never
+    omits a row. A version whose projection cannot bind serves the degraded
+    projection (mask-all + custody_unavailable) beside untouched siblings, so
+    the user can see the history and pick a bindable version to restore."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    good = await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources={"clean": {"plugin": "csv", "on_success": "out", "options": {"path": "clean.csv"}, "on_validation_failure": "discard"}},
+            metadata_={"name": "Good", "description": ""},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+
+    response = client.get(f"/api/sessions/{session.id}/state/versions")
+
+    assert response.status_code == 200, response.text
+    rows = {row["version"]: row for row in response.json()}
+    assert set(rows) == {1, 2}
+    assert rows[1]["id"] == str(good.id)
+    assert rows[1]["sources"]["clean"]["options"]["path"] == "clean.csv"
+    assert "guided_session" not in (rows[1]["composer_meta"] or {})
+    degraded = rows[2]
+    assert degraded["composer_meta"]["guided_session"]["custody_unavailable"] is True
+    assert degraded["sources"]["source"]["options"]["path"] == REDACTED_BLOB_SOURCE_PATH
+    assert _LEGACY_PRIVATE_PATH not in response.text
+    # The single-tip read keeps its named 409 for the active-unbindable tip.
+    assert client.get(f"/api/sessions/{session.id}/state").status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_state_revert_onto_a_legacy_unbindable_row_gets_revert_specific_wording(tmp_path) -> None:
+    """Fix round 1 F-A2 (python P5): the refusal detail must not tell the user
+    to "revert to an earlier version" when the refused action IS a revert."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "Legacy", "local")
+    await service.save_composition_state(
+        session.id,
+        CompositionStateData(metadata_={"name": "Good", "description": ""}, is_valid=True),
+        provenance="session_seed",
+    )
+    await _insert_legacy_composition_state(
+        service, session.id, _legacy_unbindable_guided_state(terminal=None), provenance="post_compose", version=2
+    )
+    versions = client.get(f"/api/sessions/{session.id}/state/versions").json()
+    bad_id = next(row["id"] for row in versions if row["version"] == 2)
+
+    revert = client.post(
+        f"/api/sessions/{session.id}/state/revert",
+        json={"operation_id": str(uuid.uuid4()), "state_id": bad_id},
+    )
+
+    assert revert.status_code == 409, revert.text
+    detail = revert.json()["detail"]
+    assert detail["error_type"] == "guided_custody_projection_failed"
+    assert "revert to an earlier version" not in detail["detail"]
+    assert detail["detail"] == (
+        "This version can't be restored: its guided source review no longer matches "
+        "the files this pipeline uses. Choose a different version from Composition history."
+    )
+    assert _LEGACY_PRIVATE_PATH not in revert.text
+
+
+def test_send_message_does_not_re_emit_the_already_persisted_turn_prose(tmp_path) -> None:
+    """The turn-end row carries the notice alone, not the planner's prose again.
+
+    elspeth-d581b3da7f. The staged interpretation-review handoff terminates the
+    tool batch at the successful review call, so the model's last prose IS the
+    tool-call turn's prose — which the compose loop has already committed with
+    its ``tool_calls`` envelope. The turn-end writer then persisted
+    ``result.message`` verbatim, and because ``_composer_conversation_messages``
+    filters only ``role="audit"``/``"tool"``, BOTH assistant rows reached the
+    SPA transcript. Live session 891b7b1e shows the pair 99ms apart.
+
+    This drives the real route, so it sees what the diagnosing lane's
+    compose-loop test could not: that second row.
+    """
+    from elspeth.web.composer.no_tool_policy import compose_interpretation_review_handoff_message
+    from elspeth.web.sessions._persist_payload import RedactedToolRow
+    from elspeth.web.sessions.routes._helpers import _composer_conversation_messages
+
+    prose = "Surfacing the review card now."
+    handoff_message = compose_interpretation_review_handoff_message(prose)
+    handoff_suffix = handoff_message[len(prose) :]
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Review handoff"}).json()["id"])
+
+    async def _compose_with_midloop_persist(*_args, **_kwargs) -> ComposerResult:
+        # What the compose loop's P4 does mid-turn: commit the assistant row
+        # carrying this turn's prose plus the tool_calls envelope. The hook
+        # runs inside the route's own COMPOSE operation, so the forwarded exact
+        # context is that operation's authority — acquiring a second one here
+        # would be a competing lease, not a faithful stand-in for P4.
+        outcome = await service.persist_compose_turn_async(
+            session_operation_context=cast(SessionOperationContext, _kwargs["session_operation_context"]),
+            session_id=str(session_id),
+            assistant_content=prose,
+            raw_content=None,
+            redacted_assistant_tool_calls=(
+                {
+                    "id": "call_review",
+                    "type": "function",
+                    "function": {"name": "request_interpretation_review", "arguments": "{}"},
+                },
+            ),
+            redacted_tool_rows=(RedactedToolRow(tool_call_id="call_review", content="{}", composition_state_payload=None),),
+            parent_composition_state_id=None,
+            expected_current_state_id=None,
+            writer_principal="compose_loop",
+            plugin_crash_pending=False,
+        )
+        return ComposerResult(
+            message=handoff_message,
+            state=_EMPTY_STATE,
+            raw_assistant_content=prose,
+            persisted_assistant_message_id=outcome.assistant_id,
+            persisted_assistant_content=prose,
+            persisted_tool_call_turn=True,
+            persisted_assistant_matches_terminal_model_turn=True,
+        )
+
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    )
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_with_midloop_persist)
+    app.state.composer_service = composer
+
+    response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build the pipeline."})
+    assert response.status_code == 200
+
+    messages = asyncio.run(service.get_messages(session_id, limit=None))
+    assistant_rows = [message for message in messages if message.role == "assistant"]
+
+    # The prose appears exactly once in the whole transcript — this is the
+    # assertion that fails when the turn-end writer re-emits result.message.
+    carrying_prose = [row for row in assistant_rows if prose in row.content]
+    assert len(carrying_prose) == 1, [row.content for row in assistant_rows]
+    assert carrying_prose[0].tool_calls, "the surviving copy must be the mid-loop row with its tool_calls envelope"
+
+    # And the turn-end row carries the backend notice alone.
+    turn_end = [row for row in assistant_rows if row.id != carrying_prose[0].id]
+    assert len(turn_end) == 1
+    assert turn_end[0].content == handoff_suffix
+    assert turn_end[0].raw_content == ""
+
+    # Both rows reach the SPA transcript (the filter drops only audit/tool
+    # rows), which is why the duplicate was user-visible.
+    conversation = _composer_conversation_messages(messages)
+    assert sum(prose in message.content for message in conversation if message.role == "assistant") == 1
+
+
+def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recompose turn-end row must read the REBOUND result, not the pre-rebind one.
+
+    Mirror of ``test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_settlement``
+    for the recompose route, which had no equivalent. Both handlers rebind
+    ``result`` on the auto-commit-revoked branch, so the turn-end
+    content/raw_content pair must be derived BELOW that branch
+    (elspeth-d581b3da7f). Hoisting ``composer_turn_end_assistant_row`` to the
+    top of the handler — the natural place for it — silently persists the
+    superseded message; send_message caught that, recompose did not.
+    """
+    from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+
+    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
+        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="recompose-auto-revoked")
+    )
+    asyncio.run(
+        service.add_message(
+            session_id,
+            "user",
+            "Build the pipeline.",
+            writer_principal="route_user_message",
+        )
+    )
+    assert row.pipeline_metadata is not None
+
+    async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
+        # The downgrade becomes durable while the compose turn is in flight —
+        # after intent minting, before settlement.
+        await service.update_composer_preferences(
+            session_id,
+            trust_mode="explicit_approve",
+            density_default="high",
+            actor="user:alice",
+        )
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
+            message="Pipeline prepared.",
+            state=_EMPTY_STATE,
+            pipeline_commit_intent=PipelineCommitIntent(
+                proposal_id=row.id,
+                draft_hash=row.pipeline_metadata.draft_hash,
+            ),
+        )
+
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    )
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_then_downgrade)
+    app.state.composer_service = composer
+    client = TestClient(app)
+
+    response = client.post(f"/api/sessions/{session_id}/recompose")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["status"] == "pending"
+    # The superseded "Pipeline prepared." must not reach the transcript.
+    assert body["message"]["content"] == PIPELINE_STAGED_REVIEW_MESSAGE
+
+    messages = asyncio.run(service.get_messages(session_id, limit=None))
+    assistant_rows = [message for message in messages if message.role == "assistant"]
+    assert [message.content for message in assistant_rows] == [PIPELINE_STAGED_REVIEW_MESSAGE]

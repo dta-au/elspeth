@@ -45,7 +45,7 @@ from elspeth.contracts.secrets import (
     SecretDecryptionError,
 )
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
+from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.logging import configure_logging
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -121,6 +121,7 @@ from elspeth.web.secrets.routes import create_secrets_router
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
+from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import (
@@ -299,6 +300,16 @@ async def _reconcile_pending_landscape_runs(
     )
 
 
+_ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES = 5
+"""Consecutive transient-failure bound for the periodic orphan sweeper.
+
+One or two ``OperationalError`` sweeps are DB contention and retry cleanly;
+this many in a row means the fault is standing, so the sweeper stops
+presuming transience and re-raises — terminating the task so the stored
+failure surfaces at lifespan shutdown instead of being absorbed every
+interval forever."""
+
+
 async def _periodic_orphan_cleanup(
     session_service: SessionServiceImpl,
     execution_service: ExecutionServiceImpl,
@@ -324,6 +335,7 @@ async def _periodic_orphan_cleanup(
     import structlog
 
     slog = structlog.get_logger()
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(interval_seconds)
         cancelled = 0
@@ -348,27 +360,20 @@ async def _periodic_orphan_cleanup(
                     landscape_url,
                     create_tables=create_tables,
                 )
-        except (SQLAlchemyError, OSError, SchemaCompatibilityError) as cleanup_exc:
-            # Narrow catch — only recoverable audit/IO failures are
-            # absorbed so the loop retries on the next interval.
-            # SQLAlchemyError covers DB-layer transients raised from
-            # cancel_all_orphaned_runs (engine.begin(), conn.execute());
-            # OSError covers SQLite file-level failures that can escape
-            # before SQLAlchemy wraps them.
-            #
-            # Programmer-bug exceptions (AttributeError from a drifted
-            # attribute on ExecutionServiceImpl, TypeError from a
-            # signature change, AssertionError from an invariant guard)
-            # are NOT caught: they propagate out of the while-loop,
-            # terminating the task. The dead task surfaces to the
-            # operator at lifespan shutdown because the outer await
-            # re-raises the stored exception (the surrounding
-            # contextlib.suppress narrows to CancelledError only).
-            # Consistent with the audit-cleanup narrow catch in
-            # ``ComposerServiceImpl.compose`` (web/composer/service.py)
-            # and the cleanup-rollback sites in the
-            # ``fork_from_message`` route handler
-            # (web/sessions/routes.py).
+            consecutive_failures = 0
+        except OperationalError as cleanup_exc:
+            # Only OperationalError is retried — the one DB failure class
+            # that models transient contention (lock timeout, dropped
+            # connection, sqlite-busy) rather than standing operator or
+            # programmer state. Every other SQLAlchemyError subclass
+            # (ProgrammingError, IntegrityError, ...), OSError, and
+            # SchemaCompatibilityError propagates, terminating the task
+            # so the fault surfaces at lifespan shutdown (the outer
+            # contextlib.suppress narrows to CancelledError only) —
+            # retrying those every interval can never fix them.
+            # The retry itself is bounded: past the consecutive-failure
+            # bound contention is no longer presumed transient and the
+            # exception re-raises through the same task-death route.
             #
             # exc_info deliberately omitted: SQLAlchemyError __cause__
             # chains routinely carry the DB connection URL, schema
@@ -377,9 +382,18 @@ async def _periodic_orphan_cleanup(
             # redaction pattern was standardised. Structured logs carry
             # exc_class only; operators reading logs get enough
             # correlation to triage without the traceback text.
+            consecutive_failures += 1
+            if consecutive_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                slog.error(
+                    "periodic_orphan_cleanup_escalating",
+                    exc_class=type(cleanup_exc).__name__,
+                    consecutive_failures=consecutive_failures,
+                )
+                raise
             slog.error(
                 "periodic_orphan_cleanup_failed",
                 exc_class=type(cleanup_exc).__name__,
+                consecutive_failures=consecutive_failures,
             )
         if cancelled:
             telemetry.orphaned_runs_cancelled_total.add(
@@ -502,25 +516,25 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         landscape_url = settings.get_landscape_url()
     session_service = app.state.session_service
-    cancelled_runs: list[RunRecord] = []
     # Inline custody stages are part of the blob integrity protocol, not
     # best-effort orphan bookkeeping. Do not serve until every stage has a
     # row-authoritative outcome.
     await app.state.blob_service.reconcile_inline_custody_publications()
-    try:
-        cancelled_runs = await session_service.cancel_all_orphaned_run_records(
-            reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
-        )
-        await _reconcile_pending_landscape_runs(
-            session_service,
-            landscape_url,
-            create_tables=create_landscape_tables,
-        )
-    except (SQLAlchemyError, OSError, SchemaCompatibilityError) as cleanup_exc:
-        slog.error(
-            "lifespan_orphan_cleanup_failed",
-            exc_class=type(cleanup_exc).__name__,
-        )
+    # The startup orphan sweep fails startup on any SQL/IO fault, same as
+    # the inline-custody reconciliation above: a server that cannot settle
+    # orphaned runs would serve sessions still blocked by the active-run
+    # index and Landscape rows pending reconciliation, with no record that
+    # the sweep never ran. The process supervisor retries boot; a fault
+    # transient enough to boot through is transient enough to restart
+    # through.
+    cancelled_runs = await session_service.cancel_all_orphaned_run_records(
+        reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
+    )
+    await _reconcile_pending_landscape_runs(
+        session_service,
+        landscape_url,
+        create_tables=create_landscape_tables,
+    )
     cancelled = len(cancelled_runs)
     if cancelled:
         app.state.sessions_telemetry.orphaned_runs_cancelled_total.add(
@@ -754,29 +768,49 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             create_tables=create_landscape_tables,
         )
     )
+    lifespan_owner = asyncio.current_task()
+    if lifespan_owner is None:
+        raise RuntimeError("service lifespan must run inside an asyncio task")
+
+    def _stop_lifespan_on_orphan_failure(completed: asyncio.Task[None]) -> None:
+        if not completed.cancelled() and completed.exception() is not None:
+            lifespan_owner.cancel()
+
+    orphan_task.add_done_callback(_stop_lifespan_on_orphan_failure)
 
     try:
         yield
     finally:
-        # Cancel periodic cleanup before shutting down the executor
+        # Cancel periodic cleanup before shutting down the executor. A fatal
+        # sweeper failure cancels this owning task via the done callback above;
+        # awaiting the completed task then restores that original failure.
+        # Teardown stays in the nested finally so the failure cannot skip the
+        # executor, telemetry, or shared-worker shutdown sequence.
         orphan_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await orphan_task
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await orphan_task
+        finally:
+            app.state.readiness_probe_runner.close()
 
-        app.state.readiness_probe_runner.close()
+            # Shutdown execution service thread pool without blocking the loop:
+            # worker cleanup still schedules terminal-state writes back onto it.
+            try:
+                await execution_service.shutdown()
+            finally:
+                # Tier-2 operator telemetry stops only after all audited execution
+                # work has drained. Expected collector outages are bounded/redacted
+                # inside the runtime and can never rewrite a committed Landscape
+                # record.
+                try:
+                    await app.state.operator_telemetry.shutdown()
+                finally:
+                    # Tear down the process-wide run_sync_in_worker pool before
+                    # disposing the engine, so no worker thread races a query
+                    # against a disposed pool.
+                    from elspeth.web.async_workers import shutdown_async_workers
 
-        # Shutdown execution service thread pool without blocking the loop:
-        # worker cleanup still schedules terminal-state writes back onto it.
-        await execution_service.shutdown()
-        # Tier-2 operator telemetry stops only after all audited execution work
-        # has drained. Expected collector outages are bounded/redacted inside
-        # the runtime and can never rewrite a committed Landscape record.
-        await app.state.operator_telemetry.shutdown()
-        # Tear down the process-wide run_sync_in_worker pool before disposing
-        # the engine, so no worker thread races a query against a disposed pool.
-        from elspeth.web.async_workers import shutdown_async_workers
-
-        await shutdown_async_workers()
+                    await shutdown_async_workers()
 
 
 class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
@@ -806,6 +840,19 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
 
     _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
 
+    @trust_boundary(
+        tier=3,
+        source="client-supplied Content-Length HTTP request header at the ASGI middleware layer; "
+        "clients may omit or falsify it, so absence is legal and every present value is validated "
+        "before use",
+        source_param="request",
+        suppresses=("R1",),
+        invariant="never raises on the header value: absence passes the request through to the "
+        "per-field Pydantic caps, a non-ASCII-decimal or negative value returns a 400 response, "
+        "and a declared size over _MAX_BODY_BYTES returns a 413 response; the header is never "
+        "coerced into a fabricated length",
+        non_raising=True,
+    )
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[no-untyped-def]
         content_length = request.headers.get("content-length")
         if content_length is None:
@@ -914,10 +961,14 @@ def _frontend_build_identity(dist_dir: Path) -> str | None:
     import re
 
     index_html = dist_dir / "index.html"
-    try:
-        content = index_html.read_text(encoding="utf-8")
-    except OSError:
+    # Absence (dev/test: no built dist) legitimately disarms the feature.
+    # Any other read failure on a file that EXISTS (permissions, IO) is a
+    # deployment defect and must crash create_app rather than silently
+    # disarm the cache-coherence beacon (the prior `except OSError: return
+    # None` collapsed both into the absence path).
+    if not index_html.is_file():
         return None
+    content = index_html.read_text(encoding="utf-8")
     match = re.search(r"/assets/(index-[A-Za-z0-9_-]+\.js)", content)
     return match.group(1) if match else None
 
@@ -1416,6 +1467,7 @@ def _create_app(
             settings,
             yaml_generator_module,
             secret_service=app.state.scoped_secret_resolver,
+            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
             session_id=session_id,
             plugin_snapshot=plugin_snapshot,

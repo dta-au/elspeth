@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from datetime import UTC, datetime
@@ -39,10 +39,11 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
 )
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, GuidedCustodyIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -109,6 +110,7 @@ from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
     ComposerHistoryMessage,
     ComposerPluginCrashError,
+    ComposerResult,
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
@@ -174,6 +176,7 @@ from elspeth.web.sessions.protocol import (
     InterpretationNodeMissingError,
     InterpretationNodePluginMutatedError,
     InterpretationPlaceholderConsumedError,
+    InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
     InvalidForkTargetError,
     ProposalEventRecord,
@@ -229,6 +232,22 @@ from elspeth.web.sessions.schemas import (
 
 slog = structlog.get_logger()
 
+
+def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, **fields: object) -> None:
+    """Emit a structured diagnostic on the last-resort logging channel.
+
+    Callers evaluate every field eagerly (they are ordinary call arguments),
+    so a first-party bug in diagnostic assembly crashes in the caller frame
+    instead of being swallowed alongside the emission. Only the emission
+    itself is guarded: logging is the channel of last resort — a
+    logging-stack failure has no lower channel to surface through, and it
+    must never displace the primary outcome the caller is about to raise or
+    return.
+    """
+    with contextlib.suppress(Exception):
+        log_call(event, **fields)
+
+
 _REDACTED_SECRET_DETAIL = "<redacted-secret>"
 _PROVIDER_DETAIL_REDACTED = "Provider detail redacted because it may contain secrets."
 _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
@@ -237,6 +256,25 @@ _GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL = (
 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "ToolResult.data payload from the guided source-commit tool path — plugin/tool-produced "
+        "content whose nested shape no first-party contract promotes before this egress sanitizer"
+    ),
+    source_param="tool_result",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises TypeError when the carrier is not an exact ToolResult; any unrecognized "
+        "ToolResult.data shape yields the closed generic detail string, never a raw repr "
+        "(the raw tool_result repr can dump CompositionState with Tier-3 row data and must "
+        "not reach the HTTP body)"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_guided_source_commit_failure_detail_rejects_non_tool_result"
+    ),
+    test_fingerprint="30d4ed69702aa3b786449e221203286bc29047cdc9a9318d42800affdd64abe2",
+)
 def _guided_source_commit_failure_detail(tool_result: object) -> str:
     if type(tool_result) is not ToolResult:
         raise TypeError(f"guided source commit failure detail requires ToolResult, got {type(tool_result).__name__}")
@@ -479,15 +517,18 @@ def _tool_call_outcomes_by_call_id(
             # The per-call delta lives one level DOWN, under ``invocation``:
             # the fallback writer stores exactly
             # ``redacted_tool_invocation_content_and_envelope(...)[1]``, which
-            # is ``{"_kind": "audit", "invocation": {...}}``. Reading these
-            # keys off the top level found nothing on every real row, so an
-            # applied mutation fell through to COMPLETED and rendered as a
-            # lookup (elspeth-f5e6723133's own failure mode). ``Mapping``, not
-            # ``type() is dict``: ``ChatMessageRecord.__post_init__`` freezes
-            # ``tool_calls``, so a row read back from the DB hands us
-            # ``mappingproxy`` at BOTH levels.
-            invocation = envelope["invocation"] if "invocation" in envelope else None
-            delta: Mapping[str, Any] = invocation if isinstance(invocation, Mapping) else {}
+            # is ``{"_kind": "audit", "invocation": {...}}`` — a first-party
+            # fixed contract, and the only writer that sets ``tool_calls`` on
+            # a tool row. Reading these keys off the top level found nothing
+            # on every real row, so an applied mutation fell through to
+            # COMPLETED and rendered as a lookup (elspeth-f5e6723133's own
+            # failure mode). The DB round-trip does not demote authorship
+            # (rows come back as ``mappingproxy`` after the freeze in
+            # ``ChatMessageRecord.__post_init__``), so this is a Tier-1
+            # direct read: a missing or non-mapping ``invocation`` is
+            # corruption and crashes here instead of defaulting to an empty
+            # delta that would silently reclassify the call.
+            delta: Mapping[str, Any] = envelope["invocation"]
             # Absence is a legitimate envelope shape, not a damaged row, so the
             # membership read is the honest form.
             version_before = delta["version_before"] if "version_before" in delta else None
@@ -508,10 +549,16 @@ def _tool_call_outcomes_by_call_id(
             if status in (ComposerToolStatus.ARG_ERROR.value, ComposerToolStatus.PLUGIN_CRASH.value):
                 outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.FAILED, applied_state_version=None)
                 continue
+        # Tool-row ``content`` is first-party JSON on BOTH writer paths: the
+        # compose loop ``json.dumps``'s every tool message it persists and the
+        # fallback drain writes canonical JSON (``ChatMessageRecord.content``
+        # is a non-nullable ``str``, so a ``TypeError`` cannot fire honestly
+        # either). An undecodable tool row is Tier-1 corruption and crashes
+        # rather than defaulting to a fabricated COMPLETED classification.
         try:
             content = json.loads(row.content)
-        except (TypeError, ValueError):
-            content = None
+        except json.JSONDecodeError as exc:
+            raise AuditIntegrityError("tool-row content is not the first-party JSON both tool-row writers guarantee") from exc
         # ``content`` is freshly decoded by ``json.loads`` above — never a value
         # read off a ``deep_freeze``d owner — so a JSON object is an exact
         # ``dict`` here and the exact-type form is the accurate check.
@@ -704,6 +751,7 @@ def _state_response(
     live_validation: ValidationSummary | None = None,
     *,
     policy_catalog: PolicyCatalogView | None = None,
+    degrade_unbindable_custody: bool = False,
 ) -> CompositionStateResponse:
     """Convert a CompositionStateRecord to a CompositionStateResponse.
 
@@ -720,7 +768,8 @@ def _state_response(
     # future contract violation surfaces as ``KeyError`` rather than being
     # masked by a silent fallback — silent-failure-hunter I6 review finding,
     # 2026-05-24.
-    sources_data = deep_thaw(state.sources)
+    raw_sources = deep_thaw(state.sources)
+    sources_data = raw_sources
     if sources_data is not None:
         redacted = redact_source_storage_path({"sources": sources_data})
         sources_data = redacted["sources"]
@@ -735,7 +784,12 @@ def _state_response(
     # is blob-backed) to mask the storage_path in both the snapshot and the
     # committed source before either reaches the wire.
     composer_meta_data = deep_thaw(state.composer_meta) if state.composer_meta is not None else None
-    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(sources_data, composer_meta_data)
+    sources_data, composer_meta_data = redact_guided_snapshot_storage_paths(
+        sources_data,
+        composer_meta_data,
+        raw_sources=raw_sources,
+        degrade_unbindable=degrade_unbindable_custody,
+    )
 
     return CompositionStateResponse(
         id=str(state.id),
@@ -892,6 +946,34 @@ def merge_composer_meta_updates(
     return merged
 
 
+GUIDED_CUSTODY_PROJECTION_FAILED = "guided_custody_projection_failed"
+GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL = (
+    "This session's retained guided source review no longer matches the files this pipeline uses; "
+    "restore an earlier version from Composition history to continue."
+)
+GUIDED_CUSTODY_REVERT_REFUSED_DETAIL = (
+    "This version can't be restored: its guided source review no longer matches "
+    "the files this pipeline uses. Choose a different version from Composition history."
+)
+
+
+@contextlib.contextmanager
+def _named_guided_custody_projection(detail: str = GUIDED_CUSTODY_PROJECTION_FAILED_DETAIL) -> Iterator[None]:
+    """Name a custody-unbindable tip's read refusal instead of a bare 500.
+
+    Only a tip persisted BEFORE the write gate (elspeth-4c442aaaa8) can still
+    raise here: the gate refuses new active pairs and the projection degrades
+    terminal ones. The 409 carries a constant detail — never the path.
+    """
+    try:
+        yield
+    except GuidedCustodyIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_type": GUIDED_CUSTODY_PROJECTION_FAILED, "detail": detail},
+        ) from exc
+
+
 def _recovery_partial_state_response(state: CompositionStateRecord) -> dict[str, Any]:
     """Serialize the persisted recovery state, including its server identity."""
 
@@ -933,6 +1015,25 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
     )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options persisted inside composition_states — "
+        "CompositionStateRecord freezes its containers but does not promote the nested, "
+        "LLM-authored option shapes it couriers"
+    ),
+    source_param="state",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "raises AuditIntegrityError when a node's options is not a mapping or a present "
+        "model/model_version value is not an exact str; absent model/model_version keys are "
+        "the documented no-runtime-pin case and project as None, never a fabricated default"
+    ),
+    test_ref=(
+        "tests/unit/web/sessions/routes/test_trust_boundary_helpers.py::test_extract_runtime_model_snapshot_rejects_non_string_model"
+    ),
+    test_fingerprint="4cad4f243c81c71785c876e0ef12a5cce8aa306981361fbf7b23fbcf3405c16f",
+)
 def _extract_runtime_model_snapshot(
     state: CompositionStateRecord,
     node_id: str | None,
@@ -941,20 +1042,22 @@ def _extract_runtime_model_snapshot(
 
     ``state.nodes`` is typed ``Sequence[Mapping[str, Any]] | None`` so the
     Mapping shape is guaranteed; ``id`` and ``options`` are structurally
-    required keys (Tier-1 read — KeyError on absence is correct behaviour).
-    ``options.model`` and ``options.model_version`` are *optional* keys by
-    design — an LLM transform without an explicit pin uses an LLM-pack
-    default at runtime. The audit row's columns are nullable; recording
-    ``None`` accurately reflects "no runtime model pinned in composition
-    state" without fabricating a default.
+    required keys (KeyError on absence is correct behaviour). The nested
+    option values are composer-authored Tier-3 content couriered by the
+    record — this function is their declared parse boundary (see the
+    ``@trust_boundary`` metadata above). ``options.model`` and
+    ``options.model_version`` are *optional* keys by design — an LLM
+    transform without an explicit pin uses an LLM-pack default at runtime.
+    The audit row's columns are nullable; recording ``None`` accurately
+    reflects "no runtime model pinned in composition state" without
+    fabricating a default.
 
-    A non-string value at one of the optional keys is a Tier-1 anomaly
-    (the composition_state JSON came from our own writer). It is raised
-    as :class:`AuditIntegrityError` rather than coerced or returned as
-    NULL — a coerce would put garbage into the audit row, a NULL would
-    hide the writer-side bug. ``type(value) is str`` is used rather
-    than ``isinstance`` so callers (and the tier-model gate) can see
-    the offensive check is exact-type, not duck-typed.
+    A non-string value at one of the optional keys is malformed content.
+    It is raised as :class:`AuditIntegrityError` rather than coerced or
+    returned as NULL — a coerce would put garbage into the audit row, a
+    NULL would hide the writer-side bug. ``type(value) is str`` is used
+    rather than ``isinstance`` so callers (and the tier-model gate) can
+    see the offensive check is exact-type, not duck-typed.
     """
     if node_id is None or state.nodes is None:
         return None, None
@@ -1330,6 +1433,82 @@ def _composer_history_content(message: ChatMessageRecord) -> str:
         # out of LLM history.
         return message.raw_content
     return message.content
+
+
+def composer_turn_end_assistant_row(result: ComposerResult) -> TransitionAssistantDraft:
+    """Return the content/raw_content pair for the turn-end assistant row.
+
+    Both turn-end writers (``routes/messages.py`` send_message and
+    ``routes/composer/compose.py`` recompose) used to persist ``result.message``
+    verbatim. When the compose loop terminates AT a tool-dispatch turn — the
+    staged interpretation-review handoff is the reachable case — the model's
+    last prose IS that turn's prose, which ``turn_audit.persist_compose_turn_async``
+    has already committed as an assistant row with its ``tool_calls`` envelope.
+    The turn-end write then put the same prose in the transcript a second time,
+    with only the backend suffix to tell the copies apart, and
+    ``_composer_conversation_messages`` shows both (elspeth-d581b3da7f; live
+    session 891b7b1e persisted them 99ms apart).
+
+    The row this returns carries ONLY the backend-authored suffix, with
+    ``raw_content=""``. That is the shape ``_composer_history_content``
+    documents for backend chrome: the LLM sees an empty prior turn, so the
+    suffix stays out of prompt history, and the augmentation-prefix read-path
+    invariant still holds. ``visible_message_segments`` recognises the bare
+    suffix through its ``raw_content == ""`` arm and mints it as one
+    ``TrustedSystemNoticeSegment``, so the disclosure keeps its backend
+    provenance instead of being published as model prose.
+
+    Recognising the re-emission starts with the producer-minted
+    ``persisted_assistant_matches_terminal_model_turn`` identity proof. When
+    true, two byte-level invariants make the subtraction exact:
+
+    * ``raw_assistant_content == persisted_assistant_content`` — the terminal
+      turn's pre-synthesis prose is exactly what the committed row holds.
+    * ``message.startswith(...)`` — the augmentation-prefix contract, so the
+      split is exact.
+
+    Bytes alone cannot establish turn identity: a tool-call turn commonly
+    carries no prose, making the prefix test vacuous, while the B-4D-3
+    last-chance finalize can produce later-turn prose byte-identical to an
+    earlier persisted row. The explicit flag declines both later-turn shapes,
+    and it declines the advisor-repair branch too, whose row deliberately holds
+    a fixed public message rather than the turn's prose.
+
+    A false identity flag fails toward persisting the full message — the
+    pre-fix behaviour — never toward dropping model prose. A true flag with
+    inconsistent bytes is an owned audit-invariant violation and fails closed.
+
+    Returns ``TransitionAssistantDraft`` because it already IS this pair with
+    the audit-boundary type assertions, and because returning a value rather
+    than two locals keeps callers honest: both routes rebind ``result`` on the
+    auto-commit-revoked branch, so a pair computed once at the top of the
+    handler goes stale. Call this next to the writer that consumes it.
+    """
+    if not result.persisted_assistant_matches_terminal_model_turn:
+        return TransitionAssistantDraft(content=result.message, raw_content=result.raw_assistant_content)
+    persisted = result.persisted_assistant_content
+    if persisted is None or result.raw_assistant_content != persisted or not result.message.startswith(persisted):
+        raise AuditIntegrityError(
+            "Tier 1: ComposerResult claims the persisted assistant row matches "
+            "the terminal model turn, but its content/prefix invariants disagree."
+        )
+    suffix = result.message[len(persisted) :]
+    if not suffix:
+        # Unreachable by construction: the only producer that satisfies the
+        # predicate is the staged-handoff branch, and it always appends a
+        # non-empty canonical suffix. Reaching here means a producer built a
+        # turn-end message byte-identical to a row already in the transcript,
+        # so the alternatives are committing an exact duplicate or committing
+        # an empty bubble. Fail closed instead — the route's failed-turn
+        # machinery reports it with the audit trail intact.
+        raise AuditIntegrityError(
+            "Tier 1: composer turn-end message is byte-identical to the "
+            "assistant row the compose loop already committed "
+            f"(id={result.persisted_assistant_message_id!r}), leaving no "
+            "backend-authored suffix to persist. Writing it would duplicate "
+            "the row verbatim in the operator's transcript."
+        )
+    return TransitionAssistantDraft(content=suffix, raw_content="")
 
 
 def _is_composer_audit_tool_message(message: ChatMessageRecord) -> bool:
@@ -2006,10 +2185,20 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
         while True:
             try:
                 message = await request.receive()
-            except Exception:
+            except Exception as receive_exc:
                 # A broken receive channel means we cannot observe the
                 # client any more — stop watching rather than risk
-                # cancelling a healthy compose on a transport quirk.
+                # cancelling a healthy compose on a transport quirk. This is
+                # a third-party ASGI transport boundary, and the degradation
+                # is recorded rather than silent: a dead watcher re-opens
+                # the zombie-compose window this watcher exists to close
+                # (elspeth-e08063c3a5), so "watcher stopped" must not look
+                # identical to "no disconnect ever arrived".
+                _log_last_resort_diagnostic(
+                    slog.warning,
+                    "compose.disconnect_watcher_receive_failed",
+                    exc_class=type(receive_exc).__name__,
+                )
                 return
             if message["type"] == "http.disconnect":
                 triggered = True
@@ -2130,10 +2319,15 @@ async def _track_compose_inflight(
         terminal_status = "failed"
         raise
     finally:
+        primary_error = sys.exception()
         try:
             registry.end_request(sid)
         finally:
-            finish_composer_request_metrics(metrics_token, status=terminal_status)
+            finish_composer_request_metrics(
+                metrics_token,
+                status=terminal_status,
+                primary_error=primary_error,
+            )
 
 
 async def _state_data_from_composer_state(
@@ -2235,6 +2429,13 @@ async def _state_data_from_composer_state(
     )
     state_d = state.to_dict()
     surface_meta = dict(deep_thaw(composer_meta)) if composer_meta is not None else {}
+    # Which predicate produced this row's ``is_valid``: this writer always
+    # derives it through the strict authoring+runtime pipeline above
+    # (``_composer_persisted_validation``), so the lane marker is
+    # unconditionally "strict" — overwriting any "authoring_only" marker
+    # carried forward from a mid-turn compose row (elspeth-67c6fa691d;
+    # column doc at web/sessions/models.py ``composer_meta``).
+    surface_meta["validation_lane"] = "strict"
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
@@ -2667,6 +2868,17 @@ async def _handle_convergence_error(
             )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            # The partial state's guided custody cannot bind (write gate) or
+            # cannot project (legacy tip): keep the recovery body, name the
+            # loss the same way the save-failure arm does.
+            slog.error(
+                f"{log_prefix}_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — ``IntegrityError`` alone would
             # let ``OperationalError`` (lock timeout / pool disconnect /
@@ -2815,6 +3027,14 @@ async def _handle_plugin_crash(
             )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            slog.error(
+                f"{log_prefix}_plugin_crash_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — a narrow ``IntegrityError``
             # catch would let ``OperationalError`` / ``ProgrammingError`` /
@@ -3054,6 +3274,14 @@ async def _handle_runtime_preflight_failure(
             )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
+        except GuidedCustodyIntegrityError as custody_err:
+            slog.error(
+                f"{log_prefix}_runtime_preflight_partial_state_custody_unbindable",
+                session_id=str(session_id),
+                exc_class=type(custody_err).__name__,
+            )
+            response_body["partial_state_save_failed"] = True
+            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # See sibling helpers for redaction rationale (exc_info
             # omitted; class name only on the response body).
@@ -3273,6 +3501,7 @@ __all__ = [
     "InterpretationResolveRequest",
     "InterpretationResolveResponse",
     "InterpretationSource",
+    "InterpretationSourceDataContractDriftError",
     "InterpretationUnsupportedChoiceError",
     "InvalidForkTargetError",
     "InvariantError",
@@ -3367,6 +3596,7 @@ __all__ = [
     "_is_composer_llm_audit_tool_message",
     "_litellm_error_detail",
     "_llm_calls_from_exception",
+    "_log_last_resort_diagnostic",
     "_message_response",
     "_pending_proposal_responses",
     "_persist_llm_calls",

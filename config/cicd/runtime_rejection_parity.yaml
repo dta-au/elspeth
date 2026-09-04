@@ -300,6 +300,16 @@ sites:
   disposition: not_authorable
   note: NodeSpec has no quorum_count field (state.py:240-257) and the generator never emits one (yaml_generator.py:324-338),
     so quorum_count is always None and config.py:1079 is unreachable from composer state.
+- key: 23fdd50121dd5afd
+  path: src/elspeth/core/config.py
+  qualname: CollectorSettings.reject_on_error
+  exception: ValueError
+  message: Collector '{}' does not accept on_error. Collector failures are whole-group verdicts settled
+    through scope policy and nesting. Remove on_error.
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - collector_has_on_error_invalid
 - key: 4a0c5c7b35e438e4
   path: src/elspeth/core/config.py
   qualname: CollectorSettings.validate_input
@@ -344,17 +354,6 @@ sites:
   - node_id_invalid
   note: A collector's name is its NodeSpec id; _composer_node_id_validation_message (label 'Collector
     name') mirrors the non-empty rule (WS2 Task 12).
-- key: 650ee306729c1490
-  path: src/elspeth/core/config.py
-  qualname: CollectorSettings.validate_on_error
-  exception: ValueError
-  message: Collector on_error must be a sink name, 'discard', or omitted
-  ordinal: 0
-  disposition: mirrored
-  counterpart:
-  - connection_label_invalid
-  note: Stage 1's collector arm in _routing_label_errors rejects a blank collector on_error and runs the
-    runtime label rules on any non-'discard' value (WS2 Task 12).
 - key: 96321101ced6ef42
   path: src/elspeth/core/config.py
   qualname: CollectorSettings.validate_on_success
@@ -1699,50 +1698,103 @@ sites:
     Probed: Stage 1 is_valid=True, Stage 2 (validate_pipeline_for_trained_operator) raises ValueError
     "YAML parse failed: ComposerError". Stage 1 bounds no options nesting depth. elspeth-2ed41f0a4a census
     2026-08-17.'
-- key: 3df12e6a684506f7
+- key: 38f688705859f499
   path: src/elspeth/core/config.py
-  qualname: _expand_env_vars._expand_string.replacer
+  qualname: _expand_env_string.replacer
   exception: ValueError
   message: Required environment variable '{}' is not set. Either set the variable or use ${{var_name}:-default}
     syntax for optional values.
   ordinal: 0
   disposition: structural
-  note: 'The raise (config.py:2231) lives inside _expand_env_vars, which runs only under `if expand_env_vars:`
-    (config.py:2977-2978). Fact (B): the web preflight passes expand_env_vars=False at both load sites
-    (web/execution/service.py:2195, :2197), so this pass never executes on a composer-authored pipeline
-    and no authored value can reach the raise.'
-- key: 3d550488bb691295
+  note: Carried from 3df12e6a684506f7 (_expand_env_vars._expand_string.replacer) after the 2026-08-31
+    closure hoist; guard re-verified on the hoisted tree. The raise lives in _expand_env_string, reached
+    only via _expand_env_value inside the _expand_env_vars pass (config.py:2491), which load_settings_from_config_dict
+    runs only under `if expand_env_vars:` (config.py:3502-3503). The web preflight passes expand_env_vars=False
+    at both load sites (web/execution/service.py), so this pass never executes on a composer-authored
+    pipeline and no authored value can reach the raise.
+- key: 39ea951af8715cb6
   path: src/elspeth/core/config.py
-  qualname: _fingerprint_secrets._process_value
+  qualname: _fingerprint_process_value
   exception: SecretFingerprintError
   message: Secret field '{}' found but ELSPETH_FINGERPRINT_KEY is not set. Either set the environment
     variable or use ELSPETH_ALLOW_RAW_SECRETS=true for development (not r
   ordinal: 0
   disposition: structural
-  note: 'The raise (config.py:2502) sits inside the `elif fail_if_no_key:` branch (config.py:2501), so
-    it is conditioned on the SERVER environment, not on authored shape — it fires only when ELSPETH_FINGERPRINT_KEY
-    is unset and ELSPETH_ALLOW_RAW_SECRETS is not "true" (config.py:2484-2488, 2749). Probed: in a keyless
-    env an authored `api_key` option does reach it (Stage 1 green, resolve_config raises); with the key
-    set the same state is clean. No authoring-side check can observe the server''s env, so this is a deployment
-    invariant rather than a validate-green/runtime-red authoring gap. The nested collision raise in the
-    same function (f313f94b65fcc84b) is filed unmirrored precisely because it is OUTSIDE this guard.'
-- key: f313f94b65fcc84b
+  note: Carried from 3d550488bb691295 (_fingerprint_secrets._process_value) after the 2026-08-31 closure
+    hoist; guard re-verified. The raise sits inside the `elif fail_if_no_key:` branch (config.py:2922),
+    so it is conditioned on the SERVER environment, not on authored shape — it fires only when ELSPETH_FINGERPRINT_KEY
+    is unset and ELSPETH_ALLOW_RAW_SECRETS is not "true". No authoring-side check can observe the server's
+    env; deployment invariant, not a validate-green/runtime-red authoring gap. The sibling collision raise
+    in _recurse (a5bbc45cf2c87a19) stays unmirrored precisely because it is OUTSIDE this guard.
+- key: e307756431afce42
   path: src/elspeth/core/config.py
-  qualname: _fingerprint_secrets._recurse
-  exception: SecretFingerprintError
-  message: Config contains both '{}' and '{}'. The '{}' field is auto-generated from '{}' during fingerprinting
-    — remove '{}' from your configuration.
+  qualname: _lower_llm_component
+  exception: TypeError
+  message: '{} llm profile {} lowered a non-marker api_key: {}'
+  ordinal: 0
+  disposition: structural
+  note: 'NEW site introduced by the 2026-08-31 core-contracts remediation (lane/tier-rem-core-contracts):
+    an owned-data lowering invariant, not an authoring surface. The TypeError (config.py:2602) is guarded
+    by `if not materialize: return` (config.py:2592) — the web/composer path calls _lower_llm_profile_nodes(materialize=False)
+    via load_settings_from_config_dict (expand_env_vars=False), so it is unreachable from composer-authored
+    state twice over (materialize=False, and `profiles` is empty on composer configs). On the CLI path
+    it fires only when lower_llm_profile_options — the sole writer of executable["api_key"] — produces
+    a non-dict marker, which is a lowering bug in ELSPETH-owned code (api_key is a private profile field;
+    no authored value reaches executable). Crash-on-owned-defect, per the adjacent code comment; nothing
+    for authoring-side parity to mirror.'
+- key: 42d814311f85ff1e
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_component
+  exception: ValueError
+  message: '{} llm component ''profile'' option must be a string alias'
   ordinal: 0
   disposition: unmirrored
-  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). The X / X_fingerprint collision raise
-    (config.py:2522). extra="forbid" stops the TOP-LEVEL carrier (probed: options.api_key + options.api_key_fingerprint
-    on a value_transform fails at "Extra inputs are not permitted"), but _fingerprint_secrets recurses
-    into nested dicts (config.py:2492-2493) and the llm transform declares a free-form `lookup: dict[str,
-    Any]` (plugins/transforms/llm/base.py:93 — the "arbitrary plugin payloads" the yaml_generator docstring
-    names). Probed: LLMConfig ACCEPTS lookup={"api_key": ..., "api_key_fingerprint": ...}, and _fingerprint_secrets
-    on that shape raises the collision even with ELSPETH_FINGERPRINT_KEY SET, so unlike its sibling 3d550488bb691295
-    this raise is not env-conditioned. Stage 1 does not inspect nested option payloads for secret-field
-    shape. elspeth-2ed41f0a4a census 2026-08-17.'
+  note: 'Carried from 5a44d3a8444df94f (_lower_llm_profile_nodes.lower_component) after the 2026-08-31
+    closure hoist; semantics unchanged. elspeth-96e2dd023f (parity residue ticket, 2026-08-17). A non-string
+    `profile` option on an llm component: `profile` survives composer authoring into the loader whenever
+    the plugin-policy stage finds no profile context (web/plugin_policy/validation.py returns None when
+    profile_registry is None or the plugin has no usable aliases), and _strip_web_metadata does not remove
+    it. Probed 2026-08-17: options.profile=123 -> Stage 1 is_valid=True; settings load raises exactly
+    this message. elspeth-2ed41f0a4a census.'
+- key: a7e0f99910a0a5f3
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_component
+  exception: ValueError
+  message: '{} llm component references profile {} with credential_scope {}; batch/CLI runs have no per-user
+    secret store and can only use credential_scope ''server'' (or sco'
+  ordinal: 0
+  disposition: structural
+  note: 'Carried from e990d83362891828 (_lower_llm_profile_nodes.lower_component) after the 2026-08-31
+    closure hoist; guard re-verified. The credential_scope rejection is unreachable from composer state:
+    it runs only after `profile_settings = profiles[alias]` succeeds (config.py:2582), and `profiles`
+    is built solely from raw_config["llm_profiles"] (_lower_llm_profile_nodes, config.py) which the composer
+    never emits — so `profiles` is always empty and the unknown-profile ValueError (f9c97625d4bfa23b)
+    fires first.'
+- key: f9c97625d4bfa23b
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_component
+  exception: ValueError
+  message: '{} llm component references unknown llm profile {}'
+  ordinal: 0
+  disposition: unmirrored
+  note: Carried from 0b64446599720206 (_lower_llm_profile_nodes.lower_component) after the 2026-08-31
+    closure hoist; semantics unchanged. elspeth-96e2dd023f (parity residue ticket, 2026-08-17). Any surviving
+    string `profile` on an llm source or transform hits this, because `profiles` is always empty on a
+    composer-authored config (see a7e0f99910a0a5f3). Probed 2026-08-17 on both carriers (transform and
+    source). elspeth-2ed41f0a4a census.
+- key: 12b5e5a9ce98beb4
+  path: src/elspeth/core/config.py
+  qualname: _lower_llm_component
+  exception: ValueError
+  message: '{} llm component specifies both ''profile'' and ''provider'' — choose exactly one: an operator
+    profile alias, or explicit provider config'
+  ordinal: 0
+  disposition: unmirrored
+  note: 'Carried from 3376dcea7706f4dd (_lower_llm_profile_nodes.lower_component) after the 2026-08-31
+    closure hoist; semantics unchanged. elspeth-96e2dd023f (parity residue ticket, 2026-08-17). `profile`
+    and `provider` both present on an llm component. Probed 2026-08-17: llm transform with both keys ->
+    Stage 1 is_valid=True; settings load raises exactly this message. Stage 1 has no profile/provider
+    exclusivity rule. elspeth-2ed41f0a4a census.'
 - key: a5738f59b5792ee8
   path: src/elspeth/core/config.py
   qualname: _lower_llm_profile_nodes
@@ -1761,54 +1813,21 @@ sites:
   disposition: not_authorable
   note: 'Reads raw_config["llm_profiles"] (config.py:2331-2334). Fact (A): the composer never emits an
     `llm_profiles:` section (yaml_generator.py:197-354).'
-- key: 5a44d3a8444df94f
+- key: a5bbc45cf2c87a19
   path: src/elspeth/core/config.py
-  qualname: _lower_llm_profile_nodes.lower_component
-  exception: ValueError
-  message: '{} llm component ''profile'' option must be a string alias'
+  qualname: _recurse
+  exception: SecretFingerprintError
+  message: Config contains both '{}' and '{}'. The '{}' field is auto-generated from '{}' during fingerprinting
+    — remove '{}' from your configuration.
   ordinal: 0
   disposition: unmirrored
-  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2355 — a non-string `profile`
-    option on an llm component. `profile` survives composer authoring into the loader whenever the plugin-policy
-    stage finds no profile context (web/plugin_policy/validation.py:744-745 returns None when profile_registry
-    is None or the plugin has no usable aliases), and _strip_web_metadata does not remove it. Probed:
-    llm transform with options.profile=123 -> Stage 1 is_valid=True; load_settings_from_config_dict on
-    the generated pipeline dict raises exactly this message. elspeth-2ed41f0a4a census 2026-08-17.'
-- key: e990d83362891828
-  path: src/elspeth/core/config.py
-  qualname: _lower_llm_profile_nodes.lower_component
-  exception: ValueError
-  message: '{} llm component references profile {} with credential_scope {}; batch/CLI runs have no per-user
-    secret store and can only use credential_scope ''server'' (or sco'
-  ordinal: 0
-  disposition: structural
-  note: 'The credential_scope rejection (config.py:2366) is unreachable from composer state: it runs only
-    after `profile_settings = profiles[alias]` succeeds (config.py:2362), and `profiles` is built solely
-    from raw_config["llm_profiles"] (config.py:2329-2335), which fact (A) shows the composer never emits
-    — so `profiles` is always empty and the KeyError branch at config.py:2364 fires first.'
-- key: 0b64446599720206
-  path: src/elspeth/core/config.py
-  qualname: _lower_llm_profile_nodes.lower_component
-  exception: ValueError
-  message: '{} llm component references unknown llm profile {}'
-  ordinal: 0
-  disposition: unmirrored
-  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2364 — any surviving string
-    `profile` on an llm source or transform hits this, because `profiles` is always empty on a composer-authored
-    config (see e990d83362891828). Probed both carriers: transform and source llm nodes with options.profile="no_such_alias"
-    -> Stage 1 is_valid=True, settings load raises "transforms[0] / sources[''source''] llm component
-    references unknown llm profile ''no_such_alias''". elspeth-2ed41f0a4a census 2026-08-17.'
-- key: 3376dcea7706f4dd
-  path: src/elspeth/core/config.py
-  qualname: _lower_llm_profile_nodes.lower_component
-  exception: ValueError
-  message: '{} llm component specifies both ''profile'' and ''provider'' — choose exactly one: an operator
-    profile alias, or explicit provider config'
-  ordinal: 0
-  disposition: unmirrored
-  note: 'elspeth-96e2dd023f (parity residue ticket, 2026-08-17). config.py:2357 — `profile` and `provider`
-    both present on an llm component. Probed: llm transform with both keys -> Stage 1 is_valid=True; settings
-    load raises exactly this message. Stage 1 has no profile/provider exclusivity rule. elspeth-2ed41f0a4a
+  note: 'Carried from f313f94b65fcc84b (_fingerprint_secrets._recurse) after the 2026-08-31 closure hoist;
+    semantics unchanged. elspeth-96e2dd023f (parity residue ticket, 2026-08-17). The X / X_fingerprint
+    collision raise: extra="forbid" stops the TOP-LEVEL carrier, but the fingerprint walk recurses into
+    nested dicts and the llm transform declares a free-form `lookup: dict[str, Any]` (plugins/transforms/llm/base.py)
+    — probed 2026-08-17: LLMConfig ACCEPTS lookup={api_key, api_key_fingerprint} and the walk raises the
+    collision even with ELSPETH_FINGERPRINT_KEY SET; unlike sibling 39ea951af8715cb6 this raise is not
+    env-conditioned. Stage 1 does not inspect nested option payloads for secret-field shape. elspeth-2ed41f0a4a
     census 2026-08-17.'
 - key: 19d4370762325eae
   path: src/elspeth/core/config.py

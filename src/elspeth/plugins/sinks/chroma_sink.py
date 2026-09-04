@@ -148,7 +148,7 @@ class ChromaSinkConfig(DataPluginConfig):
         Do not narrow it to ``fixed`` without a ruling, and note when asking
         that the house rule for the identical question on the transform side
         went the other way FOUR MONTHS LATER —
-        ``BaseTransform._reject_unknown_config_named_columns``
+        ``BaseTransform._reject_fixed_schema_omitting_consumed_fields``
         (``plugins/infrastructure/base.py``, ``elspeth-d3958d90f5``,
         2026-08-06) gates on ``mode != "fixed"`` because "Flexible schemas
         admit the column as an extra ... odd configs, not incoherent ones".
@@ -213,7 +213,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4a1d0b1cd65b1f8d"
+    source_file_hash: str | None = "sha256:0a6b845505e56554"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION

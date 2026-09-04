@@ -578,4 +578,56 @@ describe("useAuditReadinessStore", () => {
     // Suppress unused-variable warning from the unused resolve binding.
     void resolveFirst;
   });
+  // carrySnapshotForward — the identity half of the content-equal skip
+  // (elspeth-986801d218, review round 1). The CALLER proves the two versions
+  // carry identical authored content; this proves the store refuses to stamp
+  // any snapshot that is not the one fetched for the named predecessor.
+  describe("carrySnapshotForward", () => {
+    it("re-stamps the predecessor's snapshot onto the new version", () => {
+      useAuditReadinessStore.setState({
+        snapshotsBySession: { [SESSION_ID]: snapshot(1) },
+      });
+
+      useAuditReadinessStore.getState().carrySnapshotForward(SESSION_ID, 1, 2);
+
+      const carried = useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID];
+      expect(carried?.composition_version).toBe(2);
+      // Content untouched: this is the SAME server answer, re-keyed.
+      expect(carried?.rows).toEqual(snapshot(1).rows);
+      expect(carried?.validation_result).toEqual(snapshot(1).validation_result);
+    });
+
+    it("does nothing when the cached snapshot is not the predecessor's", () => {
+      useAuditReadinessStore.setState({
+        snapshotsBySession: { [SESSION_ID]: snapshot(3) },
+      });
+
+      useAuditReadinessStore.getState().carrySnapshotForward(SESSION_ID, 1, 2);
+
+      expect(
+        useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID]?.composition_version,
+      ).toBe(3);
+    });
+
+    it("does nothing when the session has no cached snapshot", () => {
+      useAuditReadinessStore.setState({ snapshotsBySession: {} });
+
+      useAuditReadinessStore.getState().carrySnapshotForward(SESSION_ID, 1, 2);
+
+      expect(useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID]).toBeUndefined();
+    });
+
+    it("does not reach across sessions", () => {
+      useAuditReadinessStore.setState({
+        snapshotsBySession: { [SESSION_ID]: snapshot(1) },
+      });
+
+      useAuditReadinessStore.getState().carrySnapshotForward(OTHER_SESSION_ID, 1, 2);
+
+      expect(
+        useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID]?.composition_version,
+      ).toBe(1);
+      expect(useAuditReadinessStore.getState().snapshotsBySession[OTHER_SESSION_ID]).toBeUndefined();
+    });
+  });
 });

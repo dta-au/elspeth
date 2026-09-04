@@ -11,9 +11,10 @@ Until 2026-08-30 this material sat in `AGENTS.md` itself, which meant the
 maintainer's tool choices read as project mandates. It was split out under
 [ADR-043](../architecture/adr/043-project-tooling.md) so that the public
 covenant stays short and harness-neutral. The Filigree and Loomweave blocks
-below are installer-written: their installers rewrite the block between the
-`<!-- <tool>:instructions -->` markers on every run, and those blocks now
-live here rather than in `AGENTS.md`.
+below are installer-written mirrors: their installers rewrite the block
+between the `<!-- <tool>:instructions -->` markers on every run. Their exact
+placement is installer-owned and may also include `AGENTS.md` or `CLAUDE.md`;
+this document must not claim exclusive custody of those blocks.
 
 The tools named here are the ones the maintainer's agents currently carry
 standing instructions for. The first-party `elspeth-lints` package and its
@@ -241,26 +242,39 @@ Full reference: `loomweave-workflow` skill, `loomweave --help`, MCP schemas.
 ### ELSPETH's Loomweave usage
 
 The block above is installer-written. ELSPETH's own guidance
-([ADR-043](../architecture/adr/043-project-tooling.md)):
+([ADR-043](../architecture/adr/043-project-tooling.md), re-measured
+2026-09-02 on Loomweave 1.6.1):
 
-- **Reach for it for:** who calls X (`entity_callers_list`), what subclasses
-  or implements X (`entity_relation_list`, `direction=in`), execution paths /
-  call trees (`entity_execution_path_list`, `entity_orientation_pack_get`),
-  and where X is defined in a large file (`entity_find`). These measured
-  correct against `ast` ground truth and have no grep equivalent.
-- **Do not rely on it for** semantic search, dead-code lists, HTTP-route
-  inventories, or test-caller lists until the salvage worklist closes; on
-  those `git grep` measured as good or better.
-- `entity_find` takes **`pattern`** — not `name`, not `query`; 43 % of all
-  historical calls failed on that.
-- **Zero callers is not "no callers".** Read `traversal_complete`,
-  `scope_excludes`, and `unresolved_candidates` before concluding; class
-  instantiations (never resolved to a call edge) and calls from files analyzed
-  by a venv-less hook run may sit there as `why: dynamic`. Confirm a negative
-  with `git grep`.
-- Check `project_status_get` staleness first; a re-analyze is triggered by
-  the git hooks on the main checkout, not by worktree commits. Any list over
-  ~100 rows overflows the MCP result cap — page with the cursor.
+- **Reach for it for:** who calls X (`entity_callers_list` — now covers
+  instantiations, attribute-receiver calls, and test callers;
+  `entity_test_caller_list` for the test-tagged subset), what subclasses or
+  decorates X (`entity_relation_list`: `direction=in` for subclasses,
+  `direction=out` on a decorator), execution paths
+  (`entity_execution_path_list`, `entity_orientation_pack_get`), where X is
+  defined (`entity_find` by name, also inside 14k-line files), what does Y
+  (`entity_semantic_search_list` — verify the hit), and the catalogue lists
+  (exported API, CLI commands, data models, entry points, coupling hotspots,
+  circular imports). Each measured correct against `ast` ground truth.
+- **Do not rely on it for** dead-code lists (0 of 21 sampled were dead),
+  HTTP-route inventories (0 of 91 real routes, reported as complete),
+  `entity_subsystem_get` (75 s a call — use `subsystem_member_list`), or a
+  docstring-only concept word in `entity_find` (use semantic search).
+- **Skip any row with `sei: null`** — it is a ghost of deleted or moved code
+  (4,159 of them on 2026-09-02); `entity_find` and `entity_at` still serve them.
+- `entity_find` takes **`pattern`** — not `name`, not `query`. `entity_at`
+  takes `file` + `line`; `entity_resolve` takes `qualnames`.
+- **An empty callers answer is trustworthy** unless `unresolved_name_matches`
+  is non-zero (then read `entity_call_site_list role=callee`) or the target
+  lives in one of the three degraded files ADR-043 names.
+  `traversal_complete` is `false` tree-wide while any file is degraded, so it
+  says nothing about your entity. A call in a nested function is counted
+  against the nested function and its enclosers.
+- **Page at `limit ≤ 40`**: a 100-row page is 57–70 KB and the harness
+  diverts it to a file; `entity_find` at 100 omits its cursor.
+- Check `project_status_get` staleness first. Re-analysis fires on merges
+  and branch switches on the main checkout; commits no longer trigger it, and
+  a linked worktree has its own isolated store (`loomweave worktree analyze
+  <name>` builds it) — a worktree commit never touches the main index.
 
 ## Judge-signature seam: how the maintainer's agents use it
 

@@ -42,6 +42,8 @@ _SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
     ),
 }
 
+_TYPE_COERCE_TARGETS = frozenset({"int", "float", "bool", "str"})
+
 
 def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[ValidationError]:
     """Reframe missing required source/sink settings without parsing prose.
@@ -59,9 +61,14 @@ def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[Valida
     """
     missing_parts: set[str] = set()
     for error in exc.errors():
-        if error.get("type") != "missing":
+        # pydantic's ErrorDetails is third-party data: read the two keys in
+        # the visible membership-then-subscript form. An absent key simply
+        # fails to match, and this reframe contributes nothing — the original
+        # pydantic error still surfaces through the caller.
+        error_type = error["type"] if "type" in error else None
+        if error_type != "missing":
             continue
-        loc = error.get("loc") or ()
+        loc = error["loc"] if "loc" in error else ()
         part = loc[0] if loc else None
         if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:
             missing_parts.add(part)
@@ -517,6 +524,32 @@ def _build_edge_contract_suggestion_with_resolver(
     parts.append(f"  (a) Relax the consumer's input schema on {consumer.display_name}. Either:")
     if has_type_mismatch:
         parts.append("      - Change the declared field type(s) to match what the producer emits (see Type mismatches above).")
+        # Declared-narrower-than-producer-any is the one mismatch where
+        # relaxing the consumer ERASES a real contract: the reachable
+        # narrowing lives upstream in type_coerce, and without naming it
+        # here planners widen every downstream consumer (and the sink) to
+        # 'any' instead (session 891b7b1e, elspeth-8762d9b666).
+        any_producer_mismatches = tuple((field, expected) for field, expected, actual in result.type_mismatches if actual == "Any")
+        supported_conversions = tuple((field, expected) for field, expected in any_producer_mismatches if expected in _TYPE_COERCE_TARGETS)
+        unsupported_targets = tuple(
+            (field, expected) for field, expected in any_producer_mismatches if expected not in _TYPE_COERCE_TARGETS
+        )
+        if supported_conversions:
+            fields_text = ", ".join(repr(field) for field, _expected in supported_conversions)
+            conversions_text = ", ".join(f"{{'field': {field!r}, 'to': {expected!r}}}" for field, expected in supported_conversions)
+            parts.append(
+                f"      - EXCEPTION for {fields_text}: the producer emits 'any'. To KEEP the consumer's narrower declared "
+                "type, insert a type_coerce transform between producer and consumer — options.conversions: "
+                f"[{conversions_text}] with schema mode 'observed' — which narrows the value with a "
+                "defined error path. Widening this consumer (or the sink) to 'any' erases the type contract instead."
+            )
+        for field, expected in unsupported_targets:
+            parts.append(
+                f"      - EXCEPTION for {field!r}: the producer emits 'any', but declared target {expected!r} has no "
+                "available built-in conversion. To KEEP the consumer's declared contract, use an upstream producer or "
+                "transform whose documented output contract guarantees that exact target; otherwise deliberately change "
+                "the consumer's declared type to 'any' and accept that the narrower contract is no longer enforced."
+            )
     if has_missing:
         parts.append(
             "      - Drop the missing required fields from wherever the consumer declares them — its schema.required_fields "

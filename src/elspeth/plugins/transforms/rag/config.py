@@ -5,10 +5,11 @@ from __future__ import annotations
 import keyword
 import re
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 
+from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 
@@ -23,18 +24,25 @@ _ProviderEntry = tuple[type[Any], Callable[..., Any]]
 
 
 def _get_providers() -> dict[str, _ProviderEntry]:
-    """Lazy provider registry — only imports providers whose deps are installed."""
+    """Lazy provider registry — only imports providers whose deps are installed.
+
+    Only the ABSENCE of a provider's optional third-party SDK removes it from
+    the registry. A first-party retrieval module that fails its own import —
+    or an installed SDK missing a transitive dependency — is a broken install
+    and propagates rather than reading as "provider unavailable"
+    (the same posture as ``read_litellm_model_list``).
+    """
     providers: dict[str, _ProviderEntry] = {}
 
-    try:
-        from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
-            AzureSearchProvider,
-            AzureSearchProviderConfig,
-        )
+    # azure_search speaks the Azure Search REST API through httpx (a core
+    # dependency) and needs no optional SDK: it is unconditionally available,
+    # and any import failure here is a first-party bug that must surface.
+    from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
+        AzureSearchProvider,
+        AzureSearchProviderConfig,
+    )
 
-        providers["azure_search"] = (AzureSearchProviderConfig, AzureSearchProvider)
-    except ModuleNotFoundError:
-        pass  # azure SDK not installed — azure_search provider unavailable
+    providers["azure_search"] = (AzureSearchProviderConfig, AzureSearchProvider)
 
     try:
         from elspeth.plugins.infrastructure.clients.retrieval.chroma import (
@@ -53,8 +61,15 @@ def _get_providers() -> dict[str, _ProviderEntry]:
             return ChromaSearchProvider(config=config, execution=execution, run_id=run_id)
 
         providers["chroma"] = (ChromaSearchProviderConfig, _chroma_factory)
-    except ModuleNotFoundError:
-        pass  # chromadb not installed — chroma provider unavailable
+    except ModuleNotFoundError as exc:
+        # Only chromadb itself being absent is the documented optional-extra
+        # state ([rag] not installed). A chromadb that is installed but fails
+        # its own import — a missing transitive dependency, a broken wheel —
+        # or a missing first-party module propagates: the remediation for an
+        # absent provider ("install elspeth[rag]") is wrong for a broken one.
+        missing = exc.name or ""
+        if missing != "chromadb" and not missing.startswith("chromadb."):
+            raise
 
     return providers
 
@@ -73,7 +88,13 @@ class RAGRetrievalConfig(TransformDataConfig):
             return SchemaConfig.from_dict(v)
         return v
 
-    output_prefix: str = Field(description="Prefix used for fields emitted by retrieval, such as contexts and scores.")
+    output_prefix: Annotated[
+        str,
+        EmittedToOutput(
+            "rag_retrieval builds its emitted field names from this prefix, so the value becomes "
+            "part of row-data keys and downstream artifact columns"
+        ),
+    ] = Field(description="Prefix used for fields emitted by retrieval, such as contexts and scores.")
     query_field: str = Field(description="Input row field containing the retrieval query text.")
     query_template: str | None = Field(
         default=None,
@@ -95,7 +116,10 @@ class RAGRetrievalConfig(TransformDataConfig):
         default="numbered",
         description="Formatting style used when combining retrieved contexts into output text.",
     )
-    context_separator: str = Field(default="\n---\n", description="Separator inserted between retrieved contexts when applicable.")
+    context_separator: Annotated[
+        str,
+        EmittedToOutput("rag_retrieval inserts this separator into the combined context value written to row data"),
+    ] = Field(default="\n---\n", description="Separator inserted between retrieved contexts when applicable.")
     max_context_length: int | None = Field(
         default=None,
         ge=1,

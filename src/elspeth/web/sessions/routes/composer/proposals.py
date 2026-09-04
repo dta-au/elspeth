@@ -433,13 +433,73 @@ async def accept_composition_proposal(
 
             accepted_state = None
             if result.updated_state.version == current_state.version:
+                # The tool ran but did not advance composition state. The route
+                # used to return a single uninformative 409 here regardless of
+                # whether the tool succeeded with no-op or failed semantically.
+                # Distinguish the cases so the operator sees the actual reason
+                # — a generic "did not change composition state" leaves a user
+                # with no path forward (session f613306b-… 2026-05-14: the LLM
+                # emitted a set_pipeline with no `options` blocks on any node;
+                # the validator rejected it; the 409 said only that state
+                # didn't change, marking the proposal as "stale" in the
+                # frontend without revealing the validation errors that were
+                # the actual blocker).
                 if not result.success:
-                    error_summary = result.data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
+                    # ``result`` is our own ``execute_tool`` output. Every
+                    # ``success=False`` ToolResult is built by one of the two
+                    # failure factories in ``web/composer/tools/_common.py``
+                    # (``_failure_result`` and the credential-repair factory),
+                    # both of which set ``data`` to a Mapping carrying
+                    # ``_DATA_ERROR_KEY``. That is a first-party contract — read
+                    # it directly and let a contract violation (a future tool
+                    # building ``success=False`` without the error key) crash
+                    # loudly rather than degrade to a generic message.
+                    # ``ToolResult.data`` is the closed ``ToolResultData`` union
+                    # (Mapping | Sequence | BaseModel | None), so the carrier half
+                    # of that contract is asserted before the read rather than
+                    # assumed by indexing (ADR-032). The key half stays a bare
+                    # subscript: a missing ``_DATA_ERROR_KEY`` is the loud KeyError
+                    # the comment above asks for.
+                    failure_data = result.data
+                    if not isinstance(failure_data, Mapping):
+                        raise TypeError(f"a success=False ToolResult must carry a Mapping data payload, got {type(failure_data).__name__}")
+                    error_summary = failure_data[_DATA_ERROR_KEY] or "Composer proposal failed validation."
                     validation_errors_payload = (
                         [{"component": entry.component, "message": entry.message} for entry in result.validation.errors]
                         if result.validation is not None
                         else []
                     )
+                    # Auto-reject the proposal. It is structurally unacceptable
+                    # in its current form — the LLM emitted invalid arguments
+                    # that the runtime validator rejects, and the proposal
+                    # cannot become acceptable without the composer producing
+                    # a fresh, corrected proposal. Leaving it pending causes
+                    # the "refresh asks me to reapprove" friction reported by
+                    # the operator on 2026-05-14: in-memory frontend stale
+                    # marking is lost on page reload, so the broken proposal
+                    # re-surfaces in the pending banner. Marking as rejected
+                    # server-side keeps the audit trail honest (the user
+                    # clicked Accept; the server recorded why it could not
+                    # apply; the proposal is terminal). Audit attribution
+                    # records the system as the rejecting actor so the trail
+                    # distinguishes operator-driven rejection from this
+                    # automatic-on-validation-failure path.
+                    # Control-flow sentinel, not a swallowed error. The
+                    # route-level session compose lock serializes normal
+                    # Accept/reject HTTP handlers, but non-route callers can
+                    # still transition the proposal between our load above and
+                    # this defensive auto-reject write. ``reject_composition_proposal``
+                    # raises ``ValueError`` for exactly that terminal-state case.
+                    # When that fires, the desired end state — the proposal is no
+                    # longer pending — is already satisfied, and the winning
+                    # transition recorded its own lifecycle event.
+                    # Fall through to the 422 below, which surfaces the real
+                    # validation failure to the operator. We suppress ONLY
+                    # ``ValueError`` (the benign status-race signal); we deliberately
+                    # do NOT suppress ``KeyError`` (proposal row missing): the row
+                    # was loaded successfully above and proposals are never
+                    # hard-deleted, so a missing row is corruption of our own data
+                    # and must crash rather than be swallowed.
                     try:
                         _rejected, was_cancelled = await _await_with_deferred_cancellation(
                             service.reject_composition_proposal(

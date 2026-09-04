@@ -21,6 +21,7 @@ from elspeth.contracts import Determinism, TransformResult, propagate_contract
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError, TransformErrorReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
@@ -55,10 +56,11 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:db8cc2f7aaf49719"
+    source_file_hash: str | None = "sha256:a1b9824abb66dd99"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     _provider: RetrievalProvider | None
     capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
 

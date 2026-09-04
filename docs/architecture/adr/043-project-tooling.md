@@ -110,38 +110,86 @@ on and works; the 28 issue↔entity bindings it can see were written as
 side-effects and have never driven a decision — they are tolerated, not
 relied on.
 
-*Scope of approval.* Loomweave is approved for the questions it measured
-correct on (2026-08-29, live probe against `ast`/`git` ground truth):
-**callers of an entity** (precision/recall 1.0 on every `src/` case probed,
-including a function-local-import caller), **subclasses / relations** (exact,
-where grep returns docstring false positives), **execution paths / call
-trees** (no grep equivalent), and **definition lookup in large files**. It is
-*not* advertised for semantic search, dead-code candidates, HTTP-route
-inventories, or test-caller lists until the defects recorded in
-`docs/plans/2026-08-29-loomweave-salvage-worklist.md` are fixed
-— on those questions `git grep` measured as good or better, and a tool that
-is right on three questions and wrong on four teaches agents to distrust all
-seven.
+*Scope of approval (amended 2026-09-02; supersedes the 2026-08-29 scope).*
+Re-measured on Loomweave 1.6.1 at `dc8949a8f` by four read-only probe lanes
+against `ast` / `git grep` ground truth; the numbers here are the record.
+Approved, because it measured as good as or better than grep:
 
-*Why it is kept rather than retired.* A large-file resolution defect degraded
-97–100 % of analyzed files through 2026-08 (five consecutive failed runs in
-the two hours before the fix); agents measurably stopped using it (Codex:
-1,970 calls in July, 1,882 of them cancelled over two days, then 164 in
-August; Claude Code: 104 of 180,517 tool calls, none from search-specialist
-or lane agents). The agents' own recorded reason was less "wrong answer"
-than "trust question": stale-index warnings (38 explicit statements across
-both harnesses) and the rule that a zero-caller answer must be corroborated
-by grep — "once I'm going to grep, I skip the first step." The extractor fix landed 2026-08-29 17:50 local; the first post-fix
-incremental run degraded 3 of 45 files, and the first post-fix full
-re-analyze (run `f085278d`, 38 min, all 3,093 files, 0 skipped) degraded
-**3 files in the whole tree** — `web/sessions/service.py` (13,645 lines,
-reference-site cap), `web/composer/tool_batch.py` (2,354 lines, pyright
-timeout), and one 1,165-line integration test — with zero pyright restarts. The maintainers' preference is to
-salvage: the graph is theirs, the three approved capabilities have no
-substitute, and the remaining problems are enumerable. The salvage worklist
-is the condition of this approval; the measurement that decides whether it
-worked is adoption, re-run with the same transcript forensics after the next
-delivery wave. If lane and Explore agents still make zero Loomweave calls
+- **callers of a function or class** — including function-local-import
+  callers, attribute-receiver calls, class instantiations, and test callers
+  (4 of 4 `src/` targets at 100 % recall; 3 of 3 test-caller targets exact;
+  instantiation edges 0 → 39,520; test files resolving into `src/` 78 % → 83 %);
+- **subclasses and decorated functions** (`inherits_from` 147/147 exact;
+  `decorates` with `direction=out` 286/294 — the eight misses sit in the two
+  pyright-timeout files and are not disclosed);
+- **execution paths** (8 of 8 spot-checked edges real; a path stops at the
+  Protocol declaration of an injected service, disclosed as
+  `attribute-receiver-calls`);
+- **definition lookup by name** (5 of 5 at rank 1, including inside the
+  14k-line `web/sessions/service.py`);
+- **semantic search for a concept** (`entity_semantic_search_list`, local
+  bge-small: 4 of 5 queries had the target in the top 5, 3 at rank 1, where
+  two-keyword grep returned 6–8 files with no function pointer) — verify the hit;
+- **the catalogue lists** — exported API, CLI commands, data models, entry
+  points, coupling hotspots, circular imports (spot-checks correct; TODO and
+  deprecation lists report `unsupported`, not empty).
+
+Still not advertised, because it measured wrong or unusable: **dead-code
+candidates** (0 of 21 sampled were dead; the tool rates itself low
+confidence), **HTTP-route inventories** (0 of 91 real routes, reported as
+`complete`), **`entity_subsystem_get`** (74–80 s a call; `subsystem_member_list`
+answers in 5 ms), and **`entity_find` for a word that appears only in a
+docstring** (name matches outrank it; use semantic search).
+
+Limits every agent applies:
+
+1. **A row with `sei: null` is a ghost.** 4,159 entities from deleted or moved
+   code, every one lacking an alive SEI, are still served by `entity_find` /
+   `entity_at` and inflate inventories (28 of 227 `http-route` tags). Skip them.
+2. **`traversal_complete` is `false` tree-wide** while any file is degraded —
+   three are (`web/composer/tool_batch.py` and
+   `web/sessions/routes/composer/guided_chat_atomic.py` on pyright timeout;
+   `web/sessions/service.py` references only). It cannot separate an honest
+   empty from a complete empty. An empty callers answer with
+   `unresolved_name_matches: 0` is trustworthy for every other file.
+3. **A call inside a nested function is attributed to the nested function and
+   each enclosing function** (about 6 % inflation on large caller sets).
+4. **Page at `limit ≤ 40`.** The server pages at 100 with `next_cursor`, but a
+   100-row page is 57–70 KB and the harness diverts it to a file; `entity_find`
+   at 100 omits its cursor.
+5. **The secret scanner still blocks docstrings file-wide** (6,315 entities in
+   100 files, 93 of them tests; down from 10,708 in 170). The project's
+   `# secret-scan: allow-this-line` marker is now honoured, so marking a
+   file's remaining fixture literals unblocks the whole file.
+6. Median call latency 0.09 s, p90 1 s (was 3.1 s / 11 s).
+
+*Operations (re-measured 2026-09-02).* Re-analysis fires on `post-merge` and
+branch-switch `post-checkout` only — the 1.6.1 install rewrote `post-commit`
+to `exit 0` — and a commit range touching no indexed path completes in
+0.1–0.25 s; a real incremental run is about 27 s; 0 of 90 runs since 08-30
+failed; abandoned runs are reaped; the four freshness oracles derive from one
+computation. Worktree commits never touch the main index: a linked worktree
+routes to its own isolated store, which `loomweave worktree analyze <name>`
+builds, so a worktree-side graph answer needs that store built first. No
+debounce exists: a merge-heavy day on the shared checkout still fires one run
+per merge, serialised by the lock.
+
+*Why it is kept rather than retired.* Through 2026-08 a large-file
+resolution defect degraded 97–100 % of analyzed files and agents measurably
+stopped using it (Codex: 1,970 calls in July, 1,882 cancelled over two days;
+Claude Code: 104 of 180,517 tool calls, none from search or lane agents); the
+recorded reason was distrust — stale-index warnings and the rule that a
+zero-caller answer had to be re-grepped. The extractor fix landed 2026-08-29
+and the defects behind that rule (venv-less test analysis, invisible
+instantiations) measured fixed on 2026-09-02. Adoption re-measured for the
+post-fix window (2026-08-29 08:00Z to 2026-09-02, the measuring session
+excluded): 67 Loomweave calls in 8 of 505 sessions (3 main, 5 subagent)
+against about 10,900 grep-class calls; `entity_find` argument errors 43 % → 0;
+`entity_callers_list` empty answers 50 % → 1 of 11; grep-after-empty 0. The
+correctness criterion set on 2026-08-29 is met. Adoption is not, and is now a
+briefing problem — the restrictions this amendment lifts were the recorded
+reason to skip the tool — rather than a trust problem. Re-measure after the
+next delivery wave; if lane and Explore agents still make no Loomweave calls
 against a working index, this section is amended to a retirement.
 
 ### The project ships no tool integrations beyond these

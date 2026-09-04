@@ -520,7 +520,7 @@ class SinkEffectCoordinator:
         heartbeat = _SinkEffectLeaseHeartbeat(effects=self._effects, claim=lease, ttl=self._lease_ttl)
         heartbeat.start()
         try:
-            return self._execute_effect_under_lease(
+            result = self._execute_effect_under_lease(
                 effect=effect,
                 request=request,
                 sink=sink,
@@ -531,6 +531,12 @@ class SinkEffectCoordinator:
             )
         finally:
             heartbeat.stop()
+        # A heartbeat failure captured after the last in-flight
+        # refresh_and_check would otherwise ride out inside the stopped
+        # thread: authority was in doubt during the window, so the outcome
+        # must not be reported as a clean success.
+        heartbeat.check_and_raise()
+        return result
 
     def _execute_effect_under_lease(
         self,
@@ -569,6 +575,7 @@ class SinkEffectCoordinator:
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=commit_result.descriptor,
                 evidence=commit_result.evidence,
                 accepted_ordinals=tuple(commit_result.accepted_ordinals),
@@ -605,6 +612,7 @@ class SinkEffectCoordinator:
                 effect_id=effect.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=reconciliation.descriptor,
                 evidence=reconciliation.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -634,6 +642,7 @@ class SinkEffectCoordinator:
             effect_id=effect.effect_id,
             request=request,
             lease=lease,
+            heartbeat=heartbeat,
             descriptor=commit.descriptor,
             evidence=commit.evidence,
             accepted_ordinals=tuple(commit.accepted_ordinals),
@@ -752,6 +761,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -767,6 +777,7 @@ class SinkEffectCoordinator:
                 effect_id=plan.effect_id,
                 request=request,
                 lease=lease,
+                heartbeat=heartbeat,
                 descriptor=result.descriptor,
                 evidence=result.evidence,
                 accepted_ordinals=accepted_ordinals,
@@ -1414,6 +1425,7 @@ class SinkEffectCoordinator:
         effect_id: str,
         request: SinkEffectExecutionRequest,
         lease: SinkEffectLease,
+        heartbeat: _SinkEffectLeaseHeartbeat,
         descriptor: ArtifactDescriptor,
         evidence: Mapping[str, object],
         accepted_ordinals: tuple[int, ...],
@@ -1427,6 +1439,13 @@ class SinkEffectCoordinator:
             members = tuple(by_ordinal[ordinal] for ordinal in accepted_ordinals)
         except KeyError as exc:
             raise LandscapeRecordError(f"sink result accepted unknown member ordinal {exc.args[0]}") from exc
+        # Retire and join the background renewer before our own terminal CAS.
+        # A beat after FINALIZED would correctly fail the repository's live-
+        # lease fence but would be our retirement, not a rival takeover. The
+        # synchronous final refresh proves exact authority at the handoff;
+        # finalize rechecks owner, generation, and expiry under its row locks.
+        heartbeat.stop()
+        heartbeat.refresh_and_check()
         return self._effects.finalize(
             SinkEffectFinalizeRequest(
                 effect_id=effect_id,
@@ -1546,7 +1565,16 @@ class SinkEffectCoordinator:
             artifact = artifacts_by_effect[predecessor.effect_id]
             if not artifact.publication_performed:
                 plan = self._load_plan(predecessor)
-                if plan.safe_evidence.get("publication_kind") != "reaffirmed":
+                # A finalized no-publication predecessor's plan carries
+                # publication_kind by contract (SinkEffectPlan.__post_init__
+                # rejects NO_PUBLICATION evidence without it, and
+                # _finalize_no_publication refused to finalize without it) —
+                # absence here is audit corruption, not "not reaffirmed".
+                try:
+                    publication_kind = plan.safe_evidence["publication_kind"]
+                except KeyError as exc:
+                    raise LandscapeRecordError("finalized no-publication sink effect predecessor is missing publication evidence") from exc
+                if publication_kind != "reaffirmed":
                     # A virtual or inherited predecessor did not establish new
                     # remote identity: walk back to the most recent real
                     # publication in the stream (elspeth-fac5260c6a).

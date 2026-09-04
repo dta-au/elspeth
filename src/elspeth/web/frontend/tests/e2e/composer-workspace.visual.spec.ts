@@ -11,20 +11,15 @@ import { setupWorkspaceScenario } from "./helpers/workspace-setup";
 
 const FIXED_BROWSER_TIME = new Date("2026-08-11T08:00:30.000Z");
 
-function expectedTerminalStatuses(scenario: WorkspaceScenario): {
-  validation: string;
-  audit: string;
-} {
+function expectedTerminalChecksStatus(scenario: WorkspaceScenario): string {
+  // The Checks tab's merged worst-of status: 24 validation errors plus the
+  // fixture's one DISTINCT audit issue (plugin_trust) — the audit
+  // "validation" row mirrors the failure the 24 already count, so it adds
+  // nothing — or the all-clear.
   if (scenario === "validation-audit-issues") {
-    return {
-      validation: "Validation: 24 errors",
-      audit: "Audit: 2 issues",
-    };
+    return "Checks: 25 issues";
   }
-  return {
-    validation: "Validation: Passed",
-    audit: "Audit: Ready",
-  };
+  return "Checks: Ready";
 }
 
 async function settleGraphViewport(page: Page): Promise<void> {
@@ -92,12 +87,8 @@ async function openStableVisualScenario(
       await page.evaluate(async () => {
         await document.fonts.ready;
       });
-      const terminalStatuses = expectedTerminalStatuses(scenario);
-      await expect(createdComposer.validationStatus()).toHaveAccessibleName(
-        terminalStatuses.validation,
-      );
-      await expect(createdComposer.auditStatus()).toHaveAccessibleName(
-        terminalStatuses.audit,
+      await expect(createdComposer.checksTab()).toHaveAccessibleName(
+        expectedTerminalChecksStatus(scenario),
       );
       await expect(page.locator(".react-flow__node")).toHaveCount(
         expectedNodeCount,
@@ -244,7 +235,7 @@ test.describe("Composer workspace visual baselines", () => {
     }
   });
 
-  test("inspector open at 1280x720", async ({ page }) => {
+  test("checks tab open at 1280x720", async ({ page }) => {
     const { composer, sessionId } = await openStableVisualScenario(
       page,
       "validation-audit-issues",
@@ -252,13 +243,15 @@ test.describe("Composer workspace visual baselines", () => {
       2,
     );
     try {
-      await expect(composer.validationStatus()).toHaveAccessibleName(
-        "Validation: 24 errors",
+      await expect(composer.checksTab()).toHaveAccessibleName(
+        "Checks: 25 issues",
       );
-      await composer.validationStatus().click();
-      await expect(composer.inspector()).toBeVisible();
+      await composer.checksTab().click();
+      await expect(
+        page.getByRole("region", { name: "Audit readiness" }),
+      ).toBeVisible();
       await expect(composer.workspace()).toHaveScreenshot(
-        "inspector-open-1280x720.png",
+        "checks-open-1280x720.png",
         { animations: "disabled", caret: "hide" },
       );
     } finally {

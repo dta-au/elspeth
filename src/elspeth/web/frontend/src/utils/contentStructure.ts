@@ -90,6 +90,7 @@ export function parseCsvRows(text: string, delimiter = ","): CsvParseResult {
   let row: string[] = [];
   let field = "";
   let inQuotes = false;
+  let recordStarted = false;
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -108,11 +109,13 @@ export function parseCsvRows(text: string, delimiter = ","): CsvParseResult {
     }
     if (ch === '"' && field === "") {
       inQuotes = true;
+      recordStarted = true;
       continue;
     }
     if (ch === delimiter) {
       row.push(field);
       field = "";
+      recordStarted = true;
       continue;
     }
     if (ch === "\r") {
@@ -123,12 +126,14 @@ export function parseCsvRows(text: string, delimiter = ","): CsvParseResult {
       rows.push(row);
       row = [];
       field = "";
+      recordStarted = false;
       continue;
     }
     field += ch;
+    recordStarted = true;
   }
 
-  if (field !== "" || row.length > 0) {
+  if (recordStarted || row.length > 0) {
     row.push(field);
     rows.push(row);
   }

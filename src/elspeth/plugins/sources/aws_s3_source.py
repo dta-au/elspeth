@@ -38,7 +38,12 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
+from elspeth.plugins.infrastructure.config_base import (
+    DataPluginConfig,
+    NormalizedColumnsOption,
+    NormalizedFieldMappingOption,
+    declared_source_schema_field_names,
+)
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
@@ -132,8 +137,8 @@ class AWSS3SourceConfig(DataPluginConfig):
     format: Literal["csv", "json", "jsonl"] = Field(default="csv", description="S3 object data format")
     csv_options: CSVOptions = Field(default_factory=CSVOptions, description="CSV parsing options")
     json_options: JSONOptions = Field(default_factory=JSONOptions, description="JSON and JSONL parsing options")
-    columns: list[str] | None = Field(default=None, description="Explicit columns for headerless CSV")
-    field_mapping: dict[str, str] | None = Field(default=None, description="Overrides for normalized source fields")
+    columns: NormalizedColumnsOption = Field(default=None, description="Explicit columns for headerless CSV")
+    field_mapping: NormalizedFieldMappingOption = Field(default=None, description="Overrides for normalized source fields")
     on_validation_failure: str = Field(..., description="Quarantine sink name or explicit discard")
     region_name: str | None = Field(default=None, description="AWS signing region override")
     endpoint_url: str | None = Field(default=None, description="CLI/batch-only S3-compatible HTTP endpoint")
@@ -856,7 +861,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2b69bdd5d163852d"
+    source_file_hash: str | None = "sha256:fc49da8dd44c8bbb"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

@@ -19,6 +19,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { resetStore } from "@/test/store-helpers";
 import type {
   CompositionState,
@@ -353,12 +354,44 @@ describe("ExecuteButton", () => {
     // Confirm gates execute(): nothing fired yet.
     expect(execute).not.toHaveBeenCalled();
     const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
-    // The summary derives from the actual composition.
-    expect(dialog).toHaveTextContent("source (csv)");
+    // The summary derives from the actual composition, in the reader register.
+    // Asserted in the CASED form: the lower-case identifier sentence is also
+    // in `textContent` (via the .sr-only span), so a case-insensitive
+    // assertion here would pass even with the reader text missing.
+    expect(dialog).toHaveTextContent("Source (CSV)");
+    // The model keeps its provider path: on this consent surface the path IS
+    // the egress destination (elspeth-59631ec7f7 / R2-F7).
     expect(dialog).toHaveTextContent(
-      "classify (model openrouter/anthropic/claude-sonnet-4.6)",
+      "Classify (model Claude Sonnet 4.6 via openrouter/anthropic)",
     );
-    expect(dialog).toHaveTextContent("results (csv)");
+    expect(dialog).toHaveTextContent("Results (CSV)");
+
+    const line = within(dialog).getAllByRole("listitem")[0];
+    expect(line).toHaveTextContent("Reads source data: Source (CSV).");
+    // Identifier register reachable by AT and by keyboard, not hover-only: it
+    // is in-flow content of the <li> itself (a `.sr-only` child span, no
+    // `aria-describedby` — that would announce it a second time).
+    expect(line).toHaveTextContent("Reads source data: source (csv).");
+    // FRAMED, so a screen reader hears a disclosure instead of the same
+    // sentence twice: case and parentheses do not survive speech, so the
+    // unframed span read "Reads source data: Source (CSV). Reads source data:
+    // source (csv)." as one stutter per line. Asserted on RAW textContent, not
+    // toHaveTextContent, which normalises whitespace and so cannot see the
+    // leading space — and without that space speech runs the reader sentence
+    // straight into the disclosure.
+    expect(line.textContent).toBe(
+      "Reads source data: Source (CSV). (exact identifiers: Reads source data: source (csv).)",
+    );
+    expect(line).not.toHaveAttribute("aria-describedby");
+    // `title` kept for sighted mouse hover — a convenience, not the only route.
+    expect(line).toHaveAttribute("title", "Reads source data: source (csv).");
+
+    // The .sr-only spans carry the identifier register ON PURPOSE, so they are
+    // exempted — scoped to the egress list, never `.sr-only` globally, which
+    // would silently excuse every visually-hidden string in any future dialog.
+    expectNoIdentifiersInDefaultDom(dialog, {
+      allowSelectors: [".run-disclosure-summary .sr-only"],
+    });
 
     fireEvent.click(
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
@@ -925,7 +958,7 @@ describe("ExecuteButton", () => {
     render(<ExecuteButton />);
 
     const reason = screen.getByText(
-      "Fix the validation errors shown in the Audit panel before running.",
+      "Fix the validation errors shown in the Checks tab before running.",
       { selector: "p" },
     );
     expect(reason).toHaveAttribute("data-run-block-reason", "validation");
@@ -1206,13 +1239,100 @@ describe("buildRunEgressSummary", () => {
         isLoading,
       );
 
-      expect(lines).toEqual([
+      expect(lines.map((line) => line.identifiers)).toEqual([
         "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
       ]);
-      expect(lines.join(" ")).not.toContain("Reads source data");
-      expect(lines.join(" ")).not.toContain("private authored prompt sentinel");
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("Reads source data");
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("private authored prompt sentinel");
     },
   );
+
+  it("names a described source and output the way the Spec tab does (ux M-4)", () => {
+    // The consent dialog resolved components through `stepLabelForNodeId`
+    // alone, which consults a description for NODES only — so a source
+    // described "Quarterly invoices from finance" read that way on the Spec
+    // tab and in validation prose, but "Intake (CSV)" here, on the surface
+    // where recognition matters most. Both now go through the shared
+    // description-first ladder (specRouting.componentPhrase).
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: {
+            plugin: "csv",
+            options: {},
+            on_success: "rows",
+            description: "Quarterly invoices from finance",
+          },
+        },
+        outputs: [
+          {
+            name: "results",
+            plugin: "csv",
+            options: {},
+            description: "Approved invoice ledger",
+          },
+        ],
+      } as unknown as Partial<CompositionState>),
+      [],
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Quarterly invoices from finance (CSV).",
+      "Writes output: Approved invoice ledger (CSV).",
+    ]);
+    // The identifier register is untouched: it still names every component
+    // and plugin by id (R2-F7).
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Writes output: results (csv).",
+    ]);
+  });
+
+  it("emits every disclosure line, in order, in both registers", () => {
+    // The refactor's residual risk is a DROPPED or REORDERED emission — one
+    // walk now decides both registers, so a mistake takes a whole line out of
+    // both at once and no per-line test would notice. Every other test here
+    // drives one or two lines; this one drives all six (ordinary source, LLM
+    // source, LLM node with a model, network transform, unverifiable
+    // transform, output) and pins the full ordered array in both registers.
+    // The catalog-load-failure path is what makes the uncertainty line
+    // reachable alongside the confident one.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          intake: { plugin: "csv", options: {}, on_success: "rows" },
+          drafts: { plugin: "llm", options: { profile: "approved-generation" }, on_success: "rows" },
+        },
+        nodes: [
+          { id: "classify", node_type: "transform", plugin: "llm", input: "rows", on_success: "scored", on_error: null, options: { model: "claude-sonnet" } },
+          { id: "fetch_pages", node_type: "transform", plugin: "web_scrape", input: "scored", on_success: "fetched", on_error: null, options: {} },
+          { id: "map_fields", node_type: "transform", plugin: "field_mapper", input: "fetched", on_success: "results", on_error: null, options: {} },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      } as unknown as Partial<CompositionState>),
+      null,
+      true,
+      null,
+      false,
+    );
+
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Intake (CSV).",
+      "Sends one authored prompt to the configured LLM: Drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: Classify (model Claude Sonnet).",
+      "Fetches over the network: Fetch Pages (Web Scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: Map Fields (Field Mapper).",
+      "Writes output: Results (CSV).",
+    ]);
+    expect(lines.map((line) => line.identifiers)).toEqual([
+      "Reads source data: source:intake (csv).",
+      "Sends one authored prompt to the configured LLM: source:drafts (profile approved-generation).",
+      "Sends rows to the configured LLM: classify (model claude-sonnet).",
+      "Fetches over the network: fetch_pages (web_scrape).",
+      "Plugin catalog unavailable — external-service effects could not be fully enumerated for: map_fields (field_mapper).",
+      "Writes output: results (csv).",
+    ]);
+  });
 
   it("uses a current source catalog to classify a capability-tagged LLM source", () => {
     const lines = buildRunEgressSummary(
@@ -1238,7 +1358,7 @@ describe("buildRunEgressSummary", () => {
       false,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
     ]);
   });
@@ -1272,7 +1392,7 @@ describe("buildRunEgressSummary", () => {
       llmSourceCatalog,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Reads source data: source (csv).",
       "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
       "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
@@ -1296,9 +1416,56 @@ describe("buildRunEgressSummary", () => {
       llmSourceCatalog,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends one authored prompt to the configured LLM: source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
     ]);
+    // An LLM SOURCE's binding label is unchanged in both registers BY DESIGN
+    // (it establishes egress safety, and phrasing an operator-chosen token
+    // would make it look like a product name), so `modelDisplayName` never
+    // runs on this line. Pinned so the two registers cannot silently diverge
+    // here — the node path, where the phrasing does run, is pinned separately.
+    // The component NAME still switches register ("Source" vs "source"); it is
+    // the model binding that is carried through verbatim.
+    expect(lines.map((line) => line.text)).toEqual([
+      "Sends one authored prompt to the configured LLM: Source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    ]);
+  });
+
+  it("carries a non-wordish model id raw into the reader register rather than mangling it", () => {
+    // The consent surface the review named: an LLM NODE's model goes through
+    // `modelDisplayName`, and a Bedrock id used to read "(model
+    // Anthropic.claude 3 Haiku 20240307 V1:0 via bedrock)" — a date stamp and
+    // a version suffix title-cased as if they were words. On a dialog whose
+    // whole job is earning consent, a garbled model name undermines the trust
+    // the phrasing exists to build. The provider path is still split off, so
+    // the guard changed the PHRASING only.
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "classify_in", on_validation_failure: "discard" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "classify_in",
+            on_success: "results",
+            on_error: null,
+            options: { model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0" },
+          },
+        ],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+
+    expect(lines.map((line) => line.text)).toContain(
+      "Sends rows to the configured LLM: Classify (model anthropic.claude-3-haiku-20240307-v1:0 via bedrock).",
+    );
+    // The identifier register is untouched by the guard: it never phrased.
+    expect(lines.map((line) => line.identifiers)).toContain(
+      "Sends rows to the configured LLM: classify (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    );
   });
 
   it("shows only the authored profile alias and never private resolved values", () => {
@@ -1332,11 +1499,11 @@ describe("buildRunEgressSummary", () => {
       llmSourceCatalog,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
     ]);
     for (const sentinel of privateSentinels) {
-      expect(lines.join(" ")).not.toContain(sentinel);
+      expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain(sentinel);
     }
   });
 
@@ -1362,11 +1529,11 @@ describe("buildRunEgressSummary", () => {
       llmSourceCatalog,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends one authored prompt to the configured LLM: source (configured LLM).",
     ]);
-    expect(lines.join(" ")).not.toContain("PRIVATE_MODEL");
-    expect(lines.join(" ")).not.toContain("private-resolved-model");
+    expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("PRIVATE_MODEL");
+    expect([...lines.map((l) => l.text), ...lines.map((l) => l.identifiers)].join(" ")).not.toContain("private-resolved-model");
   });
 
   it("derives sources, LLM/model nodes, network fetches, and sinks from the composition", () => {
@@ -1402,7 +1569,7 @@ describe("buildRunEgressSummary", () => {
       }),
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Reads source data: source (csv).",
       "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
       "Fetches over the network: fetch_page (web_scrape).",
@@ -1416,7 +1583,166 @@ describe("buildRunEgressSummary", () => {
         outputs: [{ name: "results", plugin: "csv", options: {} }],
       }),
     );
-    expect(lines).toEqual(["Writes output: results (csv)."]);
+    expect(lines.map((line) => line.identifiers)).toEqual(["Writes output: results (csv)."]);
+  });
+
+  it("shows an LLM source's profile alias verbatim — it is the only disclosable binding (elspeth-59631ec7f7)", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          ask_model: {
+            plugin: "llm",
+            options: { profile: "finance_default" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+        nodes: [],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      false,
+    );
+    // The alias stays raw BY DESIGN: llmSourceBindingLabel keeps provider,
+    // model, endpoint and credential bindings operator-private, and the alias
+    // is the one binding the user may see. Phrasing it would invent a name.
+    // It is therefore an identifier-surface value inside a prose sentence —
+    // which is why the whole-dialog default-DOM pin's fixture uses an LLM
+    // NODE rather than an LLM source.
+    expect(lines.map((line) => line.text).join(" ")).toContain("finance_default");
+  });
+
+  // Argument tuples lifted from the call sites above — deliberately the
+  // BRANCHY ones (catalogLoadFailed, catalogIsLoading, the LLM-source path,
+  // and the network/unverifiable sites), which have identifier coverage and
+  // no reader coverage of their own. Every tuple must yield at least one line.
+  const EGRESS_FIXTURE_CASES: Parameters<typeof buildRunEgressSummary>[] = [
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      false,
+    ],
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      true,
+      null,
+      false,
+    ],
+    [
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+      true,
+    ],
+    [
+      makeComposition({
+        sources: { source: { plugin: "csv", options: {}, on_success: "fetch_in" } },
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "fetch_in", on_success: "classify_in", on_error: null, options: {} },
+          { id: "classify", node_type: "transform", plugin: "llm", input: "classify_in", on_success: "results", on_error: null, options: { model: "openrouter/anthropic/claude-sonnet-4.6" } },
+        ],
+        outputs: [
+          { name: "results", plugin: "csv", options: {} },
+          { name: "errors", plugin: "json", options: {} },
+        ],
+      }),
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "in", on_success: "extract_in", on_error: null, options: {} },
+          { id: "extract", node_type: "transform", plugin: "aws_textract_document_analysis", input: "extract_in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      null,
+      true,
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "extract", node_type: "transform", plugin: "aws_textract_document_analysis", input: "in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      [
+        makePluginSummary({
+          name: "aws_textract_document_analysis",
+          audit_characteristics: ["external_call"],
+        }),
+      ],
+    ],
+    [
+      makeComposition({
+        nodes: [
+          { id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "in", on_success: "out", on_error: null, options: {} },
+        ],
+      }),
+      null,
+    ],
+    [makeComposition({ outputs: [{ name: "results", plugin: "csv", options: {} }] })],
+  ];
+
+  it("keeps the two egress registers aligned line-for-line across every branch", () => {
+    // The `reader.length !== identifiers.length` throw guards an alignment
+    // that holds "by construction" — register substitutes label TEXT and
+    // never gates whether a sentence is emitted. This exercises the property
+    // over the file's branchy fixtures rather than forcing the throw.
+    for (const args of EGRESS_FIXTURE_CASES) {
+      const lines = buildRunEgressSummary(...args);
+      // `every` returns true on an empty array, so a tuple that yields no
+      // lines would pass vacuously. Guard the guard.
+      expect(lines.length).toBeGreaterThan(0);
+      // THE assertion: a short `identifiers` array yields `undefined` at the
+      // tail, which is exactly what misalignment looks like.
+      expect(lines.every((line) => typeof line.identifiers === "string")).toBe(true);
+    }
+  });
+
+  it("renders reader-register text beside the identifier sentence (elspeth-d74ab492dd)", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: { source: { plugin: "csv", options: {}, on_success: "classify" } },
+        nodes: [{ id: "fetch_page", node_type: "transform", plugin: "web_scrape", input: "source", on_success: "results", on_error: null, options: {} }],
+        outputs: [{ name: "results", plugin: "csv", options: {} }],
+      }),
+    );
+    expect(lines.map((line) => line.text)).toEqual([
+      "Reads source data: Source (CSV).",
+      "Fetches over the network: Fetch Page (Web Scrape).",
+      "Writes output: Results (CSV).",
+    ]);
   });
 
   // ── Catalog-driven external-effect classification (R2-F7, elspeth-27bc704359) ──
@@ -1452,7 +1778,7 @@ describe("buildRunEgressSummary", () => {
       ],
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Fetches over the network: extract (aws_textract_document_analysis).",
     ]);
   });
@@ -1480,7 +1806,7 @@ describe("buildRunEgressSummary", () => {
       ],
     );
 
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
   });
 
   it("falls back to the hardcoded network set when the catalog has not loaded yet", () => {
@@ -1501,7 +1827,7 @@ describe("buildRunEgressSummary", () => {
       null,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Fetches over the network: fetch_page (web_scrape).",
     ]);
   });
@@ -1544,7 +1870,7 @@ describe("buildRunEgressSummary", () => {
       true,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Fetches over the network: fetch_page (web_scrape).",
       "Plugin catalog unavailable — external-service effects could not be " +
         "fully enumerated for: extract (aws_textract_document_analysis).",
@@ -1570,7 +1896,7 @@ describe("buildRunEgressSummary", () => {
       true,
     );
 
-    expect(lines).toEqual([
+    expect(lines.map((line) => line.identifiers)).toEqual([
       "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
     ]);
   });
@@ -1594,7 +1920,7 @@ describe("buildRunEgressSummary", () => {
       false,
     );
 
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
   });
 
   it("fails open (no network line, no uncertainty line) for a transform absent from a loaded catalog", () => {
@@ -1624,6 +1950,6 @@ describe("buildRunEgressSummary", () => {
       ],
     );
 
-    expect(lines).toEqual([]);
+    expect(lines.map((line) => line.identifiers)).toEqual([]);
   });
 });

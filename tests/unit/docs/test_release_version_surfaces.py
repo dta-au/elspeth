@@ -2,17 +2,63 @@
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
 import tomllib
 from pathlib import Path
 
+from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.web._aws_ecs_acceptance import receipt_contracts
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 ROOT = Path(__file__).resolve().parents[3]
-CURRENT_VERSION = "0.7.2"
+SEMVER = r"\d+\.\d+\.\d+"
+MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 
 
 def _text(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _project_version() -> str:
+    return tomllib.loads(_text("pyproject.toml"))["project"]["version"]
+
+
+def _match_version(relative_path: str, pattern: str) -> str:
+    match = re.search(pattern, _text(relative_path), re.MULTILINE)
+    assert match is not None, relative_path
+    return match.group("version")
+
+
+def _scenario_b_compatibility_record() -> dict[str, object]:
+    runbook = _text("docs/runbooks/aws-ecs-deployment.md")
+    heading = runbook.index("### Bound release/schema compatibility record")
+    fence = runbook.index("```json\n", heading) + len("```json\n")
+    record, _ = json.JSONDecoder().raw_decode(runbook[fence:])
+    assert isinstance(record, dict)
+    return record
+
+
+def _rollback_refusal_jq_filter() -> str:
+    runbook = _text("docs/runbooks/aws-ecs-deployment.md")
+    matches = re.findall(
+        r"^  jq -e '\n(?P<query>(?:    [^\n]*\n)+)  ' \"\$ROLLBACK_REFUSAL_RECEIPT\" >/dev/null$",
+        runbook,
+        re.MULTILINE,
+    )
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _run_jq(query: str, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["jq", "-e", query],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def test_package_and_lockfile_use_current_release_version() -> None:
@@ -20,20 +66,31 @@ def test_package_and_lockfile_use_current_release_version() -> None:
     lockfile = tomllib.loads(_text("uv.lock"))
     locked_project = next(package for package in lockfile["package"] if package["name"] == "elspeth")
 
-    assert pyproject["project"]["version"] == CURRENT_VERSION
-    assert locked_project["version"] == CURRENT_VERSION
+    assert locked_project["version"] == pyproject["project"]["version"]
 
 
-def test_current_public_release_surfaces_name_release_072() -> None:
-    assert "**Framework status:** `0.7.2`" in _text("docs/README.md")
-    assert "## 0.7.2 - Release candidate" in _text("CHANGELOG.md")
+def test_current_public_release_surfaces_match_package_version() -> None:
+    current_version = _project_version()
+    assert _match_version("docs/README.md", rf"^\*\*Framework status:\*\* `(?P<version>{SEMVER})`$") == current_version
+    assert _match_version("CHANGELOG.md", rf"^## (?P<version>{SEMVER})\s+-\s+.+$") == current_version
+    assert _match_version("README.md", rf"^!\[Status: (?P<version>{SEMVER})\]\([^)]+\)$") == current_version
+    assert _match_version("README.md", rf"^## What Changed In (?P<version>{SEMVER})$") == current_version
 
-    readme = _text("README.md")
-    assert "![Status: 0.7.2]" in readme
-    assert "## What Changed In 0.7.2" in readme
+
+def test_release_markdown_links_resolve() -> None:
+    broken: list[str] = []
+    for markdown in sorted((ROOT / "docs" / "release").glob("*.md")):
+        for destination in MARKDOWN_LINK_RE.findall(markdown.read_text(encoding="utf-8")):
+            relative_target = destination.split("#", maxsplit=1)[0]
+            if not relative_target or "://" in relative_target or relative_target.startswith("mailto:"):
+                continue
+            if not (markdown.parent / relative_target).exists():
+                broken.append(f"{markdown.relative_to(ROOT)} -> {destination}")
+    assert broken == []
 
 
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:
+    current_version = _project_version()
     for relative_path in (
         "README.md",
         "docs/guides/docker.md",
@@ -44,14 +101,12 @@ def test_current_container_examples_require_a_confirmed_published_tag() -> None:
     ):
         text = _text(relative_path)
         assert "IMAGE_TAG" in text, relative_path
-        assert "exact published" in text, relative_path
-        assert "v0.7.2" not in text, relative_path
+        assert f"v{current_version}" not in text, relative_path
         assert "v0.7.1" not in text, relative_path
         assert "elspeth:latest" not in text, relative_path
 
     docker = _text("docs/guides/docker.md")
     assert "docker buildx imagetools inspect" in docker
-    assert "do not infer an image tag from the python package version" in docker.lower()
 
 
 def test_first_pipeline_docker_walkthrough_creates_the_mounted_state_directory() -> None:
@@ -62,24 +117,34 @@ def test_first_pipeline_docker_walkthrough_creates_the_mounted_state_directory()
     assert "mkdir -p my-pipeline/{config,input,output,state}" not in tutorial
 
 
-def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
-    ansible = _text("docs/runbooks/ansible-ubuntu-deployment.md")
-    assert "schema-incompatible 0.7.2 upgrade from 0.7.1" in ansible
-    assert "direct 0.7.1→0.7.2 upgrade" in ansible
-    assert "full 40-character Git commit SHA" in ansible
-    assert "ELSPETH_RELEASE_REF=v0.7.2" not in ansible
-    assert "ELSPETH_ROLLBACK_REF=v0.7.1" not in ansible
-
+def test_operator_schema_version_examples_match_live_constants() -> None:
     sharing = _text("docs/guides/sharing-pipelines.md")
-    assert "For 0.7.2" in sharing
     assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
-    assert "SQLITE_SCHEMA_EPOCH=35" in sharing
+    assert f"SQLITE_SCHEMA_EPOCH={SQLITE_SCHEMA_EPOCH}" in sharing
 
-    aws = _text("docs/runbooks/aws-ecs-deployment.md")
-    assert "elspeth:ecs-0.7.2-closeout" in aws
-    assert '"candidate_package_version": "0.7.2"' in aws
-    assert '"previous_package_version": "0.7.1"' in aws
-    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": 31' in aws
-    assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
-    assert f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_31' in aws
-    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-31 Landscape code" in aws
+
+def test_scenario_b_runbook_record_matches_live_release_derivation() -> None:
+    record = _scenario_b_compatibility_record()
+
+    assert record["candidate_package_version"] == receipt_contracts._CANDIDATE_PACKAGE_VERSION == _project_version()
+    assert record["previous_package_version"] == receipt_contracts._ROLLBACK_PACKAGE_VERSION
+    assert record["schema_facts"] == receipt_contracts._expected_schema_facts("B")
+
+
+def test_scenario_b_executable_jq_gate_binds_live_landscape_epochs() -> None:
+    expected_facts = receipt_contracts._expected_schema_facts("B")
+    payload: dict[str, object] = {
+        "backward_compatible": False,
+        "rollback_permitted": False,
+        "schema_facts": expected_facts,
+    }
+    query = _rollback_refusal_jq_filter()
+
+    accepted = _run_jq(query, payload)
+    assert accepted.returncode == 0, accepted.stderr
+
+    for side in ("candidate", "previous"):
+        drifted = json.loads(json.dumps(payload))
+        drifted["schema_facts"][side]["landscape_epoch"] += 1
+        rejected = _run_jq(query, drifted)
+        assert rejected.returncode == 1, (side, rejected.stdout, rejected.stderr)

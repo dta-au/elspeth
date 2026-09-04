@@ -732,3 +732,15 @@ async def test_cancelled_model_call_records_cancelled_status() -> None:
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
     assert llm_calls[0].status is ComposerLLMCallStatus.CANCELLED
+
+
+def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
+    """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
+    partially constructed provider object can legitimately carry: the boundary
+    answers None ("no extras"), it never propagates the AttributeError."""
+    from elspeth.web.composer.llm_response_parsing import _pydantic_extra_fields
+
+    class _UnsetSlot:
+        __slots__ = ("__pydantic_extra__",)
+
+    assert _pydantic_extra_fields(_UnsetSlot()) is None

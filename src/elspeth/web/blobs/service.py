@@ -11,7 +11,7 @@ import re
 import stat
 import threading
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -181,7 +181,7 @@ def _active_run_pipeline_dict(active_run: Any) -> dict[str, Any]:
     """Convert an active-run join row to canonical runtime/YAML shape.
 
     The JSON columns arrive in their on-disk envelope; reading them raw
-    misread every production row (the guard raised KeyError instead of
+    misread every production row (the guard raised TypeError instead of
     refusing the mutation), so each column goes through the one envelope rule.
     """
     return pipeline_dict_from_record(
@@ -449,25 +449,29 @@ def _require_live_blob_write_fence(
         _require_live_guided_operation_write_fence(conn, guided_operation_write_fence)
 
 
-def _require_failed_fork_cleanup_authorization(
+def _require_fork_cleanup_authorization(
     conn: Connection,
     *,
     source_session_id: str,
     target_session_id: str,
     operation_id: str,
+    live_write_fence: BlobForkWriteFence | None,
 ) -> None:
-    """Require the failed parent operation and its exact retained plan envelope."""
-    operation = conn.execute(
-        select(guided_operations_table.c.status).where(
-            guided_operations_table.c.session_id == source_session_id,
-            guided_operations_table.c.operation_id == operation_id,
-            guided_operations_table.c.kind == "session_fork",
-            guided_operations_table.c.status == "failed",
-            guided_operations_table.c.result_session_id.is_(None),
-        )
-    ).one_or_none()
-    if operation is None:
-        raise AuditIntegrityError("Fork blob cleanup is not authorized by the exact failed parent operation")
+    """Require one exact live or failed operation plus its retained plan."""
+    if live_write_fence is None:
+        operation = conn.execute(
+            select(guided_operations_table.c.status).where(
+                guided_operations_table.c.session_id == source_session_id,
+                guided_operations_table.c.operation_id == operation_id,
+                guided_operations_table.c.kind == "session_fork",
+                guided_operations_table.c.status == "failed",
+                guided_operations_table.c.result_session_id.is_(None),
+            )
+        ).one_or_none()
+        if operation is None:
+            raise AuditIntegrityError("Fork blob cleanup is not authorized by the exact failed parent operation")
+    else:
+        _require_live_fork_write_fence(conn, live_write_fence)
 
     matching_plans = 0
     rows = conn.execute(
@@ -1850,9 +1854,11 @@ def _composition_references_blob(
     # ``generate_pipeline_dict(state_from_record(record))``). Asking it what it
     # emits gives the options-bearing sections: ``sources``, ``transforms``,
     # ``aggregations``, ``collectors``, ``sinks``. ``gates`` and ``coalesce``
-    # are emitted but PROVABLY INERT — the composer refuses options on them, so
-    # neither key has ever matched; kept rather than removed, because dropping a
-    # key this guard accepts is a behaviour change bought for tidiness.
+    # are emitted without options. The blob authoring tool also rejects every
+    # plugin-free structural node before mutation, because no inline marker
+    # could survive into runtime YAML. Both legacy keys below are kept as
+    # tolerant defence-in-depth for a non-canonical persisted dict rather than
+    # removed for tidiness.
     # ``collectors`` was the live gap: a blob referenced only from a collector's
     # options read as unreferenced and deletion was permitted under an active
     # run (elspeth-ca79b2c63a).
@@ -2042,6 +2048,33 @@ class _ForkCopyWriteAuthority:
             raise BlobForkFenceLostError(self._fence.operation_id, attempt=self._fence.attempt)
 
 
+@dataclass(frozen=True, slots=True)
+class _DrainOutcome:
+    """Terminal state observed while draining a cancelled fork-copy worker."""
+
+    cancelled: bool = False
+    failure_class: str | None = None
+
+
+async def _drained_worker_outcome(task: asyncio.Future[Any]) -> _DrainOutcome:
+    """Await a cancelled worker to completion, reporting instead of suppressing.
+
+    The callers cancel the worker and must then wait for it to stop before
+    discarding temporary bytes. Its CancelledError is the expected terminal
+    state; any OTHER terminal exception was previously erased by a
+    ``suppress(BaseException)`` — now its class is reported so the caller can
+    attach it to the primary failure as a PEP 678 note.
+    """
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        return _DrainOutcome(cancelled=True)
+    except BaseException as exc:
+        return _DrainOutcome(failure_class=type(exc).__name__)
+    return _DrainOutcome()
+
+
 async def _await_fork_copy_io_with_checkpoints[ResultT](
     operation: Awaitable[ResultT],
     *,
@@ -2062,12 +2095,13 @@ async def _await_fork_copy_io_with_checkpoints[ResultT](
                 {operation_task},
                 timeout=_FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as primary:
             if write_authority is not None:
                 write_authority.lose()
             operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
             raise
         if done:
             return operation_task.result()
@@ -2075,20 +2109,22 @@ async def _await_fork_copy_io_with_checkpoints[ResultT](
             write_authority.checkpoint_started()
         try:
             await checkpoint()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as primary:
             if write_authority is not None:
                 write_authority.lose()
             operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during cancellation drain: {drained.failure_class}")
             raise
-        except BaseException:
+        except BaseException as primary:
             if write_authority is not None:
                 write_authority.lose()
             else:
                 operation_task.cancel()
-            with suppress(BaseException):
-                await operation_task
+            drained = await _drained_worker_outcome(operation_task)
+            if drained.failure_class is not None:
+                primary.add_note(f"fork-copy worker also failed during checkpoint-failure drain: {drained.failure_class}")
             raise
         else:
             if write_authority is not None:
@@ -3153,14 +3189,25 @@ class BlobServiceImpl:
         source_session_id: UUID,
         target_session_id: UUID,
         operation_id: str,
+        *,
+        live_write_fence: BlobForkWriteFence | None = None,
     ) -> BlobForkCleanupResult:
-        """Clean a failed fork child while holding its custody lock throughout."""
+        """Clean an authorized fork child while holding its custody lock."""
         source_session_id_str, target_session_id_str = _validated_fork_session_ids(
             source_session_id,
             target_session_id,
         )
         if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise ValueError("operation_id must be a non-empty bounded string")
+        if live_write_fence is not None:
+            if type(live_write_fence) is not BlobForkWriteFence:
+                raise TypeError("live_write_fence must be an exact BlobForkWriteFence")
+            if (
+                live_write_fence.source_session_id != source_session_id
+                or live_write_fence.target_session_id != target_session_id
+                or live_write_fence.operation_id != operation_id
+            ):
+                raise AuditIntegrityError("Fork blob cleanup write fence does not match its source, target, and operation")
 
         def _sync() -> BlobForkCleanupResult:
             deleted_ids: list[UUID] = []
@@ -3173,11 +3220,12 @@ class BlobServiceImpl:
                         source_session_id=source_session_id_str,
                         target_session_id=target_session_id_str,
                     )
-                    _require_failed_fork_cleanup_authorization(
+                    _require_fork_cleanup_authorization(
                         conn,
                         source_session_id=source_session_id_str,
                         target_session_id=target_session_id_str,
                         operation_id=operation_id,
+                        live_write_fence=live_write_fence,
                     )
                     snapshot_ids = tuple(
                         sorted(
@@ -3213,11 +3261,12 @@ class BlobServiceImpl:
                                     source_session_id=source_session_id_str,
                                     target_session_id=target_session_id_str,
                                 )
-                                _require_failed_fork_cleanup_authorization(
+                                _require_fork_cleanup_authorization(
                                     conn,
                                     source_session_id=source_session_id_str,
                                     target_session_id=target_session_id_str,
                                     operation_id=operation_id,
+                                    live_write_fence=live_write_fence,
                                 )
                                 row = conn.execute(
                                     select(blobs_table)
@@ -3254,6 +3303,8 @@ class BlobServiceImpl:
                                 session_id_str=target_session_id_str,
                                 stage=stage,
                             )
+                    except (BlobForkFenceLostError, BlobContentMissingError, BlobIntegrityError):
+                        raise
                     except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         errors.append(
                             BlobForkCleanupError(

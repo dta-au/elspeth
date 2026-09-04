@@ -48,11 +48,13 @@ from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
+    ContentTrust,
     ControlRole,
     PluginCapability,
     WebConfigAuthority,
 )
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.trust_boundary import trust_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
@@ -97,6 +99,38 @@ def is_column_naming_config_option(key: str) -> bool:
     That classification is the plugin's job via ``output_naming_config_keys``.
     """
     return key in ("field", "fields", "group_by") or key.endswith(("_field", "_fields"))
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "one authored plugin config option value — settings YAML or a Web Composer "
+        "proposal — read either raw or through a per-plugin validated model whose "
+        "field types the base class does not own"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns exactly the column names the option value spells: a str is one name, "
+        "a list/tuple contributes only its str items, and every other shape yields (); "
+        "never raises and never coerces a non-str into a name"
+    ),
+    non_raising=True,
+)
+def _column_names_in_option_value(value: Any) -> tuple[str, ...]:
+    """Column names one column-naming config option value points at.
+
+    Plural options hold a LIST of column names (``keyword_filter.fields``,
+    ``batch_data_quality_report.inspect_fields``); skipping non-str values
+    inside them once made every one invisible to demotion, so list/tuple
+    items are admitted individually. Non-name shapes contribute nothing:
+    per-plugin config validation, not this helper, owns rejecting them.
+    """
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str))
+    return ()
 
 
 def _demote_required_model_fields(
@@ -294,6 +328,14 @@ class BaseTransform(ABC):
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+    fetches_http: bool = False
+    """Whether the transform performs a direct HTTP(S) fetch governed by its
+    top-level ``options.http`` policy. Web admission derives its complete
+    fetcher vocabulary from this closed declaration; catalogue tags and
+    determinism are deliberately not policy authorities."""
+
+    content_trust: ContentTrust = ContentTrust.TRUSTED_INTERNAL
+    """Trust classification of content the transform itself produces."""
 
     @classmethod
     def check_web_local_requirements(cls) -> bool:
@@ -443,6 +485,11 @@ class BaseTransform(ABC):
     # It says nothing about which rows are emitted — batch_outlier_annotator
     # declares True while dropping whole rows, which is why this is a separate
     # declaration rather than a relaxation of `passes_through_input`.
+    # With an extras-allowing output contract, presence-guarantee walks may
+    # therefore propagate predecessor guarantees through this declaration
+    # after subtracting ``removed_input_fields``; every successful row carries
+    # that lower bound. A fixed output contract is a firewall. Extras-direction
+    # walks use the same presence fact with the opposite safety polarity.
     #
     # `removed_input_fields` is per-INSTANCE (it is computed from config —
     # line_explode's `source_field`, field_mapper's rename sources), so
@@ -474,12 +521,14 @@ class BaseTransform(ABC):
     # (type_coerce and value_transform both declare passes_through_input=True
     # while doing exactly that). This flag carries the value half:
     #
-    # True means process() NEVER changes the value of any field present on the
-    # input row — it may only ADD new fields (and, for row-filtering
-    # declarers, drop whole rows). Under that promise the build-time
+    # True means process() NEVER changes the value of any input field that
+    # survives on its output row — it may ADD new fields, remove the fields
+    # named by ``removed_input_fields``, and drop whole rows. Under that promise the build-time
     # type-resolution walk (resolve_guaranteed_field_type,
     # core/dag/guarantees.py) may recurse through this transform even when its
     # schema config declares no fields (observed mode), instead of abstaining.
+    # Forwarding recursion additionally requires the field not be removed and
+    # the output contract remain open.
     # That recursion is what lets a provably-wrong downstream type declaration
     # fail at build rather than killing every row at the consumer's input
     # preflight.
@@ -596,7 +645,13 @@ class BaseTransform(ABC):
         # return None and defer the failure to `None.model_validate(...)`.
         if "input_schema" in cls.__dict__:
             declared_schema = cls.__dict__["input_schema"]
-            if not hasattr(type(declared_schema), "__get__"):
+            # Descriptor-ness exactly as class-attribute lookup decides it: a
+            # descriptor's `__get__` lives in a class dict on its TYPE's MRO
+            # (instance state never participates). This is the same search the
+            # attribute machinery performs when `cls.input_schema` is read, so
+            # the guard cannot disagree with the runtime behavior it protects.
+            is_descriptor = any("__get__" in klass.__dict__ for klass in type(declared_schema).__mro__)
+            if not is_descriptor:
                 delattr(cls, "input_schema")
                 cls._declared_input_schema = declared_schema
 
@@ -740,10 +795,8 @@ class BaseTransform(ABC):
         for key, value in self.config.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            values = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else []
-            for item in values:
-                if isinstance(item, str):
-                    authored_by.setdefault(item, []).append(key)
+            for item in _column_names_in_option_value(value):
+                authored_by.setdefault(item, []).append(key)
         # PROVENANCE, honestly. ``declared_input_fields`` is multi-provenance:
         # the author's own ``required_input_fields`` list, and — for the plugins
         # whose config derives it (web_scrape's ``url_field``, blob_fetch's
@@ -1173,13 +1226,7 @@ class BaseTransform(ABC):
         for key, value in options.items():
             if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
                 continue
-            if isinstance(value, str):
-                named.add(value)
-            elif isinstance(value, (list, tuple)):
-                # Plural options hold a LIST of column names (keyword_filter.fields,
-                # batch_data_quality_report.inspect_fields). Skipping non-str values
-                # made every one of them invisible to demotion.
-                named.update(item for item in value if isinstance(item, str))
+            named.update(_column_names_in_option_value(value))
         resolved = frozenset(named)
         # Config is fixed once construction finishes, so this is recompute-once
         # work; without the memo it was rebuilt on EVERY input_schema read, i.e.

@@ -235,6 +235,9 @@ function guidedFixture(
         },
       ],
       chat_turn_seq: 1,
+      // Server-projected reviewed ledger (elspeth-f2a8550b3d): required on
+      // the wire. Empty at step 1 before the first review turn.
+      reviewed_components: { sources: [], outputs: [] },
       profile: { coaching: true, bookends: true },
     },
     next_turn: {

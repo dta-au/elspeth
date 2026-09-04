@@ -3,7 +3,7 @@
 Pins the writer boundary (server-computed draft, planner field lists
 structurally impossible) and the resolve arm (stamps EXACTLY the backtraced
 demand set into ``schema.guaranteed_fields``, upserts the resolved
-requirement with the field-set artifact hash) — elspeth-da68332faf work
+requirement with the versioned semantic artifact hash) — elspeth-da68332faf work
 item 2.
 
 Fixture pattern mirrors ``test_interpretation_events_service.py``: in-memory
@@ -14,6 +14,7 @@ consumer whose ``required_input_fields`` is the demand.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetad
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
+from elspeth.web.sessions.models import interpretation_events_table, sessions_table
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -205,6 +206,7 @@ async def test_round_trip_stamps_exactly_the_demand_set(service, tmp_path: Path)
     from elspeth.web.composer.source_demand import parse_source_data_contract_accepted_fields
 
     assert parse_source_data_contract_accepted_fields(row["accepted_value"]) == ("colour",)
+    assert json.loads(row["accepted_value"])["contract_version"] == 2
 
 
 @pytest.mark.asyncio
@@ -344,6 +346,101 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "only_missing_evidence",
+    (False, True),
+    ids=("normal-settlement", "repair-backstop"),
+)
+async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
+    service,
+    tmp_path: Path,
+    only_missing_evidence: bool,
+) -> None:
+    """A pre-upgrade pending card carries the old consequence copy.
+
+    Its graph demand is unchanged, but it must not be reused as a v2 review:
+    the old row is terminally abandoned and a current-v2 card is surfaced.
+    """
+    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    legacy_draft = json.dumps(
+        {
+            "contract_version": 1,
+            "kind": SOURCE_DATA_CONTRACT_USER_TERM,
+            "demanded_fields": ["colour"],
+            "sample_header": ["colour", "extra"],
+            "missing_from_sample": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    legacy_event_id = uuid4()
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(interpretation_events_table).values(
+                id=str(legacy_event_id),
+                session_id=str(sid),
+                composition_state_id=str(state.id),
+                affected_node_id="source",
+                tool_call_id="legacy-v1-card",
+                user_term=SOURCE_DATA_CONTRACT_USER_TERM,
+                kind=InterpretationKind.SOURCE_DATA_CONTRACT.value,
+                llm_draft=legacy_draft,
+                accepted_value=None,
+                choice=InterpretationChoice.PENDING.value,
+                created_at=datetime.now(UTC),
+                resolved_at=None,
+                actor="composer-llm",
+                model_identifier="anthropic/test-model",
+                model_version="1",
+                provider="anthropic",
+                composer_skill_hash="0" * 64,
+                arguments_hash=None,
+                hash_domain_version=None,
+                interpretation_source="user_approved",
+            )
+        )
+
+    with pytest.raises(InterpretationResolveError):
+        await service.resolve_interpretation_event(
+            session_id=sid,
+            event_id=legacy_event_id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="alice",
+        )
+
+    await surface_pending_interpretation_reviews_for_state(
+        state_from_record(state),
+        sessions_service=service,
+        session_id=str(sid),
+        session_operation_context=seed_live_compose_context(service._engine, sid),
+        current_state_id=str(state.id),
+        model_identifier="anthropic/test-model",
+        model_version="1",
+        provider="anthropic",
+        composer_skill_hash="0" * 64,
+        only_missing_evidence=only_missing_evidence,
+    )
+
+    events = [
+        event
+        for event in await service.list_interpretation_events(sid, status="all")
+        if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+    ]
+    assert sorted(event.choice for event in events) == [
+        InterpretationChoice.PENDING,
+        InterpretationChoice.SUPERSEDED,
+    ]
+    pending = next(event for event in events if event.choice is InterpretationChoice.PENDING)
+    assert json.loads(pending.llm_draft or "")["contract_version"] == 2
+
+
+@pytest.mark.asyncio
 async def test_settlement_surfacer_skips_card_ineligible_sources(service, tmp_path: Path) -> None:
     """Composer-authored bound content never gets a data-contract card from
     the surfacer (the invented_source flow owns it), and neither does a
@@ -375,6 +472,124 @@ async def test_settlement_surfacer_skips_card_ineligible_sources(service, tmp_pa
 
     no_demand_state = CompositionState.from_dict(_uploaded_state_dict(str(csv_path), required=[]))
     assert _backend_surface_args_for_site(no_demand_state, site) is None
+
+
+def _stamped_state_dict(csv_path: str, *, required: list[str], guaranteed: list[str]) -> dict[str, Any]:
+    """The planner-stamp shape from the elspeth-d73139155a repro: the source
+    carries an observed-mode guarantee covering the whole demand, so
+    ``backtraced_source_demand`` collapses to ``()`` and the review site dies."""
+    state_dict = _uploaded_state_dict(csv_path, required=required)
+    source_options = dict(state_dict["sources"]["source"]["options"])
+    source_options["schema"] = {"mode": "observed", "guaranteed_fields": guaranteed}
+    state_dict["sources"]["source"]["options"] = source_options
+    return state_dict
+
+
+@pytest.mark.asyncio
+async def test_state_commit_supersedes_pending_card_when_demand_collapses(service, tmp_path: Path) -> None:
+    """The zombie-card lifecycle fix (elspeth-d73139155a): a commit that
+    extinguishes the review site terminally retires the persisted PENDING
+    row as SUPERSEDED in the same transaction — the card leaves the pending
+    list (ungating Run) instead of rejecting Acknowledge with an
+    unactionable drift error forever."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "extra"), ["colour"])
+    event = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+    assert event.choice is InterpretationChoice.PENDING
+
+    stamped = _stamped_state_dict(str(csv_path), required=["colour"], guaranteed=["colour"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=stamped["sources"],
+            nodes=stamped["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    events = [
+        row for row in await service.list_interpretation_events(sid, status="all") if row.kind is InterpretationKind.SOURCE_DATA_CONTRACT
+    ]
+    assert [row.choice for row in events] == [InterpretationChoice.SUPERSEDED]
+    assert events[0].resolved_at is not None
+    assert events[0].accepted_value is None
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert pending == []
+    # A racing Acknowledge degrades to the ordinary already-resolved
+    # refusal, not the eternal drift error.
+    with pytest.raises(InterpretationResolveError):
+        await service.resolve_interpretation_event(
+            session_id=sid,
+            event_id=event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="alice",
+        )
+
+
+@pytest.mark.asyncio
+async def test_state_commit_keeps_pending_card_when_demand_changes_but_survives(service, tmp_path: Path) -> None:
+    """The sweep predicate is site DEATH, never site drift: a demand that
+    changes but still exists leaves the card pending — the surfacing dedup
+    path owns that reconciliation (abandon + fresh card)."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,size\nred,10\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "size"), ["colour"])
+    event = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+
+    grown = _uploaded_state_dict(str(csv_path), required=["colour", "size"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=grown["sources"],
+            nodes=grown["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=False,
+        ),
+        provenance="tool_call",
+    )
+
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert [row.id for row in pending] == [event.id]
+    assert pending[0].choice is InterpretationChoice.PENDING
+
+
+@pytest.mark.asyncio
+async def test_stale_surfacer_returns_superseded_row_after_sweep(service, tmp_path: Path) -> None:
+    """A delayed surfacer holding a pre-collapse projection must not turn a
+    successful state commit into an error once the sweep has already retired
+    the site's card — it receives the terminal row, mirroring the abandon
+    fallback for the un-swept race."""
+    csv_path = tmp_path / "upload.csv"
+    csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
+    sid = uuid4()
+    state = await _seed_state(service, session_id=sid, csv_path=str(csv_path), required=["colour"])
+    draft = _server_draft(("colour", "extra"), ["colour"])
+    await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+
+    stamped = _stamped_state_dict(str(csv_path), required=["colour"], guaranteed=["colour"])
+    await service.save_composition_state(
+        sid,
+        CompositionStateData(
+            sources=stamped["sources"],
+            nodes=stamped["nodes"],
+            metadata_={"name": "Data contract test", "description": ""},
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+
+    stale_result = await _create_contract_event(service, session_id=sid, state=state, llm_draft=draft)
+    assert stale_result.choice is InterpretationChoice.SUPERSEDED
+    pending = await service.list_interpretation_events(sid, status="pending")
+    assert pending == []
 
 
 @pytest.mark.asyncio

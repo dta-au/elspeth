@@ -271,7 +271,10 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     initialize_session_schema(eng)
     inspector = inspect(eng)
 
-    assert SESSION_SCHEMA_EPOCH == 48
+    # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5): mainline
+    # independently reached 50, so the union schema takes the next free
+    # integer rather than letting one number name two shapes.
+    assert SESSION_SCHEMA_EPOCH == 51
     expected_tables = frozenset(
         {
             "web_instances",

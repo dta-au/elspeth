@@ -45,7 +45,8 @@ from elspeth.web.composer.tools import (
     _execute_patch_source_options,
 )
 from elspeth.web.composer.tools._common import ToolContext
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 # ---------------------------------------------------------------------------
@@ -67,18 +68,18 @@ def _option_shape_summary(*, scalar: int) -> dict[str, object]:
 
 
 def _ctx() -> ToolContext:
-    """Bare ToolContext sufficient for the argument-validation tests below.
+    """Trained-operator ToolContext over the real catalog.
 
-    The Pydantic-validation tests reject the arguments before any catalog or
-    data-dir consumption, so a catalog-less context is fine. ``MagicMock``
-    keeps the type contract honest without spinning up a real catalog.
+    The Pydantic-validation tests reject the arguments before any catalog
+    consumption, but the valid-dispatch tests reach the handler body, and
+    every ``patch_*`` handler first resolves the STATE-held plugin through
+    the request's policy view (elspeth-e405ad7cd2 R8-fix1). A ``MagicMock``
+    catalog lists no plugins, so its trained-operator snapshot models a
+    deployment with nothing installed and every patch is a
+    ``plugin_not_installed`` rejection — the real catalog models the
+    contract these states were written against.
     """
-
-    from unittest.mock import MagicMock
-
-    from elspeth.web.catalog.protocol import CatalogService
-
-    catalog = MagicMock(spec=CatalogService)
+    catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     return ToolContext(
         catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
@@ -157,6 +158,7 @@ def _state_with_llm_node(node_id: str = "llm1", options: dict[str, Any] | None =
                     "model": "anthropic/claude-haiku-4.5",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                     "prompt_template": "Summarise {{ row.text }}.",
+                    "required_input_fields": ["text"],
                     "schema": {"mode": "observed"},
                 },
                 condition=None,
@@ -408,7 +410,17 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                 "model": "anthropic/claude-haiku-4.5",
                 "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                 "prompt_template": "Old {{ row.text }}.",
+                "required_input_fields": ["text"],
                 "schema": {"mode": "observed"},
+                # The pre-existing vague_term must be WIRED (an unwired pending
+                # vague_term is rejected by the review contract): the parts ref
+                # survives the prompt_template patch, so the copied-forward row
+                # stays resolvable in the patched state.
+                PROMPT_TEMPLATE_PARTS_KEY: [
+                    {"kind": "text", "text": "Old "},
+                    {"kind": "interpretation_ref", "requirement_id": "vague"},
+                    {"kind": "text", "text": " {{ row.text }}."},
+                ],
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
                         "id": "vague",
@@ -503,6 +515,7 @@ class TestPromotePatchNodeOptionsArgErrorRouting:
                         "model": "anthropic/claude-haiku-4.5",
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "prompt_template": "Read {{ row.content }}.",
+                        "required_input_fields": ["content"],
                         "schema": {"mode": "observed"},
                     },
                     condition=None,

@@ -66,6 +66,7 @@ docs-archive/
 .claude/plans/
 .claude/lanes/
 .claude/handovers/
+.claude/red-team/
 .mcp.json
 !.mcp.json.example
 .codex
@@ -110,7 +111,7 @@ config/cicd/.sign-bundle-transactions/
 config/cicd/**/.*.lock
 
 # ---------------------------------------------------------------------------
-# evals/ — the eval library and the two tracked corpora ship; run records and
+# evals/ — the eval library and the three tracked corpora ship; run records and
 # harness output do not. Order matters: re-include the directory, then its
 # contents, then re-apply the credential rules (last matching rule wins).
 # ---------------------------------------------------------------------------
@@ -155,6 +156,26 @@ config/cicd/**/.*.lock
 !/evals/composer-battery/**/.env.example
 !/evals/composer-battery/**/.env.template
 !/evals/composer-battery/**/.env.sample
+!/evals/composer-standard-battery/
+!/evals/composer-standard-battery/**
+/evals/composer-standard-battery/runs/
+/evals/composer-standard-battery/**/jwt.txt
+/evals/composer-standard-battery/**/jwt-*.txt
+/evals/composer-standard-battery/**/jwt_*.txt
+/evals/composer-standard-battery/**/*.api_key
+/evals/composer-standard-battery/**/*.access_token
+/evals/composer-standard-battery/**/*.bearer_token
+/evals/composer-standard-battery/**/login.json
+/evals/composer-standard-battery/**/login_*.json
+/evals/composer-standard-battery/**/credentials.json
+/evals/composer-standard-battery/**/*.pem
+/evals/composer-standard-battery/**/*.p12
+/evals/composer-standard-battery/**/*.pfx
+/evals/composer-standard-battery/**/.env
+/evals/composer-standard-battery/**/.env.*
+!/evals/composer-standard-battery/**/.env.example
+!/evals/composer-standard-battery/**/.env.template
+!/evals/composer-standard-battery/**/.env.sample
 
 # ---------------------------------------------------------------------------
 # Python

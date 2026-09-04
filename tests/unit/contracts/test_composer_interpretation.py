@@ -130,8 +130,8 @@ def _surface_opt_out_record_kwargs() -> dict[str, object]:
     }
 
 
-def test_interpretation_choice_has_exactly_five_values() -> None:
-    """InterpretationChoice is a closed enum with exactly 5 members."""
+def test_interpretation_choice_has_exactly_six_values() -> None:
+    """InterpretationChoice is a closed enum with exactly 6 members."""
     members = {member.value for member in InterpretationChoice}
     assert members == {
         "pending",
@@ -139,8 +139,9 @@ def test_interpretation_choice_has_exactly_five_values() -> None:
         "amended",
         "opted_out",
         "abandoned",
+        "superseded",
     }
-    assert len(InterpretationChoice) == 5
+    assert len(InterpretationChoice) == 6
 
 
 def test_interpretation_source_has_exactly_three_values() -> None:

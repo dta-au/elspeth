@@ -24,3 +24,18 @@ export const GUIDED_STEP_LABELS: Record<GuidedStep, string> = {
   step_3_transforms: "Transforms",
   step_4_wire: "Wire",
 };
+
+/**
+ * Transcript divider opened at the FIRST post-confirmation chat turn
+ * (elspeth-986801d218). Deliberately OUTSIDE the closed map above: it is not
+ * a GuidedStep and must never be reachable by a `GUIDED_STEP_LABELS[step]`
+ * lookup — post-commit chat turns are persisted with `step="step_4_wire"`,
+ * the same wire step as the pre-commit wire turns, so the map's
+ * step-change divider cannot mark this boundary and a widened map would only
+ * break its exhaustiveness contract.
+ *
+ * The boundary is a CLIENT-side reading of the transcript (the first user
+ * turn carrying the confirmation hash as its `turn_token`, see
+ * completedChatToken.ts) — no wire field, no enum member, no server change.
+ */
+export const GUIDED_AFTER_CONFIRMATION_LABEL = "After confirmation";

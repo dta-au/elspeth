@@ -8,7 +8,10 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, proposal_blob_effe
 
 
 def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
-    assert SESSION_SCHEMA_EPOCH == 48
+    # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5): mainline
+    # independently reached 50, so the union schema takes the next free
+    # integer rather than letting one number name two shapes.
+    assert SESSION_SCHEMA_EPOCH == 51
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

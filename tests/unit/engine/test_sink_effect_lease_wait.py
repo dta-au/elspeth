@@ -14,6 +14,7 @@ from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
     SinkEffectFinalizationResult,
+    SinkEffectFinalizeRequest,
     SinkEffectInspection,
     SinkEffectInspectionRequest,
     SinkEffectLease,
@@ -1070,4 +1071,191 @@ def test_concurrent_expired_takeover_loser_waits_for_single_reclaim_publication(
         release_reconcile.set()
         for worker in workers:
             worker.join(timeout=5)
+        db.close()
+
+
+def test_heartbeat_failure_after_last_inflight_check_fails_the_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heartbeat failure captured after the final refresh_and_check must
+    surface from execute(), never ride out inside the stopped thread as a
+    clean success: authority was in doubt during the finalize window."""
+    from elspeth.engine.executors import sink_effects as sink_effects_module
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+
+    heartbeats: list[sink_effects_module._SinkEffectLeaseHeartbeat] = []
+    original_init = sink_effects_module._SinkEffectLeaseHeartbeat.__init__
+
+    def recording_init(self: sink_effects_module._SinkEffectLeaseHeartbeat, **kwargs: object) -> None:
+        original_init(self, **kwargs)  # type: ignore[arg-type]
+        heartbeats.append(self)
+
+    monkeypatch.setattr(sink_effects_module._SinkEffectLeaseHeartbeat, "__init__", recording_init)
+
+    def store_late_heartbeat_failure(seam: SinkEffectExecutionSeam) -> None:
+        # AFTER_FINALIZE_BEFORE_RESPONSE is past the last foreground
+        # refresh_and_check: simulate the background thread capturing a
+        # failure in exactly that window.
+        if seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE and heartbeats:
+            execution_heartbeat = heartbeats[-1]
+            execution_heartbeat._error = LandscapeRecordError("execution lease heartbeat lost authority")
+            execution_heartbeat._failed_event.set()
+
+    try:
+        with pytest.raises(LandscapeRecordError, match="execution lease heartbeat lost authority"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="late-heartbeat-holder",
+                lease_ttl=timedelta(seconds=30),
+                fault_hook=store_late_heartbeat_failure,
+            ).execute(request, sink)
+    finally:
+        db.close()
+
+
+def test_execution_heartbeat_retires_before_its_own_successful_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A beat scheduled behind the coordinator's own finalize is not stale authority."""
+    from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository
+    from elspeth.engine.executors import sink_effects as sink_effects_module
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+    finalized = threading.Event()
+    execution_heartbeat_ready = threading.Event()
+    heartbeat_count = 0
+
+    def heartbeat_only_after_finalize(
+        self: sink_effects_module._SinkEffectLeaseHeartbeat,
+    ) -> None:
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        if heartbeat_count == 1:
+            # Preparation has its own heartbeat and already retires before the
+            # RESERVED -> PREPARED transition. Preserve that production shape.
+            self._stop_event.wait(timeout=5)
+            return
+
+        execution_heartbeat_ready.set()
+        while not finalized.is_set():
+            if self._stop_event.wait(timeout=0.001) and not finalized.is_set():
+                return
+        try:
+            self._effects.heartbeat_lease(
+                self._claim.effect_id,
+                owner=self._claim.owner,
+                generation=self._claim.generation,
+                ttl=self._ttl,
+            )
+        except BaseException as exc:
+            self._error = exc
+            self._failed_event.set()
+
+    monkeypatch.setattr(
+        sink_effects_module._SinkEffectLeaseHeartbeat,
+        "_run",
+        heartbeat_only_after_finalize,
+    )
+    original_finalize = SinkEffectRepository.finalize
+
+    def finalize_then_release_heartbeat(
+        repository: SinkEffectRepository,
+        finalize_request: SinkEffectFinalizeRequest,
+    ) -> SinkEffectFinalizationResult:
+        assert execution_heartbeat_ready.wait(timeout=5), "execution heartbeat never started"
+        result = original_finalize(repository, finalize_request)
+        finalized.set()
+        return result
+
+    monkeypatch.setattr(SinkEffectRepository, "finalize", finalize_then_release_heartbeat)
+
+    try:
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id="self-finalizing-heartbeat-holder",
+            lease_ttl=timedelta(seconds=30),
+        ).execute(request, sink)
+
+        assert result.effect.state is SinkEffectState.FINALIZED
+        assert target.publication_count == 1
+    finally:
+        finalized.set()
+        db.close()
+
+
+def test_peer_takeover_after_heartbeat_retirement_fences_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retiring the renewer never turns the terminal CAS into an authority gap."""
+    from elspeth.core.landscape.execution import sink_effect_finalization
+    from elspeth.engine.executors import sink_effects as sink_effects_module
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+    lease_ttl = timedelta(seconds=2)
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+    monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
+    monkeypatch.setattr(sink_effect_finalization, "now", clock.now_utc)
+    original_stop = sink_effects_module._SinkEffectLeaseHeartbeat.stop
+    rival_claims: list[SinkEffectLease] = []
+
+    def stop_then_install_rival(
+        heartbeat: sink_effects_module._SinkEffectLeaseHeartbeat,
+    ) -> None:
+        original_stop(heartbeat)
+        effect = heartbeat._effects.get_effect(heartbeat._claim.effect_id)
+        if effect is None or effect.state is not SinkEffectState.IN_FLIGHT or rival_claims:
+            return
+        clock.advance(lease_ttl.total_seconds() + 0.01)
+        rival_claims.append(
+            heartbeat._effects.takeover_expired(
+                heartbeat._claim.effect_id,
+                owner="terminal-rival",
+                ttl=lease_ttl,
+            )
+        )
+
+    monkeypatch.setattr(
+        sink_effects_module._SinkEffectLeaseHeartbeat,
+        "stop",
+        stop_then_install_rival,
+    )
+
+    try:
+        with pytest.raises(LandscapeRecordError, match="stale owner or generation"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="retiring-heartbeat-holder",
+                lease_ttl=lease_ttl,
+                clock=clock,
+            ).execute(request, sink)
+
+        assert len(rival_claims) == 1
+        (effect,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        assert effect.state is SinkEffectState.IN_FLIGHT
+        assert (effect.lease_owner, effect.generation) == (
+            rival_claims[0].owner,
+            rival_claims[0].generation,
+        )
+        assert target.publication_count == 1
+        assert not factory.execution.get_artifacts(run_id)
+    finally:
         db.close()

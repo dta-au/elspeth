@@ -17,10 +17,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+from opentelemetry.sdk.metrics import MetricsTimeoutError
+
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS
 from elspeth.telemetry.serialization import derive_trace_id
 from elspeth.web.config import settings_from_env
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
@@ -32,6 +35,7 @@ from .contracts import (
     FORBIDDEN_AWS_OVERRIDE_ENV,
     AcceptanceCheckError,
     AcceptanceInputError,
+    CheckFailureRecord,
     OperatorTelemetryAcceptanceError,
     SanitizedResourceIdentity,
     _bounded_identity,
@@ -39,6 +43,7 @@ from .contracts import (
     _resolve_aws_region,
     _sha256,
     _utc_timestamp,
+    close_failure,
 )
 from .receipt_contracts import (
     _METRIC_NAME,
@@ -47,6 +52,10 @@ from .receipt_contracts import (
     _TRACE_NAMES,
 )
 from .state import AcceptanceState
+
+# Delivery-failure classes an outage probe legitimately observes: the OTel
+# flush deadline plus transport/IO faults. Everything else crashes.
+_METRIC_DELIVERY_ERRORS: tuple[type[BaseException], ...] = (MetricsTimeoutError, *TELEMETRY_TRANSPORT_ERRORS)
 
 _MAX_XRAY_SEGMENTS = 32
 _MAX_XRAY_DOCUMENT_BYTES = 64 * 1024
@@ -632,27 +641,41 @@ class AWSOperatorMetricEmitter:
             self._runtime = runtime_factory(settings)
         except Exception:
             raise OperatorTelemetryAcceptanceError("operator metric runtime initialization failed") from None
+        # Transport-level delivery failures recorded per attempt (cause class
+        # only); a False emit_web_metric return is always backed by a record
+        # here, so a swallowed first-party defect can never masquerade as
+        # collector degradation.
+        self._failures: list[CheckFailureRecord] = []
+
+    @property
+    def delivery_failures(self) -> tuple[CheckFailureRecord, ...]:
+        return tuple(self._failures)
 
     def emit_web_metric(self, sentinel_value: int, *, acceptance_namespace: str) -> bool:
         if type(acceptance_namespace) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", acceptance_namespace) is None:
             raise OperatorTelemetryAcceptanceError("operator metric acceptance namespace is invalid")
+        get_meter = self._runtime.provider.get_meter
+        meter = get_meter("elspeth.web.aws_ecs_acceptance")
+        counter = meter.create_counter(
+            _METRIC_NAME,
+            description="Unique non-content AWS ECS acceptance sentinel.",
+            unit="1",
+        )
+        counter.add(
+            sentinel_value,
+            attributes={
+                "elspeth.acceptance.namespace": acceptance_namespace,
+                "elspeth.acceptance.sentinel": str(sentinel_value),
+            },
+        )
         try:
-            get_meter = self._runtime.provider.get_meter
-            meter = get_meter("elspeth.web.aws_ecs_acceptance")
-            counter = meter.create_counter(
-                _METRIC_NAME,
-                description="Unique non-content AWS ECS acceptance sentinel.",
-                unit="1",
-            )
-            counter.add(
-                sentinel_value,
-                attributes={
-                    "elspeth.acceptance.namespace": acceptance_namespace,
-                    "elspeth.acceptance.sentinel": str(sentinel_value),
-                },
-            )
             return self._runtime.provider.force_flush(timeout_millis=5_000) is True
-        except Exception:
+        except _METRIC_DELIVERY_ERRORS as exc:
+            # Collector outage / flush deadline: exactly the failure mode the
+            # outage phase probes for. Recorded, then reported as the declared
+            # False delivery result. Anything else is a first-party defect and
+            # crashes.
+            self._failures.append(CheckFailureRecord(check="operator_metric_delivery", exception_type=type(exc).__name__))
             return False
 
     def health_degraded(self) -> bool:
@@ -945,7 +968,6 @@ def verify_operator_telemetry_live(
     cloudwatch: Any | None = None
     xray: Any | None = None
     emitter: TelemetrySentinelEmitter | None = None
-    close_failed = False
     try:
         try:
             cloudwatch = aws_client_factory("cloudwatch", region)
@@ -1003,14 +1025,18 @@ def verify_operator_telemetry_live(
         receipt["forbidden_content_absent"] = True
         return receipt
     finally:
-        for resource_to_close in (xray, cloudwatch, emitter):
-            if resource_to_close is None:
-                continue
-            try:
-                resource_to_close.close()
-            except Exception:
-                close_failed = True
-        if close_failed and sys.exc_info()[0] is None:
+        # close_failure records the cause class; on the unwind path it also
+        # attaches a PEP 678 note to the in-flight exception, so a teardown
+        # fault is visible on every path (previously it was dropped whenever
+        # another exception was already propagating).
+        close_records = [
+            record
+            for resource_to_close in (xray, cloudwatch, emitter)
+            if resource_to_close is not None
+            for record in (close_failure(resource_to_close, check="operator_telemetry_resource_close"),)
+            if record is not None
+        ]
+        if close_records and sys.exc_info()[0] is None:
             raise OperatorTelemetryAcceptanceError("operator telemetry resource close failed")
 
 

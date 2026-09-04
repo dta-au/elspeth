@@ -1,0 +1,217 @@
+<!-- Design produced 2026-09-03 by a multi-agent design pass over the guided
+     remediation milestone (elspeth-7578b41719): six subsystem readers, two
+     independent proposals per group, a judge, two adversarial critics
+     (invariants/LLM-specialist and systems/gates), and a revision that
+     answers every blocker and major. Verified against ebfab6fd2. -->
+
+## B-2.1/2.2 — Goal-first start; one requested planner run at the step-2 finish; no planner run without an intent (FINAL)
+
+Group B-2.1-2.2-goal-first-no-empty-sketch
+
+Tickets: elspeth-378cfa0e18 (IA-3), elspeth-13579d1110 (I-6)
+
+Verified against HEAD `ebfab6fd2`. Every blocker and major from the critic round was checked against the code; one attribution was wrong (see "Rejected findings"). The judged design's central mistake was naming `ModeSwitchButton` as the only convert caller: the recommended-default entry (`createSession` → `enterGuided()` → `convertToGuided(sessionId)` with no intent, sessionStore.ts:1494-1508, 3567-3593, 2790-2806) creates and PERSISTS a rootless wizard through convert Branch 1 (guided.py post_guided_convert, "no persisted state → persist a fresh wizard checkpoint"), after which `compositionState` is non-null and the pre-start goal card can never render. The final design makes "no persisted guided state before the goal" the rule for every UI path.
+
+### User-visible behaviour
+
+**Entry (every path).** A guided session shows nothing persisted until the user states a goal. The three UI entries converge:
+
+- *New session under the guided default* (`createSession` → `enterGuided()`): the store probes `GET /guided`, receives the lazy in-memory stub (200, `composition_state: null`, first `single_select` turn — guided.py get_guided docstring), adopts it exactly as `startGuided` does today, and the panel opens on the goal card. Nothing is written.
+- *"Switch to guided" on a worked freeform session*: `ModeSwitchButton` (target `guided`, not resumable) always shows its confirm card, now carrying a required goal textarea; Confirm → `enterGuided(intent)` → `POST /guided/convert {operation_id, intent}`.
+- *"Switch to guided" on an empty session*: same card (the goal is required either way; the store cannot know emptiness synchronously) → `enterGuided(intent)` → the GET probe returns the stub → `POST /guided/start {profile:"live", intent}` directly, skipping the goal card.
+- *Reload of a guided-default session that never received a goal*: `selectSession` sees the GET stub (not a 400) and, when `resolveDefaultMode() === "guided"`, adopts it again so the session reopens on the goal card rather than in freeform. (Today convert persisted a rootless checkpoint, which is what made reload land in guided; the stub adoption replaces that without a write.)
+
+**Goal card.** While `compositionState === null`, a `guided-goal-prompt` card ("What should this pipeline produce?" + one hint line) replaces the stub's "Current decision" `single_select` card and the Explain button (Explain pre-start would otherwise become the start intent). Docked-box placeholder: "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…". Send → `POST /guided/start {profile:"live", intent}` (the existing branch at sessionStore.ts:3671-3675), 0 provider calls.
+
+**Transcript after start.** The session opens with two seeded turns: the goal as a user turn and one server line, `GUIDED_GOAL_ACKNOWLEDGEMENT` = "Goal saved. The planner will build from it once the source and output are reviewed. First, the source: where does the data come from?" This is a true server statement (the goal is not shown to the step-1/2 chat solvers in this group — `build_step_chat_context_block` has no root-intent input, chat_solver.py:2159-2169 — so the copy must not claim the assistant has read it). Both turns carry `step: step_1_source`, so they render under the existing "Source stage" divider (GuidedChatHistory.tsx:105-110); accepted and pinned — the ack itself hands off to the source question. The seeded ack does NOT become the step-1 "Current decision" headline: `latestAssistantRationale` rejects multi-sentence lines via `isConversationalProse` (guidedRationale.ts:68-74, 254), so the static purpose stays; pinned explicitly.
+
+**Steps 1–2** are unchanged in this group.
+
+**Step-2 finish ("Finish outputs").** Runs the planner exactly once, from the goal plus any deferred intents, under the existing DELTA contract (guided.py:4986). A session with neither a root intent nor deferred intents cannot plan: the respond preflight refuses with 409 `{"code":"guided_planner_intent_required","detail":"Tell the assistant what this pipeline should produce before finishing outputs."}` before rate admission (guided.py:3484) and before reservation (3492); the session stays at STEP_2 on its unanswered `review_components` turn. The literal fallback sentence (guided.py:4962-4966) is gone.
+
+**Proposal card.** Headline derived from `payload.component_counts.nodes`: N>0 → "The assistant proposed N processing steps from your goal."; 0 → "The assistant proposes no processing steps — rows pass straight from your source to your output." "A complete pipeline is ready for review." (ProposePipelineTurn.tsx:215) never renders. The tutorial "starting sketch" note and the Review-wiring withhold (356-376, 400) are deleted; the remaining tutorial note becomes the unconditional "The assistant planned this pipeline from your prompt… press Review wiring to continue."
+
+**Step-3 Send** remains a prose revision (planner run #2, user-requested); the verified root intent now rides with it as the named `root_goal` fact in the planner's reviewed context — beside the request, never concatenated into it — so the goal stays the planner's root through revisions (today the revision brief omits it entirely, guided.py:3907-3911). This is a deviation from the judged design's "prepend to the intent"; see open decision 2.
+
+**Tutorial (ADR-031, frozen texts byte-identical).** "Let's go" seeds `POST /guided/start {profile:"tutorial", intent: TUTORIAL_TRANSFORMS_PROMPT}` — the same shape a live goal takes. The learner never sees the goal card (start is programmatic, `compositionState` non-null on return); they see goal + ack in the transcript, then: Send (locked source), Continue, Looks right, Finish sources, Send (locked sink), Continue, Let source decide, Finish outputs (the one planner run, real nodes), Review wiring, Confirm wiring, Run. Step 3 has no locked prompt (existing confirm-only mechanism: empty read-only box). Three tutorial branches are removed, none added. **Coverage gap recorded:** the goal card (T0) is not on the tutorial canary; it is pinned by `ChatPanel.guidedStartRecovery.test.tsx` (real ChatInput → `startGuidedSession({intent})`) and the live goal-first staging trial.
+
+### Mechanism
+
+**Backend.**
+1. `post_guided_start` (guided.py:1432-1435): replace the profile-conditional rule with `if body.intent is None: 400 "Guided start requires a visible intent."` for every profile; delete the tutorial arm of `_verify_start_root` (1523-1526) so the root is verified for both profiles; build `root_message` whenever `body.intent` is present (1637-1640). Seed `chat_history=(ChatTurn(USER, intent, seq=0, step=STEP_1), ChatTurn(ASSISTANT, GUIDED_GOAL_ACKNOWLEDGEMENT, seq=1, step=STEP_1, assistant_message_kind="assistant"))`, `chat_turn_seq=2` on `seeded_guided` before `to_dict` — the R2-F6 transcript idiom (guided.py:4040-4065), no audit twin, no schema change. `GUIDED_GOAL_ACKNOWLEDGEMENT` lives beside the other constants (protocol.py:773-786). `assistant_message_kind` stays `"assistant"` — the closed vocabulary is `{"assistant","synthetic_failure"}` (protocol.py:545) and widening it is a schema change this group does not make.
+2. Custody helpers `_verify_guided_root_message_authority` (service.py:905-960) and `get_verified_guided_root_intent` (9460-9515): load the operation row FIRST (accept `kind ∈ {guided_start, guided_convert}`), load its `result_state_id` checkpoint, derive the profile kind from THAT checkpoint via new `profile.kind_for_profile(profile) -> WorkflowProfileKind` (inverse of `profile_for_kind`; `InvariantError` on an unknown constant), rebuild the matching DTO (`StartGuidedRequest{operation_id, profile: kind, intent}` or `ConvertGuidedRequest{operation_id, intent}`) for the hash re-derivation, and drop the `guided.profile != EMPTY_PROFILE` refusal (9511). The kind is derived from the START checkpoint, never the current one: a fork resets the child to `EMPTY_PROFILE` (service.py:1418-1430) and the fork settlement synthesises the child's `guided_start` row with a literal `"profile":"live"` request hash (14066-14111) — consistent because the child's result state IS `EMPTY_PROFILE`. Pin that coupling.
+3. Pure module helper `_has_planner_intent(guided: GuidedSession) -> bool` = `guided.root_intent_message_id is not None or bool(guided.deferred_intents)` (owned dataclass attribute reads; no getattr). In `_preflight_attempt` right after `requires_planner` (3362-3368): `if requires_planner and not _has_planner_intent(projected_guided): raise HTTPException(409, {"code": "guided_planner_intent_required", ...})` — the `_unsupported_stage` coded-409 idiom. In the settlement block the fallback branch (4962-4966) becomes `raise AuditIntegrityError("guided planner run requires a root or deferred intent")` — defence in depth from the same predicate. Its observable is NOT a 409: settlement failures go through `raise_guided_operation_failure` after reservation, so the pin expects HTTP 500 `server_invariant_violated` (guided.py:3386 shape), a failed `guided_operations` row, no `composition_proposals` row, no `llm_call_audit` row.
+4. Prose-revision brief (3877-3911): when `root_intent_message_id` is set, fetch the verified root and pass it to `plan_guided_pipeline(root_goal=…)`; the service names it in `reviewed_context` as `root_goal` alongside a one-line `root_goal_usage` ("…where the instruction narrows, changes, or withdraws part of the goal, follow the instruction"). `intent` stays `[*deferred, revision]` — the request being made NOW. **Deviation from the judged design, which said `planner_intent = [root, *deferred, revision]`; see open decision 2.** Concatenating made a revision that narrows or withdraws part of the goal argue against the goal inside the one field that means "what is being asked for now", and it fed the deterministic request guards that parse `intent` as the current user message: a threshold stated only in the goal resurrected on a revision that had just withdrawn it — the `gate_condition_ignores_stated_threshold` false positive that `_stated_threshold_in`'s docstring (pipeline_planner.py:1820-1828) calls "worse than a miss", because it tells a compliant model to make an already-correct pipeline wrong and, under a repair budget of one, ends in REPAIR_EXHAUSTED with no proposal at all. Pinned in both directions by `test_respond.py:3178`. Note the asymmetry, which is deliberate: on the FIRST run (the step-2 finish, mechanism above) the goal IS the request, so it leads the intent there as `[root, *deferred]` (guided.py:5145-5164, pinned at `test_wrong_stage_intent.py:527`) — the split applies only where a later instruction supersedes part of it.
+5. `post_guided_convert`: `ConvertGuidedRequest` gains `intent: str` (1–4096, `_require_visible_content`). Branches 1 & 3 build a `GuidedOriginatingUserMessageDraft`, set `root_intent_message_id`, seed the same transcript pair, and pass `originating_message` through `save_state_for_guided_operation` (new kwarg mirroring the start settlement's binding check at service.py:10919-10930) so the root row is written atomically under kind `guided_convert`. Branch 2 (already guided, 1935-1947) no longer silently discards the client's goal: it returns 409 `{"code":"guided_already_started"}`; same-`operation_id` replays are still served by `reserve_or_replay_guided_operation` before the branch is reached, and the store's GET-first probe makes Branch 2 unreachable from the UI except in a cross-tab race, where the loser refetches.
+6. Teaching (model-facing; LLM-specialist review seat BEFORE ratification): one clause added INSIDE rule 1 of `step_3_transforms.md` §Stage timing (lines 10-20), preserving its three-part condition: "A one-sentence outcome goal counts as asking for processing whenever reaching that outcome from the reviewed source needs a step; the empty set applies only when the goal names no processing AND no deferred intents are pending AND the server named no `unproducible_output_fields`." Scoped markers untouched. `chat_solver.py`, `planning.py`, binders, delta contract, `_build_get_guided_turn`, GuidedSession key set: byte-identical.
+
+**Protocol.** `POST /guided/start`: `intent` required for every profile (400 otherwise; the "Tutorial guided start forbids a client intent." 400 is removed). `POST /guided/convert`: new required `intent`; new 409 `guided_already_started`. `POST /guided/respond`: new 409 `guided_planner_intent_required`. `GuidedSession.chat_history` on a started/converted session begins with two seeded turns (existing wire shape). Removed: the literal fallback intent. No new TurnType, wire field, GuidedSession schema bump, endpoint (telemetry table and ledger regex unchanged), or decoder change.
+
+**Frontend.**
+- `sessionStore.ts`: `enterGuided(intent?: string)` becomes GET-first: `exited_to_freeform` → `reenterGuided()` (unchanged); otherwise `api.getGuided` → (stub, no intent) adopt the stub as `startGuided` does; (stub, intent) → `api.startGuidedSession({profile:"live", intent})`; (400, intent) → `convertToGuided(sessionId, intent)`; (400, no intent) → error "A goal is required to switch to guided" (unreachable from the UI; pinned as a store guard); (200 with state) → adopt. `createSession`'s default-mode call stays `enterGuided()` (1508) and therefore lands on the goal card with no `/guided/convert` call. `selectSession`/`fetchGuidedStateForSelect` (967-1000) returns a three-way result (stub | none | state); on stub + guided default preference the stub is adopted. `convertToGuided(sessionId, intent)` keys retry custody on `[intent]`; `seedGuided(sessionId, "tutorial", intent)` posts the intent and keys custody on `[profileKind, intent]`; `chatGuided` start branch unchanged.
+- `client.ts`: `startGuidedSession` sends `intent` for both profiles (drop the `profile === "live"` conditional at 926-929; `GuidedStartCommand` becomes `{profile, intent, operationId}`); `convertToGuided(sessionId, intent, operationId, signal)` body `{operation_id, intent}`.
+- `ModeSwitchButton.tsx`: for `target="guided"` the confirm card is unconditional unless `resumesSavedGuidedSession` (a stated change to the `hasWork ? confirm : doSwitch` gate at :129); it carries a required goal textarea; Confirm is disabled while empty; Confirm → `enterGuided(intent)`. `target="freeform"` behaviour unchanged.
+- `ChatPanel.tsx`: `GUIDED_GOAL_PLACEHOLDER` selected while `compositionState === null` (selector at 790; mirror the local "ready" pseudo-step pattern rather than widening the step-keyed map); render the `guided-goal-prompt` card in place of `decisionSection` and suppress the Explain button pre-start. `GUIDED_STEP_PURPOSES.step_3_transforms` → "Review the processing steps the assistant proposed from your goal." `tutorialPromptSentForStep` (2610-2620) → `t.role === "user" && t.step === step && t.content.trim() === (lockedChatPrompt?.[step] ?? "").trim()` — trimmed exact locked-prompt equality (ChatInput trims on send, ChatInput.tsx:346; mirrors guidedReplay.ts:43 trimmed dedupe; subsumes the Explain exclusion) so the seeded goal turn at step_1 does not flip the locked box.
+- `guided.css`: real rules for `.guided-goal-prompt`, `.guided-goal-prompt__question`, `.guided-goal-prompt__hint`.
+- `ProposePipelineTurn.tsx`: counts-derived headline; tutorial sketch note + withhold deleted.
+- `TutorialGuidedShell.tsx`: `buildLockedPrompts` drops `step_3_transforms`; the start effect calls `seedGuided(sessionId, "tutorial", TUTORIAL_TRANSFORMS_PROMPT)`. `tutorialMachine.ts` constants byte-identical.
+- `GuidedChatHistory.tsx`: unchanged; the seeded pair under "Source stage" is pinned.
+
+**Harness/ledger.** `transition-ledger.ts` unchanged ('transition-ledger/1' stays comparable with phase0/phase1). `tutorial-reliability.staging.spec.ts` has TWO driver loops carrying the send-first guard and `drivenPhases` with "Transforms": the tutorial driver (262, 343, and the rationale comment 198-207) and `driveCollectorScenarioWalk` (921; 927, 954, 995). Both drop "Transforms" and the guard. The tutorial walk asserts `totals.planner_runs === 1`, the "Finish outputs" transition has `planner_runs === 1` and `next_turn_type === "propose_pipeline"`, no other tutorial transition has `planner_calls > 0`, `plannerEfficiencyAssertionFailure === null`, `transitions.violations` empty. The collector scenario keeps recording without grading (COLLECTOR_BASELINE null, 906-913); its per-transition planner assertions are NOT applied; its before/after ledger is recorded separately on the ticket. `HARNESS_LEGACY_AUTO_RUN` is a flag inside the tutorial driver (59, 173), not a second driver.
+
+### Walk after change (per transition: provider / planner calls)
+
+**Tutorial (12 transitions; −1 transition, −1 gesture, −1 planner run, −2 to −3 provider calls vs phase1-after-r2; the rest of ≤7 gestures comes from 2.3/1.4/1.2):**
+T1 Let's go → `guided/start {tutorial, intent=TUTORIAL_TRANSFORMS_PROMPT}` 0/0; chat_history = [goal, ack]; next_turn single_select (suppressed until the locked source prompt is sent, as today).
+T2 Send (locked source) → `guided/chat` 1/0 → schema_form.
+T3 Continue 0/0 → inspect_and_confirm. T4 Looks right 0/0 → review_components. T5 Finish sources 0/0 → step_2 single_select.
+T6 Send (locked sink) → `guided/chat` 2/0 → schema_form. T7 Continue 0/0 → multi_select. T8 Let source decide 0/0 → review_components.
+T9 Finish outputs → preflight `requires_planner ∧ _has_planner_intent` → rate-admitted → ONE `plan_guided_pipeline` run, DELTA contract, intent = frozen transforms prompt → propose_pipeline (web_scrape → llm → field_mapper), headline "proposed 3 processing steps", Review wiring enabled. **Acceptance criterion, not a claim:** ≤2 planner calls, phases `candidate` | `discovery,candidate`, 0 repair. The floor is 2 calls (§Stage timing 2 mandates a discovery turn for plugins whose contract is not already supplied). The phase1-after-r2 T10 run drew `discovery,candidate,repair` (3 calls, 83 s) on the FULL/amend contract against an empty predecessor; the single DELTA run from a fresh predecessor is a brief the walk has never run, so nothing transfers either way — see the B3 obligation below.
+T10 Review wiring 0/0 → confirm_wiring. T11 Confirm wiring 0/0 → terminal completed (+ Accept cards). T12 Run (1.2) → `tutorial/run`.
+Totals: planner_runs 1, planner_calls ≤2 (target), provider calls 4–5 (was 7).
+
+**Live goal-first:** T0 goal Send → `guided/start {live, intent}` 0/0, transcript goal+ack, source single_select. T1 source Send 1/0 → Continue → (Looks right) → Finish sources 0/0 each. T2 sink Send 2/0 → Continue → Let source decide → Finish outputs → 1 planner run from the goal (+ deferred intents) → propose_pipeline headlined by node count. Review wiring → Confirm wiring 0/0. A later step-3 Send is an explicit revision (second run, `intent` = [deferred…, instruction], with the goal beside it as the named `root_goal` fact).
+
+**Guided-default new session:** `createSession` → `enterGuided()` → GET stub (0/0, no write) → goal card → T0 as above. Reload before the goal → stub re-adopted (0/0, no write).
+
+**Worked-freeform → guided:** ModeSwitchButton card with goal → `guided/convert {intent}` 0/0 → root row under `guided_convert`, transcript goal+ack, source single_select.
+
+**Rootless respond-seeded session (API/tests only; guided.py:3088 seeds without a start):** Finish outputs → 409 `guided_planner_intent_required`, 0/0, no proposal row, no state write, GET /guided still at step_2 review_components. A step-2 chat that retains a transforms instruction via `retain_deferred_intent` (1–2 provider calls) then Finish outputs plans from the deferred intent.
+
+### Files to change (path — change)
+
+- `src/elspeth/web/sessions/schemas.py` — `ConvertGuidedRequest.intent: str` (1–4096, visible-content validator); `StartGuidedRequest` DTO unchanged (route enforces presence).
+- `src/elspeth/web/composer/guided/protocol.py` — `GUIDED_GOAL_ACKNOWLEDGEMENT`.
+- `src/elspeth/web/composer/guided/profile.py` — `kind_for_profile`.
+- `src/elspeth/web/sessions/routes/composer/guided.py` — start rule for all profiles; `_verify_start_root` tutorial arm deleted; root row + transcript seed on start; `_has_planner_intent`; preflight 409; fallback → AuditIntegrityError; revision brief carries the verified root as the named `root_goal` fact (never in `intent`); convert requires intent, builds root row + transcript seed, passes `originating_message`, Branch 2 → 409 `guided_already_started`.
+- `src/elspeth/web/sessions/service.py` — both custody helpers derive kind from the START checkpoint via `kind_for_profile`, accept kind ∈ {guided_start, guided_convert}, drop the EMPTY_PROFILE refusal; `save_state_for_guided_operation(originating_message=…)` binding; fork parity sites 13757 (parent root check now runs for tutorial parents) and 14066-14111 (child `"profile":"live"` ⇔ `EMPTY_PROFILE` coupling) — no code change expected there, pins added.
+- `src/elspeth/web/composer/guided/skills/step_3_transforms.md` — one clause inside rule 1.
+- `src/elspeth/web/frontend/src/stores/sessionStore.ts` — `enterGuided(intent?)` GET-first branching (1494-1508 caller unchanged; 3567-3593 rewritten); `fetchGuidedStateForSelect` three-way result + stub adoption under guided default; `seedGuided(…, intent)` + retry key; `convertToGuided(sessionId, intent)`.
+- `src/elspeth/web/frontend/src/api/client.ts` — `startGuidedSession` sends intent for both profiles; `convertToGuided` body `{operation_id, intent}`.
+- `src/elspeth/web/frontend/src/components/chat/guided/ModeSwitchButton.tsx` — unconditional confirm card for guided (non-resume) with required goal textarea; `enterGuided(intent)`.
+- `src/elspeth/web/frontend/src/components/chat/ChatPanel.tsx` — goal placeholder/card pre-start, Explain suppressed pre-start, step-3 purpose copy, trimmed locked-prompt equality.
+- `src/elspeth/web/frontend/src/components/chat/guided/guided.css` — `.guided-goal-prompt*` rules.
+- `src/elspeth/web/frontend/src/components/chat/guided/ProposePipelineTurn.tsx` — counts-derived headline; tutorial sketch note + withhold deleted.
+- `src/elspeth/web/frontend/src/components/tutorial/TutorialGuidedShell.tsx` — no step_3 locked prompt; seed with `TUTORIAL_TRANSFORMS_PROMPT`.
+- `src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts` — both drivers (tutorial 198-207/262/343; collector 927/954/995) drop the Transforms Send and guard; tutorial-walk planner_runs/per-transition assertions.
+- `tests/integration/web/composer/parity/conftest.py` — tutorial branch starts with the frozen-lesson intent and consumes ONE scripted proposal; delete the pass-through + revision choreography (734-770) and `_derive_guided_passthrough_delta`.
+- `tests/integration/web/composer/parity/test_repair_and_deferral.py` — `len(manifests) == 1` for the tutorial fixture.
+- Backend pins (named lines): `tests/unit/web/sessions/test_guided_operation_requests.py:31` (`(ConvertGuidedRequest, {})` → `{"intent": "…"}`); `tests/integration/web/composer/guided/test_convert.py:57` (tutorial/live starts send an intent); `test_respond.py:891-1010`; `test_respond_schema8_atomic.py`; `test_get_guided.py`; `test_guided_operation_retry.py`; `test_wrong_stage_intent.py:520`; `tests/integration/web/test_plugin_policy_end_to_end.py`; `tests/unit/web/sessions/test_guided_start.py:206/220/246`; `test_guided_operations_service.py`; `test_guided_atomic_settlement.py`; `test_guided_operation_fork_service.py`; `test_schema8_fork_revert.py`; `tests/unit/web/composer/guided/test_skill.py`; `test_profile.py`.
+- Frontend pins: `sessionStore.test.ts:3292-3340` (default-mode describe); `sessionStore.guided.test.ts:2045-2063` (enterGuided → convert pin rewritten to GET-first), seed/convert intent + retry keys; `client.guided.test.ts`; `ModeSwitchButton.test.tsx:17` (empty-session direct-switch pin rewritten); `ChatPanel.test.tsx:2964` (placeholder) + goal card/Explain/locked-box pins; `ChatPanel.guidedStartRecovery.test.tsx` (T0); `ProposePipelineTurn.test.tsx:639` (headline); `TutorialGuidedShell.test.tsx:82/380`; `guidedRationale.test.ts`; `GuidedChatHistory.test.tsx:215-227`; `styles/classNames.test.ts` / `guidedSurface.test.ts`; `components.a11y.test.tsx`; `defaultDomPins.ts`; route-mocked `tutorial.spec.ts:394` and `guided-collector.spec.ts:428` (start mocks accept intent; no step-3 Send mocked).
+- `docs/plans/2026-09-02-guided-tutorial-remediation.md` — "Done means" reword (open decision 1); deploy note.
+
+### Tests and gates
+
+- **Rootless pin rewrite** (`test_respond.py::test_rootless_step_3_entry_routes_through_the_provider_planner`, keep the anti-bypass polarity of 997/1009/1227): (a) respond-seeded rootless session → Finish outputs 409 `guided_planner_intent_required`, `provider_calls == []`, no `composition_proposals` row, no `llm_call_audit`, GET /guided still at step_2 review_components; (b) parametrised live/tutorial started WITH an intent → planned by the provider (`composer_provider == "test"`, model pinned, llm_call_audit present) and the planner brief's intent == the start intent. Every tutorial `/guided/start` in the guided integration dir sends an intent.
+- **Mutation gate for 2.2** (mutation-test the guard, not the defect): restore the fallback sentence → pin (a) red; remove the preflight 409 → the settlement pin catches it as HTTP 500 `server_invariant_violated` + failed `guided_operations` row + no proposal row + no llm_call_audit; make `_has_planner_intent` return True → both red.
+- **Start/custody** (`test_guided_start.py`): `test_guided_start_profile_resolves_intent_shape_before_reservation` → 400 for BOTH profiles without intent, zero operation rows; tutorial-with-intent pins the root row, `guided_operations.originating_message_id`, `chat_history == [goal, GUIDED_GOAL_ACKNOWLEDGEMENT]`, `chat_turn_seq == 2` for both profiles (re-pin the "start does NOT materialize a chat turn" asserts at 206/220/246 to the seeded pair); custody helpers accept a tutorial-profile root and a `guided_convert` root, still fail closed on content/hash drift and unknown profile constant.
+- **Fork parity** (`test_guided_operation_fork_service.py` / `test_schema8_fork_revert.py`): rooted TUTORIAL parent fork → child passes both custody helpers (child `EMPTY_PROFILE` ⇔ synthesised `"profile":"live"` hash); rooted CONVERTED parent fork (parent kind `guided_convert`); the child's seeded transcript pair crosses verbatim; negative: fork AT the goal message is refused (`_strip_guided_profile_in_meta` 1364-1370, "references a message outside copied slice") — documented pre-existing behaviour, now true of every guided session's first user message; run the rooted LIVE parent fork against HEAD first and ticket with evidence if it already fails.
+- **Convert** (`test_convert.py`): intent required (400); root row atomically under kind `guided_convert`; transcript seeded; converted session's Finish outputs plans from that intent; Branch 2 with a fresh operation_id and an intent → 409 `guided_already_started`; same-operation_id replay still returns the settled response.
+- **Planner briefs** (`test_wrong_stage_intent.py` and siblings): the step-2 finish run keeps `intent` order `[root, deferred…]` (pinned at :527); the step-3 revision run is `intent` `[deferred…, instruction]` with the goal alongside as `root_goal` (pinned at :565-571). Both directions of the reason for that split are pinned by `test_respond.py:3178`: a threshold stated only in the goal does not reach `_stated_threshold_for_planner_request` through `intent`, and the same call over the goal text alone does produce one — so the pin measures the boundary rather than an absence of thresholds.
+- **Parity**: `drive_guided_staged` tutorial branch single scripted proposal; `test_tutorial_reaches_same_commit_as_staged_with_its_fixed_lesson` manifests == 1.
+- **Teaching**: `test_skill.py` existence pins for BOTH halves of the new clause (goal-shaped intents count as processing; the three-part empty-set condition survives); markers unchanged; `test_collector_guard.py`, `test_chat_solver.py` verbatim-prompt pins re-run. LLM-specialist review seat on the clause and `GUIDED_GOAL_ACKNOWLEDGEMENT` before ratification; then live trial.
+- **B3 pre-ratification obligation (planner-call cause):** before the skill clause is ratified, pull the `planner_attempt_audit` rejection code/feedback for the phase1-after-r2 T10 candidate from staging (`GET /messages?include_llm_audit=true` on that run's session; the ledger row_ids in `run-01.json` entries[9] identify the llm_call rows) and record it on elspeth-13579d1110 and in this design. If it is a FULL-vs-DELTA binding difference (e.g. reviewed-component re-emission) state that the single DELTA run avoids it; otherwise treat it as a planner-brief defect per ADR-031 §4 and scope the clause to it. The skill clause is the only permitted lever, never a route change.
+- **Whole-tree gates**: attribute-contract + masquerade (no new getattr/hasattr; `_has_planner_intent` reads owned dataclass attributes); trust-tier corpus captured before/after from `git archive` baselines under `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`, R_TB_SUPPRESSED excluded, delta ≤ 0 (`ConvertGuidedRequest.intent` is a pydantic DTO; no new foreign-value parsing); `test_composer_request_telemetry.py` unchanged; ruff; full `pytest tests/` to a lane-private log with the exit code read.
+- **Frontend**: `sessionStore.test.ts` (default-mode createSession → GET stub adopted, `compositionState === null`, no `/guided/convert`; reload of a goal-less guided-default session re-adopts the stub; freeform default unchanged); `sessionStore.guided.test.ts` (enterGuided GET-first: stub/no-intent → adopt, stub/intent → start, 400/intent → convert, 400/no-intent → guard; seed intent + retry key; convert intent; freeform replay dedupe — goal row present once after exit_to_freeform); `client.guided.test.ts` (both profiles send intent; convert body); `ModeSwitchButton.test.tsx` (guided target always confirms unless resumable; Confirm disabled on empty goal; `enterGuided(intent)` called; freeform target unchanged); `ChatPanel.test.tsx` (pre-start placeholder/card, no stub chips or Explain pre-start; trimmed locked-prompt predicate with a locked prompt containing newlines and the seeded goal turn present — box stays locked, single-select stays suppressed); `ChatPanel.guidedStartRecovery.test.tsx` (T0 intent routing); `ProposePipelineTurn.test.tsx` (0-node vs N-node headline; Review wiring offered in tutorial on `supersedes_draft_hash === null`; no "starting sketch" copy); `TutorialGuidedShell.test.tsx` (`lockedTransforms` undefined; seed called with the prompt); `guidedRationale.test.ts` (seeded ack never becomes the headline — multi-sentence rejection — and the static step-1 purpose renders); `GuidedChatHistory.test.tsx` (seeded pair renders under one "Source stage" divider, in seq order); all with `resetStore`. `classNames.test.ts`/`guidedSurface.test.ts` for the new classes; `components.a11y.test.tsx` (goal card inside the audited ChatPanel surface, no nested live region); `defaultDomPins.ts`. Route-mocked canaries `tutorial.spec.ts` and `guided-collector.spec.ts` run.
+- **Harness (ratifying measurement, operator-fired, HARNESS_BATCH_ID phase2-b)**: per-transition provider calls expected `0,1,0,0,0,2,0,0,1–2,0,0(,run)`; `totals.planner_runs === 1`; efficiency verdict passes (one cohort, ≤2 calls, `candidate|discovery,candidate`, zero repair — a repair on the single run FAILS Phase 5); `transitions.violations == []`; record the before/after table on elspeth-13579d1110 and elspeth-378cfa0e18; record the collector scenario's ledger separately (ungraded).
+- **Live goal-first trial** (non-tutorial), both walks over `evals/composer-parity/fixtures/two_llm_colour.csv` (`color_name,hex`, 10 rows — the same blob `composer-guided-live.staging.spec.ts:55` already uploads): guided-default new session → goal card → one-sentence goal, CSV source, JSON output → 1 planner run at Finish outputs with a non-empty node set; a goal naming no processing → pass-through headline, never "complete"; worked-freeform switch with a goal → rooted session.
+- **Both trial goals are FIXED IN ADVANCE, and the trial is a named gate on
+  elspeth-378cfa0e18** (LLM-specialist finding, remediation round 1). The
+  step-3 clause's PROCESSING half — the behaviour this whole group exists to
+  produce — has no executable coverage anywhere in the package: every goal in
+  the specs is either a pass-through goal or a restatement of steps, the
+  tutorial's frozen root intent is a steps instruction, the backend pin is a
+  substring existence assertion, and the parity spec's `GUIDED_GOAL` restates
+  its fixture request's steps (noted in that file, so that walk is not read as
+  clause evidence). Deciding the goal text after seeing the result is not a
+  trial, so:
+  Both walks upload the SAME fixture,
+  `evals/composer-parity/fixtures/two_llm_colour.csv` (`color_name,hex`), so
+  the pair differs only in the goal — the variable under test — and neither
+  goal presumes a column or a plugin the deployment may not have. (The
+  fixture directory holds no URL-bearing corpus, and a goal over pages at
+  URLs would additionally presume a fetch/scrape transform is policy-visible;
+  an empty result would then be a capability miss indistinguishable from the
+  clause defect the trial exists to detect.)
+  - *processing*: **"A one-sentence description of each colour, saved as
+    JSON."** — an outcome, no step named, reachable from `color_name`/`hex`
+    with the LLM transform family the parity walk already authors twice over
+    this exact blob (`evals/composer-parity/fixtures/two_llm_colour_request.txt`).
+    PASS = a non-empty node set from the one planner run at Finish outputs.
+  - *no processing*: **"Write every colour row from the uploaded CSV to a JSON
+    file, unchanged."** — the source's own rows. PASS = the pass-through
+    headline ("no processing steps — rows pass straight from your source to
+    your output"), never "A complete pipeline is ready for review."
+  Outputs on BOTH walks: JSON, then **"Let source decide (pass all fields
+  through)"**. Do NOT declare a custom output field. A declared field naming
+  the outcome (e.g. `description`) makes the server name it in
+  `unproducible_output_fields`, and rule 1's PRE-EXISTING branch — not the
+  clause under test — decides the verdict, so the PASS stops being clause
+  evidence. With `unproducible_output_fields` empty the new outcome-goal clause
+  is the only thing that can carry the goal to processing. The escape hatch
+  passes every field through, so a description column the planner adds still
+  lands in the JSON. (LLM-7, remediation round 2: the setup previously said
+  only "CSV source, JSON output", leaving the one choice that decides whether
+  the walk is evidence unstated in both directions — a hollow PASS via the
+  custom field, or a FAIL misread as a rule-1 defect.)
+  Record both walks' ledgers and node counts on the ticket. A processing goal
+  that lands empty is a teaching defect in rule 1, not a trial to re-run with
+  different words.
+  - *third walk, revision* (RTV-3, remediation round 2): the two walks above
+    both stop at Finish outputs, which is the ONE path the `root_goal`
+    deviation did NOT change — so open decision 2 asks for a ratification that
+    nothing behavioural supports. Continue the processing walk: at step 3 send
+    a prose revision that WITHDRAWS part of the goal — **"Actually just write
+    the rows through unchanged."** — and record whether the revised proposal
+    honours the instruction or the superseded goal. That is precisely the
+    judgement open decision 2 puts to the operator. Delivery is already proved
+    by mechanism (`root_goal` reaches the provider request's `reviewed_facts`
+    verbatim, with no allowlist or scrubber between), and every existing
+    assertion is payload assembly against a monkeypatched planner, upstream of
+    the provider call; what no test measures is whether the model USES it. If
+    this walk is not run, say so in open decision 2 rather than letting
+    `done_definition` read as though the trial closes the group.
+
+### Lanes
+
+**Deploy gate (applies to all lanes):** B1 and B2 are test-independent but NOT deploy-independent. B1 deployed alone 400s the live tutorial (deployed `seedGuided(sessionId,"tutorial")` sends no intent; `client.startGuidedSession` strips `intent` for non-live profiles, client.ts:926-929) and 400s every guided-default session creation (deployed `enterGuided` posts intent-less convert). Route-mocked canaries do not surface this. B1 + B1b + B2 merge and deploy as ONE build, with the sessions.db reset in the same deploy (pre-existing rootless sessions would 409 at Finish outputs). B3's staging re-measure runs only against that build.
+
+- **B1 backend core** (lands first): start intent for all profiles + transcript seed + custody kind derivation + `_has_planner_intent` + preflight 409 + fallback removal + revision-brief root + `kind_for_profile` + `ConvertGuidedRequest.intent` + convert root row/Branch-2 409 + `save_state_for_guided_operation(originating_message=…)` + all backend pins incl. `test_guided_operation_requests.py:31`, `test_convert.py`, fork parity pins; parity conftest/test. Independent.
+- **B2 frontend** (can start against a hand-written start-response fixture; merges with B1): store GET-first `enterGuided(intent?)`, stub adoption on select, seed/convert intent + retry keys, client signatures, ModeSwitchButton card, goal placeholder/card, Explain suppression, trimmed locked-prompt predicate, proposal headline + tutorial ungating, tutorial seed intent + no step-3 locked prompt, all frontend pins, CSS/a11y gates. Land the ProposePipelineTurn edit after 1.3 merges (shared-file WIP); keep the headline change isolated to the header block.
+- **B1b** is folded into B1/B2 (convert's backend half in B1, its frontend half in B2) — splitting it produced a second non-deployable seam for no test benefit.
+- **B3 harness + teaching** (spec edits parallel with B1; finishes after the joint deploy): both staging drivers; tutorial-walk assertions; the T10 rejection-code pull and record; `step_3_transforms.md` clause + `test_skill.py` pins through the LLM-specialist seat; staging re-measure; ticket comments with the before/after tables.
+
+### Open decisions for the operator
+
+1. The plan's "Done means" bullet ("the step-2 finish no longer appears as a planner run") is contradicted by this shape; the ticket and brief both allow "headline honestly and count it". Proposed reword: "no planner run without an intent; exactly one requested planner run per walk, at the step-2 finish, from the goal; a repair turn on that run fails the gate." Phase 5 grades against this line, so it needs your acknowledgement before the lane lands the doc edit.
+
+2. **Ratification needed for a shipped deviation: the revision brief carries
+   the goal as a named `root_goal` fact, not prepended to `intent`.** This
+   design was judged and adversarially critiqued twice with mechanism §4 and
+   §"Walk after change" reading `planner_intent = [root, *deferred, revision]`.
+   The implementation does not do that, and the doc text above has been
+   corrected to the shipped mechanism — but a doc edit is not ratification, so
+   the deviation is called out here rather than absorbed silently. What
+   changed and why: prepending puts the standing goal inside the field that
+   means "what is being asked for now", so (a) a revision that narrows,
+   changes, or withdraws part of the goal has to argue against the goal in its
+   own request, with the default amend policy pushing toward keeping the
+   superseded part, and (b) the deterministic guards that parse `intent` as
+   the current user message misfire — a threshold stated only in the goal came
+   back as a `stated_threshold` on a revision that had just withdrawn it, the
+   false positive `_stated_threshold_in`'s docstring
+   (pipeline_planner.py:1820-1828) calls "worse than a miss" because it
+   exhausts the repair budget and ends with no proposal at all. The goal still
+   reaches the planner on every revision (the group's actual objective),
+   verified by the same custody helper, with an explicit precedence line; it is
+   ordered rather than concatenated. The step-2 finish run is unchanged from
+   the judged design — there the goal IS the request and leads the intent.
+   Pinned both ways at `test_respond.py:3178` and
+   `test_wrong_stage_intent.py:565-571`. If you would rather have the judged
+   form, the revert is one line in `guided.py` (`planner_intent` at 4098) plus
+   those pins — but it reinstates (b).
+
+### Rejected findings
+
+- **[systems+gates / major] "The second driver copy is the legacy/auto-run variant"** — attribution wrong. `tutorial-reliability.staging.spec.ts:921` is `async function driveCollectorScenarioWalk(page)`; the `drivenPhases`/guard at 927/954/995 belong to the collector-authoring scenario (ungraded, `COLLECTOR_BASELINE` null at 906-913). `HARNESS_LEGACY_AUTO_RUN` is a flag read at line 59 and consulted inside the single tutorial driver (173), not a second copy. The substantive remedy — fix both loops — is adopted above under the collector item (the invariants critic's minor had the attribution right).
+- **[systems+gates / major, part (a)] "the seeded acknowledgement WILL replace the static step-1 headline"** — false as written for the chosen copy: `latestAssistantRationale` passes the candidate first line through `isConversationalProse`, which rejects `MULTIPLE_SENTENCES` (guidedRationale.ts:68-74; pinned at test 254), so a multi-sentence single-line acknowledgement is discarded and the static purpose renders. The remedy (decide and pin) is adopted; the mechanism is the existing prose rejection, pinned explicitly rather than a new predicate or a duplicated server constant on the frontend. Part (b) (divider) is accepted as stated.

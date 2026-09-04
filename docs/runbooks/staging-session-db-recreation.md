@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and aggregation recovery (session epoch 48 and Landscape epoch 35)
+## Current Cutover: 0.8.0 blob cleanup, guided decline, and aggregation recovery (session epoch 51 and Landscape epoch 36)
 
-0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 48. Epoch 36 ensures a committed
+0.8.0 advances `SESSION_SCHEMA_EPOCH` from 35 to 51. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -36,7 +36,15 @@ guided Retry is occurrence-bound instead of content-based
 `proposal_events.event_type` CHECK so an auto-commit blocked by the
 settlement-boundary trust-mode recheck (elspeth-01d4c6e683) leaves a durable
 proposal event instead of silently falling back to the review path.
-An epoch-35 through epoch-46 database cannot represent
+Epoch 48 adds `superseded` to the closed `interpretation_events.choice`
+CHECK so a composition-state commit that extinguishes a reviewed
+interpretation site terminally retires the persisted pending review in the
+same transaction (elspeth-d73139155a / elspeth-dbc39dd367) instead of
+leaving a zombie card that gates Run.
+Epoch 49 adds the `composition_rejection_events` table: a composer
+mutation-tool rejection's reason — the exact payload the planner saw —
+persists durably as session data (elspeth-3e28029d2f).
+An epoch-35 through epoch-48 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
@@ -88,11 +96,12 @@ Epoch 35 flips lineage onto that groundwork: the tri-column
 from `tokens`, `token_outcomes`, and `token_work_items` (plus
 `token_outcomes.expected_branches_json`), and `token_lineage_frames`/
 `lineage_path_json` become the sole lineage truth. `join_group_id` stays.
+Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 37. Landscape epoch 35
-is the current release boundary, so a Landscape database left at epoch 34 or
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 36
+is the current release boundary, so a Landscape database left at epoch 35 or
 below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -108,9 +117,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-48 release forward,
+unsupported: keep the service drained, repair the epoch-51 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-48/Landscape-epoch-31 record when binding candidate and rollback
+session-epoch-51/Landscape-epoch-36 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -577,16 +586,18 @@ sudo systemctl status "$SERVICE" --no-pager --lines=20
 
 `initialize_session_schema()` recreates the file on service startup. If either health check fails, inspect `journalctl -u elspeth-web.service --no-pager -n 80` before retrying.
 
-After health checks pass, prove the recreated session store carries the current
-hard-cut sentinel before creating any session:
+After health checks pass, prove both recreated stores carry the current hard-cut
+sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
+resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 48 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 51 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 36 (== SQLITE_SCHEMA_EPOCH)
 ```
 
-An epoch-35, epoch-36, epoch-37, epoch-38, epoch-39, or epoch-40 result is not repairable in place: keep the service drained,
-recreate the session database with the current release, and rerun the probe.
-Then create a new session through the API or UI and confirm no
+Any predecessor session or Landscape epoch is not repairable in place: keep the
+service drained, recreate both stores with the current release, and rerun the
+probes. Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.
 
 #### 0.7.0 epoch + smoke verification

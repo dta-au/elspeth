@@ -983,6 +983,21 @@ def _row_column(node: ast.expr) -> str | None:
     return None
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "one AST node parsed from a composer-authored gate/predicate expression string: Tier-3 authored "
+        "content whose parse tree shape is unconstrained beyond Python syntax"
+    ),
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns (True, value) only for an exact JSON scalar literal or a unary +/- numeric literal, and the "
+        "sentinel (False, None) for every other node shape; never coerces, never raises — the isinstance "
+        "dispatch is nominal typing over the ast module's concrete node classes, the only correct way to "
+        "walk a foreign parse tree"
+    ),
+)
 def _json_literal(node: ast.expr) -> tuple[bool, object]:
     if isinstance(node, ast.Constant) and type(node.value) in {str, int, float, bool, type(None)}:
         return True, node.value
@@ -1369,7 +1384,10 @@ def _constraint_conjunction_contradiction(
 
     def require_subject(subject: StableSubject | PluginSubject) -> tuple[str, str, tuple[PluginKind, str] | None]:
         subject_key, component_kind, plugin_identity = subject_identity(subject)
-        required_subjects.setdefault(subject_key, subject)
+        # First-wins accumulation made explicit: the first constraint's
+        # subject object stands as the representative for its key.
+        if subject_key not in required_subjects:
+            required_subjects[subject_key] = subject
         required_component_kinds.setdefault(subject_key, set()).add(component_kind)
         if plugin_identity is not None:
             required_plugin_identities.setdefault(subject_key, set()).add(plugin_identity)

@@ -450,11 +450,13 @@ export function parsePlannerAuditMessages(value: unknown): PlannerAuditEvidence 
   };
 }
 
-/** Fetch every filtered message page; hidden audit rows are sliced after filtering. */
-export async function fetchPlannerAuditEvidence(
+/** Fetch every audit-grade message page (llm_call_audit + planner_attempt_audit
+ *  rows included); hidden audit rows are sliced after filtering. Shared by the
+ *  per-walk efficiency gate and the per-transition ledger recorder. */
+export async function fetchLlmAuditMessages(
   ctx: APIRequestContext,
   sid: string,
-): Promise<PlannerAuditEvidence> {
+): Promise<unknown[]> {
   const messages: unknown[] = [];
   for (let offset = 0; ; offset += MESSAGE_AUDIT_PAGE_SIZE) {
     const r = await ctx.get(
@@ -468,7 +470,15 @@ export async function fetchPlannerAuditEvidence(
     messages.push(...page);
     if (page.length < MESSAGE_AUDIT_PAGE_SIZE) break;
   }
-  return parsePlannerAuditMessages(messages);
+  return messages;
+}
+
+/** Parse the whole session's planner audit evidence (per-walk view). */
+export async function fetchPlannerAuditEvidence(
+  ctx: APIRequestContext,
+  sid: string,
+): Promise<PlannerAuditEvidence> {
+  return parsePlannerAuditMessages(await fetchLlmAuditMessages(ctx, sid));
 }
 
 function completeSum(

@@ -23,6 +23,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
+from elspeth.web.composer.guided.protocol import GUIDED_GOAL_ACKNOWLEDGEMENT
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
@@ -36,6 +37,13 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+
+# Goal-first entry (elspeth-378cfa0e18): EVERY profile's start carries the
+# author's goal, the tutorial included — its goal is the frozen lesson prompt
+# the shell sends. These tests only need one, so they share this constant;
+# holding it in one place also keeps same-``operation_id`` retries hashing
+# identically, which several of them depend on.
+_START_INTENT = "Summarize each page and save the summaries as JSON"
 
 
 class _CatalogServiceFake:
@@ -169,6 +177,51 @@ def _materialize_first_turn(state, catalog, payload_store):
     return replace(state, guided_session=guided)
 
 
+async def _persist_competing_guided_winner(app, service, session, *, profile, intent, session_operation_context):
+    """Persist the checkpoint a COMPETING guided start would have left behind.
+
+    Goal-first (elspeth-378cfa0e18): a real start writes its root intent row
+    and binds it on the checkpoint, for every profile. ``_verify_start_root``
+    re-derives that root before settling on someone else's head, so a
+    simulated race winner has to be rooted too — a rootless guided checkpoint
+    is now a state no start can produce, and pretending otherwise would test a
+    shape the server never writes.
+    """
+
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
+
+    root = await service.add_message(
+        session.id,
+        "user",
+        intent,
+        writer_principal="route_user_message",
+        session_operation_context=session_operation_context,
+    )
+    winner = _materialize_first_turn(
+        _initial_composition_state_with_guided_session(profile=profile),
+        app.state.catalog_service,
+        app.state.payload_store,
+    )
+    assert winner.guided_session is not None
+    winner_guided = replace(winner.guided_session, root_intent_message_id=str(root.id))
+    winner = replace(winner, guided_session=winner_guided)
+    winner_data = winner.to_dict()
+    return await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources=winner_data["sources"],
+            nodes=winner_data["nodes"],
+            edges=winner_data["edges"],
+            outputs=winner_data["outputs"],
+            metadata_=winner_data["metadata"],
+            composer_meta={"guided_session": winner_guided.to_dict()},
+        ),
+        provenance="session_seed",
+        session_operation_context=session_operation_context,
+    )
+
+
 async def _guided_turn_emitted_args(service, session_id) -> list[dict]:
     events: list[dict] = []
     for message in await service.get_messages(session_id, limit=None):
@@ -187,7 +240,7 @@ async def test_guided_start_seeds_tutorial_profile_and_persists(tmp_path) -> Non
 
     resp = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -253,7 +306,7 @@ async def test_guided_start_persists_profile_without_materializing_topology(tmp_
 
     resp = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -261,11 +314,16 @@ async def test_guided_start_persists_profile_without_materializing_topology(tmp_
     # The tutorial profile is on the wire (populated subset).
     assert body["guided_session"]["profile"] == {"coaching": True, "bookends": True}
 
-    # D contract: start does NOT materialize a chat turn or any topology.
+    # D contract: start still fabricates no source/topology. What it DOES
+    # materialize is the goal-first transcript pair (elspeth-378cfa0e18) — the
+    # author's own goal plus one server acknowledgement, and nothing else.
     # Empty CompositionState on the wire: sources={} (mapping), nodes/edges/
     # outputs=[] (lists).
-    assert body["guided_session"]["chat_history"] == []
-    assert body["guided_session"]["chat_turn_seq"] == 0
+    assert [(turn["role"], turn["content"], turn["seq"], turn["step"]) for turn in body["guided_session"]["chat_history"]] == [
+        ("user", _START_INTENT, 0, "step_1_source"),
+        ("assistant", GUIDED_GOAL_ACKNOWLEDGEMENT, 1, "step_1_source"),
+    ]
+    assert body["guided_session"]["chat_turn_seq"] == 2
     state = body["composition_state"]
     assert state["sources"] == {}
     assert state["nodes"] == []
@@ -278,7 +336,10 @@ async def test_guided_start_persists_profile_without_materializing_topology(tmp_
     assert get_resp.status_code == 200
     get_body = get_resp.json()
     assert get_body["guided_session"]["profile"] == {"coaching": True, "bookends": True}
-    assert get_body["guided_session"]["chat_history"] == []
+    assert [turn["content"] for turn in get_body["guided_session"]["chat_history"]] == [
+        _START_INTENT,
+        GUIDED_GOAL_ACKNOWLEDGEMENT,
+    ]
 
     # Re-read the persisted record: empty source/topology (tuples on the record).
     persisted = await service.get_current_state(session.id)
@@ -304,29 +365,46 @@ async def test_guided_start_live_profile_is_empty(tmp_path) -> None:
     body = resp.json()
     # live == empty profile: wire profile is None and no chat/topology exists.
     assert body["guided_session"]["profile"] is None
-    assert body["guided_session"]["chat_history"] == []
-    assert body["guided_session"]["chat_turn_seq"] == 0
+    assert [turn["content"] for turn in body["guided_session"]["chat_history"]] == [
+        "Build a live pipeline",
+        GUIDED_GOAL_ACKNOWLEDGEMENT,
+    ]
+    assert body["guided_session"]["chat_turn_seq"] == 2
     assert body["composition_state"]["sources"] == {}
     assert body["composition_state"]["nodes"] == []
 
 
 @pytest.mark.asyncio
-async def test_guided_start_profile_resolves_intent_shape_before_reservation(tmp_path) -> None:
+@pytest.mark.parametrize("profile", ("live", "tutorial"))
+async def test_guided_start_profile_resolves_intent_shape_before_reservation(tmp_path, profile: str) -> None:
+    """EVERY profile's start requires a visible intent, and refuses before reserving.
+
+    The tutorial used to be the one profile FORBIDDEN a client intent, which
+    made it the one guided walk that could not state a goal — a tutorial-only
+    backend rule of exactly the kind ADR-031 bans. Both arms now refuse the
+    same way, and neither leaves a retry artefact behind: the shape is resolved
+    before any ``guided_operations`` row is allocated.
+    """
+
     app, service = _make_app(tmp_path)
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
 
     missing = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "live", "operation_id": str(uuid.uuid4())},
+        json={"profile": profile, "operation_id": str(uuid.uuid4())},
     )
-    forbidden = client.post(
+    blank = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "intent": "client must not own tutorial seed", "operation_id": str(uuid.uuid4())},
+        json={"profile": profile, "intent": "   ", "operation_id": str(uuid.uuid4())},
     )
 
     assert missing.status_code == 400
-    assert forbidden.status_code == 400
+    assert missing.json()["detail"] == "Guided start requires a visible intent."
+    # A whitespace-only goal is rejected by the DTO's visible-content
+    # validator, not the route, so it is a 422 rather than the route's 400 —
+    # both refuse, neither reserves.
+    assert blank.status_code == 422
     with service._engine.connect() as conn:
         assert conn.execute(select(guided_operations_table)).all() == []
 
@@ -378,13 +456,13 @@ async def test_guided_start_is_idempotent(tmp_path) -> None:
     operation_id = str(uuid.uuid4())
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     assert first.status_code == 200
 
     second = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     assert second.status_code == 200
     assert second.json() == first.json()
@@ -413,11 +491,11 @@ async def test_guided_start_same_operation_id_rejects_different_profile(tmp_path
 
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     conflict = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "live", "operation_id": operation_id},
+        json={"profile": "live", "intent": _START_INTENT, "operation_id": operation_id},
     )
 
     assert first.status_code == 200
@@ -433,7 +511,7 @@ async def test_guided_start_existing_operation_conflict_precedes_profile_semanti
     operation_id = str(uuid.uuid4())
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     assert first.status_code == 200
 
@@ -455,7 +533,7 @@ async def test_guided_start_same_operation_object_profile_is_shape_error_before_
     operation_id = str(uuid.uuid4())
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     assert first.status_code == 200
 
@@ -540,7 +618,7 @@ async def test_guided_start_same_operation_surrogate_profile_does_not_mutate_ope
     operation_id = str(uuid.uuid4())
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
     assert first.status_code == 200
     operation_query = text(
@@ -579,7 +657,7 @@ async def test_guided_start_new_operation_rejects_existing_different_profile(tmp
 
     first = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     current = client.post(
         f"/api/sessions/{session.id}/guided/start",
@@ -593,7 +671,9 @@ async def test_guided_start_new_operation_rejects_existing_different_profile(tmp
     assert persisted is not None
     assert state_from_record(persisted).guided_session is not None
     assert state_from_record(persisted).guided_session.profile == TUTORIAL_PROFILE
-    assert [message for message in await service.get_messages(session.id, limit=None) if message.role == "user"] == []
+    # The refused live start writes nothing: the only user row is the tutorial
+    # start's own goal (goal-first — every profile now roots its session).
+    assert [message.content for message in await service.get_messages(session.id, limit=None) if message.role == "user"] == [_START_INTENT]
 
 
 @pytest.mark.asyncio
@@ -634,7 +714,7 @@ async def test_guided_start_rejects_existing_freeform_state_without_guided_sessi
 
     resp = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert resp.status_code == 409
     assert "existing freeform composition state" in resp.json()["detail"]
@@ -694,7 +774,7 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
 
     with (
         capture_logs() as logs,
@@ -730,6 +810,53 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
 
 
 @pytest.mark.asyncio
+async def test_guided_start_unclassified_failure_is_recorded_with_its_failure_code(tmp_path) -> None:
+    """A first-party bug settles AND leaves a server-side record.
+
+    The durable row and the replayable coded response say only THAT the
+    operation failed. Before the diagnostic widened past the integrity arm,
+    an unclassified defect discarded its traceback entirely, so the one 500
+    an operator had to work from named no site, no class and no frames. The
+    response contract is deliberately unchanged — settlement succeeded, so
+    the coded answer stays exactly replayable.
+    """
+    from structlog.testing import capture_logs
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+    operation_id = str(uuid.uuid4())
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
+
+    with (
+        capture_logs() as logs,
+        patch.object(
+            service,
+            "seed_or_complete_guided_start_operation",
+            side_effect=TypeError("unclassified first-party defect"),
+        ),
+    ):
+        first = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
+    replay = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
+
+    expected = {
+        "detail": {
+            "error_type": "guided_operation_terminal_failure",
+            "failure_code": "operation_failed",
+            "detail": "The operation failed.",
+        }
+    }
+    assert first.status_code == replay.status_code == 500
+    assert first.json() == replay.json() == expected
+    event = next(entry for entry in logs if entry.get("event") == "guided.operation_terminal_failure")
+    assert event["exc_class"] == "TypeError"
+    assert event["failure_code"] == "operation_failed"
+    assert event["site"] == "post_guided_start"
+    assert event["frames"]
+    assert "unclassified first-party defect" not in repr(event)
+
+
+@pytest.mark.asyncio
 async def test_guided_start_terminal_failure_log_correlates_to_the_response_header(tmp_path) -> None:
     """R2-F16b: the ``X-Request-ID`` an operator quotes must find the log line.
 
@@ -758,7 +885,7 @@ async def test_guided_start_terminal_failure_log_correlates_to_the_response_head
     ):
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
             headers={"X-Request-ID": "trace-guided-start-1"},
         )
 
@@ -781,7 +908,7 @@ async def test_guided_start_audit_insert_failure_rolls_back_seed_and_occurrence(
     ):
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
         )
 
     assert response.status_code == 500
@@ -795,7 +922,7 @@ async def test_guided_start_replay_uses_durable_turn_after_live_catalog_drift(tm
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     first = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     assert first.status_code == 200
     with patch(
@@ -869,11 +996,11 @@ async def test_guided_start_does_not_overwrite_head_changed_after_preflight(tmp_
         operation_id = str(uuid.uuid4())
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": operation_id},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
         )
     replay = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": operation_id},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
     )
 
     assert response.status_code == replay.status_code == 409
@@ -894,7 +1021,7 @@ async def test_guided_start_completed_retry_replays_after_later_freeform_head(tm
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     committed = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     assert committed.status_code == 200
     later_freeform = await _save_composition_state(
@@ -929,8 +1056,6 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
     second writer bypassing session serialization.
     """
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
-    from elspeth.web.sessions.protocol import CompositionStateData
-    from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 
     app, service = _make_app(tmp_path)
     client = TestClient(app)
@@ -942,33 +1067,20 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
         nonlocal winner_record
         outcome = await original_reserve(**kwargs)
         if winner_record is None:
-            live_compose_context = kwargs["session_operation_context"]
-            winner = _materialize_first_turn(
-                _initial_composition_state_with_guided_session(profile=TUTORIAL_PROFILE),
-                app.state.catalog_service,
-                app.state.payload_store,
-            )
-            assert winner.guided_session is not None
-            winner_data = winner.to_dict()
-            winner_record = await service.save_composition_state(
-                session.id,
-                CompositionStateData(
-                    sources=winner_data["sources"],
-                    nodes=winner_data["nodes"],
-                    edges=winner_data["edges"],
-                    outputs=winner_data["outputs"],
-                    metadata_=winner_data["metadata"],
-                    composer_meta={"guided_session": winner.guided_session.to_dict()},
-                ),
-                provenance="session_seed",
-                session_operation_context=live_compose_context,
+            winner_record = await _persist_competing_guided_winner(
+                app,
+                service,
+                session,
+                profile=TUTORIAL_PROFILE,
+                intent=_START_INTENT,
+                session_operation_context=kwargs["session_operation_context"],
             )
         return outcome
 
     with patch.object(service, "reserve_guided_operation", side_effect=reserve_after_guided_winner):
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
         )
 
     assert response.status_code == 200
@@ -983,8 +1095,6 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
 async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_path) -> None:
     """Atomic seed convergence rechecks a same-operation predecessor write."""
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
-    from elspeth.web.sessions.protocol import CompositionStateData
-    from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 
     app, service = _make_app(tmp_path)
     client = TestClient(app)
@@ -994,26 +1104,14 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
 
     async def seed_after_late_guided_winner(*args, **kwargs):
         nonlocal winner_record
-        winner = _materialize_first_turn(
-            _initial_composition_state_with_guided_session(profile=TUTORIAL_PROFILE),
-            app.state.catalog_service,
-            app.state.payload_store,
-        )
-        assert winner.guided_session is not None
-        winner_data = winner.to_dict()
         # The hook runs inside the original seed operation, so the forwarded
         # exact context is the same operation's authority, not a competitor's.
-        winner_record = await service.save_composition_state(
-            session.id,
-            CompositionStateData(
-                sources=winner_data["sources"],
-                nodes=winner_data["nodes"],
-                edges=winner_data["edges"],
-                outputs=winner_data["outputs"],
-                metadata_=winner_data["metadata"],
-                composer_meta={"guided_session": winner.guided_session.to_dict()},
-            ),
-            provenance="session_seed",
+        winner_record = await _persist_competing_guided_winner(
+            app,
+            service,
+            session,
+            profile=TUTORIAL_PROFILE,
+            intent=_START_INTENT,
             session_operation_context=kwargs["session_operation_context"],
         )
         return await original_seed(*args, **kwargs)
@@ -1025,7 +1123,7 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
     ):
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
         )
 
     assert response.status_code == 200
@@ -1033,6 +1131,63 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
     assert response.json()["composition_state"]["id"] == str(winner_record.id)
     versions = await service.get_state_versions(session.id)
     assert [record.id for record in versions] == [winner_record.id]
+    # The converging loser wrote no root row, so it must claim none: two
+    # completed operations naming ONE root message is exactly the "ambiguous
+    # start-operation authority" the custody helper refuses.
+    with service._engine.connect() as conn:
+        bindings = conn.execute(select(guided_operations_table.c.originating_message_id)).all()
+    assert [row.originating_message_id for row in bindings] == [None]
+
+
+@pytest.mark.asyncio
+async def test_guided_start_late_race_against_a_different_goal_is_a_stale_conflict(tmp_path) -> None:
+    """A convergence onto a winner rooted in ANOTHER goal is refused, not adopted.
+
+    Goal-first makes this reachable: the loser's own root row was never
+    written (nothing is written on a convergence), so it cannot bind its goal
+    — and adopting the winner's session would answer "start with goal A" with
+    a session rooted in goal B. The caller gets the ordinary stale-conflict
+    409 the pre-check convergence path already returns for a mismatched
+    winner, and reloads.
+    """
+
+    from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+    original_seed = service.seed_or_complete_guided_start_operation
+
+    async def seed_after_late_guided_winner(*args, **kwargs):
+        # Same operation's authority as the hook it runs inside, not a
+        # competitor's — the helper writes both the root intent row and the
+        # checkpoint under it.
+        await _persist_competing_guided_winner(
+            app,
+            service,
+            session,
+            profile=TUTORIAL_PROFILE,
+            intent="A completely different goal",
+            session_operation_context=kwargs["session_operation_context"],
+        )
+        return await original_seed(*args, **kwargs)
+
+    with patch.object(
+        service,
+        "seed_or_complete_guided_start_operation",
+        side_effect=seed_after_late_guided_winner,
+    ):
+        response = client.post(
+            f"/api/sessions/{session.id}/guided/start",
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
+        )
+
+    assert response.status_code == 409, response.json()
+    assert response.json()["detail"]["failure_code"] == "stale_conflict"
+    # The loser's goal was never persisted as a message.
+    assert [message.content for message in await service.get_messages(session.id, limit=None) if message.role == "user"] == [
+        "A completely different goal"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1219,7 @@ async def test_guided_start_replay_rejects_cross_session_result_locator(tmp_path
         provenance="post_compose",
     )
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     first = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     assert first.status_code == 200
     request_model = StartGuidedRequest.model_validate(payload)
@@ -1096,7 +1251,7 @@ async def test_guided_start_replay_rejects_cross_session_result_locator(tmp_path
 @pytest.mark.asyncio
 async def test_guided_start_joins_active_operation_outside_compose_lock(tmp_path) -> None:
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-    from elspeth.web.sessions.protocol import GuidedOperationClaimed
+    from elspeth.web.sessions.protocol import GuidedOperationActive, GuidedOperationClaimed
     from elspeth.web.sessions.routes.guided_operations import guided_response_hash
     from elspeth.web.sessions.schemas import GetGuidedResponse, StartGuidedRequest
 
@@ -1105,13 +1260,13 @@ async def test_guided_start_joins_active_operation_outside_compose_lock(tmp_path
     session = await service.create_session("alice", "T", "local")
     seeded = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert seeded.status_code == 200
     current = await service.get_current_state(session.id)
     assert current is not None
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     request_model = StartGuidedRequest.model_validate(payload)
     claim = await service.reserve_guided_operation(
         session_id=session.id,
@@ -1127,24 +1282,46 @@ async def test_guided_start_joins_active_operation_outside_compose_lock(tmp_path
     )
     assert isinstance(claim, GuidedOperationClaimed)
 
-    joining = asyncio.create_task(
-        asyncio.to_thread(
-            client.post,
-            f"/api/sessions/{session.id}/guided/start",
-            json=payload,
-        )
-    )
-    await asyncio.sleep(0.1)
-    expected_response = GetGuidedResponse.model_validate_json(seeded.content)
-    await service.complete_existing_state_guided_operation(
-        claim.fence,
-        state_id=current.id,
-        expected_current_state_id=current.id,
-        expected_current_state_version=current.version,
-        actor="composer_route",
-        response_hash_factory=lambda _record: guided_response_hash(expected_response),
-    )
-    joined = await asyncio.wait_for(joining, timeout=2)
+    join_observed = asyncio.Event()
+    original_get = service.get_guided_operation
+    compose_lock = await app.state.session_compose_lock_registry.get_lock(str(session.id))
+    active_reads = 0
+
+    async def observe_active_join(*args, **kwargs):
+        nonlocal active_reads
+        outcome = await original_get(*args, **kwargs)
+        if kwargs["operation_id"] == operation_id and isinstance(outcome, GuidedOperationActive):
+            active_reads += 1
+            # The route performs one conflict-only lookup before entering the
+            # reserve/replay helper.  The second Active read proves the helper
+            # itself has entered its join loop while the compose lock is held.
+            if active_reads == 2:
+                join_observed.set()
+        return outcome
+
+    with patch.object(service, "get_guided_operation", side_effect=observe_active_join):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as joining_client:
+            # Hold the per-session compose lock throughout the retry.  An
+            # active-operation join must observe and replay its durable winner
+            # without waiting for mutable-state admission.
+            async with compose_lock:
+                joining = asyncio.create_task(
+                    joining_client.post(
+                        f"/api/sessions/{session.id}/guided/start",
+                        json=payload,
+                    )
+                )
+                await asyncio.wait_for(join_observed.wait(), timeout=5)
+                expected_response = GetGuidedResponse.model_validate_json(seeded.content)
+                await service.complete_existing_state_guided_operation(
+                    claim.fence,
+                    state_id=current.id,
+                    expected_current_state_id=current.id,
+                    expected_current_state_version=current.version,
+                    actor="composer_route",
+                    response_hash_factory=lambda _record: guided_response_hash(expected_response),
+                )
+                joined = await asyncio.wait_for(joining, timeout=5)
 
     assert joined.status_code == 200
     assert joined.json() == seeded.json()
@@ -1166,11 +1343,11 @@ async def test_guided_start_takes_over_expired_lease_and_stale_worker_cannot_set
     session = await service.create_session("alice", "T", "local")
     seeded = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert seeded.status_code == 200
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     request_model = StartGuidedRequest.model_validate(payload)
     stale = await service.reserve_guided_operation(
         session_id=session.id,
@@ -1255,7 +1432,7 @@ async def test_guided_start_rejoins_after_fence_loss_without_polling_under_lock(
     with patch.object(service, "renew_guided_operation", side_effect=lose_first_fence):
         response = client.post(
             f"/api/sessions/{session.id}/guided/start",
-            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
         )
 
     assert response.status_code == 200
@@ -1295,7 +1472,7 @@ async def test_guided_start_repeated_request_cancellation_drains_terminal_failur
             request_task = asyncio.create_task(
                 client.post(
                     f"/api/sessions/{session.id}/guided/start",
-                    json={"profile": "tutorial", "operation_id": operation_id},
+                    json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id},
                 )
             )
             await asyncio.wait_for(renew_entered.wait(), timeout=5)
@@ -1332,7 +1509,7 @@ async def test_guided_start_cancellation_during_atomic_seed_drains_to_completed_
     app, service = _make_app(tmp_path, database_url=f"sqlite:///{tmp_path / 'start-seed-cancel.db'}")
     session = await service.create_session("alice", "T", "local")
     operation_id = str(uuid.uuid4())
-    payload = {"profile": "tutorial", "operation_id": operation_id}
+    payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
     audit_inserted = threading.Event()
     release_worker = threading.Event()
     original_insert = service._insert_prepared_guided_audit_rows_on_connection
@@ -1386,7 +1563,7 @@ async def test_guided_start_unowned_session_404(tmp_path) -> None:
     client = TestClient(app)
     resp = client.post(
         f"/api/sessions/{uuid.uuid4()}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     assert resp.status_code == 404
 
@@ -1398,7 +1575,7 @@ async def test_guided_respond_rejects_removed_stale_step_index_field(tmp_path) -
     session = await service.create_session("alice", "T", "local")
     client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     client.get(f"/api/sessions/{session.id}/guided")
 
@@ -1417,7 +1594,7 @@ async def test_guided_respond_rejects_removed_unknown_step_index_field(tmp_path)
     session = await service.create_session("alice", "T", "local")
     client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     client.get(f"/api/sessions/{session.id}/guided")
 
@@ -1437,7 +1614,7 @@ async def test_guided_respond_success_preserves_tutorial_profile(tmp_path) -> No
     session = await service.create_session("alice", "T", "local")
     started = client.post(
         f"/api/sessions/{session.id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+        json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
     )
     turn = started.json()["next_turn"]
 

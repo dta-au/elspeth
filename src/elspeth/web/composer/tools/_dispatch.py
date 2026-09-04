@@ -28,7 +28,10 @@ from sqlalchemy import Engine
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+    ToolArgumentError,
+)
 from elspeth.web.composer.state import (
     CompositionState,
     ValidationSummary,
@@ -60,6 +63,7 @@ from elspeth.web.composer.tools._registry import (
     should_augment_with_plugin_schemas,
 )
 from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
+from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
@@ -137,7 +141,10 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
             "in each response. Do NOT call this tool in a loop, do NOT use it "
             "as a substitute for reading validator output. Availability is "
             "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape."
+            "independently of this on-demand escape. Each reply carries `status` "
+            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
+            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
+            "`note` restating that the guidance is advice, not configuration."
         ),
         "parameters": {
             "type": "object",
@@ -211,10 +218,12 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Ask the user to review an LLM-authored assumption before it is "
             "finalised into the pipeline. This session-aware, kind-tagged "
             "review surface handles vague terms, invented source data, "
-            "LLM prompt templates, and pipeline-shaping decisions. Use "
+            "pipeline-shaping decisions, model choices, and source data "
+            "contracts. Prompt-template reviews are surfaced automatically "
+            "by the backend; never request one through this tool. Use "
             "affected_node_id='source' for "
-            "invented_source; use the LLM node id for vague_term and "
-            "llm_prompt_template; use the implementing node id for "
+            "invented_source and source_data_contract; use the LLM node id "
+            "for vague_term and llm_model_choice; use the implementing node id for "
             "pipeline_decision. Surface ONE assumption per call. The user "
             "will see your draft and resolve it in the review surface. Do not ask "
             "the user in assistant prose; this tool is the review surface. If "
@@ -223,13 +232,20 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "Do not call this merely because a concrete operator is present "
             "(e.g., 'rate 1-10'), but do call it when you authored the scale "
             "semantics, rubric, thresholds, category meaning, or subjective "
-            "criterion definition behind that operator. Prompt-template review "
-            "is not a substitute for an authored rubric/definition review. "
-            "For LLM prompt templates, copying the user's supplied prompt "
-            "verbatim is user-authored; creating a prompt template from the "
-            "user's goal, data, or prose is LLM-authored and must be reviewed. "
+            "criterion definition behind that operator. The backend's automatic "
+            "prompt-template review is not a substitute for an authored "
+            "rubric/definition review. "
             "Do not call this for terms the user already defined in the "
-            "conversation."
+            "conversation. The result's `_kind` tells you what happened: "
+            "`interpretation_review_pending` means the card is staged — wait "
+            "for the user; `interpretation_review_suppressed_by_opt_out` means "
+            "no card will appear because this session opted out "
+            "(`interpretation_review_disabled` is true and "
+            "`interpretation_source` names the automatic interpretation that "
+            "stood in) — proceed without waiting; "
+            "`interpretation_review_pending_idempotent` means an identical "
+            "request was already staged — treat it as pending. `message` "
+            "restates the outcome in prose."
         ),
         "parameters": {
             "type": "object",
@@ -238,18 +254,14 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "properties": {
                 "affected_node_id": {
                     "type": "string",
-                    "description": "Component id. Use 'source' for invented source data; use the LLM node id for vague terms and prompt templates.",
+                    "description": (
+                        "Component id. Use 'source' or 'source:<name>' for invented source data and source data contracts; "
+                        "use the LLM node id for vague terms and model choices."
+                    ),
                 },
                 "kind": {
                     "type": "string",
-                    "enum": [
-                        "vague_term",
-                        "invented_source",
-                        "llm_prompt_template",
-                        "pipeline_decision",
-                        "llm_model_choice",
-                        "source_data_contract",
-                    ],
+                    "enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES),
                     "description": (
                         "Class of assumption being surfaced for review. source_data_contract asks the user to "
                         "acknowledge the data contract for an uploaded/path-bound source the pipeline requires "
@@ -514,19 +526,19 @@ def _augment_with_plugin_schemas(
 
     For the mutation tools whose declarations set
     ``augments_on_failure=True`` (derived into
-    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), scan
-    ``result.validation.errors``
-    for ``Invalid options for <kind> '<plugin>'`` messages and embed the
-    full ``get_plugin_schema`` payload for every named plugin. Eliminates
-    the second round-trip the LLM would otherwise burn calling
-    ``get_plugin_schema`` after each rejection (see composer session
-    47cfbb5e on staging: 13 tool calls + 18 LLM rounds to converge a
-    4-plugin pipeline because the model never preloaded schemas).
+    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), read the structural
+    ``ValidationEntry.plugin_identity`` each producer stamped on its
+    rejection and embed the full ``get_plugin_schema`` payload for every
+    stamped plugin — never an identity parsed from the message
+    (elspeth-f60d638661). Eliminates the second round-trip the LLM would
+    otherwise burn calling ``get_plugin_schema`` after each rejection (see
+    composer session 47cfbb5e on staging: 13 tool calls + 18 LLM rounds to
+    converge a 4-plugin pipeline because the model never preloaded schemas).
 
-    No-op when the mutation succeeded, when no error message matches the
-    option-shape pattern, when the result already carries
-    ``plugin_schemas`` (handler set it directly), or when ``tool_name`` is
-    not one of the augmentation-eligible tools.
+    No-op when the mutation succeeded, when no error entry carries an
+    identity, when the result already carries ``plugin_schemas`` (handler
+    set it directly), or when ``tool_name`` is not one of the
+    augmentation-eligible tools.
     """
     if not should_augment_with_plugin_schemas(tool_name):
         return result
@@ -542,6 +554,37 @@ def _augment_with_plugin_schemas(
     return replace(result, plugin_schemas=schemas)
 
 
+def _augment_with_validation_guidance(result: ToolResult, tool_name: str) -> ToolResult:
+    """Attach inline catalogue repair guidance to a failed mutation.
+
+    The freeform twin of the planner surface's rejection enrichment
+    (``pipeline_planner._allowlisted_candidate_feedback``, which resolves the
+    same catalogue through ``explain_validation_code``). Without it the
+    freeform tool loop shipped a bare closed code and the model had to spend
+    a turn on ``explain_validation_error`` to learn the fix — the exact
+    round-trip ``plugin_schemas`` already eliminates for option-shape
+    failures (elspeth-5ff149dc4e; live session 891b7b1e burned a turn on
+    ``no_source_configured`` this way).
+
+    Scoped to mutation tools deliberately. Only ``_ToolResultResponseModel``
+    and the ``_tool_result_response_keys`` declarative entries admit the key;
+    a discovery tool such as ``get_blob_content`` answers to its own
+    ``extra="forbid"`` response model, and an unscoped augmentation would
+    fail its response path closed.
+
+    No-op on success, when the handler already set the field, and whenever
+    the envelope carries no error entries.
+    """
+    if tool_name not in _ALL_MUTATION_TOOL_NAMES:
+        return result
+    if result.success or result.validation_guidance is not None:
+        return result
+    guidance = build_validation_guidance(entry.error_code for entry in result.validation.errors)
+    if guidance is None:
+        return result
+    return replace(result, validation_guidance=guidance)
+
+
 def finalize_tool_result(
     result: ToolResult,
     *,
@@ -554,7 +597,12 @@ def finalize_tool_result(
     if tool_name in _ALL_MUTATION_TOOL_NAMES:
         result = _inject_prior_validation(result, prior_validation)
     result = _augment_with_plugin_schemas(result, tool_name, catalog, context)
-    return normalize_tool_result_validation(result, catalog)
+    result = normalize_tool_result_validation(result, catalog)
+    # Strictly after normalization: it can CONCATENATE the revalidated state's
+    # entries onto the rejections (_common.normalize_tool_result_validation),
+    # and guidance derived from the pre-normalization set would silently omit
+    # every code those entries introduce.
+    return _augment_with_validation_guidance(result, tool_name)
 
 
 def _enforce_composition_interpretation_gate(

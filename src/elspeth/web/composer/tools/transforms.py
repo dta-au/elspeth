@@ -33,6 +33,7 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _STEP_DESCRIPTION_DESCRIPTION,
     ToolContext,
     ToolResult,
@@ -60,6 +61,7 @@ from elspeth.web.composer.tools._common import (
     _validate_plugin_name,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
+    review_reconciliation_failure_message,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -240,7 +242,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "description": (
                 "Plugin-specific config (transform/aggregation only). The schema: block declares what "
                 "ARRIVES at the node, never its transformed result; declare arriving types on the "
-                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)."
+                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
             ),
         },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
@@ -542,7 +544,9 @@ def _execute_upsert_queue_node(
     fork_to: tuple[str, ...] | None = tuple(validated.fork_to) if validated.fork_to is not None else None
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
     node = NodeSpec(
         id=validated.id,
         node_type="queue",
@@ -664,7 +668,12 @@ def _execute_upsert_node(
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error, error_code="plugin_options_invalid")
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -698,7 +707,9 @@ def _execute_upsert_node(
 
     branches: CoalesceBranches | None = None
     if validated.branches is not None:
-        branches = dict(validated.branches) if isinstance(validated.branches, Mapping) else tuple(validated.branches)
+        # pydantic validated branches as exactly list[str] | dict[str, str]; dispatch on
+        # the concrete constructed type rather than re-checking shape via an ABC.
+        branches = dict(validated.branches) if type(validated.branches) is dict else tuple(validated.branches)
 
     node = NodeSpec(
         id=node_id,
@@ -743,10 +754,10 @@ def _execute_upsert_node(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     review_contract_error = composition_review_contract_error(new_state)
@@ -1206,10 +1217,10 @@ def _execute_splice_transform(
         )
     try:
         reconciled = reconcile_authoritative_reviews(state, proposed)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
@@ -1518,9 +1529,20 @@ def _execute_patch_node_options(
         return credential_error
 
     if current.node_type in ("transform", "aggregation", "collector") and current.plugin is not None:
+        # State-held plugin: resolve it through the request's policy view
+        # before prevalidation stamps it (see _execute_patch_source_options).
+        plugin_error = _validate_plugin_name(context, "transform", current.plugin)
+        if plugin_error is not None:
+            return _plugin_policy_failure(state, plugin_error)
+
         prevalidation_error = _prevalidate_transform_for_context(context, current.plugin, new_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error)
+            return _failure_result(
+                state,
+                prevalidation_error,
+                error_code="plugin_options_invalid",
+                plugin_identity=("transform", current.plugin),
+            )
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
@@ -1554,10 +1576,10 @@ def _execute_patch_node_options(
         return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, proposed_state)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the pipeline and retry.",
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
             error_code="review_reconciliation_failed",
         )
     review_contract_error = composition_review_contract_error(new_state)
@@ -1628,7 +1650,7 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "For a gate, edit on_error only with upsert_node. "
                     "A patched schema: block declares what ARRIVES at the node, never its transformed "
                     "result; to change what arrives, declare the type on the SOURCE schema "
-                    "(patch_source_options) or insert a type_coerce upstream."
+                    "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },
@@ -1717,7 +1739,12 @@ def _prepare_transform_candidate(
 
     prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("transform", plugin),
+        )
     # Operator-profiled nodes carry their private provider config (retry budget /
     # provider binding) in the profile, injected only at lowering; the
     # prevalidation above already validated the LOWERED executable. The raw
@@ -1781,7 +1808,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Insert one transform between a predecessor and successor on an existing direct linear on_success path. "
-        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs."
+        "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
+        "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
+        "over), `replaced_edge_id`, and `new_edge_id`; repeating an identical splice returns `already_applied`: true "
+        "with the node ids but no edge ids, instead of failing."
     ),
     json_schema={
         "type": "object",
@@ -1802,7 +1832,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
                         "description": "Unique ID for the inserted transform.",
                     },
                     "plugin": {"type": "string", "description": "Transform plugin name."},
-                    "options": {"type": "object", "description": "Plugin-specific authored options."},
+                    "options": {
+                        "type": "object",
+                        "description": "Plugin-specific authored options." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                    },
                     "on_error": {
                         "type": ["string", "null"],
                         "description": "Optional error route; defaults to discard.",

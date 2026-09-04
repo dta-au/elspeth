@@ -215,9 +215,9 @@ class ExecutionGraph:
             forwards_input_fields: For TRANSFORM/AGGREGATION nodes only — True
                 iff every SUCCESS row carries every input field EXCEPT
                 removed_input_fields. Weaker than passes_through_input, which
-                admits no removals and no dropped rows; read only by the
-                extras-direction walk_definite_emitted_fields
-                (elspeth-15c72686f2). No derivation from schema config when
+                admits no removals and no dropped rows; read by both the
+                presence and extras-direction walks (elspeth-15c72686f2). No
+                derivation from schema config when
                 omitted, for the same reason its declaration siblings above
                 cite: the removal set is computed from plugin options
                 (line_explode's source_field, field_mapper's rename sources)
@@ -226,9 +226,10 @@ class ExecutionGraph:
                 Meaningless without that flag; NodeInfo guards the pairing.
             preserves_input_values: For the plugin-bearing kinds — TRANSFORM,
                 AGGREGATION, COLLECTOR — True iff process() never changes the
-                VALUE of a field present on the input row (adding new fields
-                is fine). Lets resolve_guaranteed_field_type recurse through
-                an undeclaring pass-through instead of abstaining
+                VALUE of a surviving input field (adding new fields and
+                declared removals are fine). Lets
+                resolve_guaranteed_field_type recurse through an undeclaring
+                pass-through or forwarding node instead of abstaining
                 (elspeth-e6e552ce34; scope widened from TRANSFORM-only by
                 elspeth-48aeea6ad9). NodeInfo guards against misuse.
             observed_value_type: For SOURCE nodes only — the structural

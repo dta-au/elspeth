@@ -40,6 +40,7 @@ FollowerProcessor correctly:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -47,13 +48,15 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.exc import OperationalError as SQLAOperationalError
 
 from elspeth.contracts.coordination import (
     CoordinationToken,
     LeaderInfo,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.follower import FollowerProcessor, _SeatDeadError
@@ -1193,14 +1196,15 @@ class TestFollowerDepartHygiene:
 
         assert len(coord_repo.depart_calls) == 1
 
-    def test_depart_failure_does_not_mask_run_result(self) -> None:
-        """If depart_worker raises, the exception is swallowed (best-effort)."""
+    def test_transient_depart_failure_does_not_mask_run_result(self) -> None:
+        """A transient DB failure in depart_worker is contained (best-effort);
+        anything else propagates — see TestBestEffortDepartContainment."""
         processor = _CountingDrainProcessor()
         factory = _StubFactory(running=False)
 
         class _ExplodingCoordRepo(_StubRunCoordRepo):
             def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-                raise RuntimeError("DB unavailable")
+                raise SQLAOperationalError("stmt", None, Exception("DB unavailable"))
 
         coord_repo = _ExplodingCoordRepo()
         heartbeat = _StubHeartbeat()
@@ -1680,3 +1684,59 @@ class TestFollowerBarrierNodeIds:
             f"Expected barrier_key={str(agg_node_id)!r} for follower barrier node, got {barrier_key!r}. "
             "Without this, _mark_claimed_scheduler_work_blocked raises OrchestrationInvariantError."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _best_effort_depart containment is typed, recorded, and narrow
+# ---------------------------------------------------------------------------
+
+
+class _RaisingDepartRepo(_StubRunCoordRepo):
+    """Stub whose depart_worker raises a configured exception."""
+
+    def __init__(self, exc: BaseException, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._depart_exc = exc
+
+    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
+        self.depart_calls.append({"worker_id": worker_id, "now": now})
+        raise self._depart_exc
+
+
+class TestBestEffortDepartContainment:
+    """Depart contains ONLY transient DB failures — recorded at WARNING —
+    and every other exception (plugin bug, Tier-1 audit error) propagates."""
+
+    def test_operational_error_is_contained_and_recorded(self, caplog: pytest.LogCaptureFixture) -> None:
+        repo = _RaisingDepartRepo(SQLAOperationalError("stmt", None, Exception("locked")))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.follower"):
+            follower._best_effort_depart()
+
+        assert len(repo.depart_calls) == 1
+        assert any("transient DB failure" in record.getMessage() for record in caplog.records)
+
+    def test_integrity_error_propagates(self) -> None:
+        """depart_worker's CAS and audit-event insert share one transaction:
+        a constraint failure there is corruption evidence, not an established
+        transient race, so it must never be relabelled best-effort."""
+        repo = _RaisingDepartRepo(SQLAIntegrityError("stmt", None, Exception("dup")))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(SQLAIntegrityError):
+            follower._best_effort_depart()
+
+    def test_unexpected_exception_propagates(self) -> None:
+        repo = _RaisingDepartRepo(RuntimeError("depart bug"))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(RuntimeError, match="depart bug"):
+            follower._best_effort_depart()
+
+    def test_audit_integrity_error_propagates(self) -> None:
+        repo = _RaisingDepartRepo(AuditIntegrityError("coordination ledger corrupt"))
+        follower, _, _, _, _ = _make_follower(coord_repo=repo)
+
+        with pytest.raises(AuditIntegrityError):
+            follower._best_effort_depart()

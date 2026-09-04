@@ -26,7 +26,7 @@ import pytest
 from elspeth.contracts.enums import NodeType
 from elspeth.core.config import GateSettings, RowUnionSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.dag.guarantees import get_definite_emitted_fields, get_effective_guaranteed_fields
+from elspeth.core.dag.guarantees import get_definite_emitted_fields, get_effective_guaranteed_fields, resolve_guaranteed_field_type
 from elspeth.core.dag.models import EdgeContractError
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.plugins.sinks.text_sink import TextSink
@@ -327,18 +327,18 @@ class TestDefiniteEmitsIsSeparateFromTheGuaranteeWalk:
     def _explode_node(self, graph: ExecutionGraph) -> str:
         return next(node_id for node_id in graph._graph.nodes if graph.get_node_info(node_id).plugin_name == "line_explode")
 
-    def test_presence_walk_is_unchanged_at_a_forwarding_node(self) -> None:
-        """The permissive direction must NOT widen.
+    def test_presence_walk_propagates_forwarded_guarantees(self) -> None:
+        """A forwarding declaration is a success-row presence guarantee.
 
-        ``get_effective_guaranteed_fields`` feeds sink required-field
-        clearance, ``check_compatibility``'s missing-arm forgiveness, and the
-        forgiven-field type walk — all of which read a wider set as PERMISSION.
-        Widening it to close this gap would have loosened three gates to fix one.
+        Whole rows may be dropped, but every row the transform successfully
+        emits retains its predecessor fields except the named removals. The
+        presence walk may therefore carry the upstream lower bound through the
+        same subtraction without claiming a complete emit set.
         """
         graph = self._explode_graph()
         explode_node = self._explode_node(graph)
 
-        assert get_effective_guaranteed_fields(graph, explode_node) == frozenset({"sentence"})
+        assert get_effective_guaranteed_fields(graph, explode_node) == frozenset({"sentence"}) | _METADATA_EXTRAS
 
     def test_extras_walk_sees_the_forwarded_metadata(self) -> None:
         graph = self._explode_graph()
@@ -562,6 +562,151 @@ class TestForwardingParityAcrossTheDeclaringClass:
             sink_name="body_rows",
         )
 
+    def test_field_mapper_forwards_an_unmapped_required_sink_field(self) -> None:
+        """A local target guarantee must not hide a guaranteed passthrough field.
+
+        The mapper emits ``b`` itself and forwards upstream ``keep``. Treating
+        its local guarantee as the complete presence answer rejects this
+        runnable graph even though the extras walk independently sees both.
+        """
+        source_options = {
+            "path": "data/in.csv",
+            "schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]},
+            "on_validation_failure": "discard",
+        }
+        mapper_options = {
+            "mapping": {"a": "b"},
+            "select_only": False,
+            "schema": {"mode": "observed"},
+        }
+        sink_options = {
+            "path": "outputs/keep.txt",
+            "field": "keep",
+            "schema": {"mode": "fixed", "fields": ["keep: str", "b: str?"]},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        }
+
+        graph = _build_graph(
+            source_plugin=CSVSource(source_options),
+            source_plugin_name="csv",
+            source_options=source_options,
+            source_connection="rows",
+            transforms=[
+                _wired(
+                    FieldMapper(mapper_options),
+                    name="mapped",
+                    plugin_name="field_mapper",
+                    input_conn="rows",
+                    on_success="mapped_rows",
+                    options=mapper_options,
+                )
+            ],
+            sink=TextSink(sink_options),
+            sink_name="mapped_rows",
+        )
+        mapper_node = next(node_id for node_id in graph._graph.nodes if graph.get_node_info(node_id).plugin_name == "field_mapper")
+
+        assert get_effective_guaranteed_fields(graph, mapper_node) == frozenset({"b", "keep"})
+        assert get_definite_emitted_fields(graph, mapper_node) == frozenset({"b", "keep"})
+
+    def test_field_mapper_forwarded_type_reaches_downstream_validation(self) -> None:
+        """Presence permission carries the matching value-preservation evidence."""
+        source_options = {
+            "path": "data/in.csv",
+            "schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]},
+            "on_validation_failure": "discard",
+        }
+        mapper_options = {
+            "mapping": {"a": "b"},
+            "select_only": False,
+            "schema": {"mode": "flexible", "fields": ["a: str"]},
+        }
+        sink_options = {
+            "path": "outputs/keep.txt",
+            "field": "keep",
+            "schema": {"mode": "fixed", "fields": ["keep: str", "b: str?"], "required_input_fields": ["keep"]},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        }
+        graph = _build_graph(
+            source_plugin=CSVSource(source_options),
+            source_plugin_name="csv",
+            source_options=source_options,
+            source_connection="rows",
+            transforms=[
+                _wired(
+                    FieldMapper(mapper_options),
+                    name="mapped",
+                    plugin_name="field_mapper",
+                    input_conn="rows",
+                    on_success="mapped_rows",
+                    options=mapper_options,
+                )
+            ],
+            sink=TextSink(sink_options),
+            sink_name="mapped_rows",
+        )
+        mapper_node = next(node_id for node_id in graph._graph.nodes if graph.get_node_info(node_id).plugin_name == "field_mapper")
+
+        resolved = resolve_guaranteed_field_type(graph, mapper_node, "keep")
+
+        assert resolved is not None
+        assert resolved.field_type == "str"
+
+    def test_field_mapper_forwarded_type_mismatch_is_rejected(self) -> None:
+        """A widened guarantee cannot forgive a provably wrong carried type."""
+        source_options = {
+            "path": "data/in.csv",
+            "schema": {"mode": "fixed", "fields": ["a: str", "keep: str"]},
+            "on_validation_failure": "discard",
+        }
+        first_options = {
+            "mapping": {"a": "b"},
+            "select_only": False,
+            "schema": {"mode": "flexible", "fields": ["a: str"]},
+        }
+        second_options = {
+            "mapping": {"keep": "keep"},
+            "select_only": True,
+            "schema": {"mode": "flexible", "fields": ["keep: int"]},
+        }
+        sink_options = {
+            "path": "outputs/keep.txt",
+            "field": "keep",
+            "schema": {"mode": "observed"},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        }
+
+        with pytest.raises(EdgeContractError, match=r"keep.*int.*str"):
+            _build_graph(
+                source_plugin=CSVSource(source_options),
+                source_plugin_name="csv",
+                source_options=source_options,
+                source_connection="rows",
+                transforms=[
+                    _wired(
+                        FieldMapper(first_options),
+                        name="mapped",
+                        plugin_name="field_mapper",
+                        input_conn="rows",
+                        on_success="mapped_rows",
+                        options=first_options,
+                    ),
+                    _wired(
+                        FieldMapper(second_options),
+                        name="typed",
+                        plugin_name="field_mapper",
+                        input_conn="mapped_rows",
+                        on_success="typed_rows",
+                        options=second_options,
+                    ),
+                ],
+                sink=TextSink(sink_options),
+                sink_name="typed_rows",
+            )
+
 
 class TestForwardingRespectsTheNodesOwnExtrasFirewall:
     """A forwarding node whose own output contract forbids extras stops the walk.
@@ -712,11 +857,38 @@ class TestDefiniteEmitsWalkIsLinear:
 class TestForwardingDeclarationsMatchPluginBehaviour:
     """Unit-level pins on the four declarations the walk trusts."""
 
+    def test_all_shipped_forwarders_declare_surviving_value_preservation(self) -> None:
+        from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
+        from elspeth.plugins.transforms.blob_csv_expand import BlobCSVExpand
+        from elspeth.plugins.transforms.blob_json_expand import BlobJSONExpand
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        assert FieldMapper.preserves_input_values is True
+        assert LineExplode.preserves_input_values is True
+        assert JSONExplode.preserves_input_values is True
+        assert BlobCSVExpand.preserves_input_values is True
+        assert BlobJSONExpand.preserves_input_values is True
+        assert BatchOutlierAnnotator.preserves_input_values is True
+
     def test_line_explode_declares_its_consumed_source_field(self) -> None:
         transform = LineExplode(_line_explode_options())
 
         assert transform.forwards_input_fields is True
         assert transform.removed_input_fields == frozenset({_RESPONSE_FIELD})
+        assert transform.preserves_input_values is True
+
+    def test_line_explode_abstains_when_consumed_original_header_is_unresolved(self) -> None:
+        transform = LineExplode(
+            {
+                "source_field": "Body Text",
+                "output_field": "line",
+                "include_index": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        assert transform.forwards_input_fields is False
+        assert transform.removed_input_fields == frozenset()
 
     def test_field_mapper_abstains_on_an_unresolved_original_header(self) -> None:
         """An original header removes a name only ``resolve_name`` knows at runtime.

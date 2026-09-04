@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
 from elspeth.contracts.data import CompatibilityResult
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
+from elspeth.plugins.transforms.type_coerce import ConversionSpec
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.execution import _validation_authoring as authoring
 from elspeth.web.execution import _validation_diagnostics as diagnostics
@@ -15,7 +18,12 @@ from elspeth.web.execution import service as execution_service
 from elspeth.web.execution import validation as validation_facade
 
 
-def _edge_error() -> EdgeContractError:
+def _edge_error(
+    *,
+    expected_type: str = "str",
+    actual_type: str = "int",
+    type_mismatches: tuple[tuple[str, str, str], ...] | None = None,
+) -> EdgeContractError:
     return EdgeContractError(
         "incompatible",
         from_node_id="producer",
@@ -24,7 +32,7 @@ def _edge_error() -> EdgeContractError:
         consumer_schema_name="ConsumerSchema",
         compatibility_result=CompatibilityResult(
             compatible=False,
-            type_mismatches=(("value", "str", "int"),),
+            type_mismatches=type_mismatches if type_mismatches is not None else (("value", expected_type, actual_type),),
         ),
         component_type="transform",
     )
@@ -110,6 +118,62 @@ def test_facade_edge_formatter_preserves_live_suggestion_patch(monkeypatch: pyte
     _message, suggestion = validation_facade._format_edge_contract_failure(_edge_error())
 
     assert suggestion == "patched suggestion"
+
+
+@pytest.mark.parametrize("target_type", ["int", "float", "bool", "str"])
+def test_any_producer_suggests_exact_supported_scalar_conversion(target_type: str) -> None:
+    suggestion = validation_facade._build_edge_contract_suggestion(_edge_error(expected_type=target_type, actual_type="Any"))
+
+    assert f"options.conversions: [{{'field': 'value', 'to': '{target_type}'}}]" in suggestion
+    assert "<name>" not in suggestion
+    assert "<declared type>" not in suggestion
+
+
+def test_diagnostic_type_coerce_targets_match_conversion_spec_literal() -> None:
+    declared_targets = frozenset(get_args(ConversionSpec.model_fields["to"].annotation))
+
+    assert declared_targets == diagnostics._TYPE_COERCE_TARGETS
+
+
+@pytest.mark.parametrize("target_type", ["str | None", "list[str]"])
+def test_any_producer_does_not_suggest_type_coerce_for_unsupported_target(target_type: str) -> None:
+    suggestion = validation_facade._build_edge_contract_suggestion(_edge_error(expected_type=target_type, actual_type="Any"))
+
+    assert "type_coerce" not in suggestion
+    assert f"declared target '{target_type}' has no available built-in conversion" in suggestion
+    assert "upstream producer or transform whose documented output contract guarantees that exact target" in suggestion
+
+
+def test_any_producer_groups_mixed_supported_and_unsupported_targets_in_order() -> None:
+    suggestion = validation_facade._build_edge_contract_suggestion(
+        _edge_error(
+            type_mismatches=(
+                ("count", "int", "Any"),
+                ("optional_name", "str | None", "Any"),
+                ("concrete", "str", "int"),
+                ("enabled", "bool", "Any"),
+                ("labels", "list[str]", "Any"),
+            )
+        )
+    )
+
+    conversions = "options.conversions: [{'field': 'count', 'to': 'int'}, {'field': 'enabled', 'to': 'bool'}]"
+    optional_guidance = "declared target 'str | None' has no available built-in conversion"
+    labels_guidance = "declared target 'list[str]' has no available built-in conversion"
+
+    assert conversions in suggestion
+    assert suggestion.count("type_coerce") == 1
+    assert "'field': 'concrete'" not in suggestion
+    assert "EXCEPTION for 'concrete'" not in suggestion
+    assert suggestion.index(conversions) < suggestion.index(optional_guidance) < suggestion.index(labels_guidance)
+
+
+def test_any_producer_rejects_case_variant_scalar_target() -> None:
+    suggestion = validation_facade._build_edge_contract_suggestion(_edge_error(expected_type="Str", actual_type="Any"))
+
+    assert "type_coerce" not in suggestion
+    assert "declared target 'Str' has no available built-in conversion" in suggestion
+    assert "upstream producer or transform whose documented output contract guarantees that exact target" in suggestion
 
 
 def test_direct_secret_collection_preserves_depth_first_order_and_scope() -> None:

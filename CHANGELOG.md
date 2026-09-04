@@ -44,15 +44,18 @@ All notable changes to ELSPETH are documented here.
   planner through `set_pipeline` and the graph-mutation tools, per the
   standing composer invariant that the LLM does the job.
 
-## 0.7.2 - Release candidate (Release hardening and recovery correctness)
+## 0.8.0 - Release candidate (Unified lineage and production hardening)
 
-0.7.2 separates the production-path hardening completed after 0.7.1. It
-tightens deployment packaging, Composer correctness, authentication, and
-recovery after committed blob deletion. The notes below intentionally cover
-only major changes and critical correctness or security fixes.
+0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying
+forward the production-path hardening prepared after 0.7.1. It adds
+scope-bound collectors, first-class document and multimodal primitives,
+stronger Composer data contracts and reader-focused review surfaces, a
+contributor-focused repository and Composer training package, and critical
+security and recovery fixes. The notes below intentionally cover only major
+changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 47. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 50. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -79,32 +82,37 @@ key so a guided Retry resubmits the exact persisted occurrence it answers
 instead of matching on content. Epoch 47 adds the `auto_commit.revoked`
 proposal-event type so an auto-commit blocked by the settlement-boundary
 trust-mode recheck leaves a durable audit record instead of silently falling
-back to the review path.
-Landscape
-`SQLITE_SCHEMA_EPOCH` advances from 29 to 35. Epoch 30 adds the durable
-row_union barrier attribution column to scheduler work items, and epoch 31
-constrains scheduler work-item status to the public six-state vocabulary so
-removed states cannot be persisted through direct SQL. Epoch 32 atomically
-records every successful aggregation result and its ordered member actions
-with node and batch completion. A replacement process can materialize
-transform-mode outputs, continue passthrough outputs with their original token
-identities, or finish an empty result without replaying the plugin. Empty-result
-terminal outcomes commit atomically with scheduler barrier completion. Epoch 33
-gives token outcomes a composite (run_id, token_id) access path, so a
-run-scoped per-token read no longer has to choose between two single-column
-indexes that database statistics cannot separate. Landscape SQLITE_SCHEMA_EPOCH
-33 → 34: unified-lineage tables (token_lineage_frames, group_records,
-group_losses) and token_work_items.lineage_path_json; existing audit stores
-must be recreated. Landscape SQLITE_SCHEMA_EPOCH 34 → 35: unified-lineage
-flip — tri-field lineage columns retired onto token_lineage_frames +
-lineage_path_json; token_outcomes.expected_branches_json removed; existing
-audit stores must be recreated. ELSPETH does not migrate
-either predecessor database in place before 1.0. Archive or export required
-evidence, stop the old service, recreate stale session and Landscape stores,
-then install
-0.7.2. A Landscape database below epoch 35 is not current and must be recreated.
-Do not roll older code back over the recreated databases; keep the service
-drained and repair this release forward.
+back to the review path. Epoch 48 adds the `superseded` interpretation-event
+choice so a composition-state commit that extinguishes a reviewed site
+terminally retires the persisted pending review in the same transaction
+instead of leaving a zombie card that gates Run forever. Epoch 49 adds the
+`composition_rejection_events` table so a composer mutation-tool rejection's
+reason — the exact payload the planner saw — persists durably as session
+data instead of reaching the operator nowhere (elspeth-3e28029d2f). Epoch 50
+adds the `proposal.rebased` proposal-event type so a guided settlement that
+carries a still-pending proposal across the checkpoint it writes can move the
+proposal's anchor there and record the move, instead of leaving it anchored to
+a superseded checkpoint — which made the session unreadable through the guided
+route and killed the wire-review "edit this component" affordance
+(elspeth-ed67eb9d0d).
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 36. Epoch 30 adds durable
+row-union barrier attribution, epoch 31 closes scheduler status over the public
+six-state vocabulary, epoch 32 atomically records aggregation results and their
+ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
+access path. Epoch 34 adds the unified-lineage groundwork:
+`token_lineage_frames`, `group_records`, `group_losses`, and journal-carried
+`lineage_path_json`. Epoch 35 retires the legacy fork, expand, and branch
+lineage columns and makes lineage frames and paths the sole lineage truth.
+Epoch 36 adds `coalesce_effects.group_id`, allowing sibling fork groups that
+share a row id to restore their independent merge receipts without a false
+audit-integrity failure.
+
+ELSPETH does not migrate either predecessor database in place before 1.0.
+Archive or export required evidence, stop the old service, recreate stale
+session and Landscape stores, then install 0.8.0. A Landscape database below
+epoch 36 is not current and must be recreated. Do not roll older code back over
+the recreated databases; keep the service drained and repair this release
+forward.
 
 **Breaking operator setting rename:** `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`
 becomes `ELSPETH_WEB__DEFAULT_LLM_PROFILE`, and `WebSettings.tutorial_llm_profile`
@@ -154,6 +162,60 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   configuration, build, runtime, and guided coverage is present; broader audit,
   recovery, concurrency, browser-backed round-trip, and scale acceptance
   remains deferred under the open row-union work.
+- **Forks, expansions, and barriers share one durable lineage model** — tokens
+  carry typed lineage-frame paths, while Landscape records group rosters,
+  settlement, and losses through one set of tables. New `scopes:` and
+  `collectors:` configuration closes expansion groups under explicit
+  `require_all` or `best_effort` policy. Bound-region validation, ordered
+  collector flushing, crash recovery, resume protection, MCP forensics, and
+  freeform and guided Composer authoring all use the same model.
+- **Document and multimodal pipelines gain first-class transforms** —
+  `pdf_rasterize` emits one PNG-and-text row per PDF page through an isolated
+  worker; `blob_json_expand` and `blob_text_expand` turn stored or inline
+  content into bounded row groups; and `reference_join` enriches rows from a
+  configuration-bound reference table. LLM sources and transforms support
+  typed structured output, and LLM transforms can consume bounded
+  payload-store images without persisting image bytes in audit metadata.
+- **Composer exposes data contracts and technical depth deliberately** — known
+  uploaded content supplies `guaranteed_fields`; unverifiable sources receive
+  an explicit user-reviewed data-contract question; and structural preflight
+  findings remain visible while interpretation reviews are pending. A
+  per-user `show_advanced` setting keeps the default interface outcome-focused
+  while retaining technical options, schemas, diagnostics, identifiers, and
+  YAML import behind disclosure.
+- **Composer's reader view uses plain language without hiding forensic detail**
+  — chat cards, Spec routing, run confirmation and history, validation, audit,
+  recovery, blob, and secret surfaces use display names, component
+  descriptions, and humanised reasons by default. Advanced mode exposes raw
+  identifiers and codes as visible secondary text on the main technical
+  surfaces instead of leaving them hover-only; unknown values remain verbatim
+  rather than becoming false prose. The graph, keyboard component list, Spec
+  tab, and decoder share one topology model, dangling routes say
+  `(not connected)`, and keyboard selection moves focus to the component's
+  configuration. GET and PATCH preferences decode against a closed,
+  parity-tested field set so server/client drift fails closed.
+- **The public repository separates contribution guidance from maintainer
+  working state** — `AGENTS.md` is a harness-neutral covenant,
+  `CONTRIBUTING.md` owns durable whole-tree gate guidance, and
+  `docs/maintainer/toolchain.md` describes optional maintainer automation.
+  Active plans and specifications use stable `docs/plans/` and `docs/specs/`
+  paths; implemented plans remain available through git history;
+  project-control registers remain local rather than published; and
+  machine-local provenance, personal identifiers, and the LFS-tracked demo
+  video no longer ship in repository clones. The demo remains available from
+  GitHub Releases.
+- **Project-owned skills and design assets have canonical locations** —
+  reusable agent skills live once under `.agents/skills/`, with compatibility
+  links for `.claude/skills/`, while the branded component library, design
+  tokens, examples, and UI kits live under top-level `design/`. This removes
+  copied skill trees and keeps the `elspeth-design` guidance independent of a
+  particular agent harness.
+- **Composer gains a one-hour training package** — a draft 37-slide,
+  minute-by-minute instructor guide and self-contained HTML deck take new users
+  from Sense, Decide, Act, and Audit through guided and freeform authoring,
+  proposal and decision review, validation, advanced graph shapes, execution,
+  YAML exchange, version history, and review sharing. The deck includes
+  speaker notes, exact UI language, hands-on exercises, and print support.
 - **Textract document locations bind through operator profiles on the web
   surface** (ADR-036) — the transform gains a static `bucket` + `key_prefix`
   location mode (mutually exclusive with `bucket_field`), web deployments
@@ -192,6 +254,37 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   bounded ingress, source custody, protected-field propagation, and audit
   redaction keep provider, pipeline, and tool payloads out of unapproved
   surfaces.
+- **Guided source custody fails closed without bricking the session** — custody
+  correlation now uses raw source state before generic redaction, eliminating
+  false mismatches on fork-rehydrated sources. Exited and completed sessions
+  whose retained review no longer binds remain readable through a fully masked
+  `custody_unavailable` projection instead of a 500, without exposing private
+  source paths. Active writes are rejected inside the composition-state
+  transaction before the tip advances, legacy invalid tips return a named 409,
+  and guided re-entry refuses before settlement while leaving the reviewed tip
+  available for recovery by reverting to a bindable version. A byte-stability
+  corpus protects every previously valid projection and stored guided-response
+  hash.
+- **A wired secret requires both destination authorization and user approval**
+  — the server denies every secret-to-plugin-option wiring unless a
+  deployment rule matches the exact destination. Immediately before execution,
+  the authenticated caller must acknowledge the disclosed wiring set with a
+  token bound to the exact composition; planner prose and Composer tool calls
+  cannot approve it. Redirected and error-path `web_scrape` URLs are also
+  fingerprinted before they reach rows or audit evidence.
+- **Build and Composer preflight reject contracts the runtime cannot satisfy**
+  — validation follows declared value-preserving paths through observed
+  producers, treats every `field_mapper` mapping source as a required input,
+  derives environment-placeholder protection from each plugin's
+  output-affecting options, and asks the publication authority which nodes
+  require mandatory controls. Pipelines that previously validated and then
+  failed every row now stop before execution with an attributable remedy.
+- **Composer's review surfaces reflect the actual graph and run data** — CSV
+  previews honour quoting, coalesce diagrams and text alternatives show every
+  inbound branch, missing output records carry an explanation, guided replies
+  may retain several deferred intents, and advisor and share messages
+  distinguish pending review, withheld prose, skipped checks, and terminal
+  verdicts.
 - **Composer preflight cannot silently reuse stale meaning** — the runtime
   preflight cache is keyed by composition content, including unsaved state.
 - **Every token reaches a lifecycle answer when a run dies** (ADR-038) — a

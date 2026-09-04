@@ -2059,38 +2059,33 @@ class TestValidatePipelineWebFetchNetworkPolicy:
 class TestWebLlmBaseUrlPolicyHelper:
     """Unit coverage for the web-authored OpenRouter base_url policy helper."""
 
-    def test_non_llm_plugin_is_ignored(self) -> None:
-        from elspeth.web.provider_config_policy import web_llm_base_url_policy_error
-
-        assert web_llm_base_url_policy_error("web_scrape", {"base_url": "http://127.0.0.1/v1"}) is None
-
     def test_unset_base_url_is_allowed(self) -> None:
         from elspeth.web.provider_config_policy import web_llm_base_url_policy_error
 
-        assert web_llm_base_url_policy_error("llm", {"model": "openai/gpt-4o"}) is None
+        assert web_llm_base_url_policy_error({"model": "openai/gpt-4o"}) is None
 
     def test_canonical_base_url_is_allowed_with_or_without_trailing_slash(self) -> None:
         from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_BASE_URL
         from elspeth.web.provider_config_policy import web_llm_base_url_policy_error
 
-        assert web_llm_base_url_policy_error("llm", {"base_url": OPENROUTER_BASE_URL}) is None
-        assert web_llm_base_url_policy_error("llm", {"base_url": OPENROUTER_BASE_URL + "/"}) is None
+        assert web_llm_base_url_policy_error({"base_url": OPENROUTER_BASE_URL}) is None
+        assert web_llm_base_url_policy_error({"base_url": OPENROUTER_BASE_URL + "/"}) is None
 
     def test_http_loopback_base_url_is_blocked(self) -> None:
         # The reviewer's finding: loopback HTTP turns a web-authored config into
         # a credential-egress / SSRF path.
         from elspeth.web.provider_config_policy import web_llm_base_url_policy_error
 
-        assert web_llm_base_url_policy_error("llm", {"base_url": "http://127.0.0.1:8199/v1"}) is not None
-        assert web_llm_base_url_policy_error("llm", {"base_url": "http://localhost/v1"}) is not None
+        assert web_llm_base_url_policy_error({"base_url": "http://127.0.0.1:8199/v1"}) is not None
+        assert web_llm_base_url_policy_error({"base_url": "http://localhost/v1"}) is not None
 
     def test_arbitrary_https_host_is_blocked(self) -> None:
         # Superset of the loopback finding: an HTTPS host the author controls
         # would still exfiltrate the server-held bearer credential.
         from elspeth.web.provider_config_policy import web_llm_base_url_policy_error
 
-        assert web_llm_base_url_policy_error("llm", {"base_url": "https://evil.example.com/v1"}) is not None
-        assert web_llm_base_url_policy_error("llm", {"base_url": "https://10.0.0.5/v1"}) is not None
+        assert web_llm_base_url_policy_error({"base_url": "https://evil.example.com/v1"}) is not None
+        assert web_llm_base_url_policy_error({"base_url": "https://10.0.0.5/v1"}) is not None
 
 
 class TestValidatePipelineLlmBaseUrlPolicy:
@@ -5625,6 +5620,33 @@ class TestEdgeContractFailureFormatting:
         assert "patch_node_options(node_id='web_scrape_a1b2c3'" in suggestion
         # Steers toward (a) — most failures are consumer over-declaration.
         assert "Try option (a) first" in suggestion or "option (a) first" in suggestion
+
+    def test_suggestion_names_type_coerce_for_producer_any_mismatch(self) -> None:
+        """Declared-narrower-than-producer-any steers to type_coerce, not widening.
+
+        Session 891b7b1e (elspeth-8762d9b666): faced with an Any/str edge
+        mismatch, the planner widened the consumer AND the sink to 'any'
+        because the suggestion offered only consumer-side relaxation. When
+        the producer emits 'Any', the narrowing remedy must be named.
+        """
+        exc = self._make_edge_error(
+            type_mismatches=(("category", "str", "Any"),),
+        )
+        suggestion = _build_edge_contract_suggestion(exc)
+
+        assert "type_coerce" in suggestion
+        assert "'category'" in suggestion
+        # The remedy keeps the consumer's declared type rather than erasing it.
+        assert "narrower declared" in suggestion
+
+    def test_suggestion_omits_type_coerce_when_producer_type_is_concrete(self) -> None:
+        """A concrete-vs-concrete mismatch keeps the plain two-option menu."""
+        exc = self._make_edge_error(
+            type_mismatches=(("fetch_status", "str | None", "int"),),
+        )
+        suggestion = _build_edge_contract_suggestion(exc)
+
+        assert "type_coerce" not in suggestion
 
     def test_suggestion_maps_dag_transform_ids_to_composer_node_ids(self) -> None:
         exc = self._make_edge_error(

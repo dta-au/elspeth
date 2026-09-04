@@ -352,10 +352,10 @@ image without `DATABASE_URL` reports the database check as skipped:
 ```json
 {
   "status": "healthy",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "commit": "unavailable",
   "checks": {
-    "version": {"status": "ok", "value": "0.7.2"},
+    "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "warn", "value": "unavailable"},
     "python": {"status": "ok", "value": "3.13.5"},
     "database": {"status": "skip", "value": "DATABASE_URL not set"},

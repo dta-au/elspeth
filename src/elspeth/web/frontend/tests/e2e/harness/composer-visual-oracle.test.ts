@@ -11,10 +11,8 @@ const visualSpec = readFileSync(
 describe("Composer visual regression oracle", () => {
   it("waits for exact terminal validation and audit labels", () => {
     expect(visualSpec).not.toContain("not.toHaveAccessibleName");
-    expect(visualSpec).toContain('"Validation: Passed"');
-    expect(visualSpec).toContain('"Audit: Ready"');
-    expect(visualSpec).toContain('"Validation: 24 errors"');
-    expect(visualSpec).toContain('"Audit: 2 issues"');
+    expect(visualSpec).toContain('"Checks: Ready"');
+    expect(visualSpec).toContain('"Checks: 25 issues"');
   });
 
   it("masks only the fractional edge label instead of accepting broad drift", () => {

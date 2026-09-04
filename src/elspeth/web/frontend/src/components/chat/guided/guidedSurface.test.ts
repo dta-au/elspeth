@@ -373,3 +373,76 @@ describe("guided scroller's marked top boundary (elspeth-3797c79446)", () => {
     expect(tokenPx(ramp![1])).toBeLessThanOrEqual(tokenPx(paddingBlock));
   });
 });
+
+describe("goal card occupies the decision card's slot (elspeth-378cfa0e18)", () => {
+  // The goal card REPLACES .guided-current-decision while the session has no
+  // composition state — same position, same column, same conversation flow.
+  // Two AGREEMENT questions follow from that, and both are the kind that a
+  // declaration-existence test would pass while the surface visibly jumped
+  // when the goal is sent and the decision card takes over.
+
+  it("agrees with the decision card on the card frame", () => {
+    // Not "the goal card has a border": the two must render the SAME frame,
+    // resolved rather than as-spelled, or sending the goal reads as moving to
+    // a different KIND of surface instead of the same one asking the next
+    // question.
+    for (const property of [
+      "padding",
+      "border",
+      "border-radius",
+      "background-color",
+    ]) {
+      expect(
+        resolveTokens(valueIn(guidedCss, ".guided-goal-prompt", property)!),
+        `.guided-goal-prompt ${property} must match .guided-current-decision`,
+      ).toBe(
+        resolveTokens(
+          valueIn(guidedCss, ".guided-current-decision", property)!,
+        ),
+      );
+    }
+  });
+
+  it("is carried by the same scroll-region measure rules as the decision card", () => {
+    // The centred 56rem measure and the gutter live on
+    // `.guided-authoring-scroll > …` rules. A goal card left out of those
+    // selector lists inherits neither, so the column reflows at the exact
+    // moment the goal is sent — the one transition where a width change is
+    // most visible.
+    const measureRules = rulesMatching((selector) =>
+      selector === ".guided-authoring-scroll > .guided-current-decision",
+    );
+    expect(
+      measureRules.length,
+      "expected the decision card's scroll-region rules to be found",
+    ).toBeGreaterThan(0);
+    for (const { rule } of measureRules) {
+      expect(
+        rule.selectors,
+        `the goal card must share the rule declaring: ${rule.declarations.trim()}`,
+      ).toContain(".guided-authoring-scroll > .guided-goal-prompt");
+    }
+  });
+
+  it("puts the goal question on the decision heading's type rung", () => {
+    // The question is the card's <h2> exactly as the rationale is the decision
+    // card's, so the two must agree — otherwise the headline changes size when
+    // the goal is sent.
+    for (const property of ["font-size", "line-height", "font-weight"]) {
+      expect(
+        resolveTokens(
+          valueIn(guidedCss, ".guided-goal-prompt__question", property)!,
+        ),
+        `.guided-goal-prompt__question ${property} must match the decision rationale`,
+      ).toBe(
+        resolveTokens(
+          valueIn(
+            guidedCss,
+            ".guided-current-decision-copy .guided-current-decision-rationale",
+            property,
+          )!,
+        ),
+      );
+    }
+  });
+});

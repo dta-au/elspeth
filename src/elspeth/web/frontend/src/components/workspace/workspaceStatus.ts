@@ -16,13 +16,27 @@ export interface WorkspaceStatus {
   text: string;
   tone: WorkspaceStatusTone;
   accessibleLabel: string;
+  /** This channel's contribution to the merged Checks count: concrete
+   *  findings behind an error/warning tone that no other channel already
+   *  carries (0 for every other tone, and for zero-count failures like a
+   *  failed check request). The merge projection sums it across channels, so
+   *  a fact two channels both know — the audit snapshot's "validation" row
+   *  mirrors the validation channel's own failure — counts in exactly one of
+   *  them. It may therefore undercount a channel's standalone `text`. */
+  issueCount: number;
 }
 
 function validationStatus(
   text: string,
   tone: WorkspaceStatusTone,
+  issueCount = 0,
 ): WorkspaceStatus {
-  return { text, tone, accessibleLabel: `Validation: ${text}` };
+  return {
+    text,
+    tone,
+    accessibleLabel: `Validation: ${text}`,
+    issueCount,
+  };
 }
 
 export function projectValidationWorkspaceStatus(
@@ -39,12 +53,16 @@ export function projectValidationWorkspaceStatus(
   }
   const errorCount = validationResult.errors.length;
   if (errorCount > 0) {
-    return validationStatus(plural(errorCount, "error"), "error");
+    return validationStatus(plural(errorCount, "error"), "error", errorCount);
   }
   if (!validationResult.is_valid) return validationStatus("Failed", "error");
   const warningCount = validationResult.warnings?.length ?? 0;
   if (warningCount > 0) {
-    return validationStatus(plural(warningCount, "warning"), "warning");
+    return validationStatus(
+      plural(warningCount, "warning"),
+      "warning",
+      warningCount,
+    );
   }
   return validationStatus("Passed", "success");
 }
@@ -59,8 +77,9 @@ interface AuditWorkspaceStatusInputs {
 function auditStatus(
   text: string,
   tone: WorkspaceStatusTone,
+  issueCount = 0,
 ): WorkspaceStatus {
-  return { text, tone, accessibleLabel: `Audit: ${text}` };
+  return { text, tone, accessibleLabel: `Audit: ${text}`, issueCount };
 }
 
 export function projectAuditWorkspaceStatus({
@@ -110,5 +129,52 @@ export function projectAuditWorkspaceStatus({
   const tone = issueRows.some((row) => row.status === "error")
     ? "error"
     : "warning";
-  return auditStatus(plural(issueRows.length, "issue"), tone);
+  // The "validation" row is mechanically tied to validation_result.is_valid
+  // (the consistency guard above enforces it), so it restates a failure the
+  // validation channel already counts error-by-error. Text and tone keep it
+  // — standalone, "2 issues" over two red rows is the honest reading — but
+  // the merge contribution excludes it or every validation failure would
+  // inflate the merged Checks count by exactly one.
+  const contributed = issueRows.filter((row) => row.id !== "validation").length;
+  return auditStatus(plural(issueRows.length, "issue"), tone, contributed);
+}
+
+/* Ambient severity order for the merged Checks projection. Error outranks
+   warning because validation errors block running; busy outranks the resting
+   tones so an in-flight check never reads as a settled verdict; and neutral
+   ("Not checked") outranks success because green must only ever mean "both
+   channels checked and clean". */
+const CHECKS_TONE_SEVERITY: readonly WorkspaceStatusTone[] = [
+  "error",
+  "warning",
+  "busy",
+  "neutral",
+  "success",
+];
+
+/** Merge the validation and audit projections into the single ambient status
+ *  the Checks artifact tab presents: worst-of tone, summed finding count, and
+ *  a deliberately jargon-free text (the per-channel wording lives inside the
+ *  Checks panel itself, one selection away). */
+export function projectChecksWorkspaceStatus(
+  validation: WorkspaceStatus,
+  audit: WorkspaceStatus,
+): WorkspaceStatus {
+  const tone = CHECKS_TONE_SEVERITY.find(
+    (candidate) => validation.tone === candidate || audit.tone === candidate,
+  ) as WorkspaceStatusTone;
+  const issueCount = validation.issueCount + audit.issueCount;
+  const text =
+    issueCount > 0
+      ? plural(issueCount, "issue")
+      : tone === "error"
+        ? "Check failed"
+        : tone === "warning"
+          ? "Review"
+          : tone === "busy"
+            ? "Checking"
+            : tone === "neutral"
+              ? "Not checked"
+              : "Ready";
+  return { text, tone, accessibleLabel: `Checks: ${text}`, issueCount };
 }

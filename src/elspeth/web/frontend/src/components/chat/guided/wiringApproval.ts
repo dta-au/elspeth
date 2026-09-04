@@ -61,6 +61,18 @@ export type WiringApprovalOutcome =
  * pipeline that cannot be confirmed at all is never described as merely
  * carrying warnings.
  *
+ * Routes with NO STATIC CHECK are deliberately not an arm here
+ * (elspeth-e4c2ebb697, design option A). They are not a defect and not a
+ * pending action: ADR-007 abstention is admissible, the ordinary Confirm on
+ * the card stays enabled for them, and the card itself now names them twice —
+ * in the routes roll-up and in the caption under Confirm. Approving unseen is
+ * the user's deliberate skip of that card, and nearly every live `select_only`
+ * pipeline has such a route, so an arm here would turn one-click Approve into
+ * a two-click path on the common case without adding a fact the card does not
+ * already carry. This is the one axis on which unchecked routes differ from
+ * `warnings` above: a warning is the validator SAYING something, an absent
+ * contract is it declining to.
+ *
  * NOT a complete list of the server's confirm gates, and cannot be: the
  * server also 409s a confirm whose guided session has unresolved retained
  * instructions (`verified_remaining_deferred_intents`, guided.py), and that

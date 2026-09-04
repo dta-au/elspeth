@@ -653,7 +653,27 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016
 # -> 73c47a4d86c6606e80c405cdb0a7039921c60b255ced886ed5d390384b0822ee, captured
 # from test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
 # output), then this digest. No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "03f48bce2f0d53d337f14d707c4a9556d06d59d93fcf58ff7f9895ad3d21f5ed"
+# Rotated 2026-09-01 for the emitted-option env placeholder closure (0650c9c23):
+# a PLUGIN PROVENANCE rotation, not a semantic one. json_source.py gained
+# EmittedToOutput annotations alongside the other source and transform config
+# models, so its declared source_file_hash moved (8d6f47c2385ecd86 ->
+# 9f0b0a653e365a0b, recomputed with
+# scripts/cicd/plugin_hash.py::compute_source_file_hash); the manifest pin was
+# updated first, then this digest. No oracle_freeze snapshot moved.
+# Rotated 2026-09-01 after 4a3657b7c: the json_explode plugin gained its
+# forwarding/extras contract and collision guard, so its declared
+# source_file_hash moved (8983dddbea054fe3 -> 36c7c718e2cee382, recomputed
+# with scripts/cicd/plugin_hash.py::compute_source_file_hash). A structural
+# comparison of the live json-explode-parent-child durable projection against
+# the declared projection found exactly this one audit-record material byte as
+# the difference. The manifest has one json_explode provenance pin and this
+# run-workflow case has no resumed_full_projection_sha256. The oracle_freeze
+# surface excludes audit_records, so no semantic snapshot moved; the manifest
+# pin was updated first, then this full case-registry digest.
+# Merged 2026-09-01: the two rotations above landed on separate branches and
+# touch different plugins, so both provenance pins are live on the merged
+# manifest and this digest covers both.
+EXPECTED_CASE_REGISTRY_SHA256 = "fc99a2fd10d8d7b0d5540f9e68a8e4a3f222db535ee2db93dac3b7144d0eca53"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -1005,12 +1025,6 @@ LIVE_DAG_DOCUMENTS = (
     COMPLETENESS_CRITERIA_PATH,
     DOCS_INDEX_PATH,
 )
-ACTIVE_CORPUS_ISSUES = (
-    "elspeth-ef29ef6ba4",
-    "elspeth-cb1053fe46",
-    "elspeth-be41d0ea25",
-)
-
 EXPECTED_HAPPY_PATH_YAML = b"""sources:
   primary:
     plugin: csv
@@ -1557,22 +1571,11 @@ def test_dag_hub_links_the_live_scenario_corpus_authorities() -> None:
     assert "authoritative live" in content.lower()
 
 
-def test_scenario_corpus_readme_links_manifest_criteria_and_active_issue() -> None:
+def test_scenario_corpus_readme_links_manifest_and_criteria() -> None:
     targets = _markdown_link_targets(CORPUS_README_PATH)
-    content = CORPUS_README_PATH.read_text(encoding="utf-8")
 
     assert "v1/manifest.yaml" in targets
     assert "../completeness-criteria.md" in targets
-    for issue_id in ACTIVE_CORPUS_ISSUES:
-        assert issue_id in content
-        assert f"filigree show {issue_id} --json" in content
-
-
-def test_dag_docs_explain_product_criteria_and_executable_lifecycle_cells() -> None:
-    content = "\n".join(path.read_text(encoding="utf-8") for path in (DAG_HUB_PATH, CORPUS_README_PATH, ASSESSMENT_FRAMEWORK_PATH)).lower()
-
-    assert "15 product-quality criteria" in content
-    assert "11 executable lifecycle cells" in content
 
 
 @pytest.mark.parametrize("document", LIVE_DAG_DOCUMENTS)
@@ -5472,6 +5475,46 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
     }
 
 
+def test_exact_case_plugin_provenance_pins_match_registered_classes(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = install_corpus_plugin_manager(monkeypatch)
+    transform_classes = {plugin.name: plugin for plugin in manager.get_transforms()}
+    plugin_classes = {
+        **{("source", plugin.name): plugin for plugin in manager.get_sources()},
+        **{
+            (node_type, plugin_name): plugin
+            for plugin_name, plugin in transform_classes.items()
+            for node_type in ("transform", "aggregation", "collector")
+        },
+        **{("sink", plugin.name): plugin for plugin in manager.get_sinks()},
+    }
+    declared_hashes: dict[str, str] = {}
+    live_hashes: dict[str, str | None] = {}
+    unhashed_plugin_nodes: set[tuple[str, str]] = set()
+
+    for scenario, case in iter_harness_cases(load_manifest()):
+        if not isinstance(case.expected, RunExpectation):
+            continue
+        for record in case.expected.projection.audit_records:
+            if record.record_type != "node":
+                continue
+            material = json.loads(record.material)
+            declared_hash = material["source_file_hash"]
+            if declared_hash is None:
+                unhashed_plugin_nodes.add((material["node_type"], material["plugin_name"]))
+                continue
+            pin_key = f"{scenario.id}:{case.id}:{record.key}"
+            plugin_class = plugin_classes[(material["node_type"], material["plugin_name"])]
+            declared_hashes[pin_key] = declared_hash
+            live_hashes[pin_key] = plugin_class.source_file_hash
+
+    assert declared_hashes
+    assert declared_hashes == live_hashes
+    assert plugin_classes[("aggregation", "batch_stats")] is transform_classes["batch_stats"]
+    assert plugin_classes[("collector", "batch_stats")] is transform_classes["batch_stats"]
+    assert plugin_classes[("sink", "dag_corpus_always_fail_sink")].source_file_hash == plugin_classes[("sink", "json")].source_file_hash
+    assert ("aggregation", "dag_corpus_eof_batch_sum") in unhashed_plugin_nodes
+
+
 def _corpus_rows() -> list[PipelineRow]:
     contract = SchemaContract(
         mode="OBSERVED",
@@ -5845,10 +5888,8 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-7cdc4da434"
             elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "contracts":
                 expected_owner = "elspeth-67b44040ee"
-            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "runtime":
+            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension in {"runtime", "audit"}:
                 expected_owner = "elspeth-6f6bbbec00"
-            elif scenario.id == "retry-quarantine-discard-routed-errors" and dimension == "audit":
-                expected_owner = "elspeth-2e66723070"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "contracts":
                 expected_owner = "elspeth-f321e3ff21"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":

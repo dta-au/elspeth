@@ -13,6 +13,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetad
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_USER_TERM,
+    PROMPT_SHIELD_WARNING_DRAFT,
     PROMPT_TEMPLATE_PARTS_KEY,
     RAW_HTML_CLEANUP_USER_TERM,
     SOURCE_AUTHORING_KEY,
@@ -655,8 +656,8 @@ def test_gate_routed_web_scrape_into_llm_warns_without_prompt_shield() -> None:
     assert all(site.user_term != PROMPT_SHIELD_USER_TERM for site in result.sites)
 
 
-def test_web_scrape_fed_llm_keeps_remote_content_drafts_verbatim() -> None:
-    """The remote-provenance branch is a genuine security advisory: its wording
+def test_web_scrape_fed_llm_keeps_untrusted_content_drafts_verbatim() -> None:
+    """The untrusted-producer branch is a genuine security advisory: its wording
     must stay byte-identical in both availability states — the local-content
     split must never soften a real scrape graph's card."""
     from elspeth.web.interpretation_state import (
@@ -673,9 +674,70 @@ def test_web_scrape_fed_llm_keeps_remote_content_drafts_verbatim() -> None:
     assert any(PROMPT_SHIELD_AVAILABLE_DRAFT in message for _component, message in pairs_b)
 
 
+@pytest.mark.parametrize(
+    ("producer_plugin", "intermediate_plugin"),
+    [
+        ("blob_fetch", "blob_text_expand"),
+        ("azure_document_intelligence", None),
+        ("rag_retrieval", None),
+        ("llm", None),
+    ],
+)
+def test_untrusted_producers_use_provenance_neutral_content_draft(
+    producer_plugin: str,
+    intermediate_plugin: str | None,
+) -> None:
+    producer = NodeSpec(
+        id="remote_producer",
+        node_type="transform",
+        plugin=producer_plugin,
+        input="source_rows",
+        on_success="remote_result",
+        on_error="stop",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    nodes = [producer]
+    llm_input = "remote_result"
+    if intermediate_plugin is not None:
+        nodes.append(
+            NodeSpec(
+                id="remote_expander",
+                node_type="transform",
+                plugin=intermediate_plugin,
+                input="remote_result",
+                on_success="remote_content",
+                on_error="stop",
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        llm_input = "remote_content"
+    nodes.append(_llm(input_stream=llm_input))
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(_state(tuple(nodes)))
+
+    assert any(PROMPT_SHIELD_WARNING_DRAFT in message for _component, message in warning_pairs)
+    message = next(message for component, message in warning_pairs if component == "node:classify")
+    assert "untrusted or externally controlled upstream content" in message
+    assert f"produced by {producer_plugin}" in message
+    if producer_plugin in {"azure_document_intelligence", "rag_retrieval", "llm"}:
+        assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
+
+
 def test_refiner_upgrades_local_content_draft_variant() -> None:
     """C->B upgrade must stay variant-aligned: a local-content warning upgrades
-    to the local-content B draft, never to the remote fetch-step wording."""
+    to the local-content B draft, never to producer-specific wording."""
     from elspeth.web.interpretation_state import (
         PROMPT_SHIELD_AVAILABLE_DRAFT,
         PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT,
@@ -870,7 +932,8 @@ def test_prompt_shield_before_web_scrape_does_not_bless_downstream_llm() -> None
 
     assert warning_pairs
     message = next(message for component, message in warning_pairs if component == "node:classify")
-    assert "web_scrape upstream without an authorized prompt-injection shield between them" in message
+    assert "produced by web_scrape" in message
+    assert "without an authorized prompt-injection shield between them" in message
 
 
 def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() -> None:
@@ -890,7 +953,7 @@ def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() 
 
     assert warning_pairs
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a web_scrape upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by web_scrape" in message
 
 
 # ── Document-extraction producers are untrusted too ──────────────────────
@@ -913,7 +976,8 @@ def test_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content()
 
     assert warning_pairs
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a aws_textract_document_analysis upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by aws_textract_document_analysis" in message
+    assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
 
 
 def test_inline_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
@@ -939,7 +1003,8 @@ def test_inline_textract_upstream_marks_downstream_llm_as_consuming_untrusted_co
 
     assert warning_pairs
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a aws_textract_inline_analysis upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by aws_textract_inline_analysis" in message
+    assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
 
 
 def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> None:
@@ -956,8 +1021,8 @@ def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> N
     assert "web_scrape" not in message
 
 
-def test_web_scrape_untrusted_lead_is_unchanged() -> None:
-    """Regression guard: the web_scrape wording is pinned by the tutorial e2e spec."""
+def test_web_scrape_untrusted_lead_uses_shared_provenance_neutral_wording() -> None:
+    """All untrusted producers share one provenance-neutral operator record."""
     state = _state(
         (
             _web_scrape("scrape", input_stream="rows", on_success="inbound"),
@@ -968,8 +1033,8 @@ def test_web_scrape_untrusted_lead_is_unchanged() -> None:
     message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
 
     assert (
-        "consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. "
-        in message
+        "consumes untrusted or externally controlled upstream content produced by web_scrape without an authorized "
+        "prompt-injection shield between them. " in message
     )
 
 
@@ -1004,7 +1069,7 @@ def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() ->
 
     assert warning_pairs, "an unshielded predecessor path must still surface the shield advisory"
     message = next(msg for component, msg in warning_pairs if component == "node:classify")
-    assert "consumes externally-fetched content from a web_scrape upstream" in message
+    assert "consumes untrusted or externally controlled upstream content produced by web_scrape" in message
 
     # When EVERY predecessor path is shielded, State A is silent.
     fully_shielded = _state(
@@ -1036,7 +1101,9 @@ def test_row_union_requires_every_branch_to_be_prompt_shielded() -> None:
     warning_pairs = prompt_shield_recommendation_warning_pairs(partially_shielded)
 
     assert warning_pairs
-    assert "web_scrape upstream" in next(message for component, message in warning_pairs if component == "node:classify")
+    message = next(message for component, message in warning_pairs if component == "node:classify")
+    assert "produced by web_scrape" in message
+    assert "without an authorized prompt-injection shield between them" in message
 
     fully_shielded = _state(
         (
@@ -1193,9 +1260,9 @@ def test_plain_unshielded_llm_warns_always_on() -> None:
 def test_prompt_shield_warning_uses_available_draft_in_state_b() -> None:
     """A fetch-less graph gets the LOCAL-CONTENT drafts in both states.
 
-    The remote-content constants assert an "external-content fetch step" and
-    "internet-controlled text"; on this graph (plain llm over operator-supplied
-    rows, no upstream producer) those claims are false, and the staged review
+    The producer-specific constants assert a declared untrusted-content
+    producer; on this graph (plain llm over operator-supplied rows, no upstream
+    producer) that claim is false, and the staged review
     card carries the draft alone — so the draft itself must tell the truth
     (build-review finding L2, session 94bdae4f).
     """
@@ -2738,3 +2805,13 @@ def test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape() -> Non
 
     with pytest.raises(ValueError, match=r"requires field_mapper\.mapping to be a mapping"):
         _raw_html_cleanup_artifact_hash(node, ())
+
+
+@pytest.mark.parametrize("bad_field", [123, None, b"content", ["content"], {"content": 1}])
+def test_validated_mapping_field_rejects_non_string_mapping_sides(bad_field: object) -> None:
+    """Tier-3 boundary honesty: a non-string side of an authored
+    field_mapper mapping raises ValueError, never coerces or stringifies."""
+    from elspeth.web.interpretation_state import _validated_mapping_field
+
+    with pytest.raises(ValueError, match="must map string field names"):
+        _validated_mapping_field(bad_field, context="raw-html cleanup review contract", node_id="drop-raw")

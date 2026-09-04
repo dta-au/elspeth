@@ -31,6 +31,7 @@ from elspeth_lints.core.atomic_io import atomic_update_text
 from elspeth_lints.core.strict_json import strict_json_loads
 
 SCHEMA_VERSION = 2
+DEFAULT_SIGN_BUNDLE_RATIONALE = "Staged via sign-bundle; see bundle provenance for the agent rationale."
 
 _FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40,64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")

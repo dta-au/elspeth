@@ -37,6 +37,13 @@ allowed_external_types:
   # Composition state types - shared between web composer and composer MCP server
   - "web/composer/state:CompositionState"
   - "web/composer/state:PipelineMetadata"
+  # The wire dict ValidationEntry.to_dict() emits. The composer MCP server
+  # serializes the same objects and used to hand-copy this shape (a 3-key
+  # mirror of an 8-key dict — elspeth-e405ad7cd2, systems ledger #41);
+  # importing the producer's own TypedDict is the honest form. (EdgeContractDict
+  # is shared the same way but is a functional-form TypedDict the checker
+  # does not index, so it needs no entry.)
+  - "web/composer/state:ValidationEntryDict"
   # Runtime preflight coordination types - shared between web execution and composer MCP
   - "web/execution/runtime_preflight:RuntimePreflightKey"
   - "web/execution/runtime_preflight:RuntimePreflightFailure"
@@ -813,7 +820,6 @@ allowed_dict_patterns:
   # LLM tool-use loop. Tool JSON schemas define optional fields.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/composer/tools/_common.py:ToolResult.to_dict:return"
-  - "src/elspeth/web/composer/tools/sessions.py:_authoring_validation_payload:return"
   - "src/elspeth/web/composer/tools/_common.py:_secret_ref_placement_error:options"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:execute_tool:arguments"
@@ -962,6 +968,10 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/_common.py:diff_states:return"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:state_dict"
   - "src/elspeth/web/composer/redaction.py:redact_source_storage_path:return"
+  # Same serialized source.options dict, copied as the base the guided custody
+  # masks land on (elspeth-75d320fb25).
+  - "src/elspeth/web/composer/redaction.py:_projected_source_options:return"
+  - "src/elspeth/web/composer/redaction.py:_mask_option_carriers:return"
   # Planner-visible projection of a serialized CompositionState (elspeth-c67fbbbd83):
   # same serialized-state dict shape as redact_source_storage_path above.
   - "src/elspeth/web/composer/prompts.py:project_server_owned_option_metadata:serialized"
@@ -974,9 +984,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
   - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"
-  # Serialization helpers — produce JSON dicts for LLM tool responses
+  # Serialization helpers — produce JSON dicts for LLM tool responses.
+  # ``_serialize_node`` left this list at elspeth-e405ad7cd2 (RED5-2): its return is now the
+  # ``_SetPipelineNodePayload`` TypedDict the envelope census reads, so there is no bare dict
+  # pattern left to exempt.
   - "src/elspeth/web/composer/tools/_common.py:_serialize_source:return"
-  - "src/elspeth/web/composer/tools/_common.py:_serialize_node:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_output:return"
   - "src/elspeth/web/composer/tools/_common.py:_serialize_edge:return"
   - "src/elspeth/web/composer/tools/generation.py:_serialize_plugin_assistance_example:return"
@@ -986,6 +998,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/_common.py:_validate_sink_path:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_plugin_options:injected_fields"
+  - "src/elspeth/web/composer/tools/_common.py:_deferred_value_source_error:options"
   - "src/elspeth/web/composer/tools/_common.py:_prevalidate_sink:options"
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -1019,11 +1032,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_before_deadline:tools (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_with_audit:tools (list)"
-  # Advisor escape hatch: arguments come from the composer LLM's tool-call
-  # payload (a JSON object), structurally identical to other LLM-tool-call
-  # arguments processed elsewhere in the dispatch loop. Required fields are
-  # validated by _TOOL_REQUIRED_PATHS before the method runs.
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_advisor_with_audit:arguments"
   # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
   # payload; returns either None (valid) or an ARG_ERROR result_payload dict
   # for the caller to embed in the outer ComposerToolInvocation record.

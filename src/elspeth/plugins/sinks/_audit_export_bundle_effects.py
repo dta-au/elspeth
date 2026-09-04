@@ -1178,15 +1178,14 @@ def cleanup_stale_audit_export_bundle_scratch(
         current_time = now
     removed = 0
     absolute_parent = _absolute_path(parent)
+    # Pin and enumeration failures PROPAGATE. Converting them to 0 made an
+    # unreadable bundle parent indistinguishable from a clean sweep that found
+    # nothing; the caller decides what an unusable parent means
+    # (preflight_audit_export_bundle converts the raise into its typed
+    # preflight failure before any probe is created).
+    pinned = _open_pinned_bundle_parent(absolute_parent / ".elspeth-scratch-cleanup-anchor")
     try:
-        pinned = _open_pinned_bundle_parent(absolute_parent / ".elspeth-scratch-cleanup-anchor")
-    except OSError:
-        return 0
-    try:
-        try:
-            names = sorted(os.listdir(pinned.descriptor))
-        except OSError:
-            return 0
+        names = sorted(os.listdir(pinned.descriptor))
         for name in names:
             if removed >= max_entries:
                 break
@@ -1232,13 +1231,17 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
     if target_parent_device != staging_parent_device:
         raise AuditExportBundlePreflightError("bundle staging and target parents must be on the same device")
 
-    cleanup_stale_audit_export_bundle_scratch(parent)
+    try:
+        cleanup_stale_audit_export_bundle_scratch(parent)
+    except OSError as exc:
+        raise AuditExportBundlePreflightError("stale-scratch cleanup could not pin or enumerate the bundle parent") from exc
     token = f"{time.time_ns()}-{os.getpid()}-{uuid4().hex}"
     source = parent / f"{_PROBE_PREFIX}{token}-source"
     destination = parent / f"{_PROBE_PREFIX}{token}-destination"
     collision_source = parent / f"{_PROBE_PREFIX}{token}-collision-source"
     collision_destination = parent / f"{_PROBE_PREFIX}{token}-collision-destination"
     paths = (source, destination, collision_source, collision_destination)
+    probe_cleanup_failures: list[str] = []
     try:
         source.mkdir(mode=0o700)
         probe_file = source / "probe"
@@ -1286,12 +1289,21 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         for path in paths:
             try:
                 pinned = _open_pinned_bundle_parent(path)
-            except OSError:
+            except OSError as cleanup_exc:
+                # Recorded, then surfaced as the function's own failure below.
+                # When a probe failure is already propagating out of the try it
+                # stays primary; a preflight that cannot even pin the parent it
+                # just probed has failed either way.
+                probe_cleanup_failures.append(f"{path.name}: {type(cleanup_exc).__name__}: {cleanup_exc}")
                 continue
             try:
                 _remove_scratch_path_at(pinned.descriptor, path.name)
             finally:
                 pinned.close()
+    if probe_cleanup_failures:
+        raise AuditExportBundlePreflightError(
+            "bundle preflight probes succeeded but probe cleanup failed: " + "; ".join(probe_cleanup_failures)
+        )
     return AuditExportBundlePreflight(
         target_path=str(target),
         filesystem_magic=filesystem_magic,

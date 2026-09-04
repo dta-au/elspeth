@@ -605,7 +605,7 @@ def _compatibility_receipt(scenario_id: str) -> dict[str, object]:
         "candidate_image_digest": "sha256:" + "d" * 64,
         "candidate_task_definition_sha256": "e" * 64,
         "candidate_doctor_task_definition_sha256": "f" * 64,
-        "candidate_package_version": "0.7.2",
+        "candidate_package_version": "0.8.0",
         "previous_source_sha": "1" * 40 if previous else None,
         "previous_image_digest": "sha256:" + "2" * 64 if previous else None,
         "previous_task_definition_sha256": "3" * 64 if previous else None,

@@ -10,14 +10,15 @@ validation; tests for that surface live in test_step_tool_scope.py.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, get_args
+from typing import Any, ClassVar, get_args
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -29,7 +30,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided import chat_solver
+from elspeth.web.composer.guided import chat_solver, planning
 from elspeth.web.composer.guided.chat_solver import (
     _STEP_2_SINK_DIGEST_MAX_UTF8_BYTES,
     AssistantScaffoldLeakError,
@@ -37,6 +38,7 @@ from elspeth.web.composer.guided.chat_solver import (
     Step1SourceChatResolution,
     _build_step_1_source_dynamic_block,
     _build_step_2_sink_tool_prompt,
+    _llm_safe_schema_option,
     _parse_step_1_source_tool_arguments,
     _parse_step_2_sink_tool_arguments,
     _step_2_sink_digest_block,
@@ -90,6 +92,9 @@ from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
     DeferredRequestEdited,
     DeferredRequestRetained,
     DeferredRequestUnchanged,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    GATE_ROUTE_KEYS,
 )
 from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
     _fork_coalesce_payload as _advisory_fork_coalesce_payload,
@@ -994,6 +999,131 @@ def test_repair_thread_admission_parses_real_litellm_dynamic_tool_call() -> None
     assert admitted.calls[0].is_rejected is True
 
 
+@pytest.mark.parametrize(
+    "call_ids",
+    [
+        ("   ",),
+        ("duplicate", "duplicate"),
+    ],
+    ids=["blank", "duplicate"],
+)
+def test_repair_thread_admission_rejects_ambiguous_provider_call_ids(
+    call_ids: tuple[str, ...],
+) -> None:
+    calls = tuple(
+        SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+        )
+        for call_id in call_ids
+    )
+    message = SimpleNamespace(content=None)
+
+    admitted = chat_solver._admit_deferred_intent_repair_thread(
+        message,
+        calls,
+        rejected_calls=calls,
+    )
+
+    assert admitted is None
+
+
+def test_repair_thread_preserves_long_litellm_gemini_thought_signature_id_exactly() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _encode_tool_call_id_with_signature
+
+    signed_id = _encode_tool_call_id_with_signature("call_gemini", "c2ln" * 100)
+    assert len(signed_id) > 256
+    call = SimpleNamespace(
+        id=signed_id,
+        function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+    )
+    admitted = chat_solver._admit_deferred_intent_repair_thread(
+        SimpleNamespace(content=None),
+        (call,),
+        rejected_calls=(call,),
+    )
+
+    assert admitted is not None
+    assert admitted.calls[0].id == signed_id
+    replay = chat_solver._deferred_intent_repair_thread(
+        admitted,
+        errors=(chat_solver.DeferredIntentActionShapeError("repair this call"),),
+    )
+    assert replay[0]["tool_calls"][0]["id"] == signed_id
+    assert replay[1]["tool_call_id"] == signed_id
+
+
+def test_deferred_intent_management_schema_survives_supported_provider_adapters() -> None:
+    """Anthropic/Bedrock must see the management fields, not an empty tool."""
+    from litellm.litellm_core_utils.prompt_templates.factory import _bedrock_tools_pt
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    definition = deepcopy(chat_solver._DEFERRED_INTENT_MANAGEMENT_TOOL)
+    raw_schema = definition["function"]["parameters"]
+    anthropic_tool: Any
+    anthropic_tool, _ = AnthropicConfig()._map_tool_helper(definition)
+    bedrock_tools: Any = _bedrock_tools_pt(
+        [definition],
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+    transported = (
+        raw_schema,
+        anthropic_tool["input_schema"],
+        bedrock_tools[0]["toolSpec"]["inputSchema"]["json"],
+    )
+
+    assert raw_schema["additionalProperties"] is False
+    for schema in transported:
+        assert schema["type"] == "object"
+        assert set(schema["required"]) == {"action", "intent_id", "selection_token"}
+        assert set(schema["properties"]) == {"action", "intent_id", "selection_token", "replacement"}
+        assert schema["properties"]["action"]["enum"] == ["cancel", "edit"]
+        assert "oneOf" not in schema
+
+
+def test_multiple_rejected_retain_repair_prompt_requires_complete_ordered_replay() -> None:
+    calls = tuple(
+        chat_solver._RepairThreadToolCall(
+            id=f"call_{index}",
+            function=chat_solver._RepairThreadToolFunction(
+                name="retain_deferred_intent",
+                arguments=json.dumps({"target_stage": "topology"}),
+            ),
+            is_rejected=index > 0,
+        )
+        for index in range(3)
+    )
+    thread = chat_solver._deferred_intent_repair_thread(
+        chat_solver._DeferredIntentRepairThread(assistant_content=None, calls=calls),
+        errors=(
+            chat_solver.DeferredIntentActionShapeError("first rejection"),
+            chat_solver.DeferredIntentActionShapeError("second rejection"),
+        ),
+    )
+    tool_results = [message["content"] for message in thread if message["role"] == "tool"]
+
+    assert all("resend all original calls together in their original order" in content.lower() for content in tool_results)
+    assert all("resend only" not in content.lower() for content in tool_results)
+
+
+def test_retain_open_redisposition_does_not_create_a_self_referential_cause() -> None:
+    first_error = chat_solver.DeferredIntentActionShapeError("original retain rejection")
+    state = chat_solver._DeferredRetainOpen(
+        slots=(None,),
+        first_error=first_error,
+        held_resolution=None,
+    )
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError) as raised:
+        try:
+            raise first_error
+        except chat_solver.DeferredIntentActionShapeError as exc:
+            chat_solver._deferred_repair_exception_outcome(state, exc)
+
+    assert raised.value is first_error
+    assert raised.value.__cause__ is not raised.value
+
+
 def test_record_llm_call_preserves_active_primary_when_secondary_audit_build_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1146,6 +1276,179 @@ async def test_step_1_shape_rejected_resolve_source_is_repaired_within_one_tool_
         ComposerLLMCallStatus.SUCCESS,
     ]
     assert telemetry == [{"step": "step_1_source", "tool": "resolve_source", "outcome": "repaired", "attempt_index": 1}]
+
+
+@pytest.mark.asyncio
+async def test_step_1_source_repair_preserves_grouped_retains_when_only_source_is_resent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Correcting only the rejected source must keep its valid retain siblings."""
+    calls_seen = 0
+
+    async def repairing_only_source(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            source_arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+            calls = [
+                SimpleNamespace(
+                    id="c_source_rejected",
+                    function=SimpleNamespace(name="resolve_source", arguments=json.dumps(source_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_source_corrected",
+                    function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_source)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these rows, then retain two topology requirements.",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+async def test_step_2_sink_repair_preserves_grouped_retains_when_only_sink_is_resent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step-2 repair boundary keeps the same valid-sibling custody."""
+    calls_seen = 0
+
+    async def repairing_only_sink(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            sink_arguments = dict(_PAIR_SINK_ARGUMENTS)
+            sink_arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_rejected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(sink_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_corrected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_sink)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the rows, then retain two topology requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_resolution_repair_prose_reply_returns_pending_retains_with_withheld_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A repair-round prose decline cannot silently discard valid siblings."""
+    calls_seen = 0
+
+    async def declining_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 2:
+            return _ok_response("I need more information before I can correct that selection.")
+        if stage == "source":
+            resolution_arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+            resolution_call = SimpleNamespace(
+                id="c_source_rejected",
+                function=SimpleNamespace(name="resolve_source", arguments=json.dumps(resolution_arguments)),
+            )
+        else:
+            resolution_arguments = dict(_PAIR_SINK_ARGUMENTS)
+            resolution_arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+            resolution_call = SimpleNamespace(
+                id="c_sink_rejected",
+                function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(resolution_arguments)),
+            )
+        calls = [
+            resolution_call,
+            SimpleNamespace(
+                id="c_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Use the rows, then retain two topology requirements.",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Save the rows, then retain two topology requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
 
 
 @pytest.mark.asyncio
@@ -1634,6 +1937,1254 @@ async def test_step_1_group_with_one_malformed_retain_is_repaired_answering_ever
     assert {message["tool_call_id"] for message in tool_results} == {"c_source", "c_retain_1", "c_retain_2"}
     rejected = [message for message in tool_results if message["tool_call_id"] == "c_retain_2"]
     assert "rejected" in rejected[0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("malformed_first", [False, True])
+@pytest.mark.parametrize("resend_full_group", [False, True])
+async def test_deferred_repair_preserves_valid_siblings_exactly_once_in_call_order(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    malformed_first: bool,
+    resend_full_group: bool,
+) -> None:
+    """Targeted and complete repairs preserve the original group exactly once."""
+    calls_seen = 0
+
+    async def repairing_only_rejected(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            valid_call = SimpleNamespace(
+                id="c_retain_valid",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS if malformed_first else _VALID_DEFERRED_ARGUMENTS),
+                ),
+            )
+            rejected_call = SimpleNamespace(
+                id="c_retain_rejected",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps({"target_stage": "topology"}),
+                ),
+            )
+            calls = [rejected_call, valid_call] if malformed_first else [valid_call, rejected_call]
+        else:
+            corrected_call = SimpleNamespace(
+                id="c_retain_corrected",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS if malformed_first else _SECOND_DEFERRED_ARGUMENTS),
+                ),
+            )
+            resent_valid_call = SimpleNamespace(
+                id="c_retain_valid_resent",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS if malformed_first else _VALID_DEFERRED_ARGUMENTS),
+                ),
+            )
+            if resend_full_group:
+                calls = [corrected_call, resent_valid_call] if malformed_first else [resent_valid_call, corrected_call]
+            else:
+                calls = [corrected_call]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected)
+    outcome = await _run_stage_solver(stage)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("resend_full_group", [False, True])
+async def test_targeted_retain_repair_preserves_valid_grouped_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    resend_full_group: bool,
+) -> None:
+    """A retain retry preserves the resolution half without duplicating a replay."""
+    calls_seen = 0
+
+    async def repairing_only_rejected_retain(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_call = SimpleNamespace(
+                id="c_resolution",
+                function=SimpleNamespace(
+                    name="resolve_source" if stage == "source" else "resolve_sink",
+                    arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS),
+                ),
+            )
+            calls = [
+                resolution_call,
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        else:
+            corrected_call = SimpleNamespace(
+                id="c_retain_corrected",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            )
+            if resend_full_group:
+                calls = [
+                    SimpleNamespace(
+                        id="c_resolution_resent",
+                        function=SimpleNamespace(
+                            name="resolve_source" if stage == "source" else "resolve_sink",
+                            arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id="c_retain_valid_resent",
+                        function=SimpleNamespace(
+                            name="retain_deferred_intent",
+                            arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS),
+                        ),
+                    ),
+                    corrected_call,
+                ]
+            else:
+                calls = [corrected_call]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_only_rejected_retain)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Use these rows, then retain two topology requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+        assert outcome.resolution.plugin == "json"
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Save these rows, then retain two topology requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+        assert outcome.sink.outputs[0].plugin == "json"
+
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("retry_content", [None, "I cannot express that constraint."])
+async def test_deferred_repair_decline_uses_clarification_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    retry_content: str | None,
+) -> None:
+    """A no-tool repair reply must retain the original malformed instruction."""
+    calls_seen = 0
+
+    async def declining_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            [
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+            if calls_seen == 1
+            else []
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=retry_content, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", declining_repair)
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("retry_kind", ["resolution", "management", "hallucinated"])
+async def test_deferred_repair_non_retain_retry_uses_clarification_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    retry_kind: str,
+) -> None:
+    """A different terminal or unknown tool cannot replace the retain cohort."""
+    calls_seen = 0
+
+    async def replacing_retain_group_with_resolution(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        else:
+            function_name = {
+                "resolution": "resolve_source" if stage == "source" else "resolve_sink",
+                "management": "manage_deferred_intent",
+                "hallucinated": "peek_secrets",
+            }[retry_kind]
+            arguments = (
+                json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS) if retry_kind == "resolution" else "{}"
+            )
+            calls = [
+                SimpleNamespace(
+                    id="c_replacement",
+                    function=SimpleNamespace(
+                        name=function_name,
+                        arguments=arguments,
+                    ),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", replacing_retain_group_with_resolution)
+
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+    assert calls_seen == 2
+
+
+@pytest.mark.asyncio
+async def test_settled_retain_repair_allows_follow_on_sink_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settling retains clears their error before the held sink is repaired."""
+    calls_seen = 0
+
+    async def repairing_retain_then_sink(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_invalid",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_rejected",
+                    function=SimpleNamespace(
+                        name="retain_deferred_intent",
+                        arguments=json.dumps({"target_stage": "topology"}),
+                    ),
+                ),
+            ]
+        elif calls_seen == 2:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                )
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_corrected",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_retain_then_sink)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save the rows and retain two topology requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert calls_seen == 3
+
+
+def _resolution_open_first_reply(stage: str) -> list[SimpleNamespace]:
+    """Open resolution repair with two byte-identical retained actions."""
+
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = {} if stage == "source" else _PAIR_CONFIG_INVALID_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_initial",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        SimpleNamespace(
+            id="c_retain_initial_1",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+        SimpleNamespace(
+            id="c_retain_initial_2",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+    ]
+
+
+def _resolution_open_exit_reply(stage: str, exit_kind: str) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    if exit_kind == "management":
+        return [
+            SimpleNamespace(
+                id="c_management",
+                function=SimpleNamespace(
+                    name="manage_deferred_intent",
+                    arguments=json.dumps(
+                        {
+                            "action": "cancel",
+                            "intent_id": "00000000-0000-4000-8000-000000000801",
+                            "selection_token": "server-selection-token",
+                        }
+                    ),
+                ),
+            )
+        ]
+    if exit_kind == "retain_only":
+        return [
+            SimpleNamespace(
+                id="c_retain_replacement",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            )
+        ]
+    if exit_kind == "hallucinated":
+        return [SimpleNamespace(id="c_unknown", function=SimpleNamespace(name="peek_secrets", arguments="{}"))]
+    if exit_kind in {"empty", "prose"}:
+        return []
+    if exit_kind == "cap":
+        return [
+            SimpleNamespace(
+                id=f"c_retain_cap_{index}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            )
+            for index in range(chat_solver.GUIDED_MAX_DEFERRED_RETAINS_PER_REPLY + 1)
+        ]
+    if exit_kind == "mismatched_full_replay":
+        resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+        return [
+            SimpleNamespace(
+                id="c_resolution_replay",
+                function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+            ),
+            SimpleNamespace(
+                id="c_retain_replay_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id="c_retain_replay_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+    raise AssertionError(f"unknown resolution-open exit kind: {exit_kind}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize(
+    "exit_kind",
+    ["management", "retain_only", "hallucinated", "empty", "prose", "cap", "mismatched_full_replay"],
+)
+async def test_resolution_open_exit_withholds_exact_ordered_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    exit_kind: str,
+) -> None:
+    """No non-resolution exit may replace or discard a settled repair cohort."""
+
+    calls_seen = 0
+
+    async def resolution_then_exit(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = _resolution_open_first_reply(stage) if calls_seen == 1 else _resolution_open_exit_reply(stage, exit_kind)
+        content = "I cannot complete that resolution." if calls_seen > 1 and exit_kind == "prose" else None
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_then_exit)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
+
+
+def _resolution_replay_calls(stage: str, retains: tuple[dict[str, Any], ...]) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_replay",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        *[
+            SimpleNamespace(
+                id=f"c_retain_replay_{index}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(arguments)),
+            )
+            for index, arguments in enumerate(retains)
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("replay_kind", ["corrected_resolution", "exact_full_replay"])
+async def test_resolution_open_accepts_only_a_corrected_resolution_or_exact_full_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replay_kind: str,
+) -> None:
+    calls_seen = 0
+
+    async def resolution_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _resolution_open_first_reply(stage)
+        elif replay_kind == "corrected_resolution":
+            calls = _resolution_replay_calls(stage, ())
+        else:
+            calls = _resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", resolution_repair)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize(
+    "replayed_retains",
+    [
+        (_SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS),
+        (_VALID_DEFERRED_ARGUMENTS,),
+        (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS),
+    ],
+    ids=["reordered", "short", "long"],
+)
+async def test_resolution_open_rejects_replay_order_and_cardinality_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replayed_retains: tuple[dict[str, Any], ...],
+) -> None:
+    calls_seen = 0
+
+    async def mismatched_replay(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = {} if stage == "source" else _PAIR_CONFIG_INVALID_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                *_resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = _resolution_replay_calls(stage, replayed_retains)
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mismatched_replay)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain two ordered future requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain two ordered future requirements.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_source_reselection_withholds_exact_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls_seen = 0
+
+    async def reselect_after_resolution_repair(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _resolution_open_first_reply("source")
+            if calls_seen == 1
+            else [
+                SimpleNamespace(
+                    id="c_reselect",
+                    function=SimpleNamespace(
+                        name="reselect_source_plugin",
+                        arguments=json.dumps(
+                            {
+                                "plugin": "csv",
+                                "assistant_message": "I changed the pending source type.",
+                            }
+                        ),
+                    ),
+                )
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", reselect_after_resolution_repair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Create the source and retain the same future requirement twice.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        allow_plugin_reselection=True,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_resolution_open_malformed_resolution_withholds_exact_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    calls_seen = 0
+
+    async def malformed_correction(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _resolution_open_first_reply(stage)
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_malformed",
+                    function=SimpleNamespace(
+                        name="resolve_source" if stage == "source" else "resolve_sink",
+                        arguments="{}",
+                    ),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_correction)
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain the same future requirement twice.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Create the sink and retain the same future requirement twice.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            max_discovery_iters=2,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("malformed_index", [0, 1, 2])
+async def test_retain_open_repairs_every_malformed_position_without_losing_duplicate_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    malformed_index: int,
+) -> None:
+    calls_seen = 0
+
+    async def repair_one_position(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                *[
+                    SimpleNamespace(
+                        id=f"c_retain_initial_{index}",
+                        function=SimpleNamespace(
+                            name="retain_deferred_intent",
+                            arguments=json.dumps({"target_stage": "topology"} if index == malformed_index else _VALID_DEFERRED_ARGUMENTS),
+                        ),
+                    )
+                    for index in range(3)
+                ],
+            ]
+        else:
+            calls = [
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_one_position)
+    outcome = await _run_stage_solver(stage)
+
+    if stage == "source":
+        assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    else:
+        assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (
+        _EXPECTED_DEFERRED_ACTION,
+        _EXPECTED_DEFERRED_ACTION,
+        _EXPECTED_DEFERRED_ACTION,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_allows_read_only_discovery_then_corrected_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls_seen = 0
+    dispatched: list[str] = []
+
+    async def discover_then_resolve(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        elif calls_seen == 2:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        else:
+            calls = _resolution_replay_calls("sink", ())
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    def execute_discovery(**kwargs: Any) -> dict[str, Any]:
+        tool_call = kwargs["tool_call"]
+        dispatched.append(tool_call.function.name)
+        return {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps({"success": True, "data": []})}
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_then_resolve)
+    monkeypatch.setattr(chat_solver, "_execute_discovery_call", execute_discovery)
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect available sinks before correcting this output.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=3,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert dispatched == ["list_sinks"]
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_discovery_cap_withholds_exact_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls_seen = 0
+
+    async def discover_until_cap(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", discover_until_cap)
+    monkeypatch.setattr(
+        chat_solver,
+        "_execute_discovery_call",
+        lambda **kwargs: {
+            "role": "tool",
+            "tool_call_id": kwargs["tool_call"].id,
+            "content": json.dumps({"success": True, "data": []}),
+        },
+    )
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect available sinks but do not lose my future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionConfigRejected"
+
+
+@pytest.mark.asyncio
+async def test_resolution_open_sink_discovery_batch_cap_withholds_exact_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls_seen = 0
+
+    async def oversized_discovery_batch(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = [
+                SimpleNamespace(
+                    id="c_sink_initial",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                *_resolution_replay_calls("sink", (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS))[1:],
+            ]
+        else:
+            calls = [
+                SimpleNamespace(id=f"c_list_sinks_{index}", function=SimpleNamespace(name="list_sinks", arguments="{}"))
+                for index in range(2)
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", oversized_discovery_batch)
+    catalog, snapshot = _sink_digest_catalog([])
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Inspect sinks without losing my future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        state=_digest_composition_state(),
+        catalog=catalog,
+        plugin_snapshot=snapshot,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+        max_tool_calls_per_turn=1,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _SECOND_EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+
+
+def _retain_open_first_reply(stage: str) -> list[SimpleNamespace]:
+    resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+    resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+    return [
+        SimpleNamespace(
+            id="c_resolution_initial",
+            function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+        ),
+        SimpleNamespace(
+            id="c_retain_valid",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+        ),
+        SimpleNamespace(
+            id="c_retain_malformed",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+        ),
+    ]
+
+
+def _replayed_resolution_call(stage: str, *, changed: bool) -> SimpleNamespace:
+    arguments = deepcopy(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS)
+    if changed and stage == "source":
+        arguments["filename"] = "different.json"
+        arguments["content"] = '[{"line": "changed"}]'
+        arguments["sample_rows"] = [{"line": "changed"}]
+    elif changed:
+        arguments["output"]["name"] = "different_results"
+        arguments["output"]["options"]["path"] = "different.jsonl"
+    return SimpleNamespace(
+        id="c_resolution_replayed",
+        function=SimpleNamespace(
+            name="resolve_source" if stage == "source" else "resolve_sink",
+            arguments=json.dumps(arguments),
+        ),
+    )
+
+
+async def _run_failure_state_solver(
+    stage: str,
+    *,
+    recorder: BufferingRecorder | None = None,
+    progress: Callable[[Any], Awaitable[None]] | None = None,
+    discovery: bool = False,
+) -> object:
+    if stage == "source":
+        return await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Create the source and retain future requirements.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            recorder=recorder,
+            timeout_seconds=30.0,
+        )
+    extra: dict[str, Any] = {}
+    if discovery:
+        catalog, snapshot = _sink_digest_catalog([])
+        extra = {
+            "state": _digest_composition_state(),
+            "catalog": catalog,
+            "plugin_snapshot": snapshot,
+        }
+    return await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Create the sink and retain future requirements.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        recorder=recorder,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+        progress=progress,
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status"),
+    [
+        ("timeout", ComposerLLMCallStatus.TIMEOUT),
+        ("malformed", ComposerLLMCallStatus.MALFORMED_RESPONSE),
+    ],
+)
+async def test_open_deferred_repair_state_survives_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    open_state: str,
+    failure_kind: str,
+    expected_status: ComposerLLMCallStatus,
+) -> None:
+    calls_seen = 0
+
+    async def fail_second_provider_call(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _retain_open_first_reply(stage) if open_state == "retain" else _resolution_open_first_reply(stage)
+            return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+        if failure_kind == "timeout":
+            raise TimeoutError
+        return _FakeLLMResponse(choices=[])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fail_second_provider_call)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver(stage, recorder=recorder)
+    else:
+        outcome = await _run_failure_state_solver(stage, recorder=recorder)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+        assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert calls_seen == 2
+    assert recorder.llm_calls[-1].status is expected_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_open_deferred_repair_state_never_swallows_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    open_state: str,
+) -> None:
+    calls_seen = 0
+
+    async def cancel_second_provider_call(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            calls = _retain_open_first_reply(stage) if open_state == "retain" else _resolution_open_first_reply(stage)
+            return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", cancel_second_provider_call)
+    recorder = BufferingRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _run_failure_state_solver(stage, recorder=recorder)
+
+    assert calls_seen == 2
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_survives_discovery_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    calls_seen = 0
+
+    async def request_discovery_after_opening_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply("sink")
+            if calls_seen == 1 and open_state == "retain"
+            else _resolution_open_first_reply("sink")
+            if calls_seen == 1
+            else [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    def fail_discovery_dispatch(**_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("discovery dispatch failed")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    monkeypatch.setattr(chat_solver, "_execute_discovery_call", fail_discovery_dispatch)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver("sink", recorder=recorder, discovery=True)
+    else:
+        outcome = await _run_failure_state_solver("sink", recorder=recorder, discovery=True)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.API_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_survives_progress_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    provider_calls = 0
+    progress_calls = 0
+
+    async def return_open_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            calls = _retain_open_first_reply("sink") if open_state == "retain" else _resolution_open_first_reply("sink")
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    async def fail_discovery_progress(_event: Any) -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls == 3:
+            raise RuntimeError("progress sink failed")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", return_open_state)
+    recorder = BufferingRecorder()
+    if open_state == "retain":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_failure_state_solver("sink", recorder=recorder, progress=fail_discovery_progress, discovery=True)
+    else:
+        outcome = await _run_failure_state_solver("sink", recorder=recorder, progress=fail_discovery_progress, discovery=True)
+        assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+        assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert provider_calls == 2
+    assert progress_calls == 3
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.API_ERROR
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_state", ["retain", "resolution"])
+async def test_step_2_open_deferred_repair_state_never_swallows_discovery_progress_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    open_state: str,
+) -> None:
+    provider_calls = 0
+    progress_calls = 0
+
+    async def request_discovery_after_opening_state(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            calls = _retain_open_first_reply("sink") if open_state == "retain" else _resolution_open_first_reply("sink")
+        else:
+            calls = [SimpleNamespace(id="c_list_sinks", function=SimpleNamespace(name="list_sinks", arguments="{}"))]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    async def cancel_discovery_progress(_event: Any) -> None:
+        nonlocal progress_calls
+        progress_calls += 1
+        if progress_calls == 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", request_discovery_after_opening_state)
+    recorder = BufferingRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _run_failure_state_solver(
+            "sink",
+            recorder=recorder,
+            progress=cancel_discovery_progress,
+            discovery=True,
+        )
+
+    assert provider_calls == 2
+    assert progress_calls == 3
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("replay_kind", ["targeted", "full"])
+async def test_multiple_rejected_retains_require_identity_anchored_full_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    replay_kind: str,
+) -> None:
+    calls_seen = 0
+
+    async def repair_multiple_rejections(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        if calls_seen == 1:
+            resolution_name = "resolve_source" if stage == "source" else "resolve_sink"
+            resolution_arguments = _PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS
+            calls = [
+                SimpleNamespace(
+                    id="c_resolution_initial",
+                    function=SimpleNamespace(name=resolution_name, arguments=json.dumps(resolution_arguments)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_valid",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_malformed_1",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+                ),
+                SimpleNamespace(
+                    id="c_retain_malformed_2",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "wire_review"})),
+                ),
+            ]
+        else:
+            replayed = (
+                (_SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS)
+                if replay_kind == "targeted"
+                else (_VALID_DEFERRED_ARGUMENTS, _SECOND_DEFERRED_ARGUMENTS, _VALID_DEFERRED_ARGUMENTS)
+            )
+            calls = ([] if replay_kind == "targeted" else [_replayed_resolution_call(stage, changed=False)]) + [
+                SimpleNamespace(
+                    id=f"c_retain_repair_{index}",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(arguments)),
+                )
+                for index, arguments in enumerate(replayed)
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repair_multiple_rejections)
+    if replay_kind == "targeted":
+        with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+            await _run_stage_solver(stage)
+    else:
+        outcome = await _run_stage_solver(stage)
+        expected_type = chat_solver.Step1SourceResolvedOutcome if stage == "source" else chat_solver.Step2SinkResolvedOutcome
+        assert type(outcome) is expected_type
+        assert outcome.deferred_actions == (
+            _EXPECTED_DEFERRED_ACTION,
+            _SECOND_EXPECTED_DEFERRED_ACTION,
+            _EXPECTED_DEFERRED_ACTION,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+@pytest.mark.parametrize("changed_resolution", [False, True], ids=["same-resolution", "changed-resolution"])
+async def test_targeted_retain_repair_rejects_a_hybrid_resolution_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    changed_resolution: bool,
+) -> None:
+    calls_seen = 0
+
+    async def hybrid_retry(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply(stage)
+            if calls_seen == 1
+            else [
+                _replayed_resolution_call(stage, changed=changed_resolution),
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", hybrid_retry)
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_complete_retain_replay_rejects_a_changed_held_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    calls_seen = 0
+
+    async def changed_full_replay(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _retain_open_first_reply(stage)
+            if calls_seen == 1
+            else [
+                _replayed_resolution_call(stage, changed=True),
+                SimpleNamespace(
+                    id="c_retain_valid_replayed",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain_corrected",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_SECOND_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", changed_full_replay)
+    with pytest.raises(chat_solver.DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
 
 
 @pytest.mark.asyncio
@@ -2643,6 +4194,7 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
         reviewed_outputs=outputs,
         pending_output_intents={"pending-gap": SimpleNamespace()},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -2720,6 +4272,7 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
         reviewed_outputs={"output-b": output},
         pending_output_intents={"pending-a": SimpleNamespace(), "pending-b": SimpleNamespace()},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -2818,6 +4371,7 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
         reviewed_outputs={"output-a": output},
         pending_source_intents={},
         deferred_intents=(),
+        terminal=None,
     )
     captured: dict[str, Any] = {}
 
@@ -3101,6 +4655,30 @@ def test_build_step_chat_context_block_names_artifacts_llm_safely() -> None:
     assert "/srv/elspeth/blobs" not in block.system_content
     assert _FREEFORM_BLOB_REF not in block.system_content
     assert "results.jsonl" not in block.system_content
+
+
+def test_llm_safe_schema_preserves_explicit_empty_guarantee_vote() -> None:
+    projected = _llm_safe_schema_option(
+        {"mode": "observed", "guaranteed_fields": []},
+        field_aliases={},
+    )
+
+    assert projected == {"mode": "observed", "guaranteed_fields": []}
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"mode": "observed"},
+        {"mode": "observed", "guaranteed_fields": "not-a-sequence"},
+        {"mode": "observed", "guaranteed_fields": [7]},
+        {"mode": "observed", "guaranteed_fields": ["unknown"]},
+    ],
+)
+def test_llm_safe_schema_does_not_mint_an_empty_vote_from_absent_or_unprojectable_guarantees(
+    schema: dict[str, object],
+) -> None:
+    assert _llm_safe_schema_option(schema, field_aliases={}) == {"mode": "observed"}
 
 
 def test_context_block_reports_blob_binding_from_the_guided_path_sentinel() -> None:
@@ -5073,3 +6651,749 @@ class TestStep1SourceToolSchema:
 
         _step_1_source_tool(plugin_hint=None, available_source_plugins=("csv",))
         assert "enum" not in _STEP_1_SOURCE_TOOL["function"]["parameters"]["properties"]["plugin"]
+
+
+class TestCommittedBuildContext:
+    """The post-commit context block: all after-confirmation teaching lives here.
+
+    The step skills stay byte-identical (so the wire-correction planner and
+    the management call are untouched), which means this block is the ONLY
+    place that can tell the model the build is finished, that there are no
+    wizard controls to point at, and that it cannot change anything. Two
+    properties therefore matter: the default must not have moved a byte for
+    the four in-progress callers, and the committed variant must supersede
+    exactly the three passages that would otherwise be false.
+    """
+
+    _DEFAULT_OPENER_BY_STEP: ClassVar[dict[GuidedStep, str]] = {
+        GuidedStep.STEP_1_SOURCE: (
+            "The user is on wizard step step_1_source. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_2_SINK: (
+            "The user is on wizard step step_2_sink. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_3_TRANSFORMS: (
+            "The user is on wizard step step_3_transforms. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+        GuidedStep.STEP_4_WIRE: (
+            "The user is on wizard step step_4_wire. When they ask what they are "
+            "seeing or why, explain from THIS build context: name the concrete "
+            "plugins and structural details below, why they fit what the user asked "
+            "for, and what the listed details mean in plain language. Exact settings "
+            "may be intentionally withheld or summarized only as counts; never treat "
+            "a count as the setting values and do not invent values that are not listed."
+        ),
+    }
+
+    @staticmethod
+    def _wire_payload() -> dict[str, Any]:
+        return _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+
+    @classmethod
+    def _wire_context(cls, *, committed_build: Any = False, payload: dict[str, Any] | None = None) -> Any:
+        wire = payload if payload is not None else cls._wire_payload()
+        return build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=_advisory_graph_authority(wire, turn_type=TurnType.CONFIRM_WIRING),
+            committed_build=committed_build,
+        )
+
+    @pytest.mark.parametrize("step", list(GuidedStep))
+    def test_default_opener_is_byte_identical_for_every_in_progress_caller(self, step: GuidedStep) -> None:
+        """Golden pin: omitting ``committed`` renders exactly what it always did."""
+
+        graph_authority = None
+        if step in {GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE}:
+            payload = (
+                _advisory_gate_payload()
+                if step is GuidedStep.STEP_3_TRANSFORMS
+                else _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+            )
+            graph_authority = _advisory_graph_authority(
+                payload,
+                turn_type=(TurnType.PROPOSE_PIPELINE if step is GuidedStep.STEP_3_TRANSFORMS else TurnType.CONFIRM_WIRING),
+            )
+        block = build_step_chat_context_block(
+            step=step,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=graph_authority,
+        )
+
+        expected_head = "## Current build (what the user is looking at)\n\n" + self._DEFAULT_OPENER_BY_STEP[step] + "\n\n"
+        assert block.system_content.startswith(expected_head)
+        assert "The guided build is FINISHED" not in block.system_content
+
+    def test_explicit_false_renders_identically_to_omitting_the_keyword(self) -> None:
+        assert self._wire_context(committed_build=False) == self._wire_context()
+
+    def test_committed_block_supersedes_exactly_the_teaching_passages(self) -> None:
+        """The opener, the two graph-usage sentences, and the Applied lines.
+
+        Pinned as a whole-line diff so a sentence cannot be added to the
+        committed context without a reviewer reading it: every line here is
+        model-facing teaching, and the defect class this block exists to
+        prevent is a passage that is true on a live build and false on a
+        settled one.
+        """
+
+        # The serialized graph record is excluded: it is a JSON line, not a
+        # teaching sentence, and on a committed build it legitimately differs —
+        # the facts the drift gate cannot compare are renamed with the
+        # ``_at_confirmation`` suffix. That rename has its own test below.
+        default_lines = [line for line in self._wire_context().system_content.splitlines() if not line.startswith("{")]
+        committed_lines = [
+            line for line in self._wire_context(committed_build=True).system_content.splitlines() if not line.startswith("{")
+        ]
+
+        removed = [line for line in default_lines if line not in committed_lines]
+        added = [line for line in committed_lines if line not in default_lines]
+        assert removed == [
+            self._DEFAULT_OPENER_BY_STEP[GuidedStep.STEP_4_WIRE],
+            # An active-stage projection of the ONE component just applied.
+            # On a settled build it read "none yet." three lines above a graph
+            # listing every source and output the user confirmed.
+            "Applied source: none yet.",
+            "Applied output: none yet.",
+            (
+                "Use the exact endpoint relations above when explaining what the graph does. Only those covered IDs may be "
+                "used to explain why a graph decision was made from a pending instruction; every other pending instruction "
+                "is management context only. Exact authored predicates, route keys, field names, mappings, enum values, and "
+                "typed numeric/time literals follow only in a delimited user-role data block."
+            ),
+            "No pending instruction is covered, so do not attribute any graph decision to one.",
+            # The omission sentence is NOT in this list as a committed-only
+            # supersession any more: its shared option-value clause is rendered
+            # from one constant on both arms, so the in-progress line moved too
+            # (round 4, LLM-4 — unqualified it was false on both paths).
+            (
+                "Paths, prompts, samples, blobs, secrets, raw option values other than those summarized in each component's "
+                "behavior and row cardinality, warning/blocker prose, and unstructured semantic-contract detail are "
+                "intentionally omitted. State that omission exactly when the user asks for one of those values; never infer "
+                "it from counts or absence."
+            ),
+        ]
+        assert added == [
+            (
+                "The guided build is FINISHED: the user confirmed and committed this "
+                "pipeline. Chat is advisory only and you have NO build tools; the step "
+                "playbook's instruction to point the user at the wizard controls does not "
+                "apply here. Explain the committed graph from THIS context — what each "
+                "component does and why each route exists. You cannot change, re-plan, "
+                "confirm, or run anything from here; never claim to have done so, and "
+                "never name an on-screen button or control — you cannot see which controls "
+                "this surface is showing, so say in general terms that changing the "
+                "pipeline's structure means leaving guided mode. Every field below whose "
+                "name ends in _at_confirmation was RECORDED WHEN THE USER CONFIRMED and is "
+                "not re-checked against the pipeline as it stands now. THE SAME HOLDS FOR "
+                "EVERY VALUE NESTED INSIDE ONE, however deep, none of which repeats the "
+                "suffix in its own name: describe any such value as what was recorded "
+                "then, never as what is true now. Only `row_cardinality_at_confirmation`, "
+                "`schema_contract_at_confirmation` and `review_status_at_confirmation` ever "
+                "carry the suffix. Every other fact in the graph record below is CURRENT: "
+                "it is re-checked against the live pipeline and this chat is refused "
+                "outright if it moved since confirmation, so state those plainly rather "
+                "than hedging them. The review counts, and everything else inside "
+                "`review_status_at_confirmation`, are what the review said at the moment "
+                "the user confirmed; nothing here reports the pipeline's validity, its "
+                "outstanding review items or its run readiness now, so never state whether "
+                "the pipeline is valid or ready to run."
+            ),
+            (
+                "Use the exact endpoint relations above when explaining what the graph does, but never state a field whose "
+                "name ends in _at_confirmation, or any value nested inside one, as a current fact. A delimited user-role "
+                "data block follows with this build's field names. These record keys describe the pipeline as it stands: "
+                "`structured_output_fields` and `business_schema`, the second of them including the `fields`, "
+                "`guaranteed_fields` and `required_fields` nested INSIDE it. Every other key in those records — "
+                "`guaranteed_fields`, `required_fields`, `producer_guarantees`, `consumer_requires` and `missing_fields`, "
+                "at a record's own top level — was recorded at confirmation, like the _at_confirmation fields above. Where "
+                "the same name appears both inside `business_schema` and at the top of a record, only the nested one is "
+                "current. Those records carry field names with their declared types and flags, any enum values and the "
+                "schema mode; the authored settings named below are withheld."
+            ),
+            "Saved build instructions were all resolved at confirmation: none is pending, and no graph decision may be attributed to one.",
+            (
+                "Paths, prompts, samples, blobs, secrets, raw option values other than those summarized in each component's "
+                "behavior and row cardinality, warning/blocker prose, and unstructured semantic-contract detail are "
+                "intentionally omitted, and on a committed build so are the authored settings behind each component — "
+                "plugin option values such as prompt text, gate predicates, route keys, trigger counts and timeouts — "
+                "because they can be rewritten after confirmation without changing the structure above. The authored values "
+                "that ARE published are the closed vocabulary each component's `behavior` summarizes, an aggregation's "
+                "expected output count inside its `row_cardinality`, and `structured_output_fields` and `business_schema` "
+                "in the user-role block. Every one of those is checked against the live pipeline, so rewriting one — "
+                "including the plugin options behind it — ends this chat rather than leaving it stale. State that omission "
+                "exactly when the user asks for one of those values; never infer it from counts or absence."
+            ),
+        ]
+
+    def test_committed_block_keeps_the_pending_section_empty(self) -> None:
+        content = self._wire_context(committed_build=True).system_content
+
+        assert "Pending saved instructions (stable identities):\nnone" in content
+
+    def test_committed_block_states_no_validity_or_readiness_verdict(self) -> None:
+        """The context carries the CONFIRMATION-time review COUNTS and nothing else.
+
+        Regression pin for the two-authorities defect (review round 1,
+        2026-09-03): a ``Committed validation: is_valid=…`` line built from the
+        frozen wire payload's ``can_confirm`` told the model the build was
+        valid in exactly the state where the head record said ``is_valid`` was
+        False, the completion heading read "Review required", and Run was
+        refused.
+
+        Round 4 (LLM-1) closed the second half of it. The opener denied that
+        the context carried any validity or readiness signal while the JSON two
+        lines below published ``can_confirm: true`` — a guardrail whose premise
+        the model can see is false. ``can_confirm`` is now DROPPED from the
+        committed arm: ``protocol._validate_wire_payload`` refuses any payload
+        where it differs from ``not blockers``, so it restated the
+        ``blocker_count`` beside it and was the only verdict-shaped leaf in the
+        block. The in-progress arm keeps it — there the wire payload IS the
+        live review.
+        """
+
+        content = self._wire_context(committed_build=True).system_content
+        default_content = self._wire_context().system_content
+
+        assert "is_valid" not in content
+        assert "Committed validation:" not in content
+        assert "can_confirm" not in content
+        assert '"can_confirm": true' in default_content
+        assert '"blocker_count": 0' in content, "the counts stay: dropping the flag must not drop the review"
+        assert "never state whether the pipeline is valid or ready to run" in content
+
+    def test_committed_block_time_qualifies_the_facts_the_drift_gate_cannot_compare(self) -> None:
+        """One idiom for "recorded then, not now": the ``_at_confirmation`` suffix.
+
+        A completed session's chat is admitted only while the live head still
+        matches the frozen wire record on the facts
+        ``planning.guided_structure_projection`` compares. Everything else the
+        system block publishes CAN have moved since, so it is renamed rather
+        than left looking current, and the opener explains the suffix once.
+        Prose alone cannot say which key it qualifies, and a partition a test
+        can derive is the only kind a future projection arm cannot silently
+        join — ``test_guided_structure_projection.TestPublishedFactPartition``
+        holds that derivation.
+        """
+
+        default_content = self._wire_context().system_content
+        committed_content = self._wire_context(committed_build=True).system_content
+
+        assert '"review_status":' in default_content
+        assert '"review_status_at_confirmation":' in committed_content
+        assert '"review_status":' not in committed_content
+        assert "_at_confirmation was RECORDED WHEN THE USER CONFIRMED" in committed_content
+        # The suffix marks the whole SUBTREE. Both rules say so explicitly
+        # because the model quotes a leaf — ``satisfied``, ``output``,
+        # ``missing_field_count`` — and no leaf repeats the suffix, so a rule
+        # scoped to "a field whose name ends in _at_confirmation" bound the
+        # container the model does not quote (round 4, LLM-3).
+        assert "THE SAME HOLDS FOR EVERY VALUE NESTED INSIDE ONE" in committed_content
+        assert (
+            "never state a field whose name ends in _at_confirmation, or any value nested inside one, as a current fact"
+            in committed_content
+        )
+
+    def test_committed_block_withholds_authored_setting_values(self) -> None:
+        """Structure is bound to the live pipeline; authored settings are not.
+
+        The admission gate compares only the ordinal-label structure, so an
+        options-only write under a completed session (the interpretation
+        Accept the design requires be admitted) leaves the frozen record's
+        authored literals describing values the pipeline no longer has.
+        Field-name records survive — they answer "what does this check mean".
+        """
+
+        default_literals = self._wire_context().untrusted_user_content
+        committed_literals = self._wire_context(committed_build=True).untrusted_user_content
+        assert default_literals is not None
+        assert committed_literals is not None
+
+        # Quoted form: the bare route key "low" is a substring of the block's
+        # own "allow" prose, so a raw containment check would pass off the
+        # boilerplate rather than off the literal.
+        for authored in ("\"row['tier']\"", *(f'"{key}"' for key in GATE_ROUTE_KEYS)):
+            assert authored in default_literals
+            assert authored not in committed_literals
+        assert "business_schema" in default_literals
+        assert "business_schema" in committed_literals
+
+    def test_committed_block_still_omits_the_withheld_value_classes(self) -> None:
+        """The classes stay omitted, and the option-value claim carries its exception.
+
+        Unqualified, "raw option values are omitted" is contradicted by the
+        projection's own sibling keys — a coalesce's ``policy`` and ``merge``,
+        an aggregation's ``output_mode`` and ``expected_output_count`` (round 4,
+        LLM-4). The exception is positional so a future behavior arm cannot
+        falsify it again.
+        """
+
+        content = self._wire_context(committed_build=True).system_content
+
+        assert "Paths, prompts, samples, blobs, secrets, raw option values" in content
+        assert "raw option values other than those summarized in each component's behavior and row cardinality" in content
+
+    @pytest.mark.parametrize("step", [GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK, GuidedStep.STEP_3_TRANSFORMS])
+    def test_committed_build_is_refused_outside_the_wire_step(self, step: GuidedStep) -> None:
+        graph_authority = None
+        if step is GuidedStep.STEP_3_TRANSFORMS:
+            graph_authority = _advisory_graph_authority(_advisory_gate_payload(), turn_type=TurnType.PROPOSE_PIPELINE)
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=step,
+                current_source=None,
+                current_sink=None,
+                state=None,
+                deferred_intents=(),
+                graph_authority=graph_authority,
+                committed_build=True,
+            )
+
+    def test_committed_build_is_refused_while_an_instruction_is_pending(self) -> None:
+        """The coverage sentence claims nothing is pending; prove it cannot lie."""
+
+        intent = DeferredStageIntent.create(
+            intent_id="00000000-0000-4000-8000-000000000901",
+            receiving_stage="source",
+            target_stage="topology",
+            catalog_kind=None,
+            catalog_name=None,
+            redacted_summary="Add a gate.",
+            originating_message_id="00000000-0000-4000-8000-000000000902",
+            message_content_hash=stable_hash("add a gate"),
+            constraints=(),
+        )
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=GuidedStep.STEP_4_WIRE,
+                current_source=None,
+                current_sink=None,
+                state=None,
+                deferred_intents=(intent,),
+                graph_authority=_advisory_graph_authority(self._wire_payload(), turn_type=TurnType.CONFIRM_WIRING),
+                committed_build=True,
+            )
+
+    def test_committed_build_is_refused_with_an_applied_component(self) -> None:
+        """A settled build has no "applied" component to project.
+
+        The reviewed source/output maps are populated on every real completed
+        session, so without this the block would render "Applied source: …"
+        for the first of two sources above a graph listing both.
+        """
+
+        with pytest.raises(InvariantError):
+            build_step_chat_context_block(
+                step=GuidedStep.STEP_4_WIRE,
+                current_source=SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={"schema": {"mode": "observed"}},
+                    observed_columns=("name",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                ),
+                current_sink=None,
+                state=None,
+                deferred_intents=(),
+                graph_authority=_advisory_graph_authority(self._wire_payload(), turn_type=TurnType.CONFIRM_WIRING),
+                committed_build=True,
+            )
+
+    def test_committed_build_flag_must_be_an_exact_bool(self) -> None:
+        with pytest.raises(InvariantError):
+            self._wire_context(committed_build=1)
+
+
+# --------------------------------------------------------------------------
+# The committed context makes CLAIMS ABOUT ITS OWN KEYS, and round 4 found
+# three of them falsified by the JSON rendered in the same message: an opener
+# that denied carrying any validity signal above a published ``can_confirm``
+# (LLM-1), a currency claim that named ``business_schema``'s nested field lists
+# and the record's own top-level ones under one word (LLM-2), and an omission
+# list contradicted by a sibling key (LLM-4). Prose that names a key set is only
+# safe while a test holds it to the key set, so these fixtures render the real
+# committed context over shapes that between them emit EVERY published record
+# key, every qualified system key, and the published authored count.
+# --------------------------------------------------------------------------
+
+
+def _committed_field_record_payload() -> dict[str, Any]:
+    """A wire payload emitting every user-role record kind at once.
+
+    Non-vacuous on purpose: the default wire fixture authors empty field lists
+    and an ``observed`` schema, under which every record either disappears or
+    renders as empty lists — so a registry asserted against it would hold for
+    keys nothing publishes.
+    """
+
+    payload = deepcopy(_advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]))
+    payload["sources"][0]["guaranteed_fields"] = ["name"]
+    node = payload["nodes"][0]
+    node["node_type"] = "transform"
+    node["plugin"] = "llm"
+    node["behavior"] = {"kind": "transform"}
+    node["required_fields"] = ["name"]
+    node["guaranteed_fields"] = ["verdict"]
+    node["structured_output_fields"] = [
+        {"name": "verdict", "type": "string", "values": ["yes", "no"]},
+        {"name": "score", "type": "integer", "values": []},
+    ]
+    output = payload["outputs"][0]
+    output["required_fields"] = ["name"]
+    output["business_schema"] = {
+        "mode": "declared",
+        "fields": [{"name": "name", "type": "string", "required": True, "nullable": False}],
+        "guaranteed_fields": ["name"],
+        "required_fields": ["name"],
+    }
+    payload["connections"] = [
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc01",
+            "from_endpoint": {"kind": "source", "stable_id": payload["sources"][0]["stable_id"]},
+            "to_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "flow": {"kind": "source_success", "branch": None},
+            "schema_contract": None,
+        },
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc02",
+            "from_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "to_endpoint": {"kind": "output", "stable_id": output["stable_id"]},
+            "flow": {"kind": "node_success", "branch": None},
+            "schema_contract": {
+                "from": "node:node-1",
+                "to": "output:output-1",
+                "producer_guarantees": ["verdict"],
+                "consumer_requires": ["name"],
+                "missing_fields": ["name"],
+                "satisfied": False,
+            },
+        },
+        {
+            "stable_id": "cccccccc-cccc-4ccc-8ccc-cccccccccc03",
+            "from_endpoint": {"kind": "node", "stable_id": node["stable_id"]},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "node_error"},
+            "schema_contract": None,
+        },
+    ]
+    return payload
+
+
+def _committed_counted_aggregation_payload() -> dict[str, Any]:
+    """An aggregation publishing an authored count, under a non-zero warning count.
+
+    Both halves are evidence: ``expected_output_count`` is the authored option
+    value the omission prose used to call withheld, and a warning IS an
+    outstanding review item, which the opener used to deny carrying.
+    """
+
+    payload = deepcopy(_advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]))
+    node = payload["nodes"][0]
+    node["node_type"] = "aggregation"
+    node["plugin"] = "passthrough"
+    node["behavior"] = {
+        "kind": "aggregation",
+        "trigger_kinds": ["count"],
+        "count": "7",
+        "timeout_seconds": None,
+        "output_mode": "transform",
+        "expected_output_count": "3",
+    }
+    node["row_cardinality"] = {"input": "batch", "output": "expected_count", "expected_output_count": "3"}
+    payload["warnings"] = [{"code": "guided.proposal.warning.unmapped_field.v1", "component_label": "node-1"}]
+    return payload
+
+
+class TestCommittedContextNamesWhatItPublishes:
+    """Every prose claim about a key is held to the keys actually rendered.
+
+    THE DEFECT CLASS: the committed block teaches the model which published
+    facts are current and which were recorded at confirmation, and it does so
+    by NAME because the model quotes names. A key added to either projection
+    then leaves the prose describing a key set that is no longer the one beside
+    it — and a guardrail whose premise the model can falsify from the same
+    message is a guardrail it discounts.
+
+    So the name lists in the prose render from module tuples, and these tests
+    assert each tuple equals what a rendered committed context publishes.
+    Adding a published key fails here until its author states, in the tuple that
+    puts it into the sentence, whether it is current or recorded.
+    """
+
+    @staticmethod
+    def _committed_block(payload: dict[str, Any]) -> Any:
+        return build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=_advisory_graph_authority(payload, turn_type=TurnType.CONFIRM_WIRING),
+            committed_build=True,
+        )
+
+    @classmethod
+    def _corpus(cls) -> tuple[tuple[dict[str, Any], Any], ...]:
+        payloads = (
+            _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]),
+            _committed_field_record_payload(),
+            _committed_counted_aggregation_payload(),
+        )
+        return tuple((payload, cls._committed_block(payload)) for payload in payloads)
+
+    @staticmethod
+    def _system_json(block: Any) -> dict[str, Any]:
+        system: dict[str, Any] = json.loads(next(line for line in block.system_content.splitlines() if line.startswith('{"connections"')))
+        return system
+
+    @staticmethod
+    def _user_records(block: Any) -> list[dict[str, Any]]:
+        payload = json.loads(next(line for line in block.untrusted_user_content.splitlines() if line.startswith("{")))
+        return list(payload["records"])
+
+    @classmethod
+    def _suffixed_keys(cls, value: Any) -> set[str]:
+        """Every key ending in the confirmation suffix, at any depth."""
+
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key.endswith(chat_solver._GUIDED_CONFIRMATION_TIME_SUFFIX):
+                    found.add(key)
+                found |= cls._suffixed_keys(nested)
+        elif isinstance(value, list):
+            for item in value:
+                found |= cls._suffixed_keys(item)
+        return found
+
+    @staticmethod
+    def _prose_list(parts: list[str]) -> str:
+        """Rebuild the enumeration INDEPENDENTLY of the module's own renderer.
+
+        Asserting the module's rendered constant against the sentence it was
+        interpolated into is a tautology: truncating the derivation moves both
+        sides together. Rebuilding it here from the key tuple means a
+        derivation that stops enumerating fails.
+        """
+
+        return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+
+    @classmethod
+    def _qualified_values(cls, value: Any) -> list[Any]:
+        """Every value published UNDER a suffixed key, at any depth."""
+
+        found: list[Any] = []
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key.endswith(chat_solver._GUIDED_CONFIRMATION_TIME_SUFFIX):
+                    found.append(nested)
+                found.extend(cls._qualified_values(nested))
+        elif isinstance(value, list):
+            for item in value:
+                found.extend(cls._qualified_values(item))
+        return found
+
+    def test_the_opener_names_every_qualified_system_key(self) -> None:
+        """LLM-1's durable half, from the system side.
+
+        A fourth qualified family would otherwise be published under a name the
+        opener does not list, while the opener kept claiming to enumerate them.
+        """
+
+        observed: set[str] = set()
+        for _payload, block in self._corpus():
+            observed |= self._suffixed_keys(self._system_json(block))
+
+        assert observed == set(chat_solver._GUIDED_COMMITTED_QUALIFIED_FACT_KEYS), (
+            "the opener names the qualified keys; a new one must join that tuple and the sentence with it"
+        )
+        # The whole enumerated CLAUSE, not each name somewhere in the line:
+        # two of the three keys are also mentioned elsewhere in the opener, so
+        # a per-name containment check passes for a list that dropped one.
+        expected = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_QUALIFIED_FACT_KEYS])
+        opener = next(line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("The guided build is FINISHED"))
+        assert f"Only {expected} ever carry the suffix." in opener
+
+    def test_no_qualified_leaf_repeats_the_suffix_so_the_rule_states_its_own_closure(self) -> None:
+        """The reason the rule cannot be scoped to the field name alone (LLM-3).
+
+        The model quotes ``satisfied``, ``output``, ``missing_field_count`` —
+        leaves. If any of them ever carried the suffix this test would go green
+        for the wrong reason, so it asserts the premise (no leaf repeats it) and
+        the remedy (the rule says it is closed under nesting) together.
+        """
+
+        qualified_values = [value for _payload, block in self._corpus() for value in self._qualified_values(self._system_json(block))]
+        leaves = {leaf for value in qualified_values if isinstance(value, dict) for leaf in value}
+
+        assert leaves, "corpus publishes no qualified object at all"
+        assert not self._suffixed_keys(qualified_values), "a leaf now repeats the suffix; the rule may no longer need its closure clause"
+        opener = next(line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("The guided build is FINISHED"))
+        assert "THE SAME HOLDS FOR EVERY VALUE NESTED INSIDE ONE" in opener
+
+    def test_the_graph_usage_line_names_every_published_record_key(self) -> None:
+        """LLM-2/LLM-4's durable half, from the user-role side.
+
+        The alias keys are the record's identity rather than a fact about the
+        build, so they are excluded by name; every other key must have been
+        classified as current or recorded, and the classification must reach the
+        rendered sentence.
+        """
+
+        observed: set[str] = set()
+        for _payload, block in self._corpus():
+            for record in self._user_records(block):
+                observed |= set(record) - {"component_alias", "connection_alias"}
+
+        current = set(chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS)
+        recorded = set(chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS)
+        assert not current & recorded, "a key cannot be both current and recorded at confirmation"
+        assert observed == current | recorded, "every published record key needs a compare-or-qualify decision the sentence states"
+        usage_line = next(
+            line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("Use the exact endpoint relations")
+        )
+        expected_current = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS])
+        expected_recorded = self._prose_list([f"`{key}`" for key in chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS])
+        assert f"describe the pipeline as it stands: {expected_current}," in usage_line
+        assert f"— {expected_recorded}, at a record's own top level — was recorded at confirmation" in usage_line
+
+    def test_the_current_record_keys_are_the_compared_ones_and_the_recorded_keys_are_not(self) -> None:
+        """The classification is DERIVED from the gate, not asserted beside it.
+
+        Round 4 (LLM-2) found the previous sentence calling the business-schema
+        field lists confirmation-time when the gate had begun comparing them,
+        and calling the record's own top-level lists current by the same word.
+        The compared half is read from the drift gate's own mirror over the
+        same payload, so a widening or narrowing of the gate moves this test.
+        """
+
+        for payload, _block in self._corpus():
+            components, connections = guided_chat_atomic_module._wire_payload_structure(payload)
+            compared_top_level = {key for item in (*components, *connections) for key in dict(item)}
+
+            for key in chat_solver._GUIDED_COMMITTED_CURRENT_RECORD_KEYS:
+                assert key in compared_top_level, f"{key} is published as current but the gate does not compare it"
+            for key in chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS:
+                assert key not in compared_top_level, f"{key} is called recorded-at-confirmation but the gate compares it"
+
+    def test_the_same_field_list_name_is_current_nested_and_recorded_at_top_level(self) -> None:
+        """The collision the sentence disambiguates BY POSITION rather than name.
+
+        ``business_schema`` is compared whole, so the ``guaranteed_fields`` and
+        ``required_fields`` inside it are current — while the record's own
+        top-level lists of those exact names are frozen review data. One record,
+        one name, two opposite truth statuses, which is why the sentence points
+        at the position and this test proves the collision is real.
+        """
+
+        payload = _committed_field_record_payload()
+        components, _connections = guided_chat_atomic_module._wire_payload_structure(payload)
+        schemas = [dict(dict(item)["business_schema"]) for item in components if "business_schema" in dict(item)]
+
+        assert schemas, "corpus authors no business schema"
+        colliding = {"guaranteed_fields", "required_fields"}
+        assert colliding <= set(schemas[0]), "the nested collision this sentence exists for is gone"
+        assert colliding <= set(chat_solver._GUIDED_COMMITTED_RECORDED_RECORD_KEYS), "the top-level halves are the recorded ones"
+        assert schemas[0]["required_fields"], "an empty nested list proves nothing about currency"
+
+        usage_line = next(
+            line
+            for line in self._committed_block(payload).system_content.splitlines()
+            if line.startswith("Use the exact endpoint relations")
+        )
+        assert (
+            "Where the same name appears both inside `business_schema` and at the top of a record, only the nested one is current"
+            in usage_line
+        )
+
+    def test_the_withheld_settings_sentence_enumerates_the_withheld_authority(self) -> None:
+        """RT-3: nothing the sentence calls rewritable may be compared.
+
+        The pre-fix sentence promised rewritability for "field mappings" and
+        "counts" after the gate had begun comparing the schema and
+        structured-output field lists and publishing an aggregation's expected
+        output count — so a user told "yes, you can change the output schema"
+        lost the only channel a settled build has. The phrase map is therefore
+        keyed on the withheld-literal authority and asserted against it, and
+        every key it names is checked to be outside the compared behavior set.
+        """
+
+        phrases = chat_solver._GUIDED_COMMITTED_WITHHELD_SETTING_PHRASES
+        assert set(phrases) == (planning.GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS - planning._GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE), (
+            "the sentence must enumerate exactly the settings that are withheld AND uncompared"
+        )
+
+        for record_key in phrases:
+            behavior_name = planning._GUIDED_WITHHELD_RECORD_KEY_BEHAVIOR_NAMES.get(record_key, record_key)
+            if behavior_name is not None:
+                assert behavior_name in planning.GUIDED_UNCOMPARED_BEHAVIOR_KEYS, (
+                    f"{record_key} is named rewritable but the drift gate compares it"
+                )
+
+        omission_line = next(
+            line for line in self._corpus()[0][1].system_content.splitlines() if line.startswith("Paths, prompts, samples")
+        )
+        expected_withheld = self._prose_list(list(phrases.values()))
+        assert f"behind each component — {expected_withheld} — because they can be rewritten" in omission_line
+        assert "field mappings" not in omission_line, "schema and structured-output field lists are compared, so rewriting one refuses"
+
+    def test_the_published_authored_count_is_named_rather_than_called_omitted(self) -> None:
+        """LLM-4: the omission claim and its own sibling key, reconciled.
+
+        ``expected_output_count`` is withheld from the authored record and
+        published verbatim at system authority inside ``row_cardinality``, so a
+        blanket "counts are omitted" was falsifiable from three lines above it.
+        """
+
+        block = self._committed_block(_committed_counted_aggregation_payload())
+        system = self._system_json(block)
+        cardinalities = [node["row_cardinality"] for node in system["nodes"] if "row_cardinality" in node]
+
+        assert [card["expected_output_count"] for card in cardinalities] == ["3"], "the authored count is published verbatim"
+        assert "expected_output_count" in planning.GUIDED_COMMITTED_WITHHELD_LITERAL_KEYS
+        assert "expected_output_count" in planning._GUIDED_WITHHELD_KEYS_PUBLISHED_ELSEWHERE
+        omission_line = next(line for line in block.system_content.splitlines() if line.startswith("Paths, prompts, samples"))
+        assert "an aggregation's expected output count inside its `row_cardinality`" in omission_line
+        assert "trigger counts" in omission_line, "the count that IS withheld stays named as withheld"
+
+    def test_the_option_value_omission_admits_the_behavior_values_it_publishes(self) -> None:
+        """The same contradiction in machine-readable form, on BOTH arms.
+
+        The projection's own ``omitted`` array said "raw option values" while
+        publishing a coalesce's ``policy`` and ``merge``, an aggregation's
+        ``output_mode``, and an aggregation's ``expected_output_count``. The
+        exception is stated positionally so a future behavior arm summarizing
+        another authored option does not falsify it again.
+        """
+
+        block = self._committed_block(_committed_counted_aggregation_payload())
+        system = self._system_json(block)
+        behaviors = [node["behavior"] for node in system["nodes"]]
+
+        assert any(behavior.get("output_mode") == "transform" for behavior in behaviors), "corpus publishes no authored option value"
+        assert chat_solver._GUIDED_RAW_OPTION_OMISSION in system["omitted"]
+        assert "raw option values" not in system["omitted"], "the unqualified claim is what the sibling key falsifies"
+        for content in (block.system_content, self._corpus()[0][1].system_content):
+            assert chat_solver._GUIDED_RAW_OPTION_OMISSION in content

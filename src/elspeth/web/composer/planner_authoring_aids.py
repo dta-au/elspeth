@@ -4,8 +4,9 @@ The static skill pack deliberately carries no deployment plugin inventory (the
 ``no_deployment_plugin_facts`` gate enforces this), so worked ``set_pipeline``
 exemplars — which must name real plugins — are rendered here at prompt-build
 from the policy-visible catalog and ride in the planner's reviewed-context
-user message. The exact objects rendered into the prompt are validated
-through ``build_set_pipeline_candidate`` in
+user message. The exact flat canonical documents nested in the provider
+envelopes rendered into the prompt are validated through
+``build_set_pipeline_candidate`` in
 ``tests/unit/web/composer/test_planner_authoring_aids.py``; an exemplar the
 current validator rejects fails CI rather than teaching planners a dead shape.
 
@@ -41,6 +42,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
+from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 
 # The model-catalog aid restates what ``list_models`` serves, so it reads the
 # SAME accessors that tool reads (``tools/generation.py`` imports this exact
@@ -61,11 +63,10 @@ from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSumm
 from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
 from elspeth.web.composer.tools.generation import get_expression_grammar
 
-# The registered shield-review constants and the untrusted-producer set are the
-# contract's single source of truth (interpretation_state); importing them —
-# private set included — is deliberate, so the taught row can never drift.
+# The registered shield-review constants are the contract's single source of
+# truth. The untrusted-producer vocabulary comes from plugin declarations via
+# the shared manager, so the taught row cannot drift from admission.
 from elspeth.web.interpretation_state import (
-    _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS,
     PROMPT_SHIELD_AVAILABLE_DRAFT,
     PROMPT_SHIELD_USER_TERM,
     PROMPT_SHIELD_WARNING_DRAFT,
@@ -78,7 +79,7 @@ from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MA
 # The prompt never models a fabricated identifier — provenance is the lesson.
 PLACEHOLDER_BLOB_ID: Final[str] = "<blob_id copied verbatim from a list_blobs or create_blob result>"
 
-# Prompt-injection exposure follows every untrusted remote-text producer, but
+# Prompt-injection exposure follows every untrusted-content producer, but
 # the raw-HTML/fingerprint cleanup contract is specific to web_scrape output.
 # Keeping these producer sets separate prevents document extraction plugins
 # such as Textract from inheriting a factually false audit-card draft.
@@ -223,7 +224,7 @@ class _ExemplarMetadata(TypedDict):
 
 
 class _SetPipelineExemplar(TypedDict):
-    """Closed top-level shape for worked set_pipeline arguments."""
+    """Closed flat canonical document nested in worked provider arguments."""
 
     source: _ExemplarSource
     nodes: list[_ExemplarNode]
@@ -232,20 +233,26 @@ class _SetPipelineExemplar(TypedDict):
     metadata: _ExemplarMetadata
 
 
+class _SetPipelineProviderArguments(TypedDict):
+    """Provider envelope around one flat canonical set-pipeline document."""
+
+    pipeline: _SetPipelineExemplar
+
+
 class _SourceCustodyAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar_inline_blob: _SetPipelineExemplar
+    set_pipeline_exemplar_inline_blob: _SetPipelineProviderArguments
     existing_blob_source_binding: _ExemplarSource
 
 
 class _ForkCoalesceAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar: _SetPipelineExemplar
+    set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
 class _ForkRowUnionAid(TypedDict):
     rules: list[str]
-    set_pipeline_exemplar: _SetPipelineExemplar
+    set_pipeline_exemplar: _SetPipelineProviderArguments
 
 
 class _RulesAid(TypedDict):
@@ -335,8 +342,12 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "If no tool returned the identifier, bind the data with source.inline_blob "
     "(filename, mime_type, content) or create_blob first. Never fabricate a "
     "blob_id, secret reference, model identifier, or any other identifier.",
-    "inline_blob.content must be the user's data verbatim, exactly as it "
-    "appears in their message; custody records it against that message.",
+    "inline_blob.content must be verbatim source data. Usually that is the "
+    "user's data exactly as it appears in their message; custody records it "
+    "against that message. The ONLY exception is content you generated "
+    "because the user explicitly requested planner-authored sample data; "
+    "bind it through inline_blob and follow the invented_source provenance "
+    "rule below.",
     "Custody owns the storage binding: author schema.mode and on_validation_failure on a blob-bound source, never path or blob_ref.",
     "A file the user NAMES but never uploaded, whose content is not in the "
     "conversation, has NO legal binding: source paths must resolve to real "
@@ -351,6 +362,40 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "facts or blob metadata handed you) binds through source options.path, "
     "copied verbatim. source.blob_id accepts ONLY the UUID a blob tool "
     "returned this session — a path in blob_id is always rejected.",
+    # Session 891b7b1e turn 2: the planner sent source: null intending
+    # 'keep the existing source' and burned a repair turn on the rejection.
+    "set_pipeline is a FULL replacement: source: null never means 'keep "
+    "the current source'. Re-supply the source explicitly. Plugin-backed "
+    "sources must be preserved in that shape; "
+    "do not assume the current source is blob-bound. Retain source.blob_id "
+    "only for an existing singular blob-bound source whose block carries "
+    "one; use source.inline_blob only when intentionally supplying new "
+    "literal data.",
+    "ORDINARY/FREEFORM MUTATION SURFACE: when inspection and mutation tools "
+    "are advertised, re-supply the complete existing `source` configuration "
+    "or named `sources` map from "
+    "get_pipeline_state(component='set_pipeline_arguments'). If that reports "
+    "round_trip_unavailable, never fabricate or rebind source custody: use an "
+    "advertised narrow patch tool when the requested task permits, otherwise "
+    "surface the named gap.",
+    "PROPOSAL PLANNER SURFACE: read the current-state context and use only "
+    "tools advertised in this request. Re-supply an existing source only "
+    "when that context carries its exact authorable source binding. If the "
+    "authoritative binding is absent, redacted, diagnostic-only, or named/"
+    "multiple blob custody cannot round-trip, surface an exact-source/"
+    "round-trip gap and stop instead of guessing; never invoke an "
+    "unadvertised inspection or mutation tool, and never fabricate or rebind "
+    "source custody.",
+    # Session 891b7b1e turn 1: the planner fabricated rows at the user's
+    # request, then narrated its own content as 'the system auto-generated
+    # placeholder content' — a provenance inversion in an audit-grade tool.
+    "Content YOU fabricated at the user's request ('make up N rows', "
+    "'invent sample complaints') is planner-authored, not discovered: bind "
+    "it via inline_blob, stage the invented_source interpretation review, "
+    "and narrate it in FIRST PERSON — 'I generated this content as you "
+    "asked' — never as something 'the system' produced or you found. "
+    "Reading a blob you authored this turn back through get_blob_content "
+    "does not make its content external.",
 )
 
 _INLINE_EXEMPLAR_FILENAME: Final[str] = "stock_levels.csv"
@@ -465,7 +510,7 @@ def _prompt_shield_rules(
         # manual-wiring mandate stays the teaching for this posture.
         return [
             f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
-            f"When an llm transform consumes externally-controlled content (any path from a {producers} "
+            f"When an llm transform consumes untrusted or externally controlled upstream content (any path from a {producers} "
             f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
             "the llm node — its input is the producer node's on_success connection, and its on_success "
             "is the llm node's input. This is required, not advisory: untrusted text must not "
@@ -483,15 +528,15 @@ def _prompt_shield_rules(
     )
     return [
         availability,
-        f"When an llm transform consumes externally-controlled content (any path from a {producers} "
+        f"When an llm transform consumes untrusted or externally controlled upstream content (any path from a {producers} "
         "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
         "add one pending pipeline_decision entry to its options.interpretation_requirements "
         "(a sibling of the node's other options).",
         f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{PROMPT_SHIELD_USER_TERM}", "draft": "{draft}"}} '
         "— copy the user_term and draft strings verbatim.",
         "The WARNING is advisory, but a staged row costs a mandatory operator acknowledgement "
-        "before /execute — stage it only when externally-fetched content actually reaches the llm.",
-        "Never stage this fetch-step draft on an llm fed only operator-supplied content; the "
+        "before /execute — stage it only when untrusted or externally controlled upstream content actually reaches the llm.",
+        "Never stage this untrusted-content draft on an llm fed only operator-supplied content; the "
         "validator's warning already carries the correct local-content wording there.",
         "Skip the row only when an authorized prompt-injection shield transform is already wired between that producer node and the llm node.",
     ]
@@ -712,12 +757,37 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "flattened out of the reply.",
     "Downstream nodes may require only that response field (plus fields "
     "passed through from the node's input). To obtain several named result "
-    "fields from one llm node, use the plugin's multi_query mechanism — its "
-    "schema declares the per-query output fields, and it is the ONLY blessed "
-    "multi-field shape.",
+    "fields from one llm node, use one of the TWO blessed shapes: the "
+    "plugin's multi_query mechanism (its schema declares the per-query "
+    "output fields), or — in single-prompt mode — the top-level "
+    "response_format + output_fields pair, whose extracted fields land "
+    "UNPREFIXED: each entry becomes a row field named exactly its suffix.",
     "If a prompt asks for structured JSON anyway, the JSON arrives as one "
     "string in the response field; wire a schema-proven parser transform "
     "when downstream nodes need its keys as row fields.",
+    # Session 891b7b1e: a free-text 'reply with only the category word'
+    # prompt fed reference_join key_field with on_miss:fail + on_error:
+    # discard — one 'Billing.' or lowercase reply silently drops the row.
+    # The API-native constraint exists and was untaught.
+    "When an llm node's output field feeds a downstream EXACT-MATCH "
+    "consumer — a reference_join key_field, a gate condition comparing "
+    "against literals, or any lookup key — declare that field via "
+    "output_fields with type: 'enum' and the closed values list, and set "
+    "response_format: 'structured' so the constraint is API-enforced "
+    "(off-vocabulary replies become structurally impossible). Never rely "
+    "on a free-text prompt instruction for a value another node matches "
+    "exactly: reference_join has no normalization option, so one "
+    "mis-spelled, punctuated, or re-cased reply errors the join and, "
+    "under on_error: 'discard', silently drops the row.",
+    # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
+    # widened field_mapper AND the sink's fixed schema to 'any' instead of
+    # narrowing once at a type_coerce.
+    "A producer's any-typed field (json_explode, blob_json_expand, "
+    "value_transform outputs) is narrowed by inserting a type_coerce "
+    "transform (options.conversions: [{field, to}]) with its defined "
+    "per-conversion error path — never by widening every downstream "
+    "consumer's declared type to 'any', which erases the contract the "
+    "consumers rely on.",
     # ── multi_query QueryDefinition contract (run-2 G2: the blessed-shape
     # mandate above shipped without the shape's contract) ─────────────────
     "queries is a mapping of query name to a query OBJECT (list form needs "
@@ -753,9 +823,27 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "prompt_template_parts, so a per-query token survives resolution and is "
     "rejected at the compose gate. Reviewed slots belong in the node-level "
     "template; per-query templates reference plain query variables only.",
-    "Sink hygiene: the auto-appended <response_field>_usage / _model audit "
+    "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",
+    # elspeth-15b400881f: the live planner named the three business columns in
+    # its reply but left the CSV sink observed, so the first accepted row — not
+    # reviewed configuration — chose the persisted header.  Keep the ownership
+    # distinctions in the same rule: an LLM plugin owns its emitted-field
+    # guarantee, a structural coalesce has no schema option to annotate, and a
+    # sink's fields are a consumer/output-shape declaration rather than a
+    # producer guarantee.
+    "When the user-facing output has known named business columns, declare "
+    "them in sink schema.fields with their types; do NOT leave that sink in "
+    "mode: observed after promising those columns, because an observed CSV "
+    "sink locks its header from the first accepted row. If the user asked for "
+    "exactly those columns, put a schema-proven select-only projection "
+    "immediately before the sink and use mode: fixed in the requested column "
+    "order; use mode: flexible only when additional columns are intentional. "
+    "Do not copy producer contracts onto structural components: a plugin-free coalesce "
+    "derives its effective guarantees from its branches and has no authored "
+    "schema option, while guaranteed_fields on a sink is not a header "
+    "declaration because a sink consumes rows rather than producing them.",
 )
 
 
@@ -783,6 +871,11 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "required LLM reviews auto-stage on every llm node. The planner-owned "
     "kinds are vague_term (wired via prompt_template_parts), registered "
     "pipeline_decision, and invented_source.",
+    "Only the llm_prompt_template review auto-surfaces through ordinary "
+    "no-tool finalization at TURN END against the final frozen pipeline "
+    "skeleton — an "
+    "intermediate valid=True preview mid-turn is not a completion signal; "
+    "finish mutating and let the backend surface that prompt-template review.",
     "NEVER author a pipeline_decision row with user_term "
     "required_control_auto_wired — that disclosure is staged exclusively by "
     "the server's required-control auto-wire pass, and a hand-authored row "
@@ -849,12 +942,29 @@ def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapa
     private binding.
     """
     snapshot = catalog.snapshot
-    if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
+    modes = dict(snapshot.control_modes)
+    # control_modes is a genuinely partial mapping: the policy compiler copies
+    # only the capabilities the operator configured, and the trained-operator
+    # snapshot carries none. Absence is the first-class fact "not configured",
+    # so the RECOMMEND default is synthesized explicitly after membership,
+    # never via a defaulted lookup that would also mask a broken read.
+    mode = modes[capability] if capability in modes else ControlMode.RECOMMEND
+    if mode is not ControlMode.REQUIRED:
         return None
-    plugin_id = dict(snapshot.selected).get(capability)
+    # ``selected`` is partial by contract: the two shipped constructors emit
+    # every PluginCapability, but ``PluginAvailabilitySnapshot.create`` admits
+    # any subset (default ``()``) and restricted policy views build such
+    # snapshots. Absence is therefore the first-class "no selection" state,
+    # synthesized explicitly after membership — never via a defaulted lookup.
+    selected_by_capability = dict(snapshot.selected)
+    plugin_id = selected_by_capability[capability] if capability in selected_by_capability else None
     if plugin_id is None:
         return None
-    alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
+    # selected_profile_aliases is genuinely partial (empty for the trained-
+    # operator snapshot; populated only for alias-carrying plugins), so
+    # absence is the first-class "no alias" state, synthesized explicitly.
+    alias_by_plugin = dict(snapshot.selected_profile_aliases)
+    alias = alias_by_plugin[plugin_id] if plugin_id in alias_by_plugin else None
     if alias is None:
         usable_by_plugin = dict(snapshot.usable_profile_aliases)
         aliases = usable_by_plugin[plugin_id] if plugin_id in usable_by_plugin else ()
@@ -1576,11 +1686,11 @@ def build_schema_contract_evidence(
             omission_candidates.append({"plugin_id": label, "reason": "entry_budget_exceeded"})
             continue
         kind = pair[0]
-        try:
-            schema = catalog.get_schema(kind, pair[1])
-        except ValueError:
-            omission_candidates.append({"plugin_id": label, "reason": "schema_unavailable"})
-            continue
+        # Availability is settled against this same snapshot above and
+        # get_schema re-derives it before touching first-party catalog and
+        # profile code, so a ValueError escaping here is an internal defect
+        # — it propagates rather than being recorded as an omission.
+        schema = catalog.get_schema(kind, pair[1])
         if schema.plugin_type != kind or schema.name != pair[1]:
             omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
             continue
@@ -1762,7 +1872,12 @@ def discovery_digest(
         if not aliases:
             continue
         public_schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
-        public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
+        # knob_schema is Tier-1 catalog output: every cached schema passed
+        # validate_knob_schema at catalog load, "fields" is a required
+        # KnobSchema key and "required" a required KnobField key, so direct
+        # access is the honest read — a malformed schema crashes rather than
+        # publishing an incomplete required_options set.
+        public_required = [field["name"] for field in public_schema.knob_schema["fields"] if field["required"]]
         for entry in digest_by_kind[plugin_id.kind]:
             if entry["name"] == plugin_id.name:
                 entry["profile_aliases"] = sorted(aliases)
@@ -2430,7 +2545,10 @@ def fork_coalesce_exemplar_args(
                 "branches": coalesce_branches,
                 "policy": "require_all",
                 "merge": "union",
-                "options": {"schema": {"mode": "observed"}},
+                # Structural CoalesceSettings owns no plugin schema.  A
+                # NodeSpec options.schema here is inert composer metadata and
+                # yaml_generator intentionally drops it at runtime lowering.
+                "options": {},
             },
             *control_nodes_after,
             {
@@ -2544,7 +2662,14 @@ def fork_row_union_exemplar_args(
                 "plugin": "field_mapper",
                 "input": "unioned_rows",
                 "on_success": "main",
-                "on_error": "discard",
+                # Deliberately NOT 'discard': the aids corpus must carry at
+                # least one validated non-discard failure route, or every
+                # worked exemplar teaches silent row loss as the house style
+                # (elspeth-0aace271b4 I2). 'discard' costs the failed row's
+                # CONTENT — the audit trail keeps only the record of the
+                # drop — so the retention-shaped edge routes to a declared
+                # quarantine sink instead.
+                "on_error": "failed_rows",
                 "options": {
                     "schema": {
                         "mode": "flexible",
@@ -2569,7 +2694,19 @@ def fork_row_union_exemplar_args(
                     "collision_policy": "auto_increment",
                 },
                 "on_write_failure": "discard",
-            }
+            },
+            {
+                "sink_name": "failed_rows",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_failed_rows.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
         ],
         "metadata": {
             "name": "Fork and release row variants",
@@ -2628,7 +2765,10 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     aids: _PlannerAuthoringAids = {
         "purpose": (
             "Server-rendered worked exemplars and catalog digest from the live "
-            "policy-visible catalog. These shapes validate against the current deployment."
+            "policy-visible catalog. These shapes validate against the current deployment. "
+            "Each set_pipeline_exemplar* value is a provider tool-argument envelope: "
+            "its pipeline field contains the flat canonical set-pipeline document "
+            "used directly by internal and MCP consumers."
         ),
     }
     custody = source_custody_exemplar_args(catalog, visible=visible)
@@ -2636,20 +2776,20 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     if custody is not None and custody_blob_variant is not None:
         aids["source_custody"] = {
             "rules": list(_SOURCE_CUSTODY_RULES),
-            "set_pipeline_exemplar_inline_blob": custody,
+            "set_pipeline_exemplar_inline_blob": {"pipeline": custody},
             "existing_blob_source_binding": custody_blob_variant["source"],
         }
     fork_coalesce = fork_coalesce_exemplar_args(catalog, visible=visible, summaries=summaries)
     if fork_coalesce is not None:
         aids["fork_coalesce"] = {
             "rules": list(_FORK_COALESCE_RULES),
-            "set_pipeline_exemplar": fork_coalesce,
+            "set_pipeline_exemplar": {"pipeline": fork_coalesce},
         }
     fork_row_union = fork_row_union_exemplar_args(catalog, visible=visible)
     if fork_row_union is not None:
         aids["fork_row_union"] = {
             "rules": list(_FORK_ROW_UNION_RULES),
-            "set_pipeline_exemplar": fork_row_union,
+            "set_pipeline_exemplar": {"pipeline": fork_row_union},
         }
     # Resolved before the llm aids because the on_error rule they carry is
     # control-mode conditional. ``_selected_control_profile`` returns None for
@@ -2689,20 +2829,27 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         "registered_pipeline_decision_user_terms": sorted(REGISTERED_PIPELINE_DECISION_USER_TERMS),
         "rules": list(_REVIEW_REGISTRY_RULES),
     }
-    visible_untrusted_producers = tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS & visible["transform"]))
+    visible_untrusted_producers = tuple(sorted(untrusted_content_transform_names() & visible["transform"]))
     visible_raw_html_producers = tuple(sorted(_RAW_HTML_CLEANUP_PRODUCER_PLUGINS & visible["transform"]))
     control_modes = dict(catalog.snapshot.control_modes)
     if visible_untrusted_producers and "llm" in visible["transform"]:
+        # Both ``selected`` and ``control_modes`` are partial mappings by
+        # contract (PluginAvailabilitySnapshot.create admits any subset), so
+        # absence is first-class — "no shield selected" / "not configured" —
+        # and each default is synthesized explicitly after membership.
+        selected_by_capability = dict(catalog.snapshot.selected)
+        selected_shield = (
+            selected_by_capability[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in selected_by_capability else None
+        )
+        shield_mode = (
+            control_modes[PluginCapability.PROMPT_SHIELD] if PluginCapability.PROMPT_SHIELD in control_modes else ControlMode.RECOMMEND
+        )
         aids["prompt_shield"] = {
             "rules": _prompt_shield_rules(
                 # Whichever shield THIS deployment selected (aws_bedrock_prompt_shield,
                 # azure_prompt_shield, …) — never a hardcoded vendor.
-                shield_plugin=(
-                    selected_shield.name
-                    if (selected_shield := dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD))
-                    else None
-                ),
-                shield_required=control_modes.get(PluginCapability.PROMPT_SHIELD, ControlMode.RECOMMEND) is ControlMode.REQUIRED,
+                shield_plugin=selected_shield.name if selected_shield else None,
+                shield_required=shield_mode is ControlMode.REQUIRED,
                 shield_auto_wired=shield_auto_wired,
                 untrusted_producers=visible_untrusted_producers,
             ),

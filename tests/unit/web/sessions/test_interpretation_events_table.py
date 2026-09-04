@@ -196,9 +196,29 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_48() -> None:
-    # 47: proposal_events.event_type gains auto_commit.revoked (elspeth-01d4c6e683 audit trail).
-    assert SESSION_SCHEMA_EPOCH == 48
+def test_current_session_schema_epoch_is_51() -> None:
+    """Tripwire, not a truth check — this test deliberately restates the constant.
+
+    Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
+    sessions.db on next boot, so the bump must be a TWO-site change: this
+    failing test forces whoever bumps the constant to stop here and record
+    why. It is also a merge-collision detector: two branches independently
+    bumping N -> N+1 for different schema changes merge the constant cleanly
+    (both say N+1, one epoch number claiming two schemas), but both must
+    rename/edit this same test, which surfaces as a conflict a human has to
+    resolve — the honest outcome is N+2. Update the epoch note below when
+    bumping; do not replace this with a derived check unless it stays a
+    forced second touch.
+    """
+    # 51: the multi-replica session-operation substrate lands on top of
+    # mainline's 50 — persistent session-operation authority
+    # (session_operation_fences), compatible-generation membership and
+    # run-start coordination, cross-replica ticket/progress/rate state,
+    # bounded cleanup claims, and durable proposal blob-effect receipts,
+    # plus seven new ``runs`` ownership/cancellation columns. 48 and 50
+    # already name different shapes on the two merged lines, so the union
+    # takes the next free integer (elspeth-4d6c0dd0f5).
+    assert SESSION_SCHEMA_EPOCH == 51
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -576,6 +596,41 @@ class TestSourceNullability:
             _insert_session(conn, session_id)
             row = _no_surfaces_row(row_id=str(uuid.uuid4()), session_id=session_id)
             row["choice"] = "abandoned"
+            with pytest.raises(IntegrityError):
+                conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_superseded_choice_is_allowed_with_resolved_at(self, engine) -> None:
+        """Epoch 48: the state-commit supersession sweep retires a dead-site
+        pending row as choice='superseded' with resolved_at set and no
+        accepted_value (elspeth-dbc39dd367 / elspeth-d73139155a)."""
+        session_id = str(uuid.uuid4())
+        state_id = str(uuid.uuid4())
+        with engine.begin() as conn:
+            _insert_session(conn, session_id)
+            _seed_composition_state(conn, state_id=state_id, session_id=session_id)
+            row = _user_approved_row(
+                row_id=str(uuid.uuid4()),
+                session_id=session_id,
+                state_id=state_id,
+                choice="superseded",
+                resolved_at=datetime.now(UTC),
+            )
+            conn.execute(insert(interpretation_events_table).values(row))
+
+    def test_superseded_choice_without_resolved_at_raises(self, engine) -> None:
+        """A superseded row is terminal: the resolved_at pairing CHECK holds."""
+        session_id = str(uuid.uuid4())
+        state_id = str(uuid.uuid4())
+        with engine.begin() as conn:
+            _insert_session(conn, session_id)
+            _seed_composition_state(conn, state_id=state_id, session_id=session_id)
+            row = _user_approved_row(
+                row_id=str(uuid.uuid4()),
+                session_id=session_id,
+                state_id=state_id,
+                choice="superseded",
+                resolved_at=None,
+            )
             with pytest.raises(IntegrityError):
                 conn.execute(insert(interpretation_events_table).values(row))
 

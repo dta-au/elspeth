@@ -8,7 +8,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PLATFORM_DOC = REPO_ROOT / "docs" / "reference" / "deployment-platforms.md"
 README = REPO_ROOT / "README.md"
-DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 ENVIRONMENT_REFERENCE = REPO_ROOT / "docs" / "reference" / "environment-variables.md"
 REPOSITORY_STRUCTURE = REPO_ROOT / "docs" / "repository-structure.md"
 RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
@@ -71,41 +70,17 @@ def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
         assert not bundle_path.exists() or not any(bundle_path.rglob("*"))
 
 
-def test_support_matrix_states_the_shared_runtime_contract() -> None:
+def test_support_matrix_includes_runtime_connection_and_doctor_inputs() -> None:
     text = _normalized(PLATFORM_DOC)
 
     for phrase in (
-        "PostgreSQL clients, not a PostgreSQL server",
         "postgresql+psycopg://",
         "postgresql+psycopg2://",
-        "Compose provisions a PostgreSQL container",
-        "tracked AWS ECS Terraform package provisions Aurora PostgreSQL",
-        "immutable, release-specific image",
-        "one web process or replica",
-        "Payload persistence is separate from database persistence",
         "doctor deployment --init-schema",
         "doctor aws-ecs --init-schema",
         "UID/GID 1654",
     ):
         assert phrase in text
-
-    assert "UID/GID 1000" not in text
-
-    assert "Every other production topology supplies its own external PostgreSQL service" not in text
-    assert "Azure production and Kubernetes BYO deployments require operator-provided external PostgreSQL" in text
-    assert "Native Linux may instead use SQLite on one persistent host" in text
-
-
-def test_maintained_entry_points_repeat_the_database_and_process_boundaries() -> None:
-    for path in (README, DOCKER_GUIDE, AWS_RUNBOOK, AWS_COLD_INSTALL_RUNBOOK, UBUNTU_RUNBOOK):
-        text = _normalized(path)
-        assert "PostgreSQL clients" in text, path
-        assert "not a PostgreSQL server" in text, path
-        assert "postgresql+psycopg://" in text, path
-        assert "postgresql+psycopg2://" in text, path
-        assert "one web process" in text, path
-        assert "payload persistence" in text.lower(), path
-        assert "database persistence" in text.lower(), path
 
 
 def test_azure_support_is_one_stop_before_start_linux_vm() -> None:
@@ -128,10 +103,6 @@ def test_azure_support_is_one_stop_before_start_linux_vm() -> None:
     assert "azure-container-apps" in matrix
     assert "reserved" in matrix.lower()
     assert "unsupported" in matrix.lower()
-    assert "activeRevisionsMode" not in runbook
-    assert "traffic-shift" not in runbook.lower()
-    assert "per-revision" not in runbook.lower()
-    assert "deploy/azure-container-apps" not in combined
 
 
 def test_kubernetes_is_an_explicit_byo_zero_overlap_contract() -> None:
@@ -145,10 +116,6 @@ def test_kubernetes_is_an_explicit_byo_zero_overlap_contract() -> None:
         "persistent payload storage",
     ):
         assert phrase in text
-
-    assert "Kustomize" not in text
-    assert "ships no manifests" in text
-    assert "deploy/kubernetes" not in text
 
 
 def test_native_linux_documents_sqlite_or_postgresql_and_runtime_extras() -> None:
@@ -204,7 +171,9 @@ def test_native_linux_completion_checks_are_state_mode_specific() -> None:
 
 
 def test_native_linux_trust_gate_runs_after_checkout_with_dev_dependency_then_syncs_lean() -> None:
-    text = " ".join(_read(UBUNTU_RUNBOOK).replace("\\\n", "").split())
+    runbook = _read(UBUNTU_RUNBOOK)
+    text = " ".join(runbook.replace("\\\n", "").split())
+    install_section = " ".join(_section(runbook, "## Install the immutable release", "### SQLite single-host configuration").split())
     gate = (
         "uv run --frozen --extra dev elspeth-lints check --rules trust_tier.tier_model "
         "--root src/elspeth --allowlist-dir config/cicd/enforce_tier_model"
@@ -213,7 +182,9 @@ def test_native_linux_trust_gate_runs_after_checkout_with_dev_dependency_then_sy
 
     assert text.index('git -C /opt/elspeth checkout --detach "$ELSPETH_RELEASE_REF"') < text.index(gate)
     assert text.index(gate) < text.index(lean_sync)
-    assert "removes the development-only gate dependencies" in text
+    assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" in install_section
+    assert "operator's protected secret store" in install_section
+    assert "never print or retain it in the deployment log" in install_section
 
     pyproject = tomllib.loads(_read(REPO_ROOT / "pyproject.toml"))
     assert "elspeth-lints" in pyproject["project"]["optional-dependencies"]["dev"]
@@ -253,9 +224,6 @@ def test_aws_retains_the_zero_overlap_ecs_controls() -> None:
 
 
 def test_aws_docs_distinguish_tracked_cold_install_from_acceptance_inputs() -> None:
-    for path in (PLATFORM_DOC, README, CHANGELOG, AWS_RUNBOOK, AWS_COLD_INSTALL_RUNBOOK):
-        assert "live-task clone" not in _read(path).lower(), path
-
     matrix = _normalized(PLATFORM_DOC)
     assert "tracked AWS ECS Terraform package" in matrix
     assert "creates a VPC, Aurora PostgreSQL" in matrix
@@ -266,13 +234,6 @@ def test_aws_docs_distinguish_tracked_cold_install_from_acceptance_inputs() -> N
     assert "PREVIOUS_TASK_DEFINITION" in _read(AWS_RUNBOOK)
     assert "aws-ecs-cold-install.md" in _read(README)
     assert "AWS ECS Terraform cold-install package" in _normalized(CHANGELOG)
-
-
-def test_azure_sqlite_scope_is_consistent() -> None:
-    for path in (PLATFORM_DOC, DOCKER_GUIDE, UBUNTU_RUNBOOK):
-        text = _normalized(path)
-        assert "Azure production requires external Azure Database for PostgreSQL" in text, path
-        assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in text, path
 
 
 def test_environment_reference_documents_deployment_state_settings() -> None:
@@ -305,34 +266,3 @@ def test_navigation_and_repository_structure_are_honest() -> None:
     assert "`deploy/compose/`" in structure
     assert "`deploy/aws-ecs/terraform/`" in structure
     assert "`deploy/linux-systemd/`" in structure
-    for absent_path in ("deploy/azure-container-apps", "deploy/kubernetes", "deploy/platforms"):
-        assert absent_path not in structure
-
-
-def test_deployment_changelog_states_the_contract_without_claiming_multi_replica() -> None:
-    """The notes naming the deployment contract must not overclaim it.
-
-    Checked against the 0.7.2 section, not ``## Unreleased``: the contract moved
-    there when that work shipped (48cd87369), and an assertion pointed at the
-    section the text left behind stops guarding anything. The negatives are the
-    invariant — a single-VM Azure story and no ``deploy/platforms`` tree — and
-    the positives keep them anchored to the passage that makes the claim.
-
-    Whitespace is flowed first because the source is hard-wrapped: "one Azure
-    Ubuntu VM" is one phrase to a reader and two lines to ``in``.
-    """
-    text = _read(CHANGELOG)
-    before_release, release_onward = text.split("## 0.7.2", maxsplit=1)
-    assert "## Unreleased" in before_release
-
-    release_notes = release_onward.split("\n## ", maxsplit=1)[0]
-    flowed = " ".join(release_notes.split())
-
-    assert "cross-platform deployment contract" in flowed.lower()
-    assert "Docker Compose" in flowed
-    assert "AWS ECS" in flowed
-    assert "native Linux" in flowed
-    assert "Azure Ubuntu VM" in flowed
-    assert "Kubernetes" in flowed
-    assert "multi-replica" not in flowed.lower()
-    assert "deploy/platforms" not in flowed

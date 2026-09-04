@@ -16,6 +16,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -68,22 +70,53 @@ def _assistant_tool_calls_message(message: Any, tool_calls: Any) -> dict[str, An
     the tool-call request to precede the ``role=tool`` results in the next
     round, and every ``tool_call_id`` it names must be answered. We rebuild it
     explicitly (rather than re-appending the raw provider object) so the wire
-    shape is deterministic and provider-agnostic.
+    shape is deterministic and provider-agnostic. IDs are admitted as opaque,
+    non-blank, turn-unique strings and copied exactly: provider signatures may
+    make them longer than ELSPETH's persisted-ID limit.
     """
+    admitted_calls: list[dict[str, Any]] = []
+    call_ids: set[str] = set()
+    for tool_call in tool_calls:
+        call_id = tool_call.id
+        if not is_valid_provider_replay_tool_call_id(call_id):
+            raise GuidedSolverResponseShapeError("guided discovery response contains an invalid provider tool-call ID")
+        if call_id in call_ids:
+            raise GuidedSolverResponseShapeError("guided discovery response contains duplicate provider tool-call IDs")
+        call_ids.add(call_id)
+        admitted_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }
+        )
     return {
         "role": "assistant",
         "content": message.content,
-        "tool_calls": [
-            {
-                "id": tool_call.id,
-                "type": "function",
-                "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments},
-            }
-            for tool_call in tool_calls
-        ],
+        "tool_calls": admitted_calls,
     }
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the provider tool-call object from an LLM chat completion (LiteLLM/OpenAI wire shape) — "
+        "model-authored content whose id, function name and arguments payload ELSPETH neither "
+        "constructs nor type-checks upstream"
+    ),
+    source_param="tool_call",
+    suppresses=("R5",),
+    invariant=(
+        "raises GuidedSolverResponseShapeError when the provider's arguments payload is not a JSON "
+        "string, is not valid JSON, or does not decode to an object — the malformed call is recorded "
+        "as a value-free ARG_ERROR and is never coerced into an empty argument mapping or dispatched"
+    ),
+    test_ref="tests/unit/web/composer/guided/test_discovery_dispatch.py::test_execute_discovery_call_rejects_non_string_provider_arguments",
+    test_fingerprint="0e4486f6f74231d121aa7ede8150646a761bf62f986312549d2a4773c004cdda",
+)
 def _execute_discovery_call(
     *,
     tool_call: Any,

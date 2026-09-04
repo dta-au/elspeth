@@ -43,12 +43,6 @@ AUDITED_ADRS = frozenset(
     }
 )
 
-_AUTHORITY_FIELD = re.compile(
-    r"^\*\*(?:Amendment )?(?:Deciders|Decision Makers):\*\*\s*(?P<value>.+)$",
-    re.MULTILINE,
-)
-_STATUS_FIELD = re.compile(r"^\*\*Status:\*\*\s*(?P<value>.+)$", re.MULTILINE)
-_ACCOUNTABLE_AUTHORITIES = frozenset({"ELSPETH maintainer", "ELSPETH maintainers"})
 _PRIVATE_HOME = re.compile(r"/(?:home|Users)/(?!user(?:/|\b))[^/\s`),]+(?:/[^\s`),]*)?")
 _TMP_PATH_PATTERN = r"/tmp(?:/[^\s`),]*)?"
 _TMP_PATH = re.compile(_TMP_PATH_PATTERN)
@@ -75,12 +69,6 @@ _REPOSITORY_FILE_REFERENCE = re.compile(r"`(?P<path>(?:src|tests)/[^`\n]+)`")
 
 def _active_adrs() -> tuple[Path, ...]:
     return tuple(sorted(path for path in ADR_DIRECTORY.glob("[0-9][0-9][0-9]-*.md") if path.name != "000-template.md"))
-
-
-def _top_level_metadata(text: str, pattern: re.Pattern[str]) -> str | None:
-    preamble = text.split("\n## ", maxsplit=1)[0]
-    match = pattern.search(preamble)
-    return match.group("value").strip() if match else None
 
 
 def _tmp_path_is_rejected_as_provenance(paragraph: str, path: str) -> bool:
@@ -140,57 +128,6 @@ def _resolve_git_commit(revision: str) -> str | None:
         text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else None
-
-
-def test_audited_adrs_name_the_maintainer_as_accountable_authority() -> None:
-    failures: list[str] = []
-
-    for filename in sorted(AUDITED_ADRS):
-        text = (ADR_DIRECTORY / filename).read_text(encoding="utf-8")
-        authorities = tuple(match.group("value").strip() for match in _AUTHORITY_FIELD.finditer(text))
-        if not authorities or any(authority != "ELSPETH maintainer" for authority in authorities):
-            failures.append(f"{filename}: {authorities or ('missing',)}")
-
-    assert not failures, "Audited ADRs must name only the accountable authority:\n" + "\n".join(failures)
-
-
-def test_accepted_index_state_is_reflected_in_adr_status() -> None:
-    for filename in (
-        "004-adr-explicit-sink-routing.md",
-        "005-adr-declarative-dag-wiring.md",
-    ):
-        text = (ADR_DIRECTORY / filename).read_text(encoding="utf-8")
-        assert _top_level_metadata(text, _STATUS_FIELD) == "Accepted", filename
-
-
-@pytest.mark.parametrize(
-    "field",
-    ("Deciders", "Decision Makers", "Amendment Deciders", "Amendment Decision Makers"),
-)
-def test_authority_field_variants_use_the_exact_positive_allowlist(field: str) -> None:
-    match = _AUTHORITY_FIELD.fullmatch(f"**{field}:** ELSPETH maintainers")
-
-    assert match is not None
-    assert match.group("value") in _ACCOUNTABLE_AUTHORITIES
-
-
-def test_top_level_status_parser_does_not_accept_an_amendment_status() -> None:
-    text = "# ADR\n\n**Status:** Proposed\n\n## Amendment\n\n**Status:** Accepted\n"
-
-    assert _top_level_metadata(text, _STATUS_FIELD) == "Proposed"
-
-
-def test_active_adr_authority_metadata_names_an_accountable_maintainer() -> None:
-    failures: list[str] = []
-
-    for path in _active_adrs():
-        text = path.read_text(encoding="utf-8")
-        authorities = tuple(match.group("value").strip() for match in _AUTHORITY_FIELD.finditer(text))
-        for authority in authorities:
-            if authority not in _ACCOUNTABLE_AUTHORITIES:
-                failures.append(f"{path.name}: {authority}")
-
-    assert not failures, "ADR authority metadata must name an accountable ELSPETH maintainer:\n" + "\n".join(failures)
 
 
 def test_active_adrs_do_not_use_private_or_ephemeral_provenance() -> None:

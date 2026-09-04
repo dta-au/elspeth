@@ -416,14 +416,16 @@ checkpoint can allow a run while still blocking completion). Advisory checks
 never block Run.
 
 **Slide 30 — Trust tiers: what happens when data is wrong.**
-- **Tier 3 — anything from outside** (your CSV, an API, an LLM's reply): zero trust; validated at the boundary; a bad row is *quarantined*, the run continues
+- **Tier 3 — anything from outside** (your CSV, an API, an LLM's reply): zero trust; source validation follows its configured quarantine/discard route so other rows can continue
 - **Tier 2 — your rows once a source has validated them**: types are trusted downstream; a wrong type there is an upstream bug to fix
 - **Tier 1 — ELSPETH's own audit records**: fully trusted, so any anomaly *crashes* — "silently coercing bad audit data would be evidence tampering"
 - "A CSV with garbage in row 500 should not crash a 10,000-row pipeline. A corrupted audit record should crash immediately." — README
 
 *Notes.* One nuance worth saying: tiers follow the *data flow*, not the plugin.
 An LLM in the middle of your graph creates a fresh Tier-3 boundary the moment
-the model answers.
+the model answers. Source validation uses its configured failure route so other
+rows can continue. A row that contradicts an acknowledged producer guarantee
+instead records failed boundary evidence and stops the run.
 
 **Slide 31 — After the run: what survives, and for how long.**
 - Run accounting closes the books: every row reached exactly one terminal outcome, or the run says so (`Audit closure`)

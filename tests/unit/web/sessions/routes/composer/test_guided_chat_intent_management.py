@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import UUID
 
+import pytest
+
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, DeferredIntentEditAction
@@ -56,6 +59,9 @@ _FRAME_CLOSE = "Clarify the concrete topology structure and I'll firm it up."
 _AGGREGATION_MESSAGE = "Later add an aggregation that rolls the scored rows up per customer."
 _AGGREGATION_AND_COLLECTOR_MESSAGE = (
     "Later add a collector to stitch the exploded pages back together and an aggregation to roll them up per customer."
+)
+_PLURAL_AGGREGATION_AND_COLLECTOR_MESSAGE = (
+    "Later add collectors to stitch the exploded pages back together and aggregations to roll them up per customer."
 )
 
 
@@ -230,7 +236,7 @@ def test_declining_a_collector_still_gets_the_true_structural_clause() -> None:
     What this test alone kills is a mutant that ADDS negation detection and
     suppresses the clause on "no collector needed". That is the direction
     someone will eventually be tempted to "fix", and it is banned:
-    `_message_names_identifier` is a word-boundary regex with no notion of
+    `_message_names_node_kind` is a word-boundary matcher with no notion of
     negation, and a negation parse fails the opposite way on "no gate, add a
     collector". Composition is what makes leaving it undetected safe — the
     appended clause is a general truth, so an unwanted match is unhelpful
@@ -357,6 +363,60 @@ def test_structural_collector_and_aggregation_compose_in_the_stated_order() -> N
     assert result.chat.assistant_message == (_FRAME_OPEN + _GATE_CLAUSE + _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE + _FRAME_CLOSE)
     assert result.chat.assistant_message.count(_FRAME_OPEN) == 1
     assert result.chat.assistant_message.count(_FRAME_CLOSE) == 1
+
+
+def test_node_kind_teaching_accepts_regular_plurals_and_rejects_embedded_aliases() -> None:
+    """Node-kind prose accepts singular or ``s``-plural words, not aliases.
+
+    The negative case runs first and preserves the catalog identifier matcher's
+    exact word-boundary discipline. The two mixed cases then prove that either
+    kind may be singular while the other is plural; the all-plural case is the
+    regression from the adversarial rebaseline of elspeth-270e81443d.
+    """
+
+    cases = (
+        ("Later add sub_collectors and aggregation_id nodes.", ""),
+        (_AGGREGATION_AND_COLLECTOR_MESSAGE, _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE),
+        (
+            "Later add a collector to stitch pages and aggregations to roll them up.",
+            _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE,
+        ),
+        (
+            "Later add collectors to stitch pages and an aggregation to roll them up.",
+            _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE,
+        ),
+        (_PLURAL_AGGREGATION_AND_COLLECTOR_MESSAGE, _COLLECTOR_CLAUSE + _AGGREGATION_CLAUSE),
+    )
+
+    for message, expected_clauses in cases:
+        result = _apply(
+            _action("rollup_stats"),
+            catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+            message=message,
+        )
+
+        assert type(result) is DeferredRequestRetained
+        assert result.chat.assistant_message == _FRAME_OPEN + expected_clauses + _FRAME_CLOSE
+
+
+def test_plural_node_kind_mention_does_not_count_as_an_exact_catalog_plugin_name() -> None:
+    """``collectors`` teaches node semantics but does not name plugin ``collector``.
+
+    Broadening `_message_names_identifier` itself would make the availability
+    guard treat the plural node-kind word as an exact user-named plugin and
+    bypass the retained model-catalog-identity path. The node-kind matcher must
+    therefore remain a separate teaching-only surface.
+    """
+
+    result = _apply(
+        _action("collector"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+        message="Later add collectors to stitch the exploded pages back together.",
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.error_class == "DeferredIntentModelCatalogIdentity"
+    assert result.chat.assistant_message == _FRAME_OPEN + _COLLECTOR_CLAUSE + _FRAME_CLOSE
 
 
 def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
@@ -602,6 +662,30 @@ def test_management_edit_contradiction_names_conflict_and_leaves_saved_instructi
     assert result.guided.deferred_intents == (conflicting, edited)
 
 
+def test_deferred_action_fold_rejects_surplus_intent_ids() -> None:
+    """One route-minted id must correspond to exactly one deferred action."""
+    with pytest.raises(AuditIntegrityError, match="exactly as many intent ids as actions"):
+        apply_deferred_request(
+            (_action("passthrough"),),
+            None,
+            authority=DeferredRequestAuthority(
+                guided=GuidedSession.initial(),
+                catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+                originating_message=GuidedOriginatingUserMessageDraft(
+                    message_id=_MESSAGE_ID,
+                    content="Later add the passthrough transform.",
+                ),
+                new_intent_ids=(_INTENT_ID, _SECOND_INTENT_ID),
+            ),
+            chat=StepChatResult(
+                assistant_message="model-authored response",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=7,
+                error_class=None,
+            ),
+        )
+
+
 def test_two_actions_in_one_send_fold_and_compose_against_the_evolving_state() -> None:
     """elspeth-3a21f09f09: N actions in one Send each keep their own disposition.
 
@@ -673,3 +757,30 @@ def test_all_actions_unretainable_in_one_send_leave_state_unchanged() -> None:
 
     assert type(result) is DeferredRequestUnchanged
     assert result.guided.deferred_intents == ()
+
+
+def test_unparseable_catalog_identity_is_not_the_unavailable_seam() -> None:
+    """Pin the recognizer's ValueError branch (tier-rem web-sessions).
+
+    ``_has_unmentioned_unavailable_action_identity`` parses the MODEL-authored
+    ``catalog_kind:catalog_name`` through ``PluginId.parse``; an identity that
+    defeats the grammar is simply "not the unavailable-catalog seam" — the
+    recognizer's declared False verdict — and the action still flows through
+    ``validate_deferred_intent_action`` on the caller's every path
+    (guided_chat_intent_management.apply path), so nothing is silently
+    accepted.
+    """
+    from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
+        _has_unmentioned_unavailable_action_identity,
+    )
+
+    catalog = _catalog(available=frozenset({PluginId("transform", "passthrough")}))
+    malformed = replace(_action("passthrough"), catalog_name="Not A Plugin!")
+    assert (
+        _has_unmentioned_unavailable_action_identity(
+            malformed,
+            catalog=catalog,
+            originating_message_content="Please add a dedup step later.",
+        )
+        is False
+    )

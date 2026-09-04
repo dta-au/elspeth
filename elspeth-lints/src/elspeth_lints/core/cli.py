@@ -4721,6 +4721,8 @@ def _execute_new_judgment_action(
     prompt, never the verdict: the fire-time ``call_judge`` issues the
     authoritative ACCEPTED/BLOCKED independently ([O1] preserved).
     """
+    from elspeth_lints.core.review_bundle import DEFAULT_SIGN_BUNDLE_RATIONALE
+
     namespace = argparse.Namespace(
         root=args.root,
         repo_root=args.repo_root,
@@ -4729,7 +4731,7 @@ def _execute_new_judgment_action(
         rule=action.rule or "trust_tier.tier_model",
         symbol=action.symbol,
         fingerprint=action.fingerprint,
-        rationale=action.draft_rationale or "Staged via sign-bundle; see bundle provenance for the agent rationale.",
+        rationale=action.draft_rationale or DEFAULT_SIGN_BUNDLE_RATIONALE,
         owner=args.owner,
         operator_override=args.operator_override,
         max_tokens=args.max_tokens,

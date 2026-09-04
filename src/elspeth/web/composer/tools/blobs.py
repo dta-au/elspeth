@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError as PydanticValidationError
@@ -78,13 +78,16 @@ from elspeth.web.composer.state import (
     CompositionState,
 )
 from elspeth.web.composer.tools._common import (
+    _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE,
+    _INTERPRETATION_REVIEW_FOLLOWUP,
+    _RUNTIME_OWNED_LLM_OPTION_KEYS,
+    _SERVER_OWNED_SOURCE_OPTION_KEYS,
     ToolContext,
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
     _failure_result,
     _mutation_result,
-    _runtime_owned_llm_option_error,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -134,13 +137,68 @@ class BlobToolRecord(TypedDict):
 
 
 class BlobCreatePayload(TypedDict):
-    """Closed dict shape for the create_blob tool's success result data."""
+    """Closed dict shape for the create_blob tool's success result data.
+
+    ``originated_in`` is the self-authorship marker (elspeth-47eba5cced):
+    both producers of this payload — create_blob and a set_pipeline
+    resolved inline_blob — describe a blob whose bytes came from the
+    calling LLM's OWN tool arguments, and mid-turn custody rewrites excise
+    those bytes from the live transcript, so without this marker a later
+    get_blob_content round trip is structurally indistinguishable from
+    discovering someone else's data.
+    """
 
     blob_id: str
     filename: str
     mime_type: str
     size_bytes: int
     content_hash: str
+    originated_in: Literal["this_tool_call"]
+
+
+class BlobContentPayload(TypedDict):
+    """Closed dict shape for the get_blob_content tool's success result data.
+
+    ``created_by`` and ``creation_modality`` are the read-back half of the
+    self-authorship marker on :class:`BlobCreatePayload` (elspeth-47eba5cced).
+    ``originated_in`` can only speak for the tool call that created the blob;
+    a later ``get_blob_content`` is a different call, and custody rewrites
+    have by then excised the planner's own inline bytes from the live
+    transcript.  Without these two fields the read-back result carried no
+    origin facts at all, so a planner reading back content it fabricated
+    earlier saw a discovery-shaped result and could narrate its own invention
+    as something the system produced.
+
+    Both are stored columns, not derived classifications: each is a closed
+    vocabulary (``BLOB_CREATORS`` / :class:`CreationModality`) mirrored by a
+    DB CHECK and re-checked on every read by ``_guard_blob_row_literals``.
+    They are typed ``str`` here to match :class:`BlobToolRecord`, whose
+    values that guard has already narrowed.
+
+    Read them as a PAIR.  ``creation_modality`` alone is not an authorship
+    statement: four unrelated paths write ``verbatim`` — the composer, for
+    content copied out of the user's own message; ``create_blob`` behind the
+    upload route; ``create_pending_blob`` for pipeline output; and
+    ``copy_blobs_for_fork``.  ``created_by`` is what separates them.
+
+    Both fields report what the row RECORDS, which is not always what
+    happened: fork copy preserves ``created_by`` but resets the modality to
+    ``verbatim`` and nulls the five ``creating_*`` columns, so an
+    LLM-generated blob carried across a session fork records as verbatim.
+    That is a defect in the fork writer, not something this read path can
+    detect — and it is the reason no derived "the assistant authored this"
+    flag is offered here: such a flag would confidently deny authorship of
+    content the assistant really did invent.
+    """
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: str
+    truncated: bool
+    size_bytes: int
+    created_by: str
+    creation_modality: str
 
 
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
@@ -263,6 +321,12 @@ def _sync_list_blobs(engine: Engine, session_id: str) -> list[dict[str, Any]]:
                 "mime_type": blob["mime_type"],
                 "size_bytes": blob["size_bytes"],
                 "created_by": blob["created_by"],
+                # Paired with created_by so the inventory answers "who
+                # authored these bytes" at the same depth as the read-back
+                # path (get_blob_content). created_by alone cannot: the
+                # composer writes created_by="assistant" both for content it
+                # generated and for content copied verbatim from the user.
+                "creation_modality": blob["creation_modality"],
                 "status": blob["status"],
             }
             for blob in (_blob_row_to_tool_dict(row) for row in rows)
@@ -314,7 +378,10 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     name="list_blobs",
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="List uploaded/created files (blobs) in this session with metadata.",
+    description=(
+        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 
@@ -344,7 +411,8 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
         "List ready blobs available for audited inline-content authoring. "
-        "Returns only blob_id, mime_type, size_bytes, content_hash, and filename; never content bytes."
+        "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
+        "and `filename`; never content bytes."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -380,7 +448,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Get metadata for a specific blob (file) by ID.",
+    description="Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -392,6 +460,18 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="existing component options content (web/LLM-authored, thawed from persisted session state) navigated by an LLM-supplied field_path",
+    source_param="container",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when a field_path segment collides with an existing non-object value or "
+        "when field_path carries no segment; never coerces an existing value into an object"
+    ),
+    test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_set_nested_option_rejects_non_object_segment_collision",
+    test_fingerprint="f737be9d00e5cfa17240cfb4dda84f2dbf1ef46dd5be557429ef27613b2877d2",
+)
 def _set_nested_option(container: dict[str, Any], keys: list[str], value: Any) -> dict[str, Any]:
     if not keys:
         raise ValueError("field_path must include at least one .options.<field> segment")
@@ -431,16 +511,22 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
             if source_name == "source":
                 raise ValueError("Cannot wire source ref: no source has been set")
             raise ValueError(f"Source {source_name!r} not found in composition state")
+        if keys[0] in _SERVER_OWNED_SOURCE_OPTION_KEYS:
+            field_name = keys[0]
+            raise ValueError(
+                f"wire_blob_inline_ref cannot write server/resolver-owned source option root '{field_name}'. "
+                "Bind source blobs with set_source_from_blob or set_source_from_blobs; "
+                "ELSPETH stamps source_authoring and canonical blob metadata from session records."
+            )
         # Symmetric with the node arm below: never let a wire write land inside a
         # source's interpretation_requirements. Source review metadata
-        # (INVENTED_SOURCE) may only be staged as a pending composer requirement
-        # and resolved by resolve_interpretation_event — a wired ref here would
-        # corrupt that structure outside the review boundary.
+        # (INVENTED_SOURCE) may only be staged as a pending composer requirement;
+        # a wired ref here would corrupt that structure outside the review boundary.
         if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
             raise ValueError(
                 "wire_blob_inline_ref cannot write source interpretation_requirements; "
-                "review metadata may only be staged as pending composer input and "
-                "resolved by resolve_interpretation_event."
+                "stage an authorable pending source review with set_source or patch_source_options. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         patched_options = _set_nested_option(dict(deep_thaw(source.options)), keys, marker)
         return state.with_named_source(source_name, replace(source, options=patched_options))
@@ -451,20 +537,24 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
         found = False
         for node in state.nodes:
             if node.id == node_id:
-                if node.plugin == "llm" and keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
+                if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
                     raise ValueError(
-                        "wire_blob_inline_ref cannot write LLM interpretation_requirements; "
-                        "review metadata may only be staged as pending composer input and "
-                        "resolved by resolve_interpretation_event."
+                        "Inline blob references can only be wired into source, transform, aggregation, collector, or output plugin options."
                     )
-                runtime_owned_error = _runtime_owned_llm_option_error(
-                    node.plugin,
-                    {keys[0]: marker},
-                    tool_name="wire_blob_inline_ref",
-                    component_id=node_id,
-                )
-                if runtime_owned_error is not None:
-                    raise ValueError(runtime_owned_error)
+                if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
+                    raise ValueError(
+                        "wire_blob_inline_ref cannot write node interpretation_requirements; "
+                        "stage an authorable pending node review with upsert_node or patch_node_options. "
+                        f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
+                    )
+                if node.plugin == "llm" and keys[0] in _RUNTIME_OWNED_LLM_OPTION_KEYS:
+                    field_name = keys[0]
+                    raise ValueError(
+                        "wire_blob_inline_ref field_path targets runtime-owned top-level LLM option "
+                        f"'{field_name}'. This field_path cannot be wired. For an author-owned LLM option "
+                        "edit use patch_node_options, or upsert_node for a full node edit, without the runtime hash; "
+                        "ELSPETH re-derives it during review reconciliation or execution."
+                    )
                 patched_options = _set_nested_option(dict(deep_thaw(node.options)), keys, marker)
                 new_nodes.append(replace(node, options=patched_options))
                 found = True
@@ -479,8 +569,8 @@ def _apply_inline_blob_marker(state: CompositionState, field_path: str, marker: 
         if keys[0] == INTERPRETATION_REQUIREMENTS_KEY:
             raise ValueError(
                 "wire_blob_inline_ref cannot write output interpretation_requirements; "
-                "review metadata may only be staged as pending composer input and "
-                "resolved by resolve_interpretation_event."
+                "outputs do not own review metadata. Stage an authorable pending review on its source or node. "
+                f"{_INTERPRETATION_REVIEW_FOLLOWUP}"
             )
         new_outputs = []
         found = False
@@ -630,7 +720,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_MUTATION,
     description=(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
-        "Composer pins sha256 from blob metadata; callers must not pass content bytes."
+        "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+        "Returns the `field_path` that was wired."
     ),
     json_schema={
         "type": "object",
@@ -639,7 +730,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Canonical path: source.options.<field>, source:<name>.options.<field>, "
-                    "node:<node_id>.options.<field>, or output:<name>.options.<field>."
+                    "node:<node_id>.options.<field> for a transform, aggregation, or collector, "
+                    "or output:<name>.options.<field>." + _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
             "blob_id": {"type": "string", "format": "uuid", "description": "Ready blob ID to wire as inline content."},
@@ -758,6 +850,19 @@ def _blob_creation_provenance(content: str, context: ToolContext) -> _BlobCreati
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="one component's frozen options tree (web/LLM-authored content retained through CompositionState freezing)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns True only on an exact blob_ref/path/file match found by structural traversal; raises "
+        "AuditIntegrityError on a present-but-non-str blob_ref (audited-state corruption) rather than "
+        "treating the blob as unbound"
+    ),
+    test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_state_options_reference_blob_crashes_on_non_str_blob_ref",
+    test_fingerprint="cc4ab30745da588422649670128e04e05a2b19ad065a5750801cfc3a86e56a3b",
+)
 def _state_options_reference_blob(
     options: Mapping[str, Any],
     blob_id: str,
@@ -1038,6 +1143,7 @@ def _blob_create_payload(prepared: _PreparedBlobCreate) -> BlobCreatePayload:
         "mime_type": prepared.mime_type,
         "size_bytes": len(prepared.content_bytes),
         "content_hash": prepared.content_hash,
+        "originated_in": "this_tool_call",
     }
 
 
@@ -1137,7 +1243,9 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
     description=(
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload."
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
+        "this call, not uploaded)."
     ),
     json_schema={
         "type": "object",
@@ -1713,7 +1821,10 @@ _UPDATE_BLOB_DECLARATION = ToolDeclaration(
     name="update_blob",
     handler=_execute_update_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Update the content of an existing blob (file). Overwrites the file content while preserving metadata.",
+    description=(
+        "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
+        "Returns the new `content_hash` and `size_bytes`."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -1991,7 +2102,7 @@ _DELETE_BLOB_DECLARATION = ToolDeclaration(
     name="delete_blob",
     handler=_execute_delete_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Delete a blob (file) and its storage.",
+    description="Delete a blob (file) and its storage. Returns `deleted`: true.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2176,24 +2287,32 @@ def _execute_get_blob_content(
     if truncated:
         content = content[:max_chars]
 
-    return _discovery_result(
-        state,
-        {
-            "blob_id": blob_id,
-            "filename": blob["filename"],
-            "mime_type": blob["mime_type"],
-            "content": content,
-            "truncated": truncated,
-            "size_bytes": blob["size_bytes"],
-        },
-    )
+    payload: BlobContentPayload = {
+        "blob_id": blob_id,
+        "filename": blob["filename"],
+        "mime_type": blob["mime_type"],
+        "content": content,
+        "truncated": truncated,
+        "size_bytes": blob["size_bytes"],
+        # Origin facts, read straight off the row. See BlobContentPayload:
+        # they are the only within-result signal that distinguishes reading
+        # back self-authored content from discovering an operator's file.
+        "created_by": blob["created_by"],
+        "creation_modality": blob["creation_modality"],
+    }
+    return _discovery_result(state, payload)
 
 
 _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     name="get_blob_content",
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters.",
+    description=(
+        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+        "(`truncated` is true when so; `size_bytes` is the full size). "
+        "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
+        "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
+    ),
     json_schema={
         "type": "object",
         "properties": {

@@ -139,7 +139,7 @@ Published ELSPETH images come from the repository's `Build and Push` workflow
 (`.github/workflows/build-push.yaml`). It publishes `sha-<commit>` tags for
 every trusted merge to `main`, and it publishes a release or release-candidate
 image only when the operator pushes a git tag matching `v*` — for example
-`v0.7.2`, or the pre-release shape `v0.7.2-RC-280726` for a release-candidate
+`v0.8.0`, or the pre-release shape `v0.8.0-RC-280726` for a release-candidate
 handoff. The workflow builds, smoke-tests, and then promotes the verified
 digest to `ghcr.io/<owner>/elspeth:<git-tag>`, where `<git-tag>` is the literal
 tag name including the leading `v` and any `-RC-...` suffix. No
@@ -151,7 +151,7 @@ index into that exact repository using the authenticated handoff in Section 1.
 Only the resulting ECR digest reference belongs in the scenario tfvars.
 
 Some registry tags predate this contract and were published without the
-leading `v` (for example `0.7.2-RC-290726`); they did not come from the
+leading `v` (for example `0.8.0-RC-290726`); they did not come from the
 tag-triggered workflow path above and are not install candidates.
 
 **Minimum image revision.** This Terraform package renders the web settings
@@ -160,7 +160,7 @@ loader rejects unknown `ELSPETH_WEB__` keys, so an image older than the
 package's settings contract fails every task at settings load (observed as
 `{"check": "storage_settings", ...}` from `provision-storage` on a cold
 install). The supported pairing is a package and image cut from the same
-commit. Concretely for 0.7.2: the image must include commit `25f3440f5`
+commit. Concretely for 0.8.0: the image must include commit `25f3440f5`
 (`ELSPETH_WEB__LOG_JSON`), the earliest revision whose `WebSettings` defines
 every name this package ships. Any image whose revision does not contain it
 fails to boot under this package — this is ancestry, not chronology, so an
@@ -1121,7 +1121,7 @@ Only the baked, root-owned, 0444 image path above is trusted.
 OCI digest
 `sha256:c5e65357b7470cf1a702eeb084e865f0f5e0e43ab9741b76e872fa7568029700`
 predates this contract. It is an acceptance-attempt artifact and is not
-eligible for the `v0.7.2-RC-290726` release candidate.
+eligible for the `v0.8.0-RC-290726` release candidate.
 
 Before promoting a candidate, verify the baked bundle, the OCI CA labels, the
 live Aurora CA identifier, and the `readonlyRootFilesystem` split:

@@ -25,7 +25,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate as real_build_set_pipeline_candidate
@@ -73,6 +73,12 @@ class _ScriptedLLM:
         if not self._responses:
             return _fake_llm_response(content="Done.")
         return self._responses.pop(0)
+
+
+async def _clean_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+    """Keep proposal-prevalidation tests independent of the real advisor."""
+
+    return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN")
 
 
 class _FinalRejectingCatalog(PolicyCatalogView):
@@ -179,6 +185,7 @@ def _harness(tmp_path: Path) -> _Harness:
             sessions_service=sessions,
             session_engine=engine,
         )
+    service._run_advisor_checkpoint = _clean_advisor_checkpoint  # type: ignore[method-assign]
     return _Harness(
         engine=engine,
         sessions=sessions,
@@ -391,15 +398,34 @@ async def test_final_profile_rejection_is_unapplied_audited_and_repairable(tmp_p
     assert invalid_payload["data"] == {
         "status": "PREVALIDATION_REJECTED",
         "applied": False,
-        "applied_version": state.version,
         "candidate_version": state.version + 1,
         "message": (
             "The candidate pipeline failed prevalidation, was not applied, and was not submitted for approval. "
             "Repair the reported validation errors and retry."
         ),
     }
-    assert invalid_payload["version"] == state.version + 1
+    # The envelope's version is the UNAPPLIED state, so it agrees with the audit
+    # rather than contradicting it, and there is no `applied_version` twin under
+    # `data` (SYS-R3-3). `candidate_version` is the one fact the envelope lacks.
+    assert invalid_payload["version"] == state.version
     assert tuple(invocation.version_after for invocation in result.tool_invocations) == (state.version, state.version)
+    assert invalid_payload["data"]["candidate_version"] == invalid_payload["version"] + 1
+    # Nothing was applied, so no field may describe a change. Both of these came
+    # from the DISCARDED candidate while ``version`` named the unchanged state:
+    # ``affected_nodes`` listed the components the candidate would have touched,
+    # and the delta against the candidate's prior validation reported
+    # ``resolved_errors`` naming errors the unapplied state still has — the
+    # field the skill tells the model to act on instead of re-reading state
+    # (LLM seat LLM-R3B-1). This is now the APPROVAL_REQUIRED envelope's shape.
+    assert invalid_payload["affected_nodes"] == []
+    assert "validation_delta" not in invalid_payload
+    assert set(invalid_payload) == {"success", "validation", "affected_nodes", "version", "data"}
+    # ``validation`` deliberately stays the candidate's: it is the rejection the
+    # model repairs from, and the skill now says whose it is. The unapplied
+    # state has two errors of its OWN, which is what the departed delta used to
+    # report as ``resolved_errors``.
+    assert [error["error_code"] for error in invalid_payload["validation"]["errors"]] == ["profile_complete_state_rejected"]
+    assert {entry.error_code for entry in state.validate().errors} == {"no_sinks_configured", "source_on_success_dangling"}
     files_after = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()))
     assert files_after == files_before
 

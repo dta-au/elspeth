@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.7.2](https://img.shields.io/badge/status-0.7.2-green.svg)
+![Status: 0.8.0](https://img.shields.io/badge/status-0.8.0-green.svg)
 
 > [!IMPORTANT]
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
@@ -38,7 +38,7 @@ and audit model used by YAML-authored pipelines.
 
 - [Why Elspeth Exists](#why-elspeth-exists)
 - [Architecture At A Glance](#architecture-at-a-glance)
-- [What Changed In 0.7.2](#what-changed-in-072)
+- [What Changed In 0.8.0](#what-changed-in-080)
 - [Getting Started](#getting-started)
   - [YAML Operator Path](#yaml-operator-path)
   - [Web Composer Path](#web-composer-path)
@@ -158,9 +158,9 @@ reasonable to let both authoring surfaces feed the same executor.
 
 ---
 
-## What Changed In 0.7.2
+## What Changed In 0.8.0
 
-0.7.2 hardens the production paths introduced in 0.7.1 across deployment,
+0.8.0 hardens the production paths introduced in 0.7.1 across deployment,
 Composer authoring, trust boundaries, and committed blob cleanup.
 
 - **Deployment artifacts are production-shaped.** The release adds maintained
@@ -195,9 +195,9 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
   ECS; provider and tool data remain bounded and redacted.
 
-**Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 48; guided schema moves to 11, and Landscape moves from epoch
-29 to 30. Session epoch 40 makes the required coalesce timeout field an eager
+**Operational:** 0.8.0 is a pre-1.0 database cutover. The session store moves
+from epoch 35 to 51; guided schema moves to 11, and Landscape moves from epoch
+29 to 36. Session epoch 40 makes the required coalesce timeout field an eager
 startup cutover instead of allowing epoch-39 guided payloads to fail during
 replay, and session epoch 41 does the same for the projected node option
 summary the review cards render. Session epoch 42 retains the reviewed output-field
@@ -213,7 +213,7 @@ session epoch 48 adds the session-operation coordination tables (retained
 per-session fences, guided-operation leases, and fork/blob-effect receipts)
 that ground the multi-replica fencing work.
 Archive or export evidence as required, stop the old service, recreate
-a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
+a stale session store and a Landscape store left at epoch 29, and install 0.8.0.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.
@@ -582,7 +582,7 @@ Elspeth is a dual-surface authoring and execution platform: a CLI-first
 auditable pipeline engine plus a Web Composer for guided authoring, over one
 shared execution and audit core.
 
-Current 0.7.2 behaviour:
+Current 0.8.0 behaviour:
 
 - YAML remains a first-class operator path.
 - The Web Composer builds through discovery, mutation, blob, secret-reference,
@@ -1082,7 +1082,7 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 | [docs/architecture/adr/](docs/architecture/adr/) | Architects | Architecture Decision Records for routing, declaration-trust, terminal outcomes, and other load-bearing decisions |
 | [docs/guides/data-trust-and-error-handling.md](docs/guides/data-trust-and-error-handling.md) | Developers | Trust model, external-boundary handling, quarantine, and plugin error semantics |
 | [docs/guides/](docs/guides/) | All | Tutorials, MCP analysis guide, data trust model |
-| [docs/release/](docs/release/) | Evaluators | Executive summary, Composer guide, platform architecture, guarantees, assessment mapping, release evidence, and archive policy |
+| [docs/release/](docs/release/) | Evaluators | Composer guide, platform architecture, guarantees, and archive policy |
 | [docs/reference/](docs/reference/) | Developers | Configuration reference |
 | [docs/reference/deployment-platforms.md](docs/reference/deployment-platforms.md) | Operators | Maintained deployment paths, database ownership, persistence, and deferred platform boundaries |
 | [docs/runbooks/](docs/runbooks/) | Operators | Deployment and operations |

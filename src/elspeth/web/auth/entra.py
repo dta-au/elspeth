@@ -110,9 +110,11 @@ class EntraAuthProvider:
 
         return UserIdentity(
             user_id=sub,
-            # preferred_username is optional — fall back to sub if absent,
-            # null, or empty.
-            username=payload.get("preferred_username") or sub,
+            # preferred_username is an optional cosmetic Tier-3 claim — fall
+            # back to sub when absent, null, non-string, or blank. Read
+            # through the audited optional_profile_claim boundary helper so
+            # the absent->None decision is explicit.
+            username=optional_profile_claim(payload, "preferred_username") or sub,
         )
 
     async def get_user_info(self, token: str) -> UserProfile:
@@ -132,7 +134,7 @@ class EntraAuthProvider:
 
         return UserProfile(
             user_id=sub,
-            username=payload.get("preferred_username") or sub,
+            username=optional_profile_claim(payload, "preferred_username") or sub,
             display_name=display_name,
             email=optional_profile_claim(payload, "email"),
             groups=self._extract_groups(payload),

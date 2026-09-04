@@ -405,12 +405,14 @@ class TestSerialization:
         assert captured.value.__context__ is None
 
     @pytest.mark.parametrize("format", ["json", "jsonl"])
-    def test_json_size_estimate_accepts_exactly_what_the_encoder_accepts(self, format: str) -> None:
-        """The record-size estimator must not quarantine a row json.dumps would write.
+    def test_json_size_estimate_accepts_exactly_what_deep_thaw_emits(self, format: str) -> None:
+        """The record-size estimator admits deep_thaw's exact shapes and nothing wider.
 
-        Tuples and dict subclasses are encoder-serializable; a deep-frozen row that
-        skipped deep_thaw (mappingproxy values) is rejected by the encoder and must
-        be the same static failure here rather than a silent size mismatch.
+        Rows reach serialization rebuilt by deep_thaw (contracts/freeze.py),
+        which emits exact built-in dicts; tuples are encoder-serializable and
+        accepted. A dict SUBCLASS or a mapping proxy is an upstream invariant
+        break deep_thaw never emits — it must be the same static serialization
+        failure rather than a value silently sized under a widened contract.
         """
         from collections import OrderedDict
         from types import MappingProxyType
@@ -418,7 +420,7 @@ class TestSerialization:
         from elspeth.plugins.sinks.aws_s3_sink import S3RecordSerializationError
 
         serialized = _serialize(
-            [{"id": 1, "name": "Ada", "tags": ("a", "b"), "nested": OrderedDict(k=[1, (2, 3)])}],
+            [{"id": 1, "name": "Ada", "tags": ("a", "b"), "nested": {"k": [1, (2, 3)]}}],
             format=format,
             max_record_chars=100,
         )
@@ -429,6 +431,10 @@ class TestSerialization:
 
         with pytest.raises(S3RecordSerializationError) as captured:
             _serialize([{"id": 1, "name": "Ada", "nested": MappingProxyType({"k": 1})}], format=format)
+        assert captured.value.__context__ is None
+
+        with pytest.raises(S3RecordSerializationError) as captured:
+            _serialize([{"id": 1, "name": "Ada", "nested": OrderedDict(k=[1, (2, 3)])}], format=format)
         assert captured.value.__context__ is None
 
     @pytest.mark.parametrize("format", ["csv", "json", "jsonl"])

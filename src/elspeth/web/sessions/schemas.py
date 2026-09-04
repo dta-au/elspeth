@@ -208,9 +208,14 @@ class MessageWithStateResponse(_StrictResponse):
 
 
 class ValidationEntryResponse(_StrictResponse):
-    """Structured validation entry preserving component attribution.
+    """A four-key projection of ``ValidationEntry.to_dict()`` for the HTTP surface.
 
-    Mirrors ``ValidationEntry.to_dict()`` from the composer state module.
+    Carries ``component`` / ``message`` / ``severity`` / ``error_code`` only;
+    the detail payloads (``contract``, ``row_union_schema``,
+    ``coalesce_union_type``) and ``rejected_component`` are deliberately not
+    on this surface. Constructed field by field in ``routes/_helpers``, so a
+    new ``to_dict`` key never reaches it by accident — and never widens it
+    either (elspeth-e405ad7cd2, systems ledger #44).
     """
 
     component: str
@@ -428,7 +433,22 @@ class GuidedPlanRequest(_GuidedOperationRequest):
 
 
 class ConvertGuidedRequest(_GuidedOperationRequest):
-    """Request body for POST /api/sessions/{id}/guided/convert."""
+    """Request body for POST /api/sessions/{id}/guided/convert.
+
+    ``intent`` is the author's goal for the converted session and is REQUIRED,
+    exactly as it is on ``StartGuidedRequest``: a conversion seeds a fresh
+    wizard, and a wizard with no root intent cannot reach the planner (the
+    Step-2 finish refuses with ``guided_planner_intent_required``). It is also
+    the durable root row the conversion writes, so it participates in the
+    canonical request hash the custody helpers re-derive.
+    """
+
+    intent: str = pydantic.Field(min_length=1, max_length=4096)
+
+    @field_validator("intent")
+    @classmethod
+    def _validate_intent(cls, value: str) -> str:
+        return _require_visible_content(value, field_label="Guided intent")
 
 
 class ReenterGuidedRequest(_GuidedOperationRequest):
@@ -534,6 +554,43 @@ class WorkflowProfileResponse(_StrictResponse):
     bookends: bool
 
 
+class GuidedReviewedComponentResponse(_StrictResponse):
+    """One settled component in the server-projected reviewed ledger.
+
+    The field set is CLOSED at identity + display: ``stable_id``, ``name``,
+    ``plugin``, and the constant ``status``.  It is exactly what the
+    ``review_components`` card already publishes (both are projected from
+    :func:`elspeth.web.composer.guided.state_machine.reviewed_component_ledger`),
+    which makes this model a redaction boundary rather than a convenience
+    projection: authored option values (``on_validation_failure``,
+    ``on_write_failure``, ``schema.mode`` — all of them schema-form knobs),
+    inspected ``observed_columns`` / ``sample_rows``, storage paths, and
+    content-identity anchors are Tier-3-bearing reviewed custody and stay
+    under ``composition_state.composer_meta.guided_session``.  Widening this
+    model is a deliberate egress decision, and the pins in
+    ``tests/unit/web/sessions/test_guided_reviewed_components.py`` fail until
+    it is made deliberately.
+    """
+
+    stable_id: str
+    name: str
+    plugin: str
+    status: Literal["reviewed"]
+
+
+class GuidedReviewedComponentsResponse(_StrictResponse):
+    """Server-projected reviewed-component ledger, in authored order.
+
+    The frontend used to re-fold this ledger from ``next_turn`` alone, so a
+    reload mid-stage and every completed session (``next_turn`` is ``None``)
+    saw an empty ledger.  Projecting it on the guided response makes the
+    server the single authority for "what has been settled so far".
+    """
+
+    sources: list[GuidedReviewedComponentResponse]
+    outputs: list[GuidedReviewedComponentResponse]
+
+
 class GuidedSessionResponse(_StrictResponse):
     """Wire representation of the GuidedSession attached to a CompositionState."""
 
@@ -549,6 +606,13 @@ class GuidedSessionResponse(_StrictResponse):
     # standard, that is evidence tampering.
     chat_history: list[ChatTurnResponse]
     chat_turn_seq: int
+    # Server-projected reviewed-component ledger. Required for the same
+    # reason ``chat_history`` is: a default of empty lists here would let a
+    # route that forgot to project the live reviewed custody return a
+    # truthful-looking "nothing settled yet" while the server held two
+    # reviewed sources — the decision sheets read this field, so a silent
+    # empty is a false record of what the user agreed to.
+    reviewed_components: GuidedReviewedComponentsResponse
     # Server-owned WorkflowProfile (wire-visible subset). ``None`` for the
     # empty/live-guided profile. Defaulted to ``None`` because most
     # GuidedSessionResponse construction sites carry the empty profile; the

@@ -78,7 +78,10 @@ import {
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { Button } from "@/components/ui";
 import { useExecutionStore } from "@/stores/executionStore";
-import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import {
+  selectApprovedInterpretations,
+  useInterpretationEventsStore,
+} from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunOutputArtifact } from "@/types/index";
 
@@ -294,13 +297,18 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
       run.finished_at !== null
         ? new Date(run.finished_at).getTime()
         : Date.now();
-    const candidates = resolvedBySession[activeSessionId] ?? [];
+    // Approved rows only (choice-classified by the store's shared
+    // selector, elspeth-3a8a843c47): the overlay narrates how
+    // user-supplied terms were reviewed and accepted, so declined-review
+    // rows are out of scope here — the auto_interpreted_* shapes (both
+    // CHECK-forced to choice='opted_out') are surfaced by the opt-out
+    // indicator below and by the F-22 opt_out_summary route, not by the
+    // per-event list. This also stops no-surfaces rows (all display
+    // fields null) rendering as empty bullets.
+    const candidates = selectApprovedInterpretations(
+      resolvedBySession[activeSessionId] ?? [],
+    );
     return candidates.filter((event) => {
-      // Auto-interpreted opt-out rows are surfaced by the opt-out
-      // indicator below, not by the per-event list.
-      if (event.interpretation_source === "auto_interpreted_opt_out") {
-        return false;
-      }
       const eventTimeIso = event.resolved_at ?? event.created_at;
       const eventTime = new Date(eventTimeIso).getTime();
       return eventTime >= runStart && eventTime <= runEnd;
@@ -372,11 +380,10 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
           <h4>How user-supplied terms were interpreted</h4>
           <ul>
             {resolvedEventsInWindow.map((event) => {
-              // Render `accepted_value` when present (user accepted or
-              // amended); fall back to `llm_draft` when `accepted_value`
-              // is null (e.g. an opted_out row that slipped through —
-              // we skip auto_interpreted_opt_out above, but a manual
-              // opted_out row still carries a draft we surface).
+              // Approved rows carry the resolved `accepted_value`; the
+              // `llm_draft` fallback is wire-type narrowing (the field is
+              // nullable on the wire union), not a rendering path for
+              // declined rows — those never reach this list.
               const displayValue = event.accepted_value ?? event.llm_draft;
               return (
                 <li

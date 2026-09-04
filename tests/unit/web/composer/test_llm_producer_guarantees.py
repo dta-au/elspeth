@@ -39,17 +39,64 @@ from elspeth.web.composer.state import (
 
 
 class TestProbeProviderStub:
-    def test_llm_without_provider_gains_gateway_stub(self) -> None:
+    def test_unbound_llm_without_profile_or_provider_remains_incomplete(self) -> None:
         prepared = prepare_validation_probe_options(
-            {"prompt_template": "Hi {{ row.x }}", "model": "test-model"},
+            {
+                "prompt_template": "Hi {{ row.x }}",
+                "response_field": "answer",
+                "required_input_fields": ["x"],
+                "schema": {"mode": "observed"},
+            },
             plugin="llm",
         )
+
+        assert "provider" not in prepared
+        assert "model" not in prepared
+
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        with pytest.raises(ValueError) as excinfo:
+            get_shared_plugin_manager().create_transform("llm", prepared)
+        assert "provider: Field required" in str(excinfo.value)
+
+    def test_profile_authored_llm_gains_complete_gateway_stub(self) -> None:
+        """The public web shape carries only the alias, never provider/model."""
+        prepared = prepare_validation_probe_options(
+            {
+                "profile": "sonnet",
+                "prompt_template": "Hi {{ row.x }}",
+                "response_field": "answer",
+                "required_input_fields": ["x"],
+                "schema": {"mode": "observed"},
+            },
+            plugin="llm",
+        )
+
+        assert "profile" not in prepared
         assert prepared["provider"] == "gateway"
-        assert prepared["endpoint"].startswith("https://")
-        assert prepared["api_key"]
-        # Derived from the closed vocabulary, so a structured-output node
-        # (which demands the json_schema capability) still constructs.
+        assert prepared["model"] == "validation-probe-model"
         assert set(prepared["required_capabilities"]) == GATEWAY_SUPPORTED_CAPABILITIES
+
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        transform = get_shared_plugin_manager().create_transform("llm", prepared)
+        assert "answer" in transform.declared_output_fields
+
+    def test_profile_with_private_binding_field_is_not_normalized(self) -> None:
+        """Malformed public input stays malformed instead of borrowing the stub."""
+        prepared = prepare_validation_probe_options(
+            {
+                "profile": "sonnet",
+                "model": "author-forged-model",
+                "prompt_template": "Hi {{ row.x }}",
+                "schema": {"mode": "observed"},
+            },
+            plugin="llm",
+        )
+
+        assert prepared["profile"] == "sonnet"
+        assert prepared["model"] == "author-forged-model"
+        assert "provider" not in prepared
 
     def test_llm_with_authored_provider_is_untouched(self) -> None:
         options = {
@@ -84,7 +131,24 @@ class TestProbeProviderStub:
 _SRC_SCHEMA: dict[str, Any] = {"mode": "observed", "guaranteed_fields": ["colour"]}
 
 
-def _llm_node(node_id: str, source: str, out: str, response_field: str) -> NodeSpec:
+def _llm_node(
+    node_id: str,
+    source: str,
+    out: str,
+    response_field: str,
+    *,
+    profile: str | None = "sonnet",
+) -> NodeSpec:
+    options: dict[str, Any] = {
+        "prompt_template": "For {{ row.colour }} answer.",
+        "response_field": response_field,
+        "required_input_fields": ["colour"],
+        "schema": {"mode": "observed"},
+    }
+    if profile is not None:
+        # The real public web schema exposes only an operator profile alias.
+        # Provider AND model are private and arrive at lowering.
+        options["profile"] = profile
     return NodeSpec(
         id=node_id,
         node_type="transform",
@@ -92,13 +156,7 @@ def _llm_node(node_id: str, source: str, out: str, response_field: str) -> NodeS
         input=source,
         on_success=out,
         on_error="discard",
-        options={
-            "prompt_template": "For {{ row.colour }} answer.",
-            "model": "test-model",
-            "response_field": response_field,
-            "required_input_fields": ["colour"],
-            "schema": {"mode": "observed"},
-        },
+        options=options,
         condition=None,
         routes=None,
         fork_to=None,
@@ -108,7 +166,14 @@ def _llm_node(node_id: str, source: str, out: str, response_field: str) -> NodeS
     )
 
 
-def _consumer(node_id: str, source: str, required: list[str], mapping: dict[str, str]) -> NodeSpec:
+def _consumer(node_id: str, source: str, required: list[str] | None, mapping: dict[str, str]) -> NodeSpec:
+    options: dict[str, Any] = {
+        "mapping": mapping,
+        "select_only": True,
+        "schema": {"mode": "observed"},
+    }
+    if required is not None:
+        options["required_input_fields"] = required
     return NodeSpec(
         id=node_id,
         node_type="transform",
@@ -116,12 +181,7 @@ def _consumer(node_id: str, source: str, required: list[str], mapping: dict[str,
         input=source,
         on_success="main",
         on_error="discard",
-        options={
-            "mapping": mapping,
-            "select_only": True,
-            "schema": {"mode": "observed"},
-            "required_input_fields": required,
-        },
+        options=options,
         condition=None,
         routes=None,
         fork_to=None,
@@ -162,9 +222,17 @@ def _probe_failed_warnings(summary: ValidationSummary) -> list[str]:
     return [w.message for w in summary.warnings if "Computed contract probe" in w.message]
 
 
-def _linear_summary(required: list[str]) -> ValidationSummary:
+def _linear_summary(required: list[str] | None, *, profile: str | None = "sonnet") -> ValidationSummary:
     state = _base_state()
-    state = state.with_node(_llm_node("recommend_pairing", "rows", "pairing_done", "complementary_colour"))
+    state = state.with_node(
+        _llm_node(
+            "recommend_pairing",
+            "rows",
+            "pairing_done",
+            "complementary_colour",
+            profile=profile,
+        )
+    )
     state = state.with_node(
         _consumer(
             "tidy_output",
@@ -176,7 +244,7 @@ def _linear_summary(required: list[str]) -> ValidationSummary:
     return _with_output(state).validate()
 
 
-def _fork_coalesce_summary(required: list[str]) -> ValidationSummary:
+def _fork_coalesce_summary(required: list[str] | None) -> ValidationSummary:
     """The live-session shape: fork -> two llm arms -> union coalesce -> consumer."""
     state = _base_state()
     state = state.with_node(
@@ -227,14 +295,23 @@ def _fork_coalesce_summary(required: list[str]) -> ValidationSummary:
 
 
 class TestLlmProducerGuarantees:
+    def test_unbound_llm_draft_still_fails_closed(self) -> None:
+        """The validation stub is profile lowering, not generic config repair."""
+        summary = _linear_summary(["colour", "complementary_colour"], profile=None)
+
+        assert "guarantees: [(none)]" in "\n".join(_contract_violations(summary))
+        assert _probe_failed_warnings(summary)
+
     def test_linear_llm_consumer_requiring_response_field_is_accepted(self) -> None:
-        summary = _linear_summary(["colour", "complementary_colour"])
+        # No hand-authored required_input_fields: the field_mapper mapping is
+        # the authority that derives this consumer contract.
+        summary = _linear_summary(None)
         assert _contract_violations(summary) == []
         assert summary.is_valid, [e.to_dict() for e in summary.errors]
 
     def test_linear_llm_probe_emits_no_probe_failure_warning(self) -> None:
         """The fail-closed arm must not be reached for a well-authored llm node."""
-        summary = _linear_summary(["colour", "complementary_colour"])
+        summary = _linear_summary(None)
         assert _probe_failed_warnings(summary) == []
 
     def test_linear_llm_consumer_requiring_absent_field_is_still_rejected(self) -> None:
@@ -250,8 +327,8 @@ class TestLlmProducerGuarantees:
         assert "complementary_colour" in joined
 
     def test_fork_coalesce_llm_pipeline_is_accepted(self) -> None:
-        """elspeth-d4ae04b374's live shape validates once llm guarantees are real."""
-        summary = _fork_coalesce_summary(["colour", "complementary_colour", "hex_code"])
+        """The live shape validates using field_mapper's DERIVED requirements."""
+        summary = _fork_coalesce_summary(None)
         assert _contract_violations(summary) == []
         assert summary.is_valid, [e.to_dict() for e in summary.errors]
 

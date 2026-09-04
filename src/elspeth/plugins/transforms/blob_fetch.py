@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+from dataclasses import dataclass
 from ipaddress import IPv4Network, IPv6Network
 from typing import Annotated, Any, Literal, cast
 
@@ -15,8 +16,10 @@ from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
@@ -200,8 +203,36 @@ def _final_response_ip(response: httpx.Response) -> str:
     return final_host
 
 
-def _normalized_content_type(response: httpx.Response) -> str:
-    return cast(str, response.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+@dataclass(frozen=True, slots=True)
+class _ContentType:
+    """The response's content-type header, parsed once at the HTTP boundary.
+
+    ``raw`` preserves absence as ``None`` so routed error metadata reports a
+    missing header as missing rather than as an externally supplied empty
+    string; ``normalized`` is the bare media type the allow-list decision uses.
+    """
+
+    raw: str | None
+    normalized: str
+
+
+@trust_boundary(
+    tier=3,
+    source="HTTP response headers returned by an external server via httpx",
+    source_param="response",
+    suppresses=("R1",),
+    invariant=(
+        "parses the content-type header into an owned _ContentType; an absent "
+        "header is preserved as raw=None and normalizes to the empty string, "
+        "which cannot match any configured allowed content type and so surfaces "
+        "as the row's unsupported_content_type error — never raises, never "
+        "fabricates a type"
+    ),
+    non_raising=True,
+)
+def _parse_content_type(response: httpx.Response) -> _ContentType:
+    raw = cast("str | None", response.headers.get("content-type"))
+    return _ContentType(raw=raw, normalized="" if raw is None else raw.split(";", 1)[0].strip().lower())
 
 
 def _blob_fetch_added_output_fields(cfg: BlobFetchConfig) -> tuple[FieldDefinition, ...]:
@@ -255,9 +286,11 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d4b8687389d9908c"
+    source_file_hash: str | None = "sha256:a7ec5ed8ed9cd12d"
     config_model = BlobFetchConfig
     passes_through_input = True
+    fetches_http = True
+    content_trust = ContentTrust.UNTRUSTED
     capability_tags: tuple[str, ...] = ("http", "network", "blob")
 
     usage_when_to_use = (
@@ -477,17 +510,17 @@ class BlobFetch(BaseTransform):
                 }
             )
 
-        content_type = _normalized_content_type(response)
+        content_type = _parse_content_type(response)
         safe_url = fingerprint_url(safe_request.original_url)
-        if content_type not in self._allowed_content_types:
+        if content_type.normalized not in self._allowed_content_types:
             return TransformResult.error(
                 {
                     "reason": "unsupported_content_type",
                     "error": (
-                        f"content-type {response.headers.get('content-type', '')!r} returned by {safe_url}; "
+                        f"content-type {content_type.raw!r} returned by {safe_url}; "
                         f"allowed values are {sorted(self._allowed_content_types)!r}"
                     ),
-                    "content_type": response.headers.get("content-type", ""),
+                    "content_type": content_type.raw,
                     "url": safe_url,
                 }
             )
@@ -514,7 +547,7 @@ class BlobFetch(BaseTransform):
 
         output = row.to_dict()
         output[self._blob_ref_field] = blob_ref
-        output[self._content_type_field] = content_type
+        output[self._content_type_field] = content_type.normalized
         output[self._size_bytes_field] = body_size
         output[self._sha256_field] = blob_ref
         output[self._fetch_status_field] = response.status_code

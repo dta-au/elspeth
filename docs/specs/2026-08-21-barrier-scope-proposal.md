@@ -2,6 +2,26 @@
 
 **Date:** 2026-08-21
 **Status:** PROPOSAL — **REVIEWED, THREE BLOCKERS. Not buildable as written.**
+**SUPERSEDED ON DESIGN (added 2026-09-03):** `2026-08-21-barrier-scopes-full-nesting-spec.md`
+(rev 3.2, same day) supersedes this document's *design content*. Its **§2 "Canonical
+vocabulary" holds the signed-off strings of record**; the table below survives only as the
+mapping from the maintainer's placeholder terms, and §2 wins wherever the two differ.
+
+All three blockers below are addressed by that spec's §1 unification — B1 by the single
+`lineage_path` frame stack replacing the tri-field, B2 by the one `group_losses` ledger and
+one frame-driven settlement routine, B3 by extending resume protection to all bound groups
+via the §8 fail-closed satisfiability gate. Carry the spec's own qualifier with that claim:
+the defect class is **relocated** into the declarative pop/roster rules, *not eliminated* —
+a better address, because one rule set is auditable and mutation-testable where the N-arm
+seam was not, but the corners (pop rule, roster equality, frame guard) must be adversarially
+tested. Live residue against B1 and B3 is tracked separately: the SESE universal B1's
+whole-nestedness argument rests on ("no token may leave a bound region except through its
+closer") is **refuted by 12 engine runs**, and B3's failure *class* — a run that looks fine
+and is not — recurs at a new address in the silent single-member convergence defect.
+
+What remains authoritative here is the **blocker analysis itself**: the record of *why* the
+unified model was necessary. Read this document for reasoning; read the spec for anything you
+intend to build or name.
 
 ## BLOCKERS (systems stress test, 2026-08-21 — all verified against source)
 
@@ -61,7 +81,7 @@ The maintainer proposed this using placeholder terms. Mapped to existing ELSPETH
 
 | Placeholder | ELSPETH term | Status |
 |---|---|---|
-| "span" | **barrier scope** | **NEW** — the tree has no term for the region between an opener and its barrier |
+| "span" | **barrier scope** | **NEW** — the tree has no term for the region between an opener and its barrier. **Do NOT adopt "span" itself: it is already taken, at this exact seam.** `engine/spans.py` is the OpenTelemetry span factory (`SpanFactory`, `run_span`, `span_id`, `EngineSpanStatus`; `opentelemetry-api`/`-sdk`/`-exporter-otlp` are hard dependencies, `pyproject.toml:62-64`), and an engine span is *also* a bounded, nested region of pipeline execution carrying run/token correlation — so the collision is not incidental, and `span_id` leaves the process on the wire to OTLP collectors. The distinction the names must preserve: an engine span **observes** execution and has no control semantics; a barrier scope **governs** it and can hold or fail the group. In an audit-first system, a reader who cannot tell recording from enforcement at a glance has lost the product's core guarantee. Same rule as "control edge" below. |
 | "span transforms" | **scope opener** (a `creates_tokens=True` node, ADR-015) and **scope closer** (the bound barrier) | opener/barrier exist; the *pairing* is new |
 | "family" | **token group** — `fork_group_id`, `expand_group_id`, `join_group_id` (`contracts/identity.py:22-23, 37-38`) | exists |
 | "family scramble mode" | `policy: require_all` | **exists** — `config.py:994`, `Literal["require_all","quorum","best_effort","first"]` |

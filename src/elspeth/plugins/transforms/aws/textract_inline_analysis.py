@@ -35,6 +35,7 @@ from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
@@ -255,9 +256,10 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:db1c84634024e96d"
+    source_file_hash: str | None = "sha256:c5977c9db0ea2125"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
+    content_trust = ContentTrust.UNTRUSTED
     creates_tokens = False
     audit_characteristics = frozenset({AuditCharacteristic.CREDENTIALS})
     # The catalogue caps tags at six; "document" is carried by textract/ocr.

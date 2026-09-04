@@ -268,8 +268,6 @@ def validate_sink_effect_type_capability(
         )
     effect_sink_type = cast("type[SinkEffectProtocol]", sink_type)
     sink_name = effect_sink_type.name
-    if not isinstance(required_input_kind, SinkEffectInputKind):
-        raise SinkEffectCapabilityError("Sink effect required input kind must be an exact SinkEffectInputKind")
     protocol_version = effect_sink_type.effect_protocol_version
     if protocol_version != SINK_EFFECT_PROTOCOL_VERSION:
         raise SinkEffectCapabilityError(

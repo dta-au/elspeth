@@ -349,6 +349,42 @@ async def test_argument_canonicalization_failure_records_arg_error() -> None:
     assert inv.result_canonical is not None
 
 
+@pytest.mark.asyncio
+async def test_result_canonicalization_failure_is_plugin_crash_never_sentinel() -> None:
+    """Un-canonicalizable SUCCESS output crashes; no synthesized evidence.
+
+    ``result_dict`` is our own handler's output, so a non-finite float in it
+    is a bug in our code (contrast the *arguments* path, which is Tier-3 LLM
+    input and takes the bounded sentinel). The finally block must reclassify
+    to PLUGIN_CRASH, record ``result_canonical is None`` — never a sentinel
+    hash masquerading as the real result — and re-raise so the client does
+    not receive an unaudited success.
+    """
+    catalog = create_catalog_service()
+    with tempfile.TemporaryDirectory() as td:
+        probe = _ProbeRecorder()
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
+        with patch(
+            "elspeth.composer_mcp.server._dispatch_tool",
+            return_value={"success": True, "data": {"non_finite": float("inf")}},
+        ):
+            response = await _call_handler(server.request_handlers, "get_pipeline_state", {})
+
+    # The MCP SDK frames the re-raised canonicalization failure as an
+    # isError CallToolResult AFTER the inner finally recorded the audit row.
+    assert response.root.isError is True
+
+    assert len(probe.invocations) == 1
+    inv = probe.invocations[0]
+    assert inv.status == ComposerToolStatus.PLUGIN_CRASH
+    assert inv.error_class == "ValueError"
+    # Class-name-only echo — pins the redaction discipline for this path.
+    assert inv.error_message == "ValueError"
+    assert inv.result_canonical is None
+    assert inv.result_hash is None
+    assert inv.version_after is None
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments"),
     [
@@ -404,7 +440,7 @@ async def test_set_pipeline_output_without_options_preserves_collision_control_e
             server.request_handlers,
             "set_pipeline",
             {
-                "source": None,
+                "source": {"plugin": "null", "on_success": "rows"},
                 "nodes": [],
                 "edges": [],
                 "outputs": [

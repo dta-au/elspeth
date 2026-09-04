@@ -43,7 +43,7 @@
       },
       {
         "default": false,
-        "description": "When true, fail if any mapped source field is missing from an input row.",
+        "description": "Controls direct process() calls for a missing normalized source. Normal engine execution requires every configured source before process(); dotted and unresolved original-header misses always route.",
         "kind": "checkbox",
         "label": "Strict",
         "name": "strict",

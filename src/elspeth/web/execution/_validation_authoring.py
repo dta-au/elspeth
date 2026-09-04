@@ -23,6 +23,7 @@ from elspeth.core.secrets import (
     parse_secret_ref_marker,
     secret_env_ref_name,
 )
+from elspeth.plugins.infrastructure.manager import http_fetch_transform_names
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import (
@@ -89,10 +90,9 @@ _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], 
 )
 _DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the required control path, then validate again."
 
-_WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
-_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
-_WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
-_WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
+_WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS = 30
+_WEB_HTTP_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
+_WEB_HTTP_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,20 +109,21 @@ def _parse_resource_limit(
     raw_value: object,
     *,
     component_id: str,
+    plugin_name: str,
     option_name: str,
     maximum: int,
 ) -> _ParsedResourceLimit:
     """Parse one Pydantic-derived web limit into an explicit typed outcome."""
     try:
-        value = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_value)
+        value = _WEB_HTTP_FETCH_INT_ADAPTER.validate_python(raw_value)
     except PydanticValidationError:
         return _ParsedResourceLimit(
             value=None,
             error=ValidationError(
                 component_id=component_id,
                 component_type="transform",
-                message=f"blob_fetch.http.{option_name} must be an integer; got {type(raw_value).__name__}.",
-                suggestion=f"Set blob_fetch.http.{option_name} to an integer from 0 to {maximum}.",
+                message=f"{plugin_name}.http.{option_name} must be an integer; got {type(raw_value).__name__}.",
+                suggestion=f"Set {plugin_name}.http.{option_name} to an integer from 0 to {maximum}.",
                 error_code="web_fetch_resource_config_invalid",
             ),
         )
@@ -468,8 +469,9 @@ def validate_web_network_policy(
 ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
     """Reject web-authored private-network fetch configuration."""
     errors: list[ValidationError] = []
+    fetch_transform_names = http_fetch_transform_names()
     for node in policy.state.nodes:
-        if plugin_snapshot.is_trained_operator or node.plugin not in _WEB_FETCH_TRANSFORMS:
+        if plugin_snapshot.is_trained_operator or node.plugin not in fetch_transform_names:
             continue
         http_options = node.options["http"] if "http" in node.options else None
         if not isinstance(http_options, Mapping) or "allowed_hosts" not in http_options:
@@ -540,11 +542,12 @@ def validate_web_resource_policy(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
 ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
-    """Bound blob-fetch resource use for web-authored pipelines."""
+    """Bound direct HTTP-fetch resource use for web-authored pipelines."""
     errors: list[ValidationError] = []
+    fetch_transform_names = http_fetch_transform_names()
     if not plugin_snapshot.is_trained_operator:
         for node in policy.state.nodes:
-            if node.plugin != "blob_fetch" or "http" not in node.options:
+            if node.plugin not in fetch_transform_names or "http" not in node.options:
                 continue
             http_options = node.options["http"]
             if not isinstance(http_options, Mapping):
@@ -552,8 +555,8 @@ def validate_web_resource_policy(
                     ValidationError(
                         component_id=node.id,
                         component_type="transform",
-                        message=f"blob_fetch.http must be a mapping; got {type(http_options).__name__}.",
-                        suggestion="Set blob_fetch.http to a mapping of HTTP resource options.",
+                        message=f"{node.plugin}.http must be a mapping; got {type(http_options).__name__}.",
+                        suggestion=f"Set {node.plugin}.http to a mapping of HTTP resource options.",
                         error_code="web_fetch_resource_config_invalid",
                     )
                 )
@@ -563,21 +566,22 @@ def validate_web_resource_policy(
                 parsed_timeout = _parse_resource_limit(
                     raw_timeout,
                     component_id=node.id,
+                    plugin_name=node.plugin,
                     option_name="timeout",
-                    maximum=_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS,
+                    maximum=_WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS,
                 )
                 if parsed_timeout.error is not None:
                     errors.append(parsed_timeout.error)
-                elif parsed_timeout.value is not None and parsed_timeout.value > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
+                elif parsed_timeout.value is not None and parsed_timeout.value > _WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS:
                     errors.append(
                         ValidationError(
                             component_id=node.id,
                             component_type="transform",
                             message=(
-                                f"blob_fetch.http.timeout={parsed_timeout.value} exceeds the web execution limit of "
-                                f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
+                                f"{node.plugin}.http.timeout={parsed_timeout.value} exceeds the web execution limit of "
+                                f"{_WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS} seconds."
                             ),
-                            suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
+                            suggestion=f"Set {node.plugin}.http.timeout to {_WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS} or less.",
                             error_code="web_fetch_resource_limit_exceeded",
                         )
                     )
@@ -586,21 +590,22 @@ def validate_web_resource_policy(
                 parsed_max_body_bytes = _parse_resource_limit(
                     raw_max_body_bytes,
                     component_id=node.id,
+                    plugin_name=node.plugin,
                     option_name="max_body_bytes",
-                    maximum=_WEB_BLOB_FETCH_MAX_BODY_BYTES,
+                    maximum=_WEB_HTTP_FETCH_MAX_BODY_BYTES,
                 )
                 if parsed_max_body_bytes.error is not None:
                     errors.append(parsed_max_body_bytes.error)
-                elif parsed_max_body_bytes.value is not None and parsed_max_body_bytes.value > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
+                elif parsed_max_body_bytes.value is not None and parsed_max_body_bytes.value > _WEB_HTTP_FETCH_MAX_BODY_BYTES:
                     errors.append(
                         ValidationError(
                             component_id=node.id,
                             component_type="transform",
                             message=(
-                                f"blob_fetch.http.max_body_bytes={parsed_max_body_bytes.value} exceeds the web execution limit of "
-                                f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
+                                f"{node.plugin}.http.max_body_bytes={parsed_max_body_bytes.value} exceeds the web execution limit of "
+                                f"{_WEB_HTTP_FETCH_MAX_BODY_BYTES} bytes."
                             ),
-                            suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
+                            suggestion=f"Set {node.plugin}.http.max_body_bytes to {_WEB_HTTP_FETCH_MAX_BODY_BYTES} or less.",
                             error_code="web_fetch_resource_limit_exceeded",
                         )
                     )
@@ -610,22 +615,22 @@ def validate_web_resource_policy(
             failed_check=ValidationCheck(
                 name=CHECK_WEB_FETCH_RESOURCE_POLICY,
                 passed=False,
-                detail="blob_fetch resource configuration violates the web execution policy",
+                detail="HTTP-fetch resource configuration violates the web execution policy",
                 affected_nodes=tuple(error.component_id for error in errors if error.component_id is not None),
                 outcome_code=None,
             ),
             errors=tuple(errors),
             readiness=_blocked_readiness(
                 code=CHECK_WEB_FETCH_RESOURCE_POLICY,
-                detail="blob_fetch resource configuration violates the web execution policy.",
+                detail="HTTP-fetch resource configuration violates the web execution policy.",
                 component_id=errors[0].component_id,
                 component_type="transform",
             ),
         )
     detail = (
-        "Local trained-operator validation is exempt from the web blob_fetch resource policy"
+        "Local trained-operator validation is exempt from the web HTTP-fetch resource policy"
         if plugin_snapshot.is_trained_operator
-        else "No blob_fetch resource limits exceed the web execution policy"
+        else "No HTTP-fetch resource limits exceed the web execution policy"
     )
     return PhaseReport(
         artifact=policy,

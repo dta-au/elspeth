@@ -55,7 +55,9 @@ def _get_guided(client: TestClient, session_id: str) -> dict:
 def _start_guided(client: TestClient, session_id: str) -> dict:
     response = client.post(
         f"/api/sessions/{session_id}/guided/start",
-        json={"profile": "tutorial", "operation_id": str(uuid4())},
+        # Goal-first (elspeth-378cfa0e18): the tutorial profile carries a goal
+        # through the same door every other profile does.
+        json={"profile": "tutorial", "intent": "Build the pipeline I describe.", "operation_id": str(uuid4())},
     )
     assert response.status_code == 200, response.json()
     return response.json()
@@ -798,10 +800,15 @@ class TestGetGuidedFullStateRebuild:
             f"Expected multi_select_with_custom but got {body['next_turn']['type']!r} — "
             "Codex #10 regression: GET /guided returned single_select instead of multi_select"
         )
-        # Defaults come from the server-held reviewed source projection.
+        # Options come from the server-held reviewed source projection; nothing
+        # is pre-pinned (I-3, design review 2026-09-02): pass-through is the
+        # designed default, pinning is a deliberate tick.
         payload = body["next_turn"]["payload"]
-        assert "col_a" in payload["default_chosen"]
-        assert "col_b" in payload["default_chosen"]
+        option_ids = [option["id"] for option in payload["options"]]
+        assert "col_a" in option_ids
+        assert "col_b" in option_ids
+        assert payload["default_chosen"] == []
+        assert payload["escape_label"] is not None
 
     # ------------------------------------------------------------------
     # M5: Step 1 INSPECT_AND_CONFIRM rebuild (Codex #14)
@@ -856,3 +863,140 @@ class TestGetGuidedFullStateRebuild:
         observed = body["next_turn"]["payload"]["observed"]
         assert "col_a" in observed["columns"]
         assert "col_b" in observed["columns"]
+
+
+class TestGetGuidedReviewedComponentsLedger:
+    """``guided_session.reviewed_components`` over the real HTTP projection.
+
+    The unit pins in ``tests/unit/web/sessions/test_guided_reviewed_components.py``
+    own the projector's shape and its redaction boundary. These exercise the
+    route: the GET handler builds its own ``GuidedSessionResponse`` (it does
+    not go through ``guided_replay._guided_session_response``), so a site that
+    forgot the field would only be caught here — and the completed case is the
+    one the retired client-side fold could never serve, because a terminal
+    session carries no ``next_turn`` to fold.
+    """
+
+    PRIVATE_PATH = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
+    PRIVATE_CELL = "Ada Lovelace, 22 Maida Vale"
+
+    def _reviewed_source(self, name: str, *, plugin: str = "csv") -> dict:
+        return {
+            "name": name,
+            "plugin": plugin,
+            "options": {"path": self.PRIVATE_PATH, "schema": {"mode": "observed"}},
+            "observed_columns": ["colour_name", "resident"],
+            "sample_rows": [{"colour_name": "red", "resident": self.PRIVATE_CELL}],
+            "on_validation_failure": "discard",
+            "content_hash_prefix": "9f8e7d6c5b4a3928",
+        }
+
+    def _reviewed_output(self, name: str) -> dict:
+        return {
+            "name": name,
+            "plugin": "json",
+            "options": {"path": "/srv/elspeth/exports/colours.json"},
+            "required_fields": ["colour_name"],
+            "schema_mode": "observed",
+            "on_write_failure": "discard",
+        }
+
+    def test_mid_walk_ledger_names_both_kinds_in_authored_order(self, composer_test_client: TestClient) -> None:
+        session_id = _create_session(composer_test_client)
+        first_source, second_source, output_id = str(uuid4()), str(uuid4()), str(uuid4())
+
+        _seed_guided_session(
+            composer_test_client,
+            session_id,
+            {
+                "step": "step_2_sink",
+                "history": [],
+                "source_order": [second_source, first_source],
+                "reviewed_sources": {
+                    first_source: self._reviewed_source("colours"),
+                    second_source: self._reviewed_source("orders", plugin="jsonl"),
+                },
+                "output_order": [output_id],
+                "reviewed_outputs": {output_id: self._reviewed_output("report")},
+            },
+        )
+
+        ledger = _get_guided(composer_test_client, session_id)["guided_session"]["reviewed_components"]
+
+        assert ledger["sources"] == [
+            {"stable_id": second_source, "name": "orders", "plugin": "jsonl", "status": "reviewed"},
+            {"stable_id": first_source, "name": "colours", "plugin": "csv", "status": "reviewed"},
+        ]
+        assert ledger["outputs"] == [{"stable_id": output_id, "name": "report", "plugin": "json", "status": "reviewed"}]
+
+    def test_ledger_redacts_what_the_checkpoint_beside_it_still_carries(self, composer_test_client: TestClient) -> None:
+        """The absence is redaction, not missing data.
+
+        The same response's ``composition_state.composer_meta.guided_session``
+        carries the reviewed path and sample cell in full — that is the
+        Tier-3-bearing custody surface. Asserting both halves in one test is
+        what keeps this honest: a projector that simply lost the reviewed
+        components would pass a bare "no path on the wire" assertion.
+        """
+        session_id = _create_session(composer_test_client)
+        source_id = str(uuid4())
+
+        _seed_guided_session(
+            composer_test_client,
+            session_id,
+            {
+                "step": "step_2_sink",
+                "history": [],
+                "source_order": [source_id],
+                "reviewed_sources": {source_id: self._reviewed_source("colours")},
+            },
+        )
+
+        body = _get_guided(composer_test_client, session_id)
+        ledger_bytes = json.dumps(body["guided_session"]["reviewed_components"], sort_keys=True)
+        checkpoint = body["composition_state"]["composer_meta"]["guided_session"]["reviewed_sources"][source_id]
+
+        assert body["guided_session"]["reviewed_components"]["sources"][0]["name"] == "colours"
+        assert self.PRIVATE_PATH not in ledger_bytes
+        assert self.PRIVATE_CELL not in ledger_bytes
+        assert "content_hash_prefix" not in ledger_bytes
+        assert checkpoint["sample_rows"] == [{"colour_name": "red", "resident": self.PRIVATE_CELL}]
+
+    def test_a_terminal_completed_session_serves_a_populated_ledger(self, composer_test_client: TestClient) -> None:
+        """The surface the read-only decision sheets are built for.
+
+        ``next_turn`` is ``None`` on a completed session, so the client-side
+        fold this field replaced had nothing to fold — the graduation view
+        selected a session whose ledger was necessarily empty.
+        """
+        session_id = _create_session(composer_test_client)
+        source_id, output_id = str(uuid4()), str(uuid4())
+
+        _seed_guided_session(
+            composer_test_client,
+            session_id,
+            {
+                "step": "step_4_wire",
+                "history": [],
+                "source_order": [source_id],
+                "reviewed_sources": {source_id: self._reviewed_source("colours")},
+                "output_order": [output_id],
+                "reviewed_outputs": {output_id: self._reviewed_output("report")},
+                "terminal": {"kind": "completed", "reason": None, "pipeline_yaml": "sources: {}\n"},
+            },
+        )
+
+        body = _get_guided(composer_test_client, session_id)
+
+        assert body["next_turn"] is None
+        assert body["terminal"]["kind"] == "completed"
+        assert [item["name"] for item in body["guided_session"]["reviewed_components"]["sources"]] == ["colours"]
+        assert [item["name"] for item in body["guided_session"]["reviewed_components"]["outputs"]] == ["report"]
+
+    def test_a_fresh_session_serves_two_empty_lists(self, composer_test_client: TestClient) -> None:
+        session_id = _create_session(composer_test_client)
+        _start_guided(composer_test_client, session_id)
+
+        ledger = _get_guided(composer_test_client, session_id)["guided_session"]["reviewed_components"]
+
+        assert ledger == {"sources": [], "outputs": []}

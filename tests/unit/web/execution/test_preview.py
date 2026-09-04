@@ -7,12 +7,45 @@ The endpoint-level tests live in ``test_outputs_routes.py``.
 
 from __future__ import annotations
 
+import csv
+import io
 from pathlib import Path
+
+import pytest
 
 from elspeth.web.execution.preview import (
     _classify_text_or_binary,
     build_artifact_preview,
 )
+
+
+def _write_llm_csv(
+    path: Path,
+    *,
+    record_count: int,
+    answer_lines: int,
+    delimiter: str = ",",
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("id", "question", "answer", "answer_usage"),
+            delimiter=delimiter,
+        )
+        writer.writeheader()
+        for index in range(record_count):
+            writer.writerow(
+                {
+                    "id": index,
+                    "question": f"Question {index}?",
+                    "answer": "\n".join(f"answer {index} line {line_number}" for line_number in range(answer_lines)),
+                    "answer_usage": {
+                        "completion_tokens": 60,
+                        "prompt_tokens": 100,
+                        "total_tokens": 160,
+                    },
+                }
+            )
 
 
 class TestClassifyTextOrBinary:
@@ -83,7 +116,96 @@ class TestBuildArtifactPreview:
         assert preview.content_type == "csv"
         assert preview.row_count_preview == 50
         assert preview.truncated is True
-        assert preview.preview_text.count("\n") == 49  # 50 lines joined by 49 newlines
+        assert preview.preview_text.count("\n") == 50  # 50 complete records
+
+    @pytest.mark.parametrize(
+        ("record_count", "answer_lines"),
+        ((30, 6), (5, 120)),
+    )
+    def test_csv_multiline_llm_records_are_capped_as_logical_records(
+        self,
+        tmp_path: Path,
+        record_count: int,
+        answer_lines: int,
+    ) -> None:
+        f = tmp_path / f"llm_{record_count}x{answer_lines}.csv"
+        _write_llm_csv(
+            f,
+            record_count=record_count,
+            answer_lines=answer_lines,
+        )
+
+        preview = build_artifact_preview(f, artifact_id="art-multiline")
+
+        parsed_rows = list(csv.reader(io.StringIO(preview.preview_text), strict=True))
+        assert len(parsed_rows) == record_count + 1  # header plus every data record
+        assert preview.row_count_preview == len(parsed_rows)
+        assert preview.preview_text == f.read_bytes().decode("utf-8")
+        assert preview.truncated is False
+
+    def test_csv_row_cap_counts_quoted_multiline_records(self, tmp_path: Path) -> None:
+        f = tmp_path / "multiline_row_cap.csv"
+        _write_llm_csv(f, record_count=8, answer_lines=3)
+
+        preview = build_artifact_preview(
+            f,
+            artifact_id="art-logical-row-cap",
+            row_cap=4,
+        )
+
+        parsed_rows = list(csv.reader(io.StringIO(preview.preview_text), strict=True))
+        assert len(parsed_rows) == 4  # header plus three complete data records
+        assert preview.row_count_preview == len(parsed_rows)
+        assert preview.truncated is True
+
+    @pytest.mark.parametrize("partial_value", ('"line one\nline two', "partial-unquoted"))
+    def test_csv_byte_cap_omits_the_partial_final_record(
+        self,
+        tmp_path: Path,
+        partial_value: str,
+    ) -> None:
+        f = tmp_path / "byte_capped.csv"
+        complete_prefix = "id,value\r\n1,complete\r\n"
+        content = complete_prefix + f"2,{partial_value}\r\n3,unseen\r\n"
+        f.write_bytes(content.encode("utf-8"))
+        byte_cap = len((complete_prefix + f"2,{partial_value}").encode("utf-8"))
+
+        preview = build_artifact_preview(
+            f,
+            artifact_id="art-byte-cap",
+            byte_cap=byte_cap,
+        )
+
+        assert preview.preview_text == complete_prefix
+        assert preview.row_count_preview == 2
+        assert len(list(csv.reader(io.StringIO(preview.preview_text), strict=True))) == 2
+        assert preview.truncated is True
+
+    def test_malformed_csv_degrades_to_raw_text_without_a_row_count(self, tmp_path: Path) -> None:
+        f = tmp_path / "malformed.csv"
+        content = 'id,note\n1,"unterminated\nstill open'
+        f.write_text(content, encoding="utf-8")
+
+        preview = build_artifact_preview(f, artifact_id="art-malformed")
+
+        assert preview.preview_text == content
+        assert preview.row_count_preview is None
+        assert preview.truncated is False
+
+    def test_tsv_row_cap_honours_quoted_multiline_records(self, tmp_path: Path) -> None:
+        f = tmp_path / "multiline.tsv"
+        _write_llm_csv(f, record_count=3, answer_lines=4, delimiter="\t")
+
+        preview = build_artifact_preview(
+            f,
+            artifact_id="art-tsv",
+            row_cap=2,
+        )
+
+        parsed_rows = list(csv.reader(io.StringIO(preview.preview_text), delimiter="\t", strict=True))
+        assert len(parsed_rows) == 2
+        assert preview.row_count_preview == len(parsed_rows)
+        assert preview.truncated is True
 
     def test_text_under_byte_cap_returns_full_content(self, tmp_path: Path) -> None:
         f = tmp_path / "log.txt"
@@ -138,6 +260,48 @@ class TestBuildArtifactPreview:
         assert preview.content_type == "jsonl"
         assert preview.row_count_preview == 2
 
+    def test_jsonl_byte_cap_omits_the_partial_final_record(self, tmp_path: Path) -> None:
+        f = tmp_path / "byte_capped.jsonl"
+        complete_prefix = '{"id":1}\n'
+        content = complete_prefix + '{"id":2,"value":"partial"}\n{"id":3}\n'
+        f.write_text(content, encoding="utf-8")
+        byte_cap = len((complete_prefix + '{"id":2,"value":"part').encode("utf-8"))
+
+        preview = build_artifact_preview(
+            f,
+            artifact_id="art-jsonl-byte-cap",
+            byte_cap=byte_cap,
+        )
+
+        assert preview.preview_text == complete_prefix
+        assert preview.row_count_preview == 1
+        assert preview.truncated is True
+
+    def test_jsonl_row_cap_counts_nonempty_logical_records(self, tmp_path: Path) -> None:
+        f = tmp_path / "blank_lines.jsonl"
+        f.write_text('{"id":1}\n\n{"id":2}\n{"id":3}\n', encoding="utf-8")
+
+        preview = build_artifact_preview(
+            f,
+            artifact_id="art-jsonl-row-cap",
+            row_cap=2,
+        )
+
+        assert preview.preview_text == '{"id":1}\n\n{"id":2}\n'
+        assert preview.row_count_preview == 2
+        assert preview.truncated is True
+
+    def test_jsonl_crlf_blank_frames_are_not_counted(self, tmp_path: Path) -> None:
+        f = tmp_path / "crlf_blank_lines.jsonl"
+        content = b'{"id":1}\r\n\r\n{"id":2}\r\n'
+        f.write_bytes(content)
+
+        preview = build_artifact_preview(f, artifact_id="art-jsonl-crlf")
+
+        assert preview.preview_text == content.decode("utf-8")
+        assert preview.row_count_preview == 2
+        assert preview.truncated is False
+
     def test_json_extension_uses_json_content_type(self, tmp_path: Path) -> None:
         f = tmp_path / "doc.json"
         f.write_text('{"key": "value"}')
@@ -158,8 +322,8 @@ class TestBuildArtifactPreview:
 
     def test_csv_with_byte_cap_below_row_cap_marks_truncated(self, tmp_path: Path) -> None:
         # The byte cap fires before the row cap: even though we have
-        # fewer than row_cap full lines, the final line may itself be
-        # cut. Truncated must be True.
+        # fewer than row_cap complete records, the final record may itself
+        # be cut and withheld. Truncated must be True.
         f = tmp_path / "small_rows_huge_cells.csv"
         f.write_text("a,b\n" + ("x" * 100 + ",y\n") * 20)  # ~2 KiB
 

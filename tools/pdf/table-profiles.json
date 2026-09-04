@@ -1,4 +1,104 @@
 {
-  "_comment": "Table column-width profiles for the ELSPETH arch-pack PDF pipeline. Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF.",
-  "profiles": []
+  "_comment": "Table column-width profiles for the ELSPETH PDF pipelines (arch-pack and control-pack). Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF. Matchers name at least two header cells so a profile cannot capture an unrelated table of the same width.",
+  "profiles": [
+    {
+      "_doc": "control-pack: RAID tier table (reader / visibility)",
+      "cols": 7,
+      "match": {
+        "col_1": "id",
+        "col_2": "entry",
+        "col_5": "posture"
+      },
+      "widths": [
+        0.05,
+        0.34,
+        0.07,
+        0.14,
+        0.07,
+        0.1,
+        0.23
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID what-is-being-asked",
+      "cols": 5,
+      "match": {
+        "col_1": "decision",
+        "col_2": "options",
+        "col_3": "decide by"
+      },
+      "widths": [
+        0.2,
+        0.28,
+        0.15,
+        0.07,
+        0.3
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID carried deliberately",
+      "cols": 3,
+      "match": {
+        "col_1": "item",
+        "col_2": "why",
+        "col_3": "review"
+      },
+      "widths": [
+        0.25,
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "_doc": "control-pack: RAID watch list",
+      "cols": 2,
+      "match": {
+        "col_1": "indicator",
+        "col_2": "entry"
+      },
+      "widths": [
+        0.7,
+        0.3
+      ]
+    },
+    {
+      "_doc": "control-pack: programme corrections table",
+      "cols": 2,
+      "match": {
+        "col_1": "prior framing",
+        "col_2": "measured position"
+      },
+      "widths": [
+        0.35,
+        0.65
+      ]
+    },
+    {
+      "_doc": "control-pack: programme pilot-vs-durable options",
+      "cols": 3,
+      "match": {
+        "col_2_contains": "option a",
+        "col_3_contains": "option b"
+      },
+      "widths": [
+        0.2,
+        0.4,
+        0.4
+      ]
+    },
+    {
+      "_doc": "control-pack: programme terminology",
+      "cols": 3,
+      "match": {
+        "col_1": "informal",
+        "col_2": "term of record",
+        "col_3": "note"
+      },
+      "widths": [
+        0.22,
+        0.25,
+        0.53
+      ]
+    }
+  ]
 }

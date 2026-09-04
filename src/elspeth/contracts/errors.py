@@ -666,7 +666,7 @@ class TransformErrorReason(TypedDict):
         response: Full response object for debugging
         response_keys: Keys present in response dict
         body_preview: HTTP body preview for errors
-        content_type: Content-Type header value
+        content_type: Raw Content-Type header value; None when the header was absent
 
     Type validation context:
         expected: Expected type or value
@@ -776,7 +776,7 @@ class TransformErrorReason(TypedDict):
     response: NotRequired[dict[str, Any]]
     response_keys: NotRequired[list[str] | None]
     body_preview: NotRequired[str]  # HTTP body preview; absent = empty/unavailable
-    content_type: NotRequired[str]
+    content_type: NotRequired[str | None]  # Raw Content-Type header; None = the server sent none
     body_size: NotRequired[int]  # Actual response body size in bytes (body_too_large errors)
     max_body_bytes: NotRequired[int]  # Configured limit in bytes (body_too_large errors)
     max_blob_bytes: NotRequired[int]  # Configured blob parser limit in bytes
@@ -986,6 +986,20 @@ class AuditIntegrityError(Exception):
     ) -> None:
         super().__init__(*args)
         self.failed_turn = failed_turn
+
+
+@tier_1_error(
+    reason="ADR-008: guided reviewed-source custody cannot bind to the live sources — the audit trail's source provenance is unprovable",
+    caller_module=__name__,
+)
+class GuidedCustodyIntegrityError(AuditIntegrityError):
+    """Raised when a guided session's retained source review cannot bind.
+
+    Every guided blob custody validator and the custody projection raise this
+    subclass so a read arm can name the condition (a stable 409 on a legacy
+    tip persisted before the write gate) without catching the whole
+    ``AuditIntegrityError`` family as if it were custody.
+    """
 
 
 # TIER-2: Authoring-state lowering defect — the state is malformed, no audit mutation has begun, and the author can repair and retry.
@@ -1500,6 +1514,15 @@ class PluginRetryableError(Exception):
     All plugin error types that may be retried by the engine's RetryManager
     must inherit from this class. The processor catches PluginRetryableError
     and dispatches to retry logic based on the retryable attribute.
+
+    Deliberate engine-classified carve-out: the processor additionally treats
+    the Python runtime's canonical transient transport signals —
+    ``ConnectionError`` and ``TimeoutError`` — and the contract-owned
+    ``CapacityError`` (``retryable`` always True) as retryable, because they
+    can surface from beneath provider SDKs without a plugin seam to classify
+    them. No other unclassified exception is retried; in particular bare
+    ``OSError`` (``FileNotFoundError``, ``PermissionError``, ...) is a plugin
+    bug-class and crashes.
 
     Attributes:
         retryable: Whether the error is transient and should be retried.

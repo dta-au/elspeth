@@ -2,24 +2,21 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui";
 import { stepLabelForPlugin } from "@/components/chat/interpretationStepLabel";
+import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import { useShowAdvanced } from "@/stores/preferencesStore";
+import { useSessionStore } from "@/stores/sessionStore";
 
 import type {
   GuidedEditTarget,
   GuidedProposalReviewState,
   GuidedProposalRetryAction,
   GuidedRespondAction,
-  ProposalFlow,
   ProposePipelinePayload,
 } from "@/types/guided";
-import {
-  ReadOnlyPipelineGraph,
-  type ReadOnlyPipelineGraphEdge,
-  type ReadOnlyPipelineGraphNode,
-} from "./ReadOnlyPipelineGraph";
 import { behaviorSummary, gateSummary } from "./behaviorSummary";
+import { flowLabel, routeKeysByAlias } from "./guidedGraphProjection";
+import { NodeOptionsSummary } from "./nodeOptionDisplay";
 import { optionTier } from "./optionTiers";
-import { nodeOptionText } from "./WireStageTurn";
 import { WireReviewList, type WireReviewItem } from "./WireReviewList";
 
 interface ProposePipelineTurnProps {
@@ -43,8 +40,6 @@ interface ProposePipelineTurnProps {
   disabled?: boolean;
   isTutorial?: boolean;
 }
-
-const DISCARD_NODE_ID = "guided-proposal-discard";
 
 const BLOCKER_COPY: Record<ProposePipelinePayload["blockers"][number]["code"], string> = {
   pipeline_invalid: "The proposed pipeline has validation problems that must be revised.",
@@ -82,43 +77,6 @@ function sameRetryAction(
   );
 }
 
-/** Human name for one gate route: "when true (route-1)". The ordinal alias
- *  stays visible — it is the revise-target / integrity token — while the
- *  author-visible key says which branch this actually is (F11). */
-function routeName(alias: string, routeKeys: ReadonlyMap<string, string>): string {
-  const key = routeKeys.get(alias);
-  return key === undefined ? alias : `when ${key} (${alias})`;
-}
-
-function flowLabel(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): string {
-  switch (flow.kind) {
-    case "source_success":
-      return flow.branch === null ? "on source success" : `on source success in ${flow.branch}`;
-    case "source_validation_failure":
-      return "on validation failure";
-    case "node_success":
-      return flow.branch === null ? "on success" : `on success in ${flow.branch}`;
-    case "node_error":
-      return "on error";
-    case "gate_route": {
-      const label = routeName(flow.route, routeKeys);
-      return flow.branch === null ? label : `${label} in ${flow.branch}`;
-    }
-    case "gate_fork":
-      return `${flow.routes.map((route) => routeName(route, routeKeys)).join(" + ")} forks to ${flow.branch}`;
-    case "queue_continue":
-      return flow.branch === null ? "queue continues" : `queue continues in ${flow.branch}`;
-    case "coalesce_success":
-      return flow.branch === null ? "after join" : `after join in ${flow.branch}`;
-    case "row_union_success":
-      return flow.branch === null
-        ? "after row union"
-        : `after row union in ${flow.branch}`;
-    case "output_write_failure":
-      return "on write failure";
-  }
-}
-
 function reviewStatusCopy(
   state: GuidedProposalReviewState,
   isCurrentBinding: boolean,
@@ -146,6 +104,29 @@ function reviewStatusCopy(
   }
 }
 
+/**
+ * The proposal's one-line summary, DERIVED from the node count.
+ *
+ * It used to be the fixed sentence "A complete pipeline is ready for review."
+ * That sentence was a claim the card could not support: a zero-node
+ * pass-through — rows going straight from source to output, which is a
+ * legitimate proposal when the goal names no processing — was announced as a
+ * "complete pipeline", and so was every planner result regardless of what it
+ * actually built. Reading the count the payload already carries says the true
+ * thing in both cases and costs nothing (the counts strip below renders the
+ * same field).
+ */
+function proposalHeadline(nodeCount: number): string {
+  if (nodeCount === 0) {
+    return "The assistant proposes no processing steps — rows pass straight from your source to your output.";
+  }
+  // Singular matters: the one-node case is the common shape for a simple goal,
+  // and "1 processing steps" reads as a bug in the thing the user is being
+  // asked to trust.
+  const steps = nodeCount === 1 ? "1 processing step" : `${nodeCount} processing steps`;
+  return `The assistant proposed ${steps} from your goal.`;
+}
+
 export function ProposePipelineTurn({
   payload,
   reviewState,
@@ -155,6 +136,7 @@ export function ProposePipelineTurn({
   isTutorial = false,
 }: ProposePipelineTurnProps): JSX.Element {
   const showAdvanced = useShowAdvanced();
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const statusRef = useRef<HTMLParagraphElement | null>(null);
   const revisionFeedbackId = useId();
   const retainedCorrection =
@@ -176,6 +158,20 @@ export function ProposePipelineTurn({
   const [revisionFeedback, setRevisionFeedback] = useState(
     retainedCorrection?.correction_feedback ?? "",
   );
+  // "Edit prompt" on an llm row (I-2) opens the SAME node-scoped revise the
+  // "Revise <node>" button opens — pre-targeted — and hands focus to the
+  // feedback field once it has mounted. The planner re-plans the node from
+  // that feedback; there is no local prompt editor (composer invariant 1).
+  const revisionFeedbackRef = useRef<HTMLTextAreaElement | null>(null);
+  const focusRevisionFeedbackOnMount = useRef(false);
+  useEffect(() => {
+    if (focusRevisionFeedbackOnMount.current && revisionFeedbackRef.current !== null) {
+      focusRevisionFeedbackOnMount.current = false;
+      revisionFeedbackRef.current.focus();
+    }
+  }, [revisionTarget]);
+  const nodeReviseTarget = (stableId: string): GuidedEditTarget | null =>
+    payload.edit_targets.find((target) => target.kind === "node" && target.stable_id === stableId) ?? null;
   const labelById = useMemo(() => {
     const labels = new Map<string, string>();
     for (const source of payload.graph.sources) labels.set(source.stable_id, source.label);
@@ -183,58 +179,9 @@ export function ProposePipelineTurn({
     for (const output of payload.outputs) labels.set(output.stable_id, output.label);
     return labels;
   }, [payload]);
-  // Alias → author-visible route key, from each gate's behavior bindings
-  // (bijective with route_aliases; aliases are globally unique ordinals, so
-  // one flat map covers every gate).
-  const routeKeyByAlias = useMemo(() => {
-    const keys = new Map<string, string>();
-    for (const node of payload.nodes) {
-      if (node.behavior.kind !== "gate") continue;
-      for (const { alias, key } of node.behavior.routes) keys.set(alias, key);
-    }
-    return keys;
-  }, [payload.nodes]);
-  const hasDiscard = payload.graph.edges.some((edge) => edge.to_endpoint.kind === "discard");
-  const graphNodes = useMemo<ReadOnlyPipelineGraphNode[]>(() => [
-    ...payload.graph.sources.map((source) => ({
-      id: source.stable_id,
-      label: source.label,
-      kind: "source" as const,
-      subtitle: stepLabelForPlugin(source.plugin.id),
-    })),
-    ...payload.nodes.map((node) => ({
-      id: node.stable_id,
-      label: node.label,
-      kind: node.node_type,
-      subtitle: node.plugin === null ? null : stepLabelForPlugin(node.plugin.id),
-    })),
-    ...payload.outputs.map((output) => ({
-      id: output.stable_id,
-      label: output.label,
-      kind: "output" as const,
-      subtitle: stepLabelForPlugin(output.plugin.id),
-    })),
-    ...(hasDiscard
-      ? [{ id: DISCARD_NODE_ID, label: "discard", kind: "discard" as const, subtitle: null }]
-      : []),
-  ], [hasDiscard, payload]);
-  const graphEdges = useMemo<ReadOnlyPipelineGraphEdge[]>(() =>
-    payload.graph.edges.map((edge) => {
-      const targetId = edge.to_endpoint.kind === "discard"
-        ? DISCARD_NODE_ID
-        : edge.to_endpoint.stable_id;
-      const from = labelById.get(edge.from_endpoint.stable_id) ?? edge.from_endpoint.stable_id;
-      const to = edge.to_endpoint.kind === "discard"
-        ? "discard"
-        : (labelById.get(edge.to_endpoint.stable_id) ?? edge.to_endpoint.stable_id);
-      return {
-        id: edge.stable_id,
-        source: edge.from_endpoint.stable_id,
-        target: targetId,
-        label: `${from} ${flowLabel(edge.flow, routeKeyByAlias)} → ${to}`,
-        isError: ["source_validation_failure", "node_error", "output_write_failure"].includes(edge.flow.kind),
-      };
-    }), [labelById, payload.graph.edges, routeKeyByAlias]);
+  // Alias → author-visible route key (guidedGraphProjection owns the rule so
+  // the route list here and the pane's edge labels cannot drift).
+  const routeKeyByAlias = useMemo(() => routeKeysByAlias(payload.nodes), [payload.nodes]);
   const routeItems = useMemo<WireReviewItem[]>(() =>
     payload.graph.edges.map((edge) => ({
       id: edge.stable_id,
@@ -288,7 +235,7 @@ export function ProposePipelineTurn({
     <article className="guided-turn guided-proposal" aria-labelledby="guided-proposal-heading">
       <header className="guided-proposal__header">
         <h3 id="guided-proposal-heading">Review pipeline proposal</h3>
-        <p>A complete pipeline is ready for review.</p>
+        <p>{proposalHeadline(payload.component_counts.nodes)}</p>
         <p>Review its structure, routes, and blockers before checking the detailed wiring.</p>
         <p className="guided-proposal__counts">
           {payload.component_counts.sources} sources · {payload.component_counts.nodes} nodes ·{" "}
@@ -324,11 +271,29 @@ export function ProposePipelineTurn({
         </section>
       ) : null}
 
-      <ReadOnlyPipelineGraph
-        nodes={graphNodes}
-        edges={graphEdges}
-        ariaLabel={`Pipeline proposal graph with ${graphNodes.length} components and ${graphEdges.length} routes`}
-      />
+      {/* The proposal's DAG is drawn in the Pipeline pane's Graph tab
+          (GraphView → GuidedGraphPane, from the same payload via
+          guidedGraphProjection) — not here. The 300px in-card mini graph was
+          the review's IA-1/V-1 defect: a six-node DAG in the narrow column
+          while the wide pane sat empty. This pointer is the card's only
+          anchor to it; the button works on narrow viewports too, where the
+          pane is a tab (ArtifactWorkspace's REQUEST_ARTIFACT_VIEW handler
+          calls showPipeline before selecting the tab). */}
+      <p className="guided-proposal__graph-pointer">
+        The proposed structure is drawn in the Graph pane.{" "}
+        <Button
+          compact
+          onClick={() =>
+            dispatchArtifactViewIntent({
+              tab: "graph",
+              focusMode: false,
+              sessionId: activeSessionId,
+            })
+          }
+        >
+          Show graph
+        </Button>
+      </p>
 
       <section className="guided-proposal__components" aria-labelledby="guided-proposal-components">
         <h4 id="guided-proposal-components">Components</h4>
@@ -360,12 +325,32 @@ export function ProposePipelineTurn({
                   options say what this one actually does. Advanced-tier pairs
                   are gated on show_advanced (elspeth-ca456d9d8d) — this list
                   has no per-row disclosure, so a plain gate, not a new
-                  surface, is the honest form of "debug mode expands". */}
-              {node.node_options_summary
-                .filter((entry) => showAdvanced || optionTier(entry) !== "advanced")
-                .map((entry) => (
-                  <p key={entry.key}>{nodeOptionText(entry)}</p>
-                ))}
+                  surface, is the honest form of "debug mode expands". An llm
+                  node's model and prompts are common-tier (I-2): the decision
+                  being approved, never gated. Its Edit opens the node revise
+                  below; withheld with the rest of the revise flow in the
+                  tutorial (step 3.2 un-hides them together). */}
+              {(() => {
+                const reviseTarget = isTutorial ? null : nodeReviseTarget(node.stable_id);
+                return (
+                  <NodeOptionsSummary
+                    entries={node.node_options_summary.filter(
+                      (entry) => showAdvanced || optionTier(entry) !== "advanced",
+                    )}
+                    nodeLabel={node.label}
+                    onEdit={
+                      reviseTarget === null
+                        ? undefined
+                        : () => {
+                            setRevisionTarget(reviseTarget);
+                            setRevisionFeedback("");
+                            focusRevisionFeedbackOnMount.current = true;
+                          }
+                    }
+                    editDisabled={reviseTarget !== null && !revisionTargetEnabled(reviseTarget)}
+                  />
+                );
+              })()}
             </li>
           ))}
           {payload.outputs.map((output) => (
@@ -394,23 +379,24 @@ export function ProposePipelineTurn({
           the tutorial realistically sees (interpretation_required) clears via
           the Accept cards outside this turn.
 
-          That presupposition only holds AFTER the frozen prompt has been
-          sent. The step-2→step-3 transition auto-plans a FIRST proposal
-          before any transforms instruction exists (tutorial run 18: a
-          source→sink passthrough that committed and then failed the tutorial
-          launch gate). The auto-proposal carries supersedes_draft_hash null;
-          a Send re-plans it as a superseding revision. Until that revision
-          arrives, withhold "Review wiring" and direct the learner to Send. */}
+          That presupposition now holds on the FIRST proposal the learner
+          sees. Goal-first (elspeth-378cfa0e18) makes the tutorial's frozen
+          transforms prompt the session's ROOT INTENT, stated at
+          /guided/start, so the step-2 finish plans ONCE from it and produces
+          real processing steps. The withheld arm below is gone with the
+          proposal it existed for: that transition used to auto-plan a
+          source-to-sink pass-through before any transforms instruction
+          existed (tutorial run 18: it committed and then failed the tutorial
+          launch gate), which a later Send had to supersede — so "Review
+          wiring" was withheld while supersedes_draft_hash was null. The one
+          planned proposal the walk now produces carries a null
+          supersedes_draft_hash and IS the thing to review, so gating on that
+          field would strand the learner on a card with no forward
+          affordance. */}
       {isTutorial ? (
-        payload.supersedes_draft_hash === null ? (
-          <p className="guided-proposal__tutorial-note">
-            This starting sketch only connects your reviewed source to your output. Press Send below to give the assistant your processing instructions — it will replan the pipeline with those steps before you review the wiring.
-          </p>
-        ) : (
-          <p className="guided-proposal__tutorial-note">
-            The assistant planned this pipeline from your prompt. Review how its sources, processing steps, routes, and outputs fit together, then press Review wiring to continue.
-          </p>
-        )
+        <p className="guided-proposal__tutorial-note">
+          The assistant planned this pipeline from your prompt. Review how its sources, processing steps, routes, and outputs fit together, then press Review wiring to continue.
+        </p>
       ) : null}
       <div className="guided-proposal__controls">
         <div className="guided-proposal__primary-actions">
@@ -435,24 +421,22 @@ export function ProposePipelineTurn({
               Retry {retainedInstruction.revision_mode} revision
             </Button>
           ) : null}
-          {!(isTutorial && payload.supersedes_draft_hash === null) && (
-            <Button
-              variant="bare"
-              className="guided-turn-primary"
-              disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
-              onClick={() => onSubmit({
-                chosen: ["review_wiring"],
-                edited_values: null,
-                custom_inputs: null,
-                edit_target: null,
-                control_signal: null,
-                proposal_id: payload.proposal_id,
-                draft_hash: payload.draft_hash,
-              } satisfies GuidedRespondAction)}
-            >
-              Review wiring
-            </Button>
-          )}
+          <Button
+            variant="bare"
+            className="guided-turn-primary"
+            disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
+            onClick={() => onSubmit({
+              chosen: ["review_wiring"],
+              edited_values: null,
+              custom_inputs: null,
+              edit_target: null,
+              control_signal: null,
+              proposal_id: payload.proposal_id,
+              draft_hash: payload.draft_hash,
+            } satisfies GuidedRespondAction)}
+          >
+            Review wiring
+          </Button>
           {/* The shortcut for an operator who has read the proposal above and
               does not need the wiring detail. Same gate as Review wiring —
               it dispatches review_wiring first — and withheld from the
@@ -534,6 +518,7 @@ export function ProposePipelineTurn({
                 </label>
                 <textarea
                   id={revisionFeedbackId}
+                  ref={revisionFeedbackRef}
                   className="wire-stage__correction-input"
                   rows={2}
                   value={revisionFeedback}

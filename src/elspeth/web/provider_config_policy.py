@@ -181,10 +181,8 @@ def _positive_int_or_none(value: object) -> int | None:
         "never raises on malformed options"
     ),
 )
-def web_llm_retry_budget_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
-    """Reject web-authored sequential multi-query LLM configs with unbounded local retries."""
-    if plugin != "llm":
-        return None
+def web_llm_retry_budget_policy_error(options: Mapping[str, Any]) -> str | None:
+    """Reject known-LLM sequential multi-query configs with unbounded local retries."""
     if options.get("queries") is None:
         return None
 
@@ -212,8 +210,8 @@ def web_llm_retry_budget_policy_error(plugin: str | None, options: Mapping[str, 
         "normalises to the canonical endpoint; never raises on malformed options"
     ),
 )
-def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
-    """Reject web-authored OpenRouter LLM configs that override base_url.
+def web_llm_base_url_policy_error(options: Mapping[str, Any]) -> str | None:
+    """Reject known-LLM web-authored configs that override OpenRouter base_url.
 
     The OpenRouter provider sends ``Authorization: Bearer <api_key>`` to whatever
     ``base_url`` names. In a web-authored pipeline the ``api_key`` is resolved
@@ -234,8 +232,6 @@ def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]
     web-author option — mirroring the managed-identity and web_scrape network
     policies.
     """
-    if plugin != "llm":
-        return None
     base_url = options.get("base_url")
     if base_url is None:
         return None
@@ -260,12 +256,12 @@ def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]
     source_param="options",
     suppresses=("R1", "R5"),
     invariant=(
-        "non-LLM plugins and absent/null tracing return None; every non-null LLM tracing "
+        "absent/null tracing returns None; every non-null LLM tracing "
         "value returns a static policy error without inspecting or echoing nested values; never raises"
     ),
 )
-def web_llm_tracing_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
-    """Reject every author-supplied LLM tracing configuration."""
-    if plugin != "llm" or options.get("tracing") is None:
+def web_llm_tracing_policy_error(options: Mapping[str, Any]) -> str | None:
+    """Reject every known-LLM author-supplied tracing configuration."""
+    if options.get("tracing") is None:
         return None
     return LLM_TRACING_POLICY_ERROR

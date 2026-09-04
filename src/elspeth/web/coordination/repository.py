@@ -679,7 +679,7 @@ class _RepositoryCompositionStateMutations:
                 created_at=creation.created_at,
             )
         )
-        return CompositionStateRecord(
+        record = CompositionStateRecord(
             id=creation.id,
             session_id=UUID(state._session_id),
             version=version,
@@ -695,6 +695,21 @@ class _RepositoryCompositionStateMutations:
             derived_from_state_id=derived_from_state_id,
             composer_meta=data.composer_meta,
         )
+        # The locked session head owns supersession authority, so a head that
+        # extinguishes a review site must retire that review in THIS
+        # transaction. ``SessionServiceImpl._insert_composition_state`` runs the
+        # same sweep; both writers share one implementation so an append
+        # through the operation authority cannot leave the zombie card
+        # ``elspeth-d73139155a`` exists to retire.
+        from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
+
+        supersede_dead_site_pending_interpretation_events(
+            connection,
+            session_id=state._session_id,
+            state_record=record,
+            now=state._database_now,
+        )
+        return record
 
 
 @final
@@ -845,6 +860,17 @@ class _RepositoryInterpretationMutations:
                     surfacing_state=(self._state_record(surfacing_row) if surfacing_row is not None else None),
                 )
             )
+        superseded_rows = connection.execute(
+            select(interpretation_events_table)
+            .where(
+                interpretation_events_table.c.session_id == state._session_id,
+                interpretation_events_table.c.affected_node_id == command.affected_node_id,
+                interpretation_events_table.c.kind == command.kind.value,
+                interpretation_events_table.c.choice == InterpretationChoice.SUPERSEDED.value,
+                interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value,
+            )
+            .order_by(interpretation_events_table.c.created_at.desc(), interpretation_events_table.c.id.desc())
+        ).all()
         review_disabled = bool(
             connection.execute(
                 select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == state._session_id)
@@ -868,6 +894,7 @@ class _RepositoryInterpretationMutations:
             pending_sites=tuple(pending_sites),
             review_disabled=review_disabled,
             opt_out_marker_exists=marker_exists,
+            superseded_events=tuple(self._event_record(row) for row in superseded_rows),
         )
         decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator)
         if type(decision) is not SessionPendingInterpretationDecision:
@@ -877,23 +904,37 @@ class _RepositoryInterpretationMutations:
             for site in snapshot.pending_sites
             if type(site.event.user_term) is str and site.event.user_term.strip() == command.user_term.strip()
         }
-        if not set(decision.abandoned_event_ids).issubset(matching_term_ids):
+        # A decision may also RESULT in an already-terminal row for this site
+        # (the sweep retired it first); supersession itself still only ever
+        # applies to PENDING rows, so the subset check below keeps that scope.
+        matching_terminal_ids = {
+            event.id
+            for event in snapshot.superseded_events
+            if type(event.user_term) is str and event.user_term.strip() == command.user_term.strip()
+        }
+        if not set(decision.superseded_event_ids).issubset(matching_term_ids):
             raise SessionDerivedCustodyError
-        if decision.abandoned_event_ids:
-            abandoned = connection.execute(
+        if decision.superseded_event_ids:
+            superseded = connection.execute(
                 update(interpretation_events_table)
                 .where(
-                    interpretation_events_table.c.id.in_(str(event_id) for event_id in decision.abandoned_event_ids),
+                    interpretation_events_table.c.id.in_(str(event_id) for event_id in decision.superseded_event_ids),
                     interpretation_events_table.c.session_id == state._session_id,
                     interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
                 )
-                .values(choice=InterpretationChoice.ABANDONED.value, resolved_at=command.created_at)
+                # SUPERSEDED, not ABANDONED: a fresh surfacing of the same site
+                # (changed identity, v1->v2 copy, or opt-out auto-interpretation)
+                # obsoletes the old card while the session continues
+                # (elspeth-dbc39dd367 adjudication, carried onto this extracted
+                # planner by the multi-replica merge — the pre-extraction code
+                # this repository replaced still wrote ABANDONED).
+                .values(choice=InterpretationChoice.SUPERSEDED.value, resolved_at=command.created_at)
             )
-            if abandoned.rowcount != len(decision.abandoned_event_ids):
+            if superseded.rowcount != len(decision.superseded_event_ids):
                 raise SessionDerivedCustodyError
 
         if not decision.insert_event:
-            if decision.result_event_id not in matching_term_ids:
+            if decision.result_event_id not in (matching_term_ids | matching_terminal_ids):
                 raise SessionDerivedCustodyError
             row = connection.execute(
                 select(interpretation_events_table).where(

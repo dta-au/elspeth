@@ -11,12 +11,18 @@ from __future__ import annotations
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.service import CatalogServiceImpl
-from elspeth.web.composer.guided.protocol import _NODE_OPTION_SUMMARY_ALLOWLIST
+from elspeth.web.composer.guided.protocol import (
+    _NODE_OPTION_DISPLAY_ONLY_ALLOWLIST,
+    _NODE_OPTION_SUMMARY_ALLOWLIST,
+)
 
 
 def test_allowlist_tiers_match_the_lowered_knob_schema() -> None:
     svc = CatalogServiceImpl(get_shared_plugin_manager())
-    for plugin, tiers in _NODE_OPTION_SUMMARY_ALLOWLIST.items():
+    # Both tables are rendered on the cards with a tier; both must follow
+    # the catalog lowering.
+    entries = list(_NODE_OPTION_SUMMARY_ALLOWLIST.items()) + list(_NODE_OPTION_DISPLAY_ONLY_ALLOWLIST.items())
+    for plugin, tiers in entries:
         # Only transforms are allowlisted today; the allowlist is keyed by plugin
         # name without a kind, so allowlisting a source/sink means extending this.
         fields = {field["name"]: field for field in svc.get_schema("transform", plugin).knob_schema["fields"]}

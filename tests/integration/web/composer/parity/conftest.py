@@ -140,8 +140,11 @@ class _ScriptedCompletion:
     def replace_unconsumed_response(self, *responses: _Response) -> None:
         """Replace the sole queued response after reviewed stable IDs are known.
 
-        Accepts one response (the live walk's initial delta) or several (the
-        tutorial walk queues the pass-through entry AND the lesson revision).
+        Both guided-staged arms now queue exactly one response — the single
+        planner run at the step-2 finish (goal-first, elspeth-378cfa0e18,
+        removed the tutorial arm's second run). The varargs form is kept for a
+        walk that must queue a repair turn behind the candidate; nothing
+        currently does, so the multi-response path is presently unexercised.
         """
         if self.requests or len(self._responses) != 1:
             raise AssertionError("scripted completion response can only be replaced before its first call")
@@ -155,9 +158,8 @@ def emit_proposal_response(pipeline: Mapping[str, Any], *, tool_call_id: str = "
 
     ``tool_call_id`` must be distinct per staged proposal within one session:
     composition_proposals carries uq_composition_proposals_session_tool_call,
-    exactly as real provider tool-call ids are unique per call. Walks that
-    stage more than one scripted proposal (the tutorial entry + revision)
-    must not share the default.
+    exactly as real provider tool-call ids are unique per call. A walk that
+    stages more than one scripted proposal must not share the default.
     """
     return _Response(
         choices=[
@@ -354,31 +356,6 @@ def _derive_guided_candidate(
     if "metadata" in args:
         candidate["metadata"] = copy.deepcopy(dict(args["metadata"]))
     return candidate
-
-
-def _derive_guided_passthrough_delta(guided_session: Mapping[str, Any]) -> dict[str, Any]:
-    """The rootless step-2→3 entry candidate: reviewed source → reviewed output, zero nodes.
-
-    The provider planner authors this pass-through (elspeth-b4a286d517 removed
-    the server-synthesized sketch); the scripted completion answers with it so
-    the tutorial walk follows the real post-removal shape.
-    """
-    source_order = guided_session.get("source_order")
-    output_order = guided_session.get("output_order")
-    reviewed_outputs = guided_session.get("reviewed_outputs")
-    if not isinstance(source_order, list) or not isinstance(output_order, list) or len(output_order) != 1:
-        raise AssertionError("guided parity pass-through entry expects ordered sources and a single reviewed output")
-    if not isinstance(reviewed_outputs, dict) or output_order[0] not in reviewed_outputs:
-        raise AssertionError("guided parity session projection carries no reviewed output authority")
-    output_name = reviewed_outputs[output_order[0]].get("name")
-    if not isinstance(output_name, str) or not output_name:
-        raise AssertionError("guided parity reviewed output has no name to route the pass-through to")
-    return {
-        "source_routes": [{"stable_id": stable_id, "on_success": output_name} for stable_id in source_order],
-        "nodes": [],
-        "edges": [],
-        "output_targets": [{"stable_id": output_order[0]}],
-    }
 
 
 def _derive_guided_initial_delta(
@@ -669,29 +646,21 @@ class ParityEnv:
             completion = _ScriptedCompletion(emit_proposal_response(candidate))
             self.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
 
+            # Goal-first (elspeth-378cfa0e18): every profile's start carries the
+            # goal, so both arms open the same way and spend the single scripted
+            # planner response on the ONE run at the step-2 finish. The tutorial
+            # arm used to start rootless and then buy the lesson graph with a
+            # second planner run through a synthetic prose revision; that was a
+            # walk no learner performs.
+            start_body: dict[str, Any] = {
+                "operation_id": str(uuid4()),
+                "intent": f"Build the {fixture['class']} pipeline from the reviewed components.",
+            }
             if start_profile is not None:
-                started = await client.post(
-                    f"/api/sessions/{session_id}/guided/start",
-                    json={"profile": start_profile, "operation_id": str(uuid4())},
-                )
-                if started.status_code != 200:
-                    raise AssertionError(f"guided-staged {start_profile} start failed ({started.status_code}): {started.text}")
-            else:
-                # Fixture choreography, not a routing necessity: the scripted
-                # completion answers exactly one planner call, so the walk
-                # starts with a root intent to spend it on the transform-ful
-                # fixture graph. (The rootless step-3 entry is provider-planned
-                # too — elspeth-b4a286d517 — it would just consume a scripted
-                # response this fixture does not carry.)
-                started = await client.post(
-                    f"/api/sessions/{session_id}/guided/start",
-                    json={
-                        "operation_id": str(uuid4()),
-                        "intent": f"Build the {fixture['class']} pipeline from the reviewed components.",
-                    },
-                )
-                if started.status_code != 200:
-                    raise AssertionError(f"guided-staged intent start failed ({started.status_code}): {started.text}")
+                start_body["profile"] = start_profile
+            started = await client.post(f"/api/sessions/{session_id}/guided/start", json=start_body)
+            if started.status_code != 200:
+                raise AssertionError(f"guided-staged {start_profile or 'live'} start failed ({started.status_code}): {started.text}")
 
             # Step 1 — review every source in canonical order.
             for index, (_name, spec) in enumerate(source_items):
@@ -731,17 +700,9 @@ class ParityEnv:
             if reviewed_output is None:
                 raise AssertionError("guided parity fixture reviewed no outputs")
             guided_session = reviewed_output["composition_state"]["composer_meta"]["guided_session"]
-            if start_profile == "tutorial":
-                # Two planner calls, both provider-authored: the rootless
-                # step-2→3 entry proposes the pass-through (elspeth-b4a286d517
-                # removed the server-synthesized sketch), then the frozen-prompt
-                # REVISION below delivers the lesson graph.
-                completion.replace_unconsumed_response(
-                    emit_proposal_response(_derive_guided_passthrough_delta(guided_session), tool_call_id="parity-terminal-entry"),
-                    emit_proposal_response(candidate),
-                )
-            else:
-                completion.replace_unconsumed_response(emit_proposal_response(_derive_guided_initial_delta(candidate, guided_session)))
+            # One planner run, both profiles: the step-2 finish plans the whole
+            # graph from the goal the start carried.
+            completion.replace_unconsumed_response(emit_proposal_response(_derive_guided_initial_delta(candidate, guided_session)))
             staged = await self._staged_respond(client, session_id, component_action={"action": "finish", "component_kind": "output"})
             if staged["next_turn"]["type"] != "propose_pipeline":
                 raise AssertionError(
@@ -751,25 +712,6 @@ class ParityEnv:
             surface_value = staged["composition_state"]["composer_meta"]["guided_session"]["active_proposal"]
             if surface_value is None:
                 raise AssertionError(f"guided-staged staged no active proposal for {fixture['class']}")
-
-            if start_profile == "tutorial":
-                # The rootless tutorial entry is provider-planned like every
-                # transition (elspeth-b4a286d517): the entry consumed the
-                # scripted pass-through, and the lesson pipeline arrives via
-                # the frozen-prompt REVISION below — the real tutorial flow,
-                # consuming the second scripted response.
-                staged = await self._staged_respond(
-                    client,
-                    session_id,
-                    proposal_id=proposal["proposal_id"],
-                    draft_hash=proposal["draft_hash"],
-                    edited_values={"revision_instruction": f"Apply the tutorial lesson: build the {fixture['class']} pipeline."},
-                )
-                if staged["next_turn"]["type"] != "propose_pipeline":
-                    raise AssertionError(
-                        f"tutorial revision did not stage a proposal for {fixture['class']} (got {staged['next_turn']['type']!r})"
-                    )
-                proposal = staged["next_turn"]["payload"]
 
             # Step 3 → Step 4 — review wiring, then confirm (the sole commit).
             reviewed = await self._staged_respond(

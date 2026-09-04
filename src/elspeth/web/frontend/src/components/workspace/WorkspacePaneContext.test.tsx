@@ -119,10 +119,10 @@ describe("WorkspacePaneContext", () => {
         <button
           type="button"
           onClick={(event) =>
-            controller.actions.openInspector("audit", event.currentTarget)
+            controller.actions.openInspector("history", event.currentTarget)
           }
         >
-          Open audit
+          Open history
         </button>
       );
     }
@@ -133,11 +133,11 @@ describe("WorkspacePaneContext", () => {
       </WorkspacePaneProvider>,
     );
     const initialOpen = currentController().actions.openInspector;
-    const button = screen.getByRole("button", { name: "Open audit" });
+    const button = screen.getByRole("button", { name: "Open history" });
 
     act(() => button.click());
 
-    expect(paneState.openInspector).toHaveBeenCalledExactlyOnceWith("audit");
+    expect(paneState.openInspector).toHaveBeenCalledExactlyOnceWith("history");
     expect(currentController().inspectorInvokerRef.current).toBe(button);
     expect(currentController().inspectorInvokerRef.current?.isConnected).toBe(
       true,
@@ -145,7 +145,7 @@ describe("WorkspacePaneContext", () => {
 
     view.rerender(
       <WorkspacePaneProvider
-        paneState={{ ...paneState, activeInspectorTab: "audit", inspectorOpen: true }}
+        paneState={{ ...paneState, activeInspectorTab: "history", inspectorOpen: true }}
       >
         <Consumer />
       </WorkspacePaneProvider>,

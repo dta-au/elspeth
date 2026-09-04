@@ -25,6 +25,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
 from elspeth.web.composer.guided.protocol import GuidedStep
 
@@ -141,6 +142,17 @@ def _looks_secret_like_sample(value: str) -> bool:
     return lowered.startswith(("sk-", "pk_", "rk_", "xoxb-")) or any(marker in lowered for marker in secret_markers)
 
 
+@observation_boundary(
+    tier=3,
+    source="one uploaded sample-row value: Tier-3 operator-uploaded data of unknown type, observed only to mask it for prompt display",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a bounded '<sample:...>' type tag for every possible value — never the value itself, a key, "
+        "or a member — masking secret-like, url, and email-like strings behind category tags; unknown types "
+        "collapse to their type name and this masker never raises"
+    ),
+)
 def _summarize_sample_value(value: Any) -> str:
     if value is None:
         return "<sample:null>"

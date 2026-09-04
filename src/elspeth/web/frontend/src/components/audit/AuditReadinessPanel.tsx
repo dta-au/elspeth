@@ -11,22 +11,21 @@
  * default arm fails the build if a new row is added to the wire schema
  * without a UI case.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useSessionStore } from "../../stores/sessionStore";
 import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useExecutionStore } from "../../stores/executionStore";
 import { useInlineSourceStore } from "../../stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "../../stores/interpretationEventsStore";
+import { useShowAdvanced } from "@/stores/preferencesStore";
 import { hasCompositionContent } from "../../utils/compositionState";
 import { relativeTime } from "../../utils/time";
 import type {
-  AuditReadinessSnapshot,
   CompositionState,
   ReadinessRow,
   ReadinessRowId,
   ReadinessStatus,
-  ValidationResult,
 } from "../../types/api";
 import { Button } from "@/components/ui";
 import { ReadinessRowDetail } from "./ReadinessRowDetail";
@@ -34,6 +33,10 @@ import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
 import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 import { matchingAuditReadinessSnapshot } from "@/lib/auditReadinessFreshness";
+import {
+  projectMatchingSnapshotToExecution,
+  useAuditReadinessSync,
+} from "./useAuditReadinessSync";
 
 /** Glyph + accessible label for each row status. */
 function statusGlyph(status: ReadinessStatus): { glyph: string; aria: string } {
@@ -239,34 +242,6 @@ function compositionHasLlmSource(state: CompositionState | null): boolean {
   return Object.values(state.sources).some((source) => source.plugin === "llm");
 }
 
-function validationResultFromSnapshot(snapshot: AuditReadinessSnapshot): ValidationResult {
-  return snapshot.validation_result;
-}
-
-function projectMatchingSnapshotToExecution(
-  sessionId: string,
-  compositionVersion: number,
-  setValidationResult: (result: ValidationResult) => void,
-): void {
-  const currentSnapshot =
-    useAuditReadinessStore.getState().snapshotsBySession[sessionId];
-  const activeSessionId = useSessionStore.getState().activeSessionId;
-  const activeVersion =
-    useSessionStore.getState().compositionState?.version ?? null;
-  if (
-    activeSessionId !== sessionId ||
-    activeVersion !== compositionVersion ||
-    matchingAuditReadinessSnapshot(
-      currentSnapshot,
-      sessionId,
-      compositionVersion,
-    ) === undefined
-  ) {
-    return;
-  }
-  setValidationResult(validationResultFromSnapshot(currentSnapshot));
-}
-
 interface AuditReadinessPanelProps {
   onSelectComponent?: (componentId: string) => void;
 }
@@ -296,6 +271,7 @@ export function AuditReadinessPanel({
   );
   const loadSnapshot = useAuditReadinessStore((s) => s.loadSnapshot);
   const setValidationResult = useExecutionStore((s) => s.setValidationResult);
+  const showAdvanced = useShowAdvanced();
 
   // Phase 5a Task 7: when an inline_blob source is bound to the active
   // composition, the Provenance row's summary text is replaced with an
@@ -326,33 +302,9 @@ export function AuditReadinessPanel({
 
   const compositionHasContent = hasCompositionContent(compositionState);
 
-  useEffect(() => {
-    if (!activeSessionId || !compositionState || !compositionHasContent) return;
-    let cancelled = false;
-    // Fire and forget; store handles errors.
-    void loadSnapshot(activeSessionId, compositionState.version).then(() => {
-      if (cancelled) return;
-      projectMatchingSnapshotToExecution(
-        activeSessionId,
-        compositionState.version,
-        setValidationResult,
-      );
-    });
-    return () => {
-      cancelled = true;
-      // Unmount-during-fetch cleanup: abort the in-flight controller for this
-      // session. The store's AbortError catch arm clears
-      // isLoadingBySession[activeSessionId] and preserves cached snapshot/error.
-      const ctrl = useAuditReadinessStore.getState().abortControllers[activeSessionId];
-      if (ctrl) {
-        ctrl.abort();
-      }
-    };
-  // Intentional: `compositionState?.version` is the dep, not the compositionState reference.
-  // Using the reference would re-run the effect on every render-cycle that re-creates the object
-  // without changing the version. The linter flags `compositionState` as missing; suppress here.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, compositionState?.version, compositionHasContent, loadSnapshot, setValidationResult]);
+  // Ambient snapshot sync (shared with ArtifactWorkspaceSurface, which runs
+  // it while this panel is unmounted; see useAuditReadinessSync).
+  useAuditReadinessSync();
 
   const anyActionable = useMemo(
     () => snapshot?.rows.some((r) => isActionable(r.status)) ?? false,
@@ -518,28 +470,33 @@ export function AuditReadinessPanel({
             </p>
           </div>
           <div className="audit-readiness-actions">
-            <Button
-              type="button"
-              className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
-              onClick={() =>
-                void loadSnapshot(
-                  activeSessionId,
-                  compositionState.version,
-                  {
-                    force: true,
-                  },
-                ).then(() =>
-                  projectMatchingSnapshotToExecution(
+            {/* The panel refetches on every composition version (useEffect
+                above); a manual Refresh is a debugging affordance
+                (elspeth-f1394307e3). Explain and Collapse stay. */}
+            {showAdvanced && (
+              <Button
+                type="button"
+                className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
+                onClick={() =>
+                  void loadSnapshot(
                     activeSessionId,
                     compositionState.version,
-                    setValidationResult,
-                  ),
-                )
-              }
-              aria-label="Refresh audit check now"
-            >
-              Refresh
-            </Button>
+                    {
+                      force: true,
+                    },
+                  ).then(() =>
+                    projectMatchingSnapshotToExecution(
+                      activeSessionId,
+                      compositionState.version,
+                      setValidationResult,
+                    ),
+                  )
+                }
+                aria-label="Refresh audit check now"
+              >
+                Refresh
+              </Button>
+            )}
             <Button
               variant="primary"
               type="button"

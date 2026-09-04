@@ -322,6 +322,27 @@ _WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
         {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
         id="_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
     ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL,
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_WITH_DETAIL",
+    ),
 ]
 
 
@@ -380,6 +401,173 @@ class TestWrappedDiagnosticWireShapeLinkage:
 
         assert declared_templates, "AST scan found no _wrapped_diagnostic_template assignments — the scan itself is broken"
         assert declared_templates == covered
+
+
+# The BARE (non-diagnostic) canonical suffix round-trip cases, bound to the
+# module by the same completeness gate as the wrapped templates below it. Each
+# ``id`` is the suffix constant's name — the join key the AST scan asserts
+# against. A bare suffix added to the module without a case here fails the
+# gate; the historical incident this closes is elspeth-2ed41f0a4a R2, where a
+# hand-assembled bare notice shipped unregistered and rendered backend copy as
+# model-attributable prose (the wrapped family got this gate first; the bare
+# family stayed on hand-maintained equality checks until elspeth-25f7b757e7).
+_BARE_SUFFIX_ROUND_TRIP_CASES = [
+    pytest.param(
+        no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX,
+        no_tool_policy._EMPTY_STATE_NOTICE_BODY,
+        id="_EMPTY_STATE_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
+        id="_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNVERIFIED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNVERIFIED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_UNVERIFIED_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_NOTICE,
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_HANDOFF_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        f"{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_FOOTER}",
+        id="_ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+        id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX,
+        no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE,
+        id="_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE,
+        f"{no_tool_policy._PREFLIGHT_NOTICE_HEADER}\n\n{no_tool_policy._PREFLIGHT_NOTICE_FOOTER}",
+        id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE",
+    ),
+]
+
+
+class TestBareTrustedSuffixCompleteness:
+    """Every bare canonical suffix is recognizer-registered, and provably all of them.
+
+    The wrapped-diagnostic family already derives producer and recognizer from
+    one wire shape and pins case-list completeness by AST. The bare family had
+    neither: suffixes were assembled by hand-repeated concatenation and
+    recognized by hand-maintained ``==`` arms, so a new bare notice could ship
+    unregistered and silently fall through to a single untrusted
+    ``AssistantTextSegment`` — backend copy attributed to the model
+    (elspeth-2ed41f0a4a R2). ``_bare_trusted_suffix`` is now the single
+    constructor; this gate makes its use the registration obligation.
+    """
+
+    @pytest.mark.parametrize(("suffix", "notice"), _BARE_SUFFIX_ROUND_TRIP_CASES)
+    def test_every_bare_suffix_is_recognized_as_one_trusted_notice(self, suffix: str, notice: str) -> None:
+        assert no_tool_policy._canonical_trusted_suffix_segments(suffix) == (TrustedSystemNoticeSegment(notice),)
+
+    def test_the_bare_case_list_covers_every_bare_suffix_constructor_call(self) -> None:
+        """AST-derived completeness: the case list above cannot silently lag.
+
+        Discovery is by AST over the module source for assignments whose value
+        is a ``_bare_trusted_suffix(...)`` call — the same no-reflection
+        pattern as the wrapped-template gate below (a ``getattr(module,
+        name)`` resolution is exactly the masquerade shape the whole-repo
+        gate rejects). A bare suffix assembled WITHOUT the constructor does
+        not register here, which is why the constructor is the only sanctioned
+        spelling: the sibling test asserting recognizer round-trip runs per
+        case, so an unconstructed suffix must arrive through a case entry or
+        it has no recognizer proof at all.
+        """
+        module_source = Path(no_tool_policy.__file__).read_text(encoding="utf-8")
+        declared_suffixes = {
+            target.id
+            for node in ast.parse(module_source).body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_bare_trusted_suffix"
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+
+        covered = {case.id for case in _BARE_SUFFIX_ROUND_TRIP_CASES if case.id is not None}
+
+        assert declared_suffixes, "AST scan found no _bare_trusted_suffix assignments — the scan itself is broken"
+        assert declared_suffixes == covered
+
+
+# elspeth-b61894d93d follow-up (F7 sign-off M13): ``_red_diagnostic_suffix``
+# turned each red composer's (template, bare_suffix) pairing into parameters,
+# so a mismatched pair — the flagged composer handed the unrendered class's
+# bare fallback — became a latent self-contradiction (could-not-be-obtained
+# framing for a review that DID flag) reachable whenever a red result yields
+# no extractable objection. This pin holds each composer to its own
+# reason-class bare fallback, and is the bare-fallback path's first test on
+# all three red composers.
+_RED_COMPOSER_BARE_FALLBACK_CASES = [
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_unrepairable_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_UNREPAIRABLE_RED_SUFFIX_BARE,
+        id="unrepairable",
+    ),
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_flagged_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_FLAGGED_RED_SUFFIX_BARE,
+        id="flagged",
+    ),
+    pytest.param(
+        no_tool_policy.compose_advisor_signoff_unrendered_red_message,
+        no_tool_policy._ADVISOR_SIGNOFF_UNRENDERED_RED_SUFFIX_BARE,
+        id="unrendered",
+    ),
+]
+
+
+class TestRedComposerBareFallbackPairing:
+    @pytest.mark.parametrize(("composer", "expected_bare_suffix"), _RED_COMPOSER_BARE_FALLBACK_CASES)
+    def test_detail_less_red_result_falls_back_to_the_composers_own_class_framing(self, composer, expected_bare_suffix: str) -> None:
+        detail_less_red = ValidationResult(
+            is_valid=False,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=False,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[],
+            ),
+        )
+
+        message = composer("model prose", runtime_result=detail_less_red)
+
+        assert message == "model prose" + expected_bare_suffix
 
 
 class TestInterpretationReviewHandoffSegments:

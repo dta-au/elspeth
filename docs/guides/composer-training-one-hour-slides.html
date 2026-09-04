@@ -693,10 +693,11 @@ Keep the same routing.</pre>
   <div class="kicker"><span class="seg">Segment 7 · Trust and evidence</span><span class="mode">Talk</span></div>
   <h2>Trust tiers: what happens when data is wrong</h2>
   <div class="tiers">
-    <div class="tier t3"><h3>Tier 3 — anything from outside</h3><p>Your CSV, an API, an LLM's reply. <strong>Zero trust.</strong> Validated at the boundary; a bad row is <strong>quarantined</strong>, the run continues.</p></div>
+    <div class="tier t3"><h3>Tier 3 — anything from outside</h3><p>Your CSV, an API, an LLM's reply. <strong>Zero trust.</strong> Source validation follows its configured quarantine/discard route so other rows can continue.</p></div>
     <div class="tier t2"><h3>Tier 2 — your rows, once validated</h3><p>Types are trusted downstream. A wrong type there is an <strong>upstream bug to fix</strong>, not a data-quality case to handle.</p></div>
     <div class="tier t1"><h3>Tier 1 — ELSPETH's own audit records</h3><p>Fully trusted, so any anomaly <strong>crashes</strong>. "Silently coercing bad audit data would be evidence tampering."</p></div>
   </div>
+  <div class="alert info" style="margin-top:16px">Source validation uses its configured failure route so other rows can continue. A row that contradicts an acknowledged producer guarantee instead records failed boundary evidence and stops the run.</div>
   <div class="quote" style="font-size:18px;margin-top:16px">A CSV with garbage in row 500 should not crash a 10,000-row pipeline. A corrupted audit record should crash immediately.<span class="cite">README.md — Data Trust Model</span></div>
   <aside class="notes"><p>One nuance worth saying: tiers follow the data flow, not the plugin. An LLM in the middle of your graph creates a fresh Tier-3 boundary the moment the model answers.</p></aside>
 </section>

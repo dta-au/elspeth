@@ -101,9 +101,9 @@ transforms:
 
 collectors:
 # THE SCOPE CLOSER. Note what is absent: there is no `trigger:` key, because a
-# closer has nothing to trigger on but the end of its group. `on_error` is also
-# omitted — the route then derives from structure, and losses settle through
-# the scope's group machinery rather than through a configured error edge.
+# closer has nothing to trigger on but the end of its group. A collector also
+# does not accept `on_error`: plugin failure is a whole-group verdict settled
+# through the scope's group policy and nesting, not a per-row error edge.
 - name: page_stitcher
   plugin: batch_stats
   input: pages

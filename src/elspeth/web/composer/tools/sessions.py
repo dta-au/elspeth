@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Final, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
@@ -19,11 +19,23 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.enums import is_llm_authored_creation_modality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import (
+    REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+    REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
+    REQUEST_INTERPRETATION_REVIEW_KINDS,
+    SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+    SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+    SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
+    SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+    ToolArgumentError,
+)
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
     redact_source_storage_path,
@@ -40,7 +52,6 @@ from elspeth.web.composer.state import (
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
-    ValidationSummary,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
@@ -51,6 +62,8 @@ from elspeth.web.composer.tools._common import (
     _ECHOED_REVIEW_METADATA_NOTE,
     _ECHOED_SOURCE_AUTHORING_NOTE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
+    _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+    _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     ReviewedSourceAuthority,
@@ -62,7 +75,6 @@ from elspeth.web.composer.tools._common import (
     _credential_wiring_contract_failure,
     _discovery_result,
     _failure_result,
-    _graph_repair_suggestions,
     _merged_component_rejection_result,
     _missing_output_options_repair_error,
     _mutation_result,
@@ -77,7 +89,6 @@ from elspeth.web.composer.tools._common import (
     _resolver_owned_interpretation_requirement_error,
     _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
-    _semantic_contracts_payload,
     _serialize_full_pipeline_state,
     _serialize_node,
     _serialize_output,
@@ -92,6 +103,8 @@ from elspeth.web.composer.tools._common import (
     _vf_destination_note,
     canonicalize_source_validation_failure,
     normalize_tool_result_validation,
+    rejected_component_prefix,
+    review_reconciliation_failure_message,
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
@@ -107,11 +120,13 @@ from elspeth.web.composer.tools.declarations import (
 )
 from elspeth.web.composer.tools.sources import (
     _MIME_TO_SOURCE,
+    _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
     _delimiter_extra_for_csv_blob,
     _drop_echoed_source_authoring,
     _header_only_inline_csv_conflict,
     _options_with_derived_guarantees,
     _options_with_source_blob_review,
+    _planner_guarantee_stamp_error,
     _reject_manual_source_authoring,
     _reject_manual_source_blob_ref,
     _reject_manual_source_blobs,
@@ -125,6 +140,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
+    VAGUE_TERM_UNWIRED_PREFIX,
     composition_review_contract_error,
     current_source_data_contract_demand,
     interpretation_sites,
@@ -183,7 +199,8 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
 
     * ``affected_node_id`` — short identifier; 256-char cap matches the wire
       cap used by ``upsert_node.id``.
-    * ``kind`` — closed interpretation class for the review row.
+    * ``kind`` — closed request-tool interpretation class; backend-only
+      prompt-template surfacing is excluded by the field validator.
     * ``user_term`` and ``llm_draft`` — capped at 8192 chars to defend against
       pathological inputs that would distend the audit row beyond the
       schema's 8192-byte expectation (see ``interpretation_events_table``
@@ -202,11 +219,22 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
     """
 
     affected_node_id: str = Field(min_length=1, max_length=256)
-    kind: InterpretationKind
+    kind: InterpretationKind = Field(json_schema_extra={"enum": list(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)})
     user_term: str = Field(min_length=1, max_length=8192)
     llm_draft: str | None = Field(default=None, min_length=1, max_length=8192)
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_must_be_requestable(cls, value: InterpretationKind) -> InterpretationKind:
+        if value not in REQUEST_INTERPRETATION_REVIEW_KINDS:
+            raise ToolArgumentError(
+                argument="kind",
+                expected=REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+                actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
+            )
+        return value
 
 
 def _validate_source_artifact_review_content(value: str) -> None:
@@ -483,7 +511,7 @@ def authored_node_interpretation_requirement_parse_error(
         parse_interpretation_requirements(options)
     except (KeyError, TypeError, ValueError):
         return (
-            f"Node '{node_id}': options.{INTERPRETATION_REQUIREMENTS_KEY} is malformed — "
+            f"options.{INTERPRETATION_REQUIREMENTS_KEY} is malformed — "
             f"{INTERPRETATION_REQUIREMENTS_KEY} must be a list of review entry objects, each carrying "
             "string fields kind, user_term, and draft (server-owned id/status are filled automatically; "
             "never author resolved review metadata). Re-emit each entry as {kind, user_term, draft}, or "
@@ -503,6 +531,49 @@ class SetPipelineCandidate:
     def acceptable(self) -> bool:
         """Whether the candidate is eligible for commit or proposal publication."""
         return self.result.success and self.result.validation is not None and self.result.validation.is_valid
+
+
+def _no_source_configured_repair(state: CompositionState) -> str:
+    """Describe the complete source shape an internal caller must restore.
+
+    Public provider calls cannot reach this defense because the declaration
+    schema rejects missing/null/ambiguous source selection. Keep the branch
+    accurate for trusted internal callers without assuming every existing
+    source came from a blob.
+    """
+    prefix = (
+        "set_pipeline requires exactly one non-null source or sources object. "
+        "This tool is a full replacement; omission or null never keeps existing source configuration."
+    )
+    if not state.sources:
+        return f"{prefix} Supply a complete `source` object or named `sources` map."
+
+    singular_default = set(state.sources) == {"source"}
+    container = "`source` configuration" if singular_default else "named `sources` map"
+    serialized, error = _serialize_set_pipeline_arguments(state)
+    if error is not None or serialized is None:
+        return (
+            f"{prefix} The existing {container} cannot be represented as lossless set_pipeline arguments: "
+            "get_pipeline_state(component='set_pipeline_arguments') returns error_code `round_trip_unavailable`. "
+            "Inspect the current configuration with get_pipeline_state(component='source'); do not fabricate source fields "
+            "or blob identities, and do not rebind any source. If the requested change is limited to existing source options, "
+            "use patch_source_options with the current source_name; use the matching narrow patch tool for node/output-only "
+            "changes. For a true full rebuild, surface the `round_trip_unavailable` gap and stop instead of guessing."
+        )
+
+    guidance = f"{prefix} Re-supply the complete existing {container} from get_pipeline_state(component='set_pipeline_arguments')."
+    if not singular_default:
+        return guidance
+
+    if "source" not in serialized:
+        return guidance
+    serialized_source = serialized["source"]
+    if type(serialized_source) is not dict or "blob_id" not in serialized_source:
+        return guidance
+    return (
+        f"{guidance} The existing singular source is blob-bound: retain its source.blob_id; "
+        "use source.inline_blob only when intentionally supplying new literal data."
+    )
 
 
 @trust_boundary(
@@ -567,6 +638,7 @@ def build_set_pipeline_candidate(
         rejected_state: CompositionState,
         error_msg: str,
         *,
+        rejected_component: str | None,
         error_code: str | None = None,
         plugin_identity: tuple[str, str] | None = None,
     ) -> SetPipelineCandidate:
@@ -579,13 +651,25 @@ def build_set_pipeline_candidate(
         # resolved this identity through the request policy view; an
         # unresolved name is precisely the input that makes the downstream
         # catalog lookup raise.
+        #
+        # ``rejected_component`` is the validation-component ref this
+        # rejection is ABOUT (``source`` / ``source:<name>`` / ``node:<id>`` /
+        # ``output:<name>``), keyword-required so a whole-candidate rejection
+        # says ``None`` out loud. It rides on the leading entry AND mints the
+        # message prefix, so prose and stamp cannot disagree — the same
+        # explicit-at-the-construction-site carrying `plugin_identity` uses
+        # (elspeth-e405ad7cd2, F10; the closure it replaced left a fifth
+        # per-node loop unattributed and produced a present-but-wrong ref
+        # whenever a nested helper assigned without `nonlocal`).
+        message = error_msg if rejected_component is None else f"{rejected_component_prefix(rejected_component)}{error_msg}"
         return _candidate(
             _tool_failure_result(
                 rejected_state,
-                error_msg,
+                message,
                 error_code=error_code,
                 with_state_validation=False,
                 plugin_identity=plugin_identity,
+                rejected_component=rejected_component,
             )
         )
 
@@ -593,14 +677,16 @@ def build_set_pipeline_candidate(
         rejected_state: CompositionState,
         violation: Any,
         *,
-        component: str | None = None,
+        rejected_component: str | None,
     ) -> SetPipelineCandidate:
+        component = None if rejected_component is None else rejected_component_prefix(rejected_component).removesuffix(": ")
         return _candidate(
             _tool_plugin_policy_failure(
                 rejected_state,
                 violation,
                 component=component,
                 with_state_validation=False,
+                rejected_component=rejected_component,
             )
         )
 
@@ -727,13 +813,18 @@ def build_set_pipeline_candidate(
         ) from exc
 
     if validated.source is not None and validated.sources is not None:
-        return _failure_result(state, "set_pipeline must use either source or sources, not both.")
+        return _failure_result(state, "set_pipeline must use either source or sources, not both.", rejected_component=None)
     if validated.source is None and validated.sources is None:
         # Carries the same closed code the state-level check would emit so
         # repair feedback on every surface resolves to the "include a source
         # block" guidance (the stale-state riders themselves are withheld
         # from set_pipeline failure envelopes — elspeth-e89e6bf47a).
-        return _failure_result(state, "set_pipeline requires source or sources.", error_code="no_source_configured")
+        return _failure_result(
+            state,
+            _no_source_configured_repair(state),
+            rejected_component=None,
+            error_code="no_source_configured",
+        )
 
     source_specs: dict[str, SourceSpec] = {}
     resolved_source_blob: _ResolvedSourceBlob | None = None
@@ -767,7 +858,7 @@ def build_set_pipeline_candidate(
             inline_blob_supported=True,
         )
         if manual_blob_ref_error is not None:
-            return _failure_result(state, manual_blob_ref_error)
+            return _failure_result(state, manual_blob_ref_error, rejected_component="source")
         # Echo tolerance (elspeth-c67fbbbd83): server-owned metadata that
         # exactly matches the stored source is an echo from a read-modify-write
         # over the planner-visible state, not a forgery attempt — reduce/drop
@@ -788,10 +879,10 @@ def build_set_pipeline_candidate(
             echoed_metadata_notes.append(_ECHOED_SOURCE_AUTHORING_NOTE)
         manual_authoring_error = _reject_manual_source_authoring(legacy_src_options, tool_name="set_pipeline")
         if manual_authoring_error is not None:
-            return _failure_result(state, manual_authoring_error)
+            return _failure_result(state, manual_authoring_error, rejected_component="source")
         manual_blobs_error = _reject_manual_source_blobs(legacy_src_options, tool_name="set_pipeline")
         if manual_blobs_error is not None:
-            return _failure_result(state, manual_blobs_error)
+            return _failure_result(state, manual_blobs_error, rejected_component="source")
         review_metadata_error = (
             None
             if interpretation_requirements_are_internal
@@ -807,6 +898,7 @@ def build_set_pipeline_candidate(
                 state,
                 review_metadata_error,
                 error_code="interpretation_requirements_invalid",
+                rejected_component="source",
             )
         if not interpretation_requirements_are_internal:
             legacy_src_options = _canonicalize_authored_interpretation_requirements(
@@ -826,7 +918,20 @@ def build_set_pipeline_candidate(
         src_on_vf = canonicalize_source_validation_failure(legacy_source_model.on_validation_failure)
         single_source_on_vf = src_on_vf
         if source_blob_id is not None and inline_blob is not None:
-            return _failure_result(state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.")
+            return _failure_result(
+                state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.", rejected_component="source"
+            )
+        if source_blob_id is None and inline_blob is None:
+            # Plain-path source: the blob branches below run this same guard
+            # with the bound blob's real creation modality.
+            guarantee_stamp_error = _planner_guarantee_stamp_error(
+                legacy_src_options,
+                stored_options=stored_legacy_options,
+                llm_authored=stored_legacy_options is not None and SOURCE_AUTHORING_KEY in stored_legacy_options,
+                tool_name="set_pipeline",
+            )
+            if guarantee_stamp_error is not None:
+                return _failure_result(state, guarantee_stamp_error, rejected_component="source")
         if source_blob_id is not None:
             resolved = _resolve_source_blob(
                 blob_id=source_blob_id,
@@ -855,9 +960,9 @@ def build_set_pipeline_candidate(
             legacy_src_options = resolved.options
         if inline_blob is not None:
             if session_engine is None or session_id is None:
-                return _failure_result(state, "set_pipeline source.inline_blob requires session context.")
+                return _failure_result(state, "set_pipeline source.inline_blob requires session context.", rejected_component="source")
             if data_dir is None:
-                return _failure_result(state, "set_pipeline source.inline_blob requires data_dir for storage.")
+                return _failure_result(state, "set_pipeline source.inline_blob requires data_dir for storage.", rejected_component="source")
             # _prepare_blob_create raises ToolArgumentError on invalid LLM
             # arguments (CEC1 channel discipline) — propagate to the
             # compose loop's ARG_ERROR branch rather than masking as
@@ -885,7 +990,18 @@ def build_set_pipeline_candidate(
                 session_id=session_id,
             )
             if header_conflict is not None:
-                return _failure_result(state, header_conflict)
+                return _failure_result(state, header_conflict, rejected_component="source")
+            # A user-verbatim inline blob (paste-through) is sample evidence
+            # like an upload; only an LLM-authored one is hash-bound to its
+            # author's schema claim.
+            guarantee_stamp_error = _planner_guarantee_stamp_error(
+                legacy_src_options,
+                stored_options=stored_legacy_options,
+                llm_authored=is_llm_authored_creation_modality(prepared_inline_blob.creation_modality),
+                tool_name="set_pipeline",
+            )
+            if guarantee_stamp_error is not None:
+                return _failure_result(state, guarantee_stamp_error, rejected_component="source")
 
             # ``prepared_inline_blob.mime_type`` was validated by
             # ``_prepare_blob_create`` against ``_ALLOWED_BLOB_MIME_TYPES``,
@@ -939,13 +1055,14 @@ def build_set_pipeline_candidate(
                 state,
                 canonical_error,
                 error_code="interpretation_requirements_invalid",
+                rejected_component="source",
             )
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, legacy_src_options)
         if endpoint_policy_error is not None:
-            return _failure_result(state, endpoint_policy_error)
+            return _failure_result(state, endpoint_policy_error, rejected_component="source")
         plugin_error = _validate_plugin_name(context, "source", src_plugin)
         if plugin_error is not None:
-            return _plugin_policy_failure(state, plugin_error)
+            return _plugin_policy_failure(state, plugin_error, rejected_component="source")
         credential_error = _credential_wiring_contract_failure(
             state,
             component_id="source",
@@ -960,7 +1077,7 @@ def build_set_pipeline_candidate(
 
         path_error = _validate_source_path(legacy_src_options, data_dir, session_id=session_id)
         if path_error is not None:
-            return _failure_result(state, path_error)
+            return _failure_result(state, path_error, rejected_component="source")
 
         src_prevalidation = _prevalidate_source_for_context(
             context,
@@ -974,7 +1091,13 @@ def build_set_pipeline_candidate(
             # option-shape message was coded there and codeless here (pack
             # pressure-suite run 1 surfaced the asymmetry as a bare
             # 'validation_error' in the planner view).
-            return _failure_result(state, src_prevalidation, error_code="plugin_options_invalid", plugin_identity=("source", src_plugin))
+            return _failure_result(
+                state,
+                src_prevalidation,
+                error_code="plugin_options_invalid",
+                plugin_identity=("source", src_plugin),
+                rejected_component="source",
+            )
         source_specs["source"] = SourceSpec(
             plugin=src_plugin,
             on_success=legacy_source_model.on_success,
@@ -986,15 +1109,18 @@ def build_set_pipeline_candidate(
 
     if validated.sources is not None:
         if not validated.sources:
-            return _failure_result(state, "set_pipeline sources must include at least one named source.")
+            return _failure_result(state, "set_pipeline sources must include at least one named source.", rejected_component=None)
         # Every ``continue`` below abandons the REST OF THIS SOURCE and moves
         # to the next one: the later checks read options the earlier ones
         # canonicalized, so running them after a failure would report a
         # defect the planner cannot act on.
         for source_name, source_model in validated.sources.items():
             if not source_name.strip():
-                _record_component_rejection(_failure_result(state, "set_pipeline sources keys must be non-empty source names."))
+                _record_component_rejection(
+                    _failure_result(state, "set_pipeline sources keys must be non-empty source names.", rejected_component=None)
+                )
                 continue
+            source_ref = _source_component_id(source_name)
             src_plugin = source_model.plugin
             src_options = dict(source_model.options)
             # None and "" both mean 'discard' — one shared owner
@@ -1053,8 +1179,9 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        f"Source '{source_name}': {review_metadata_error}",
+                        review_metadata_error,
                         error_code="interpretation_requirements_invalid",
+                        rejected_component=source_ref,
                     )
                 )
                 continue
@@ -1081,30 +1208,44 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        f"Source '{source_name}': {canonical_error}",
+                        canonical_error,
                         error_code="interpretation_requirements_invalid",
+                        rejected_component=source_ref,
                     )
                 )
                 continue
             endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(src_plugin, src_options)
             if endpoint_policy_error is not None:
-                _record_component_rejection(_failure_result(state, endpoint_policy_error))
+                _record_component_rejection(_failure_result(state, endpoint_policy_error, rejected_component=source_ref))
                 continue
             plugin_error = _validate_plugin_name(context, "source", src_plugin)
             if plugin_error is not None:
-                _record_component_rejection(_plugin_policy_failure(state, plugin_error, component=f"Source '{source_name}'"))
+                _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=source_ref))
                 continue
             manual_blob_ref_error = None if reviewed_source else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
             if manual_blob_ref_error is not None:
-                _record_component_rejection(_failure_result(state, f"Source '{source_name}': {manual_blob_ref_error}"))
+                _record_component_rejection(_failure_result(state, manual_blob_ref_error, rejected_component=source_ref))
                 continue
             manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
             if manual_authoring_error is not None:
-                _record_component_rejection(_failure_result(state, f"Source '{source_name}': {manual_authoring_error}"))
+                _record_component_rejection(_failure_result(state, manual_authoring_error, rejected_component=source_ref))
+                continue
+            guarantee_stamp_error = (
+                None
+                if reviewed_source
+                else _planner_guarantee_stamp_error(
+                    src_options,
+                    stored_options=stored_source_options,
+                    llm_authored=stored_source_options is not None and SOURCE_AUTHORING_KEY in stored_source_options,
+                    tool_name="set_pipeline",
+                )
+            )
+            if guarantee_stamp_error is not None:
+                _record_component_rejection(_failure_result(state, guarantee_stamp_error, rejected_component=source_ref))
                 continue
             manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
             if manual_blobs_error is not None:
-                _record_component_rejection(_failure_result(state, f"Source '{source_name}': {manual_blobs_error}"))
+                _record_component_rejection(_failure_result(state, manual_blobs_error, rejected_component=source_ref))
                 continue
             credential_error = _credential_wiring_contract_failure(
                 state,
@@ -1120,7 +1261,7 @@ def build_set_pipeline_candidate(
                 continue
             path_error = _validate_source_path(src_options, data_dir, session_id=session_id)
             if path_error is not None:
-                _record_component_rejection(_failure_result(state, f"Source '{source_name}': {path_error}"))
+                _record_component_rejection(_failure_result(state, path_error, rejected_component=source_ref))
                 continue
             src_prevalidation = _prevalidate_source_for_context(
                 context,
@@ -1133,9 +1274,10 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        f"Source '{source_name}': {src_prevalidation}",
+                        src_prevalidation,
                         error_code="plugin_options_invalid",
                         plugin_identity=("source", src_plugin),
+                        rejected_component=source_ref,
                     )
                 )
                 continue
@@ -1156,6 +1298,7 @@ def build_set_pipeline_candidate(
     current_nodes = {node.id: node for node in state.nodes}
     for node_index, node in enumerate(validated.nodes):
         node_id = node.id
+        node_ref = f"node:{node_id}"
         node_type = node.node_type
         node_plugin = node.plugin
         node_options: Mapping[str, Any] = node.options
@@ -1181,8 +1324,9 @@ def build_set_pipeline_candidate(
             _record_component_rejection(
                 _failure_result(
                     state,
-                    f"Node '{node_id}': {runtime_owned_error}",
+                    runtime_owned_error,
                     error_code=error_code,
+                    rejected_component=node_ref,
                 )
             )
             continue
@@ -1210,8 +1354,9 @@ def build_set_pipeline_candidate(
             _record_component_rejection(
                 _failure_result(
                     state,
-                    f"Node '{node_id}': {canonical_error}",
+                    canonical_error,
                     error_code="interpretation_requirements_invalid",
+                    rejected_component=node_ref,
                 )
             )
             continue
@@ -1222,7 +1367,9 @@ def build_set_pipeline_candidate(
         # with a closed, explainable error_code instead.
         review_parse_error = authored_node_interpretation_requirement_parse_error(node_id, review_options)
         if review_parse_error is not None:
-            _record_component_rejection(_failure_result(state, review_parse_error, error_code="interpretation_requirements_invalid"))
+            _record_component_rejection(
+                _failure_result(state, review_parse_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref)
+            )
             continue
         credential_error = _credential_wiring_contract_failure(
             state,
@@ -1242,15 +1389,15 @@ def build_set_pipeline_candidate(
         if node_type in ("transform", "aggregation", "collector") and node_plugin is not None:
             plugin_error = _validate_plugin_name(context, "transform", node_plugin)
             if plugin_error is not None:
-                _record_component_rejection(_plugin_policy_failure(state, plugin_error, component=f"Node '{node_id}'"))
+                _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=node_ref))
                 continue
             batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
             if batch_placement_error is not None:
-                _record_component_rejection(_failure_result(state, f"Node '{node_id}': {batch_placement_error}"))
+                _record_component_rejection(_failure_result(state, batch_placement_error, rejected_component=node_ref))
                 continue
             batch_required_error = _batch_aware_required_input_fields_error(node_id, node_plugin, review_options)
             if batch_required_error is not None:
-                _record_component_rejection(_failure_result(state, f"Node '{node_id}': {batch_required_error}"))
+                _record_component_rejection(_failure_result(state, batch_required_error, rejected_component=node_ref))
                 continue
 
             node_prevalidation = _prevalidate_transform_for_context(context, node_plugin, review_options)
@@ -1258,9 +1405,10 @@ def build_set_pipeline_candidate(
                 _record_component_rejection(
                     _failure_result(
                         state,
-                        f"Node '{node_id}': {node_prevalidation}",
+                        node_prevalidation,
                         error_code="plugin_options_invalid",
                         plugin_identity=("transform", node_plugin),
+                        rejected_component=node_ref,
                     )
                 )
                 continue
@@ -1290,7 +1438,7 @@ def build_set_pipeline_candidate(
             if "profile" not in review_options:
                 provider_policy_error = _validate_transform_provider_config_policy(review_options, plugin=node_plugin)
                 if provider_policy_error is not None:
-                    _record_component_rejection(_failure_result(state, f"Node '{node_id}': {provider_policy_error}"))
+                    _record_component_rejection(_failure_result(state, provider_policy_error, rejected_component=node_ref))
                     continue
 
             # S2: confine nested provider_config persist_directory (RAG
@@ -1299,18 +1447,18 @@ def build_set_pipeline_candidate(
             # path while rejecting an escaping sink path.
             provider_path_error = _validate_transform_provider_config_path(review_options, data_dir, session_id=session_id)
             if provider_path_error is not None:
-                _record_component_rejection(_failure_result(state, f"Node '{node_id}': {provider_path_error}"))
+                _record_component_rejection(_failure_result(state, provider_path_error, rejected_component=node_ref))
                 continue
         # Validate gate condition expression at composition time.
         if node_type == "gate" and node.condition is not None:
             expr_error = _validate_gate_expression(node.condition)
             if expr_error is not None:
-                _record_component_rejection(_failure_result(state, f"Node '{node_id}': {expr_error}"))
+                _record_component_rejection(_failure_result(state, expr_error, rejected_component=node_ref))
                 continue
             parity_error = _validate_gate_route_parity(node.condition, node.routes)
             if parity_error is not None:
                 _record_component_rejection(
-                    _failure_result(state, f"Node '{node_id}': {parity_error}", error_code="gate_route_labels_mismatch")
+                    _failure_result(state, parity_error, error_code="gate_route_labels_mismatch", rejected_component=node_ref)
                 )
                 continue
         canonical_node_options[node_index] = review_options
@@ -1359,23 +1507,25 @@ def build_set_pipeline_candidate(
             _record_component_rejection(
                 _failure_result(
                     state,
-                    f"Output '{output.sink_name}': {exc}",
+                    str(exc),
                     error_code="plugin_options_invalid",
+                    rejected_component=f"output:{output.sink_name}",
                 )
             )
     for index, output in enumerate(validated.outputs):
         if index in uncanonical_output_indexes:
             continue
         out_name = output.sink_name
+        output_ref = f"output:{out_name}"
         out_plugin = output.plugin
         out_options = canonical_out_options[index]
         endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(out_plugin, out_options)
         if endpoint_policy_error is not None:
-            _record_component_rejection(_failure_result(state, endpoint_policy_error))
+            _record_component_rejection(_failure_result(state, endpoint_policy_error, rejected_component=output_ref))
             continue
         plugin_error = _validate_plugin_name(context, "sink", out_plugin)
         if plugin_error is not None:
-            _record_component_rejection(_plugin_policy_failure(state, plugin_error, component=f"Output '{out_name}'"))
+            _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=output_ref))
             continue
         raw_out_args: Mapping[str, Any] = {}
         if isinstance(raw_outputs, list) and 0 <= index < len(raw_outputs):
@@ -1401,6 +1551,23 @@ def build_set_pipeline_candidate(
                             on_write_failure=output.on_write_failure if output.on_write_failure is not None else "discard",
                             validation_error=validation_error,
                         ),
+                        # The repair hint embeds the sink's option-shape
+                        # rejection when that is what empty options failed on;
+                        # the plugin was resolved by ``_validate_plugin_name``
+                        # above, so the schema augmentation carries it. A
+                        # collision-policy failure is not an option-shape
+                        # rejection and carries nothing.
+                        #
+                        # ``error_code`` rides the SAME predicate: every other
+                        # producer of the embedded rejection pairs the identity
+                        # with ``plugin_options_invalid``, and a codeless entry
+                        # here left ``validation_guidance`` unable to resolve
+                        # the very rejection the hint quotes. The collision arm
+                        # keeps the identity's ``None`` — that failure is not an
+                        # option-shape rejection, so it may claim neither.
+                        plugin_identity=("sink", out_plugin) if out_prevalidation is not None else None,
+                        error_code="plugin_options_invalid" if out_prevalidation is not None else None,
+                        rejected_component=output_ref,
                     )
                 )
                 continue
@@ -1418,16 +1585,17 @@ def build_set_pipeline_candidate(
             continue
         out_path_error = _validate_sink_path(out_options, data_dir, session_id=session_id)
         if out_path_error is not None:
-            _record_component_rejection(_failure_result(state, f"Output '{out_name}': {out_path_error}"))
+            _record_component_rejection(_failure_result(state, out_path_error, rejected_component=output_ref))
             continue
         out_prevalidation = _prevalidate_sink(out_plugin, out_options)
         if out_prevalidation is not None:
             _record_component_rejection(
                 _failure_result(
                     state,
-                    f"Output '{out_name}': {out_prevalidation}",
+                    out_prevalidation,
                     error_code="plugin_options_invalid",
                     plugin_identity=("sink", out_plugin),
+                    rejected_component=output_ref,
                 )
             )
             continue
@@ -1438,7 +1606,7 @@ def build_set_pipeline_candidate(
         )
         if out_collision_error is not None:
             _record_component_rejection(
-                _failure_result(state, f"Output '{out_name}': {out_collision_error}", error_code="file_sink_write_policy_invalid")
+                _failure_result(state, out_collision_error, error_code="file_sink_write_policy_invalid", rejected_component=output_ref)
             )
             continue
 
@@ -1510,14 +1678,14 @@ def build_set_pipeline_candidate(
         # mutation rejection — an orphan queue is accepted here.
         queue_contract_error = queue_node_contract_error(node_spec)
         if queue_contract_error is not None:
-            return _failure_result(state, queue_contract_error)
+            return _failure_result(state, queue_contract_error, rejected_component=f"node:{n.id}")
         row_union_contract_error = _row_union_node_contract_error(
             node_spec,
             output_names=frozenset(output.sink_name for output in validated.outputs),
         )
         if row_union_contract_error is not None:
             message, error_code = row_union_contract_error
-            return _failure_result(state, message, error_code=error_code)
+            return _failure_result(state, message, error_code=error_code, rejected_component=f"node:{n.id}")
         node_specs.append(node_spec)
 
     edge_specs = []
@@ -1568,22 +1736,23 @@ def build_set_pipeline_candidate(
     invariant_error = _post_mutation_invariant_error(new_state)
     if invariant_error is not None:
         message, error_code = invariant_error
-        return _failure_result(state, message, error_code=error_code)
+        return _failure_result(state, message, error_code=error_code, rejected_component=None)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
-    except TypeError as exc:
-        if str(exc) == "interpretation_requirements must be a list":
-            return _failure_result(state, "interpretation_requirements must be a list.")
+    except (KeyError, TypeError, ValueError) as exc:
+        # The list-shape TypeError keeps its own bare message: it names the
+        # payload key the planner must fix and carries no error_code, so the
+        # generic reconciliation code would misroute the repair.
+        if type(exc) is TypeError and str(exc) == "interpretation_requirements must be a list":
+            return _failure_result(state, "interpretation_requirements must be a list.", rejected_component=None)
         return _failure_result(
             state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
+            review_reconciliation_failure_message(
+                exc,
+                retry_hint="Re-inspect the exact set_pipeline_arguments payload and retry.",
+            ),
             error_code="review_reconciliation_failed",
-        )
-    except (KeyError, ValueError):
-        return _failure_result(
-            state,
-            "Authoritative interpretation-review reconciliation failed. Re-inspect the exact set_pipeline_arguments payload and retry.",
-            error_code="review_reconciliation_failed",
+            rejected_component=None,
         )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         new_state,
@@ -1594,6 +1763,7 @@ def build_set_pipeline_candidate(
             state,
             canonical_error,
             error_code="interpretation_requirements_invalid",
+            rejected_component=None,
         )
     review_contract_error = composition_review_contract_error(new_state)
     if review_contract_error is not None:
@@ -1604,12 +1774,17 @@ def build_set_pipeline_candidate(
         # via explain_validation_code. A term-matched row whose draft fails
         # marker recognition carries its own code: "add the missing row" is the
         # wrong repair when the row exists and only the draft text is wrong.
+        # An unwired vague_term likewise carries its own code: the repair is
+        # wiring a prompt_template_parts interpretation_ref, not restaging
+        # (session 4c42a794, 2026-09-01).
         review_contract_code = (
             "interpretation_review_draft_malformed"
             if review_contract_error.startswith(RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX)
+            else "vague_term_unwired"
+            if review_contract_error.startswith(VAGUE_TERM_UNWIRED_PREFIX)
             else "interpretation_review_contract_unsatisfied"
         )
-        return _failure_result(state, review_contract_error, error_code=review_contract_code)
+        return _failure_result(state, review_contract_error, error_code=review_contract_code, rejected_component=None)
 
     # 6. Report all nodes + sources + outputs as affected
     affected = (*(_source_component_id(name) for name in source_specs), *(n.id for n in node_specs), *(o.name for o in output_specs))
@@ -1678,17 +1853,21 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
     handler=_handle_set_pipeline,
     kind=ToolKind.MUTATION,
     description=(
-        "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, "
-        "use the dedicated patch tool; use `splice_transform` to insert one transform on a direct linear path."
+        "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, name the "
+        "tool that matches the edit: `patch_node_options` for an option-only change, `splice_transform` to "
+        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node."
     ),
     json_schema={
         "type": "object",
         "properties": {
             "source": {
-                "type": ["object", "null"],
+                "type": "object",
                 "description": (
                     "Source configuration. Use blob_id to bind an already uploaded session blob, or "
-                    "inline_blob to materialize user-provided literal data atomically with the pipeline."
+                    "inline_blob to materialize user-provided literal data atomically with the pipeline. "
+                    "null carries NO meaning — it is not 'keep the existing source'. Every call must "
+                    "supply source or sources as a real object: on a full rebuild, re-supply the "
+                    "complete existing source block, including blob_id only when that block carries one."
                 ),
                 "properties": {
                     "plugin": {"type": "string"},
@@ -1698,7 +1877,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "options": {
                         "type": "object",
-                        "description": "Plugin-specific source config. Required by most file/data sources.",
+                        "description": "Plugin-specific source config. Required by most file/data sources."
+                        + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                     },
                     "on_success": {
                         "type": "string",
@@ -1734,16 +1914,20 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "required": ["plugin", "on_success"],
             },
             "sources": {
-                "type": ["object", "null"],
+                "type": "object",
                 "description": (
                     "Named source roots keyed by stable source name; use instead of source for multi-source "
-                    "pipelines. Values share source's shape minus blob_id/inline_blob."
+                    "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
+                    "meaning; every call must supply source or sources as a real object."
                 ),
                 "additionalProperties": {
                     "type": "object",
                     "properties": {
                         "plugin": {"type": "string"},
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "on_success": {"type": "string"},
                         "on_validation_failure": {
                             "type": ["string", "null"],
@@ -1791,7 +1975,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "node, never as an edge; omit it to preserve fail-fast behavior."
                             ),
                         },
-                        "options": {"type": "object"},
+                        "options": {
+                            "type": "object",
+                            "description": "Plugin-specific node config." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                        },
                         "condition": {"type": ["string", "null"]},
                         "routes": {
                             "type": ["object", "null"],
@@ -1902,7 +2089,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific sink config.",
+                            "description": "Plugin-specific sink config." + _OUTPUT_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "on_write_failure": {"type": ["string", "null"]},
                         "description": {
@@ -1940,6 +2127,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 },
             },
         },
+        "oneOf": [
+            {"required": ["source"]},
+            {"required": ["sources"]},
+        ],
         "required": ["nodes", "edges", "outputs"],
         "additionalProperties": False,
     },
@@ -2031,7 +2222,14 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     "an applied_component field, that field is already the post-change state "
     "of everything that mutation touched — read it there, and call this tool "
     "for what it does not cover: a component the change did not touch, or "
-    "the whole document.",
+    "the whole document. A node or output request returns just `node` or "
+    '`output`; `component="source"` returns the `sources` map; '
+    "`set_pipeline_arguments` returns the exact round-trip arguments. A "
+    "full-state read (no component, or an alias) returns the whole document "
+    "with an `inspection` block: `requested_component` (what you asked for), "
+    "`resolved_component` (always `full` here — the request matched a "
+    "full-state alias), and `accepted_full_state_aliases` (the exact strings "
+    "that do).",
     json_schema={
         "type": "object",
         "properties": {
@@ -2050,18 +2248,6 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     },
     cacheable=False,
 )
-
-
-def _authoring_validation_payload(state: CompositionState, validation: ValidationSummary) -> dict[str, Any]:
-    return {
-        "is_valid": validation.is_valid,
-        "errors": [e.to_dict() for e in validation.errors],
-        "warnings": [e.to_dict() for e in validation.warnings],
-        "suggestions": [e.to_dict() for e in validation.suggestions],
-        "edge_contracts": [ec.to_dict() for ec in validation.edge_contracts],
-        "semantic_contracts": _semantic_contracts_payload(validation.semantic_contracts),
-        "graph_repair_suggestions": _graph_repair_suggestions(state, validation),
-    }
 
 
 def _find_node_or_raise(state: CompositionState, affected_node_id: str) -> NodeSpec:
@@ -2197,24 +2383,21 @@ def _assert_affected_component(
         if source_name is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected="'source' for source_data_contract or 'source:<name>' for a named source",
+                expected=SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
                 actual_type="node id",
             )
         source = state.sources.get(source_name)
         if source is None:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=f"an existing source component ({affected_node_id!r})",
-                actual_type="missing source",
+                expected=SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
             )
         matched_terms = _matching_interpretation_sites(state, affected_node_id, kind, user_term)
         if not matched_terms:
             raise ToolArgumentError(
                 argument="affected_node_id",
-                expected=(
-                    "a source with an outstanding data-contract demand — the pipeline must require fields "
-                    "from this source that no current acknowledgement covers"
-                ),
+                expected=SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
                 actual_type=f"missing pending {kind.value} review site",
             )
         # The draft is SERVER-COMPUTED from the graph's demand backtrace and
@@ -2225,8 +2408,8 @@ def _assert_affected_component(
         if llm_draft is not None and llm_draft != computed_draft:
             raise ToolArgumentError(
                 argument="llm_draft",
-                expected="omitted — the server computes the data-contract card from the graph's demand backtrace",
-                actual_type="caller-supplied draft that does not match the server-computed data contract",
+                expected=SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
+                actual_type=SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
             )
         return computed_draft
 
@@ -2382,6 +2565,18 @@ def _assert_affected_llm_node(
     _assert_affected_component(state, affected_node_id, InterpretationKind.VAGUE_TERM, user_term)
 
 
+@trust_boundary(
+    tier=3,
+    source="CompositionState.nodes whose options carry web/LLM-authored values (prompt_template admitted un-typed from persisted session payloads)",
+    source_param="nodes",
+    suppresses=("R5",),
+    invariant=(
+        "raises ToolArgumentError (argument='nodes[].options.prompt_template', expected='a string') on a "
+        "present non-string prompt_template; never coerces or skips the malformed node"
+    ),
+    test_ref="tests/unit/web/composer/test_request_interpretation_review_tool.py::test_typed_detector_raises_for_non_string_prompt_template",
+    test_fingerprint="7e2a188e6441151da86c4da34971d2b1d764265ddf8f8d005a1709cb39b19ae1",
+)
 def _detect_unresolved_interpretation_placeholders_typed(
     nodes: Sequence[NodeSpec],
 ) -> list[tuple[str, str]]:
@@ -2529,7 +2724,6 @@ async def _check_duplicate_interpretation(
             data={
                 "_kind": "interpretation_review_pending_idempotent",
                 "event_id": str(original.id),
-                "affected_node_id": affected_node_id,
                 "kind": kind.value,
                 "interpretation_source": original.interpretation_source.value,
                 "message": "Interpretation review is already pending; reusing the existing event.",
@@ -2685,18 +2879,6 @@ async def _handle_request_interpretation_review(
             "request_interpretation_review arguments",
         ),
     )
-    # Backend owns prompt-template surfacing (elspeth-e51216d305 Case B). The
-    # ``llm_prompt_template`` review is auto-staged on every LLM node and the
-    # BACKEND surfaces its EVENT against the FINAL frozen skeleton at turn
-    # finalization, so it can never go stale against a later skeleton mutation.
-    # The LLM must NOT surface it mid-build via this tool; reject the kind at
-    # the Tier-3 boundary immediately after the parse, before any service call.
-    if parsed.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-        raise ToolArgumentError(
-            argument="kind",
-            expected="vague_term, invented_source, pipeline_decision, or llm_model_choice",
-            actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
-        )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.
     # ``reject_credential_shaped_content`` raises ``ValueError``; we wrap
     # as ToolArgumentError so the compose loop's ARG_ERROR routing catches
@@ -2843,7 +3025,6 @@ async def _handle_request_interpretation_review(
         data={
             "_kind": "interpretation_review_pending",
             "event_id": str(event.id),
-            "affected_node_id": parsed.affected_node_id,
             "kind": parsed.kind.value,
             "interpretation_source": event.interpretation_source.value,
             "message": (

@@ -119,9 +119,9 @@ def read_litellm_model_list() -> tuple[str, ...]:
     composer ``list_models`` tool and the openrouter catalog reader use
     this — they cannot drift on what counts as "what litellm knows."
 
-    Returns an empty tuple when litellm itself is not installed (the LLM
-    extra was not selected) or when ``model_list`` is not a list. The
-    result is sorted so callers can rely on a stable order.
+    Returns an empty tuple only when litellm itself is not installed (the
+    LLM extra was not selected). The result is sorted so callers can rely
+    on a stable order.
 
     A litellm that IS installed but fails its own import — a missing
     transitive dependency, a broken wheel — is not "litellm absent" and
@@ -129,7 +129,11 @@ def read_litellm_model_list() -> tuple[str, ...]:
     empty catalog is "install ``elspeth[llm]``", which is the wrong
     instruction for a broken install. Only the absence of the ``litellm``
     module itself is tolerated here; every other import failure
-    propagates.
+    propagates. The same logic governs the catalog's SHAPE: a
+    ``model_list`` that is not a list of str is litellm version drift on
+    an installed package, so it raises rather than reading as an absent
+    or narrowed catalog (the catalog feeds validate-time membership and a
+    persisted digest — silent narrowing would corrupt both).
     """
     try:
         import litellm
@@ -137,10 +141,35 @@ def read_litellm_model_list() -> tuple[str, ...]:
         if exc.name != "litellm":
             raise
         return ()
-    raw: Any = litellm.model_list
+    return _parse_litellm_model_list(litellm.model_list)
+
+
+@trust_boundary(
+    tier=3,
+    source=(
+        "the installed litellm package's module-level `model_list` attribute — external package data whose shape litellm, not ELSPETH, owns"
+    ),
+    source_param="raw",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError when model_list is not a list or contains a non-str entry — "
+        "version drift on an installed litellm is never read as an absent or narrowed catalog"
+    ),
+    test_ref="tests/unit/plugins/llm/test_model_catalog.py::test_parse_litellm_model_list_rejects_malformed_shapes",
+    test_fingerprint="6ad65b56729a2875a5a1a49b8a65e249a812039b56a270aa3ba11d5a197263a2",
+)
+def _parse_litellm_model_list(raw: Any) -> tuple[str, ...]:
+    """Parse ``litellm.model_list`` into the owned sorted-tuple catalog form."""
     if not isinstance(raw, list):
-        return ()
-    return tuple(sorted(str(m) for m in raw if isinstance(m, str)))
+        raise TypeError(
+            f"litellm.model_list is {type(raw).__name__}, expected list — litellm version drift or a broken install, not an absent catalog"
+        )
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise TypeError(
+                f"litellm.model_list contains a {type(entry).__name__} entry, expected str — litellm version drift, not an absent catalog"
+            )
+    return tuple(sorted(raw))
 
 
 OPENROUTER_LITELLM_PREFIX = "openrouter/"

@@ -103,8 +103,14 @@ class _PerLabelStats:
 class BatchClassifierMetricsConfig(TransformDataConfig):
     """Configuration for batch classifier metrics transform."""
 
-    actual_field: str = Field(description="Name of the field containing ground-truth labels")
-    predicted_field: str = Field(description="Name of the field containing predicted labels")
+    actual_field: Annotated[
+        str,
+        EmittedToOutput("batch_classifier_metrics writes this configured input-field name into each metrics row and its summary text"),
+    ] = Field(description="Name of the field containing ground-truth labels")
+    predicted_field: Annotated[
+        str,
+        EmittedToOutput("batch_classifier_metrics writes this configured input-field name into each metrics row and its summary text"),
+    ] = Field(description="Name of the field containing predicted labels")
     positive_label: Annotated[
         str | int | bool | None,
         EmittedToOutput(
@@ -159,7 +165,7 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a40428818862bd93"
+    source_file_hash: str | None = "sha256:43952c04e45c4fed"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
     usage_when_to_use: str = (

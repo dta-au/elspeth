@@ -22,7 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
-from elspeth.contracts.plugin_protocols import TransformProtocol
+from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
     SchemaConfig,
@@ -39,7 +39,7 @@ from elspeth.contracts.sink import (
     FILE_SINK_PLUGINS,
     LOCAL_RECOVERY_SINK_PLUGINS,
 )
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.union_merge import UnionTypeConflictError, merge_union_field_flags
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.config import (
@@ -59,7 +59,6 @@ from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
     describe_undeclared_row_fields,
-    normalize_field_name,
     undeclared_row_fields,
 )
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
@@ -112,6 +111,17 @@ _MIRRORED_COALESCE_MERGES: Final[frozenset[str]] = frozenset({"union", "nested"}
 _SCOPE_POLICY_VOCABULARY: Final[tuple[str, ...]] = get_args(ScopeSettings.model_fields["policy"].annotation)
 
 
+@observation_boundary(
+    tier=3,
+    source="a NodeSpec branches value re-read from a persisted session payload or authored by the web/LLM surface",
+    source_param="branches",
+    suppresses=("R5",),
+    invariant=(
+        "returns branches unchanged for non-row_union node types, for None, for mapping form, and for "
+        "duplicate-carrying lists (the invalid shape is preserved for validate() to reject); only a unique "
+        "row_union list normalizes to the runtime's ordered identity mapping; never raises"
+    ),
+)
 def _row_union_normalized_branches(node_type: str, branches: CoalesceBranches | None) -> CoalesceBranches | None:
     """Return ``row_union`` list branches as the runtime's identity mapping.
 
@@ -211,7 +221,13 @@ def _composer_node_id_validation_message(node_id: str, node_type: str) -> str | 
     Wording tracks the runtime's so a repair loop reads one message on both
     surfaces.
     """
-    label = _NODE_TYPE_NAME_LABELS.get(node_type, "Node name")
+    # Explicit membership rather than .get(default): _NODE_TYPE_NAME_LABELS
+    # covers every COMPOSER_NODE_TYPES member, so an unknown node_type here is
+    # an unvalidated web-authored value that validate()'s unknown_node_type
+    # check rejects in the SAME result set (it runs after this message pass).
+    # The generic label only words this pass's messages for that not-yet-
+    # rejected shape; it never substitutes for the rejection.
+    label = _NODE_TYPE_NAME_LABELS[node_type] if node_type in _NODE_TYPE_NAME_LABELS else "Node name"
     if not node_id or not node_id.strip():
         return f"{label} must not be empty"
     if node_type in _LOWERCASE_ONLY_NODE_TYPES and node_id != node_id.lower():
@@ -247,6 +263,19 @@ def _label_message(value: str, *, field_label: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec fields (branches, routes, fork_to, connections) admitted un-typed from persisted session payloads via NodeSpec.from_dict",
+    source_param="nodes",
+    suppresses=("R5",),
+    invariant=(
+        "returns label-rule ValidationEntry diagnostics for well-typed label values only; a non-string "
+        "branch name or connection yields no entry from this advisory rule and the value's shape rejection "
+        "is owned by the intrinsic node-shape checks in CompositionState.validate "
+        "(row_union_branch_invalid / coalesce_branches_invalid); never raises"
+    ),
+    non_raising=True,
+)
 def _routing_label_errors(
     *,
     sources: Mapping[str, SourceSpec],
@@ -275,6 +304,17 @@ def _routing_label_errors(
     def add(component: str, message: str, code: str = "connection_label_invalid") -> None:
         found.append(ValidationEntry(component, message, "high", code))
 
+    @trust_boundary(
+        tier=3,
+        source="a source/node label value (on_success, route, branch, connection) admitted un-typed from persisted session payloads",
+        source_param="value",
+        suppresses=("R5",),
+        invariant=(
+            "a non-string value yields no label entry (malformed shapes are owned by the intrinsic "
+            "node-shape checks); only well-typed labels are checked; never raises"
+        ),
+        non_raising=True,
+    )
     def label(component: str, value: object, field_label: str) -> None:
         # Malformed external values (a non-string branch value from a
         # persisted payload) are owned by the intrinsic node-shape checks;
@@ -350,11 +390,6 @@ def _routing_label_errors(
                 add(component, "Collector on_success must be a connection name or sink name")
             else:
                 label(component, node.on_success, "Collector on_success connection name")
-            if node.on_error is not None:
-                if not node.on_error.strip():
-                    add(component, "Collector on_error must be a sink name, 'discard', or omitted")
-                elif node.on_error != _DISCARD_ROUTE_TARGET:
-                    label(component, node.on_error, "Collector on_error sink name")
         elif node.node_type in ("coalesce", "row_union"):
             kind = "Coalesce" if node.node_type == "coalesce" else "row_union"
             raw_branches = node.branches
@@ -409,7 +444,14 @@ def _routing_label_errors(
         try:
             validate_composer_output_name(output.name)
         except ValueError as exc:
-            add(component, str(exc), "output_name_invalid")
+            found.append(
+                ValidationEntry(
+                    component=component,
+                    message=str(exc),
+                    severity="high",
+                    error_code="output_name_invalid",
+                )
+            )
         if not output.on_write_failure or not output.on_write_failure.strip():
             add(component, "on_write_failure must be a sink name or 'discard'")
         elif output.on_write_failure != _DISCARD_ROUTE_TARGET:
@@ -923,7 +965,8 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
 
     Mirrors, at composition time, the runtime rejections a collector NodeSpec
     would otherwise only meet at settings load or DAG build:
-    ``CollectorSettings`` (plugin required, no trigger, extra="forbid"),
+    ``CollectorSettings`` (plugin required, no trigger or on_error,
+    extra="forbid"),
     ``ScopeSettings`` (name rules, closed policy vocabulary), the builder's
     is_batch_aware requirement, and spec §7 rule 1 (a collector requires its
     scope binding). Cross-node scope checks (duplicate scope names/openers,
@@ -971,6 +1014,18 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
             )
         )
 
+    if node.on_error is not None:
+        errors.append(
+            _err(
+                component,
+                f"Collector '{node.id}' does not accept 'on_error': collector failures are whole-group "
+                "verdicts settled through the scope's group policy and nesting, not per-row diversions. "
+                "Remove on_error.",
+                "high",
+                "collector_has_on_error_invalid",
+            )
+        )
+
     # timeout_seconds is deliberately absent here: the shared
     # node_timeout_unsupported check in validate() owns that field for every
     # non-barrier node type, collectors included.
@@ -990,7 +1045,7 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
             _err(
                 component,
                 f"Collector '{node.id}' does not accept field(s): {present}. A collector carries "
-                "plugin/input/on_success/on_error/options plus its scope binding "
+                "plugin/input/on_success/options plus its scope binding "
                 "(scope_name/scope_opener/scope_policy).",
                 "high",
                 "collector_config_invalid",
@@ -1365,6 +1420,7 @@ class ValidationEntryDict(TypedDict):
     contract: NotRequired[SchemaContractDetailDict]
     row_union_schema: NotRequired[RowUnionSchemaDetailDict]
     coalesce_union_type: NotRequired[CoalesceUnionTypeDetailDict]
+    rejected_component: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1400,6 +1456,21 @@ class ValidationEntry:
     # projection moves. Keep it that way unless a wire consumer genuinely
     # needs it.
     plugin_identity: tuple[str, str] | None = None
+    # The validation-component ref (``source`` / ``source:<name>`` /
+    # ``node:<id>`` / ``output:<name>``) a ``rejected_mutation`` entry is
+    # ABOUT. ``component`` stays the literal discriminator
+    # ``"rejected_mutation"`` — the merge, dispatch, and planner filters key on
+    # it — so the subject rides here, stamped by the set_pipeline
+    # per-component loops (``build_set_pipeline_candidate``) where the loop
+    # variable IS the subject. Before this the subject lived only in the
+    # message prefix (``Output 'main': ...``) and the planner's withholding
+    # decision parsed it back with a regex; on a two-component rejection the
+    # model had to match prose to learn which component each entry named
+    # (elspeth-e405ad7cd2, F10). Absent means unattributable: consumers fail
+    # closed rather than parse, exactly as for ``plugin_identity``. Unlike
+    # ``plugin_identity`` this IS wire-carried — it exists so the model can
+    # read it.
+    rejected_component: str | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
@@ -1412,6 +1483,8 @@ class ValidationEntry:
             result["row_union_schema"] = self.row_union_schema.to_dict()
         if self.coalesce_union_type is not None:
             result["coalesce_union_type"] = self.coalesce_union_type.to_dict()
+        if self.rejected_component is not None:
+            result["rejected_component"] = self.rejected_component
         return result
 
 
@@ -1430,7 +1503,12 @@ EdgeContractDict = TypedDict(
 
 @dataclass(frozen=True, slots=True)
 class EdgeContract:
-    """Schema contract check result for a single producer->consumer edge."""
+    """Schema contract check result for one producer->consumer PAIR.
+
+    Not one row per graph edge: ``from_id`` is the REAL upstream producer,
+    walked past forwarding nodes, and several routes converging from that
+    producer onto one consumer collapse into a single row.
+    """
 
     from_id: str
     to_id: str
@@ -1456,11 +1534,18 @@ class ValidationSummary:
     """Stage 1 validation result.
 
     errors block execution. warnings are advisory but actionable.
-    suggestions are optional improvements. edge_contracts shows
-    per-edge schema contract check results. semantic_contracts shows
-    per-edge semantic contract check results (Phase 1: line_explode +
-    web_scrape only). All are tuples for structured component
-    attribution.
+    suggestions are optional improvements. edge_contracts shows one
+    schema contract check per producer->consumer PAIR that was checked,
+    not one per graph edge: the producer is the real upstream walked past
+    forwarding nodes, a node pair is emitted only where the consumer
+    requires fields, and a sink pair is deduped per real producer and
+    emitted only where the sink requires fields AND the producer makes a
+    static claim (the ADR-007 abstention clause). An absent pair is
+    therefore "not checked", never "checked and satisfied".
+    semantic_contracts shows one check per (producer, consumer, required
+    field) triple, an unresolvable producer recorded under a ``"?"``
+    from_id (Phase 1: line_explode + web_scrape only). All are tuples for
+    structured component attribution.
     """
 
     is_valid: bool
@@ -1692,42 +1777,31 @@ _SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 # on how it had learned of the error and could not converge. Neither surface's
 # text was pinned by any test, which is why the drift landed green.
 _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION: Final[str] = (
-    "A field_mapper with select_only: true declares a required output field that its own mapping cannot guarantee. "
-    "The rejection's contract facts name the node and the declared-but-unguaranteed field names, which are mapping "
-    "TARGETS. Because a node's `schema` block is its INPUT contract, a target name is usually absent from "
-    "`schema.fields` altogether, so an instruction to remove it from the declaration has nothing to act on."
+    "A field_mapper with select_only: true produced contradictory internal contract metadata: a required output field "
+    "was absent from the mapping's computed guarantees. Since d4ae04b374 the mapping itself is the required-read "
+    "authority; every configured target must therefore be present on every successful row. The rejection's 'contract' "
+    "facts carry 'producer' and 'consumer' both set to that field_mapper's own node id — the contradiction is "
+    "internal to one node, not an edge — and 'missing_fields', those absent fields."
 )
 _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX: Final[str] = (
-    "Change ONLY that node, and remember `schema` is ALSO its runtime input model: under `mode: fixed` a repair "
-    "must leave every field a row actually carries declared, or the row is rejected before the mapping runs. Each "
-    "name in `missing_fields` is a mapping TARGET, so first look up its SOURCE in the `mapping` you authored — "
-    "what repairs one kind of source is inert for another. If the source contains a dot it is a nested read that "
-    "`schema.guaranteed_fields` cannot name: set `strict: true`, which is node-wide and routes any row missing ANY "
-    "mapped source to on_error, and if `schema.mode` is `fixed` set it to `flexible` in the same edit — fixed mode "
-    "rejects the nested read's top-level container field as an undeclared extra, so `strict: true` alone clears "
-    "this error and then fails every row at input validation. Otherwise, IF you are certain the source is spelled "
-    "exactly as the upstream row keys it, declare it in `schema.fields` AND name it in `schema.guaranteed_fields` "
-    "AND remove the target's own entry from `schema.fields` — all three, since leaving the target declared makes "
-    "the node demand the emitted name as an input it never receives. If you are not certain of that spelling, do "
-    "NOT guess: a source the row is not keyed by is accepted by both of those declarations and changes nothing, "
-    "returning this same error. Withdraw the guarantee instead — make the target optional by appending `?` to its "
-    "declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must keep at least one "
-    "field, so deleting the last one is rejected), drop it from `schema.guaranteed_fields` if named there, and if "
-    "`schema.mode` is `fixed` set it to `flexible` so the key the row actually arrives under passes input "
-    "validation. A consumer that needs the field then rejects at its own edge rather than here. Or repair it end "
-    "to end: rename the field upstream so the row is keyed by a normalization-stable spelling, rewrite the mapping "
-    "key to that SAME spelling, and then declare and guarantee it. Never rewrite the mapping key alone to make it "
-    "look right: that is accepted silently and drops the column."
+    "Do not mutate the pipeline to work around this error. Preserve the authored mapping and report the node and "
+    "missing_fields as an internal field_mapper contract defect: the plugin must derive every mapping target into "
+    "its output guarantees. For a fixed input schema, independently ensure it declares each configured flat source "
+    "or dotted source's top-level root; emitted target names are not substitutes for those input fields."
 )
 _TRANSFORM_OUTPUT_COLLISION_EXPLANATION: Final[str] = (
     "A transform declares an output field that already arrives on its input row. The engine rejects a transform that "
-    "would overwrite an existing input field, so the run fails on the first row. The rejection's contract facts name "
-    "the node and the colliding field names."
+    "would overwrite an existing input field, so the run fails on the first row. The rejection's 'contract' facts "
+    "name the collision: 'producer' and 'consumer' both carry this same transform's own node id — not an upstream "
+    "edge, because the colliding field can arrive from several upstream arms at once, so no single upstream producer "
+    "is named — and 'extra_fields' lists the declared output field names that already definitely arrive on the input "
+    "row (a lower bound: more names may collide than are listed)."
 )
 _TRANSFORM_OUTPUT_COLLISION_FIX: Final[str] = (
-    "Change ONLY that node's output name, or the field upstream of it: rename this transform's output to a name the "
-    "row does not already carry (for an llm transform that is `response_field`), OR rename/drop the incoming field "
-    "upstream with a field_mapper before this node."
+    "Change ONLY this node's output name, or the field(s) upstream of it: rename this transform's output to a name "
+    "the row does not already carry — for an llm transform, change whichever option produced the colliding name: "
+    "`response_field`, or the output_fields entry that equals it — OR rename or drop each name in 'extra_fields' "
+    "upstream with a field_mapper before this node; resolve every listed name, not just one."
 )
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
     "A single-prompt llm node's prompt_template reads row fields its own options.required_input_fields does not "
@@ -2403,17 +2477,51 @@ def _node_topology_cycle(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...] | None:
     return None
 
 
-def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
+class SinkLureDict(TypedDict):
+    """The sink-publishing hop that lures one unreachable coalesce branch."""
+
+    node_id: str
+    publishes_to_sink: str
+
+
+class UnreachableBranchDict(TypedDict):
+    """One coalesce branch whose consumed connection nothing produces.
+
+    Carries its own ``sink_lure`` rather than exposing a parallel list keyed
+    by connection name: the repair needs "this branch is broken AND this is
+    the node that broke it" as one fact, not two the reader must join on a
+    string.
+
+    ``branch`` matches the identity key of the sibling per-member record
+    ``RowUnionBranchSchemaDetailDict`` — one envelope should not name one
+    concept three ways.
+    """
+
+    branch: str
+    consumed_connection: str
+    sink_lure: NotRequired[SinkLureDict]
+
+
+class CoalesceReachabilityFactDict(TypedDict):
+    """Redaction-safe repair facts for one coalesce's unreachable branches."""
+
+    unreachable_branches: list[UnreachableBranchDict]
+    produced_connections: list[str]
+
+
+def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceReachabilityFactDict]:
     """Redaction-safe wiring facts for coalesce branch-reachability rejections.
 
     Maps each coalesce node id whose ``branches`` values name connections no
     runtime routing field produces to the facts a repair needs:
-    ``unreachable_branches`` (branch key -> consumed connection value, exactly
-    as authored — list-form branches key by the entry itself) and
-    ``produced_connections`` (the membership set ``validate()``'s
-    ``coalesce_branch_unreachable`` check tests, minus sink names and the
-    coalesce's own published id — both pass the walk but are never a correct
-    branch value, so the facts must not steer a repair toward them).
+    ``unreachable_branches`` (one record per broken branch, naming the branch
+    and the connection it consumes exactly as authored — for list-form
+    branches the two are the same string, which the record states plainly
+    rather than encoding as a self-mapping) and ``produced_connections`` (the
+    membership set ``validate()``'s ``coalesce_branch_unreachable`` check
+    tests, minus sink names and the coalesce's own published id — both pass
+    the walk but are never a correct branch value, so the facts must not
+    steer a repair toward them).
 
     Guided session 277fb6c4 (2026-07-22) exhausted its repair budget on four
     identical ``coalesce_branch_unreachable`` rejections: the observed
@@ -2424,13 +2532,25 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
     ``SchemaContractDetail`` — so forwarding it through the message-stripped
     repair feedback does not re-open the redaction boundary.
 
-    ``sink_targeting_branches`` names the lure explicitly: for each
-    unreachable branch whose branch-side transform CHAIN terminates in a
-    sink-publishing hop, the entry carries that transform's id, the sink it
-    publishes to, and the connection the coalesce expects instead. Guided
-    attempt 14 (session 04200b45) re-wired branch transforms to the
-    reviewed sink three times WITH the bare facts live — the repair needs
-    the exact miswired node named.
+    A MAPPED branch whose branch-side transform CHAIN terminates in a
+    sink-publishing hop carries ``sink_lure``: that transform's id and the
+    sink it publishes to. Guided attempt 14 (session 04200b45) re-wired
+    branch transforms to the reviewed sink three times WITH the bare facts
+    live — the repair needs the exact miswired node named. The lure rides
+    on the branch record it explains, so nothing has to be joined back by
+    connection name; the connection the coalesce expects is that record's
+    own ``consumed_connection``.
+
+    An IDENTITY branch (list form, or a mapping entry whose value equals
+    its key) never carries a lure: the walk starts from the branch name,
+    which for such a branch is the consumed connection itself, so it finds
+    a competing consumer rather than a producer. See the guard at the
+    append site.
+
+    Every field here is taught to the planner per-key in
+    ``tools/generation.py``'s ``coalesce_branch_unreachable`` guidance. A
+    fact the model is never told how to read cannot repair anything, so a
+    new field is a change to BOTH surfaces.
     """
     targets = _runtime_connection_targets(state.sources, state.nodes)
     sink_names = {output.name for output in state.outputs}
@@ -2439,7 +2559,7 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
         if node.node_type == "transform" and node.input not in transform_by_input:
             transform_by_input[node.input] = node
 
-    def _sink_lure(branch_key: str) -> tuple[str, str] | None:
+    def _sink_lure(branch_key: str) -> SinkLureDict | None:
         """Follow the transform chain consuming ``branch_key`` to a sink hop."""
         connection = branch_key
         for _ in range(len(state.nodes)):
@@ -2449,16 +2569,15 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
             if consumer.on_success is None:
                 return None
             if consumer.on_success in sink_names:
-                return consumer.id, consumer.on_success
+                return {"node_id": consumer.id, "publishes_to_sink": consumer.on_success}
             connection = consumer.on_success
         return None
 
-    facts: dict[str, dict[str, Any]] = {}
+    facts: dict[str, CoalesceReachabilityFactDict] = {}
     for node in state.nodes:
         if node.node_type != "coalesce" or node.branches is None:
             continue
-        unreachable: dict[str, str] = {}
-        sink_targeting: list[dict[str, str]] = []
+        unreachable: list[UnreachableBranchDict] = []
         for branch_name, branch_connection in zip(
             _coalesce_branch_names(node.branches),
             _coalesce_branch_connections(node.branches),
@@ -2466,22 +2585,32 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
         ):
             if branch_connection in targets:
                 continue
-            unreachable[str(branch_name)] = branch_connection
-            lure = _sink_lure(str(branch_name))
-            if lure is not None:
-                sink_targeting.append({"node_id": lure[0], "on_success_sink": lure[1], "expected_connection": branch_connection})
+            record: UnreachableBranchDict = {"branch": branch_name, "consumed_connection": branch_connection}
+            # Only a MAPPED branch can carry a lure. _sink_lure walks from the
+            # branch NAME, which for a mapped branch is the fork alias — so the
+            # transform consuming it is that branch's producer, and re-pointing
+            # its on_success at the consumed connection is the correct repair.
+            # For an identity branch (list form, or a mapping entry whose value
+            # equals its key) the name IS the consumed connection, so that walk
+            # finds a competing CONSUMER of the connection the coalesce awaits.
+            # Naming it would tell the planner to set that node's on_success to
+            # its own input — a self-loop, rejected as pipeline_cycle, spending
+            # a repair turn in the one payload that exists to stop repair
+            # budgets burning on coalesce_branch_unreachable.
+            if branch_name != branch_connection:
+                lure = _sink_lure(branch_name)
+                if lure is not None:
+                    record["sink_lure"] = lure
+            unreachable.append(record)
         if not unreachable:
             continue
-        entry: dict[str, Any] = {
+        facts[node.id] = {
             "unreachable_branches": unreachable,
             # _FORK_ROUTE_TARGET is the reserved route keyword ("go to
             # fork_to"), not a connection — it rides the membership set but
             # must not be advertised as a wirable name.
             "produced_connections": sorted(targets - sink_names - {node.id, _FORK_ROUTE_TARGET}),
         }
-        if sink_targeting:
-            entry["sink_targeting_branches"] = sink_targeting
-        facts[node.id] = entry
     return facts
 
 
@@ -2806,11 +2935,6 @@ def _validate_runtime_route_destinations(
         # Mirror the builder's collector on_success resolution ("Collector
         # '{name}' on_success '{target}' is neither a sink nor a known
         # connection"): a sink or a consumed connection, like a transform.
-        # on_error carries NO dangling check on purpose — CollectorSettings
-        # validates only its label shape, and the builder builds no
-        # collector on_error edge (an omitted on_error derives the route
-        # from structure, spec §7 rule 9), so rejecting a name here would
-        # be composer-red/runtime-green.
         if (
             node.node_type == "collector"
             and node.on_success is not None
@@ -2952,10 +3076,17 @@ def edge_lowering_error(edge: EdgeSpec, *, from_kind: ComponentKind | None, to_k
         return None
     if edge_type in ("route_true", "route_false", "fork"):
         return f"Only gates can use '{edge_type}' edges; '{edge.from_node}' is a {from_kind}."
-    if from_kind in ("transform", "aggregation", "collector"):
+    if from_kind in ("transform", "aggregation"):
         if edge_type == "on_error" and to_kind is not None and to_kind != "output":
             return (
                 f"{from_kind.capitalize()} '{edge.from_node}' on_error must route to a sink or 'discard'; '{edge.to_node}' is a {to_kind}."
+            )
+        return None
+    if from_kind == "collector":
+        if edge_type == "on_error":
+            return (
+                f"Collector '{edge.from_node}' has no on_error route: collector failures are whole-group "
+                "verdicts settled through scope policy and nesting."
             )
         return None
     if from_kind == "coalesce":
@@ -3490,10 +3621,11 @@ def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]
     tier=3,
     source="node.options['queries'] (web-authored multi-query definitions)",
     source_param="queries",
-    suppresses=("R5",),
+    suppresses=("R1", "R5"),
     invariant=(
         "returns only well-formed (label, entry) pairs; malformed queries or entries are silently "
-        "dropped (QueryDefinition's contract is reported by plugin schema validation, not here), and "
+        "dropped (QueryDefinition's contract is reported by plugin schema validation, not here); a list "
+        "entry without a well-formed name is labelled positionally ('#<index>') for diagnostics, and "
         "this boundary never raises"
     ),
 )
@@ -4163,165 +4295,6 @@ def _check_schema_contracts(
                 raise
             return None
 
-    def _mapping_source_of(options: Mapping[str, Any], target: str) -> str:
-        """Return the mapping key that emits ``target``.
-
-        No shape guard, and no absent-key fallback, because neither state is
-        reachable from the one call site. Rule C reaches this only after
-        ``_probe_transform_output_schema`` returned a config, which means
-        ``FieldMapperConfig`` already parsed these same options — so ``mapping``
-        is a validated ``dict[str, str]``. And ``target`` always has an entry,
-        because under ``select_only`` the projection that produces
-        ``declared_required`` emits mapping TARGETS only, making ``missing`` a
-        subset of ``mapping.values()`` by construction (a declared non-target is
-        dropped by the projection, never carried into ``missing``).
-
-        A ``KeyError``/``AttributeError`` here is therefore a framework bug and
-        must crash loudly rather than degrade into advice that names no source.
-        """
-        mapping: Mapping[str, str] = options["mapping"]
-        return next(source for source, mapped in mapping.items() if mapped == target)
-
-    remedy_class_cache: dict[str, str] = {}
-
-    def _mapping_source_remedy_class(source: str, target: str) -> str:
-        """Memoized ``_classify_mapping_source``.
-
-        Two plugin constructions per classification, and ``validate()`` runs on
-        every composer tool call, so a many-target mapper would otherwise pay
-        for each one. The verdict depends only on the SOURCE — the target is a
-        free variable the probes carry through — so one entry per distinct
-        source serves every target it maps to.
-        """
-        if source in remedy_class_cache:
-            return remedy_class_cache[source]
-        verdict = _classify_mapping_source(source, target)
-        remedy_class_cache[source] = verdict
-        return verdict
-
-    def _classify_mapping_source(source: str, target: str) -> str:
-        """Classify what would actually repair ``source`` -> ``target``.
-
-        Asks the PLUGIN, by constructing two canonical counterfactual configs
-        and reading back whether ``target`` lands in its guarantees. The message
-        therefore cannot disagree with the rule it explains: both read the same
-        ``_output_schema_config``. A hand-written predicate here would drift —
-        the obvious spellings (``str.isidentifier``, "lowercase with no spaces")
-        are both measurably wrong, admitting ``Name``/``userID``/``_id``/``a__b``
-        where the plugin abstains and rejecting ``class_``/``_1``/``if_`` where
-        it does not (elspeth-920bd88299, and elspeth-f262a8c678 for the
-        isidentifier half).
-
-        ``declarable`` — the source is the name the row is keyed by, so
-        declaring and guaranteeing it repairs the node while KEEPING the
-        downstream promise. ``strict_only`` — a nested read, which
-        ``guaranteed_fields`` can never name. ``unguaranteeable`` — the plugin
-        deliberately abstains (it cannot tell whether the row is keyed by the
-        literal or by its normalized form), so NO declaration repairs it.
-        """
-        declared_options = {
-            "mapping": {source: target},
-            "select_only": True,
-            "schema": {"mode": "fixed", "fields": [f"{source}: any"], "guaranteed_fields": [source]},
-        }
-        constructed, config = _probe_transform_output_schema("field_mapper", declared_options)
-        if constructed and config is not None and target in (config.guaranteed_fields or ()):
-            return "declarable"
-        strict_options = {
-            "mapping": {source: target},
-            "select_only": True,
-            "strict": True,
-            "schema": {"mode": "fixed", "fields": [f"{target}: any"]},
-        }
-        constructed, config = _probe_transform_output_schema("field_mapper", strict_options)
-        if constructed and config is not None and target in (config.guaranteed_fields or ()):
-            return "strict_only"
-        return "unguaranteeable"
-
-    def _unguaranteed_target_remedies(options: Mapping[str, Any], missing: frozenset[str]) -> str:
-        """Build Rule C's repair advice, one clause per applicable source class.
-
-        Emits ONLY the remedies measured to work for the sources actually in
-        play — measured through EXECUTION, not just through this validator.
-        The rule previously offered four alternatives joined by "OR", of
-        which two were inert for the shape that fires most and one was
-        unauthorable in every shape — so a planner could apply a remedy, have
-        the mutation ACCEPTED, and get a byte-identical error back with no
-        signal that its repair had done nothing (elspeth-920bd88299). The
-        successor defect was subtler: a remedy that cleared THIS validator but
-        left a node whose fixed-mode INPUT model rejected the very field the
-        mapping reads, so every row died in ``_run_preflight`` before
-        ``process()`` — which is why the fixed-mode clauses below also
-        instruct the ``schema.mode: flexible`` switch.
-        """
-        # Direct indexing on the same grounds as ``_mapping_source_of``: this
-        # function runs only after ``_probe_transform_output_schema`` returned
-        # a config, so ``FieldMapperConfig`` (whose ``schema`` and ``mode``
-        # are required, defaultless fields) already parsed these options.
-        schema_is_fixed = options["schema"]["mode"] == "fixed"
-
-        # Seeded with every class so the reads below are direct indexing: this
-        # dict is built and consumed here, so a ``.get`` default would be
-        # covering for an absence this function itself rules out.
-        by_class: dict[str, list[tuple[str, str]]] = {"declarable": [], "strict_only": [], "unguaranteeable": []}
-        for target in sorted(missing):
-            source = _mapping_source_of(options, target)
-            by_class[_mapping_source_remedy_class(source, target)].append((target, source))
-
-        clauses: list[str] = [
-            "Those names are mapping TARGETS, and `schema` is this node's INPUT contract, so a target is usually "
-            "absent from `schema.fields` altogether — removing it from the declaration then changes nothing and "
-            "this same error repeats."
-        ]
-        for target, source in by_class["declarable"]:
-            clauses.append(
-                f"'{target}' is mapped from '{source}', which the row is keyed by: declare '{source}' in "
-                f"`schema.fields`, name it in `schema.guaranteed_fields`, AND remove '{target}' from "
-                f"`schema.fields` — all three, because leaving '{target}' declared makes this node demand the "
-                f"emitted name as an input field it never receives."
-            )
-        for target, source in by_class["strict_only"]:
-            container = source.split(".", 1)[0]
-            fixed_mode_leg = (
-                f" Set `schema.mode: flexible` in the same edit: `schema` is also this node's runtime input "
-                f"model, and fixed mode rejects the top-level '{container}' field the nested read consumes as an "
-                f"undeclared extra — with `strict: true` alone this error clears and every row then fails input "
-                f"validation before the mapping runs."
-                if schema_is_fixed
-                else ""
-            )
-            clauses.append(
-                f"'{target}' is mapped from the nested read '{source}', which `schema.guaranteed_fields` cannot "
-                f"name: set `strict: true` instead. That is node-wide — it routes any row missing ANY mapped "
-                f"source to on_error rather than emitting the row without it.{fixed_mode_leg}"
-            )
-        for target, source in by_class["unguaranteeable"]:
-            fixed_mode_leg = (
-                ", and set `schema.mode: flexible` so the key the row actually arrives under passes this node's input validation"
-                if schema_is_fixed
-                else ""
-            )
-            try:
-                stable_spelling = f"'{normalize_field_name(source)}'"
-            except ValueError:
-                # ``ExternalHeaderError``/``ValueError`` for a literal with no
-                # normalized form at all (``'!!!'``) — there is no spelling to
-                # name, but the shape of the repair is still statable.
-                stable_spelling = "a normalization-stable spelling"
-            clauses.append(
-                f"'{target}' is mapped from '{source}', which is not the name a row is keyed by, so this node "
-                f"cannot promise '{target}' at all — no `schema` declaration and no `strict: true` clears this. "
-                f"Do NOT rewrite the mapping key to another spelling on its own: that is accepted silently and "
-                f"drops the column. Either withdraw the guarantee — make '{target}' optional by appending `?` to "
-                f"its declared type in `schema.fields` (do not delete the entry: a fixed/flexible schema must "
-                f"keep at least one field, so deleting the last one is rejected), drop '{target}' from "
-                f"`schema.guaranteed_fields` if named there{fixed_mode_leg} — after which a consumer that "
-                f"requires '{target}' rejects at its own edge; or repair it end to end — rename the field "
-                f"upstream so the row is keyed by {stable_spelling}, rewrite the mapping key to that SAME "
-                f"spelling, and then declare and guarantee it like any row-keyed source."
-            )
-        return " ".join(clauses)
-
     class _CollisionProbe(NamedTuple):
         declared_output_fields: frozenset[str]
         can_overwrite_input: bool
@@ -4567,12 +4540,15 @@ def _check_schema_contracts(
             if transform is not None:
                 transform.close()
 
-        if is_pass_through_instance:
+        forwards_input = transform.forwards_input_fields
+        forwards_through_open_contract = forwards_input and (output_schema_config is None or output_schema_config.allows_extra_fields)
+        if is_pass_through_instance or forwards_through_open_contract:
             base = output_schema_config.get_effective_guaranteed_fields() if output_schema_config is not None else frozenset()
             inherited_participates, inherited_fields = _connection_propagation_vote(
                 producer_node.input,
                 visited_fan_in_ids=visited_fan_in_ids,
             )
+            removals = frozenset() if is_pass_through_instance else transform.removed_input_fields
             # ADR-009 §Clause 1: share the aggregation rule with graph.py.
             # Composer's producer-graph is single-upstream at this level
             # (coalesce absorbs fan-in via pre-computed output), so we pass a
@@ -4588,7 +4564,7 @@ def _check_schema_contracts(
             # validate_sink_required_fields rejects accordingly).
             return (
                 own_participates or inherited_participates,
-                compose_propagation(base, [inherited_fields if inherited_participates else None]),
+                compose_propagation(base, [inherited_fields - removals if inherited_participates else None]),
             )
 
         if output_schema_config is None:
@@ -5714,6 +5690,98 @@ def _check_schema_contracts(
             return False
         return schema_config is not None and not schema_config.is_observed
 
+    def _resolved_producer_field_type(
+        producer: ProducerEntry,
+        field_name: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """Resolve a declared type through truthful value-preserving forwarders."""
+        if producer.producer_id in visited:
+            return None
+        owner = _producer_owner(producer)
+        raw_schema = get_raw_schema_config(producer.options, owner=owner)
+        if is_source_producer_id(producer.producer_id):
+            if raw_schema is None:
+                return None
+            if raw_schema.fields is not None:
+                for field in raw_schema.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+                return None
+            if not raw_schema.is_observed or field_name not in (raw_schema.guaranteed_fields or ()):
+                return None
+
+            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+            source_spec = source_map.get(source_name)
+            if source_spec is None or producer.plugin_name is None:
+                return None
+            source: SourceProtocol | None = None
+            try:
+                from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+                probe_options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
+                probe_options["on_validation_failure"] = source_spec.on_validation_failure
+                source = get_shared_plugin_manager().create_source(producer.plugin_name, probe_options)
+                return source.observed_value_type
+            except Exception as exc:
+                if _is_source_config_probe_exception(exc):
+                    return None
+                raise
+            finally:
+                if source is not None:
+                    source.close()
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+            return None
+
+        transform: TransformProtocol | None = None
+        try:
+            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+            transform = get_shared_plugin_manager().create_transform(
+                producer_node.plugin,
+                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
+            )
+            output_config = transform._output_schema_config
+            if output_config is not None and output_config.fields is not None:
+                for field in output_config.fields:
+                    if field.name == field_name:
+                        return None if field.field_type == "any" else field.field_type
+
+            forwards_field_unchanged = (
+                transform.forwards_input_fields
+                and transform.preserves_input_values
+                and field_name not in transform.removed_input_fields
+                and (output_config is None or output_config.allows_extra_fields)
+            )
+            if not ((transform.passes_through_input and transform.preserves_input_values) or forwards_field_unchanged):
+                return None
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                return None
+            raise
+        finally:
+            if transform is not None:
+                transform.close()
+
+        upstream = resolver.find_producer_for(producer_node.input)
+        if upstream is None:
+            return None
+        upstream = _walk_producer_entry_to_real_producer(
+            upstream,
+            connection_name=producer_node.input,
+            warnings=[],
+        )
+        if upstream is None:
+            return None
+        return _resolved_producer_field_type(
+            upstream,
+            field_name,
+            visited=visited | {producer.producer_id},
+        )
+
     def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
 
@@ -5760,10 +5828,11 @@ def _check_schema_contracts(
         loop's job and extras belong to the Rule A/B walkers; reporting either
         here would double-attribute one defect.
 
-        Callers gate on ``_producer_is_typed_source``, which is the runtime's
-        own Phase-2 bypass — observed sources and transform/gate/coalesce
-        producers resolve to a dynamic effective producer schema at runtime and
-        are skipped there, so they are skipped here too.
+        A direct typed source settles its own fields. A transform with an open
+        output may additionally carry an ancestor declaration only when its
+        explicit forwarding and value-preservation contracts prove the field
+        survives unchanged. Removed fields, fixed output firewalls, rewriting
+        transforms, and unresolved fan-in all abstain.
         """
         if isinstance(consumer, OutputSpec):
             consumer_id = f"output:{consumer.name}"
@@ -5772,7 +5841,6 @@ def _check_schema_contracts(
             consumer_id = consumer.id
             consumer_component = f"node:{consumer.id}"
         try:
-            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
             consumer_options = consumer.options
             consumer_owner = consumer_component
             if isinstance(consumer, NodeSpec) and consumer.node_type == "aggregation":
@@ -5783,24 +5851,22 @@ def _check_schema_contracts(
             # ``contract_config_invalid`` parsers; do not double-report.
             return None
 
-        if producer_schema_config is None or consumer_schema_config is None:
+        if consumer_schema_config is None:
             return None
         if consumer_schema_config.is_observed:
             return None
-        if producer_schema_config.fields is None or consumer_schema_config.fields is None:
+        if consumer_schema_config.fields is None:
             return None
 
-        producer_types = {field.name: field.field_type for field in producer_schema_config.fields}
         # ``any`` is a declared abstention on BOTH sides — the author has said
         # the type is not pinned, so no conflict is mechanically provable.
-        mismatches = [
-            (field.name, field.field_type, producer_types[field.name])
-            for field in consumer_schema_config.fields
-            if field.name in producer_types
-            and field.field_type != "any"
-            and producer_types[field.name] != "any"
-            and producer_types[field.name] != field.field_type
-        ]
+        mismatches: list[tuple[str, str, str]] = []
+        for field_def in consumer_schema_config.fields:
+            if field_def.field_type == "any":
+                continue
+            producer_type = _resolved_producer_field_type(producer, field_def.name)
+            if producer_type is not None and producer_type != field_def.field_type:
+                mismatches.append((field_def.name, field_def.field_type, producer_type))
         if not mismatches:
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
@@ -5902,11 +5968,11 @@ def _check_schema_contracts(
 
         producer_is_typed_source = _producer_is_typed_source(actual_producer)
         contract_required = consumer_required
+        type_error = _edge_field_type_conflict(actual_producer, node)
+        if type_error is not None:
+            errors.append(type_error)
         if producer_is_typed_source:
             contract_required = consumer_required | consumer_effective_required
-            type_error = _edge_field_type_conflict(actual_producer, node)
-            if type_error is not None:
-                errors.append(type_error)
             if declared_string_input:
                 string_type_error = _string_input_field_type_conflict(actual_producer, node, declared_string_input)
                 if string_type_error is not None:
@@ -6178,14 +6244,12 @@ def _check_schema_contracts(
             assert producer_vote is not None  # No error => guarantees resolved.
             producer_participates, producer_guaranteed = producer_vote
 
-            # Field-TYPE conflict on the producer -> sink edge, gated exactly as
-            # the node-consumer call above: only a typed (fixed/flexible) SOURCE
-            # presents a static schema the runtime's Phase-2 check reads; a
-            # transform/gate/coalesce producer is dynamic and skipped there too.
-            if _producer_is_typed_source(actual_producer):
-                sink_type_error = _edge_field_type_conflict(actual_producer, output)
-                if sink_type_error is not None:
-                    errors.append(sink_type_error)
+            # Field-TYPE conflict on the producer -> sink edge. Direct typed
+            # declarations and safely forwarded ancestor types share the same
+            # resolver as node consumers above.
+            sink_type_error = _edge_field_type_conflict(actual_producer, output)
+            if sink_type_error is not None:
+                errors.append(sink_type_error)
 
             # ADR-007 parity: mirror the runtime abstention clause in
             # validate_sink_required_fields (core/dag/schema_validation.py).
@@ -6263,17 +6327,20 @@ def _check_schema_contracts(
                 if sink_extras_error is not None:
                     errors.append(sink_extras_error)
 
-    # Rule C: per-transform self-consistency between declared output schema
-    # and the *actual* predicted emit set, scoped to plugins whose emit set
-    # can be computed deterministically from config alone. Currently:
-    # ``field_mapper`` with ``select_only=True`` — the actual output is
-    # exactly ``mapping.values()``, so any declared output field absent from
-    # mapping targets cannot be emitted.
+    # Rule C: internal self-consistency tripwire between the declared output
+    # schema and the *actual* predicted emit set. For ``field_mapper`` with
+    # ``select_only=True`` the successful emit set is exactly
+    # ``mapping.values()``. Since d4ae04b374 the mapping is also the
+    # required-read authority: representable sources are checked before
+    # ``process()``, and unrepresentable misses route to error. Consequently
+    # every target MUST be in the plugin-computed guarantee set. A finding here
+    # is framework drift, not an author-repairable schema choice.
     #
     # Why this is plugin-scoped rather than generic: ``_output_schema_config.
-    # guaranteed_fields`` has plugin-specific semantics. For field_mapper it
-    # IS the actual emit set (computed by ``_build_field_mapper_output_schema_config``
-    # from the mapping). For additive plugins like ``line_explode``/``web_scrape``
+    # guaranteed_fields`` has plugin-specific semantics. For a select-only
+    # field_mapper it IS the actual emit set (computed by
+    # ``_build_field_mapper_output_schema_config`` from the mapping). For
+    # additive plugins like ``line_explode``/``web_scrape``
     # it is a *lower bound* on emission (only the fields the transform itself
     # adds — passes-through input fields are not enumerated), so a generic
     # ``get_effective_guaranteed_fields() - guaranteed_fields`` check would
@@ -6293,17 +6360,9 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
-        # Gate on the PLUGIN'S parse of select_only, not on raw-JSON
-        # truthiness. The two disagree on exactly the pydantic-False strings
-        # ("false"/"False"/"no"/"off"/"0"): ``bool()`` reads every non-empty
-        # string as True, and the drifted gate adjudicated a mapper whose
-        # parsed select_only is False under this rule's select_only-only
-        # jurisdiction, asserting "with select_only: true" about a
-        # configuration the node does not have (elspeth-fc3cd7a86c).
-        # Constructing the CONFIG asks the single owner of that semantics
-        # while still short-circuiting before plugin construction and
-        # touching no private plugin instance attributes. An unparseable
-        # config is the config-parse rules' to report, never Rule C's.
+        # Gate on the PLUGIN'S parse of select_only, not raw-JSON truthiness;
+        # pydantic-False strings and Python bool() disagree. An unparseable
+        # config belongs to the config-parse rules, never this tripwire.
         node_cfg = _probe_field_mapper_config(node.options)
         if node_cfg is None:
             continue
@@ -6328,14 +6387,13 @@ def _check_schema_contracts(
                 f"[{_format_fields(declared_required)}] (required) but with select_only: true the mapping can only "
                 f"guarantee [{_format_fields(predicted_emit)}]. "
                 f"Declared required output fields not guaranteed by this transform: [{_format_fields(missing)}]. "
-                f"{_unguaranteed_target_remedies(node.options, missing)}",
+                + _TRANSFORM_DECLARED_NOT_GUARANTEED_FIX,
                 "high",
                 "transform_declared_output_not_guaranteed",
                 # Self-inconsistency: producer and consumer are the same node.
-                # missing_fields are mapping TARGETS the node declares required
-                # but cannot guarantee — not names the author necessarily wrote
-                # in `schema.fields`, which is why the message resolves each one
-                # back to its mapping source before advising anything.
+                # Missing fields are mapping TARGETS. Since the mapping itself
+                # is now the required-read authority, this is internal plugin
+                # contract drift rather than an author-repairable declaration.
                 contract=SchemaContractDetail(
                     producer=node.id,
                     consumer=node.id,
@@ -7094,6 +7152,20 @@ class CompositionState:
                         )
                     )
             elif node.node_type == "coalesce":
+                # ``CoalesceSettings`` is a built-in structural contract and
+                # has no plugin options field.  The YAML generator therefore
+                # cannot lower NodeSpec.options for this node kind.  Refuse
+                # any non-empty mapping here instead of validating authored
+                # metadata that disappears before runtime (elspeth-15b400881f).
+                if node.options:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' does not accept options; author branches, policy, merge, and optional timeout_seconds instead.",
+                            "high",
+                            "coalesce_config_invalid",
+                        )
+                    )
                 if node.branches is None:
                     errors.append(
                         _err(
@@ -7117,6 +7189,33 @@ class CompositionState:
                             "coalesce_branches_invalid",
                         )
                     )
+                if node.branches is not None:
+                    # Mirror of the row_union arm's per-branch type rejection
+                    # (row_union_branch_invalid below): a persisted payload can
+                    # carry a non-string branch name/connection that
+                    # NodeSpec.from_dict admits, _routing_label_errors abstains
+                    # on (well-typed labels only), and the runtime's
+                    # CoalesceSettings would reject at settings_load — so
+                    # without this check the shape validated green here and
+                    # died there (valid-but-not-runnable).
+                    for branch_name, connection_name in zip(
+                        _coalesce_branch_names(node.branches),
+                        _coalesce_branch_connections(node.branches),
+                        strict=True,
+                    ):
+                        for value, field_label in (
+                            (branch_name, "branch name"),
+                            (connection_name, f"branch '{branch_name}' input connection"),
+                        ):
+                            if type(value) is not str:
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Coalesce {field_label} must be a string (got {type(value).__name__}).",
+                                        "high",
+                                        "coalesce_branches_invalid",
+                                    )
+                                )
                 # Mirror the engine's closed vocabularies (core/config.py
                 # CoalesceSettings) at composition time: a committed value
                 # outside them passes composer validation but fails engine
@@ -8286,12 +8385,25 @@ class CompositionState:
         suggestions: list[ValidationEntry] = []
         _sug = ValidationEntry
 
-        # S1: No error routing
+        # S1: No retaining error routing. "discard" does not count as error
+        # routing here (elspeth-0aace271b4 I5): the composer tool layer
+        # default-fills on_error="discard", so counting it made this advisory
+        # permanently unreachable, and discard silently drops failed rows in a
+        # system whose purpose is lineage. The wording is a pipeline-level
+        # nudge, deliberately neutral about which node should change
+        # (control-covered llm nodes may legitimately have to keep "discard" —
+        # elspeth-184d9c9686).
         has_gate = any(n.node_type == "gate" for n in self.nodes)
-        has_error_routing = any(e.edge_type == "on_error" for e in self.edges) or any(n.on_error is not None for n in self.nodes)
-        if not has_gate and not has_error_routing and self.nodes:
+        has_retaining_error_routing = any(e.edge_type == "on_error" for e in self.edges) or any(
+            n.on_error is not None and n.on_error != "discard" for n in self.nodes
+        )
+        if not has_gate and not has_retaining_error_routing and self.nodes:
             suggestions.append(
-                _sug("pipeline", "Consider adding error routing — rows that fail transforms currently have no explicit destination.", "low")
+                _sug(
+                    "pipeline",
+                    "Consider adding error routing to a retention output — failed rows are currently discarded rather than kept for review.",
+                    "low",
+                )
             )
 
         # S2: Single output to external sink — suggest a local fallback

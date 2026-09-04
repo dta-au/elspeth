@@ -327,10 +327,11 @@ class ExplainScreen:
         artifacts_by_state_id: Mapping[str, Sequence[Artifact]],
         artifacts_by_token_id: Mapping[str, Sequence[Artifact]],
     ) -> Artifact | None:
-        """Return effect membership evidence first, then legacy state evidence."""
-        effect_artifacts = artifacts_by_token_id.get(token_id, ())
-        if effect_artifacts:
-            return effect_artifacts[-1]
+        """Return effect membership evidence first, then node-state producer evidence."""
+        # Construction only inserts a token key alongside a first artifact, so
+        # membership guarantees a non-empty sequence.
+        if token_id in artifacts_by_token_id:
+            return artifacts_by_token_id[token_id][-1]
         for state in reversed(node_states):
             artifacts = artifacts_by_state_id.get(state.state_id, ())
             if artifacts:

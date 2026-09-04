@@ -15,6 +15,7 @@ import { makePhraseFor } from "@/lib/validationHumaniser";
 import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
+import { DIAGNOSTIC_CAUSE_PHRASES, DIAGNOSTIC_REASON_PHRASES } from "./diagnosticPhrases";
 import { Button, StatusBadge } from "@/components/ui";
 import { isTerminalRunStatus } from "@/types/index";
 import type { Run, RunDiagnostics, RunDiagnosticsWorkingView } from "@/types/index";
@@ -206,6 +207,41 @@ function visibleStateFailure(error: unknown): VisibleStateFailure | null {
   };
 }
 
+/** One diagnostic enum value: prose when this wave has phrased it (raw value
+ *  in `title`), otherwise the identifier register. An unphrased value is never
+ *  dressed up as a sentence (elspeth-d74ab492dd). */
+/**
+ * One diagnostic enum. A value nobody has phrased stays in <code> — an
+ * unknown identifier is never dressed up as a sentence (diagnosticPhrases.ts).
+ * A phrased one reads as prose, and with the Advanced detail level on it
+ * carries the raw enum beside it in the same <code> register
+ * (elspeth-f49e1611ab): a run-failure reason or cause is exactly what gets
+ * pasted into a support search, and `title` alone leaves a keyboard-only or
+ * touch user no route to it. `title` stays as the mouse convenience.
+ */
+function DiagnosticValue({
+  value,
+  phrases,
+}: {
+  value: string;
+  phrases: ReadonlyMap<string, string>;
+}): JSX.Element {
+  const showAdvanced = useShowAdvanced();
+  const phrase = phrases.get(value);
+  if (phrase === undefined) return <code>{value}</code>;
+  return (
+    <span title={value}>
+      {phrase}
+      {showAdvanced && (
+        <>
+          {" "}
+          <code>{value}</code>
+        </>
+      )}
+    </span>
+  );
+}
+
 function RunStateFailureDetail({
   error,
   nodeId,
@@ -251,12 +287,12 @@ function RunStateFailureDetail({
       </div>
       {failure.reason && (
         <div>
-          Reason: <code>{failure.reason}</code>
+          Reason: <DiagnosticValue value={failure.reason} phrases={DIAGNOSTIC_REASON_PHRASES} />
         </div>
       )}
       {failure.cause && (
         <div>
-          Cause: <code>{failure.cause}</code>
+          Cause: <DiagnosticValue value={failure.cause} phrases={DIAGNOSTIC_CAUSE_PHRASES} />
         </div>
       )}
       {failure.hint && <div>{failure.hint}</div>}

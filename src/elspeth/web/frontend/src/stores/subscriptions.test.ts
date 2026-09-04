@@ -20,7 +20,34 @@ import {
 const SESSION_A = "00000000-0000-0000-0000-000000000001";
 const SESSION_B = "00000000-0000-0000-0000-000000000002";
 
+/**
+ * A composition whose AUTHORED CONTENT changes with the version — an
+ * ordinary edit, which is what a version bump normally is.
+ *
+ * The content must vary: since elspeth-986801d218 the version-keyed
+ * subscribers skip a bump whose content is unchanged (see
+ * `compositionAtNewVersion` below and the content-equal tests), so a fixture
+ * that held `content: "hello"` across versions would silently exercise the
+ * SKIP path in every test that means to exercise the validate path.
+ */
 function compositionWithSource(version: number) {
+  return {
+    version,
+    sources: {
+      source: { plugin: "text", options: { content: `hello ${version}` } },
+    },
+    nodes: [],
+    edges: [],
+    outputs: [],
+  };
+}
+
+/**
+ * The SAME authored content re-issued at a new version — a settlement that
+ * wrote a row but authored nothing (a post-completion guided chat persists
+ * exactly this, elspeth-986801d218).
+ */
+function compositionAtNewVersion(version: number) {
   return {
     version,
     sources: { source: { plugin: "text", options: { content: "hello" } } },
@@ -1508,5 +1535,249 @@ describe("subscriptions — run rehydration on session activation", () => {
     useSessionStore.setState({ sessions: [] } as never);
 
     expect(rehydrateActiveRun).not.toHaveBeenCalled();
+  });
+});
+
+// ── Content-equal version bumps (elspeth-986801d218) ─────────────────────────
+//
+// A settlement that writes a composition_states row but authors NOTHING still
+// bumps `version` — a post-completion guided chat does exactly that, so the
+// reply has a state to hang off. Both version-keyed subscribers used to treat
+// that as an edit: one cleared the validation verdict, the other POSTed
+// /validate, and `useCompletionOutcome` read executionReady=false in between,
+// flipping the completed heading off "Pipeline ready" for the round trip.
+// Asking a question about a pipeline must not un-verify it.
+//
+// Discrimination in every test below is the CONTENT, not the version: the
+// same version pair fires or skips depending only on whether the authored
+// sources/nodes/edges/outputs/metadata changed.
+describe("content-equal version bumps carry the verdict forward", () => {
+  /** The cached readiness the badge, the Execute button and the ambient sync
+   *  all match on `composition_version` before they will use. */
+  function seedAuditSnapshot(sessionId: string, version: number): void {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        [sessionId]: {
+          session_id: sessionId,
+          composition_version: version,
+        } as never,
+      },
+    } as never);
+  }
+
+  function snapshotVersion(sessionId: string): number | undefined {
+    return useAuditReadinessStore.getState().snapshotsBySession[sessionId]
+      ?.composition_version;
+  }
+
+  beforeEach(() => {
+    _resetSubscriptionsForTesting();
+    useAuditReadinessStore.setState({ snapshotsBySession: {} } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: null,
+      sessions: [{ id: "sess-1", title: "x" } as never],
+    } as never);
+    useExecutionStore.setState({
+      isExecuting: false,
+      progress: null,
+      validationResult: null,
+    } as never);
+    initStoreSubscriptions();
+  });
+
+  it("does not clear validation on a content-equal version bump", async () => {
+    const clearValidation = vi.fn();
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+
+    // Install the spy only now: the seeding write above legitimately clears
+    // (there was no previous state to compare against).
+    useExecutionStore.setState({ clearValidation } as never);
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(clearValidation).not.toHaveBeenCalled();
+  });
+
+  it("does not fire /validate on a content-equal version bump, and carries the cache forward", async () => {
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() =>
+      expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 1 }),
+    );
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(validate).toHaveBeenCalledTimes(1);
+
+    // Cache carried to 2: a THIRD content-equal bump must also skip, which is
+    // only true if version 2 was recorded as validated rather than merely
+    // ignored.
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(3) as never,
+    } as never);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(validate).toHaveBeenCalledTimes(1);
+  });
+
+  it("still clears and re-validates when the nodes change (interpretation Accept shape)", async () => {
+    const clearValidation = vi.fn();
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+
+    useExecutionStore.setState({ clearValidation } as never);
+    // An interpretation Accept rewrites a node's prompt_template — a `nodes`
+    // change, so the verdict genuinely no longer describes this content.
+    useSessionStore.setState({
+      compositionState: {
+        ...compositionAtNewVersion(2),
+        nodes: [{ id: "n1", node_type: "transform", options: { prompt_template: "accepted" } }],
+      } as never,
+    } as never);
+
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(2));
+    expect(validate).toHaveBeenLastCalledWith("sess-1", { expectedVersion: 2 });
+    expect(clearValidation).toHaveBeenCalled();
+  });
+
+  it("does not carry a verdict across sessions at the same version", async () => {
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({
+      activeSessionId: "sess-A",
+      sessions: [{ id: "sess-A", title: "a" } as never, { id: "sess-B", title: "b" } as never],
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() =>
+      expect(validate).toHaveBeenCalledWith("sess-A", { expectedVersion: 1 }),
+    );
+
+    // Identical content, different session: each session's admission is its
+    // own, so the skip must not reach across.
+    useSessionStore.setState({
+      activeSessionId: "sess-B",
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+    await waitFor(() =>
+      expect(validate).toHaveBeenCalledWith("sess-B", { expectedVersion: 2 }),
+    );
+  });
+
+  it("re-validates a content-equal bump whose predecessor never validated", async () => {
+    // validate() resolving false is the suppressed/failed path: no verdict
+    // landed, so there is nothing to carry forward and the next bump must
+    // validate rather than inherit a cache entry that was never written.
+    const validate = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(2));
+    expect(validate).toHaveBeenLastCalledWith("sess-1", { expectedVersion: 2 });
+  });
+
+  // ── The third version-keyed subscriber (review round 1, 2026-09-03) ───────
+  //
+  // `useAuditReadinessSync` is keyed on `compositionState.version` too, and
+  // its snapshot is version-matched by the Checks badge, the ExecuteButton's
+  // advisory readiness and the sync's own early return. Left alone it turned
+  // every post-completion question into a "Checking" badge, an undefined
+  // advisory snapshot and a second server-side validation + audit projection
+  // — the same defect the two subscribers above were fixed for, on a surface
+  // that only started bumping the version because of this lane.
+  it("carries the audit-readiness snapshot forward on a content-equal bump", async () => {
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+    seedAuditSnapshot("sess-1", 1);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+
+    // Version-matched again ⇒ `loadSnapshot` early-returns (no GET), the
+    // badge keeps its status, and ExecuteButton keeps its advisory snapshot.
+    expect(snapshotVersion("sess-1")).toBe(2);
+  });
+
+  it("leaves the audit snapshot behind when the authored content changed", async () => {
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+    seedAuditSnapshot("sess-1", 1);
+
+    useSessionStore.setState({
+      compositionState: {
+        ...compositionAtNewVersion(2),
+        nodes: [{ id: "n1", node_type: "transform", options: {} }],
+      } as never,
+    } as never);
+
+    // Stale by construction: the readiness was computed for other content, so
+    // it must miss and be refetched.
+    expect(snapshotVersion("sess-1")).toBe(1);
+  });
+
+  it("does not stamp a snapshot from some older version forward", async () => {
+    const validate = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(1) as never,
+    } as never);
+    await waitFor(() => expect(validate).toHaveBeenCalledTimes(1));
+    // A snapshot for a version this bump's content-equality says nothing
+    // about — carrying it would assert a readiness the server never gave.
+    seedAuditSnapshot("sess-1", 0);
+
+    useSessionStore.setState({
+      compositionState: compositionAtNewVersion(2) as never,
+    } as never);
+
+    expect(snapshotVersion("sess-1")).toBe(0);
   });
 });

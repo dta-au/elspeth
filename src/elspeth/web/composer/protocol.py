@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import GuidedOperationFence
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import FailedTurnMetadata
@@ -43,7 +44,46 @@ from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Route-owned provenance marker carried only inside Composer's in-process chat
 # history. ``prompts.build_messages`` removes it before provider dispatch.
-COMPOSER_HISTORY_USER_AUTHORED_KEY: Final[str] = "_elspeth_user_authored"
+# Bare Final (not Final[str]) so mypy infers the Literal type and TypedDict
+# indexing through this constant type-checks at the history boundary.
+COMPOSER_HISTORY_USER_AUTHORED_KEY: Final = "_elspeth_user_authored"
+
+# Canonical request-tool kind policy. ``InterpretationKind`` is the closed
+# persistence/event vocabulary; this tuple is the subset the planner may send
+# through ``request_interpretation_review``. Prompt-template reviews are
+# backend-surfaced against the final frozen skeleton and therefore are not a
+# request-tool arm. The partition check makes a new enum member fail closed
+# until it is deliberately classified instead of silently inheriting policy.
+REQUEST_INTERPRETATION_REVIEW_KINDS: Final[tuple[InterpretationKind, ...]] = (
+    InterpretationKind.VAGUE_TERM,
+    InterpretationKind.INVENTED_SOURCE,
+    InterpretationKind.PIPELINE_DECISION,
+    InterpretationKind.LLM_MODEL_CHOICE,
+    InterpretationKind.SOURCE_DATA_CONTRACT,
+)
+_BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS: Final[frozenset[InterpretationKind]] = frozenset({InterpretationKind.LLM_PROMPT_TEMPLATE})
+if frozenset(REQUEST_INTERPRETATION_REVIEW_KINDS) & _BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS or frozenset(
+    REQUEST_INTERPRETATION_REVIEW_KINDS
+) | _BACKEND_ONLY_INTERPRETATION_REVIEW_KINDS != frozenset(InterpretationKind):
+    raise RuntimeError("every InterpretationKind must be classified as requestable or backend-only")
+REQUEST_INTERPRETATION_REVIEW_KIND_VALUES: Final[tuple[str, ...]] = tuple(kind.value for kind in REQUEST_INTERPRETATION_REVIEW_KINDS)
+REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION: Final[str] = ", ".join(REQUEST_INTERPRETATION_REVIEW_KIND_VALUES)
+
+# Source-data-contract repair vocabulary. Producers and the secret-safe
+# ToolArgumentError projector share these exact operator-owned strings so the
+# target, demand, and server-computed-draft instructions cannot be collapsed
+# to generic diagnostics by a stale allowlist.
+SOURCE_DATA_CONTRACT_TARGET_EXPECTATION: Final[str] = "'source' for source_data_contract or 'source:<name>' for a named source"
+SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION: Final[str] = "an existing source component"
+SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION: Final[str] = (
+    "a source with an outstanding data-contract demand — the pipeline must require fields "
+    "from this source that no current acknowledgement covers"
+)
+SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION: Final[str] = (
+    "omitted — the server computes the data-contract card from the graph's demand backtrace"
+)
+SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE: Final[str] = "caller-supplied draft that does not match the server-computed data contract"
+SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE: Final[str] = "missing source component"
 
 
 class ComposerHistoryMessage(TypedDict):
@@ -209,7 +249,32 @@ class ComposerResult:
     # SessionServiceProtocol.persist_compose_turn_async. Routes must not drain
     # tool_invocations again for that turn.
     persisted_assistant_message_id: str | None = None
+    # The content that row actually holds. The turn-end writers in
+    # ``routes/messages.py`` and ``routes/composer/compose.py`` use it to
+    # recognise when ``message`` merely re-carries prose the compose loop has
+    # already committed, and then persist only the backend-authored suffix
+    # (``_helpers.composer_turn_end_assistant_row``, elspeth-d581b3da7f).
+    # Defaulted because 55 test constructions and every non-loop producer
+    # legitimately leave the whole pair unset; the biconditional in
+    # ``__post_init__`` is what makes a HALF-threaded pair — the shape that
+    # regresses to duplication — unrepresentable.
+    persisted_assistant_content: str | None = None
     persisted_tool_call_turn: bool = False
+    # Positive proof that the persisted pair above belongs to the terminal
+    # model turn whose prose ``raw_assistant_content`` carries. False is
+    # deliberately inconclusive: distinct turns may produce identical bytes.
+    persisted_assistant_matches_terminal_model_turn: bool = False
+    # Positive proof, set only by the END advisor gate's blocked-terminal
+    # builder, that this result was already published: its message is fixed
+    # backend copy and its ``composer.advisor_terminal_publication`` event was
+    # already emitted. The repair-cohort replacer passes such a result through
+    # untouched instead of re-deriving telemetry from ``runtime_preflight`` —
+    # which for this result is the SYNTHESIZED advisor-signoff validation, not
+    # a real turn preflight (elspeth-2ae50afcd1). False is inconclusive and
+    # keeps the replacement path: the marker, not the preflight shape, is the
+    # discriminator, so a raw-prose result whose preflight merely looks
+    # advisor-blocked still gets its prose replaced.
+    advisor_terminal_published: bool = False
     # Exact durable composition-state head after the final persisted tool turn.
     # Routes use this as the final response-settlement CAS; re-reading latest
     # would bless an out-of-band writer that raced the compose loop.
@@ -300,6 +365,44 @@ class ComposerResult:
                 "(capped by _MAX_REPAIR_TURNS in web/composer/service.py); "
                 f"got {self.repair_turns_used}."
             )
+        # Persisted-row pairing. The compose loop threads the id and the
+        # content of the already-committed assistant row through ~13 sites
+        # via ``dataclasses.replace``; a site that carries the id and drops
+        # the content leaves the turn-end writer unable to recognise its own
+        # re-emission, and it silently reverts to persisting the planner's
+        # prose a second time (elspeth-d581b3da7f, live session 891b7b1e).
+        # Because both fields are defaulted, that miss would otherwise be
+        # invisible — this check is what converts it into a crash at the
+        # construction boundary.
+        if (self.persisted_assistant_message_id is None) != (self.persisted_assistant_content is None):
+            raise ValueError(
+                "ComposerResult field-pairing invariant violated: "
+                "persisted_assistant_message_id and persisted_assistant_content "
+                "must be set or unset together. The id names the assistant row "
+                "the compose loop already committed and the content is what "
+                "that row holds; carrying one without the other regresses the "
+                "turn-end writer to re-emitting prose that is already in the "
+                "transcript. "
+                f"id={'set' if self.persisted_assistant_message_id is not None else 'None'}, "
+                f"content={'set' if self.persisted_assistant_content is not None else 'None'}."
+            )
+        if self.persisted_assistant_matches_terminal_model_turn:
+            if self.persisted_assistant_message_id is None or self.persisted_assistant_content is None:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: persisted assistant id and content "
+                    "must both be present when persisted_assistant_matches_terminal_model_turn is true."
+                )
+            if not self.persisted_tool_call_turn:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: persisted_tool_call_turn must be true "
+                    "when persisted_assistant_matches_terminal_model_turn is true."
+                )
+            if self.raw_assistant_content != self.persisted_assistant_content:
+                raise ValueError(
+                    "ComposerResult same-turn invariant violated: raw_assistant_content must equal persisted_assistant_content."
+                )
+            if not self.message.startswith(self.persisted_assistant_content):
+                raise ValueError("ComposerResult same-turn invariant violated: message must start with persisted_assistant_content.")
 
 
 class ComposerServiceError(Exception):
@@ -470,10 +573,10 @@ class ComposerPluginCrashError(ComposerServiceError):
     ``ComposerConvergenceError``. If the ordering is inverted the generic
     handler would launder the crash into a 502, reintroducing the
     silent-laundering behaviour the narrowed catch was designed to
-    eliminate. The invariant is mechanically enforced by
-    ``scripts/cicd/enforce_composer_catch_order.py`` (rule CCO1), which
-    scans ``web/`` for any ``try`` block where a superclass handler
-    precedes one of its ``ComposerServiceError`` subclasses.
+    eliminate. The ``composer.catch_order`` lint rule mechanically enforces
+    the invariant by scanning ``web/`` for any ``try`` block where a
+    superclass handler precedes one of its ``ComposerServiceError``
+    subclasses.
     """
 
     _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset(
@@ -713,10 +816,14 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
         "id of a node whose plugin is 'llm'",
         "only the optional 'source_name' key",
         "source artifact content without template metacharacters, credential patterns, or non-printable controls",
+        REQUEST_INTERPRETATION_REVIEW_KIND_EXPECTATION,
+        SOURCE_DATA_CONTRACT_TARGET_EXPECTATION,
+        SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION,
+        SOURCE_DATA_CONTRACT_DEMAND_EXPECTATION,
+        SOURCE_DATA_CONTRACT_DRAFT_EXPECTATION,
         "source with composer-authored source metadata",
         "the exact node review requirement draft staged in options.interpretation_requirements",
         "the exact source review requirement draft staged in source.options.interpretation_requirements",
-        "vague_term, invented_source, pipeline_decision, or llm_model_choice",
         "valid UTF-8 text",
         "well-formed interpretation authoring metadata",
         "a valid value",
@@ -735,14 +842,14 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = frozenset(
 ) | frozenset(_TOOL_ARGUMENT_SCHEMA_EXPECTATIONS.values())
 
 _SAFE_TOOL_ARGUMENT_EXPECTATIONS = _SAFE_TOOL_ARGUMENT_EXPECTATIONS | frozenset(
-    f"a pending {kind} interpretation requirement{suffix}"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
-    for suffix in ("", " or placeholder")
+    f"a pending {kind.value} interpretation requirement{suffix}" for kind in InterpretationKind for suffix in ("", " or placeholder")
 )
 
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
     {
         "credential-shaped content rejected at the tool boundary",
+        SOURCE_DATA_CONTRACT_DRAFT_MISMATCH_ACTUAL_TYPE,
+        SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE,
         "invalid_schema",
         "invalid_session_id",
         "invented_source event draft does not match the source review requirement draft",
@@ -776,8 +883,7 @@ _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = frozenset(
 )
 
 _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES = _SAFE_TOOL_ARGUMENT_ACTUAL_TYPES | frozenset(
-    f"missing pending {kind} review site"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term")
+    f"missing pending {kind.value} review site" for kind in InterpretationKind
 )
 
 _SAFE_TOOL_ARGUMENT_TYPE_NAMES = frozenset(
@@ -831,17 +937,19 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
         return "prompt_template_parts interpretation_ref or placeholder wiring"
     if "preserves raw html/fingerprint field" in lowered:
         return "a pipeline decision without preserved raw HTML/fingerprint fields"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
-        if "pending" in lowered and kind in lowered:
+    for kind in InterpretationKind:
+        if "pending" in lowered and kind.value in lowered:
             if "placeholder" in lowered:
-                return f"a pending {kind} interpretation requirement or placeholder"
-            return f"a pending {kind} interpretation requirement"
+                return f"a pending {kind.value} interpretation requirement or placeholder"
+            return f"a pending {kind.value} interpretation requirement"
     if "pending" in lowered and "placeholder" in lowered:
         return "a pending interpretation requirement or placeholder"
     if "pending" in lowered and "requirement" in lowered:
         return "a pending interpretation requirement"
     if "existing llm transform" in lowered:
         return "id of an existing LLM transform"
+    if "existing source component" in lowered:
+        return SOURCE_DATA_CONTRACT_EXISTING_SOURCE_EXPECTATION
     if "options.prompt_template" in lowered:
         return "the current non-empty options.prompt_template"
     if "options.model" in lowered:
@@ -865,15 +973,17 @@ def _canonical_tool_argument_actual_type(value: object) -> str:
         return "node with incompatible plugin"
     if "invalid interpretation metadata" in lowered:
         return "invalid interpretation metadata"
-    for kind in ("invented_source", "llm_model_choice", "llm_prompt_template", "pipeline_decision", "vague_term"):
-        if "missing pending" in lowered and kind in lowered:
-            return f"missing pending {kind} review site"
+    for kind in InterpretationKind:
+        if "missing pending" in lowered and kind.value in lowered:
+            return f"missing pending {kind.value} review site"
     if "missing pending" in lowered:
         return "missing pending interpretation review site"
     if "prompt_template" in lowered:
         return "invalid prompt_template state"
     if "options.model" in lowered:
         return "invalid model state"
+    if lowered == "missing source":
+        return SOURCE_DATA_CONTRACT_MISSING_SOURCE_ACTUAL_TYPE
     if "cap" in lowered or "limit" in lowered or "would record" in lowered:
         return "interpretation request limit exceeded"
     if "missing" in lowered:
@@ -1083,6 +1193,14 @@ class ToolArgumentError(Exception):
         try:
             value = BaseException.__getattribute__(self, "_safe_code")
         except AttributeError:
+            # Fail-SAFE, not fail-closed, by ratified design: like the sibling
+            # ``argument``/``expected``/``actual_type`` properties, a missing
+            # or tampered backing slot degrades to the fixed safe constant so
+            # a bypass-constructed or attribute-stripped instance can never
+            # render attacker-controllable content — and never turns the
+            # arg-error rendering path into a crash mid-request. Pinned by
+            # TestToolArgumentError::
+            # test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks.
             return None
         return (
             value
@@ -1310,8 +1428,18 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
+        root_goal: str | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
-        """Run the shared planner once with split private/provider-safe facts."""
+        """Run the shared planner once with split private/provider-safe facts.
+
+        ``root_goal`` is the outcome the author stated when the session
+        started, carried as a NAMED reviewed fact on a correction or revision
+        only — never folded into ``intent``, which always means "the request
+        being made now". A revision that narrows or withdraws part of the goal
+        would otherwise argue against the goal inside the one field the
+        planner (and the deterministic request guards that parse it) read as
+        the current request.
+        """
         ...
 
     async def plan_guided_full_pipeline(
@@ -1344,7 +1472,7 @@ class ComposerService(Protocol):
 
         Surfaces a resolvable pending interpretation EVENT for every
         interpretation site on ``state`` whose writer-boundary precondition
-        holds (all five ``InterpretationKind`` members). Called by the guided
+        holds (every ``InterpretationKind`` member). Called by the guided
         route persistence seam (``post_guided_respond``) after every committed
         source or transform commit, because the guided dispatch path
         never reaches the freeform fail-closed orphan gate, and by the

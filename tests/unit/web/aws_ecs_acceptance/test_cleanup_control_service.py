@@ -99,7 +99,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         "candidate_image_digest": "sha256:" + "d" * 64,
         "candidate_task_definition": inventory["values"]["CANDIDATE_TASK_DEFINITION"],
         "candidate_doctor_task_definition": inventory["values"]["DOCTOR_TASK_DEFINITION"],
-        "candidate_package_version": "0.7.2",
+        "candidate_package_version": "0.8.0",
         "previous_source_sha": "a" * 40,
         "previous_image_digest": "sha256:" + "b" * 64,
         "previous_task_definition": inventory["values"]["PREVIOUS_TASK_DEFINITION"],

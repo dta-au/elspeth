@@ -252,15 +252,6 @@ entries:
     (tier-B13) after dropping the dead None default — BaseTransform defines the property,
     so the static lookup cannot miss on a subclass.
 - path: src/elspeth/plugins/infrastructure/base.py
-  qualname: BaseTransform.__init_subclass__
-  kind: hasattr
-  occurrences: 1
-  probe_shapes:
-  - 8b0e21c6db1d04135bd0630647b35a12f13e3e033b29ba6121d09742217ceb53
-  classification: approved-introspection
-  justification: Class-creation descriptor guard paired with getattr_static; it rejects
-    a subclass that shadows BaseTransform.input_schema incorrectly.
-- path: src/elspeth/plugins/infrastructure/base.py
   qualname: BaseTransform._config_named_input_columns
   kind: getattr
   occurrences: 1
@@ -271,17 +262,6 @@ entries:
     declaration; receiver and field-name table are both owned configuration types.
     Re-adjudicated 2026-08-29 (tier-B13) after dropping the dead None default — every
     declared field is present on a validated instance.
-- path: src/elspeth/plugins/infrastructure/clients/llm.py
-  qualname: _extract_usage_from_provider_response
-  kind: getattr
-  occurrences: 3
-  probe_shapes:
-  - 8f37acb03fc9716c42fdfb82ccdef349f1de2309bdefed29275cd44f72e9019c
-  - b152071c62005727ff01cd4a182fd4cc896837b3a8e2f95c1502a8fa1d3a7bdb
-  - cd78238256c587a3f94efda2962ac996ed0f1776579d4c239801e26159111112
-  classification: external-parse
-  justification: Parses optional token counters from vendor LLM usage objects, then
-    constructs the owned TokenUsage value; mapping responses use their mapping API.
 - path: src/elspeth/plugins/transforms/aws/textract_document_analysis.py
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
@@ -350,17 +330,19 @@ entries:
 - path: src/elspeth/web/composer/service.py
   qualname: _capture_composer_llm_completion_fields
   kind: getattr
-  occurrences: 4
+  occurrences: 3
   probe_shapes:
-  - 003c86d1099abf0b3dfa922585b895c6adea0e275a48e80b63653c16609c4b4b
   - 8db4dd38e8917a32cf84749b587527221cbc8312767ee17c50e0a4980ac562e4
   - 9f646fbd5d363c11e29e145e250834754a3827fa6e8f2388c34a4e8c06988f9e
   - a7184e0fea70413ed933dc47e8d4e8670fc3cecea4269eeb725222321e2ff63e
   classification: external-parse
-  justification: Sentinel-parses choices, message, content, and tool_calls from one
+  justification: 'Sentinel-parses choices, message, content, and tool_calls from one
     unowned LiteLLM completion, validates every retained value, and constructs frozen
     ELSPETH-owned message, tool-batch, and provider-metadata carriers before the raw
-    provider objects are discarded.
+    provider objects are discarded. Re-adjudicated 2026-08-31 (tier-remediation web-composer
+    lane): the new @trust_boundary decoration amnesties one probe on the declared
+    source param, dropping the non-amnestied count from 4 to 3; the parse form is
+    unchanged (docs/agents/sweeps/tier-remediation-2026-08-31/web-composer.md).'
 - path: src/elspeth/web/composer/tool_batch.py
   qualname: _admit_tool_batch
   kind: getattr

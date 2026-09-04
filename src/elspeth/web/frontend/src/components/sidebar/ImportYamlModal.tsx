@@ -62,11 +62,27 @@ export const IMPORT_YAML_422_MESSAGE =
 
 const IMPORT_YAML_GENERIC_ERROR_DETAIL = "Failed to import YAML. Please try again.";
 
+export const IMPORT_YAML_SECTION_KEYS = [
+  "sources",
+  "transforms",
+  "gates",
+  "row_unions",
+  "aggregations",
+  "coalesce",
+  "queues",
+  "collectors",
+  "scopes",
+  "sinks",
+] as const;
+
 // Client-side import preflight mirrors only the backend's first hard gates:
 // syntactically valid YAML, mapping root, and at least one runtime pipeline
 // section. Plugin/schema validation remains server-owned.
 export const IMPORT_YAML_SECTIONS_REQUIRED_MESSAGE =
-  "Pipeline YAML must define at least one pipeline section: sources, source, transforms, gates, row_unions, aggregations, coalesce, queues, or sinks.";
+  `Pipeline YAML must define at least one pipeline section: ${IMPORT_YAML_SECTION_KEYS.slice(0, -1).join(", ")}, or ${IMPORT_YAML_SECTION_KEYS[IMPORT_YAML_SECTION_KEYS.length - 1]}.`;
+
+export const IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE =
+  'Section "source" was removed by ADR-025. Use the "sources" mapping instead.';
 
 interface ImportErrorInfo {
   title: string;
@@ -167,28 +183,34 @@ export interface ImportYamlSourceBindingCandidate {
   path: string;
 }
 
-type ImportYamlSection =
-  | "aggregations"
-  | "coalesce"
-  | "gates"
-  | "queues"
-  | "row_unions"
-  | "sinks"
-  | "source"
-  | "sources"
-  | "transforms";
+type ImportYamlSection = (typeof IMPORT_YAML_SECTION_KEYS)[number];
 
-const IMPORT_YAML_SECTION_ALIASES: Record<string, ImportYamlSection> = {
-  aggregations: "aggregations",
-  coalesce: "coalesce",
-  gates: "gates",
-  queues: "queues",
-  row_unions: "row_unions",
-  sinks: "sinks",
-  source: "source",
-  sources: "sources",
-  transforms: "transforms",
-};
+type ImportYamlSectionCountTarget = "source" | "step" | "output" | "metadata";
+type ImportYamlSectionContainerShape = "mapping" | "list";
+
+interface ImportYamlSectionMetadata {
+  countTarget: ImportYamlSectionCountTarget;
+  containerShape: ImportYamlSectionContainerShape;
+}
+
+const IMPORT_YAML_SECTION_METADATA = {
+  sources: { countTarget: "source", containerShape: "mapping" },
+  transforms: { countTarget: "step", containerShape: "list" },
+  gates: { countTarget: "step", containerShape: "list" },
+  row_unions: { countTarget: "step", containerShape: "list" },
+  aggregations: { countTarget: "step", containerShape: "list" },
+  coalesce: { countTarget: "step", containerShape: "list" },
+  queues: { countTarget: "step", containerShape: "mapping" },
+  collectors: { countTarget: "step", containerShape: "list" },
+  scopes: { countTarget: "metadata", containerShape: "list" },
+  sinks: { countTarget: "output", containerShape: "mapping" },
+} as const satisfies Readonly<Record<ImportYamlSection, ImportYamlSectionMetadata>>;
+
+function importYamlSection(key: string): ImportYamlSection | undefined {
+  return Object.prototype.hasOwnProperty.call(IMPORT_YAML_SECTION_METADATA, key)
+    ? (key as ImportYamlSection)
+    : undefined;
+}
 
 const IMPORT_YAML_SOURCE_PATH_KEYS = ["path", "file"] as const;
 
@@ -252,17 +274,17 @@ function countParsedSectionEntries(
   section: ImportYamlSection,
   value: unknown,
 ): number | string {
-  if (section === "source") {
-    return isRecord(value) ? 1 : 'Section "source" must be a mapping.';
+  const { containerShape } = IMPORT_YAML_SECTION_METADATA[section];
+  switch (containerShape) {
+    case "mapping":
+      return countRecordEntries(value, section);
+    case "list":
+      return countSequenceEntries(value, section);
+    default: {
+      const exhaustiveShape: never = containerShape;
+      return exhaustiveShape;
+    }
   }
-  if (
-    section === "sources"
-    || section === "queues"
-    || section === "sinks"
-  ) {
-    return countRecordEntries(value, section);
-  }
-  return countSequenceEntries(value, section);
 }
 
 type ImportYamlParsedDocument = ReturnType<typeof parseDocument>;
@@ -294,10 +316,8 @@ function findImportYamlSourceBindingCandidatesFromParsed(
   const parsedRoot = parsedDraft.root;
   if (!isRecord(parsedRoot)) return [];
 
-  let rawSources = parsedRoot.sources;
-  if (rawSources === undefined && parsedRoot.source !== undefined) {
-    rawSources = { source: parsedRoot.source };
-  }
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) return [];
+  const rawSources = parsedRoot.sources;
   if (!isRecord(rawSources)) return [];
 
   const candidates: ImportYamlSourceBindingCandidate[] = [];
@@ -377,8 +397,20 @@ function analyseImportYamlDraftFromParsed(
     };
   }
 
+  if (Object.prototype.hasOwnProperty.call(parsedRoot, "source")) {
+    return {
+      hasText: true,
+      canImport: false,
+      sectionsParsed: false,
+      sourceCount: 0,
+      stepCount: 0,
+      outputCount: 0,
+      validationMessage: IMPORT_YAML_SINGULAR_SOURCE_REMOVED_MESSAGE,
+    };
+  }
+
   const parsedSectionKeys = Object.keys(parsedRoot)
-    .map((key) => IMPORT_YAML_SECTION_ALIASES[key])
+    .map(importYamlSection)
     .filter((section): section is ImportYamlSection => section !== undefined);
   if (parsedSectionKeys.length === 0) {
     return {
@@ -396,7 +428,7 @@ function analyseImportYamlDraftFromParsed(
   let parsedStepCount = 0;
   let parsedOutputCount = 0;
   for (const [key, value] of Object.entries(parsedRoot)) {
-    const section = IMPORT_YAML_SECTION_ALIASES[key];
+    const section = importYamlSection(key);
     if (section === undefined) continue;
     const count = countParsedSectionEntries(section, value);
     if (typeof count === "string") {
@@ -410,12 +442,23 @@ function analyseImportYamlDraftFromParsed(
         validationMessage: count,
       };
     }
-    if (section === "source" || section === "sources") {
-      parsedSourceCount += count;
-    } else if (section === "sinks") {
-      parsedOutputCount += count;
-    } else {
-      parsedStepCount += count;
+    const target = IMPORT_YAML_SECTION_METADATA[section].countTarget;
+    switch (target) {
+      case "source":
+        parsedSourceCount += count;
+        break;
+      case "step":
+        parsedStepCount += count;
+        break;
+      case "output":
+        parsedOutputCount += count;
+        break;
+      case "metadata":
+        break;
+      default: {
+        const exhaustiveTarget: never = target;
+        return exhaustiveTarget;
+      }
     }
   }
 

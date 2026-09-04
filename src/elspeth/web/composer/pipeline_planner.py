@@ -49,6 +49,7 @@ from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
@@ -108,6 +109,7 @@ from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
+    CoalesceReachabilityFactDict,
     CompositionState,
     RouteDestinationFactDict,
     ValidationEntry,
@@ -129,6 +131,7 @@ from elspeth.web.composer.tools._dispatch import (
 )
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
+    EXPLAIN_VALIDATION_ERROR_GUIDANCE,
     explain_validation_code,
     explain_withheld_validation_code,
 )
@@ -1616,7 +1619,7 @@ def _parse_response_tool_calls(
         function = _provider_field(raw_call, "function")
         name = _provider_field(function, "name")
         raw_arguments = _provider_field(function, "arguments")
-        if type(call_id) is not str or not call_id or type(name) is not str or not name:
+        if not is_valid_provider_replay_tool_call_id(call_id) or type(name) is not str or not name:
             raise PipelinePlannerError("planner tool call metadata is malformed", code="MALFORMED_RESPONSE")
         if call_id in seen_call_ids:
             raise PipelinePlannerError("planner response contains duplicate tool call ids", code="MALFORMED_RESPONSE")
@@ -2114,6 +2117,32 @@ _ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+_ROUTE_DESTINATION_ON_SUCCESS_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks", "consumable_connections"})
+_ROUTE_DESTINATION_ON_ERROR_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_error", "declared_sinks"})
+_ROUTE_DESTINATION_COALESCE_KEYS: Final[frozenset[str]] = frozenset({"dangling_on_success", "declared_sinks"})
+
+
+def route_destination_fact_keys(code: str) -> frozenset[str]:
+    """The ``RouteDestinationFactDict`` keys one route-destination code may ship.
+
+    ``route_destination_facts`` keys its facts by COMPONENT and merges the
+    on_success and on_error findings for one component into a single dict,
+    while the closed code names ONE routing field. Attaching the merged dict
+    to every entry for that component shipped ``dangling_on_success`` and
+    ``consumable_connections`` under an on_error code (and the reverse) —
+    keys the code's guidance never names and the teaching gate never
+    enumerated (elspeth-68721c71d7, red-team finding). Each entry is
+    projected to its own field's keys here, and the gate imports this map
+    so what it checks is what the consumer ships.
+    """
+    if code not in _ROUTE_DESTINATION_FACT_CODES:
+        raise ValueError(f"{code!r} is not a route-destination fact code")
+    if "on_error" in code:
+        return _ROUTE_DESTINATION_ON_ERROR_KEYS
+    if code.startswith("coalesce_"):
+        return _ROUTE_DESTINATION_COALESCE_KEYS
+    return _ROUTE_DESTINATION_ON_SUCCESS_KEYS
+
 
 def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
     """Identity of one candidate rejection: sorted (component, code) pairs.
@@ -2156,13 +2185,17 @@ _REPEAT_NOTICE_WITHHELD = (
     "honest decline — can resolve this."
 )
 
-# Subject prefix of a ``rejected_mutation`` entry's message. These prefixes are
-# authored by our own ``build_set_pipeline_candidate`` failure sites
-# (``Source '<name>': …`` / ``Node '<id>': …`` / ``Output '<name>': …``), the
-# same first-party format ``_INVALID_OPTIONS_PLUGIN_RE`` already parses for
-# schema augmentation — Tier-1 parsing of ELSPETH-authored text, not a
-# provider boundary.
-_REJECTED_MUTATION_SUBJECT_RE: Final[re.Pattern[str]] = re.compile(r"^(Source|Node|Output) '([^']+)': ")
+# Honest variant for a repeat of a rejection that NO re-emitted candidate can
+# clear: the taught fix for these says "do not re-emit" / "decline", and the
+# ordinary notice's "keep every other part byte-identical, and re-emit" would
+# contradict it in the same message (elspeth-68721c71d7). Static text, never
+# per-request data.
+_REPEAT_NOTICE_TERMINAL = (
+    "This candidate failed with EXACTLY the same rejection as an earlier candidate in this "
+    "request. No candidate you can author clears this rejection, so another attempt cannot "
+    "succeed. Follow the suggested_fix above: decline in plain text and tell the user what "
+    "they must change."
+)
 
 
 def _entry_component_ref(entry: Any) -> str | None:
@@ -2170,23 +2203,23 @@ def _entry_component_ref(entry: Any) -> str | None:
 
     State-validation entries already carry the canonical vocabulary
     (``source`` / ``source:<name>`` / ``node:<id>`` / ``output:<name>`` /
-    ``pipeline``). ``rejected_mutation`` entries name their subject in the
-    message prefix instead; an unprefixed rejected_mutation message has no
+    ``pipeline``) in ``component``. ``rejected_mutation`` entries carry their
+    subject structurally in ``rejected_component``, stamped by the
+    set_pipeline component loop that produced them
+    (``build_set_pipeline_candidate``); an entry without one has no
     attributable subject and returns ``None`` (the withholding decision then
-    fails closed whenever the finalizer owns anything).
+    fails closed whenever the finalizer owns anything). There is no parse
+    fallback: until elspeth-e405ad7cd2 the subject was recovered from the
+    ``Output 'main': …`` message prefix by regex — the prose-parsing shape
+    three ``plugin_identity`` parsers were each defeated by
+    (elspeth-1d8fc3da83) — and a rejection whose producer did not prefix its
+    message silently lost attribution.
     """
     component = entry.component
     if component != "rejected_mutation":
         return cast(str, component)
-    match = _REJECTED_MUTATION_SUBJECT_RE.match(entry.message)
-    if match is None:
-        return None
-    kind, name = match.groups()
-    if kind == "Node":
-        return f"node:{name}"
-    if kind == "Source":
-        return "source" if name == "source" else f"source:{name}"
-    return f"output:{name}"
+    ref = entry.rejected_component
+    return ref if type(ref) is str and ref else None
 
 
 # Codes whose projection attaches instance ``connectivity`` facts — the only
@@ -2304,19 +2337,25 @@ def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwn
 
 def _withheld_component_count(result: ToolResult) -> int:
     """How many defective components the candidate builder counted but did not list."""
+    # ``ToolResult.data`` is a union-typed owned field (frozen Mapping payloads,
+    # lists, or None depending on the tool); the Mapping dispatch is required
+    # because ``freeze_fields`` yields MappingProxyType, and an absent key is
+    # the first-class "nothing withheld" state.
     data = result.data
     if not isinstance(data, Mapping) or COMPONENTS_WITHHELD_KEY not in data:
         return 0
     withheld = data[COMPONENTS_WITHHELD_KEY]
-    return withheld if type(withheld) is int else 0
+    if type(withheld) is not int:
+        # The key is written only by _merge_component_rejections with an int;
+        # any other shape is first-party envelope corruption.
+        raise AuditIntegrityError(f"{COMPONENTS_WITHHELD_KEY} must be an int; got {type(withheld).__name__}")
+    return withheld
 
 
-# Static usage line, never per-request data. Live planners called
-# explain_validation_error with junk ({"error_text": "ValidationError"})
-# because nothing said the exact code string is the lookup key. Kept
-# deliberately free of topology hints — mid-repair suggestions have derailed
-# otherwise-converging repairs.
-_EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
+# The freeform tool envelope advertises the same tool with the same bytes
+# (tools.generation.build_validation_guidance), so the string lives once in
+# the module that owns the catalogue it points at.
+_EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = EXPLAIN_VALIDATION_ERROR_GUIDANCE
 
 
 def _explain_tool_advertisement_earns_its_turn(errors: Sequence[Mapping[str, Any]]) -> bool:
@@ -2400,7 +2439,7 @@ def _allowlisted_candidate_feedback(
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
-    reachability_facts: dict[str, dict[str, Any]] | None = None
+    reachability_facts: dict[str, CoalesceReachabilityFactDict] | None = None
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
     any_facts_withheld = False
     for entry in _rejection_entries(result):
@@ -2483,7 +2522,10 @@ def _allowlisted_candidate_feedback(
             # repair budget on exactly that blindness (elspeth-5904b1683a).
             if destination_facts is None:
                 destination_facts = route_destination_facts(result.updated_state)
-            projected["connectivity"] = destination_facts[entry.component]
+            # The facts are keyed by component and merge both routing fields;
+            # this entry is about ONE field, so ship only that field's keys.
+            allowed_keys = route_destination_fact_keys(code)
+            projected["connectivity"] = {key: value for key, value in destination_facts[entry.component].items() if key in allowed_keys}
         if code == "coalesce_branch_unreachable" and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
@@ -2633,8 +2675,41 @@ def _binding_rejection_feedback(
     if _explain_tool_advertisement_earns_its_turn([entry]):
         feedback["guidance"] = _EXPLAIN_VALIDATION_ERROR_GUIDANCE
     if repeated_fingerprint:
-        feedback["repeat_notice"] = _REPEAT_NOTICE
+        # The terminal notice keeps the fix and the notice saying the same
+        # thing: the two shapes below are unclearable by resubmission and
+        # their taught fix already says so.
+        feedback["repeat_notice"] = _REPEAT_NOTICE_TERMINAL if _binding_rejection_is_terminal(rejection) else _REPEAT_NOTICE
     return feedback
+
+
+# Binder rejections no re-emitted candidate can clear, as (code, exact fact-key
+# shape). ``None`` means every shape under the code. Both are closed
+# structural labels the binder authors: the reviewed failure-route check runs
+# before any delta is read (``_require_reviewed_failure_routes``), and an
+# ``edge_patch`` against a correction target with no writable routing field
+# (``_apply_selected_edge_route_patch``) fails whatever the patch says. The
+# catalogue prose for each says "do not re-emit" / "decline"; a test pins that
+# the prose and this table name the same rejections.
+_TERMINAL_BINDING_REJECTIONS: Final[frozenset[tuple[str, frozenset[str] | None]]] = frozenset(
+    {
+        ("guided_delta_reviewed_failure_route_required", None),
+        ("guided_delta_authority_violation", frozenset({"delta_member", "owner_kind"})),
+    }
+)
+
+
+def _binding_rejection_is_terminal(rejection: GuidedCandidateBindingRejected) -> bool:
+    """True when no re-emitted candidate can clear ``rejection``.
+
+    Matches the exact fact-key SHAPE, not the code alone: ten binder sites
+    share ``guided_delta_authority_violation`` and only the owner_kind shape
+    is terminal, so a widened or different shape keeps the ordinary notice.
+    """
+    shape = frozenset(rejection.connectivity)
+    return any(
+        code == rejection.error_code and (terminal_shape is None or terminal_shape == shape)
+        for code, terminal_shape in _TERMINAL_BINDING_REJECTIONS
+    )
 
 
 def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) -> tuple[tuple[str, str], ...]:
@@ -2647,10 +2722,20 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
     the model to keep every other part byte-identical. That is false, and it
     can steer a planner into reverting a genuine fix. The rejection's own
     connectivity facts carry the discriminators: which collection the
-    complaint is about, and which delta member the binder was reading. Both
-    are closed structural labels the binder authors, never candidate values,
-    so a genuine repeat — same code, same facts — still fingerprints the same
-    and still draws the notice.
+    complaint is about, which delta member the binder was reading, and the
+    SET of fact keys — the shape of the complaint. All three are closed
+    structural labels the binder authors, never candidate values, so a
+    genuine repeat — same code, same shape — still fingerprints the same and
+    still draws the notice.
+
+    The key set matters because one member can fail several ways under one
+    code: ``edge_patch`` alone raises ``guided_delta_authority_violation``
+    for not-a-dict, ``unexpected_keys``, a missing ``to_node`` and
+    ``owner_kind``, and ``node_patch`` raises ``guided_delta_unknown_stable_id``
+    for a bad ``stable_id`` and for ``node_occurrences``. A candidate that
+    correctly repaired the first shape and then tripped the next drew the
+    repeat notice — "keep every other part byte-identical and re-emit" —
+    beside a taught fix that says the opposite (elspeth-68721c71d7).
     """
     facts = rejection.connectivity
     discriminators: list[tuple[str, str]] = []
@@ -2660,6 +2745,7 @@ def _binding_rejection_fingerprint(rejection: GuidedCandidateBindingRejected) ->
         fact = facts[key]
         if type(fact) is str:
             discriminators.append((key, fact))
+    discriminators.append(("fact_keys", ",".join(sorted(facts))))
     return (("pipeline", rejection.error_code), *discriminators)
 
 
@@ -2889,22 +2975,66 @@ def _materialize_terminal_payload(
     return pipeline_result, owned_refs, None, False
 
 
-def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+class _AllowlistedArgumentErrorEntry(TypedDict):
+    """One argument rejection, projected without its message or its input.
+
+    ``ToolArgumentError`` canonicalizes ``argument`` to a closed schema-owned
+    label and ``code`` to a closed dispatch discriminant, so every member here
+    is operator-owned; the LLM-supplied value never reaches this projection.
+    """
+
+    component: str
+    severity: str
+    error_code: str
+    error_class: str
+
+
+class _AllowlistedArgumentErrorPayload(TypedDict):
+    """``data`` for a discovery result the planner rejected on its arguments.
+
+    ``argument_error`` rather than ``validation``: on that arm the entry rides
+    under the ``data`` of a ``ToolResult`` whose own ``validation`` is the
+    STATE's, so a same-named key would be a homonym carrying different content
+    (systems seat SYS-R3-1), and the envelope's ``success`` already says the
+    call failed. The whole-message projection below keeps the family shape
+    because it has no envelope beside it.
+    """
+
+    argument_error: _AllowlistedArgumentErrorEntry
+
+
+def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
     """Project a semantic argument failure without its message or input."""
+    return {
+        "component": error.argument,
+        "severity": "high",
+        "error_code": error.code or "argument_error",
+        "error_class": "ToolArgumentError",
+    }
+
+
+def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+    """The whole tool-message content for an argument rejection on the repair loop.
+
+    This is a tool message the planner reads on its own, with no envelope
+    around it, so ``success`` and ``validation`` here are the message's own
+    top-level fields — the same shape ``_canonical_schema_feedback`` and the
+    other terminal-rejection builders use on that surface, not a ``data``
+    payload beside an envelope that already carries both. The ``data`` arm is
+    ``_allowlisted_argument_error_payload``.
+    """
     return {
         "success": False,
         "validation": {
             "is_valid": False,
-            "errors": [
-                {
-                    "component": error.argument,
-                    "severity": "high",
-                    "error_code": error.code or "argument_error",
-                    "error_class": "ToolArgumentError",
-                }
-            ],
+            "errors": [_allowlisted_argument_error_entry(error)],
         },
     }
+
+
+def _allowlisted_argument_error_payload(error: ToolArgumentError) -> _AllowlistedArgumentErrorPayload:
+    """``data`` for the ToolResult arm of an argument rejection."""
+    return {"argument_error": _allowlisted_argument_error_entry(error)}
 
 
 class _ClosedProviderValidationEntry(TypedDict):
@@ -2996,10 +3126,10 @@ def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContrac
     suppresses=("R5",),
     invariant=(
         "dispatches on result.data's shape (an authoritative-state component echo) and falls closed "
-        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; never "
-        "raises. Two of this function's isinstance sites root at provider_current_state (a separate, "
-        "policy-owned server-computed projection, not this boundary) and are outside this decorator's "
-        "scope by design"
+        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; raises "
+        "only on an internal invariant failure in the policy-owned provider_current_state projection. "
+        "The output-lookup isinstance site roots at provider_current_state (a separate, policy-owned "
+        "server-computed projection, not this boundary) and is outside this decorator's scope by design"
     ),
 )
 def _serialize_provider_discovery_result(
@@ -3018,9 +3148,12 @@ def _serialize_provider_discovery_result(
     on every discovery result. Discovery execution, audit, validation, and
     candidate construction continue to use the authoritative
     ``CompositionState``. Non-state discovery retains its canonical outcome
-    and data; preview fails closed because its data duplicates authoritative
-    validation, runtime preflight, and proof diagnostics. Failed reads retain
-    their canonical outcome and leak-safe error data. Successful state
+    and data; preview fails closed because its data is computed from the
+    authoritative state and this surface has no policy-owned projection of it
+    to disclose instead — ``get_pipeline_state`` is servable here only because
+    the caller supplies exactly that in ``provider_current_state``, which is
+    why the closed code is ``surface_projection_unavailable``. Failed reads
+    retain their canonical outcome and leak-safe error data. Successful state
     component reads follow the authoritative result shape, so node/output
     identifiers that collide with full-state aliases keep dispatch precedence.
     """
@@ -3086,12 +3219,11 @@ def _serialize_provider_discovery_result(
         selected = authoritative_data["node"]
         nodes = provider_current_state["nodes"] if "nodes" in provider_current_state else []
         selected_id = selected["id"] if isinstance(selected, Mapping) and "id" in selected else None
+        # Node candidates are ELSPETH's own server-computed projection: a
+        # candidate without a subscriptable "id" is an internal invariant
+        # failure that must raise, not fall closed as a surface error.
         node = next(
-            (
-                candidate
-                for candidate in nodes
-                if isinstance(candidate, Mapping) and (candidate["id"] if "id" in candidate else None) == selected_id
-            ),
+            (candidate for candidate in nodes if candidate["id"] == selected_id),
             None,
         )
         if node is not None:
@@ -3103,11 +3235,7 @@ def _serialize_provider_discovery_result(
         outputs = provider_current_state["outputs"] if "outputs" in provider_current_state else []
         selected_name = selected["sink_name"] if isinstance(selected, Mapping) and "sink_name" in selected else None
         output = next(
-            (
-                candidate
-                for candidate in outputs
-                if isinstance(candidate, Mapping) and (candidate["name"] if "name" in candidate else None) == selected_name
-            ),
+            (candidate for candidate in outputs if candidate["name"] == selected_name),
             None,
         )
         if output is not None:
@@ -3130,13 +3258,19 @@ async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
     task: asyncio.Task[Any] = asyncio.create_task(settle())
     try:
         return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
+        # Drain until the shielded custody task settles.  Each awaited pass may
+        # raise the task's own failure or a repeat cancellation of THIS
+        # coroutine; both must stay inside the loop — anything escaping here
+        # would REPLACE the active cancellation.  The task's outcome is
+        # observed explicitly below, never lost to this suppress.
         while not task.done():
-            with suppress(asyncio.CancelledError):
+            with suppress(BaseException):
                 await asyncio.shield(task)
-        # Observe a custody failure without replacing the active cancellation.
-        with suppress(BaseException):
-            task.result()
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            # Surface the custody failure chained onto the preserved
+            # cancellation instead of silently discarding it.
+            raise cancellation from failure
         raise
 
 
@@ -3147,16 +3281,18 @@ async def _settle_lifecycle(lifecycle: PlannerRequestLifecycle, outcome: Planner
     task: asyncio.Task[None] = asyncio.create_task(settle())
     try:
         await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
         # Settlement is operator/UI bookkeeping.  Let it finish even while the
-        # request task is being torn down, observe its result, then preserve
-        # the original cancel. A second cancellation cannot turn a settlement
-        # failure into an unobserved task exception.
+        # request task is being torn down, then preserve the original cancel.
+        # The drain suppress keeps repeat cancellations and the task's own
+        # failure from escaping mid-loop; the task's outcome is observed
+        # explicitly below, so a settlement failure is surfaced (chained onto
+        # the re-raised cancellation) rather than silently discarded.
         while not task.done():
             with suppress(BaseException):
                 await asyncio.shield(task)
-        with suppress(BaseException):
-            task.result()
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            raise cancellation from failure
         raise
 
 
@@ -4871,7 +5007,13 @@ async def _plan_pipeline_inner(
                 # projection back as this call's tool result and let the model
                 # repair next turn. Raising here would crash the whole request
                 # as a non-PipelinePlannerError 500 with no disposition.
-                feedback = _allowlisted_argument_feedback(exc)
+                #
+                # The payload is the ``data`` projection, not the whole-message
+                # one: this arm has an envelope, whose ``success`` says the call
+                # failed and whose ``validation`` is the STATE's — a second
+                # ``validation`` under ``data`` carrying the argument rejection
+                # instead would be a homonym, and a ``success`` there a twin
+                # (SYS-R3-1). Built inline so there is no local to re-shape.
                 return (
                     call,
                     ToolResult(
@@ -4879,7 +5021,7 @@ async def _plan_pipeline_inner(
                         updated_state=current_state,
                         validation=current_state.validate(),
                         affected_nodes=(),
-                        data=dict(feedback),
+                        data=_allowlisted_argument_error_payload(exc),
                     ),
                     False,
                 )

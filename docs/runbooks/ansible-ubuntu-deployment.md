@@ -59,10 +59,10 @@ that topology.
 
 ## Release compatibility
 
-The schema-incompatible 0.7.2 upgrade from 0.7.1 is not an in-place session
-database migration. Before a direct 0.7.1→0.7.2 upgrade, archive required
+The schema-incompatible 0.8.0 upgrade from 0.7.1 is not an in-place session
+database migration. Before a direct 0.7.1→0.8.0 upgrade, archive required
 evidence, drain and stop the old service, recreate the session database at the
-new epoch, and repair forward. Do not start 0.7.1 against the recreated 0.7.2
+new epoch, and repair forward. Do not start 0.7.1 against the recreated 0.8.0
 session database.
 
 ## Install the immutable release
