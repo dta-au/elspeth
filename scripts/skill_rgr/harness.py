@@ -118,6 +118,155 @@ class Scenario:
     green_predicates: list[Callable[[list[dict[str, Any]]], bool]] = field(default_factory=list)
 
 
+def preview_pipeline_result(
+    *,
+    preview_is_valid: bool,
+    validation_errors: list[dict[str, Any]] | None = None,
+    edge_contracts: list[dict[str, Any]] | None = None,
+    overview: dict[str, Any] | None = None,
+    version: int = 1,
+) -> dict[str, Any]:
+    """Build a ``preview_pipeline`` result in the shape the tool ships.
+
+    Mirrors ``ToolResult.to_dict()`` over
+    ``tools/generation.py::_execute_preview_pipeline``: the authoring check
+    rides on the envelope's own ``validation``, the dry-run on the top-level
+    ``runtime_preflight``, and ``data`` carries only the facts the preview
+    stage itself produces — ``preview_is_valid`` (the conjunct of the
+    authoring check, the runtime check and the source proof),
+    ``preview_errors``, ``edge_contracts``, ``proof_diagnostics``, and the
+    read-only overview.  Authoring errors stay on ``validation.errors``; the
+    pre-2026-09 stubs published them (and an ``is_valid`` homonym) under
+    ``data``, a shape the tool no longer emits (elspeth-e405ad7cd2 R4).
+
+    The runtime stage is always modelled as run-and-passing, for two reasons.
+    A stub that publishes ``preview_is_valid: true`` with no top-level
+    ``runtime_preflight`` is a wire shape that cannot occur: with no runtime
+    callback the live tool forces the conjunct false and mints a
+    ``runtime_preflight_not_run`` entry into ``preview_errors``.  And with the
+    runtime leg fixed at valid and no proof diagnostics, the conjunct reduces
+    to the authoring verdict, so a scenario's own edits are the only mover.
+
+    Args:
+        preview_is_valid: The authoring verdict.  Drives both
+            ``validation.is_valid`` and ``data["preview_is_valid"]``, so the
+            envelope and the conjunct cannot disagree.
+        validation_errors: ``ValidationEntry.to_dict()`` entries
+            (``component`` / ``message`` / ``severity``, optional
+            ``error_code``) for the envelope's authoring channel.
+        edge_contracts: ``EdgeContract.to_dict()`` entries (``from`` / ``to``
+            / ``producer_guarantees`` / ``consumer_requires`` /
+            ``missing_fields`` / ``satisfied``).
+        overview: The read-only ``sources`` / ``node_count`` / ``output_count``
+            / ``nodes`` / ``outputs`` block.  Omitted entirely by stubs that
+            track no pipeline state, rather than published as empty next to a
+            valid verdict.
+        version: ``CompositionState.version`` for the envelope.
+    """
+
+    return {
+        "success": True,
+        "validation": {
+            "is_valid": preview_is_valid,
+            "errors": list(validation_errors or []),
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": version,
+        "data": {
+            "preview_is_valid": preview_is_valid,
+            "preview_errors": [],
+            "edge_contracts": list(edge_contracts or []),
+            "proof_diagnostics": [],
+            **(overview or {}),
+        },
+        "runtime_preflight": {
+            "is_valid": True,
+            "checks": [],
+            "errors": [],
+            "warnings": [],
+            # The all-true, blocker-free readiness of a passing dry-run
+            # (``web/execution/validation.py::_execution_ready``).  A failing
+            # readiness axis always ships with a populated ``blockers`` list
+            # and ``is_valid: false``, so it cannot be modelled by flipping
+            # these flags alone.
+            "readiness": {
+                "authoring_valid": True,
+                "execution_ready": True,
+                "completion_ready": True,
+                "blockers": [],
+            },
+            "semantic_contracts": [],
+        },
+    }
+
+
+def get_pipeline_state_result(
+    *,
+    sources: dict[str, dict[str, Any]] | None = None,
+    nodes: list[dict[str, Any]] | None = None,
+    outputs: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    requested_component: Any = None,
+    version: int = 1,
+) -> dict[str, Any]:
+    """Build a full-state ``get_pipeline_state`` result in the shape the tool ships.
+
+    Mirrors ``ToolResult.to_dict()`` over
+    ``tools/_common.py::_serialize_full_pipeline_state``: ``data`` carries
+    ``sources`` (a MAPPING keyed by source name), ``nodes``, ``outputs`` and
+    ``edges`` as lists, plus ``metadata`` and the ``inspection`` block that
+    reports how the requested component resolved.  There is no singular
+    ``source`` key on any full-state read — the pre-2026-09 stub published one,
+    a shape the tool does not emit, so a scenario whose model read state was
+    scored against a wire that does not exist (elspeth-e405ad7cd2 LLM-R3-6,
+    the sibling of the ``preview_pipeline`` stubs c27587e0f fixed).
+
+    ``accepted_full_state_aliases`` mirrors ``_FULL_STATE_COMPONENT_ALIASES``
+    in that module; it is spelled out here rather than imported because it is
+    private to ``_common``.
+
+    This is the full-state shape only.  The live tool answers
+    ``component="source"`` with a ``sources``-only ``data`` (which
+    ``_default_stub`` routes here), and a component naming a node or output
+    with ``{"node": ...}`` / ``{"output": ...}`` or, when nothing matches, a
+    not-found failure result.  A stub pipeline holds no components, so the
+    default stub does not model that last request; a scenario that needs it
+    supplies its own stub.
+    """
+
+    return {
+        "success": True,
+        "validation": {
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "suggestions": [],
+            "semantic_contracts": [],
+            "graph_repair_suggestions": [],
+        },
+        "affected_nodes": [],
+        "version": version,
+        "data": {
+            "sources": dict(sources or {}),
+            "nodes": list(nodes or []),
+            "outputs": list(outputs or []),
+            "edges": list(edges or []),
+            "metadata": {"name": name, "description": description},
+            "inspection": {
+                "requested_component": requested_component,
+                "resolved_component": "full",
+                "accepted_full_state_aliases": ["", "full", "all", "pipeline"],
+            },
+        },
+    }
+
+
 def _default_stub(tool_name: str) -> ToolStub:
     """Return a stub that produces a plausible empty / valid response.
 
@@ -139,15 +288,15 @@ def _default_stub(tool_name: str) -> ToolStub:
     if tool_name == "list_secret_refs":
         return lambda _args: {"secrets": []}
     if tool_name == "preview_pipeline":
-        return lambda _args: {
-            "is_valid": True,
-            "errors": [],
-            "warnings": [],
-            "edge_contracts": [],
-            "suggestions": [],
-        }
+        return lambda _args: preview_pipeline_result(preview_is_valid=True)
     if tool_name == "get_pipeline_state":
-        return lambda _args: {"source": None, "nodes": [], "outputs": {}}
+        # ``component="source"`` is the one slice an empty stub state can
+        # answer truthfully; every other request reads as the full document.
+        return lambda args: (
+            {**get_pipeline_state_result(), "data": {"sources": {}}}
+            if args.get("component") == "source"
+            else get_pipeline_state_result(requested_component=args.get("component"))
+        )
     return lambda _args: {"status": "ok"}
 
 

@@ -71,6 +71,7 @@ from harness import (
     Scenario,
     called_tool,
     emitted_text_matching,
+    preview_pipeline_result,
     tool_call_args_match,
 )
 
@@ -193,16 +194,16 @@ def _preview_pipeline_stub(_args: dict) -> dict:
 
     A scenario that fails preview would test a different code path
     (validation-feedback loop). Here we want the success path so the
-    GREEN predicate "model reaches preview successfully" is meaningful.
+    GREEN predicate "model reaches preview successfully" is meaningful,
+    and the skill's terminal-state rule reads
+    ``data["preview_is_valid"]`` — see ``preview_pipeline_result``.
+
+    No read-only overview: this stub tracks none of the state the model
+    builds, and publishing an empty ``nodes`` / ``outputs`` block beside a
+    valid verdict would contradict the pipeline the model just authored.
     """
 
-    return {
-        "is_valid": True,
-        "errors": [],
-        "warnings": [],
-        "edge_contracts": [],
-        "suggestions": [],
-    }
+    return preview_pipeline_result(preview_is_valid=True)
 
 
 BATCH3_BOOTSTRAP = Scenario(

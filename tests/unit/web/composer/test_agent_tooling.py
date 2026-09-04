@@ -653,20 +653,33 @@ class TestDiffStates:
         )
 
     def test_version_tracking(self) -> None:
+        """``from_version`` only: the "to" side is the result envelope's own ``version``.
+
+        ``_execute_diff_pipeline`` passes the CURRENT state to
+        ``_discovery_result``, so a ``to_version`` under ``data`` byte-equals
+        the envelope's ``version`` — the twin shape 3a20129be removed from
+        ``get_pipeline_state`` (systems seat SYS-R3-5). ``from_version`` is a
+        fact the envelope does not carry, so it stays.
+        """
         s1 = _empty_state()
         s2 = s1.with_metadata({"name": "Updated"})
         diff = diff_states(s1, s2)
         assert diff["from_version"] == 1
-        assert diff["to_version"] == 2
+        assert "to_version" not in diff
+        assert s2.version == 2, "the version the diff ran TO, which the envelope carries"
 
 
 class TestDiffPipelineTool:
-    def test_returns_error_without_baseline(self) -> None:
+    def test_fails_closed_without_baseline(self) -> None:
+        """A missing baseline is a failure with a closed code, not a success carrying ``error`` (D5, elspeth-e405ad7cd2)."""
         state = _empty_state()
         catalog = _mock_catalog()
         result = execute_tool("diff_pipeline", {}, state, catalog)
-        assert result.success is True
+        assert result.success is False
         assert "No baseline" in result.data["error"]
+        assert result.data["error_code"] == "diff_baseline_unavailable"
+        assert "current_version" not in result.data
+        assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
 
     def test_returns_changes_with_baseline(self) -> None:
         s1 = _empty_state()

@@ -2197,37 +2197,29 @@ _REPEAT_NOTICE_TERMINAL = (
     "they must change."
 )
 
-# Subject prefix of a ``rejected_mutation`` entry's message. These prefixes are
-# authored by our own ``build_set_pipeline_candidate`` failure sites
-# (``Source '<name>': …`` / ``Node '<id>': …`` / ``Output '<name>': …``), the
-# same first-party format ``_INVALID_OPTIONS_PLUGIN_RE`` already parses for
-# schema augmentation — Tier-1 parsing of ELSPETH-authored text, not a
-# provider boundary.
-_REJECTED_MUTATION_SUBJECT_RE: Final[re.Pattern[str]] = re.compile(r"^(Source|Node|Output) '([^']+)': ")
-
 
 def _entry_component_ref(entry: Any) -> str | None:
     """Canonical validation-component ref a rejection entry is about.
 
     State-validation entries already carry the canonical vocabulary
     (``source`` / ``source:<name>`` / ``node:<id>`` / ``output:<name>`` /
-    ``pipeline``). ``rejected_mutation`` entries name their subject in the
-    message prefix instead; an unprefixed rejected_mutation message has no
+    ``pipeline``) in ``component``. ``rejected_mutation`` entries carry their
+    subject structurally in ``rejected_component``, stamped by the
+    set_pipeline component loop that produced them
+    (``build_set_pipeline_candidate``); an entry without one has no
     attributable subject and returns ``None`` (the withholding decision then
-    fails closed whenever the finalizer owns anything).
+    fails closed whenever the finalizer owns anything). There is no parse
+    fallback: until elspeth-e405ad7cd2 the subject was recovered from the
+    ``Output 'main': …`` message prefix by regex — the prose-parsing shape
+    three ``plugin_identity`` parsers were each defeated by
+    (elspeth-1d8fc3da83) — and a rejection whose producer did not prefix its
+    message silently lost attribution.
     """
     component = entry.component
     if component != "rejected_mutation":
         return cast(str, component)
-    match = _REJECTED_MUTATION_SUBJECT_RE.match(entry.message)
-    if match is None:
-        return None
-    kind, name = match.groups()
-    if kind == "Node":
-        return f"node:{name}"
-    if kind == "Source":
-        return "source" if name == "source" else f"source:{name}"
-    return f"output:{name}"
+    ref = entry.rejected_component
+    return ref if type(ref) is str and ref else None
 
 
 # Codes whose projection attaches instance ``connectivity`` facts — the only
@@ -2983,22 +2975,66 @@ def _materialize_terminal_payload(
     return pipeline_result, owned_refs, None, False
 
 
-def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+class _AllowlistedArgumentErrorEntry(TypedDict):
+    """One argument rejection, projected without its message or its input.
+
+    ``ToolArgumentError`` canonicalizes ``argument`` to a closed schema-owned
+    label and ``code`` to a closed dispatch discriminant, so every member here
+    is operator-owned; the LLM-supplied value never reaches this projection.
+    """
+
+    component: str
+    severity: str
+    error_code: str
+    error_class: str
+
+
+class _AllowlistedArgumentErrorPayload(TypedDict):
+    """``data`` for a discovery result the planner rejected on its arguments.
+
+    ``argument_error`` rather than ``validation``: on that arm the entry rides
+    under the ``data`` of a ``ToolResult`` whose own ``validation`` is the
+    STATE's, so a same-named key would be a homonym carrying different content
+    (systems seat SYS-R3-1), and the envelope's ``success`` already says the
+    call failed. The whole-message projection below keeps the family shape
+    because it has no envelope beside it.
+    """
+
+    argument_error: _AllowlistedArgumentErrorEntry
+
+
+def _allowlisted_argument_error_entry(error: ToolArgumentError) -> _AllowlistedArgumentErrorEntry:
     """Project a semantic argument failure without its message or input."""
+    return {
+        "component": error.argument,
+        "severity": "high",
+        "error_code": error.code or "argument_error",
+        "error_class": "ToolArgumentError",
+    }
+
+
+def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
+    """The whole tool-message content for an argument rejection on the repair loop.
+
+    This is a tool message the planner reads on its own, with no envelope
+    around it, so ``success`` and ``validation`` here are the message's own
+    top-level fields — the same shape ``_canonical_schema_feedback`` and the
+    other terminal-rejection builders use on that surface, not a ``data``
+    payload beside an envelope that already carries both. The ``data`` arm is
+    ``_allowlisted_argument_error_payload``.
+    """
     return {
         "success": False,
         "validation": {
             "is_valid": False,
-            "errors": [
-                {
-                    "component": error.argument,
-                    "severity": "high",
-                    "error_code": error.code or "argument_error",
-                    "error_class": "ToolArgumentError",
-                }
-            ],
+            "errors": [_allowlisted_argument_error_entry(error)],
         },
     }
+
+
+def _allowlisted_argument_error_payload(error: ToolArgumentError) -> _AllowlistedArgumentErrorPayload:
+    """``data`` for the ToolResult arm of an argument rejection."""
+    return {"argument_error": _allowlisted_argument_error_entry(error)}
 
 
 class _ClosedProviderValidationEntry(TypedDict):
@@ -3112,9 +3148,12 @@ def _serialize_provider_discovery_result(
     on every discovery result. Discovery execution, audit, validation, and
     candidate construction continue to use the authoritative
     ``CompositionState``. Non-state discovery retains its canonical outcome
-    and data; preview fails closed because its data duplicates authoritative
-    validation, runtime preflight, and proof diagnostics. Failed reads retain
-    their canonical outcome and leak-safe error data. Successful state
+    and data; preview fails closed because its data is computed from the
+    authoritative state and this surface has no policy-owned projection of it
+    to disclose instead — ``get_pipeline_state`` is servable here only because
+    the caller supplies exactly that in ``provider_current_state``, which is
+    why the closed code is ``surface_projection_unavailable``. Failed reads
+    retain their canonical outcome and leak-safe error data. Successful state
     component reads follow the authoritative result shape, so node/output
     identifiers that collide with full-state aliases keep dispatch precedence.
     """
@@ -4968,7 +5007,13 @@ async def _plan_pipeline_inner(
                 # projection back as this call's tool result and let the model
                 # repair next turn. Raising here would crash the whole request
                 # as a non-PipelinePlannerError 500 with no disposition.
-                feedback = _allowlisted_argument_feedback(exc)
+                #
+                # The payload is the ``data`` projection, not the whole-message
+                # one: this arm has an envelope, whose ``success`` says the call
+                # failed and whose ``validation`` is the STATE's — a second
+                # ``validation`` under ``data`` carrying the argument rejection
+                # instead would be a homonym, and a ``success`` there a twin
+                # (SYS-R3-1). Built inline so there is no local to re-shape.
                 return (
                     call,
                     ToolResult(
@@ -4976,7 +5021,7 @@ async def _plan_pipeline_inner(
                         updated_state=current_state,
                         validation=current_state.validate(),
                         affected_nodes=(),
-                        data=dict(feedback),
+                        data=_allowlisted_argument_error_payload(exc),
                     ),
                     False,
                 )

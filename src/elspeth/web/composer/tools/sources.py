@@ -953,7 +953,12 @@ def _resolve_source_blob(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     return _ResolvedSourceBlob(
         plugin=plugin,
@@ -1131,7 +1136,12 @@ def _execute_set_source(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", plugin),
+        )
 
     source = SourceSpec(
         plugin=plugin,
@@ -1392,7 +1402,12 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", "blob_rows"),
+        )
     return merged_options, tuple(payloads)
 
 
@@ -1809,9 +1824,11 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     handler=_execute_inspect_source,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Return bounded structural facts about a blob-backed source: source kind, observed "
-        "headers, sample row count, inferred scalar types per column, URL candidates, and "
-        "warnings. Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+        "Return bounded structural facts about a blob-backed source: `source_kind`, "
+        "`observed_headers`, `sample_row_count`, inferred scalar types per column, "
+        "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
+        "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+        "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
         "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
         "tell you which fields the source actually contains and what numeric coercion is "
         "needed before any gate or value_transform numeric op. Never returns raw row "
@@ -1863,6 +1880,15 @@ def _execute_patch_source_options(
     if source_name not in state.sources:
         return _failure_result(state, f"No source named '{source_name}' configured to patch.")
     current_source = state.sources[source_name]
+    # The plugin comes from persisted state, not from this request: resolve
+    # it through the request's policy view before anything downstream
+    # (prevalidation, the plugin_identity stamp) may assume it resolves. A
+    # plugin removed or renamed between deployments, or no longer authorized
+    # by this snapshot, is a policy rejection — the same one set_source gives
+    # — never a raise out of the schema augmentation (elspeth-e405ad7cd2 R8-fix1).
+    plugin_error = _validate_plugin_name(context, "source", current_source.plugin)
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
     patch: Mapping[str, Any] = validated.patch
 
     # Echo tolerance (elspeth-c67fbbbd83): a patch echoing the stored
@@ -1986,7 +2012,12 @@ def _execute_patch_source_options(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("source", current_source.plugin),
+        )
 
     new_source = replace(current_source, options=new_options)
     proposed_state = state.with_named_source(source_name, new_source)

@@ -377,7 +377,10 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     name="list_blobs",
     handler=_handle_list_blobs,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="List uploaded/created files (blobs) in this session with metadata.",
+    description=(
+        "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, filename, "
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 
@@ -407,7 +410,8 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
         "List ready blobs available for audited inline-content authoring. "
-        "Returns only blob_id, mime_type, size_bytes, content_hash, and filename; never content bytes."
+        "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
+        "and `filename`; never content bytes."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -443,7 +447,7 @@ _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
     name="get_blob_metadata",
     handler=_handle_get_blob_metadata,
     kind=ToolKind.BLOB_DISCOVERY,
-    description="Get metadata for a specific blob (file) by ID.",
+    description="Get metadata for a specific blob (file) by ID: `id`, filename, `mime_type`, `size_bytes`, `content_hash`, and `status`.",
     json_schema={
         "type": "object",
         "properties": {
@@ -715,7 +719,8 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_MUTATION,
     description=(
         "Author a widened blob_ref inline_content marker at a canonical field_path. "
-        "Composer pins sha256 from blob metadata; callers must not pass content bytes."
+        "Composer pins sha256 from blob metadata; callers must not pass content bytes. "
+        "Returns the `field_path` that was wired."
     ),
     json_schema={
         "type": "object",
@@ -1237,7 +1242,9 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
     description=(
         "Create a new file (blob) from inline content. "
         "Use this to create seed input files (URLs, JSON, CSV snippets) "
-        "mid-conversation without requiring manual upload."
+        "mid-conversation without requiring manual upload. Returns the new blob's `blob_id`, "
+        "`content_hash`, `size_bytes`, and `originated_in` (`this_tool_call`: the blob was authored by "
+        "this call, not uploaded)."
     ),
     json_schema={
         "type": "object",
@@ -1793,7 +1800,10 @@ _UPDATE_BLOB_DECLARATION = ToolDeclaration(
     name="update_blob",
     handler=_execute_update_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Update the content of an existing blob (file). Overwrites the file content while preserving metadata.",
+    description=(
+        "Update the content of an existing blob (file). Overwrites the file content while preserving metadata. "
+        "Returns the new `content_hash` and `size_bytes`."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -2051,7 +2061,7 @@ _DELETE_BLOB_DECLARATION = ToolDeclaration(
     name="delete_blob",
     handler=_execute_delete_blob,
     kind=ToolKind.BLOB_MUTATION,
-    description="Delete a blob (file) and its storage.",
+    description="Delete a blob (file) and its storage. Returns `deleted`: true.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2257,9 +2267,10 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     handler=_execute_get_blob_content,
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
-        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters. "
-        "The result also carries the blob's recorded origin — created_by (user, assistant, or pipeline) and "
-        "creation_modality — so content the assistant generated earlier is not mistaken for a discovered file."
+        "Retrieve the content of a blob (file) for inspection. Large files are truncated to 50,000 characters "
+        "(`truncated` is true when so; `size_bytes` is the full size). "
+        "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
+        "`creation_modality` — so content the assistant generated earlier is not mistaken for a discovered file."
     ),
     json_schema={
         "type": "object",

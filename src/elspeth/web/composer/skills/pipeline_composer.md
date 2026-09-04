@@ -265,6 +265,105 @@ proactive security/safety or red-listed-plugin concerns. Valid triggers:
 replies, convert the advice into normal composer tool calls and verify the
 result.
 
+## Reading a tool result
+
+Every tool returns one JSON object with the same framing: `success` is the
+outcome; `version` is the state version after the call; `affected_nodes`
+lists the component ids the call touched; `data` is the tool-specific
+payload each tool's own description names. `validation` is always present —
+the whole-document check after the call: `is_valid`, and `errors` /
+`warnings` / `suggestions` entries, each with `component`, `message`,
+`severity`, and a closed `error_code`; when the code carries facts they ride
+as a `contract`, `row_union_schema`, or `coalesce_union_type` block. An
+entry whose `component` is the literal `rejected_mutation` is a rejection of
+the call itself — nothing was applied. A `set_pipeline` rejection names the
+component it is about in `rejected_component` (`source`, `source:<name>`,
+`node:<id>`, or `output:<name>`) — repair that component; when that key is
+ABSENT the rejection is about the whole candidate rather than any one
+component, so repair from its `message`. A single-component tool's rejection
+is about the component you called it with.
+`semantic_contracts` lists each edge's `producer_field` → `consumer_field`
+check with its `outcome` and `requirement_code` (`from_id`, `to_id`,
+`producer_plugin`, `consumer_plugin` locate the edge); a `requirement_code`
+is the `issue_code` to pass to `get_plugin_assistance` for the repair.
+
+Two `status` values ride under `data` regardless of `success`.
+`APPROVAL_REQUIRED` (with `proposal_id`, `tool_name`, `summary`, `message`)
+means the change is a proposal awaiting human approval and nothing was
+applied: tell the user it awaits approval and stop. `PREVALIDATION_REJECTED`
+with `applied` false (`candidate_version`, `message`) means the candidate was
+not applied: repair from `validation`, which describes the rejected candidate,
+not the unchanged state the envelope's `version` names. Nothing changed, so
+`affected_nodes` is empty and there is no `validation_delta`;
+`candidate_version` is the version the candidate would have taken (equal to
+`version` when it failed before one was assigned).
+
+`graph_repair_suggestions` gives a ready repair for a duplicate consumer:
+`code`, `connection`, `strategy`, the `affected_consumers` (`id`,
+`current_input`, `new_input`), and a `tool_sequence` of tool-call objects —
+call each `tool` directly with its `arguments`, in order; never quote
+`arguments` back to the user. A different `tool_sequence` appears under a
+credential failure's `repair` → `post_hoc_form`: a plain list of tool NAMES
+to call in order, with no `arguments`; build each call's arguments yourself
+from `credential_fields` and `components`.
+
+### On failure
+
+A failed mutation carries `error` under `data` and, when the failure has a
+closed code, `error_code`. A top-level `validation_guidance` maps each
+`error_code` in `codes` to an `explanation` and a `suggested_fix`; when
+`explain_tool` is present, some entry had no matching code — call
+`explain_validation_error` with that entry's `error_code`, or with its full
+`message` when it has none. A top-level `plugin_schemas` (when present) is
+the option schema for each plugin a rejected component uses, keyed
+`<kind>/<name>`, each with `plugin_type`, `json_schema`, `knob_schema`,
+`web_config_authority`, `composer_hints`, and `secret_requirements` (the
+credential fields YOU must wire; empty when there are none — an
+`operator_profiled` plugin's credentials live in its profile, not in your
+`options`). It holds one entry per distinct plugin the rejected components
+use. On a `set_pipeline` rejection, match each entry to every rejection whose
+`rejected_component` uses that plugin; on a single-component tool there is one
+entry: the plugin of the component you called it on. Read no other entry. A
+rejection with no schema entry (for example `plugin_not_installed`) is still a
+component to repair, from its `message`. `web_config_authority` tells you whether to author raw
+`options` (`user_configurable` or `user_configurable_with_policy`) or to
+author `options.profile` instead and leave the plugin's own options alone
+(`operator_profiled`).
+
+A credential failure carries `credential_fields`, `components`
+(`component_id`, `component_type`, `fields`), and `repair` with an
+`inline_form` (`instruction`, `example_options` — each defective field shown
+as a `secret_ref` marker to copy) and a `post_hoc_form`
+(`instruction`, `tool_sequence` — the tool-names-only shape above); follow
+one form exactly. A full-replacement rejection may add
+`components_withheld`: the count of further defective components not
+listed; repair the listed ones and resubmit.
+
+### On success
+
+A `note` under `data` on a successful source, node, or `set_pipeline`
+mutation can name a real problem the mutation did not block on (for example
+an `on_validation_failure` destination that matches no configured output):
+read it and repair what it names before the next turn; it is not optional.
+
+A successful incremental mutation carries `applied_component` (`source`,
+`sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`
+(`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
+list of the entries described above); read the delta to choose the next
+repair and never re-read state to confirm the echo. `post_call_hints` are
+plugin-authored next steps.
+
+Housekeeping keys: `server_owned_metadata_note` means you may omit that
+field on future writes; a blob-backed source mutation may add `source_blob`
+/ `source_blobs` (the bound blob's identity); a `set_pipeline` that resolved
+`source.inline_blob` returns the created blob under `inline_blob`
+(`blob_id`, `content_hash`, `originated_in`) — that id is the bound source
+blob; do not call `list_blobs` to rediscover it. `runtime_preflight` appears
+only on `preview_pipeline`, and only when a runtime check ran, as its own
+top-level field: `is_valid`, `checks`,
+`readiness` (`execution_ready` and `blockers` say whether it can run), and
+runtime `errors` / `warnings` / `semantic_contracts`.
+
 ## Audit Boundaries
 
 - User data is trusted only after the source boundary validates it. Inside
@@ -911,8 +1010,11 @@ Before you stop, copy this checklist and confirm each item:
 
 For build/edit/validate turns, end only in one of these states:
 
-1. `preview_pipeline` returned `is_valid: true` and blocking diagnostics are
-   resolved.
+1. `preview_pipeline` returned `preview_is_valid: true` (its `data` verdict,
+   which already folds in the runtime check and the source proof). When it is
+   false and `validation`, `runtime_preflight` and `preview_errors` are all
+   clean, a `proof_diagnostics` entry with `severity` `blocking` is the
+   reason — apply its `suggested_repair`.
 2. All required `request_interpretation_review` calls succeeded, and the only
    remaining blocker is unresolved pending interpretation reviews. Tell the user
    the review cards are waiting; do not call `preview_pipeline` yet. Announce

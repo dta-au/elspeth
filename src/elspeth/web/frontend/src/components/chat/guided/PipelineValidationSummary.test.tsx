@@ -188,6 +188,7 @@ describe("PipelineValidationSummary", () => {
           message: "Cannot resolve secret references: OPENROUTER_API_KEY",
           suggestion:
             "Add the missing secrets via the Secrets panel before executing.",
+          error_code: "missing_secret_ref",
         },
       ],
       warnings: [],
@@ -196,6 +197,51 @@ describe("PipelineValidationSummary", () => {
     expect(
       screen.getByText(/part of the full composer, outside this tutorial/i),
     ).toBeInTheDocument();
+  });
+
+  // The note is keyed on the finding's closed error_code, not on its prose
+  // (elspeth-e405ad7cd2 SYS-R3-4): a reworded backend suggestion must keep the
+  // note, and a suggestion that merely mentions the words must not gain one.
+  it("keeps the tutorial note when the Secrets-panel suggestion is reworded", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: null,
+          component_type: null,
+          message: "Cannot resolve secret references: OPENROUTER_API_KEY",
+          suggestion: "Store OPENROUTER_API_KEY as a secret before executing.",
+          error_code: "fabricated_secret",
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary isTutorial />);
+    expect(
+      screen.getByText(/part of the full composer, outside this tutorial/i),
+    ).toBeInTheDocument();
+  });
+
+  it("does not add the tutorial note to a finding that is not a secret-reference failure", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: null,
+          component_type: null,
+          message: "Output 'rows' is misconfigured",
+          suggestion: "Open the Secrets panel documentation for context.",
+          error_code: "plugin_options_invalid",
+        },
+      ],
+      warnings: [],
+    });
+    render(<PipelineValidationSummary isTutorial />);
+    expect(
+      screen.queryByText(/part of the full composer, outside this tutorial/i),
+    ).not.toBeInTheDocument();
   });
 
   // ── elspeth-3b35abf148 error-rendering: contract dumps are humanised ────────

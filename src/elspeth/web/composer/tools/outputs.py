@@ -165,7 +165,12 @@ def _execute_set_output(
 
     prevalidation_error = _prevalidate_sink(plugin, sink_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("sink", plugin),
+        )
     collision_error = validate_composer_file_sink_collision_policy(
         plugin,
         sink_options,
@@ -236,6 +241,11 @@ def _execute_patch_output_options(
     current = next((o for o in state.outputs if o.name == sink_name), None)
     if current is None:
         return _failure_result(state, f"Output '{sink_name}' not found.")
+    # State-held plugin: resolve it through the request's policy view before
+    # prevalidation stamps it (see _execute_patch_source_options).
+    plugin_error = _validate_plugin_name(context, "sink", current.plugin)
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
     new_options = _apply_merge_patch(current.options, patch)
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(current.plugin, new_options)
     if endpoint_policy_error is not None:
@@ -258,7 +268,12 @@ def _execute_patch_output_options(
 
     prevalidation_error = _prevalidate_sink(current.plugin, new_options)
     if prevalidation_error is not None:
-        return _failure_result(state, prevalidation_error)
+        return _failure_result(
+            state,
+            prevalidation_error,
+            error_code="plugin_options_invalid",
+            plugin_identity=("sink", current.plugin),
+        )
     collision_error = validate_composer_file_sink_collision_policy(
         current.plugin,
         new_options,

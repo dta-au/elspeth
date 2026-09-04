@@ -1218,7 +1218,7 @@ def test_review_reconciliation_failure_names_the_underlying_cause() -> None:
     # id reaching the planner, which is deliberate and redaction-safe: the id is
     # a pipeline identifier derived from kind + node id, not row content, and
     # the same boundary already returns rejected option KEYS and VALUES from
-    # plugin prevalidation (see plugin_identities_in_option_failure). Without
+    # plugin prevalidation (the ``_prevalidate_plugin_options`` messages). Without
     # the id, a pipeline carrying several resolved reviews still leaves the
     # planner guessing which one to re-send.
     assert "model_choice_review:enrich" in result.data["error"], result.data["error"]

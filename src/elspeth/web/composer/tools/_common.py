@@ -34,6 +34,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -81,6 +82,7 @@ from elspeth.web.composer.state import (
     _coalesce_branch_names,
     _serialize_branches,
 )
+from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -601,7 +603,6 @@ class _FullPipelineStatePayload(TypedDict):
     outputs: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     metadata: _FullPipelineStateMetadataPayload
-    version: int
     inspection: _FullPipelineStateInspectionPayload
 
 
@@ -630,9 +631,11 @@ def _semantic_contracts_payload(
 ) -> list[_SemanticEdgeContractPayload]:
     """Serialize a SemanticEdgeContract tuple to JSON-friendly dicts.
 
-    Centralized so ToolResult.to_dict and _execute_preview_pipeline
-    emit identical shapes — and so adding a field updates both
-    surfaces in one place.
+    Centralized so ToolResult.to_dict and the guided stage emitter
+    (guided/emitters.py) emit identical shapes — and so adding a field
+    updates both surfaces in one place. (preview_pipeline no longer
+    co-emits it: its data stopped carrying a copy of the envelope's
+    validation in elspeth-e405ad7cd2 R4.)
 
     SemanticEdgeContract intentionally has no .to_dict() of its own:
     serialization happens at consumption sites so L0 stays free of
@@ -744,11 +747,7 @@ def _duplicate_consumer_repair_suggestions(
     validation: ValidationSummary,
 ) -> list[_GraphRepairSuggestion]:
     """Build copyable repair skeletons for duplicate-consumer validation failures."""
-    duplicate_error_components = {
-        error.component
-        for error in validation.errors
-        if error.component.startswith("connection:") and error.message.startswith("Duplicate consumer for connection ")
-    }
+    duplicate_error_components = {error.component for error in validation.errors if error.error_code == "duplicate_connection_consumer"}
     if not duplicate_error_components:
         return []
 
@@ -818,7 +817,10 @@ def _duplicate_consumer_repair_suggestions(
         patched_consumers: dict[str, dict[str, Any]] = {}
         for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
             if node.id not in patched_consumers:
-                patched_consumers[node.id] = _serialize_node(node)
+                # Widened deliberately: this is a repair-call argument the loop
+                # below re-keys, not the node payload the census reports, so it
+                # must not borrow ``_SetPipelineNodePayload``'s closed key set.
+                patched_consumers[node.id] = dict(_serialize_node(node))
             patched_consumer = patched_consumers[node.id]
             if consumer_branch_alias is None:
                 patched_consumer["input"] = branch_name
@@ -873,6 +875,73 @@ def _graph_repair_suggestions(
     return _duplicate_consumer_repair_suggestions(state, validation)
 
 
+ToolResultData = Mapping[str, object] | Sequence[object] | BaseModel
+"""The closed shapes a tool's ``data`` payload may take on the wire: a JSON object, a JSON array, or
+a pydantic model that ``serialize_tool_result`` dumps. Each tool's own TypedDict says which keys."""
+
+_DATA_CONTAINER_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType, list, tuple)
+_MAPPING_TYPES: Final[tuple[type, ...]] = (dict, MappingProxyType)
+
+
+class AppliedComponentEcho(TypedDict, total=False):
+    """The post-change components a successful incremental mutation echoes (``_applied_component_echo``).
+
+    Every key is optional and present only when non-empty; the key set is the
+    registry's ``APPLIED_COMPONENT_KEYS`` and the constructor refuses any other.
+    """
+
+    source: dict[str, JsonValue]
+    sources: dict[str, dict[str, JsonValue]]
+    nodes: list[_SetPipelineNodePayload]
+    outputs: list[dict[str, JsonValue]]
+    edges: list[dict[str, JsonValue]]
+
+
+def _require_tool_result_data(value: object) -> None:
+    """Nominal admission (ADR-032): exact container types or a pydantic model; a dict subclass is refused."""
+    if value is None or isinstance(value, BaseModel) or type(value) in _DATA_CONTAINER_TYPES:
+        return
+    raise AuditIntegrityError(f"ToolResult.data is not a closed payload shape: {type(value).__name__}")
+
+
+def _exact_mapping(value: object) -> Mapping[str, object] | None:
+    """The value when it is EXACTLY a dict or mappingproxy; a subclass or anything else yields None.
+
+    ``isinstance`` gives mypy the narrowing; the ``type(...) in`` test gives the
+    nominal exactness ADR-032 asks for (a dict subclass is an impostor here).
+    """
+    if isinstance(value, (dict, MappingProxyType)) and type(value) in _MAPPING_TYPES:
+        return value
+    return None
+
+
+def _require_validation_guidance(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or "codes" not in mapping or _exact_mapping(mapping["codes"]) is None:
+        raise AuditIntegrityError("ToolResult.validation_guidance must carry a 'codes' mapping")
+
+
+def _require_applied_component(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None:
+        raise AuditIntegrityError(f"ToolResult.applied_component is not a mapping: {type(value).__name__}")
+    extra = sorted(set(mapping) - set(APPLIED_COMPONENT_KEYS))
+    if extra:
+        raise AuditIntegrityError(f"ToolResult.applied_component keys outside the registry: {extra}")
+
+
+def _require_plugin_schemas(value: object) -> None:
+    if value is None:
+        return
+    mapping = _exact_mapping(value)
+    if mapping is None or any(_exact_mapping(schema) is None for schema in mapping.values()):
+        raise AuditIntegrityError("ToolResult.plugin_schemas must map '<kind>/<plugin>' to a schema mapping")
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Result of a tool execution.
@@ -894,10 +963,11 @@ class ToolResult:
             *only when non-empty* so existing tool consumers see no
             schema change.
         plugin_schemas: Inline ``get_plugin_schema`` payloads for every
-            plugin named in a validation error of the form
-            ``Invalid options for <kind> '<plugin>'``. Populated only on
-            failed mutations (``success=False``) for the option-shape
-            tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
+            plugin a validation error carries in its structural
+            ``ValidationEntry.plugin_identity`` (stamped by the producer of
+            a plugin-option rejection; never read from the message).
+            Populated only on failed mutations (``success=False``) for the
+            option-shape tools by ``execute_tool``. Keys are ``"<kind>/<plugin>"``
             strings sorted deterministically. ``to_dict`` emits this
             field *only when non-empty*. Eliminates the second
             round-trip the LLM would otherwise burn calling
@@ -928,13 +998,13 @@ class ToolResult:
     updated_state: CompositionState
     validation: ValidationSummary
     affected_nodes: tuple[str, ...]
-    data: Any = None
+    data: ToolResultData | None = None
     prior_validation: ValidationSummary | None = None
     runtime_preflight: ValidationResult | None = None
     post_call_hints: tuple[str, ...] = ()
-    plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
-    validation_guidance: Mapping[str, Any] | None = None
-    applied_component: Mapping[str, Any] | None = None
+    plugin_schemas: Mapping[str, Mapping[str, JsonValue]] | None = None
+    validation_guidance: ValidationGuidance | None = None
+    applied_component: AppliedComponentEcho | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
     # True when this failure envelope deliberately withheld the pre-mutation
     # state's validate() entries (full-replacement rejections,
@@ -944,6 +1014,11 @@ class ToolResult:
     _state_validation_withheld: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Admission before freezing: a refusal must leave nothing half-frozen behind.
+        _require_tool_result_data(self.data)
+        _require_plugin_schemas(self.plugin_schemas)
+        _require_validation_guidance(self.validation_guidance)
+        _require_applied_component(self.applied_component)
         freeze_fields(self, "affected_nodes", "post_call_hints")
         if self.data is not None:
             freeze_fields(self, "data")
@@ -1027,9 +1102,13 @@ def diff_states(
         baseline_validation: Pre-computed validation for the baseline state.
         current_validation: Pre-computed validation for the current state.
     """
+    # No ``to_version``: the handler passes ``current`` as the result's state,
+    # so the envelope's own ``version`` IS the "to" side and a copy under
+    # ``data`` would be a twin — the same shape 3a20129be removed from
+    # get_pipeline_state one file away (systems seat SYS-R3-5).
+    # ``from_version`` stays: it is a fact the envelope does not carry.
     changes: dict[str, Any] = {
         "from_version": baseline.version,
-        "to_version": current.version,
         "sources_changed": False,
         "metadata_changed": False,
         "nodes": {"added": [], "removed": [], "modified": []},
@@ -1168,6 +1247,7 @@ def _failure_result(
     error_code: str | None = None,
     with_state_validation: bool = True,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
@@ -1194,9 +1274,20 @@ def _failure_result(
     be made to. Omitting it costs an enrichment, never correctness.
     """
     if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code, plugin_identity=plugin_identity)
+        validation = _prepend_rejection_entry(
+            state.validate(),
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
     else:
-        validation = _rejection_only_validation(error_msg, error_code=error_code, plugin_identity=plugin_identity)
+        validation = _rejection_only_validation(
+            error_msg,
+            error_code=error_code,
+            plugin_identity=plugin_identity,
+            rejected_component=rejected_component,
+        )
     data = {_DATA_ERROR_KEY: error_msg}
     if error_code is not None:
         data["error_code"] = error_code
@@ -1233,8 +1324,8 @@ def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str
     identifiers (node ids, server-owned requirement ids), closed
     ``InterpretationKind`` values, and planner-authored user terms. None of
     them can reach row content, and the surrounding boundary already quotes
-    rejected option keys and VALUES from plugin prevalidation
-    (see ``plugin_identities_in_option_failure``).
+    rejected option keys and VALUES from plugin prevalidation (the
+    ``_prevalidate_plugin_options`` message family).
     """
     reason = str(exc).strip().rstrip(".")
     if not reason:
@@ -1242,88 +1333,109 @@ def review_reconciliation_failure_message(exc: BaseException, *, retry_hint: str
     return f"{REVIEW_RECONCILIATION_FAILURE_PREFIX}: {reason}. {retry_hint}"
 
 
-# Regex matching the option-shape failure messages emitted by
-# ``_prevalidate_plugin_options`` (see ``_prevalidate_source`` /
-# ``_prevalidate_transform`` / ``_prevalidate_sink``). The kind token is
-# pinned to the three valid PluginKind values so an unrelated message
-# containing ``Invalid options for ...`` text cannot trigger augmentation.
-# The plugin name group accepts any non-apostrophe characters because
-# plugin names are validated upstream.
-_INVALID_OPTIONS_PLUGIN_RE: Final[re.Pattern[str]] = re.compile(
-    r"Invalid options for (source|transform|sink) '([^']+)'",
-)
-
-
-def plugin_identities_in_option_failure(message: str) -> tuple[tuple[PluginKind, str], ...]:
-    """Return the ``(kind, plugin)`` pairs one option-shape message names.
-
-    Scans the WHOLE message, so it reports identities the validator never
-    resolved. These messages interpolate model-authored text in three places —
-    the details tail quotes rejected option VALUES, the secret_ref-placement
-    head quotes option KEYS, and the ``set_pipeline`` attribution prefix
-    quotes the component NAME, which is unvalidated for exactly the components
-    that fail — and each one is enough to plant a plugin identity here. No
-    reading of the message is trustworthy; that is why the in-process consumer
-    now carries ``ValidationEntry.plugin_identity`` from the producer instead
-    (elspeth-1d8fc3da83).
-
-    The freeform augmentation below is this function's only caller and keeps
-    the whole-message reading, its own pre-existing behaviour: changing it
-    would move the schema bytes it inlines. Its exposure is real and tracked
-    separately.
-
-    Ordering is sorted and duplicates dropped.
-    """
-    identities = {(cast(PluginKind, match.group(1)), match.group(2)) for match in _INVALID_OPTIONS_PLUGIN_RE.finditer(message)}
-    return tuple(sorted(identities))
-
-
 def build_plugin_schemas_for_failure(
     result: ToolResult,
     catalog: CatalogService,
     *,
     schema_unavailable_message: Callable[[PluginSchemaInfo], str | None] | None = None,
-) -> Mapping[str, Mapping[str, Any]] | None:
+) -> Mapping[str, Mapping[str, JsonValue]] | None:
     """Build the ``plugin_schemas`` augmentation dict for a failed mutation.
 
-    Scans every entry in ``result.validation.errors`` (including both the
-    leading ``rejected_mutation`` entry and any state-level errors that
-    follow). Each entry's ``message`` is regex-matched against
-    ``_INVALID_OPTIONS_PLUGIN_RE``; every distinct ``(kind, plugin)`` pair
-    is resolved through ``catalog.get_schema`` and dumped to a plain dict
-    via ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical
-    to what the LLM would otherwise receive from a discrete
+    Reads ``ValidationEntry.plugin_identity`` from every entry in
+    ``result.validation.errors`` (the leading ``rejected_mutation`` entry and
+    any state-level errors that follow). The identity is a structural fact
+    the PRODUCER stamped at the moment it built the failure, from the plugin
+    it had already resolved through the request's policy view — never
+    recovered from ``message``. Those messages quote model-authored text in
+    three places (rejected option VALUES in the details tail, option KEYS in
+    the secret_ref-placement head, the component NAME in the ``set_pipeline``
+    attribution prefix), and each was enough to plant a plugin identity that
+    no validator had admitted; ``catalog.get_schema`` on such a name raised
+    out of ``execute_tool`` as a model-triggerable 500. Three successive
+    message parsers were each defeated by a different one of those, so the
+    parser is deleted rather than re-anchored (elspeth-f60d638661).
+
+    Fails closed on absence: an entry with ``plugin_identity=None`` attaches
+    nothing, whatever its message says. The model cannot plant an identity
+    through message text because no text is read.
+
+    Every distinct ``(kind, plugin)`` pair is resolved through
+    ``catalog.get_schema`` and dumped to a plain dict via
+    ``PluginSchemaInfo.model_dump()`` so the payload is byte-identical to
+    what the LLM would otherwise receive from a discrete
     ``get_plugin_schema`` tool call. When ``schema_unavailable_message`` is
     supplied, plugins hidden by the same availability gate as
-    ``get_plugin_schema`` are omitted rather than inlining a forbidden schema.
+    ``get_plugin_schema`` are omitted rather than inlining a forbidden
+    schema. Keys are ``"<kind>/<plugin>"``, sorted, deduplicated.
 
-    Returns ``None`` when the result is successful or when no error
-    message matches the option-shape pattern. The caller is responsible
-    for restricting the call to declarations that set
-    ``augments_on_failure=True`` (gated by
+    Returns ``None`` when the result is successful or when no entry carries
+    an identity. The caller is responsible for restricting the call to
+    declarations that set ``augments_on_failure=True`` (gated by
     ``_registry.should_augment_with_plugin_schemas``).
 
-    Trust tier: server-controlled response shaping. A regex match implies
-    the validator already resolved the plugin in the catalog (the unknown
-    -plugin path emits ``"Unknown <kind> plugin '<name>'"`` instead).
-    Therefore ``catalog.get_schema`` returning ``ValueError`` here is a
-    Tier-1 anomaly — propagate, do not silently omit.
+    Trust tier: server-controlled response shaping. A stamped identity was
+    resolved by the producer, so ``catalog.get_schema`` raising here is a
+    Tier-1 anomaly (a producer stamped a name it never resolved) —
+    propagate, do not silently omit.
     """
     if result.success:
         return None
     discovered: dict[tuple[str, str], Mapping[str, Any]] = {}
     for entry in result.validation.errors:
-        for key in plugin_identities_in_option_failure(entry.message):
-            kind, plugin_name = key
-            if key in discovered:
-                continue
-            schema = catalog.get_schema(kind, plugin_name)
-            if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
-                continue
-            discovered[key] = schema.model_dump()
+        if entry.plugin_identity is None:
+            continue
+        kind, plugin_name = entry.plugin_identity
+        key = (kind, plugin_name)
+        if key in discovered:
+            continue
+        schema = catalog.get_schema(cast(PluginKind, kind), plugin_name)
+        if schema_unavailable_message is not None and schema_unavailable_message(schema) is not None:
+            continue
+        discovered[key] = schema.model_dump()
     if not discovered:
         return None
     return {f"{kind}/{plugin_name}": payload for (kind, plugin_name), payload in sorted(discovered.items())}
+
+
+def rejected_component_ref(component_type: str, component_id: str) -> str:
+    """The canonical validation-component ref for a component a rejection is about.
+
+    ``source`` ids already carry the canonical form (``source`` /
+    ``source:<name>``, minted by ``source_component_id``); node and output ids
+    are bare and take the ``node:`` / ``output:`` prefix. This is the one
+    place the ``rejected_component`` grammar is minted for rejections, so the
+    prose prefix (:func:`rejected_component_prefix`) and the structural fact
+    cannot disagree (elspeth-e405ad7cd2, F10).
+    """
+    # ``component_type`` arrives in two vocabularies: the component family
+    # (``source`` / ``node`` / ``output``, what the mutation tools pass) and the
+    # plugin kind (``transform`` / ``sink``, what the credential payload's
+    # ``components[].component_type`` historically carried). Both map onto the
+    # same three ref families.
+    if component_type == "source":
+        return component_id
+    if component_type in {"node", "transform"}:
+        return f"node:{component_id}"
+    if component_type in {"output", "sink"}:
+        return f"output:{component_id}"
+    raise AuditIntegrityError(f"unknown component_type {component_type!r} for a rejection subject")
+
+
+def rejected_component_prefix(rejected_component: str) -> str:
+    """The message prefix a set_pipeline rejection about one component carries.
+
+    ``Source '<name>': `` / ``Node '<id>': `` / ``Output '<name>': `` — the
+    same prose the per-component loops used to hand-write beside the stamp.
+    """
+    if rejected_component.startswith("node:"):
+        return f"Node '{rejected_component.removeprefix('node:')}': "
+    if rejected_component.startswith("output:"):
+        return f"Output '{rejected_component.removeprefix('output:')}': "
+    if rejected_component == "source":
+        return "Source 'source': "
+    if rejected_component.startswith("source:"):
+        return f"Source '{rejected_component.removeprefix('source:')}': "
+    raise AuditIntegrityError(f"not a validation-component ref: {rejected_component!r}")
 
 
 def _prepend_rejection_entry(
@@ -1332,6 +1444,7 @@ def _prepend_rejection_entry(
     *,
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary with a leading rejected_mutation entry.
 
@@ -1346,6 +1459,7 @@ def _prepend_rejection_entry(
         severity="high",
         error_code=error_code,
         plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
     )
     return ValidationSummary(
         is_valid=False,
@@ -1362,6 +1476,7 @@ def _rejection_only_validation(
     *,
     error_code: str | None = None,
     plugin_identity: tuple[str, str] | None = None,
+    rejected_component: str | None = None,
 ) -> ValidationSummary:
     """Return a ValidationSummary holding only a rejected_mutation entry.
 
@@ -1378,6 +1493,7 @@ def _rejection_only_validation(
         severity="high",
         error_code=error_code,
         plugin_identity=plugin_identity,
+        rejected_component=rejected_component,
     )
     return ValidationSummary(is_valid=False, errors=(rejection,))
 
@@ -1561,10 +1677,19 @@ def _serialize_source(source: SourceSpec) -> dict[str, Any]:
     }
 
 
-def _serialize_node(node: NodeSpec) -> dict[str, Any]:
-    """Serialize a NodeSpec to a plain dict for LLM consumption.
+def _serialize_node(node: NodeSpec) -> _SetPipelineNodePayload:
+    """Serialize a NodeSpec to the exact node payload for LLM consumption.
 
     Includes all fields (even None) so the LLM sees the full schema.
+
+    Typed rather than ``dict[str, Any]`` because the envelope census reports
+    ``_SetPipelineNodePayload``'s keys as this function's wire (through
+    ``_serialize_set_pipeline_node``). While the type was only asserted over
+    the result, a key added to the literal below shipped while the census kept
+    reporting the TypedDict's — measured: 22 keys on the wire against 21
+    censused, gate green, mypy clean (red-team RED5-2). The annotation is what
+    holds the two equal; consumers wanting a plain mapping widen at their own
+    call site.
     """
     return {
         "id": node.id,
@@ -1617,11 +1742,14 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
     """Serialize the full state and expose accepted full-state spellings."""
     return {
         "sources": {name: _serialize_source(source) for name, source in state.sources.items()},
-        "nodes": [_serialize_node(n) for n in state.nodes],
+        # Widened to the declared ``list[dict[str, Any]]``: this payload is
+        # censused from ``_FullPipelineStatePayload``, which stops at ``nodes``.
+        # Narrowing the field would enumerate 21 sub-keys none of these surfaces
+        # teaches yet — the opaque-reference residue on elspeth-657f603fcd.
+        "nodes": [dict(_serialize_node(n)) for n in state.nodes],
         "outputs": [_serialize_output(o) for o in state.outputs],
         "edges": [_serialize_edge(e) for e in state.edges],
         "metadata": {"name": state.metadata.name, "description": state.metadata.description},
-        "version": state.version,
         "inspection": {
             "requested_component": requested_component,
             "resolved_component": "full",
@@ -1744,10 +1872,15 @@ def _credential_wiring_contract_failure(
     # validation.errors; with_state_validation decides whether the unchanged
     # state's errors follow it (False for full-replacement set_pipeline,
     # elspeth-e89e6bf47a).
+    # The builder already receives the subject structurally (``component_type``
+    # + ``component_id``), so it stamps ``rejected_component`` itself — every
+    # caller, incremental tools included, gets attribution with no edit
+    # (elspeth-e405ad7cd2, F10 round 2).
+    subject = rejected_component_ref(component_type, component_id)
     if with_state_validation:
-        validation = _prepend_rejection_entry(state.validate(), error_msg)
+        validation = _prepend_rejection_entry(state.validate(), error_msg, rejected_component=subject)
     else:
-        validation = _rejection_only_validation(error_msg)
+        validation = _rejection_only_validation(error_msg, rejected_component=subject)
     return ToolResult(
         success=False,
         updated_state=state,
@@ -1915,6 +2048,7 @@ def _plugin_policy_failure(
     *,
     component: str | None = None,
     with_state_validation: bool = True,
+    rejected_component: str | None = None,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
     return _failure_result(
@@ -1922,6 +2056,7 @@ def _plugin_policy_failure(
         message,
         error_code=violation.error_code.value,
         with_state_validation=with_state_validation,
+        rejected_component=rejected_component,
     )
 
 
@@ -2992,7 +3127,7 @@ def _missing_output_options_repair_error(
         option_list = ", ".join(options)
         field_note = f" Replace {_FIELD_OPTION_PLACEHOLDER} with the actual selected string field." if "field" in options else ""
         return (
-            f"Output '{sink_name}' is missing options. For {plugin_name} file sinks, include "
+            f"Missing options. For {plugin_name} file sinks, include "
             f"an options object with {option_list}. Use this runnable output object and adjust "
             f"the path/schema if needed: {json.dumps(repair_output)}.{field_note}{detail}"
         )
@@ -3005,7 +3140,7 @@ def _missing_output_options_repair_error(
     }
     detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
     return (
-        f"Output '{sink_name}' is missing options. Include the sink plugin's options object. "
+        "Missing options. Include the sink plugin's options object. "
         f"If this sink accepts empty configuration, use: {json.dumps(repair_output)}; otherwise "
         f"call get_plugin_schema for sink '{plugin_name}' and fill the required options.{detail}"
     )
@@ -3517,7 +3652,13 @@ def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonVa
 
 
 def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
-    payload = cast(_SetPipelineNodePayload, _serialize_node(node))
+    """The node payload with authoring-only options, the shape the census attributes to this name.
+
+    No ``cast``: ``_serialize_node`` is annotated with this very TypedDict, so
+    the attribution is derived from what mypy holds the producer to rather than
+    asserted over it (red-team RED5-2).
+    """
+    payload = _serialize_node(node)
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
 
@@ -3715,7 +3856,7 @@ _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES: Final[int] = 16 * 1024
 def _applied_component_echo(
     state: CompositionState,
     affected: tuple[str, ...],
-) -> Mapping[str, Any] | None:
+) -> AppliedComponentEcho | None:
     """Project the components a successful mutation applied, post-finalizer.
 
     The echo is the exact ``set_pipeline`` arguments that
@@ -3750,6 +3891,11 @@ def _applied_component_echo(
         # get_pipeline_state. An echo is never worth a second projection.
         return None
     assert payload is not None
+    # Storage-path redaction runs on the full authoring payload before the echo
+    # is narrowed: same bytes redacted, and the echo is then assembled directly
+    # in its closed shape (AppliedComponentEcho) with no round-trip through an
+    # open dict.
+    payload = redact_source_storage_path(payload)
 
     state_node_ids = {node.id for node in state.nodes}
     state_output_names = {output.name for output in state.outputs}
@@ -3770,7 +3916,7 @@ def _applied_component_echo(
         elif component in state_output_names:
             output_names.add(component)
 
-    echo: dict[str, Any] = {}
+    echo: AppliedComponentEcho = {}
     if "source" in payload and SOURCE_COMPONENT_ID in source_names:
         echo["source"] = payload["source"]
     if "sources" in payload:
@@ -3796,7 +3942,6 @@ def _applied_component_echo(
     if not echo:
         return None
 
-    echo = redact_source_storage_path(echo)
     if len(canonical_json(echo).encode("utf-8")) > _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES:
         return None
     return echo

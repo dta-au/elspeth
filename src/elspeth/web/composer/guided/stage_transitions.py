@@ -1230,6 +1230,11 @@ def canonical_sink_local_paths(options: Mapping[str, Any]) -> dict[str, JsonValu
         if type(value) is not str or not value or value.startswith(BLOB_REF_PATH_PREFIX):
             continue
         raw = PurePosixPath(value)
+        # These messages interpolate ONLY server constants (the option key
+        # from SINK_LOCAL_PATH_OPTION_KEYS). Never interpolate the path
+        # VALUE: it is model/user-authored text, and quoting it into a
+        # message re-creates the parsed-attribution vector this family of
+        # messages was cleared of (elspeth-f60d638661).
         if not raw.parts:
             raise ValueError(f"option {key!r} must name a path, not the current directory")
         if ".." in raw.parts:

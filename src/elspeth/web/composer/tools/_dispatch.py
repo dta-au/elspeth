@@ -141,7 +141,10 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
             "in each response. Do NOT call this tool in a loop, do NOT use it "
             "as a substitute for reading validator output. Availability is "
             "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape."
+            "independently of this on-demand escape. Each reply carries `status` "
+            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
+            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
+            "`note` restating that the guidance is advice, not configuration."
         ),
         "parameters": {
             "type": "object",
@@ -233,7 +236,16 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "prompt-template review is not a substitute for an authored "
             "rubric/definition review. "
             "Do not call this for terms the user already defined in the "
-            "conversation."
+            "conversation. The result's `_kind` tells you what happened: "
+            "`interpretation_review_pending` means the card is staged — wait "
+            "for the user; `interpretation_review_suppressed_by_opt_out` means "
+            "no card will appear because this session opted out "
+            "(`interpretation_review_disabled` is true and "
+            "`interpretation_source` names the automatic interpretation that "
+            "stood in) — proceed without waiting; "
+            "`interpretation_review_pending_idempotent` means an identical "
+            "request was already staged — treat it as pending. `message` "
+            "restates the outcome in prose."
         ),
         "parameters": {
             "type": "object",
@@ -514,19 +526,19 @@ def _augment_with_plugin_schemas(
 
     For the mutation tools whose declarations set
     ``augments_on_failure=True`` (derived into
-    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), scan
-    ``result.validation.errors``
-    for ``Invalid options for <kind> '<plugin>'`` messages and embed the
-    full ``get_plugin_schema`` payload for every named plugin. Eliminates
-    the second round-trip the LLM would otherwise burn calling
-    ``get_plugin_schema`` after each rejection (see composer session
-    47cfbb5e on staging: 13 tool calls + 18 LLM rounds to converge a
-    4-plugin pipeline because the model never preloaded schemas).
+    ``_registry._AUGMENTS_ON_FAILURE_TOOL_NAMES``), read the structural
+    ``ValidationEntry.plugin_identity`` each producer stamped on its
+    rejection and embed the full ``get_plugin_schema`` payload for every
+    stamped plugin — never an identity parsed from the message
+    (elspeth-f60d638661). Eliminates the second round-trip the LLM would
+    otherwise burn calling ``get_plugin_schema`` after each rejection (see
+    composer session 47cfbb5e on staging: 13 tool calls + 18 LLM rounds to
+    converge a 4-plugin pipeline because the model never preloaded schemas).
 
-    No-op when the mutation succeeded, when no error message matches the
-    option-shape pattern, when the result already carries
-    ``plugin_schemas`` (handler set it directly), or when ``tool_name`` is
-    not one of the augmentation-eligible tools.
+    No-op when the mutation succeeded, when no error entry carries an
+    identity, when the result already carries ``plugin_schemas`` (handler
+    set it directly), or when ``tool_name`` is not one of the
+    augmentation-eligible tools.
     """
     if not should_augment_with_plugin_schemas(tool_name):
         return result

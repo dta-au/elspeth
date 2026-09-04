@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from collections import UserDict
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import litellm
 import pytest
 from litellm.types.utils import Message
 from scripts.skill_rgr import harness
+
+from elspeth.web.composer import tool_result_envelope as env
+from elspeth.web.composer.tools._common import (
+    _FULL_STATE_COMPONENT_ALIASES,
+    _FullPipelineStateInspectionPayload,
+    _FullPipelineStateMetadataPayload,
+    _FullPipelineStatePayload,
+)
 
 
 class _FakeMessage:
@@ -238,3 +246,39 @@ def test_run_scenario_does_not_admit_a_mapping_without_model_dump(
             model="test-model",
             label="red",
         )
+
+
+def test_state_read_stub_carries_the_tool_payload_shape() -> None:
+    """``get_pipeline_state_result`` is derived from the tool's own payload types.
+
+    The harness loads the LIVE ``pipeline_composer`` skill, so a stub whose
+    wire the tool never produces scores a scenario against a fiction: the
+    pre-2026-09 stub published a singular ``source`` with an ``outputs``
+    MAPPING and no envelope, where the tool ships a ``sources`` mapping,
+    ``outputs``/``edges`` lists, ``metadata`` and ``inspection`` under ``data``
+    (elspeth-e405ad7cd2 LLM-R3-6; the same defect ``c27587e0f`` fixed for the
+    three ``preview_pipeline`` stubs). Deriving the expectation from
+    ``_FullPipelineStatePayload`` rather than restating it means a key added to
+    the tool reds this test instead of silently ageing the stub.
+    """
+    result = harness.get_pipeline_state_result()
+    assert set(result) >= set(env.TOOL_RESULT_REQUIRED_KEYS)
+    data = result["data"]
+    assert set(data) == set(get_type_hints(_FullPipelineStatePayload))
+    assert set(data["metadata"]) == set(get_type_hints(_FullPipelineStateMetadataPayload))
+    assert set(data["inspection"]) == set(get_type_hints(_FullPipelineStateInspectionPayload))
+    assert data["inspection"]["accepted_full_state_aliases"] == list(_FULL_STATE_COMPONENT_ALIASES)
+
+
+def test_default_state_stub_answers_the_source_slice_with_the_slice_shape() -> None:
+    """``component="source"`` ships a ``sources``-only ``data``, never the full document.
+
+    ``sessions.py::_execute_get_pipeline_state`` answers that component with
+    ``{"sources": ...}`` alone; the full-state arm is the no-component / alias
+    arm. A stub that answered both with the full document would teach a reader
+    that ``metadata`` and ``inspection`` ride every state read.
+    """
+    stub = harness._default_stub("get_pipeline_state")
+    assert set(stub({"component": "source"})["data"]) == {"sources"}
+    assert set(stub({})["data"]) == set(get_type_hints(_FullPipelineStatePayload))
+    assert stub({"component": "full"})["data"]["inspection"]["requested_component"] == "full"

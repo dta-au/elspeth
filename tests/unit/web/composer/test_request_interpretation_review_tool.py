@@ -1413,7 +1413,7 @@ async def test_02_happy_path_produces_success_and_db_row(service: SessionService
     )
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1501,7 +1501,7 @@ async def test_02c_structured_pending_requirement_happy_path(service: SessionSer
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "rate_node"
+    assert result.affected_nodes == ("rate_node",)
     assert result.data["kind"] == "vague_term"
     assert "user_term" not in result.data
     assert "llm_draft" not in result.data
@@ -1781,7 +1781,7 @@ async def test_request_interpretation_review_accepts_source_component_for_invent
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1816,7 +1816,7 @@ async def test_request_interpretation_review_accepts_named_source_component_for_
     )
 
     assert result.success is True
-    assert result.data["affected_node_id"] == "source:orders"
+    assert result.affected_nodes == ("source:orders",)
     assert result.data["kind"] == "invented_source"
 
 
@@ -1972,7 +1972,7 @@ async def test_request_interpretation_review_invented_source_persists_with_real_
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == SOURCE_COMPONENT_ID
+    assert result.affected_nodes == (SOURCE_COMPONENT_ID,)
     assert result.data["kind"] == "invented_source"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2007,7 +2007,7 @@ async def test_request_interpretation_review_accepts_pipeline_decision_kind(serv
 
     assert result.success is True
     assert result.data["_kind"] == "interpretation_review_pending"
-    assert result.data["affected_node_id"] == "drop_raw_html"
+    assert result.affected_nodes == ("drop_raw_html",)
     assert result.data["kind"] == "pipeline_decision"
     rows = await service.list_interpretation_events(session_id, status="pending")
     assert len(rows) == 1
@@ -2914,7 +2914,7 @@ async def test_dedup_second_pending_restage_is_idempotent(service: SessionServic
     # Affected node + kind flow through for frontend correlation. Raw review
     # text stays in the scoped interpretation-events API, not the ToolResult
     # sent back to the LLM or persisted in chat-message audit payloads.
-    assert second.data["affected_node_id"] == "rate_node"
+    assert second.affected_nodes == ("rate_node",)
     assert second.data["kind"] == "vague_term"
     assert "user_term" not in second.data
     assert "llm_draft" not in second.data

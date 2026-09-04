@@ -52,8 +52,8 @@ Stateful preview_pipeline stub
 ------------------------------
 
 The default harness stub returns an empty ``edge_contracts`` and
-``is_valid: true``. That makes the scenario unanswerable — the LLM
-cannot know whether its patch worked.
+``data["preview_is_valid"]: true``. That makes the scenario
+unanswerable — the LLM cannot know whether its patch worked.
 
 This scenario installs a ``ContractLoopStub`` state machine that:
 
@@ -68,9 +68,14 @@ This scenario installs a ``ContractLoopStub`` state machine that:
    workaround). The two paths are observably distinct in the post-run
    stub state — predicates use that distinction.
 
-The stub deliberately does **not** simulate runtime preflight. The
-edge_contract simulation is enough for the LLM to observe whether its
-patch closed the violation, which is the behaviour under test.
+The stub deliberately does **not** simulate the runtime preflight's
+checks: it publishes the fixed passing ``runtime_preflight`` block that
+``preview_pipeline_result`` supplies, so the authoring/edge-contract leg
+of ``preview_is_valid`` is the only mover. (The block cannot simply be
+dropped — with no runtime stage the live tool forces ``preview_is_valid``
+false and mints ``runtime_preflight_not_run``.) The edge_contract
+simulation is enough for the LLM to observe whether its patch closed the
+violation, which is the behaviour under test.
 
 RED predicates (current skill)
 ------------------------------
@@ -135,6 +140,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from harness import (
     Scenario,
+    get_pipeline_state_result,
+    preview_pipeline_result,
 )
 
 # ---------------------------------------------------------------------------
@@ -226,36 +233,77 @@ class ContractLoopStub:
     # ----- tool callbacks -----
 
     def get_pipeline_state(self, _args: dict) -> dict:
-        """Mirror the shape ``_execute_get_pipeline_state`` returns."""
-        return {
-            "source": {
-                "plugin": "csv",
-                "on_success": self.INITIAL_NODE_ID,
-                "options": {"path": "data.csv", "schema": self.source_schema},
+        """Mirror the shape ``_execute_get_pipeline_state`` returns.
+
+        Built through ``harness.get_pipeline_state_result``, so the envelope
+        and the ``data`` block are the tool's own: ``sources`` is a MAPPING
+        keyed by the composer-visible source name, ``outputs`` is a LIST whose
+        entries key the sink on ``sink_name``, and every field
+        ``_serialize_source`` / ``_serialize_node`` / ``_serialize_output``
+        emits is present — including the ``None`` ones, which that serializer
+        keeps deliberately "so the LLM sees the full schema". The pre-2026-09
+        stub published a singular ``source``, an ``outputs`` mapping and no
+        envelope at all, none of which the tool emits (elspeth-e405ad7cd2
+        LLM-R3-6; same defect c27587e0f fixed for ``preview_pipeline``).
+        """
+        return get_pipeline_state_result(
+            sources={
+                "source": {
+                    "plugin": "csv",
+                    "on_success": self.INITIAL_NODE_ID,
+                    "options": {"path": "data.csv", "schema": self.source_schema},
+                    "on_validation_failure": "discard",
+                    "description": None,
+                }
             },
-            "nodes": [
+            nodes=[
                 {
                     "id": self.INITIAL_NODE_ID,
                     "node_type": "transform",
                     "plugin": "passthrough",
-                    "options": ({"schema": self.clean_schema} if self.clean_schema is not None else {}),
+                    "input": None,
                     "on_success": f"output:{self.INITIAL_OUTPUT_NAME}",
+                    "on_error": None,
+                    "options": ({"schema": self.clean_schema} if self.clean_schema is not None else {}),
+                    "condition": None,
+                    "routes": None,
+                    "fork_to": None,
+                    "branches": None,
+                    "policy": None,
+                    "merge": None,
+                    "trigger": None,
+                    "output_mode": None,
+                    "expected_output_count": None,
+                    "timeout_seconds": None,
+                    "description": None,
+                    "scope_name": None,
+                    "scope_opener": None,
+                    "scope_policy": None,
                 }
             ],
-            "outputs": {
-                self.INITIAL_OUTPUT_NAME: {
+            outputs=[
+                {
+                    "sink_name": self.INITIAL_OUTPUT_NAME,
                     "plugin": "json",
                     "options": {
                         "path": "out.json",
                         "required_input_fields": list(self.sink_required_fields),
                     },
+                    "on_write_failure": None,
+                    "description": None,
                 }
-            },
-            "version": 1 + len(self.patches),
-        }
+            ],
+            version=1 + len(self.patches),
+        )
 
     def preview_pipeline(self, _args: dict) -> dict:
         """Compute edge_contracts based on current schema state.
+
+        Returned in the shipping envelope (``preview_pipeline_result``): the
+        authoring verdict and its errors ride on ``validation``, and ``data``
+        carries the preview stage's own facts — ``preview_is_valid``,
+        ``preview_errors``, ``edge_contracts``, ``proof_diagnostics`` and the
+        read-only overview.
 
         Two edges:
 
@@ -291,39 +339,60 @@ class ContractLoopStub:
             },
         ]
 
-        return {
-            "is_valid": edge_satisfied,
-            "errors": (
+        return preview_pipeline_result(
+            preview_is_valid=edge_satisfied,
+            validation_errors=(
                 []
                 if edge_satisfied
                 else [
                     {
-                        "code": "edge_contract_unsatisfied",
+                        # Component, message and code as the live sink-side
+                        # contract error emits them
+                        # (``state.py::_check_schema_contracts``): component
+                        # ``output:<name>``, code ``schema_contract_violation``,
+                        # field lists sorted and ``(none)`` when empty.
+                        "component": f"output:{self.INITIAL_OUTPUT_NAME}",
                         "message": (
-                            f"Edge {self.INITIAL_NODE_ID} -> "
-                            f"output:{self.INITIAL_OUTPUT_NAME} requires "
-                            f"{missing} but producer guarantees "
-                            f"{clean_guarantees}"
+                            f"Schema contract violation: '{self.INITIAL_NODE_ID}' -> "
+                            f"'output:{self.INITIAL_OUTPUT_NAME}'. "
+                            f"Sink '{self.INITIAL_OUTPUT_NAME}' requires fields: "
+                            f"[{', '.join(sorted(sink_required)) or '(none)'}]. "
+                            f"Producer (passthrough) guarantees: "
+                            f"[{', '.join(sorted(clean_guarantees)) or '(none)'}]. "
+                            f"Missing fields: [{', '.join(sorted(missing)) or '(none)'}]."
                         ),
+                        "severity": "high",
+                        "error_code": "schema_contract_violation",
                     }
                 ]
             ),
-            "warnings": [],
-            "suggestions": [],
-            "edge_contracts": edge_contracts,
-            "semantic_contracts": [],
-            "source": {"plugin": "csv", "on_success": self.INITIAL_NODE_ID},
-            "node_count": 1,
-            "output_count": 1,
-            "nodes": [
-                {
-                    "id": self.INITIAL_NODE_ID,
-                    "node_type": "transform",
-                    "plugin": "passthrough",
-                }
-            ],
-            "outputs": [{"name": self.INITIAL_OUTPUT_NAME, "plugin": "json"}],
-        }
+            edge_contracts=edge_contracts,
+            overview={
+                # ``sources`` is a mapping keyed by the composer-visible source
+                # name — ``"source"`` for a single default-named root — and
+                # ``has_schema_config`` is key presence, not truthiness
+                # (``raw_options_have_schema``). This stub's source options
+                # always carry a ``schema``.
+                "sources": {
+                    "source": {
+                        "plugin": "csv",
+                        "on_success": self.INITIAL_NODE_ID,
+                        "has_schema_config": True,
+                    }
+                },
+                "node_count": 1,
+                "output_count": 1,
+                "nodes": [
+                    {
+                        "id": self.INITIAL_NODE_ID,
+                        "node_type": "transform",
+                        "plugin": "passthrough",
+                    }
+                ],
+                "outputs": [{"name": self.INITIAL_OUTPUT_NAME, "plugin": "json"}],
+            },
+            version=1 + len(self.patches),
+        )
 
     def patch_source_options(self, args: dict) -> dict:
         """Apply a shallow merge-patch to source options.

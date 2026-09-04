@@ -1739,12 +1739,7 @@ def _compose_preflight_repair_message(runtime_result: ValidationResult, *, next_
             "user the deployment operator must allowlist this exact secret/plugin/option "
             "destination before this pipeline can run."
         )
-    elif any(
-        error.error_code in {"fabricated_secret", "missing_secret_ref"}
-        or "Credential field(s)" in error.message
-        or "secret reference" in error.message
-        for error in runtime_result.errors
-    ):
+    elif any(error.error_code in {"fabricated_secret", "missing_secret_ref"} for error in runtime_result.errors):
         credential_note = (
             "\n\nCredential-secret diagnostic requirement:\n"
             "- Before answering or finalising, call list_secret_refs and validate_secret_ref for the intended secret name "

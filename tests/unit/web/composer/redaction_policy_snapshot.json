@@ -5,7 +5,7 @@
     "shape": "declarative"
   },
   "create_blob": {
-    "hash": "7eccee981e30317c72500b295e127a9115903aa09f4f7e6d29a1250b15a3c464",
+    "hash": "452236c20e0c12e94b885df293ac048b86dcde21ba721e6bf52523b7c561c9bd",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
@@ -30,7 +30,7 @@
     "shape": "declarative"
   },
   "get_blob_content": {
-    "hash": "6bb8fe016bd8341108c33c8b2621fcee768f59359607665350cca412c083c5ce",
+    "hash": "3201042b22ad5460705cc1bffc4539829138576a4f82971e8c32670b9f0f74bb",
     "sensitive_path_count": 2,
     "shape": "type_driven"
   },
@@ -100,17 +100,17 @@
     "shape": "declarative"
   },
   "patch_node_options": {
-    "hash": "ad14341891c10fe93810c30a48e80afef33f6e5bf681c5850d071aacae8669d5",
+    "hash": "e13092250dec90294558eff6dbbc2163cb8ff9387702e0e2ab5eaaef7858856c",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "patch_output_options": {
-    "hash": "b0c14cdcaa370c7f9191b8425a8660dc0903a53a8d126c99b9a67e7015d82633",
+    "hash": "0bfac007401a585f858b43583f50934d678bf13889de268a65e69cd3bcc0e4ca",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "patch_source_options": {
-    "hash": "d42aa90d7d1c630f2cac7a94b9482c7b953f4e7210a83c8aff919bde4fab4f4c",
+    "hash": "2d86337e43878541324525385f0265afdeeae6b9cd35e7cf621bed86b2a44efc",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
@@ -140,7 +140,7 @@
     "shape": "declarative"
   },
   "request_interpretation_review": {
-    "hash": "856f1d40c823645c68f06e3e341b9da97c1d51ff0fb9b3dc4c58d1ddfcccefb7",
+    "hash": "aaa8e463881afe2463ba97b64567e8ebe6bd640309844624aa1360c6e9bf483e",
     "sensitive_path_count": 6,
     "shape": "type_driven"
   },
@@ -155,32 +155,32 @@
     "shape": "declarative"
   },
   "set_pipeline": {
-    "hash": "38a00c9db3bc322bfe40a666e3db3f05ddece45e0b0e0d6f7b1118dd4e0cd33d",
+    "hash": "5a86f4c75613377e846f2dfd13d878ce6595c636b3602845ddb4219cdfe175df",
     "sensitive_path_count": 15,
     "shape": "type_driven"
   },
   "set_source": {
-    "hash": "9903f29f204b50b126590c1d841ff70bf56667086a98c59cf6b5743b057d8285",
+    "hash": "34a0e4f4aa1257206c03ef2c4d2bad9a297a82a16ba0e0d8c298973aee4a4399",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "set_source_from_blob": {
-    "hash": "8765e0cafcba92d9914949ab09d06feb1a5f1d8a5a26afcc8c2cd5328adba495",
+    "hash": "bb16919aafa7e7c8a5aba32f4ac89224ca9a2cd3bd7154e18d7f6f131096eb23",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "set_source_from_blobs": {
-    "hash": "5118c38cc3c01007252104e243f5f8e8037a0b6d55b8ed4a8e17ce8a5b9a0445",
+    "hash": "1e8be956e027eece2376d90dd7a77cd44c4283ac7b0e5d119c49371cba4a5638",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "splice_transform": {
-    "hash": "f3e14060b4f4e486c3dc23b92fedda91efe5100c6133832fda16e6ace9a6fb42",
+    "hash": "e73cd6420fc2bf37ffe11d85d4832eddcfea03449c7823c8f49b7a32a5821fdb",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
   "update_blob": {
-    "hash": "9379feb41e3c1d18af54e00479869b62180f1edacee015f0275fad7f3262e75f",
+    "hash": "ddccaa50a98d48237f8eddd514a6fcc5b1ce018deff8425af3615b27ca5e5a77",
     "sensitive_path_count": 10,
     "shape": "type_driven"
   },
