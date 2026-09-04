@@ -99,6 +99,56 @@ property you MEASURE, never one you infer from its identifier — see
 sharper case: it is not just the column's semantics but the function's
 discriminating power.
 
+### The measurement that closes the topology question
+
+A grounding agent measured the ACCEPTED candidate directly against the live
+validator (standalone script with verified module resolution, so the
+`pythonpath` trap below does not apply).
+
+**On the accepted graph, `locked_input_extras` is structurally unreachable.**
+The gate is `_locked_input_field_set` (`state.py:3790`): it returns `None`
+unless `schema.mode == "fixed"` AND `schema.fields is not None`. Every
+component returns `None` — the accepted modes are observed / observed /
+flexible / observed, and `_sink_locked_input_set(json_output)` is `None` too.
+
+**The discrimination this whole investigation kept sliding past:**
+`cleanup_fields` DOES declare `fields: [url, summary]` — with
+`mode: flexible`. Declaring fields is not sufficient. (Relatedly,
+`state.py:5423`'s field_mapper special-case only swaps the fix-suggestion
+WORDING; it gives field_mapper no second route to a locked input.
+`_locked_input_field_set` is plugin-agnostic.)
+
+**Therefore the accepted repair REMOVED a locked input.** The code fired at
+attempt 3; at attempt 4 it cannot fire at all. That is two measurements, not
+an inference across candidates.
+
+**Hypothesis, explicitly not a finding.** Removing the locked input is exactly
+what the no-facts fallback prescribes — "set `schema.mode: flexible`". A
+`mode: fixed` version of that same `cleanup_fields` is the natural first
+authoring of "retain exactly url and summary", and `flexible` is what the
+accepted candidate carries. If that is what happened, the guidance defect is
+one we WATCHED the planner comply with, and the tutorial shipped a dissolved
+contract. It is NOT established: the rejected candidate is unpersisted, and
+several routes reach the same accepted state. This is the same
+accepted-to-rejected substitution recorded above, so it stays a hypothesis
+with a stated discriminator — persist the rejected candidate's edge and re-run.
+
+**Two further corrections, each reached independently by two agents:**
+
+- "Withheld only when the producer is the reviewed source" is narrower than
+  the code. `withholding.contract` ALSO fires when the entry's own component
+  is config-owned.
+- **Withholding never rewrites `error_code`** — the projection sets it
+  unconditionally — so the audit's `rejection_codes` cannot distinguish a
+  withheld entry from a forwarded one. That route to the question is closed.
+
+**And the forwarded-versus-withheld question is formally UNRESOLVED**, not
+merely unproven. A source-edge `locked_input_extras` requires a first
+transform whose locked field set excludes `url`. Measured: with a REQUIRED
+field it co-fires with `schema_contract_violation`, and attempt 3 shows
+exactly one code — that variant is ruled out. The all-optional variant emits
+`locked_input_extras` alone with `producer='source'` and is NOT ruled out.
+
 ## Superseded: the misattribution correction that preceded it
 
 *Retained because it shipped, and because its structural finding survives.*
