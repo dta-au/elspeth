@@ -1261,7 +1261,10 @@ def test_management_provider_api_error_completes_unavailable_turn_without_mutati
             .one()
         )
     assert proposal["status"] == "pending"
-    assert events == ["proposal.created"]
+    # elspeth-ed67eb9d0d: reaching the wire review carried this still-pending
+    # proposal across a new checkpoint, moving its anchor there. The move is a
+    # non-terminal lifecycle event; the row is untouched otherwise.
+    assert events == ["proposal.created", "proposal.rebased"]
     assert operation["status"] == "completed"
     assert operation["result_state_id"] is not None
 
@@ -1391,7 +1394,7 @@ def test_schema8_passed_output_edit_preserves_stable_id_and_rewinds_reviewed_pen
             .all()
         )
     assert proposal_row["status"] == "rejected"
-    assert events == ["proposal.created", "proposal.rejected"]
+    assert events == ["proposal.created", "proposal.rebased", "proposal.rejected"]
 
 
 @pytest.mark.parametrize("fault_point", ("proposal_event", "proposal_update"))

@@ -170,6 +170,7 @@ from .._helpers import (
 )
 from .guided_plan import _guided_full_failure_code
 from .guided_plan import router as guided_plan_router
+from .guided_proposal_rebase import carried_pending_proposal_rebase
 from .pipeline_settlement import (
     _GUIDED_ATOMIC_SETTLEMENT_COMPLETED,
     _GUIDED_ATOMIC_SETTLEMENT_FAILURE,
@@ -865,7 +866,18 @@ async def get_guided(
                 raise AuditIntegrityError("guided proposal reference differs from private authority")
             if type(proposal.base) is not PresentBase:
                 raise AuditIntegrityError("guided proposal authority has a non-present base")
-            if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(state):
+            # Currency is asked of the proposal's ANCHOR, not of
+            # ``proposal.base``: the base is hashed into ``draft_hash`` and
+            # so is the reviewed artifact's immutable identity (checked
+            # against the checkpoint reference just above), while the anchor
+            # is the lifecycle-managed binding a guided settlement legally
+            # moves forward when it carries the proposal across a new
+            # checkpoint (elspeth-ed67eb9d0d). The comparison itself is
+            # unchanged — an exact id match against the head, plus content.
+            current_base = active_authority.current_base
+            if type(current_base) is not PresentBase:
+                raise AuditIntegrityError("guided proposal authority has a non-present anchor")
+            if current_base.state_id != state_record_out.id or current_base.composition_content_hash != composition_content_hash(state):
                 raise AuditIntegrityError("guided proposal base differs from current checkpoint")
             if active_authority.row.status != "pending":
                 # elspeth-4dc78b3897: a terminal row behind a still-active
@@ -3772,6 +3784,19 @@ async def post_guided_respond(
                             ),
                             chat_turn_seq=base_guided.chat_turn_seq + len(instruction_turns) + 1,
                         )
+                        # This settlement advances the head while leaving the
+                        # proposal under review, so the proposal's anchor has
+                        # to follow the checkpoint being written or every
+                        # later currency check names a stale row
+                        # (elspeth-ed67eb9d0d).
+                        settled_rebase = carried_pending_proposal_rebase(
+                            settled_guided,
+                            from_state_id=(current_state_record.id if current_state_record is not None else None),
+                            base_composition_content_hash=(
+                                composition_content_hash(current_state) if current_state_record is not None else None
+                            ),
+                            reason="revision_declined",
+                        )
                         settled_state = _replace(current_state, guided_session=settled_guided)
                         settled_state_dict = settled_state.to_dict()
                         settled_is_valid, settled_validation_errors = _guided_persisted_validity(settled_state, catalog=catalog)
@@ -3822,6 +3847,7 @@ async def post_guided_respond(
                                     planner_attempts=llm_recorder.planner_attempts,
                                     chat_turns=llm_recorder.chat_turns,
                                 ),
+                                rebased_pending_proposal=settled_rebase,
                             ),
                             payload_store=payload_store,
                         )
@@ -4398,6 +4424,21 @@ async def post_guided_respond(
                             active_proposal=guided.active_proposal,
                             active_edit_target=None,
                         )
+                        # Advancing into wire review keeps the proposal under
+                        # review while writing a new checkpoint, so its anchor
+                        # follows here too. Before elspeth-ed67eb9d0d this hop
+                        # went unrebound and was absorbed by the one-hop
+                        # ``derived_from`` tolerance in
+                        # ``back_edit_guided_pipeline_proposal`` — which meant
+                        # it SPENT that tolerance, and the next carrying
+                        # settlement at Step 4 killed the "edit this
+                        # component" affordance outright.
+                        reviewed_rebase = carried_pending_proposal_rebase(
+                            final_guided,
+                            from_state_id=state_record.id,
+                            base_composition_content_hash=composition_content_hash(state),
+                            reason="wire_review_entry",
+                        )
                         reviewed_state = _replace(state, guided_session=final_guided)
                         emit_turn_answered(
                             recorder,
@@ -4459,6 +4500,7 @@ async def post_guided_respond(
                                 ),
                                 payloads=(prepared_response, prepared_wire),
                                 audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+                                rebased_pending_proposal=reviewed_rebase,
                             ),
                             payload_store=payload_store,
                         )

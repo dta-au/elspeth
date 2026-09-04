@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBase
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
@@ -70,6 +70,37 @@ PipelineProposalRejectionReason = Literal[
 # recording "superseded" there would fabricate a successor that never existed.
 GuidedProposalInvalidationReason = Literal["superseded", "guided_exit"]
 _GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
+# Which gesture moved a still-pending proposal's anchor. Sibling of the
+# rejection reason above, and needed for the same purpose: the four
+# settlements that carry a proposal across a new checkpoint
+# (elspeth-ed67eb9d0d) are otherwise indistinguishable in the proposal's own
+# event trail — two of them settle the SAME ``guided_respond`` operation
+# kind, so the settlement's identity cannot discriminate them either. Closed
+# vocabulary rather than free text: this value is persisted in an immutable
+# audit payload, so it must have bounded cardinality and no user content. The
+# frozenset below is the SINGLE authority — the settlement imports it rather
+# than restating the members, so widening the Literal cannot leave a writer
+# and its parser disagreeing about what is admissible.
+#   revision_declined    the planner declined a prose revision at Step 3/4
+#                        and the settlement records the turn
+#   wire_review_entry    a Step-3 proposal was accepted into wire review
+#   advisory_chat        an ordinary guided chat turn advanced the head
+#   guided_full_declined the guided-full escape hatch declined and settled
+#                        its checkpoint over the observed head
+GuidedProposalRebaseReason = Literal[
+    "revision_declined",
+    "wire_review_entry",
+    "advisory_chat",
+    "guided_full_declined",
+]
+GUIDED_PROPOSAL_REBASE_REASONS = frozenset(
+    {
+        "revision_declined",
+        "wire_review_entry",
+        "advisory_chat",
+        "guided_full_declined",
+    }
+)
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]
 ProposalEventType = Literal[
     "proposal.created",
@@ -83,6 +114,19 @@ ProposalEventType = Literal[
     # downgrade left the trail showing a successful dispatch against a
     # still-pending proposal with nothing recording the block.
     "auto_commit.revoked",
+    # Non-terminal: the proposal stays pending. Records one guided
+    # settlement moving a still-pending proposal's ANCHOR — its
+    # lifecycle-managed ``composition_proposals.base_state_id``, never the
+    # draft-hashed ``PipelineProposal.base`` — onto the checkpoint that
+    # settlement writes (elspeth-ed67eb9d0d). In guided mode a
+    # ``composition_states`` row is a SESSION checkpoint —
+    # ``chat_history`` lives inside ``composer_meta`` — so an ordinary chat
+    # or a declined revision mints a new version without touching the
+    # graph, and a proposal carried across it would otherwise stay anchored
+    # to the previous checkpoint forever. The move is admitted only when
+    # the new checkpoint's composition content hash is unchanged, so it can
+    # never launder a graph that actually moved.
+    "proposal.rebased",
 ]
 GuidedOperationKind = Literal[
     "guided_start",
@@ -678,13 +722,32 @@ class ProposalEventRecord:
 
 @dataclass(frozen=True, slots=True)
 class AuthoritativePipelineProposal:
-    """Verified pipeline authority reconstructed from one row + creation event."""
+    """Verified pipeline authority reconstructed from one row + its events.
+
+    Two different bases, and reading the wrong one is a defect:
+
+    ``proposal.base`` is the IMMUTABLE reviewed identity. It is hashed into
+    ``draft_hash`` (``pipeline_draft_hash``), so it cannot move without
+    changing which plan this is. Use it for "the checkpoint this proposal
+    was created against".
+
+    ``current_base`` is the LIFECYCLE-MANAGED anchor: the creation base
+    moved forward by every appended ``proposal.rebased`` event, and the
+    value ``composition_proposals.base_state_id`` is kept equal to. Use it
+    for "is this proposal still anchored to the current head" — the
+    currency question the guided read and the wire-review back-edit ask.
+
+    Before rebases existed (elspeth-ed67eb9d0d) the two always coincided,
+    which is why the currency question used to be answerable from
+    ``proposal.base``. A rebase is exactly what separates them.
+    """
 
     row: CompositionProposalRecord
     proposal: PipelineProposal
     creation_event_id: UUID
     custody_result: Literal["not_required", "ready"]
     supersedes_proposal_id: UUID | None
+    current_base: ProposalBase
 
 
 @dataclass(frozen=True, slots=True)
@@ -1600,6 +1663,59 @@ class GuidedPendingProposalInvalidation:
 
 @final
 @dataclass(frozen=True, slots=True)
+class GuidedPendingProposalRebase:
+    """Exact pending proposal anchor move carried by a guided settlement.
+
+    A guided settlement always mints a fresh ``composition_states`` row —
+    ``GuidedSession``, ``chat_history`` included, is persisted inside
+    ``composer_meta``, so an advisory chat or a declined revision is
+    structurally a new version even when the graph is untouched. A pending
+    proposal carried across such a settlement must move its anchor onto the
+    checkpoint being written, or every later currency check names a
+    checkpoint that is no longer current (elspeth-ed67eb9d0d).
+
+    The anchor is ``AuthoritativePipelineProposal.current_base`` and the
+    ``composition_proposals.base_state_id`` column, never
+    ``PipelineProposal.base`` — that one is hashed into ``draft_hash`` and
+    is the reviewed artifact's identity.
+
+    This sideband is the caller's assertion of one such move; the settlement
+    re-derives every field from the live tree before it writes.
+    ``from_state_id`` is the anchor the proposal held before this
+    settlement, and ``composition_content_hash`` is the anchor content hash
+    that must be UNCHANGED across the move — the load-bearing admission
+    that keeps a rebase from laundering a graph that actually changed.
+
+    ``reason`` names the gesture that moved the anchor. It has no default:
+    the persisted ``proposal.rebased`` event is otherwise identical across
+    every carrying settlement modulo ids, and the proposal's own trail could
+    then not say which gesture moved it — the same completeness the sibling
+    ``proposal.rejected`` payload's ``reason_code`` exists to provide.
+    """
+
+    proposal_id: UUID
+    draft_hash: str
+    reviewed_facts: Mapping[str, Any]
+    from_state_id: UUID
+    composition_content_hash: str
+    reason: GuidedProposalRebaseReason
+
+    def __post_init__(self) -> None:
+        if type(self.proposal_id) is not UUID:
+            raise AuditIntegrityError("Guided pending proposal rebase id must be a UUID")
+        _require_guided_sha256(self.draft_hash, "Guided pending proposal rebase draft_hash")
+        if type(self.reviewed_facts) not in {dict, MappingProxyType}:
+            raise AuditIntegrityError("Guided pending proposal rebase reviewed_facts must be a mapping")
+        if type(self.from_state_id) is not UUID:
+            raise AuditIntegrityError("Guided pending proposal rebase from_state_id must be a UUID")
+        _require_guided_sha256(self.composition_content_hash, "Guided pending proposal rebase composition_content_hash")
+        if self.reason not in GUIDED_PROPOSAL_REBASE_REASONS:
+            raise AuditIntegrityError("Guided pending proposal rebase reason is outside the closed vocabulary")
+        freeze_fields(self, "reviewed_facts")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedStateOperationCommand:
     """Complete immutable input for one fenced guided state settlement."""
 
@@ -1620,6 +1736,7 @@ class GuidedStateOperationCommand:
     retained_deferred_intent_ids: tuple[UUID, ...] = ()
     deferred_intent_action: DeferredIntentManagementAction | None = None
     invalidated_pending_proposal: GuidedPendingProposalInvalidation | None = None
+    rebased_pending_proposal: GuidedPendingProposalRebase | None = None
     interpretations: tuple[PreparedGuidedInterpretationDraft, ...] = ()
 
     def _validate_deferred_intent_sidebands(self) -> None:
@@ -1659,6 +1776,15 @@ class GuidedStateOperationCommand:
             terminal = guided_meta["terminal"] if guided_meta is not None and "terminal" in guided_meta else None
             if terminal is None:
                 raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
+        if self.rebased_pending_proposal is not None and type(self.rebased_pending_proposal) is not GuidedPendingProposalRebase:
+            raise AuditIntegrityError("GuidedStateOperationCommand.rebased_pending_proposal must be exact or None")
+        if self.rebased_pending_proposal is not None and self.invalidated_pending_proposal is not None:
+            # A settlement either carries a pending proposal forward onto its
+            # new checkpoint or clears it. Doing both would rebind custody
+            # that the same transaction terminalizes.
+            raise AuditIntegrityError("A guided settlement cannot rebase and invalidate the same pending proposal")
+        if self.rebased_pending_proposal is not None and self.rebased_pending_proposal.from_state_id == self.state_id:
+            raise AuditIntegrityError("Guided pending proposal rebase must move the anchor off its previous checkpoint")
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -1960,6 +2086,12 @@ class GuidedFullPipelineDeclineCommand:
     guided-full planner outcome: no pipeline/proposal fields, because a
     decline creates no proposal — only a checkpoint and the advisor's own
     words as an ordinary assistant chat message.
+
+    It still writes a checkpoint over the observed head, ``composer_meta``
+    carried forward verbatim, so a guided walk holding a pending proposal
+    carries that proposal across this settlement exactly as a guided
+    RESPOND or CHAT settlement does — and must move its anchor the same way
+    (elspeth-ed67eb9d0d). ``rebased_pending_proposal`` is that assertion.
     """
 
     fence: GuidedOperationFence
@@ -1972,6 +2104,7 @@ class GuidedFullPipelineDeclineCommand:
     actor: str
     originating_message: GuidedOriginatingUserMessageDraft
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+    rebased_pending_proposal: GuidedPendingProposalRebase | None = None
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -2000,6 +2133,10 @@ class GuidedFullPipelineDeclineCommand:
             raise AuditIntegrityError("guided-full decline originating message must be exact")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided-full decline audit evidence must be exact")
+        if self.rebased_pending_proposal is not None and type(self.rebased_pending_proposal) is not GuidedPendingProposalRebase:
+            raise AuditIntegrityError("guided-full decline rebased_pending_proposal must be exact or None")
+        if self.rebased_pending_proposal is not None and self.rebased_pending_proposal.from_state_id == self.checkpoint_state_id:
+            raise AuditIntegrityError("guided-full decline rebase must move the anchor off its previous checkpoint")
 
 
 @final

@@ -94,11 +94,14 @@ def test_review_wiring_changes_only_checkpoint_and_keeps_proposal_pending(
         if str(proposal.id) == proposal_turn["payload"]["proposal_id"]
     )
     assert proposal.status == "pending"
+    # elspeth-ed67eb9d0d: "changes only checkpoint" now includes moving the
+    # pending proposal's anchor onto that checkpoint, recorded as one
+    # non-terminal ``proposal.rebased`` event. The row stays pending.
     assert [
         event.event_type
         for event in asyncio.run(service.list_proposal_events(UUID(session_id)))
         if str(event.proposal_id) == proposal_turn["payload"]["proposal_id"]
-    ] == ["proposal.created"]
+    ] == ["proposal.created", "proposal.rebased"]
 
 
 def test_confirm_wiring_is_the_only_commit_and_consumption_point(
@@ -136,7 +139,8 @@ def test_confirm_wiring_is_the_only_commit_and_consumption_point(
         event.event_type
         for event in asyncio.run(service.list_proposal_events(UUID(session_id)))
         if str(event.proposal_id) == proposal_turn["payload"]["proposal_id"]
-    ] == ["proposal.created", "proposal.accepted"]
+        # ``proposal.rebased`` between them is the wire-review anchor move.
+    ] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
     assert _get_guided(composer_test_client, session_id)["terminal"]["kind"] == "completed"
 
 
@@ -323,6 +327,9 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     events = asyncio.run(service.list_proposal_events(UUID(session_id)))
     assert [event.event_type for event in events if str(event.proposal_id) == original["proposal_id"]] == [
         "proposal.created",
+        # The wire-review advance moved this proposal's anchor before the
+        # correction superseded it (elspeth-ed67eb9d0d).
+        "proposal.rebased",
         "proposal.rejected",
     ]
     rejected = next(
@@ -491,6 +498,7 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     proposal_events = asyncio.run(service.list_proposal_events(UUID(session_id)))
     assert [event.event_type for event in proposal_events if str(event.proposal_id) == wire_turn["payload"]["proposal_id"]] == [
         "proposal.created",
+        "proposal.rebased",
         "proposal.accepted",
     ]
     with engine.connect() as connection:
@@ -656,19 +664,20 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     if winner == "revert":
         assert set(proposals) == {proposal["proposal_id"]}
         assert proposals[proposal["proposal_id"]].status == "rejected"
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.rejected"]
         assert all(message.content != correction_feedback for message in messages)
         assert dispatches == []
     elif wire_action == "confirm":
         assert set(proposals) == {proposal["proposal_id"]}
         assert proposals[proposal["proposal_id"]].status == "committed"
-        assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
+        assert [event.event_type for event in events] == ["proposal.created", "proposal.rebased", "proposal.accepted"]
         assert len(dispatches) == 1
     else:
         assert len(proposals) == 2
         assert proposals[proposal["proposal_id"]].status == "rejected"
         assert [event.event_type for event in events if str(event.proposal_id) == proposal["proposal_id"]] == [
             "proposal.created",
+            "proposal.rebased",
             "proposal.rejected",
         ]
         successor = next(item for proposal_id, item in proposals.items() if proposal_id != proposal["proposal_id"])

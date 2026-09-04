@@ -210,11 +210,11 @@ def test_current_session_schema_epoch_is_49() -> None:
     bumping; do not replace this with a derived check unless it stays a
     forced second touch.
     """
-    # 49: composition_rejection_events table added — durable session-side
-    # record of composer mutation-tool rejections, the unredacted reason the
-    # planner saw (elspeth-3e28029d2f; operator ruling 2026-09-02: session
-    # data, not Landscape data).
-    assert SESSION_SCHEMA_EPOCH == 49
+    # 50: ck_proposal_events_type widened with proposal.rebased — a guided
+    # settlement that carries a pending proposal across the checkpoint it
+    # writes re-pins the proposal's forward-declared base and records the
+    # rebinding as an appended immutable lifecycle event (elspeth-ed67eb9d0d).
+    assert SESSION_SCHEMA_EPOCH == 50
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
