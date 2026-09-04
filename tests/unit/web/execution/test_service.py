@@ -42,6 +42,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
@@ -68,6 +69,7 @@ from elspeth.web.blobs.protocol import (
     BlobServiceProtocol,
     BlobStateError,
 )
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.execution.errors import (
@@ -111,7 +113,12 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
-from tests.helpers.session_fences import make_blob_read_context
+from tests.helpers.session_fences import (
+    RecordingSessionOperationAuthority,
+    adopt_execute_lease,
+    close_adopted_lease,
+    make_blob_read_context,
+)
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -780,11 +787,89 @@ def isolate_raw_sink_effect_eligibility_gate(request: pytest.FixtureRequest) -> 
 
 
 @pytest.fixture
+def real_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    """A test-owned loop for the service's ``_call_async`` bridge and the worker lease."""
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        loop.close()
+
+
+_worker_lease: SessionOperationLease | None = None
+
+
+def _execute_lease() -> SessionOperationLease:
+    """The live EXECUTE lease a direct call to a lease-fenced internal passes.
+
+    ``_run_pipeline``, ``_finalize_output_blobs``, ``_on_pipeline_done`` and
+    ``_broadcast_progress_event`` take the exact ``SessionOperationLease`` the
+    worker was handed at submission and reprove it through
+    ``guard_external_effect`` before every external effect. Tests that drive
+    them from the test thread pass this one; it is a real lifecycle lease
+    adopted onto ``real_loop`` over a recording authority, so the guards run.
+    """
+    if _worker_lease is None:
+        raise RuntimeError("live EXECUTE lease fixture is not active")
+    return _worker_lease
+
+
+@pytest.fixture(autouse=True)
+def _live_execute_lease(real_loop: asyncio.AbstractEventLoop) -> Iterator[None]:
+    """Adopt one real EXECUTE lease onto ``real_loop`` for the test's duration.
+
+    Closed at teardown on the same loop unless the code under test already
+    closed it (``_on_pipeline_done`` does, when the service's loop is real).
+    """
+    global _worker_lease
+    lease = adopt_execute_lease(real_loop, uuid4())
+    _worker_lease = lease
+    try:
+        yield
+    finally:
+        _worker_lease = None
+        if not lease.closed:
+            close_adopted_lease(real_loop, lease)
+
+
+async def _execute(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    authority: RecordingSessionOperationAuthority | None = None,
+    **kwargs: Any,
+) -> UUID:
+    """Call ``execute()`` the way the route does: under a fresh EXECUTE lease for ``session_id``.
+
+    ``execute`` requires an exact ``SessionOperationLease`` carrying EXECUTE
+    authority for this session (service.py, the head of ``execute``). Mirrors
+    ``routes.py``'s transfer contract: on success the lease belongs to the
+    worker, which closes it after terminal cleanup via ``_on_pipeline_done``;
+    when ``execute`` fails before transfer the caller closes it. Pass
+    ``authority`` to recover the exact context the lease carries
+    (``authority.calls[0]`` is ``("acquire", context)``).
+    """
+    lease = await SessionOperationLease.acquire(
+        authority if authority is not None else RecordingSessionOperationAuthority(),
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id="execution-service-test",
+        lease_seconds=30,
+    )
+    try:
+        return await service.execute(session_id, session_operation_lease=lease, **kwargs)
+    except BaseException:
+        await lease.close()
+        raise
+
+
+@pytest.fixture
 def service(
     mock_loop: MagicMock,
     broadcaster: ProgressBroadcaster,
     mock_settings: MagicMock,
     mock_session_service: MagicMock,
+    real_loop: asyncio.AbstractEventLoop,
 ) -> Iterator[ExecutionServiceImpl]:
     # AC #17: All Run CRUD goes through SessionService — no direct DB access.
     yaml_generator = _YamlGeneratorStub()
@@ -799,13 +884,13 @@ def service(
     # Patch _call_async for tests that call _run_pipeline directly (sync).
     # The real _call_async uses asyncio.run_coroutine_threadsafe which needs
     # a running event loop. In unit tests, we bridge by running the coroutine
-    # synchronously via asyncio.get_event_loop().run_until_complete().
+    # synchronously on the test-owned ``real_loop`` (the loop the worker
+    # lease from ``_execute_lease()`` is adopted onto).
     # TestB8AsyncBridging tests _call_async itself with its own mocking.
-    _real_loop = asyncio.new_event_loop()
 
     def _mock_call_async(coro: Coroutine[Any, Any, Any]) -> Any:
         try:
-            return _real_loop.run_until_complete(coro)
+            return real_loop.run_until_complete(coro)
         except RuntimeError:
             # If no event loop is available, just close the coroutine
             coro.close()
@@ -831,7 +916,6 @@ def service(
     )
     with patch("elspeth.web.execution.validation.validate_pipeline", return_value=_gate_valid):
         yield svc
-    _real_loop.close()
 
 
 # ── Basic Lifecycle ────────────────────────────────────────────────────
@@ -868,7 +952,7 @@ class TestExecutionFlow:
     async def test_execute_returns_run_id_immediately(self, service: ExecutionServiceImpl) -> None:
         """execute() returns a UUID without blocking on pipeline completion."""
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -877,7 +961,7 @@ class TestExecutionFlow:
         cast(_YamlGeneratorStub, service._yaml_generator).result = object()
 
         with pytest.raises(TypeError, match="must return str"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_execute_creates_run_via_session_service(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
@@ -885,8 +969,11 @@ class TestExecutionFlow:
         with R6 expanded params (session_id, state_id, pipeline_yaml)."""
         session_id = uuid4()
         state_record = mock_session_service.get_current_state.return_value
+        authority = RecordingSessionOperationAuthority()
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id, authority=authority)
+        acquired = [context for name, context in authority.calls if name == "acquire"]
+        assert len(acquired) == 1
         mock_session_service.create_run.assert_awaited_once()
         create_call = mock_session_service.create_run.await_args
         assert create_call.args == ()
@@ -894,6 +981,8 @@ class TestExecutionFlow:
             "session_id": session_id,
             "state_id": state_record.id,
             "pipeline_yaml": _RESOLVED_TEST_PIPELINE_YAML,
+            # The exact context of the EXECUTE lease execute() was handed.
+            "session_operation_context": acquired[0],
         }
 
     @pytest.mark.asyncio
@@ -924,7 +1013,7 @@ class TestExecutionFlow:
         completed.set_result(None)
 
         with patch.object(service._executor, "submit", return_value=completed) as submit:
-            await service.execute(session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice")
 
         submitted_args = submit.call_args.args
         assert submitted_args[4].plugin_snapshot is snapshot
@@ -1033,7 +1122,7 @@ class TestExecutionFlow:
 
         with patch.object(service._executor, "submit", return_value=completed) as submit:
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
-                await service.execute(session_id=session_id, user_id="alice")
+                await _execute(service, session_id=session_id, user_id="alice")
 
             risk = raised.value.guard.risks[0]
             assert risk.provider == "bedrock"
@@ -1054,7 +1143,8 @@ class TestExecutionFlow:
             assert private_region in json.dumps(executable_state.to_dict(), default=dict)
             assert private_region not in json.dumps(raised.value.guard.to_dict())
 
-            await service.execute(
+            await _execute(
+                service,
                 session_id=session_id,
                 user_id="alice",
                 fanout_ack_token=raised.value.guard.ack_token,
@@ -1109,7 +1199,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=invalid),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # No opaque failed-run: the gate refuses BEFORE create_run.
         assert mock_session_service.create_run.await_count == 0
@@ -1146,7 +1236,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
             pytest.raises(ExecutionReadinessError) as exc_info,
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         assert exc_info.value.blockers == (blocker,)
         mock_session_service.create_run.assert_not_awaited()
@@ -1173,7 +1263,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
             pytest.raises(ExecutionReadinessError) as exc_info,
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         assert exc_info.value.blockers == ()
         mock_session_service.create_run.assert_not_awaited()
@@ -1218,7 +1308,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as submit,
             pytest.raises(PipelineValidationError),
         ):
-            await service.execute(session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice")
 
         mock_session_service.create_run.assert_not_awaited()
         instantiate.assert_not_called()
@@ -1269,7 +1359,7 @@ class TestExecutionFlow:
             patch.object(service._executor, "submit") as mock_submit,
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await service.execute(session_id=state_record.session_id)
+            await _execute(service, session_id=state_record.session_id)
 
         assert mock_session_service.create_run.await_count == 0
         mock_load.assert_not_called()
@@ -1299,7 +1389,7 @@ class TestExecutionFlow:
             patch("elspeth.web.execution.validation.validate_pipeline", return_value=valid),
             patch.object(service, "_run_pipeline"),
         ):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
         mock_session_service.create_run.assert_called_once()
 
@@ -1366,7 +1456,7 @@ class TestExecutionFlow:
             ) as merge,
             patch.object(service, "_run_pipeline"),
         ):
-            run_id = await service.execute(session_id=session_id, state_id=selected_record.id)
+            run_id = await _execute(service, session_id=session_id, state_id=selected_record.id)
 
         assert isinstance(run_id, UUID)
         merge.assert_called_once()
@@ -1397,7 +1487,7 @@ class TestExecutionFlow:
         }
 
         with pytest.raises(CompletionGateIntegrityError) as exc_info:
-            await service.execute(session_id=selected_record.session_id)
+            await _execute(service, session_id=selected_record.session_id)
 
         assert private_persisted_detail not in str(exc_info.value)
         assert private_persisted_detail not in repr(exc_info.value)
@@ -1445,13 +1535,15 @@ class TestExecutionFlow:
         validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
         service.validate_state = validate_state  # type: ignore[method-assign]
 
-        result = await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
+        context = make_blob_read_context(session_id)
+        result = await service.validate(session_id, session_operation_context=context, user_id="alice")
 
         assert result is expected
         validate_state.assert_awaited_once()
         delegated_state = validate_state.await_args.args[0]
         assert delegated_state.version == mock_session_service.get_current_state.return_value.version
         assert validate_state.await_args.kwargs == {
+            "session_operation_context": context,
             "user_id": "alice",
             "session_id": session_id,
             "completion_gates": None,
@@ -2170,7 +2262,7 @@ class TestAuthoritativeProofDiagnostics:
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
-            await service.execute(session_id=session_id, user_id="alice")
+            await _execute(service, session_id=session_id, user_id="alice")
 
         assert exc_info.value.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
         assert snapshot_calls == 1
@@ -2829,9 +2921,10 @@ class TestExecutionFanoutGuard:
             # first (elspeth-f3c1aafd25); acknowledge it to reach the fanout
             # guard under test.
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await service.execute(session_id=session_id)
+                await _execute(service, session_id=session_id)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
-                await service.execute(
+                await _execute(
+                    service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
                 )
@@ -2901,9 +2994,10 @@ class TestExecutionFanoutGuard:
         ):
             # Secret approval (elspeth-f3c1aafd25) gates first, then fanout.
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await service.execute(session_id=session_id)
+                await _execute(service, session_id=session_id)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
-                await service.execute(
+                await _execute(
+                    service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
                 )
@@ -2915,7 +3009,8 @@ class TestExecutionFanoutGuard:
         # contract gate, so keep that sibling gate stubbed on the accepted
         # retry just as it is on the initial guard-producing call above.
         with patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())):
-            await service.execute(
+            await _execute(
+                service,
                 session_id=session_id,
                 fanout_ack_token=raised.value.guard.ack_token,
                 secret_ack_token=secret_raised.value.guard.ack_token,
@@ -2977,8 +3072,9 @@ class TestExecutionFanoutGuard:
             # The wired secret still requires its own out-of-band approval
             # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await service.execute(session_id=session_id)
-            run_id = await service.execute(
+                await _execute(service, session_id=session_id)
+            run_id = await _execute(
+                service,
                 session_id=session_id,
                 secret_ack_token=secret_raised.value.guard.ack_token,
             )
@@ -3051,9 +3147,10 @@ class TestExecutionFanoutGuard:
         ):
             # Acknowledge the wired-secret approval first (elspeth-f3c1aafd25).
             with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await service.execute(session_id=session_id)
+                await _execute(service, session_id=session_id)
             with pytest.raises(ExecutionFanoutGuardRequired) as raised:
-                await service.execute(
+                await _execute(
+                    service,
                     session_id=session_id,
                     secret_ack_token=secret_raised.value.guard.ack_token,
                 )
@@ -3427,7 +3524,7 @@ landscape:
             patch("elspeth.core.secrets.resolve_secret_refs") as resolve_secret_refs,
             pytest.raises(SinkEffectCapabilityError, match="export lane"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), user_id="alice")
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), user_id="alice", session_operation_lease=_execute_lease())
 
         assert purposes == [SinkEffectExecutionPurpose.FRESH, SinkEffectExecutionPurpose.AUDIT_EXPORT]
         secret_service.list_refs.assert_not_called()
@@ -3456,7 +3553,7 @@ sinks:
             patch("elspeth.web.execution.service.FilesystemPayloadStore") as make_payload_store,
             pytest.raises(SinkEffectCapabilityError, match="effect protocol"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_session_service.update_run_status.assert_not_called()
         open_database.assert_not_called()
@@ -3508,6 +3605,7 @@ sinks:
             threading.Event(),
             user_id="alice",
             auth_provider_type="local",
+            session_operation_lease=_execute_lease(),
         )
 
         db = LandscapeDB.from_url(mock_settings.landscape_url, create_tables=False)
@@ -3609,7 +3707,7 @@ telemetry:
             patch("elspeth.telemetry.create_telemetry_manager", return_value=telemetry_manager),
             patch("elspeth.web.operator_telemetry.record_operator_pipeline_queue_drops") as record_queue_drops,
         ):
-            service._run_pipeline(run_id, pipeline_yaml, threading.Event())
+            service._run_pipeline(run_id, pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         telemetry_manager.close.assert_called_once_with()
         record_queue_drops.assert_called_once_with(1)
@@ -3774,7 +3872,7 @@ sinks:
         mode: observed
 """
 
-        service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+        service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         completed_calls = [
             call for call in mock_session_service.update_run_status.await_args_list if call.kwargs.get("status") == "completed"
@@ -3826,7 +3924,7 @@ class TestB2ShutdownEvent:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(str(run_id), "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # B2 invariant: shutdown_event was passed
         orch_run_call = mock_orch.run.call_args
@@ -3886,7 +3984,7 @@ class TestB2ShutdownEvent:
                 return_value=_run_accounting_for_status(RunStatus.COMPLETED),
             ),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         create_store.assert_called_once_with(export_settings)
         assert mock_orch.run.call_args.kwargs["audit_export_content_store"] is store
@@ -3932,7 +4030,7 @@ class TestB3Construction:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # B3: LandscapeDB opened through the deployment-gated factory.
         mock_open_landscape.assert_called_once_with(service._settings)
@@ -3975,7 +4073,7 @@ class TestB3Construction:
                 return_value=_run_accounting_for_status(RunStatus.COMPLETED),
             ),
         ):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_from_settings.assert_called_once_with(mock_load.return_value.rate_limit, state_dir=Path("/tmp/custom-web-state"))
 
@@ -4098,7 +4196,7 @@ sinks:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert order.index("link") < order.index("read")
         assert order.index("metadata") < order.index("record") < order.index("load")
@@ -4168,7 +4266,7 @@ sinks:
 """
 
         with pytest.raises(AuditIntegrityError, match="audit write refused"):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_load.assert_not_called()
         mock_orch_cls.assert_not_called()
@@ -4232,7 +4330,7 @@ sinks:
 """
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert exc_info.value.oversized == (("node:classify.options.system_prompt", 256 * 1024 + 1, 256 * 1024),)
         blob_service.read_blob_content.assert_not_awaited()
@@ -4312,7 +4410,7 @@ sinks:
 """
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         assert exc_info.value.oversized == (("(aggregate)", 5 * 220 * 1024, 1024 * 1024),)
         blob_service.read_blob_content.assert_not_awaited()
@@ -4384,7 +4482,7 @@ sinks:
 """
 
         with pytest.raises(BlobIntegrityError):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         hash_counter.add.assert_called_once_with(1)
         mock_load.assert_not_called()
@@ -4483,7 +4581,7 @@ sinks:
 """
 
         with pytest.raises(BlobNotFoundError):
-            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(run_id), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         # No metadata of the cross-session blob is ever consumed: the run never
         # links or reads it, and never records an inline resolution.
@@ -4682,7 +4780,9 @@ class TestBlobRowsRuntimeAdmission:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), _blob_rows_pipeline_yaml(entries), threading.Event())
+            service._run_pipeline(
+                str(run_id), _blob_rows_pipeline_yaml(entries), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         # Both blobs linked as inputs, both staged, in authoring order.
         assert blob_service.link_blob_to_run.await_count == 2
@@ -4739,7 +4839,9 @@ class TestBlobRowsRuntimeAdmission:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(BlobNotFoundError):
-            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         blob_service.link_blob_to_run.assert_not_awaited()
         blob_service.read_blob_content.assert_not_awaited()
@@ -4791,7 +4893,9 @@ class TestBlobRowsRuntimeAdmission:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(expected_error, match=match):
-            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         blob_service.link_blob_to_run.assert_not_awaited()
         blob_service.read_blob_content.assert_not_awaited()
@@ -4823,7 +4927,9 @@ class TestBlobRowsRuntimeAdmission:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(BlobRowsSourceAdmissionError, match=r"blobs\[0\] failed validation"):
-            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         blob_service.get_blob.assert_not_awaited()
         blob_service.link_blob_to_run.assert_not_awaited()
@@ -4870,7 +4976,9 @@ class TestBlobRowsRuntimeAdmission:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(run_id), _blob_rows_pipeline_yaml([entry], singular=True), threading.Event())
+            service._run_pipeline(
+                str(run_id), _blob_rows_pipeline_yaml([entry], singular=True), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         blob_service.link_blob_to_run.assert_awaited_once_with(blob_id=blob_id, run_id=run_id, direction="input")
         mock_payload_cls.return_value.store.assert_called_once_with(content)
@@ -4914,7 +5022,9 @@ class TestBlobRowsRuntimeAdmission:
         mock_orch_cls.return_value = orchestrator
 
         with pytest.raises(BlobIntegrityError):
-            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+            service._run_pipeline(
+                str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event(), session_operation_lease=_execute_lease()
+            )
 
         orchestrator.run.assert_not_called()
 
@@ -4962,7 +5072,7 @@ sinks:
             patch("elspeth.web.execution.service.validate_sink_effect_eligibility_from_raw_config"),
             pytest.raises(ValueError, match="template_file"),
         ):
-            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event())
+            service._run_pipeline(str(uuid4()), pipeline_yaml, threading.Event(), session_operation_lease=_execute_lease())
 
         mock_runtime_graph.assert_not_called()
 
@@ -4994,7 +5104,7 @@ class TestB7ExceptionHandling:
         mock_landscape.side_effect = KeyboardInterrupt("ctrl-c")
 
         with _admitted_runtime_setup(), pytest.raises(KeyboardInterrupt):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # R6: The 'running' update went through, but the 'failed' update was skipped
         calls = mock_session_service.update_run_status.call_args_list
@@ -5014,7 +5124,7 @@ class TestB7ExceptionHandling:
         mock_landscape.side_effect = SystemExit(1)
 
         with _admitted_runtime_setup(), pytest.raises(SystemExit):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # R6: The 'running' update went through, but the 'failed' update was skipped
         calls = mock_session_service.update_run_status.call_args_list
@@ -5033,7 +5143,7 @@ class TestB7ExceptionHandling:
         with _admitted_runtime_setup(), patch("elspeth.web.execution.service.open_landscape_db") as mock_db:
             mock_db.side_effect = RuntimeError("boom")
             with pytest.raises(RuntimeError):
-                service._run_pipeline(run_id, _TEST_PIPELINE_YAML, event)
+                service._run_pipeline(run_id, _TEST_PIPELINE_YAML, event, session_operation_lease=_execute_lease())
 
         # finally must have removed the event
         assert run_id not in service._shutdown_events
@@ -5047,7 +5157,7 @@ class TestB7ExceptionHandling:
         future.set_exception(RuntimeError("unhandled"))
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
             mock_slog.error.assert_called_once()
             call_kwargs = mock_slog.error.call_args
             assert call_kwargs[0][0] == "pipeline_done_callback_exception"
@@ -5078,7 +5188,7 @@ class TestB7ExceptionHandling:
             future.set_exception(outer)
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
             call_kwargs = mock_slog.error.call_args[1]
             assert call_kwargs["exc_type"] == "RuntimeError"
             assert call_kwargs["exc_class_chain"] == ["RuntimeError", "ValueError"]
@@ -5094,7 +5204,7 @@ class TestB7ExceptionHandling:
         future.set_result(None)
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
-            service._on_pipeline_done(future)
+            service._on_pipeline_done(future, session_operation_lease=_execute_lease())
             mock_slog.error.assert_not_called()
 
     @patch("elspeth.web.execution.service.open_landscape_db")
@@ -5131,7 +5241,7 @@ class TestB7ExceptionHandling:
             patch("elspeth.web.execution.service.slog") as mock_slog,
             pytest.raises(PydanticValidationError),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv\n", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv\n", threading.Event(), session_operation_lease=_execute_lease())
 
         schema_calls = [call for call in mock_slog.error.call_args_list if call.args[0] == "run_schema_contract_violation"]
         assert len(schema_calls) == 1
@@ -5382,7 +5492,7 @@ class TestOperatorFailureDiagnostic:
 
         run_id = run_id or str(uuid4())
         with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(type(exc)):
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         failed_status_calls = [
             call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == "failed"
@@ -5742,7 +5852,7 @@ class TestOperatorFailureDiagnostic:
 
         run_id = str(uuid4())
         with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(ValueError, match="boom"):
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # Audit primacy holds: no failed status update, no failed SSE event.
         statuses = [call.kwargs.get("status") for call in mock_session_service.update_run_status.call_args_list]
@@ -5781,7 +5891,7 @@ class TestOperatorFailureDiagnostic:
             patch("elspeth.web.execution.service.slog") as mock_slog,
             pytest.raises(KeyboardInterrupt),
         ):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         assert [call for call in mock_slog.error.call_args_list if call.args and call.args[0] == "run_pipeline_failed"] == []
 
@@ -5951,7 +6061,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # The test sets shutdown_event BEFORE _run_pipeline, so the early
         # shutdown check (line 534) fires — no orchestrator runs, no row counts.
@@ -6011,7 +6121,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         status_calls = mock_session_service.update_run_status.call_args_list
         # Second call is the GSE handler (first is running transition)
@@ -6079,7 +6189,7 @@ class TestCancelMechanism:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED_WITH_FAILURES),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+            service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # Must be "completed", NOT "cancelled"
         status_calls = mock_session_service.update_run_status.call_args_list
@@ -6108,7 +6218,7 @@ class TestCancelMechanism:
 
         # Should NOT raise — graceful exit
         with _admitted_runtime_setup():
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # No Orchestrator or LandscapeDB instantiated (early return)
         mock_landscape.assert_not_called()
@@ -6133,7 +6243,7 @@ class TestCancelMechanism:
         shutdown_event = threading.Event()
         shutdown_event.set()
 
-        service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event)
+        service._run_pipeline(run_id, "source:\n  plugin: csv", shutdown_event, session_operation_lease=_execute_lease())
 
         # No LandscapeDB or PayloadStore constructed (skipped setup)
         mock_landscape.assert_not_called()
@@ -6161,7 +6271,7 @@ class TestCancelMechanism:
         mock_session_service.get_run.return_value = _run_record_stub(status="completed")
 
         with _admitted_runtime_setup(), pytest.raises(ValueError, match="completed"):
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
     @patch("elspeth.web.execution.service.open_landscape_db")
     @patch("elspeth.web.execution.service.FilesystemPayloadStore")
@@ -6210,7 +6320,7 @@ class TestCancelMechanism:
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
         with _admitted_runtime_setup(), pytest.raises(ValueError, match="sentinel-existing-id") as exc_info:
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # Discriminator #1: the propagating exception is bare ValueError, not the
         # narrow subclass — proves the catch did not match.
@@ -6261,7 +6371,7 @@ class TestCancelMechanism:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_shutdown_event_cleaned_up_on_blob_linkage_failure(
@@ -6298,7 +6408,7 @@ class TestCancelMechanism:
         }
 
         with pytest.raises(RuntimeError, match="blob storage unavailable"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert str(run_id) not in service._shutdown_events
 
@@ -6350,7 +6460,7 @@ class TestP2aCleanupCatchNarrowing:
             patch("elspeth.web.execution.service.slog") as mock_slog,
             pytest.raises(RuntimeError, match="pool shutdown"),
         ):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         # slog.error was called for the cleanup failure.
         slog_calls = [c for c in mock_slog.error.call_args_list if c[0] and c[0][0] == "run_cleanup_status_update_failed"]
@@ -6397,7 +6507,7 @@ class TestP2aCleanupCatchNarrowing:
         # We accept either RuntimeError here — the key invariant is that
         # a RuntimeError propagates rather than being swallowed.
         with pytest.raises(RuntimeError):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
 
 # ── Completion-Path Guard ─────────────────────────────────────────────
@@ -6459,7 +6569,7 @@ class TestCompletionPathExternalCancellation:
         mock_session_service.get_run.return_value = _run_record_stub(status="cancelled")
 
         # Should NOT raise — graceful exit
-        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # The "failed" path should NOT have been entered: check that
         # update_run_status was called exactly twice (running + completed),
@@ -6523,7 +6633,7 @@ class TestCompletionPathExternalCancellation:
 
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
-        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+        service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         event_types = [call[1].event_type for call in broadcast_calls]
         terminal_types = [et for et in event_types if et in ("completed", "failed", "cancelled")]
@@ -6586,7 +6696,7 @@ class TestCompletionPathExternalCancellation:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         assert blob_calls == [False]
         assert blob_state["status"] == "error"
@@ -6633,7 +6743,7 @@ class TestCompletionPathExternalCancellation:
         mock_session_service.get_run.return_value = _run_record_stub(status="completed")
 
         with pytest.raises(ValueError, match="completed"):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
     @patch("elspeth.web.execution.service.Orchestrator")
     @patch("elspeth.web.execution.preflight.ExecutionGraph")
@@ -6709,7 +6819,7 @@ class TestCompletionPathExternalCancellation:
         service._broadcaster.broadcast = spy_broadcast  # type: ignore[assignment]
 
         with pytest.raises(ValueError, match="sentinel-existing-id") as exc_info:
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Discriminator #1: bare ValueError, not the narrow subclass.
         assert not isinstance(exc_info.value, IllegalRunTransitionError)
@@ -6852,7 +6962,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Exactly two status updates: "running" (line 650) and the terminal
         # "completed" (line 857).  No third "failed" call.
@@ -6944,7 +7054,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         statuses = [c.kwargs.get("status") for c in mock_session_service.update_run_status.call_args_list]
         assert statuses == ["running", "completed_with_failures"], f"Expected [running, completed_with_failures], got {statuses}"
@@ -7016,7 +7126,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # The probe failure must surface as a structured log so it's observable.
         probe_failed_logs = [c for c in mock_slog.error.call_args_list if c.args and c.args[0] == "post_exception_run_state_probe_failed"]
@@ -7134,7 +7244,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(RuntimeError, match="simulated SSE crash"),
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Audit-primacy completion: branch 3 must NOT have broadcast a
         # ``failed`` SSE event (the audit row is in a real terminal status
@@ -7224,7 +7334,7 @@ class TestPostCompletionExceptionRecovery:
             ),
             pytest.raises(ValueError, match="Run not found") as exc_info,
         ):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         # Exception chain pins the original cause — the probe ValueError
         # is raised while handling the RuntimeError, so __context__ MUST
@@ -7287,7 +7397,7 @@ class TestPostCompletionExceptionRecovery:
 
         run_id = str(uuid4())
         with patch("elspeth.web.execution.service.slog") as mock_slog, pytest.raises(RuntimeError, match="orchestrator blew up"):
-            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(run_id, "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         statuses = [c.kwargs.get("status") for c in mock_session_service.update_run_status.call_args_list]
         assert statuses == ["running", "failed"], f"Non-terminal path must still record failure; got {statuses}"
@@ -7385,7 +7495,7 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # The critical invariant: create_run() was never called,
         # so no stale pending run exists.
@@ -7424,7 +7534,7 @@ class TestBlobRefPreValidation:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         blob_service.link_blob_to_run.assert_called_once_with(
             blob_id=UUID(blob_ref),
@@ -7463,7 +7573,7 @@ class TestBlobRefPreValidation:
         cast(Any, service)._blob_service = blob_service
 
         with pytest.raises(MalformedBlobRefError, match=r"sources\.refunds\.blob_ref"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         mock_session_service.create_run.assert_not_called()
         blob_service.get_blob.assert_not_called()
@@ -7509,7 +7619,7 @@ class TestBlobRefPreValidation:
         }
 
         with patch.object(service, "_run_pipeline"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         linked_blob_ids = [call.kwargs["blob_id"] for call in blob_service.link_blob_to_run.await_args_list]
         assert linked_blob_ids == [UUID(orders_blob), UUID(refunds_blob)]
@@ -7570,7 +7680,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(BlobNotFoundError):
-            await service.execute(session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id)
 
         # Critical: create_run was never called (rejected before run creation)
         mock_session_service.create_run.assert_not_called()
@@ -7617,7 +7727,7 @@ class TestBlobOwnership:
         }
 
         with pytest.raises(BlobNotFoundError):
-            await service.execute(session_id=executing_session_id)
+            await _execute(service, session_id=executing_session_id)
 
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -7652,7 +7762,7 @@ class TestBlobOwnership:
         }
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
 
@@ -7724,7 +7834,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path == diverging_path
         assert exc_info.value.canonical_path == canonical_path
@@ -7776,7 +7886,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path is None
         assert exc_info.value.canonical_path == canonical_path
@@ -7815,7 +7925,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.stored_path == diverging_path
         assert exc_info.value.canonical_path == canonical_path
@@ -7864,7 +7974,7 @@ class TestBlobSourcePathReadGuard:
         }
 
         with pytest.raises(BlobSourcePathMismatchError) as exc_info:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         assert exc_info.value.blob_id == refunds_blob
         assert exc_info.value.stored_path == refunds_diverging_path
@@ -7888,7 +7998,7 @@ class TestOneActiveRun:
         mock_session_service.get_active_run.return_value = _run_record_stub(status="running")
 
         with pytest.raises(RunAlreadyActiveError):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_execute_after_completed_run_succeeds(
@@ -7899,7 +8009,7 @@ class TestOneActiveRun:
         """After a run completes, a new one can start."""
         mock_session_service.get_active_run.return_value = None
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -7967,6 +8077,7 @@ class TestEventBusBridge:
                 rows_routed_failure=2,
                 elapsed_seconds=10.5,
             ),
+            session_operation_lease=_execute_lease(),
         )
 
         mock_session_service.append_run_event.assert_awaited_once()
@@ -7998,6 +8109,7 @@ class TestEventBusBridge:
                     rows_routed_failure=2,
                     elapsed_seconds=10.5,
                 ),
+                session_operation_lease=_execute_lease(),
             )
         finally:
             if not loop.is_closed():
@@ -8149,7 +8261,13 @@ class TestAsyncShutdown:
         def worker() -> None:
             shutdown_event.wait()
             try:
-                svc._call_async(mock_session_service.update_run_status(uuid4(), status="cancelled"))
+                svc._call_async(
+                    mock_session_service.update_run_status(
+                        uuid4(),
+                        status="cancelled",
+                        session_operation_context=_execute_lease().context,
+                    )
+                )
             except BaseException as exc:
                 worker_errors.append(type(exc).__name__)
             finally:
@@ -8196,7 +8314,7 @@ class TestRunningStatusFailure:
         cast(Any, service)._call_async = failing_call_async
 
         with _admitted_runtime_setup(), pytest.raises(ConnectionError):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         # The except block tried to set "failed" via the second _call_async call
         assert call_count >= 2
@@ -8384,7 +8502,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_sink_path_traversal_rejected(
@@ -8411,7 +8529,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_sink_path_under_outputs_accepted(
@@ -8437,7 +8555,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -8468,7 +8586,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_sink_path_in_other_session_outputs_rejected(
@@ -8500,7 +8618,7 @@ class TestSinkPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=executing_session)
+            await _execute(service, session_id=executing_session)
 
     @pytest.mark.asyncio
     async def test_sink_path_in_own_session_blobs_accepted(
@@ -8527,7 +8645,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=own_session)
+            run_id = await _execute(service, session_id=own_session)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -8553,7 +8671,7 @@ class TestSinkPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -8625,7 +8743,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_traversal_rejected(
@@ -8658,7 +8776,7 @@ class TestTransformProviderConfigPathRestriction:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed output directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_transform_persist_directory_under_outputs_accepted(
@@ -8690,7 +8808,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -8729,7 +8847,7 @@ class TestTransformProviderConfigPathRestriction:
             patch.object(service, "_run_pipeline") as run_pipeline,
             pytest.raises(PipelineValidationError, match="managed identity"),
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         run_pipeline.assert_not_called()
 
@@ -8778,7 +8896,7 @@ class TestTransformProviderConfigPathRestriction:
             patch.object(service, "_run_pipeline") as run_pipeline,
             pytest.raises(PipelineValidationError, match="sequential multi-query LLM"),
         ):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         run_pipeline.assert_not_called()
 
@@ -8825,7 +8943,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -8854,7 +8972,7 @@ class TestTransformProviderConfigPathRestriction:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
 
@@ -8964,7 +9082,7 @@ class TestExecuteSemanticContractViolation:
         # ``except ValueError`` paths still catch it. New callers should
         # catch the specific type and read .entries/.contracts.
         with pytest.raises(ValueError, match="line_explode"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         mock_session_service.create_run.assert_not_awaited()
 
@@ -8988,7 +9106,7 @@ class TestExecuteSemanticContractViolation:
         self._set_web_scrape_line_explode_state(mock_session_service, session_id=session_id)
 
         with pytest.raises(SemanticContractViolationError) as excinfo:
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
         exc = excinfo.value
         assert len(exc.entries) >= 1
@@ -9012,7 +9130,7 @@ class TestExecuteSemanticContractViolation:
         )
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
 
         assert isinstance(run_id, UUID)
 
@@ -9178,7 +9296,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         # The typed payload carries (node_id, term) — no prompt_template.
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
@@ -9204,7 +9322,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_structured_pending_interpretation_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         assert excinfo.value.placeholders == (("rate_node", "cool"),)
         mock_session_service.create_run.assert_not_awaited()
@@ -9326,7 +9444,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_drifted_invented_source_state(mock_session_service)
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         source_sites = [s for s in excinfo.value.sites if s.component_type == "source"]
         assert len(source_sites) == 1
@@ -9380,7 +9498,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         state.outputs = []
 
         with patch.object(service, "_run_pipeline"), pytest.raises(UnresolvedInterpretationPlaceholderError) as excinfo:
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         assert [(site.component_id, site.kind.value) for site in excinfo.value.sites] == [("source:orders", "invented_source")]
         mock_session_service.create_run.assert_not_awaited()
@@ -9405,7 +9523,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
         self._set_unresolved_placeholder_state(mock_session_service)
 
         with pytest.raises(UnresolvedInterpretationPlaceholderError):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
         counter = service._telemetry.interpretation_placeholder_unresolved_at_runtime_total
         # Test fixture uses fake counters — type-narrow to access ``calls``.
@@ -9524,7 +9642,7 @@ class TestExecuteUnresolvedInterpretationPlaceholderGate:
             patch.object(service, "_run_pipeline"),
             patch("elspeth.web.execution.service.evaluate_execution_fanout_guard", return_value=None),
         ):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
 
         assert isinstance(run_id, UUID)
         # Counter was NOT incremented.
@@ -9566,7 +9684,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=uuid4())
+            run_id = await _execute(service, session_id=uuid4())
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9591,7 +9709,7 @@ class TestRelativePathResolution:
         state.edges = None
 
         with patch.object(service, "_run_pipeline"):
-            run_id = await service.execute(session_id=session_id)
+            run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
 
     @pytest.mark.asyncio
@@ -9627,7 +9745,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match=r"Source 'refunds'.*resolves outside allowed directories"):
-            await service.execute(session_id=session_id)
+            await _execute(service, session_id=session_id)
 
     @pytest.mark.asyncio
     async def test_relative_traversal_still_blocked(
@@ -9652,7 +9770,7 @@ class TestRelativePathResolution:
         from elspeth.web.execution.errors import PathAllowlistViolationError
 
         with pytest.raises(PathAllowlistViolationError, match="resolves outside allowed directories"):
-            await service.execute(session_id=uuid4())
+            await _execute(service, session_id=uuid4())
 
 
 # ── Edge Compatibility in _run_pipeline ───────────────────────────────
@@ -9694,7 +9812,7 @@ class TestEdgeCompatibility:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(RunStatus.COMPLETED),
         ):
-            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event())
+            service._run_pipeline(str(uuid4()), "source:\n  plugin: csv", threading.Event(), session_operation_lease=_execute_lease())
 
         mock_graph.validate.assert_called_once()
         mock_graph.validate_edge_compatibility.assert_called_once()
@@ -9725,7 +9843,7 @@ class TestEdgeCompatibility:
         )
 
         with pytest.raises(GraphValidationError, match="Schema mismatch"):
-            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
 
 # ── Blob Finalization Catch Widening ──────────────────────────────────
@@ -9790,7 +9908,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobNotFoundError("missing-blob")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
-        svc._finalize_output_blobs(str(uuid4()), success=True)
+        svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_runtime_error_from_blob_lifecycle(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """RuntimeError is no longer suppressed — it's too broad and would
@@ -9801,7 +9919,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = RuntimeError("Cannot finalize — status is 'ready', expected 'pending'")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(RuntimeError, match="Cannot finalize"):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_suppresses_blob_quota_exceeded_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         from elspeth.web.blobs.protocol import BlobQuotaExceededError
@@ -9809,7 +9927,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service = _blob_service_stub()
         blob_service.finalize_run_output_blobs.side_effect = BlobQuotaExceededError("sess-1", current_bytes=100, limit_bytes=50)
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
-        svc._finalize_output_blobs(str(uuid4()), success=True)
+        svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_type_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """Programmer bugs (TypeError, AttributeError, etc.) must still crash."""
@@ -9817,7 +9935,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = TypeError("unexpected keyword argument")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(TypeError, match="unexpected keyword argument"):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
     def test_propagates_attribute_error(self, mock_settings: MagicMock, mock_session_service: MagicMock) -> None:
         """AttributeError is a programmer bug — must crash."""
@@ -9825,7 +9943,7 @@ class TestFinalizeOutputBlobsCatchWidening:
         blob_service.finalize_run_output_blobs.side_effect = AttributeError("'NoneType' object has no attribute 'id'")
         svc = self._make_service_with_blob(blob_service, mock_settings, mock_session_service)
         with pytest.raises(AttributeError):
-            svc._finalize_output_blobs(str(uuid4()), success=True)
+            svc._finalize_output_blobs(str(uuid4()), success=True, session_operation_lease=_execute_lease())
 
 
 # ── Terminal Ordering Invariant ───────────────────────────────────────
@@ -9904,7 +10022,7 @@ class TestTerminalOrderingInvariant:
             cast(Any, svc)._call_async = lambda coro: _real_loop.run_until_complete(coro)
 
             with contextlib.suppress(Exception):
-                svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+                svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
             terminals = _collect_terminal_types(mock_broadcaster)
             assert len(terminals) == 1, (
@@ -9970,7 +10088,7 @@ class TestTerminalOrderingInvariant:
         try:
             cast(Any, svc)._call_async = lambda coro: _real_loop.run_until_complete(coro)
 
-            svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event())
+            svc._run_pipeline(str(uuid4()), _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
             terminals = _collect_terminal_types(mock_broadcaster)
             assert len(terminals) == 1, (
@@ -10533,7 +10651,7 @@ class TestFailureSampleClientEgress:
             "elspeth.web.execution.service.load_run_accounting_from_db",
             return_value=_run_accounting_for_status(result.status),
         ):
-            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event())
+            service._run_pipeline(run_id, _TEST_PIPELINE_YAML, threading.Event(), session_operation_lease=_execute_lease())
 
         status_calls = [
             call for call in mock_session_service.update_run_status.call_args_list if call.kwargs.get("status") == session_status
