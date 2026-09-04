@@ -20,11 +20,68 @@ return-arrow exemplar this document mirrors), `elspeth-15c60e7c66`
 (prevalidation error-code flattening), `elspeth-15b400881f` (no
 `guaranteed_fields` authored downstream of the source).
 
-## RESOLVED — read this before the analysis below
+## THE FOUNDING OBSERVATION IS UNSOUND — read this first
 
-**The `locked_input_extras` investigation that occupies much of this document
-reached the wrong subject.** The LLM-specialist seat found the misreading and
-it is verified in-tree. Three corrections, in order of consequence:
+**Measured 2026-09-04, and it retires the evidence this whole document was
+built on.** `_candidate_shape_hash` does not distinguish what its name and its
+`_value_free_shape` helper imply. Running it over a tutorial-shaped candidate:
+
+| mutation | hash |
+|---|---|
+| rename a node id and its references | **same** |
+| re-point a route (rewire `input`) | **same** |
+| fix a sink alias | **same** |
+| flip `schema.mode` fixed → flexible | **same** |
+| **swap the plugin entirely** (`llm` → `coalesce`) | **same** |
+| add a schema field | differs |
+| add a node | differs |
+
+`_value_free_shape` drops dict KEYS and maps every string to the literal
+`"string"`, so the hash sees sequence LENGTHS and container nesting and
+essentially nothing else.
+
+**Therefore "attempts 2 and 3 share a shape hash" means only: same node count,
+same field count, same nesting.** It licenses NO inference about values versus
+structure. Every claim in this document of the form "the first repair changed
+only VALUES inside an identical structure" is withdrawn, as is every
+downstream claim about what the model believed, assumed, or was shown. A
+repair that renamed every node, re-pointed every route and swapped a plugin
+would have been invisible to this instrument.
+
+**It also inverts the reading.** `guided_reviewed_name_shadowed`,
+`guided_route_target_unknown` and `guided_output_alias_collision` all prescribe
+RENAMES or ROUTE SWAPS — exactly the edits measured invisible above — and all
+three mask to `validation_error`. A well-informed model following good guidance
+produces precisely the signature that was read as blindness.
+
+**Retracted with it:** the claim, committed earlier in this branch, that the
+one-turn structural repair at attempt #4 is behavioural proof the contract
+facts were forwarded. Both withholding branches are undiscriminated — this
+time not because the record is missing, but because the instrument never had
+the resolution that was assigned to it.
+
+**What survives, each verified without reference to the hash:** the staged
+validator against a repair budget of exactly 2; the
+`guided_amend_contract_violation` violations computed and never sent;
+`validation_error` as the default for a codeless rejection and
+`explain_validation_error` disclaiming it; and the withholding rule, which is
+a property of the predicate, tested directly, and never depended on the walk.
+
+**The method failure, stated because it is the fourth in one investigation:**
+`_candidate_shape_hash` and `_value_free_shape` read as "structure-preserving,
+value-dropping". Two agents reasoned from that reading for a day. Nobody ran
+the function. A name is not a specification, and a hash's resolution is a
+property you MEASURE, never one you infer from its identifier — see
+[[derive-a-log-columns-semantics-from-its-writer]], of which this is the
+sharper case: it is not just the column's semantics but the function's
+discriminating power.
+
+## Superseded: the misattribution correction that preceded it
+
+*Retained because it shipped, and because its structural finding survives.*
+The LLM-specialist seat first found a misreading of WHICH attempt the audit's
+code belongs to. That correction stands on its own terms and is recorded
+below; its conclusions about values-only repair do not, per the section above.
 
 **1. The attempt audit's shape hash records the candidate SUBMITTED at that
 attempt, not the one the rejection was answering.** `pipeline_planner.py:3915`
