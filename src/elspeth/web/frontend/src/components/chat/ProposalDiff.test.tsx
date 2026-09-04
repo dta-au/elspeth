@@ -512,10 +512,70 @@ describe("ProposalChanges", () => {
       screen.queryByText("No difference from the current pipeline."),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByText(
-        "No difference in what this view can compare. Plugin option values are redacted, so a change to them would not appear here.",
-      ),
+      screen.getByText("No difference in what this view can compare."),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-caveat")).toBeInTheDocument();
+  });
+
+  it("carries the caveat when rows ARE present, because the list is not exhaustive either", () => {
+    // A reviewer who sees rows reasonably infers that is the complete set and
+    // approves. Option values were never compared, so there may be
+    // differences this list cannot show — the same over-claim of completeness
+    // as the empty state, on the same gate, so it gets the same correction.
+    render(
+      <ProposalChanges
+        diff={{
+          entries: [
+            {
+              kind: "changed",
+              section: "node",
+              identity: "extract",
+              before: undefined,
+              after: undefined,
+              beforeSummary: "transform field_mapper",
+              afterSummary: "transform html_extract",
+            },
+          ],
+          optionValuesNotCompared: true,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Changed node")).toBeInTheDocument();
+    expect(screen.getByTestId("proposal-diff-caveat")).toHaveTextContent(
+      "Option values are not compared, so a change to them would not appear here.",
+    );
+    // The rows render normally; the caveat qualifies the list, it does not
+    // replace it, and the empty-state sentence must not appear beside rows.
+    expect(
+      screen.queryByText("No difference from the current pipeline."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows no caveat when the projection compared everything it was given", () => {
+    // Gated on the ledger, not on a constant: a future change that stops
+    // skipping removes the note automatically rather than stranding a caveat
+    // that is no longer true.
+    render(
+      <ProposalChanges
+        diff={{
+          entries: [
+            {
+              kind: "changed",
+              section: "node",
+              identity: "extract",
+              before: undefined,
+              after: undefined,
+              beforeSummary: "a",
+              afterSummary: "b",
+            },
+          ],
+          optionValuesNotCompared: false,
+        }}
+      />,
+    );
+
+    expect(screen.queryByTestId("proposal-diff-caveat")).not.toBeInTheDocument();
   });
 
   it("labels redaction-limited rows 'Writes', not 'Changed'", () => {
@@ -559,32 +619,6 @@ describe("ProposalChanges", () => {
     expect(screen.getByText("Changed node")).toBeInTheDocument();
   });
 
-  it("renders rows normally when the caveat is set but differences were found", () => {
-    // The caveat governs only the empty state; rows still render.
-    render(
-      <ProposalChanges
-        diff={{
-          entries: [
-            {
-              kind: "changed",
-              section: "node",
-              identity: "extract",
-              before: undefined,
-              after: undefined,
-              beforeSummary: "transform field_mapper",
-              afterSummary: "transform html_extract",
-            },
-          ],
-          optionValuesNotCompared: true,
-        }}
-      />,
-    );
-
-    expect(screen.getByText("Changed node")).toBeInTheDocument();
-    expect(
-      screen.queryByText("No difference from the current pipeline."),
-    ).not.toBeInTheDocument();
-  });
 });
 
 describe("ArgumentFields", () => {

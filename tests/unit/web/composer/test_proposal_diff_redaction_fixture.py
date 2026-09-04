@@ -124,6 +124,14 @@ def test_fixture_records_every_projected_tool_whose_arguments_are_summarized() -
     exact gap elspeth-b1c14dd3c2 was filed for. Which tools those are is read
     off the manifest here, so adding a Sensitive argument to any projected
     tool fails this test until the fixture records it.
+
+    DO NOT replace ``must_record`` with a literal set, however obvious the
+    membership looks today. The first version of this guard did exactly that
+    and was wrong about ``set_source`` — the derivation is the point, because
+    a guard that restates its authority instead of consulting it eventually
+    lies about it. ``PROJECTED_TOOLS`` is the one hand-maintained input, and
+    only because the frontend ``switch`` is its authority and Python cannot
+    read it.
     """
     tools_recorded = {case["tool"] for case in _cases().values()}
     must_record = {name for name, entry in MANIFEST.items() if name in PROJECTED_TOOLS and _summarizes_an_argument(entry)}

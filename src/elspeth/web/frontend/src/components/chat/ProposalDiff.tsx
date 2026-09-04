@@ -687,12 +687,25 @@ interface ProposalChangesProps {
  * styling. The caller (ToolCallCard) owns the derivability/staleness gate and
  * passes only a projection it already computed.
  *
- * The empty state has TWO forms, and picking the wrong one is a false claim on
- * a human approval gate. "No difference from the current pipeline." is only
- * honest when every provided key was actually compared. When option values
- * were skipped, the same empty list means the comparison could not be made —
- * a set_pipeline that changes only plugin options is byte-identical, after
- * redaction, to one that changes nothing.
+ * TWO things depend on whether the projection had to skip a comparison, and
+ * both exist because this is a gate where a human commits to an irreversible
+ * action, so the surface must not claim more completeness than it has.
+ *
+ * 1. The empty state. "No difference from the current pipeline." is only
+ *    honest when every provided key was actually compared. When option values
+ *    were skipped, the same empty list means the comparison could not be made
+ *    — a set_pipeline that changes only plugin options is byte-identical,
+ *    after redaction, to one that changes nothing.
+ *
+ * 2. The caveat, which renders WHENEVER a skip was recorded — rows present or
+ *    not. A reviewer who sees three rows reasonably infers that is the
+ *    complete set and approves; option values were never compared, so there
+ *    may be differences this list cannot show. Same claim of completeness,
+ *    same consequence, so the same correction.
+ *
+ * Both read off the ledger rather than a constant, so a future change that
+ * stops skipping removes them automatically instead of stranding a caveat
+ * that is no longer true.
  */
 export function ProposalChanges({ diff }: ProposalChangesProps) {
   const { entries, optionValuesNotCompared } = diff;
@@ -702,7 +715,7 @@ export function ProposalChanges({ diff }: ProposalChangesProps) {
       {entries.length === 0 ? (
         <p className="proposal-diff-empty">
           {optionValuesNotCompared
-            ? "No difference in what this view can compare. Plugin option values are redacted, so a change to them would not appear here."
+            ? "No difference in what this view can compare."
             : "No difference from the current pipeline."}
         </p>
       ) : (
@@ -716,6 +729,12 @@ export function ProposalChanges({ diff }: ProposalChangesProps) {
           ))}
         </ul>
       )}
+      {optionValuesNotCompared ? (
+        <p className="proposal-diff-caveat" data-testid="proposal-diff-caveat">
+          Option values are not compared, so a change to them would not appear
+          here.
+        </p>
+      ) : null}
     </div>
   );
 }
