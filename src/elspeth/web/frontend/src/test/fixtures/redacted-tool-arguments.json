@@ -1,0 +1,364 @@
+{
+  "_comment": "GENERATED FILE -- do not hand-edit. Each 'redacted' payload is the output of elspeth.web.composer.redaction.redact_tool_call_arguments for its 'arguments'. Frontend tests read these payloads so they are driven by the real producer; a Python test re-derives them so the two languages cannot drift (elspeth-b1c14dd3c2).",
+  "_regenerate": ".venv/bin/python scripts/cicd/bootstrap_proposal_diff_fixture.py --write",
+  "cases": {
+    "patch_source_options_two_scalars": {
+      "tool": "patch_source_options",
+      "arguments": {
+        "source_name": "source",
+        "patch": {
+          "path": "s3://bucket/in.csv",
+          "delimiter": ";"
+        }
+      },
+      "redacted": {
+        "source_name": "source",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "patch_node_options_one_mapping": {
+      "tool": "patch_node_options",
+      "arguments": {
+        "node_id": "extract",
+        "patch": {
+          "mappings": {
+            "a": "c"
+          }
+        }
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "patch_node_options_mixed_shapes": {
+      "tool": "patch_node_options",
+      "arguments": {
+        "node_id": "extract",
+        "patch": {
+          "mappings": {
+            "a": "c"
+          },
+          "tags": [
+            "x",
+            "y"
+          ],
+          "model": "anthropic/claude-haiku-4.5",
+          "unused": null
+        }
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":4,\"value_shape_counts\":{\"mapping\":1,\"scalar\":2,\"sequence\":1,\"set\":0}}"
+      }
+    },
+    "patch_node_options_empty_patch": {
+      "tool": "patch_node_options",
+      "arguments": {
+        "node_id": "extract",
+        "patch": {}
+      },
+      "redacted": {
+        "node_id": "extract",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":0,\"value_shape_counts\":{\"mapping\":0,\"scalar\":0,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "patch_node_options_missing_node": {
+      "tool": "patch_node_options",
+      "arguments": {
+        "node_id": "ghost",
+        "patch": {
+          "threshold": 0.5
+        }
+      },
+      "redacted": {
+        "node_id": "ghost",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "patch_output_options_one_scalar": {
+      "tool": "patch_output_options",
+      "arguments": {
+        "sink_name": "results",
+        "patch": {
+          "path": "out2.json"
+        }
+      },
+      "redacted": {
+        "sink_name": "results",
+        "patch": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "set_metadata_name_and_description": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": {
+          "name": "Renamed",
+          "description": "Now described"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:description,name>"
+      }
+    },
+    "set_metadata_name_only": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": {
+          "name": "Renamed"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:name>"
+      }
+    },
+    "set_metadata_empty": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": {}
+      },
+      "redacted": {
+        "patch": "<metadata-patch:empty>"
+      }
+    },
+    "set_metadata_unknown_key": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": {
+          "name": "Renamed",
+          "colour": "red"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:name,unknown>"
+      }
+    },
+    "set_metadata_invalid": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": "not-a-mapping"
+      },
+      "redacted": {
+        "patch": "<metadata-patch:invalid>"
+      }
+    },
+    "set_metadata_only_unknown_key": {
+      "tool": "set_metadata",
+      "arguments": {
+        "patch": {
+          "colour": "red"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:unknown>"
+      }
+    },
+    "set_metadata_no_arguments": {
+      "tool": "set_metadata",
+      "arguments": {},
+      "redacted": {}
+    },
+    "set_source_with_options": {
+      "tool": "set_source",
+      "arguments": {
+        "plugin": "csv",
+        "options": {
+          "path": "in.csv",
+          "delimiter": ","
+        },
+        "on_success": "rows",
+        "on_validation_failure": "discard"
+      },
+      "redacted": {
+        "source_name": "source",
+        "plugin": "csv",
+        "on_success": "rows",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":2,\"value_shape_counts\":{\"mapping\":0,\"scalar\":2,\"sequence\":0,\"set\":0}}",
+        "on_validation_failure": "discard",
+        "description": null
+      }
+    },
+    "upsert_node_with_options": {
+      "tool": "upsert_node",
+      "arguments": {
+        "id": "extract",
+        "node_type": "transform",
+        "plugin": "html_extract",
+        "input": "rows",
+        "options": {
+          "selector": ".body"
+        }
+      },
+      "redacted": {
+        "id": "extract",
+        "node_type": "transform",
+        "plugin": "html_extract",
+        "input": "rows",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "set_output_with_options": {
+      "tool": "set_output",
+      "arguments": {
+        "sink_name": "errors",
+        "plugin": "csv",
+        "options": {
+          "path": "errors.csv"
+        }
+      },
+      "redacted": {
+        "sink_name": "errors",
+        "plugin": "csv",
+        "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}"
+      }
+    },
+    "set_pipeline_replaying_current_state": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "csv",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [
+          {
+            "id": "extract",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "mapped",
+            "on_error": null,
+            "options": {
+              "mappings": {
+                "a": "b"
+              }
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": {
+              "path": "out.json"
+            }
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "csv",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
+          "description": null,
+          "blob_id": null
+        },
+        "sources": null,
+        "nodes": [
+          {
+            "id": "extract",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":1,\"scalar\":0,\"sequence\":0,\"set\":0}}",
+            "on_error": null,
+            "node_type": "transform",
+            "input": "rows",
+            "plugin": "field_mapper",
+            "on_success": "mapped",
+            "condition": null,
+            "routes": null,
+            "fork_to": null,
+            "branches": null,
+            "policy": null,
+            "merge": null,
+            "trigger": null,
+            "output_mode": null,
+            "expected_output_count": null,
+            "timeout_seconds": null,
+            "description": null,
+            "scope_name": null,
+            "scope_opener": null,
+            "scope_policy": null
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "from_node": "source",
+            "to_node": "extract",
+            "edge_type": "on_success",
+            "label": null
+          }
+        ],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "json",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": null,
+            "description": null
+          }
+        ],
+        "metadata": "<metadata-patch:invalid>"
+      }
+    },
+    "set_pipeline_plugin_changed_no_nodes": {
+      "tool": "set_pipeline",
+      "arguments": {
+        "source": {
+          "plugin": "json",
+          "options": {
+            "path": "input.csv"
+          },
+          "on_success": "rows",
+          "on_validation_failure": "discard"
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "csv",
+            "options": {
+              "path": "out.json"
+            }
+          }
+        ]
+      },
+      "redacted": {
+        "source": {
+          "plugin": "json",
+          "on_success": "rows",
+          "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+          "on_validation_failure": "discard",
+          "description": null,
+          "blob_id": null
+        },
+        "sources": null,
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+          {
+            "sink_name": "results",
+            "plugin": "csv",
+            "options": "{\"_option_shape\":\"mapping\",\"entry_count\":1,\"value_shape_counts\":{\"mapping\":0,\"scalar\":1,\"sequence\":0,\"set\":0}}",
+            "on_write_failure": null,
+            "description": null
+          }
+        ],
+        "metadata": "<metadata-patch:invalid>"
+      }
+    }
+  }
+}
