@@ -22,7 +22,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
-from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -1566,7 +1566,7 @@ class TestD12AdmissionWallOnEveryIssuancePath:
     @pytest.mark.asyncio
     async def test_login_refuses_a_pending_identity(self, closed) -> None:
         closed.create_user("alice", "pw", display_name="Alice")
-        with pytest.raises(AuthenticationError, match="Account is pending"):
+        with pytest.raises(AccessPending):
             await closed.login("alice", "pw")
 
     @pytest.mark.asyncio
@@ -1586,7 +1586,7 @@ class TestD12AdmissionWallOnEveryIssuancePath:
         closed.create_user("alice", "pw", display_name="Alice", email="a@example.com", email_verified=False)
         verification = closed.create_email_verification_token("alice")
 
-        with pytest.raises(AuthenticationError, match="Account is pending"):
+        with pytest.raises(AccessPending):
             closed.verify_email_and_issue_token(
                 verification,
                 record_token_issued=lambda _identity, _token: None,
@@ -1624,7 +1624,7 @@ class TestD12AdmissionWallOnEveryIssuancePath:
             conn.execute(identities_table.update().where(identities_table.c.identity_id == identity_id).values(access_state="disabled"))
         _delete_user(provider, "alice")
 
-        with pytest.raises(AuthenticationError, match="Account is disabled"):
+        with pytest.raises(IdentityDisabled):
             provider.register_open_user_with_audit(
                 "alice",
                 "new-password",

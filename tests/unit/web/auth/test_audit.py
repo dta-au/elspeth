@@ -17,7 +17,7 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
-from elspeth.web.auth.models import AuthenticationError
+from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -362,13 +362,22 @@ class TestAdmissionFailureCategories:
     """
 
     def test_a_pending_identity_is_not_a_credential_failure(self) -> None:
-        exc = AuthenticationError("Account is pending — awaiting administrator approval")
-        assert classify_authentication_failure(exc) == "access_pending"
+        assert classify_authentication_failure(AccessPending()) == "access_pending"
 
     def test_a_disabled_identity_is_its_own_category(self) -> None:
         """A revocation taking effect, not a failed guess."""
-        exc = AuthenticationError("Account is disabled — contact an administrator")
-        assert classify_authentication_failure(exc) == "identity_disabled"
+        assert classify_authentication_failure(IdentityDisabled()) == "identity_disabled"
+
+    def test_rewording_the_message_does_not_change_the_category(self) -> None:
+        """The point of classifying on the TYPE.
+
+        A prefix match put the same literal in the raiser and the classifier
+        with nothing binding them, so an ordinary copy edit to the message an
+        operator reads would silently reclassify the audit event — and a test
+        that built the literal itself would keep passing.
+        """
+        assert classify_authentication_failure(AccessPending("Hold tight, someone is reviewing this")) == "access_pending"
+        assert classify_authentication_failure(IdentityDisabled("This account was closed")) == "identity_disabled"
 
     def test_a_genuinely_bad_credential_keeps_its_category(self) -> None:
         """The control: adding the arms above must not lose this one."""
@@ -382,12 +391,12 @@ class TestAdmissionFailureCategories:
     def test_the_four_admission_outcomes_are_all_distinct(self) -> None:
         """A classifier that collapsed any two would defeat the point."""
         categories = {
-            classify_authentication_failure(AuthenticationError(detail))
-            for detail in (
-                "Account is pending — awaiting administrator approval",
-                "Account is disabled — contact an administrator",
-                "Invalid credentials",
-                "Email verification required",
+            classify_authentication_failure(exc)
+            for exc in (
+                AccessPending(),
+                IdentityDisabled(),
+                AuthenticationError("Invalid credentials"),
+                AuthenticationError("Email verification required"),
             )
         }
         assert len(categories) == 4

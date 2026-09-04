@@ -18,7 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
+from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.schema_probe import postgres_engine_kwargs
 
@@ -194,6 +194,15 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     """Classify auth errors without storing their external-data-bearing detail."""
     if type(exc) is AuthProviderUnavailable:
         return "provider_unavailable"
+    # Admission outcomes are matched by TYPE. They used to be matched on a
+    # message prefix, which put the same literal in the raiser and here with
+    # nothing binding the two: rewording the message an operator reads would
+    # have silently reclassified the event, and the tests — which built the
+    # literal themselves — would not have noticed.
+    if type(exc) is AccessPending:
+        return "access_pending"
+    if type(exc) is IdentityDisabled:
+        return "identity_disabled"
 
     detail = exc.detail
     # Admission outcomes come FIRST and are their own categories. A correct
@@ -202,10 +211,6 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     # people waiting for approval, and the one that would show a brute-force
     # attempt. Same for a disabled identity, which is a revocation taking
     # effect, not a failed guess.
-    if detail.startswith("Account is pending"):
-        return "access_pending"
-    if detail.startswith("Account is disabled"):
-        return "identity_disabled"
     if detail.startswith("Invalid credentials"):
         return "invalid_credentials"
     if detail.startswith("Email verification required"):

@@ -27,7 +27,14 @@ import structlog
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.models import AuthenticationError, IdentityClaims, UserIdentity, UserProfile
+from elspeth.web.auth.models import (
+    AccessPending,
+    AuthenticationError,
+    IdentityClaims,
+    IdentityDisabled,
+    UserIdentity,
+    UserProfile,
+)
 from elspeth.web.auth.session_token import SessionTokenIssuer
 
 if TYPE_CHECKING:
@@ -1145,8 +1152,8 @@ class LocalAuthProvider:
             # leaks nothing here -- the caller has already proven the
             # credential, or just created it.
             if record.access_state == "disabled":
-                raise AuthenticationError("Account is disabled — contact an administrator")
-            raise AuthenticationError("Account is pending — awaiting administrator approval")
+                raise IdentityDisabled
+            raise AccessPending
         return record.identity_id
 
     def _issue_token(self, identity_id: str, username: str, *, issued_at: int | None = None) -> str:

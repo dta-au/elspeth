@@ -66,6 +66,29 @@ class AuthenticationError(Exception):
         super().__init__(detail)
 
 
+class AccessPending(AuthenticationError):
+    """The credential was correct; the identity has not been admitted yet.
+
+    A CLASS, not a message prefix. The spec's §Failure categories requires
+    exactly this ("each an explicit exception class, never a ``detail``
+    prefix") and the reason is visible in what a prefix costs: the raiser and
+    the classifier would hold the same literal in two files with nothing
+    binding them, so an ordinary copy edit to the message would silently
+    reclassify the event to ``authentication_error`` with every test green.
+    The type is the contract; the message is free to change.
+    """
+
+    def __init__(self, detail: str = "Account is pending — awaiting administrator approval") -> None:
+        super().__init__(detail)
+
+
+class IdentityDisabled(AuthenticationError):
+    """The identity has been disabled. Re-authenticating is not an appeal."""
+
+    def __init__(self, detail: str = "Account is disabled — contact an administrator") -> None:
+        super().__init__(detail)
+
+
 class AuthProviderUnavailable(AuthenticationError):
     """Raised when an upstream auth provider cannot validate availability.
 
