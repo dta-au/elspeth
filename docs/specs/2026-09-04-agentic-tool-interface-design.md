@@ -1,6 +1,13 @@
 # Agentic tool interface — making the composer's real contract legible at the point of decision
 
-Date: 2026-09-04. Status: design, revision 1. Branch: `release/0.8.0`.
+Date: 2026-09-04. Status: design, revision 2. Branch: `plan/agentic-interface`,
+branched off `release/0.8.0` @ `cbae1ef0c`.
+Revision 2 corrects revision 1's central factual error: revision 1 said the
+rejection's instance facts are "computed and discarded". They are computed
+into a purpose-built type AND projected to the planner; what is missing is
+persistence. The correction is marked in place under §Layer 1 rather than
+silently rewritten, because the wrong version shipped in `cbae1ef0c` and an
+implementer may have read it.
 Origin: operator framing during the `strany/tool-result-envelope` landing —
 "the big win in this line of effort is getting the composer reliable tool
 calls", with the north star stated as **agentic as a first-class interface**
@@ -25,8 +32,10 @@ Two different contracts govern a pipeline proposal:
    consumer accept the fields the producer emits? That lives in the *graph*
    and appears in no tool definition.
 
-The model is shown (1) and judged on (2). When a proposal is refused, the
-refusal names a code, not the fact that produced it.
+The model is shown (1) and judged on (2). The refusal's *persisted* record
+names a code and nothing else; whether the model itself was shown the facts
+behind that code is, today, unrecorded — see the layer-1 correction below,
+which is the difference between two very different defects.
 
 ### Measured evidence
 
@@ -58,10 +67,17 @@ because values are what it was shown. It is not a weak-model problem.
 
 `locked_input_extras` (`state.py:5423`, code string `:5465`) is one code
 covering a family of violations: a consumer whose input schema is locked
-received fields the producer emits and it does not accept. *Which* field,
-from *which* producer, against *which* locked consumer, is computed and
-discarded. Nothing downstream — model, harness, or maintainer — can recover
-it.
+received fields the producer emits and it does not accept.
+
+*Which* field, from *which* producer, against *which* locked consumer, **is**
+computed — into `SchemaContractDetail` — and **is** projected to the planner
+at `pipeline_planner.py:2541`, subject to a `withholding.contract` custody
+check. What no downstream reader can recover is what was actually sent: none
+of it is persisted. So "the feedback is under-specified" is a hypothesis this
+document cannot yet assert, and the layer-1 correction below states the
+measurement that would settle it. The claim that survives without that
+measurement is narrower and still sufficient to act on: the *record* is
+under-specified, and that is why nobody can tell.
 
 Separately, `_prevalidate_transform_for_context` (`tools/_common.py:3278`)
 does not validate against the real graph despite its name. It constructs a
@@ -118,25 +134,79 @@ and shipped it — and the surface that most needs it does not write to it.
 Ordered by ambition. Each is independently deliverable and each is a strict
 improvement; layer 3 is the exemplar move.
 
-### Layer 1 — the rejection carries instance facts
+### Layer 1 — persist the rejection facts that were already sent
 
-A refusal must name the fact that produced it, structurally. Not
-`locked_input_extras`, but the offending field, its producer, and the locked
-consumer schema it violated — as data, not as prose interpolated into
-`message`.
+**Revision 1 correction, measured 2026-09-04 after first publication.** The
+framing below originally said the instance facts are "computed and
+discarded". That is wrong, and wrong in a way that would send an implementer
+to build a carrier that already exists. The corrected statement:
 
-The carrier exists (Exemplar B). The work is to route planner candidate
-rejections into it and to widen the record from a code plus a human string to
-a code plus its structured instance facts.
+- The facts **are** computed, as a purpose-built structured type.
+  `SchemaContractDetail` (`state.py:1246`) carries `producer`, `consumer`,
+  `missing_fields`, `extra_fields`, and its docstring states the exact
+  rationale this document argues for: "A bare `schema_contract_violation` is
+  not repairable within the repair budget: the planner must know WHICH edge
+  failed and WHICH fields are missing." `_locked_input_extras_error`
+  (`state.py:5423`) populates it.
+- The facts **are** projected to the planner. `pipeline_planner.py:2541`:
+  `if entry.contract is not None and not withholding.contract:` →
+  `projected["contract"] = entry.contract.to_dict()`.
+- The facts are **not persisted**. Measured on tutorial run
+  `a9767adc-523e-4f6c-a8d4-f4f78776bb95`: `locked_input_extras` occurs
+  exactly ONCE in the whole session database, in the `planner_attempt_audit`
+  envelope's `rejection_codes` array. `composition_rejection_events` has zero
+  rows. The repair loop runs inside a single `compose()` call and its
+  intermediate tool results never become chat messages.
+
+So the observability gap is **narrower and sharper** than first written: we
+cannot tell what the model was shown, because what it was shown is not
+recorded. That is a persistence defect, not a derivation defect.
+
+**The decisive next measurement, and it must precede any fix.** Was
+`withholding.contract` set for that entry? The two answers demand different
+work and there is currently no data to choose between them:
+
+- **Withheld** — the model was blind to `extra_fields` and the defect is
+  custody scoping. Note the standing hazard: the `_allowlisted_candidate_feedback`
+  docstring records that the predecessor candidate-global predicate "made
+  guided repair permanently blind — the guided binder ALWAYS mutates the
+  candidate" (elspeth-5904b1683a). A per-entry successor can still withhold
+  too much.
+- **Forwarded** — the model received the offending field names and still
+  needed a further turn. Then this is not an observability defect at all, and
+  layer 1 buys nothing; the work moves to the planner brief and to layer 3.
+
+**Precedent for the withheld branch, already adjudicated once.** Run
+`06c9ec49` (2026-07-29) is the same failure shape at a different code:
+withholding the validator's message made an exactly-repairable
+`plugin_options_invalid` rejection unrepairable — the planner "burned every
+repair on the static enrichment's profile-alias hypothesis, and declined with
+a confabulated cause — twice, in two sessions." The remedy was to forward the
+detail, on the custody argument that the planner already holds that content
+verbatim. `SchemaContractDetail` was built with the same argument
+pre-made ("forwarding them does not re-open the message redaction
+boundary"), so if it is being withheld here, the precedent is directly on
+point.
+
+The work, restated: persist what was projected, so the question above is
+answerable from data on the next walk rather than from code reading. The
+durable carrier for it exists (Exemplar B).
 
 This is the same discipline as
 [[stop-parsing-carry-the-fact-structurally]]: three defeated parses mean the
-fact should have been carried, not re-derived. Here the fact is not even
-re-derivable — it is discarded at the point of computation.
+fact should have been carried, not re-derived. Here the fact IS carried on
+the wire and is simply never written down, so the defeated party is the later
+reader rather than the model — which is why the remedy is persistence, not
+derivation.
 
-**Expected effect on the measured walk:** attempts 2 and 3 collapse to one.
-The model spent an attempt eliminating the value hypothesis because nothing
-told it the problem was structural.
+**Expected effect on the measured walk — conditional, and the condition is
+the unresolved one.** IF the contract detail was withheld, attempts 2 and 3
+collapse to one: the model spent a turn eliminating the value hypothesis
+because nothing told it the problem was structural. IF it was forwarded, this
+layer changes nothing about the walk and only makes the next walk
+diagnosable. Do not quote the first branch as the expected benefit until the
+withholding question is answered — that is exactly the overstatement this
+document's own "not verified" discipline exists to prevent.
 
 ### Layer 2 — the error arrives at its cause
 
