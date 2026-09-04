@@ -7,12 +7,25 @@ signing for both OIDC and Entra test modules.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+
+from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.session_token import (
+    DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+    DEFAULT_TOKEN_EXPIRY_HOURS,
+    LOCAL_AUDIENCE,
+    SessionTokenIssuer,
+)
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, read_identity
+from elspeth.web.sessions.schema import initialize_session_schema
 
 
 @pytest.fixture
@@ -66,3 +79,70 @@ def make_rsa_token(private_key, claims: dict[str, object], *, algorithm: str = "
 def make_rs256_token(private_key, claims: dict[str, object]) -> str:
     """Backward-compatible helper for the common RS256 case."""
     return make_rsa_token(private_key, claims, algorithm="RS256")
+
+
+def build_local_auth_provider(
+    db_path,
+    *,
+    registration_open: bool = True,
+    signing_key: bytes = b"local-provider-test-signing-key!",
+    audience: str = LOCAL_AUDIENCE,
+    token_expiry_hours: int = DEFAULT_TOKEN_EXPIRY_HOURS,
+    max_refresh_chain_hours: int = DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+    session_engine=None,
+    quota_tokens_per_day: int | None = None,
+    quota_storage_bytes: int | None = None,
+) -> LocalAuthProvider:
+    """Build a LocalAuthProvider wired to a real in-memory identity substrate.
+
+    A local provider now needs THREE things: a credential store (``auth.db``),
+    an identity substrate to resolve ``sub``, and a token issuer. Tests build
+    them here rather than each constructing its own, so the wiring cannot
+    drift between test modules -- and so a change to the provider's
+    collaborators is one edit rather than fifty-eight.
+
+    ``registration_open=True`` is the default because it matches the shipped
+    ``registration_mode`` default: a first login is admitted immediately.
+    Pass ``False`` to exercise the D12 pending wall.
+
+    The engine is REAL, not a stub. The behaviours these tests depend on --
+    a repeat login finding its own identity, an activation writing a quota
+    row -- are arbitrated by constraints, and a stub arbitrates nothing.
+
+    FILE-BACKED, not ``:memory:``. The session engine pools per THREAD
+    (SingletonThreadPool), and admission runs inside ``run_sync_in_worker``,
+    so an in-memory database would hand the worker thread its own empty copy
+    and every login would fail with "no such table: identities".
+    """
+    if session_engine is not None:
+        engine = session_engine
+    else:
+        sessions_db = pathlib.Path(db_path).parent / "identity-substrate.db"
+        engine = create_session_engine(f"sqlite:///{sessions_db}")
+        initialize_session_schema(engine)
+
+    def _principal_is_active(identity_id: str) -> bool:
+        record = read_identity(engine, identity_id)
+        return record is not None and record.is_active
+
+    def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
+        return ensure_identity(
+            engine,
+            claims=claims,
+            activate=registration_open,
+            quota_tokens_per_day=quota_tokens_per_day,
+            quota_storage_bytes=quota_storage_bytes,
+        )
+
+    return LocalAuthProvider(
+        db_path=db_path,
+        token_issuer=SessionTokenIssuer(
+            signing_key=signing_key,
+            provider="local",
+            audience=audience,
+            token_expiry_hours=token_expiry_hours,
+            max_refresh_chain_hours=max_refresh_chain_hours,
+            principal_is_active=_principal_is_active,
+        ),
+        admit_identity=_admit_identity,
+    )

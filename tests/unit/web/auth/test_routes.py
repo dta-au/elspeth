@@ -19,11 +19,12 @@ from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import auth_events_table
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.audit import AuthAuditRecorder
-from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity, UserProfile
 from elspeth.web.auth.routes import LoginRequest, RegisterRequest, create_auth_router
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.request_id import RequestIdMiddleware
+
+from .conftest import build_local_auth_provider
 
 _OIDC_FIELDS = {
     "oidc_issuer": "https://issuer.example.com",
@@ -181,10 +182,7 @@ def _token_bearing_401_case(case: str, tmp_path):
     sensitive_exception = "SENSITIVE_EXCEPTION_DETAIL"
     if case == "invalid_verification_token":
         sensitive_token = "SENSITIVE_VERIFICATION_TOKEN"
-        local_provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key-that-is-at-least-32-bytes",
-        )
+        local_provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(local_provider, registration_mode="email_verified")
         return (
             app,
@@ -240,10 +238,7 @@ class TestLoginEndpoint:
     """Tests for POST /api/auth/login."""
 
     async def test_login_valid_credentials(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider)
 
@@ -262,10 +257,7 @@ class TestLoginEndpoint:
 
     async def test_login_valid_credentials_records_durable_auth_event(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
@@ -296,10 +288,7 @@ class TestLoginEndpoint:
 
     async def test_login_valid_credentials_records_token_issuance_without_jwt(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
@@ -334,10 +323,7 @@ class TestLoginEndpoint:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
@@ -353,10 +339,7 @@ class TestLoginEndpoint:
         assert _read_auth_event_rows(audit_url) == []
 
     async def test_login_invalid_credentials(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider)
 
@@ -369,10 +352,7 @@ class TestLoginEndpoint:
 
     async def test_login_invalid_credentials_records_failure_without_secret_material(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
@@ -404,7 +384,7 @@ class TestLoginEndpoint:
         """An over-length username is rejected at the request boundary (422) and
         never reaches the audit write — the unauthenticated amplification vector."""
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
         oversized_username = "a" * (AUTH_AUDIT_PRINCIPAL_MAX_LENGTH + 1)
@@ -446,10 +426,7 @@ class TestRegisterEndpoint:
     """Tests for POST /api/auth/register."""
 
     async def test_register_open_mode_creates_user_and_returns_token(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open")
 
         async with _client_for(app) as client:
@@ -465,10 +442,7 @@ class TestRegisterEndpoint:
         assert len(body["access_token"].split(".")) == 3
 
     async def test_register_open_mode_with_email(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open")
 
         async with _client_for(app) as client:
@@ -485,10 +459,7 @@ class TestRegisterEndpoint:
 
     async def test_register_open_mode_records_token_issuance_without_jwt(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open", landscape_url=audit_url)
         _enable_auth_audit(app)
 
@@ -518,10 +489,7 @@ class TestRegisterEndpoint:
         assert "pw123" not in serialized
 
     async def test_register_open_mode_audit_failure_compensates_user_creation(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open")
         app.state.auth_audit_recorder = _RaisingTokenAuditRecorder()
 
@@ -544,10 +512,7 @@ class TestRegisterEndpoint:
         assert retry_response.status_code == 200
 
     async def test_register_closed_mode_returns_404(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="closed")
 
         async with _client_for(app) as client:
@@ -558,10 +523,7 @@ class TestRegisterEndpoint:
         assert response.status_code == 404
 
     async def test_register_email_verified_mode_creates_pending_user_and_verifies_token(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
 
         async with _client_for(app) as client:
@@ -607,10 +569,7 @@ class TestRegisterEndpoint:
             assert login_response.status_code == 200
 
     async def test_verify_email_audit_failure_restores_retryable_verification_state(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
 
         async with _client_for(app) as client:
@@ -637,10 +596,7 @@ class TestRegisterEndpoint:
         assert retry_response.status_code == 200
 
     async def test_register_email_verified_mode_requires_email(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
 
         async with _client_for(app) as client:
@@ -652,10 +608,7 @@ class TestRegisterEndpoint:
         assert "email" in response.json()["detail"]
 
     async def test_register_email_verified_mode_rejects_blank_email_without_user(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
 
         async with _client_for(app) as client:
@@ -674,10 +627,7 @@ class TestRegisterEndpoint:
         assert provider.delete_user("bob") is False
 
     async def test_register_email_verified_mode_uses_configured_public_base_url(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(
             provider,
             registration_mode="email_verified",
@@ -704,10 +654,7 @@ class TestRegisterEndpoint:
         assert "evil.example" not in record["verification_url"]
 
     async def test_register_email_verified_mode_uses_trusted_request_origin_for_dev_proxy(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(
             provider,
             registration_mode="email_verified",
@@ -739,10 +686,7 @@ class TestRegisterEndpoint:
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="email_verified", data_dir=tmp_path)
 
         def fail_outbox(*args, **kwargs) -> None:
@@ -800,10 +744,7 @@ class TestRegisterEndpoint:
         assert response.status_code == 404
 
     async def test_register_duplicate_username_returns_409(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("bob", "existing", display_name="Bob")
         app = _create_test_app(provider, registration_mode="open")
 
@@ -815,10 +756,7 @@ class TestRegisterEndpoint:
         assert response.status_code == 409
 
     async def test_register_blank_username_returns_422(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open")
 
         async with _client_for(app) as client:
@@ -829,10 +767,7 @@ class TestRegisterEndpoint:
         assert response.status_code == 422
 
     async def test_register_blank_password_returns_422(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, registration_mode="open")
 
         async with _client_for(app) as client:
@@ -848,10 +783,7 @@ class TestTokenRefreshEndpoint:
     """Tests for POST /api/auth/token."""
 
     async def test_token_refresh_returns_new_token(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "pw", display_name="Alice")
         app = _create_test_app(provider)
 
@@ -876,10 +808,7 @@ class TestTokenRefreshEndpoint:
 
     async def test_token_refresh_records_token_issuance_without_jwt(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "pw", display_name="Alice")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
@@ -928,10 +857,7 @@ class TestTokenRefreshEndpoint:
 
         import jwt as pyjwt
 
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "pw", display_name="Alice")
         app = _create_test_app(provider)
 
@@ -963,10 +889,7 @@ class TestTokenRefreshEndpoint:
 
     async def test_token_refresh_missing_iat_rejected(self, tmp_path) -> None:
         """Refresh must reject valid local tokens whose chain origin is absent."""
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "pw", display_name="Alice")
         app = _create_test_app(provider)
         token_without_iat = pyjwt.encode(
@@ -990,10 +913,7 @@ class TestTokenRefreshEndpoint:
         assert "re-authenticate" in response.json()["detail"]
 
     async def test_token_refresh_invalid_token(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider)
 
         async with _client_for(app) as client:
@@ -1087,10 +1007,7 @@ class TestMeEndpoint:
     """Tests for GET /api/auth/me."""
 
     async def test_me_returns_profile(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user(
             "alice",
             "pw",
@@ -1118,10 +1035,7 @@ class TestMeEndpoint:
         assert body["groups"] == []
 
     async def test_me_unauthenticated(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider)
 
         async with _client_for(app) as client:
@@ -1130,10 +1044,7 @@ class TestMeEndpoint:
 
     async def test_me_unauthenticated_records_auth_failure(self, tmp_path) -> None:
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
 
@@ -1157,10 +1068,7 @@ class TestAuthConfigEndpoint:
     """Tests for GET /api/auth/config (S9/D5)."""
 
     async def test_local_provider_returns_null_oidc_fields(self, tmp_path) -> None:
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, auth_provider_type="local")
 
         async with _client_for(app) as client:
@@ -1175,10 +1083,7 @@ class TestAuthConfigEndpoint:
     async def test_registration_mode_closed_is_exposed_to_frontend(self, tmp_path) -> None:
         """The LoginPage gates its "Create an account" affordance on the
         effective registration mode — /config must reflect a closed mode."""
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, auth_provider_type="local", registration_mode="closed")
 
         async with _client_for(app) as client:
@@ -1466,7 +1371,7 @@ class TestAuthRateLimiting:
         from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
         audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, landscape_url=audit_url)
         _enable_auth_audit(app)
         app.state.auth_rate_limiter = ComposerRateLimiter(limit=1)
@@ -1491,7 +1396,7 @@ class TestAuthRateLimiting:
         """Login returns 429 after exceeding per-IP rate limit."""
         from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider)
         # Override with a very low limit
@@ -1512,7 +1417,7 @@ class TestAuthRateLimiting:
         """Register returns 429 after exceeding per-IP rate limit."""
         from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider)
         app.state.auth_rate_limiter = ComposerRateLimiter(limit=1)
 
@@ -1535,7 +1440,7 @@ class TestAuthRateLimiting:
         """Auth and composer rate limiters are separate instances."""
         from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "password123", display_name="Alice")
         app = _create_test_app(provider)
         # Auth limiter at 1, composer limiter stays at default (100)

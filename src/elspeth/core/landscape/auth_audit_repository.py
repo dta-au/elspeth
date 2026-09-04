@@ -106,6 +106,7 @@ class AuthAuditRepository:
         client_host: str | None,
         user_agent: str | None,
         metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> tuple[str, dict[str, object]]:
         if event_type not in AUTH_AUDIT_EVENT_TYPES:
             raise AuditIntegrityError(f"Unsupported auth audit event_type: {event_type!r}")
@@ -123,6 +124,12 @@ class AuthAuditRepository:
             "event_type": event_type,
             "outcome": outcome,
             "provider": provider,
+            # The durable join to the identity substrate. ``user_id`` is the
+            # principal as the request named it and stays whatever the token
+            # carried; ``identity_id`` is the row every ownership FK points
+            # at, so an identity renamed or re-subjected later is still
+            # traceable through its events.
+            "identity_id": identity_id,
             "user_id": _bounded_principal(user_id),
             "username": _bounded_principal(username),
             "failure_category": failure_category,
@@ -145,6 +152,7 @@ class AuthAuditRepository:
         client_host: str | None,
         user_agent: str | None,
         metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> str:
         """Record an auth event synchronously before the HTTP response is sent."""
         event_id, values = self._auth_event_values(
@@ -158,6 +166,7 @@ class AuthAuditRepository:
             client_host=client_host,
             user_agent=user_agent,
             metadata=metadata,
+            identity_id=identity_id,
         )
         self._ops.execute_insert(
             auth_events_table.insert().values(**values),

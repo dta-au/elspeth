@@ -17,6 +17,8 @@ from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 
+from .conftest import build_local_auth_provider
+
 
 class _NoopAuthAuditRecorder:
     def record_login_success_and_token_issued(self, *args, **kwargs) -> None:
@@ -61,7 +63,7 @@ def _client_for(app: FastAPI) -> AsyncClient:
 
 
 def _provider_with_admin(tmp_path) -> LocalAuthProvider:
-    provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+    provider = build_local_auth_provider(tmp_path / "auth.db")
     provider.create_user("john", "admin-password-1", display_name="John")
     return provider
 

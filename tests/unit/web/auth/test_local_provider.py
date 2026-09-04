@@ -23,6 +23,9 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE
+
+from .conftest import build_local_auth_provider
 
 
 class _CommitFailingConnection:
@@ -65,16 +68,38 @@ def _fail_commits(provider: LocalAuthProvider, monkeypatch: pytest.MonkeyPatch) 
 @pytest.fixture
 def provider(tmp_path):
     """Create a LocalAuthProvider with a temporary SQLite database."""
-    return LocalAuthProvider(
-        db_path=tmp_path / "auth.db",
-        secret_key="test-secret-key-for-unit-tests",
-        token_expiry_hours=24,
-    )
+    return build_local_auth_provider(tmp_path / "auth.db", token_expiry_hours=24)
 
 
 def _signed_local_token(provider: LocalAuthProvider, claims: dict[str, Any]) -> str:
-    """Create a signed local JWT for boundary-shape tests."""
-    return pyjwt.encode(claims, provider._secret_key, algorithm="HS256")
+    """Sign an arbitrary claim set with the provider's real signing key.
+
+    For boundary-shape tests only: it produces a GENUINELY signed token whose
+    claims are deliberately wrong, which is the only way to test what the
+    envelope checks do once the signature has already passed.
+
+    Callers must supply the full envelope (``iss``, ``aud``, ``provider``,
+    ``jti``) except for the one claim under test — otherwise the token is
+    refused for a reason the test did not intend and the assertion passes for
+    the wrong cause.
+    """
+    return pyjwt.encode(claims, provider._token_issuer._signing_key, algorithm="HS256")
+
+
+def _envelope(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid claim set to mutate one field of."""
+    claims: dict[str, Any] = {
+        "sub": "some-identity-id",
+        "username": "alice",
+        "provider": "local",
+        "iss": "elspeth",
+        "aud": LOCAL_AUDIENCE,
+        "jti": "test-jti",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+    }
+    claims.update(overrides)
+    return claims
 
 
 def _delete_user(provider: LocalAuthProvider, user_id: str) -> None:
@@ -152,16 +177,32 @@ class TestCreateUser:
 
     def test_auth_database_is_created_owner_only_under_permissive_umask(self, tmp_path) -> None:
         db_path = tmp_path / "auth.db"
+        # A real subprocess, because umask is process state: setting it in
+        # this process would leak into every other test in the worker. The
+        # collaborators are wired inline rather than imported from conftest,
+        # which is not reliably importable by path from a child interpreter.
         script = """
 import os
 import stat
 import sys
 from pathlib import Path
 from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.session_token import LOCAL_AUDIENCE, SessionTokenIssuer
 
 os.umask(0)
 path = Path(sys.argv[1])
-LocalAuthProvider(db_path=path, secret_key="subprocess-test-key")
+LocalAuthProvider(
+    db_path=path,
+    token_issuer=SessionTokenIssuer(
+        signing_key=b"subprocess-test-signing-key-32b!",
+        provider="local",
+        audience=LOCAL_AUDIENCE,
+        token_expiry_hours=24,
+        max_refresh_chain_hours=168,
+        principal_is_active=lambda identity_id: True,
+    ),
+    admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
+)
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
         completed = subprocess.run(
@@ -180,16 +221,16 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         db_path.chmod(0o644)
 
         with pytest.raises(RuntimeError, match="owner-only"):
-            LocalAuthProvider(db_path=db_path, secret_key="test-key")
+            build_local_auth_provider(db_path)
 
     def test_auth_database_rejects_symlink(self, tmp_path) -> None:
         target = tmp_path / "target.db"
-        LocalAuthProvider(db_path=target, secret_key="test-key")
+        build_local_auth_provider(target)
         db_path = tmp_path / "auth.db"
         db_path.symlink_to(target)
 
         with pytest.raises(RuntimeError, match="regular owner-only file"):
-            LocalAuthProvider(db_path=db_path, secret_key="test-key")
+            build_local_auth_provider(db_path)
 
     def test_open_owner_only_database_creates_missing_file_owner_only(self, tmp_path) -> None:
         """The ``FileNotFoundError`` arm creates the file and the identity check admits it."""
@@ -517,10 +558,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
                 "alice",
                 "replacement456",
@@ -571,10 +609,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             replacement_token = restarted.register_open_user_with_audit(
                 "alice",
                 "replacement456",
@@ -632,10 +667,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             )
             assert audit_entered.wait(timeout=2)
             now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-            restarted = LocalAuthProvider(
-                db_path=provider._db_path,
-                secret_key="test-secret-key-for-unit-tests",
-            )
+            restarted = build_local_auth_provider(provider._db_path)
             retry_token = restarted.verify_email_and_issue_token(
                 verification_token,
                 record_token_issued=lambda _identity, _access_token: None,
@@ -653,10 +685,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         provider.create_user("alice", "password123", display_name="Alice")
         _insert_crashed_intent(provider, user_id="alice", issuance_path="register", created_at=1_000)
 
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == []
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
@@ -696,10 +725,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         )
 
         now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == []
         issued_tokens: list[str] = []
@@ -720,10 +746,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             created_at=int(time.time()),
         )
 
-        restarted = LocalAuthProvider(
-            db_path=provider._db_path,
-            secret_key="test-secret-key-for-unit-tests",
-        )
+        restarted = build_local_auth_provider(provider._db_path)
 
         assert _audit_intents(restarted) == [("alice", "register")]
         token = restarted._login_sync("alice", "password123")
@@ -866,7 +889,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         tmp_path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         real_append = auth_local._append_email_verification_record
 
@@ -888,7 +911,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             provider._login_sync("alice", "password123")
 
         monkeypatch.setattr(auth_local, "_append_email_verification_record", real_append)
-        restarted = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        restarted = build_local_auth_provider(tmp_path / "auth.db")
         restarted.publish_pending_email_verifications(outbox_path)
 
         records = [json.loads(line) for line in outbox_path.read_text(encoding="utf-8").splitlines()]
@@ -1010,7 +1033,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
     def test_retry_after_expiry_rotates_pending_registration_delivery(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         now = [1_000]
         monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         kwargs = {
             "verification_origin": "https://composer.example.test",
@@ -1040,7 +1063,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert records[1]["token"] != first["token"]
 
     def test_publish_retry_deduplicates_append_before_ack_crash(self, tmp_path) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         provider.register_email_verified_user(
             "alice",
@@ -1059,7 +1082,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         assert len(records) == 1
 
     def test_publish_retry_rejects_divergent_payload_for_existing_delivery_id(self, tmp_path) -> None:
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         outbox_path = tmp_path / "email-verifications.jsonl"
         provider.register_email_verified_user(
             "alice",
@@ -1123,7 +1146,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
     ) -> None:
         now = [1_000]
         monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
-        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.register_email_verified_user(
             "alice",
             "password123",
@@ -1134,7 +1157,7 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         )
 
         now[0] += auth_local._EMAIL_VERIFICATION_TOKEN_TTL_SECONDS + auth_local._PENDING_REGISTRATION_RETENTION_SECONDS + 1
-        restarted = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        restarted = build_local_auth_provider(tmp_path / "auth.db")
         restarted.create_user("alice", "replacement-password", display_name="Replacement")
 
         token = restarted._login_sync("alice", "replacement-password")
@@ -1193,22 +1216,16 @@ class TestAuthenticate:
     @pytest.mark.asyncio
     async def test_authenticate_expired_token(self, tmp_path) -> None:
         """Token with 0-second expiry should fail after creation."""
-        import jwt as pyjwt
 
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="test-key",
-            token_expiry_hours=24,
-        )
+        provider = build_local_auth_provider(tmp_path / "auth.db", token_expiry_hours=24)
         provider.create_user("alice", "pw", display_name="Alice")
 
-        # Manually create an already-expired token
-        payload = {
-            "sub": "alice",
-            "username": "alice",
-            "exp": int(time.time()) - 10,  # 10 seconds in the past
-        }
-        expired_token = pyjwt.encode(payload, "test-key", algorithm="HS256")
+        # A COMPLETE envelope whose only defect is expiry, so the refusal can
+        # only be the expiry check.
+        expired_token = _signed_local_token(
+            provider,
+            _envelope(iat=int(time.time()) - 7200, exp=int(time.time()) - 10),
+        )
 
         with pytest.raises(AuthenticationError):
             await provider.authenticate(expired_token)
@@ -1228,16 +1245,9 @@ class TestAuthenticate:
     @pytest.mark.asyncio
     async def test_authenticate_wrong_secret_key(self, tmp_path) -> None:
         """Token signed with a different key should fail."""
-        provider = LocalAuthProvider(
-            db_path=tmp_path / "auth.db",
-            secret_key="correct-key",
-        )
-        payload = {
-            "sub": "alice",
-            "username": "alice",
-            "exp": int(time.time()) + 3600,
-        }
-        bad_token = pyjwt.encode(payload, "wrong-key", algorithm="HS256")
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        # Every claim correct; only the signing key is wrong.
+        bad_token = pyjwt.encode(_envelope(), "wrong-key", algorithm="HS256")
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(bad_token)
 

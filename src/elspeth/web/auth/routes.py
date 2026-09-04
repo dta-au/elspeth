@@ -396,54 +396,23 @@ def create_auth_router() -> APIRouter:
         request: Request,
         response: Response,
     ) -> TokenResponse:
-        """Re-issue a JWT from a valid existing token (local auth only).
+        """Re-issue a session token from a valid existing one (local auth only).
 
-        Passes the original ``iat`` claim through so the provider can
-        enforce a maximum refresh chain lifetime.
+        Hands the provider the TOKEN. The chain bound used to be enforced
+        against an ``iat`` read here from the middleware's unverified decode;
+        the provider's issuer now reads it from its own verified decode, so
+        the route no longer stands between a signature and a security bound.
         """
         settings: WebSettings = request.app.state.settings
         if settings.auth_provider != "local":
             raise HTTPException(status_code=404, detail="Not found")
 
         user = await get_current_user(request)
-
-        # Extract iat from claims parsed by the auth middleware.
-        # The middleware decodes claims without signature verification for
-        # downstream use, then verifies the signature via authenticate().
-        # If authenticate() fails, this route handler never executes.
-        #
-        # If claims are None (decode failed despite valid signature), refuse
-        # the refresh — we cannot enforce chain lifetime without iat.
-        claims = request.state.auth_claims
-        if claims is None:
-            raise _route_auth_failure(
-                request,
-                detail="Token claims could not be parsed — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
-        if "iat" not in claims:
-            raise _route_auth_failure(
-                request,
-                detail="Token missing required iat claim — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
-        original_iat = claims["iat"]
-        if type(original_iat) is not int:
-            raise _route_auth_failure(
-                request,
-                detail="Token missing required iat claim — re-authenticate",
-                failure_category="claims_invalid",
-                failure_stage="refresh_claims",
-                user=user,
-            )
+        token = request.state.auth_token
 
         provider: CredentialAuthProvider = request.app.state.auth_provider
         try:
-            new_token = await provider.refresh(user.user_id, user.username, original_iat=original_iat)
+            new_token = await provider.refresh(token)
         except AuthenticationError as exc:
             raise _route_auth_failure(
                 request,

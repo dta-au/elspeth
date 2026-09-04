@@ -58,8 +58,15 @@ from elspeth.web.audit_readiness.service import ReadinessService, build_boot_plu
 from elspeth.web.auth.admin_routes import create_dev_admin_router
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.protocol import AuthProvider
 from elspeth.web.auth.routes import create_auth_router
+from elspeth.web.auth.session_token import (
+    DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+    DEFAULT_TOKEN_EXPIRY_HOURS,
+    LOCAL_AUDIENCE,
+    SessionTokenIssuer,
+)
 from elspeth.web.auth.urls import (
     oidc_browser_endpoint_origin,
     validate_oidc_browser_endpoints,
@@ -99,7 +106,11 @@ from elspeth.web.external_state_startup import (
 from elspeth.web.external_state_startup import (
     validate_only_schema_or_raise as validate_external_schema_or_raise,
 )
-from elspeth.web.key_derivation import derive_binding_generation_key, derive_user_secret_master_key
+from elspeth.web.key_derivation import (
+    derive_binding_generation_key,
+    derive_session_token_key,
+    derive_user_secret_master_key,
+)
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
@@ -121,6 +132,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, read_identity
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -978,6 +990,78 @@ def _configure_web_logging(settings: WebSettings) -> None:
     configure_logging(json_output=settings.log_json)
 
 
+def _session_token_audience(settings: WebSettings) -> str:
+    """Bind tokens to THIS deployment.
+
+    Without an audience, two deployments configured from the same
+    ``secret_key`` -- a staging clone of production, most obviously -- would
+    each accept the other's tokens. ``LOCAL_AUDIENCE`` is the fallback for a
+    deployment with no public URL, where there is no second deployment to be
+    confused with.
+    """
+    public_base_url = settings.public_base_url
+    if public_base_url is None or not public_base_url.strip():
+        return LOCAL_AUDIENCE
+    return public_base_url.strip()
+
+
+def _build_local_auth_provider(settings: WebSettings, session_engine: Engine) -> LocalAuthProvider:
+    """Assemble the local provider from its three separate concerns.
+
+    ``auth.db`` holds credentials, the identities substrate holds admission,
+    and the issuer holds the token. This function is the only place that knows
+    all three, which is what keeps ``LocalAuthProvider`` from needing an
+    engine and the issuer from needing settings.
+    """
+    audit_recorder = AuthAuditRecorder.from_settings(settings)
+
+    def _principal_is_active(identity_id: str) -> bool:
+        record = read_identity(session_engine, identity_id)
+        # An absent row is never an implicit grant.
+        return record is not None and record.is_active
+
+    def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
+        # D12 puts a first login behind an administrator by default. A local
+        # deployment with OPEN registration has already declared that anyone
+        # may admit themselves, so it would be incoherent to hold back the
+        # people who did so before this table existed while admitting every
+        # newcomer instantly.
+        activate = settings.registration_mode == "open"
+        outcome = ensure_identity(
+            session_engine,
+            claims=claims,
+            activate=activate,
+            quota_tokens_per_day=settings.quota_default_tokens_per_day,
+            quota_storage_bytes=settings.quota_default_storage_bytes,
+        )
+        if outcome.activated_now:
+            # Written only on the transition. The surrounding ``login`` event
+            # carries the request context; this pair carries the authority
+            # decision and joins to it by identity_id.
+            audit_recorder.record_identity_admitted(
+                provider="local",
+                identity_id=outcome.record.identity_id,
+                username=outcome.record.username,
+                tokens_per_day=settings.quota_default_tokens_per_day,
+                storage_bytes=settings.quota_default_storage_bytes,
+            )
+        return outcome
+
+    issuer = SessionTokenIssuer(
+        signing_key=derive_session_token_key(settings.secret_key),
+        provider="local",
+        audience=_session_token_audience(settings),
+        token_expiry_hours=DEFAULT_TOKEN_EXPIRY_HOURS,
+        max_refresh_chain_hours=DEFAULT_MAX_REFRESH_CHAIN_HOURS,
+        principal_is_active=_principal_is_active,
+    )
+    return LocalAuthProvider(
+        db_path=settings.data_dir / "auth.db",
+        token_issuer=issuer,
+        admit_identity=_admit_identity,
+    )
+
+
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     """Create the application and synchronously clean up failed engine ownership."""
     session_engine_finalizer: weakref.finalize[..., FastAPI] | None = None
@@ -1311,14 +1395,48 @@ def _create_app(
     )
     app.include_router(catalog_router, prefix="/api/catalog")
 
+    # W16/S3: Secret key production guard -- hard crash
+    if settings.secret_key == "change-me-in-production" and not _allow_insecure_test_keys(settings.host):
+        raise SystemExit(
+            "FATAL: WebSettings.secret_key is set to the default value. "
+            "Set a secure secret_key before starting the web server. "
+            "See WebSettings documentation."
+        )
+
+    # --- Session database setup ---
+    if external_session_engine is not None:
+        session_engine = external_session_engine
+    else:
+        session_db_url = settings.get_session_db_url()
+        session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
+        register_session_engine_finalizer(session_engine_finalizer)
+        app.state._session_engine_finalizer = session_engine_finalizer
+        initialize_session_schema(session_engine)
+        session_db_path = session_engine.url.database
+        if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
+            session_engine.dispose()
+
+    # Build the sessions-telemetry container ONCE per process and share it
+    # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
+    # any future surface). The counters are intentionally process-scoped —
+    # one Counter per metric, not one per consumer — so OTel aggregates by
+    # attribute set instead of by injection site.
+    sessions_telemetry = build_sessions_telemetry(meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__))
+    app.state.sessions_telemetry = sessions_telemetry
+
+    app.state.session_engine = session_engine  # available to guided step handlers
+
     # --- Auth provider setup ---
+    #
+    # ORDER: this block now sits AFTER the session engine, because a local
+    # provider needs the identities substrate to mint a token at all -- ``sub``
+    # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
     if settings.auth_provider == "local":
-        auth_provider = LocalAuthProvider(
-            db_path=settings.data_dir / "auth.db",
-            secret_key=settings.secret_key,
-        )
-        auth_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
+        local_provider = _build_local_auth_provider(settings, session_engine)
+        local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
+        auth_provider = local_provider
     elif settings.auth_provider == "oidc":
         from elspeth.web.auth.oidc import OIDCAuthProvider
 
@@ -1351,38 +1469,6 @@ def _create_app(
     app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
     app.state.oidc_authorization_endpoint = settings.oidc_authorization_endpoint
     app.state.oidc_token_endpoint = settings.oidc_token_endpoint
-
-    # W16/S3: Secret key production guard -- hard crash
-    if settings.secret_key == "change-me-in-production" and not _allow_insecure_test_keys(settings.host):
-        raise SystemExit(
-            "FATAL: WebSettings.secret_key is set to the default value. "
-            "Set a secure secret_key before starting the web server. "
-            "See WebSettings documentation."
-        )
-
-    # --- Session database setup ---
-    if external_session_engine is not None:
-        session_engine = external_session_engine
-    else:
-        session_db_url = settings.get_session_db_url()
-        session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
-        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
-        register_session_engine_finalizer(session_engine_finalizer)
-        app.state._session_engine_finalizer = session_engine_finalizer
-        initialize_session_schema(session_engine)
-        session_db_path = session_engine.url.database
-        if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
-            session_engine.dispose()
-
-    # Build the sessions-telemetry container ONCE per process and share it
-    # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
-    # any future surface). The counters are intentionally process-scoped —
-    # one Counter per metric, not one per consumer — so OTel aggregates by
-    # attribute set instead of by injection site.
-    sessions_telemetry = build_sessions_telemetry(meter=operator_runtime.provider.get_meter("elspeth.web.composer", __version__))
-    app.state.sessions_telemetry = sessions_telemetry
-
-    app.state.session_engine = session_engine  # available to guided step handlers
 
     # --- Preferences service ---
     # Per-user composer settings (default_composer_mode, banner_dismissed_at,

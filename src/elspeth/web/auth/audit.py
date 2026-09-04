@@ -87,6 +87,18 @@ class AuthAuditWriter(Protocol):
         exception_class: str | None,
     ) -> None: ...
 
+    # The one member with no ``request``: a self-admitting deployment
+    # activates inside the login worker, where there is none to read.
+    def record_identity_admitted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
+    ) -> None: ...
+
 
 class AuthAuditOperation(StrEnum):
     LOGIN_SUCCESS_AND_TOKEN_ISSUED = "login_success_and_token_issued"
@@ -339,4 +351,61 @@ class AuthAuditRecorder:
                 client_host=_client_host(request),
                 user_agent=_bounded_text(_optional_header(request, "user-agent")),
                 metadata=_request_metadata(request),
+            )
+
+    def record_identity_admitted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
+    ) -> None:
+        """Write the ``identity_activated`` + ``quota_set`` pair for an admission.
+
+        Deliberately NOT request-bound, unlike every method above it. A
+        self-admitting deployment activates inside the login worker, which has
+        no ``Request`` to read a client host or a request id from; the
+        surrounding ``login`` event carries that context and this pair is
+        joined to it by ``identity_id``. Inventing request fields here would
+        put fabricated provenance in the audit trail.
+
+        Both rows are written under one Landscape open, in the order an
+        administrator would read them: the identity was admitted, and this is
+        the allowance it was admitted with. An activation whose quota row went
+        unaudited would leave the identity's first refusal unexplainable.
+        """
+        with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS) as db:
+            recorder = RecorderFactory(db).auth_audit
+            recorder.record_auth_event(
+                event_type="identity_activated",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=identity_id,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={"activated_by": "registration_mode", "actor": "operator"},
+            )
+            recorder.record_auth_event(
+                event_type="quota_set",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=identity_id,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "operator",
+                    "tokens_per_day": tokens_per_day,
+                    "storage_bytes": storage_bytes,
+                    "source": "container_defaults",
+                },
             )
