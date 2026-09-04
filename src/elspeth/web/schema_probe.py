@@ -32,6 +32,7 @@ from elspeth.web.sessions.schema import (
     _assert_schema_sentinels,
     _create_session_tables,
     _stamp_schema_sentinels,
+    explain_non_current_schema,
     probe_current_schema,
 )
 
@@ -321,11 +322,23 @@ def init_session_schema(engine: Engine) -> None:
             _create_session_tables(conn, checkfirst=True)
             _stamp_schema_sentinels(conn)
             return
-        raise SessionSchemaError("Session database schema is stale or partial; delete the old session database and restart.")
+        # Same treatment as verify(), and for the same reason: the operator
+        # instruction alone does not say WHAT drifted. The validator's own
+        # message already ends with "Delete the old session database and
+        # restart", so routing through the explainer keeps the instruction
+        # and adds the table, the constraint and both sides of the mismatch.
+        explain_non_current_schema(conn)
 
     def verify(conn: Connection) -> None:
-        if probe_session_schema(conn) is not SchemaState.CURRENT:
-            raise SessionSchemaError("Session database initialization did not produce the current schema.")
+        if probe_session_schema(conn) is SchemaState.CURRENT:
+            return
+        # Never raise a bare "did not produce the current schema" here. The
+        # probe collapsed a precise diagnosis into an enum to answer a yes/no
+        # question; on this path the answer is fatal, so re-run the validators
+        # un-guarded and let the one that objects say WHAT drifted. See
+        # ``explain_non_current_schema`` for why re-validating is the right
+        # trade. It never returns.
+        explain_non_current_schema(conn)
 
     _run_locked(engine, target=_LOCK_TARGET, body=body, verify=verify)
 
