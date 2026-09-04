@@ -26,7 +26,13 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 def _builtin_transforms() -> tuple[type[BaseTransform], ...]:
     manager = PluginManager()
     manager.register_builtin_plugins()
-    return tuple(manager.get_transforms())
+    transforms: list[type[BaseTransform]] = []
+    for transform in manager.get_transforms():
+        # Fail loudly rather than skip: a registered transform outside the
+        # BaseTransform hierarchy would be invisible to both tripwires.
+        assert issubclass(transform, BaseTransform), f"{transform!r} is not a BaseTransform"
+        transforms.append(transform)
+    return tuple(transforms)
 
 
 def input_semantic_requirement_overriders(transforms: Iterable[type[BaseTransform]]) -> tuple[type[BaseTransform], ...]:
@@ -85,7 +91,7 @@ def test_the_override_detector_sees_an_override() -> None:
         name = "overrides"
         determinism = Determinism.DETERMINISTIC
 
-        def input_semantic_requirements(self):  # type: ignore[override]
+        def input_semantic_requirements(self):
             return super().input_semantic_requirements()
 
     assert input_semantic_requirement_overriders((_Inherits, _Overrides)) == (_Overrides,)
