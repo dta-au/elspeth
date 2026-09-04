@@ -47,6 +47,7 @@ from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.spans import SpanFactory
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
+from tests.helpers.run_coordination import register_run_leader
 
 
 @pytest.fixture
@@ -245,7 +246,8 @@ class TestCheckRunStatusResumable:
 
         _insert_run(db, "run-seat-parity", status=RunStatus.RUNNING)
         leader_id = mint_worker_id("run-seat-parity")
-        RunCoordinationRepository(db.engine).register_run_leader(
+        register_run_leader(
+            RunCoordinationRepository(db.engine),
             run_id="run-seat-parity",
             worker_id=leader_id,
             now=datetime.now(UTC),
@@ -275,7 +277,8 @@ class TestResumeEntryGuard:
 
         _insert_run(db, "run-running", status=RunStatus.RUNNING)
         leader_id = mint_worker_id("run-running")
-        RunCoordinationRepository(db.engine).register_run_leader(
+        register_run_leader(
+            RunCoordinationRepository(db.engine),
             run_id="run-running",
             worker_id=leader_id,
             now=datetime.now(UTC),
@@ -309,7 +312,8 @@ class TestResumeEntryGuard:
 
         _insert_run(db, "run-live-leader", status=RunStatus.RUNNING)
         leader_id = mint_worker_id("run-live-leader")
-        RunCoordinationRepository(db.engine).register_run_leader(
+        register_run_leader(
+            RunCoordinationRepository(db.engine),
             run_id="run-live-leader",
             worker_id=leader_id,
             now=datetime.now(UTC),
@@ -358,7 +362,8 @@ class TestResumeEntryGuard:
         from elspeth.core.landscape.schema import run_coordination_table
 
         _insert_run(db, "run-dead-leader", status=RunStatus.RUNNING)
-        RunCoordinationRepository(db.engine).register_run_leader(
+        register_run_leader(
+            RunCoordinationRepository(db.engine),
             run_id="run-dead-leader",
             worker_id=mint_worker_id("run-dead-leader"),
             now=datetime.now(UTC),
