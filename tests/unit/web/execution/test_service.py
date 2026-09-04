@@ -111,6 +111,7 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.helpers.session_fences import make_blob_read_context
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -1412,7 +1413,7 @@ class TestExecutionFlow:
         session_id = uuid4()
         mock_session_service.get_current_state.return_value = None
 
-        result = await service.validate(session_id, user_id="alice")
+        result = await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
 
         assert result.is_valid is False
         assert result.checks[0].name == "state_exists"
@@ -1444,7 +1445,7 @@ class TestExecutionFlow:
         validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
         service.validate_state = validate_state  # type: ignore[method-assign]
 
-        result = await service.validate(session_id, user_id="alice")
+        result = await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
 
         assert result is expected
         validate_state.assert_awaited_once()
@@ -1478,7 +1479,10 @@ class TestExecutionFlow:
 
         with patch("elspeth.web.execution.service.run_sync_in_worker", new_callable=AsyncMock) as run_worker:
             run_worker.return_value = expected
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+            session_id = uuid4()
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result is expected
         run_worker.assert_awaited_once()
@@ -1517,7 +1521,14 @@ class TestExecutionFlow:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4(), completion_gates=facts)
+            session_id = uuid4()
+            result = await service.validate_state(
+                state,
+                session_operation_context=make_blob_read_context(session_id),
+                user_id="alice",
+                session_id=session_id,
+                completion_gates=facts,
+            )
 
         assert result.is_valid is True
         assert result.readiness.authoring_valid is True
@@ -1560,7 +1571,7 @@ class TestExecutionFlow:
         validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
         service.validate_state = validate_state  # type: ignore[method-assign]
 
-        await service.validate(session_id, user_id="alice")
+        await service.validate(session_id, session_operation_context=make_blob_read_context(session_id), user_id="alice")
 
         validate_state.assert_awaited_once()
         assert validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
@@ -1615,7 +1626,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -1676,7 +1689,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -1728,7 +1743,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -1775,7 +1792,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -1832,7 +1851,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -1868,7 +1889,10 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+            session_id = uuid4()
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
@@ -1919,7 +1943,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -1970,7 +1996,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -2013,7 +2041,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert [error.component_id for error in result.errors] == ["order_gate", "refund_gate"]
@@ -2044,7 +2074,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert [check.name for check in result.checks[:24]] == [check.name for check in _successful_core_validation_result().checks]
         assert result.checks[24].name == "proof_diagnostics"
@@ -2080,7 +2112,9 @@ class TestAuthoritativeProofDiagnostics:
             ),
             patch.object(Path, "read_bytes", side_effect=AssertionError("proof must use verified prefix API")),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
@@ -2189,7 +2223,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -2224,7 +2260,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2257,7 +2295,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2281,7 +2321,10 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+            session_id = uuid4()
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2334,7 +2377,10 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+            session_id = uuid4()
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -2378,7 +2424,9 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+            result = await service.validate_state(
+                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
+            )
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
