@@ -3722,6 +3722,12 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "scope_name",
                     "scope_opener",
                     "scope_policy",
+                    # Advertised since 80fa17fed (2026-08-15) and absent here until
+                    # 2026-09-04: composer-authored prose shown to reviewers on the
+                    # Spec tab. While unlisted, this fail-closed policy replaced the
+                    # key NAME with the unknown-argument sentinel, so the audit row
+                    # could not say which knob the planner had set.
+                    "description",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={
@@ -3807,6 +3813,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "plugin",
                     "options",
                     "on_write_failure",
+                    # See the note on upsert_node's "description": same schema
+                    # property, added by the same commit, missing here for the
+                    # same 20 days.
+                    "description",
                 ),
                 sensitive_argument_keys=("options",),
                 argument_summarizers={"options": _summarize_set_source_options},
