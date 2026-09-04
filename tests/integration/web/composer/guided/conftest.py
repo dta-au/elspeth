@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from testcontainers.postgres import PostgresContainer
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import stable_hash
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -60,11 +61,18 @@ class _GuidedTestExecutionService:
         self,
         state: CompositionState,
         *,
+        session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
         completion_gates: object | None = None,
     ) -> ValidationResult:
+        # Mirror the production protocol exactly: the operation context is a
+        # required keyword there, so a route that omits it must fail HERE, not
+        # only on a live deployment (the platform lane's guided wiring-confirm
+        # call shipped without it because this fake did not demand it).
         del completion_gates
+        if not isinstance(session_operation_context, SessionOperationContext):
+            raise AssertionError("guided confirmation validation requires the operation's session context")
         if user_id is None or session_id is None:
             raise AssertionError("guided confirmation validation requires principal and session custody")
         app_state = self._app.state

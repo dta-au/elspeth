@@ -5100,6 +5100,7 @@ async def post_guided_respond(
                         authoritative_preflight, _ = await _await_with_deferred_cancellation(
                             request.app.state.execution_service.validate_state(
                                 accepted_state,
+                                session_operation_context=reserved.session_operation_context,
                                 user_id=user.user_id,
                                 session_id=session_id,
                             ),

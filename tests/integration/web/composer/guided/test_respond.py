@@ -29,6 +29,7 @@ from sqlalchemy.sql.dml import Insert, Update
 from elspeth.contracts.composer_interpretation import InterpretationChoice
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -5424,11 +5425,13 @@ class TestStep2IntraStep:
                 self,
                 state,
                 *,
+                session_operation_context: SessionOperationContext,
                 user_id: str | None = None,
                 session_id: UUID | None = None,
                 completion_gates=None,
             ) -> ValidationResult:
                 del completion_gates
+                assert isinstance(session_operation_context, SessionOperationContext)
                 self.calls.append((user_id, session_id))
                 proof_state = reattach_guided_blob_refs_for_public_export(state)
                 source = next(iter(proof_state.sources.values()))
