@@ -197,13 +197,23 @@ def test_session_operation_authority_exposes_context_as_sole_action_capability()
     transaction_surface = {
         name for name, value in inspect.getmembers(SessionForkCreationTransaction, inspect.isfunction) if not name.startswith("_")
     }
+    # The fork transaction's reader set is CLOSED: staging derives every parent
+    # fact through these methods and never through a raw connection, so an
+    # addition here is a deliberate, reviewed widening rather than a drift.
+    # ``read_parent_blob_custody`` and ``read_parent_proposal_rebase_events``
+    # were added for exactly that reason — without them the fork path had to
+    # substitute a NARROWER rule than the ordinary-connection path (custody
+    # scoped to planned blobs; a proposal anchor held at its creation base),
+    # which is the asymmetry the multi-replica merge proved defective.
     assert transaction_surface == {
         "count_parent_proposal_terminal_events",
         "read_child_snapshot",
+        "read_parent_blob_custody",
         "read_parent_guided_root_authority",
         "read_parent_message",
         "read_parent_proposal",
         "read_parent_proposal_creation_events",
+        "read_parent_proposal_rebase_events",
         "read_parent_ready_blobs",
         "read_parent_session",
         "read_parent_state",

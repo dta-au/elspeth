@@ -299,6 +299,7 @@ async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside
                 lease_token=uuid4().hex,
                 attempt=1,
             ),
+            session_operation_context=make_compose_context(str(session_id)),
             **overrides,
         )
 

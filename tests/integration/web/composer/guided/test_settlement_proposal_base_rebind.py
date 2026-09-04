@@ -71,9 +71,11 @@ import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
 from elspeth.web.composer.pipeline_proposal import PresentBase
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions._guided_step_chat import GuidedStepChatOnlyResult, StepChatResult
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import (
@@ -481,6 +483,13 @@ def _seed_a_live_confirmation_admission(client: TestClient, session_id: str) -> 
     own transaction before the confirm route goes on to dispatch, so process
     death anywhere in the rest of that route leaves exactly this state behind
     until the lease runs out.
+
+    The SESSION-operation lease is taken and released around the two writes,
+    exactly as ``reserve_or_replay_guided_operation`` does: the residue this
+    seeds is the guided-operation row, not a held session lease. Holding the
+    session lease open here would make the request under test refuse with
+    ``SessionOperationConflictError`` before it ever reached the anchor fence
+    this test is about -- a different refusal, from a different guard.
     """
 
     service = client.app.state.session_service
@@ -488,19 +497,36 @@ def _seed_a_live_confirmation_admission(client: TestClient, session_id: str) -> 
     assert guided is not None
     active = guided.active_proposal
     assert active is not None, "the staged Step-3 proposal must still be pending"
-    claimed = asyncio.run(
-        service.reserve_guided_operation(
+
+    async def _seed() -> str:
+        lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
             session_id=UUID(session_id),
-            operation_id=str(uuid4()),
-            kind="guided_respond",
-            request_hash="b" * 64,
-            actor="worker",
-            lease_seconds=300,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
-    )
-    assert type(claimed) is GuidedOperationClaimed
-    asyncio.run(service.bind_guided_operation(claimed.fence, proposal_id=active.proposal_id))
-    return claimed.fence.operation_id
+        try:
+            claimed = await service.reserve_guided_operation(
+                session_id=UUID(session_id),
+                operation_id=str(uuid4()),
+                kind="guided_respond",
+                request_hash="b" * 64,
+                actor="worker",
+                lease_seconds=300,
+                session_operation_context=lease.context,
+            )
+            assert type(claimed) is GuidedOperationClaimed
+            await service.bind_guided_operation(
+                claimed.fence,
+                proposal_id=active.proposal_id,
+                session_operation_context=lease.context,
+            )
+        finally:
+            await lease.close()
+        return claimed.fence.operation_id
+
+    return asyncio.run(_seed())
 
 
 def test_a_carrying_settlement_refuses_while_a_confirmation_admission_is_live(

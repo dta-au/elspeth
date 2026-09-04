@@ -5,8 +5,12 @@ the reason the planner saw — text AND reasoning — persists as SESSION data
 (not Landscape data), keyed to session + the composition state that was
 current at rejection time. These tests pin the persistence primitive.
 
-Uses the shared ``engine`` fixture and ``_make_session`` helper from
-``tests/unit/web/conftest.py``.
+Uses the shared ``engine`` fixture from ``tests/unit/web/conftest.py`` and the
+fenced ``_make_session`` / ``_test_compose_context`` pair from the sibling
+``test_persist_compose_turn.py``: ``persist_compose_turn`` is the same writer
+those tests drive, and it requires an exact live COMPOSE fence for the session.
+The bare conftest ``_make_session`` mints a session row with no fence, which the
+writer refuses -- correctly, and that refusal is not this file's subject.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from elspeth.web.sessions._persist_payload import (
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.conftest import _make_session
+from tests.unit.web.sessions.test_persist_compose_turn import _make_session, _test_compose_context
 
 
 @pytest.fixture
@@ -94,6 +98,7 @@ def test_persist_compose_turn_persists_rejection_record(service):
         expected_current_state_id=None,
         writer_principal="compose_loop",
         plugin_crash_pending=False,
+        session_operation_context=_test_compose_context("s_rej"),
     )
 
     with service._engine.begin() as conn:
@@ -152,6 +157,7 @@ def test_rejection_record_links_to_state_current_at_rejection(service):
         expected_current_state_id=None,
         writer_principal="compose_loop",
         plugin_crash_pending=False,
+        session_operation_context=_test_compose_context("s_rej2"),
     )
 
     with service._engine.begin() as conn:
@@ -184,6 +190,7 @@ def test_persist_compose_turn_rejects_rejection_for_unknown_tool_call_id(service
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=False,
+            session_operation_context=_test_compose_context("s_rej3"),
         )
 
     with service._engine.begin() as conn:

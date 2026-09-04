@@ -1041,6 +1041,34 @@ def register_session_routes(router: APIRouter) -> None:
                     if isinstance(primary_exc, (AuditIntegrityError, BlobContentMissingError, BlobIntegrityError))
                     else "operation_failed"
                 )
+                if isinstance(primary_exc, AuditIntegrityError):
+                    # The ONLY carrier of what failed is ``str(primary_exc)``:
+                    # ``fail_guided_operation`` durably records a code, not a
+                    # message, and ``raise_guided_operation_failure`` answers
+                    # with a fixed envelope. For pre-staging custody detection
+                    # (inside ``fork_session``, no child row yet) and for the
+                    # rewrite-boundary backstop, that message NAMES the
+                    # offending composer_meta key -- the whole point of failing
+                    # there rather than at settlement -- so it gets a
+                    # last-resort record; the failed operation (and, after
+                    # staging, the archived child) is the audit evidence, this
+                    # is the diagnostic that says which key.
+                    #
+                    # This record is taken BEFORE the ``staged is None`` arm
+                    # below, which raises: the pre-staging case is the one that
+                    # names a key no other surface can, so settling the
+                    # operation first would discard exactly the diagnostic this
+                    # exists for.
+                    _log_last_resort_diagnostic(
+                        slog.error,
+                        "session.fork_rewrite_integrity_error",
+                        session_id=str(session_id),
+                        child_session_id=str(staged.session.id) if staged is not None else None,
+                        operation_id=fence.operation_id,
+                        exc_class=type(primary_exc).__name__,
+                        message=str(primary_exc),
+                    )
+
                 if staged is None:
                     # Staging itself failed: the reserved row must still reach
                     # a terminal state under the parent authority, otherwise
@@ -1060,28 +1088,6 @@ def register_session_routes(router: APIRouter) -> None:
                     raise_guided_operation_failure(failed)
 
                 cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
-
-                if isinstance(primary_exc, AuditIntegrityError):
-                    # The ONLY carrier of what failed is ``str(primary_exc)``:
-                    # ``fail_guided_operation`` durably records a code, not a
-                    # message, and ``raise_guided_operation_failure`` answers
-                    # with a fixed envelope. For pre-staging custody detection
-                    # (inside ``fork_session``, no child row yet) and for the
-                    # rewrite-boundary backstop, that message NAMES the
-                    # offending composer_meta key -- the whole point of failing
-                    # there rather than at settlement -- so it gets a
-                    # last-resort record; the failed operation (and, after
-                    # staging, the archived child) is the audit evidence, this
-                    # is the diagnostic that says which key.
-                    _log_last_resort_diagnostic(
-                        slog.error,
-                        "session.fork_rewrite_integrity_error",
-                        session_id=str(session_id),
-                        child_session_id=str(staged.session.id) if staged is not None else None,
-                        operation_id=fence.operation_id,
-                        exc_class=type(primary_exc).__name__,
-                        message=str(primary_exc),
-                    )
 
                 if staged is not None:
                     try:

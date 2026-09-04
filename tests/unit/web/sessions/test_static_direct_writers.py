@@ -1544,13 +1544,16 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     ReviewedWriter(
         path="tests/unit/web/sessions/test_guided_custody_gate.py",
-        enclosing_symbol="TestWriteBoundaryGate.test_set_active_state_refuses_to_copy_a_legacy_unbindable_active_row",
+        enclosing_symbol="TestWriteBoundaryGate.test_guided_revert_refuses_to_copy_a_legacy_unbindable_active_row",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
             "Seeds a composition_states row that predates the pre-persist guided "
-            "custody gate (elspeth-4c442aaaa8) so set_active_state's refusal to "
-            "re-tip onto it can be pinned; the gate itself blocks the service path."
+            "custody gate (elspeth-4c442aaaa8) so the fenced guided revert's refusal "
+            "to re-tip onto it can be pinned; the gate itself blocks the service path. "
+            "Renamed with its test when the unfenced set_active_state setter this "
+            "originally pinned was removed (fc84028df); same row, same purpose, and "
+            "revert_state_for_guided_operation reaches the same custody gate."
         ),
     ),
     ReviewedWriter(

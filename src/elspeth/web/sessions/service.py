@@ -1055,12 +1055,71 @@ def _verified_guided_root_message_row(
     session_id: str,
     message_id: str,
 ) -> Any:
-    """Re-derive one guided root intent from the operation that authored it.
+    """Read one guided root intent's authority rows on an ordinary connection.
 
-    The single authority for "is this message really this session's root
-    intent": the immutable, completed ``guided_start`` OR ``guided_convert``
-    row that names it, its result checkpoint, and the canonical request hash
-    re-derived from the live message content.
+    The three rows — the immutable completed ``guided_start`` OR
+    ``guided_convert`` operation that names the message, that operation's
+    result checkpoint, and the chat row itself — are read under this session's
+    scope and handed to :func:`_verified_guided_root_authority`, which is the
+    single judge. Returns the verified ``chat_messages`` row so callers that
+    must hand the content on do not re-read it.
+    """
+
+    operations = conn.execute(
+        select(guided_operations_table)
+        .where(guided_operations_table.c.session_id == session_id)
+        .where(guided_operations_table.c.kind.in_(("guided_start", "guided_convert")))
+        .where(guided_operations_table.c.status == "completed")
+        .where(guided_operations_table.c.originating_message_id == message_id)
+        .where(guided_operations_table.c.result_kind == "composition_state")
+    ).fetchall()
+    state_row = None
+    if len(operations) == 1:
+        state_row = conn.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == session_id)
+            .where(composition_states_table.c.id == operations[0].result_state_id)
+        ).one_or_none()
+    message_row = conn.execute(
+        select(chat_messages_table).where(chat_messages_table.c.session_id == session_id).where(chat_messages_table.c.id == message_id)
+    ).one_or_none()
+    return _verified_guided_root_authority(
+        service=service,
+        session_id=session_id,
+        message_id=message_id,
+        message_row=message_row,
+        operations=tuple(operations),
+        state_row=state_row,
+    )
+
+
+def _verified_guided_root_authority(
+    *,
+    service: Any,
+    session_id: str,
+    message_id: str,
+    message_row: Any,
+    operations: tuple[Any, ...],
+    state_row: Any,
+) -> Any:
+    """Judge one guided root intent from rows a caller's own reader supplied.
+
+    The ordinary-connection reader (:func:`_verified_guided_root_message_row`)
+    and the fork transaction's closed reader
+    (``SessionForkCreationTransaction.read_parent_guided_root_authority``) both
+    hand their three rows here, so the KIND, PROFILE and HASH derivation exists
+    exactly once. Splitting it left the fork branch hardcoding
+    ``kind="guided_start"`` and ``profile="live"`` while the ordinary branch
+    read both off the checkpoint — a fork of a converted or non-``live`` parent
+    then re-derived a different hash and was refused.
+
+    ``operations`` must already be scoped to COMPLETED ``guided_start`` /
+    ``guided_convert`` rows whose ``originating_message_id`` is ``message_id``
+    and whose ``result_kind`` is ``composition_state``; ``state_row`` is that
+    operation's result checkpoint and ``message_row`` the named chat row, each
+    read under the caller's own session scoping. Returns the verified
+    ``chat_messages`` row so callers that must hand the content on do not
+    re-read it.
 
     Two facts are read off the RESULT CHECKPOINT rather than assumed:
 
@@ -1078,39 +1137,20 @@ def _verified_guided_root_message_row(
     the child's ``guided_start`` row under a literal ``"profile": "live"``
     request hash, so the child's own start checkpoint is the consistent
     authority even when its parent was a tutorial.
-
-    Returns the verified ``chat_messages`` row so callers that must hand the
-    content on do not re-read it.
     """
 
     from elspeth.web.composer.guided.profile import kind_for_profile
     from elspeth.web.sessions.guided_operations import guided_operation_request_hash
     from elspeth.web.sessions.schemas import ConvertGuidedRequest, StartGuidedRequest
 
-    operations = conn.execute(
-        select(guided_operations_table)
-        .where(guided_operations_table.c.session_id == session_id)
-        .where(guided_operations_table.c.kind.in_(("guided_start", "guided_convert")))
-        .where(guided_operations_table.c.status == "completed")
-        .where(guided_operations_table.c.originating_message_id == message_id)
-        .where(guided_operations_table.c.result_kind == "composition_state")
-    ).fetchall()
     if len(operations) != 1:
         raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
     operation = operations[0]
-    state_row = conn.execute(
-        select(composition_states_table)
-        .where(composition_states_table.c.session_id == session_id)
-        .where(composition_states_table.c.id == operation.result_state_id)
-    ).one_or_none()
     if state_row is None:
         raise AuditIntegrityError("guided root intent start result state is missing")
     start_guided = state_from_record(service._row_to_state_record(state_row)).guided_session
     if start_guided is None or start_guided.root_intent_message_id != message_id:
         raise AuditIntegrityError("guided root intent differs from its live start checkpoint")
-    message_row = conn.execute(
-        select(chat_messages_table).where(chat_messages_table.c.session_id == session_id).where(chat_messages_table.c.id == message_id)
-    ).one_or_none()
     if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
         raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
     operation_kind: GuidedOperationKind = "guided_convert" if operation.kind == "guided_convert" else "guided_start"
@@ -1154,11 +1194,6 @@ def _verify_guided_root_message_authority(
         return
     message_id = guided.root_intent_message_id
     if type(conn) is not _ForkCreationTransaction:
-        # Ordinary connection: ``_verified_guided_root_message_row`` is the
-        # single authority and is strictly broader than the inline walk this
-        # branch replaced — it accepts ``guided_convert`` as well as
-        # ``guided_start`` and recovers the profile discriminator from the
-        # start checkpoint instead of hardcoding ``"live"``.
         _verified_guided_root_message_row(
             cast(Connection, conn),
             service=service,
@@ -1168,39 +1203,23 @@ def _verify_guided_root_message_authority(
         return
 
     # Fork staging reads the PARENT session through the fork transaction's
-    # closed accessor, which is scoped to ``guided_start`` rows; the request
-    # hash is therefore re-derived against ``StartGuidedRequest`` here.
-    from elspeth.web.sessions.guided_operations import guided_operation_request_hash
-    from elspeth.web.sessions.schemas import StartGuidedRequest
-
+    # closed accessor rather than an ordinary connection, then hands the same
+    # three rows to the same judge. Only the READER differs between the two
+    # branches; the kind/profile/hash derivation must not, which is exactly
+    # what an inline walk here got wrong.
     try:
         root_message_id = UUID(message_id)
     except ValueError as exc:
         raise AuditIntegrityError("guided root intent message id is malformed") from exc
     message_row, operations, state_row = cast(SessionForkCreationTransaction, conn).read_parent_guided_root_authority(root_message_id)
-    if message_row is None or message_row.role != "user" or message_row.writer_principal != "route_user_message":
-        raise AuditIntegrityError("guided root intent row failed session/role/writer custody")
-    if len(operations) != 1:
-        raise AuditIntegrityError("guided root intent has absent or ambiguous start-operation authority")
-    operation = operations[0]
-    request = StartGuidedRequest.model_validate(
-        {"operation_id": operation.operation_id, "profile": "live", "intent": message_row.content},
-        strict=True,
+    _verified_guided_root_authority(
+        service=service,
+        session_id=session_id,
+        message_id=message_id,
+        message_row=message_row,
+        operations=operations,
+        state_row=state_row,
     )
-    if (
-        guided_operation_request_hash(
-            session_id=UUID(session_id),
-            kind="guided_start",
-            request=request,
-        )
-        != operation.request_hash
-    ):
-        raise AuditIntegrityError("guided root intent content no longer matches its start request hash")
-    if state_row is None:
-        raise AuditIntegrityError("guided root intent start result state is missing")
-    start_guided = state_from_record(service._row_to_state_record(state_row)).guided_session
-    if start_guided is None or start_guided.root_intent_message_id != message_id:
-        raise AuditIntegrityError("guided root intent differs from its live start checkpoint")
 
 
 def _require_exact_guided_intent_cancellation_audit(
@@ -2154,10 +2173,8 @@ def _pipeline_proposal_rebase_hop(
 
 
 def _effective_pipeline_proposal_base(
-    conn: Connection,
+    rows: Sequence[Any],
     *,
-    session_id: str,
-    proposal_id: str,
     creation_base: ProposalBase,
     tool_call_id: str,
     draft_hash: str,
@@ -2172,6 +2189,13 @@ def _effective_pipeline_proposal_base(
     DERIVED here rather than trusted from the mutable column — the column is
     then checked against this derivation by the caller.
 
+    ``rows`` are that proposal's ``proposal.rebased`` events, read by the
+    caller through whichever reader it holds — an ordinary connection or the
+    fork transaction's closed accessor. The derivation is deliberately not a
+    reader itself: keeping the WALK here and the READ at the call site is what
+    lets the fork-transaction path share this one derivation instead of
+    substituting a narrower rule of its own.
+
     The chain is walked as a linked list (each hop's ``from_state_id``
     naming the previous ``to_state_id``), never sorted by ``created_at``:
     same-microsecond ties are possible and a timestamp sort cannot see a
@@ -2179,12 +2203,6 @@ def _effective_pipeline_proposal_base(
     hop is detectable corruption instead of a silently shortened chain.
     """
 
-    rows = conn.execute(
-        select(proposal_events_table)
-        .where(proposal_events_table.c.session_id == session_id)
-        .where(proposal_events_table.c.proposal_id == proposal_id)
-        .where(proposal_events_table.c.event_type == "proposal.rebased")
-    ).fetchall()
     if not rows:
         return creation_base
     if type(creation_base) is not PresentBase:
@@ -2320,24 +2338,27 @@ def _restore_authoritative_pipeline_proposal(
     # base moved forward by every appended rebase hop, and the mutable row
     # column is checked against that derivation rather than being trusted
     # as the source of truth (elspeth-ed67eb9d0d).
+    # Only the READER of the rebase hops differs by connection kind; the
+    # derivation below is the same one on both paths.
     if type(conn) is _ForkCreationTransaction:
-        # The fork transaction's reader set is closed and has no
-        # ``proposal.rebased`` accessor (``read_parent_proposal_creation_events``
-        # filters to ``proposal.created``), so the anchor cannot be DERIVED on
-        # this path. Hold the creation base rather than trusting the mutable
-        # column: the binding check below then refuses a parent whose pending
-        # proposal has been rebased, which is exactly the behaviour this path
-        # had before rebases existed.
-        current_base = proposal.base
+        rebase_rows: Sequence[Any] = cast(SessionForkCreationTransaction, conn).read_parent_proposal_rebase_events(row.id)
     else:
-        current_base = _effective_pipeline_proposal_base(
-            cast(Connection, conn),
-            session_id=str(row.session_id),
-            proposal_id=str(row.id),
-            creation_base=proposal.base,
-            tool_call_id=row.tool_call_id,
-            draft_hash=proposal.draft_hash,
+        rebase_rows = (
+            cast(Connection, conn)
+            .execute(
+                select(proposal_events_table)
+                .where(proposal_events_table.c.session_id == str(row.session_id))
+                .where(proposal_events_table.c.proposal_id == str(row.id))
+                .where(proposal_events_table.c.event_type == "proposal.rebased")
+            )
+            .fetchall()
         )
+    current_base = _effective_pipeline_proposal_base(
+        rebase_rows,
+        creation_base=proposal.base,
+        tool_call_id=row.tool_call_id,
+        draft_hash=proposal.draft_hash,
+    )
     expected_base_state_id = current_base.state_id if type(current_base) is PresentBase else None
     if row.base_state_id != expected_base_state_id:
         raise AuditIntegrityError("pipeline proposal row/base state binding mismatch")
@@ -2818,6 +2839,7 @@ def _verify_guided_pending_proposal_rebase(
 def _rebind_guided_pending_proposal(
     conn: Connection,
     *,
+    mutation: _GuidedSessionMutationTransaction,
     authority: AuthoritativePipelineProposal,
     reason: GuidedProposalRebaseReason,
     actor: str,
@@ -2845,7 +2867,17 @@ def _rebind_guided_pending_proposal(
     realistic producer is process death mid-confirm, the scenario
     ``test_expired_confirmation_takeover_recovers_without_duplicate_dispatch``
     models) releases its proposal locator on the first call past expiry,
-    which is the release this function's own guard performs.
+    which is the release the fence performs.
+
+    The fence is ``mutation.guided.require_no_active_confirmation``, the
+    guided facet's own ``guided_operations`` writer, so the release and the
+    active-owner check run under the settling operation's exact dual fence
+    like every other guided-operation write. A module-level duplicate of
+    that facet method once lived here on a raw connection; the narrow-domain
+    rule (``test_guided_composite_authority_has_only_narrow_domain_mutations``)
+    forbids exactly that, and the facet scopes the check by the fence's
+    session, which is the proposal's session because both the fence and the
+    rebase authority derive from the same settlement command.
 
     No owner discrimination is needed here, unlike
     :meth:`SessionServiceImpl.admit_guided_pipeline_confirmation`, which
@@ -2864,12 +2896,7 @@ def _rebind_guided_pending_proposal(
     if type(authority.current_base) is not PresentBase:  # pragma: no cover - the rebase verifier owns this
         raise AuditIntegrityError("guided proposal rebase lost its persisted anchor")
     from_state_id = authority.current_base.state_id
-    _require_no_active_guided_confirmation_admission(
-        conn,
-        session_id=session_id,
-        proposal_id=proposal_id,
-        now=created_at,
-    )
+    mutation.guided.require_no_active_confirmation(proposal_id=authority.row.id, now=created_at)
     event_id = str(uuid.uuid4())
     conn.execute(
         insert(proposal_events_table).values(
@@ -2963,44 +2990,6 @@ def _verify_guided_pending_proposal_transition(
             carried=refs.carried,
         ),
     )
-
-
-def _require_no_active_guided_confirmation_admission(
-    conn: Connection,
-    *,
-    session_id: str,
-    proposal_id: str,
-    now: datetime,
-) -> None:
-    """Fail a competing mutation while a live confirmation owns dispatch.
-
-    Expired leases cannot dispatch or persist under their old fence, so their
-    proposal locator is released before the active-owner check. This prevents
-    an abandoned admission from fencing the proposal forever.
-    """
-
-    conn.execute(
-        update(guided_operations_table)
-        .where(
-            guided_operations_table.c.session_id == session_id,
-            guided_operations_table.c.proposal_id == proposal_id,
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.lease_expires_at <= now,
-        )
-        .values(proposal_id=None, updated_at=now)
-    )
-    active = conn.execute(
-        select(guided_operations_table.c.operation_id)
-        .where(
-            guided_operations_table.c.session_id == session_id,
-            guided_operations_table.c.proposal_id == proposal_id,
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.lease_expires_at > now,
-        )
-        .limit(1)
-    ).one_or_none()
-    if active is not None:
-        raise GuidedOperationSettlementConflictError()
 
 
 def _classify_authoritative_composition_proposal(
@@ -6276,24 +6265,35 @@ class SessionServiceImpl:
         """Retire pending reviews the just-inserted head extinguished, then log them.
 
         The sweep itself lives in ``sessions/dead_site_supersession.py`` so the
-        session-operation authority's own composition-state writer
-        (``_RepositoryCompositionStateMutations.append_state``) runs the SAME
-        retirement inside its own transaction. Two writers with one rule; see
-        that module for why the predicate is "derivation raises".
+        session-operation authority's own composition-state writers
+        (``_RepositoryCompositionStateMutations.append_state`` and
+        ``_RepositoryInterpretationMutations.create_or_reconcile_pending``) run
+        the SAME retirement inside their own transactions. One rule for every
+        writer; see that module for why the predicate is "derivation raises".
+
+        The head is handed over as a BUILDER, not a value: the sweep short-
+        circuits when nothing is pending, which is the common case, and this
+        caller's derivation costs a row re-read plus a full record parse. Passing
+        a materialised record here would put both on every composition-state
+        insert.
         """
-        state_row = conn.execute(
-            select(composition_states_table)
-            .where(composition_states_table.c.id == state_id)
-            .where(composition_states_table.c.session_id == session_id)
-        ).one_or_none()
-        if state_row is None:  # pragma: no cover - caller inserted this row in this transaction
-            raise AuditIntegrityError(
-                f"_supersede_dead_site_pending_interpretation_events: state {state_id!r} missing in session {session_id!r}"
-            )
+
+        def _build_state_record() -> CompositionStateRecord:
+            state_row = conn.execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.id == state_id)
+                .where(composition_states_table.c.session_id == session_id)
+            ).one_or_none()
+            if state_row is None:  # pragma: no cover - caller inserted this row in this transaction
+                raise AuditIntegrityError(
+                    f"_supersede_dead_site_pending_interpretation_events: state {state_id!r} missing in session {session_id!r}"
+                )
+            return self._row_to_state_record(state_row)
+
         for retired in supersede_dead_site_pending_interpretation_events(
             conn,
             session_id=session_id,
-            state_record=self._row_to_state_record(state_row),
+            build_state_record=_build_state_record,
             now=self._now(),
         ):
             self._log.info(
@@ -10890,14 +10890,20 @@ class SessionServiceImpl:
                     # After the insert: ``composition_proposals.base_state_id``
                     # carries a foreign key onto ``composition_states``, so the
                     # checkpoint the base moves onto must already exist.
-                    _rebind_guided_pending_proposal(
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        authority=rebased_authority.authority,
-                        reason=rebased_authority.reason,
-                        actor=command.actor,
-                        created_at=now,
-                        to_state_id=command.state_id,
-                    )
+                        guided_fence=command.fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        _rebind_guided_pending_proposal(
+                            conn,
+                            mutation=mutation,
+                            authority=rebased_authority.authority,
+                            reason=rebased_authority.reason,
+                            actor=command.actor,
+                            created_at=now,
+                            to_state_id=command.state_id,
+                        )
 
                 row_count = len(audit_rows) + (1 if command.originating_message is not None else 0)
                 sequence_no = self._reserve_sequence_range(conn, sid, count=row_count) if row_count else None
@@ -11475,14 +11481,20 @@ class SessionServiceImpl:
                     # After the insert: ``composition_proposals.base_state_id``
                     # carries a foreign key onto ``composition_states``, so the
                     # checkpoint the anchor moves onto must already exist.
-                    _rebind_guided_pending_proposal(
+                    with self._guided_session_mutation_transaction(
                         conn,
-                        authority=rebase_plan.authority,
-                        reason=rebase_plan.reason,
-                        actor=command.actor,
-                        created_at=now,
-                        to_state_id=command.checkpoint_state_id,
-                    )
+                        guided_fence=command.fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        _rebind_guided_pending_proposal(
+                            conn,
+                            mutation=mutation,
+                            authority=rebase_plan.authority,
+                            reason=rebase_plan.reason,
+                            actor=command.actor,
+                            created_at=now,
+                            to_state_id=command.checkpoint_state_id,
+                        )
 
                 sequence_no = self._reserve_sequence_range(conn, sid, count=2 + len(audit_rows))
                 self._insert_chat_message(
@@ -13354,6 +13366,20 @@ class SessionServiceImpl:
                             session_id=parent_session_id_str,
                             guided=source_guided,
                         )
+                # Custody no rewriter can rebase is refused HERE, inside the
+                # staging transaction and before any child row is written, so
+                # the failure the route's backstop can only NAME never leaves
+                # an archived child behind. The needle set is every parent blob
+                # row at any status: an unplanned (non-``ready``) blob has no
+                # child copy to rebase onto, so the plan's own reader cannot
+                # see the references that matter here.
+                parent_blob_rows = transaction.read_parent_blob_custody()
+                _refuse_unrewritable_fork_custody(
+                    composer_meta=forked_composer_meta,
+                    validation_errors=locked_source_state.validation_errors,
+                    metadata=locked_source_state.metadata_,
+                    forbidden=frozenset(item for row in parent_blob_rows for item in (row.id, row.storage_path)),
+                )
 
             plan = tuple(
                 BlobForkPlanEntry(

@@ -20,13 +20,19 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composition_states_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateRecord,
+    GuidedOperationClaimed,
+    GuidedOperationFence,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _PRIVATE = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
 _LIVE_BLOB_REF = "50f5b3e9-f52f-4c5f-98df-a20ec7b2627b"
@@ -43,12 +49,32 @@ def engine():
 
 @pytest.fixture
 def service(engine):
-    return SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    """The leased harness, not a bare ``SessionServiceImpl``.
+
+    Every composition-state writer below is fenced: it requires an exact
+    ``session_operation_context`` of the right operation kind. These tests are
+    about the CUSTODY gate, not about lease acquisition, so the harness holds a
+    real short-lived lease around each call rather than each test hand-rolling
+    one. Passing no context at all is what the fence contract refuses, and that
+    refusal is the merge working as designed -- not a signature to relax.
+    """
+    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
 
 
-def _unbindable_pair(*, terminal: dict[str, Any] | None, transition_consumed: bool = False) -> CompositionStateData:
+def _unbindable_pair(
+    *,
+    terminal: dict[str, Any] | None,
+    transition_consumed: bool = False,
+    guided_session: dict[str, Any] | None = None,
+) -> CompositionStateData:
     """Incident v13 (elspeth-201903a286): a retained sentinel review of ``source``
-    re-attached to a live ``source`` bound to a different blob."""
+    re-attached to a live ``source`` bound to a different blob.
+
+    ``guided_session`` overrides the minimal hand-rolled snapshot for callers
+    that must also survive a ``GuidedSession.from_dict`` parse upstream of the
+    write gate; the custody claim (live ``source`` on one blob, reviewed
+    ``source`` on a sentinel naming another) is identical either way.
+    """
     return CompositionStateData(
         sources={"source": {"plugin": "csv", "options": {"path": _PRIVATE, "blob_ref": _LIVE_BLOB_REF}}},
         nodes=[],
@@ -57,7 +83,9 @@ def _unbindable_pair(*, terminal: dict[str, Any] | None, transition_consumed: bo
         metadata_={"name": "Guided", "description": ""},
         is_valid=False,
         composer_meta={
-            "guided_session": {
+            "guided_session": guided_session
+            if guided_session is not None
+            else {
                 "reviewed_sources": {
                     "11111111-1111-4111-8111-111111111111": {"name": "source", "plugin": "csv", "options": {"path": _REVIEWED_SENTINEL}}
                 },
@@ -66,6 +94,79 @@ def _unbindable_pair(*, terminal: dict[str, Any] | None, transition_consumed: bo
                 "transition_consumed": transition_consumed,
             }
         },
+    )
+
+
+def _schema10_unbindable_guided_session() -> dict[str, Any]:
+    """The same unbindable custody claim, serialized by the real ``GuidedSession``.
+
+    ``_unbindable_pair``'s minimal dict is all the write gate needs (it binds on
+    the schema-8 review keys and never parses the record), but the guided revert
+    reader runs ``GuidedSession.from_dict`` on the target checkpoint first and
+    refuses an unparseable one for shape. Building the snapshot through the real
+    dataclass keeps the custody claim and gets past that reader, so the refusal
+    under test is the CUSTODY gate's and not a shape guard's.
+    """
+    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
+    from elspeth.web.composer.guided.resolved import SourceResolved
+    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
+
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    return GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_2_SINK,
+                turn_type=TurnType.INSPECT_AND_CONFIRM,
+                payload_hash="a" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": _REVIEWED_SENTINEL},
+                observed_columns=("id",),
+                sample_rows=({"id": 1},),
+                on_validation_failure="discard",
+            )
+        },
+        root_intent_message_id=str(uuid.uuid4()),
+    ).to_dict()
+
+
+async def _claim_state_revert(service: DualFencedSessionServiceHarness, session_id: uuid.UUID) -> GuidedOperationFence:
+    """Reserve the guided ``state_revert`` operation the fenced revert requires."""
+    outcome = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id=str(uuid.uuid4()),
+        kind="state_revert",
+        request_hash="a" * 64,
+        actor="composer_route",
+        lease_seconds=60,
+    )
+    assert isinstance(outcome, GuidedOperationClaimed)
+    return outcome.fence
+
+
+async def _revert_to(
+    service: DualFencedSessionServiceHarness,
+    fence: GuidedOperationFence,
+    state_id: uuid.UUID,
+) -> CompositionStateRecord:
+    """Copy ``state_id`` forward through the fenced revert, bound to the live head."""
+    current = await service.get_current_state(fence.session_id)
+    assert current is not None
+    return await service.revert_state_for_guided_operation(
+        fence,
+        state_id=state_id,
+        expected_current_state_id=current.id,
+        expected_current_state_version=current.version,
+        actor="composer_route",
+        response_hash_factory=lambda state: stable_hash({"state_id": str(state.id), "version": state.version}),
     )
 
 
@@ -113,16 +214,31 @@ class TestWriteBoundaryGate:
         assert [m.role for m in messages] == []
 
     @pytest.mark.asyncio
-    async def test_set_active_state_refuses_to_copy_a_legacy_unbindable_active_row(self, service, engine) -> None:
+    async def test_guided_revert_refuses_to_copy_a_legacy_unbindable_active_row(self, service, engine) -> None:
         """A row persisted before the gate existed must not be re-tipped by revert:
-        the copy would brick the session exactly as the original insert did."""
+        the copy would brick the session exactly as the original insert did.
+
+        Re-expressed against ``revert_state_for_guided_operation``. The revert
+        this test was written for -- the unfenced ``set_active_state`` -- was
+        deliberately deleted on this branch (``fc84028df``, "remove unfenced
+        active state setter"); the fenced guided revert is the only remaining
+        copy-a-prior-checkpoint writer, and it reaches the same
+        ``_insert_composition_state`` gate. The property mainline pinned is
+        therefore preserved exactly: the refusal, the unchanged version count
+        after it, and a clean revert still advancing the version.
+        """
         session = await service.create_session("alice", "Guided", "local")
         good = await service.save_composition_state(
             session.id,
             CompositionStateData(metadata_={"name": "Guided", "description": ""}, is_valid=True),
             provenance="session_seed",
         )
-        legacy = _unbindable_pair(terminal=None)
+        # Schema-10-valid guided authority carrying the SAME unbindable custody
+        # as ``_unbindable_pair``. The revert reader parses the target
+        # checkpoint's guided session before the write gate runs, so a
+        # hand-rolled dict is refused for malformed shape and never reaches the
+        # custody gate this test is about.
+        legacy = _unbindable_pair(terminal=None, guided_session=_schema10_unbindable_guided_session())
         legacy_id = uuid.uuid4()
         with engine.begin() as conn:
             conn.execute(
@@ -144,10 +260,13 @@ class TestWriteBoundaryGate:
                     created_at=datetime.now(UTC),
                 )
             )
+        fence = await _claim_state_revert(service, session.id)
         with pytest.raises(AuditIntegrityError, match="guided blob"):
-            await service.set_active_state(session.id, legacy_id)
+            await _revert_to(service, fence, legacy_id)
         assert _version_count(engine, session.id) == 2
-        reverted = await service.set_active_state(session.id, good.id)
+        # The refused revert left the operation live, so the same fence settles
+        # the clean one: the gate rejects the ROW, it does not brick the lease.
+        reverted = await _revert_to(service, fence, good.id)
         assert reverted.version == 3
 
 

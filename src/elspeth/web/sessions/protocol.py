@@ -3567,9 +3567,16 @@ class SessionForkCreationTransaction(Protocol):
 
     def read_parent_ready_blobs(self) -> tuple[Any, ...]: ...
 
+    def read_parent_blob_custody(self) -> tuple[Any, ...]: ...
+
     def read_parent_proposal(self, proposal_id: UUID) -> Any | None: ...
 
     def read_parent_proposal_creation_events(
+        self,
+        proposal_id: UUID,
+    ) -> tuple[Any, ...]: ...
+
+    def read_parent_proposal_rebase_events(
         self,
         proposal_id: UUID,
     ) -> tuple[Any, ...]: ...

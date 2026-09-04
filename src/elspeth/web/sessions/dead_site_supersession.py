@@ -1,13 +1,20 @@
 """Dead-site supersession of pending interpretation reviews.
 
-One implementation, two composition-state writers. The locked session head
-owns supersession authority, so the head advance and the retirement of the
-reviews it extinguished must settle in the SAME transaction. Before this
-module the sweep lived only on ``SessionServiceImpl._insert_composition_state``
-while the session-operation authority's own writer
-(``_RepositoryCompositionStateMutations.append_state``) appended a head
-without it — a split that merges cleanly and leaves the zombie card
-mainline's ``elspeth-d73139155a`` fix exists to retire.
+One implementation, every writer that advances a session HEAD. The locked
+session head owns supersession authority, so the head advance and the
+retirement of the reviews it extinguished must settle in the SAME transaction.
+Before this module the sweep lived only on
+``SessionServiceImpl._insert_composition_state`` while the session-operation
+authority's own head writers appended without it — a split that merges cleanly
+and leaves the zombie card mainline's ``elspeth-d73139155a`` fix exists to
+retire. The three head writers are
+``SessionServiceImpl._insert_composition_state``,
+``_RepositoryCompositionStateMutations.append_state`` and
+``_RepositoryInterpretationMutations.create_or_reconcile_pending`` (the
+auto-interpreted opt-out derived head). ``insert_child_state`` is deliberately
+excluded: it writes version 1 of a session that did not exist before this
+transaction, so that session can carry no review the new head could
+extinguish.
 
 The module holds no logging: ``web/coordination/repository.py`` is
 deliberately log-free and the durable ``interpretation_events`` row is the
@@ -28,6 +35,7 @@ from elspeth.web.sessions.models import interpretation_events_table
 from elspeth.web.sessions.protocol import CompositionStateRecord, InterpretationResolveError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
 
     from sqlalchemy import Connection
@@ -48,14 +56,18 @@ def supersede_dead_site_pending_interpretation_events(
     connection: Connection,
     *,
     session_id: str,
-    state_record: CompositionStateRecord,
+    build_state_record: Callable[[], CompositionStateRecord],
     now: datetime,
 ) -> tuple[RetiredDeadSiteReview, ...]:
     """Terminally retire pending reviews whose site the new head extinguished.
 
-    ``state_record`` is the head this transaction just appended; ``connection``
-    must be the same connection that inserted it, so the advance and the
-    retirement commit together.
+    ``build_state_record`` derives the head this transaction just appended, and
+    is called ONLY once a pending user-approved review is found. The derivation
+    is deferred rather than taken as a value because the common case is that
+    nothing is pending: a writer on the hot composition-state path must not pay
+    a row re-read and record parse per append to discover there is no work.
+    ``connection`` must be the same connection that inserted the head, so the
+    advance and the retirement commit together.
 
     The predicate is deliberately "identity derivation RAISES", never
     "identity differs": a differing identity means the site still exists and
@@ -70,8 +82,6 @@ def supersede_dead_site_pending_interpretation_events(
     """
     from elspeth.web.sessions.pending_interpretation import _reviewed_content_identity
 
-    if type(state_record) is not CompositionStateRecord:
-        raise TypeError("dead-site supersession requires an exact CompositionStateRecord head")
     pending_rows = connection.execute(
         select(interpretation_events_table)
         .where(interpretation_events_table.c.session_id == session_id)
@@ -80,6 +90,9 @@ def supersede_dead_site_pending_interpretation_events(
     ).all()
     if not pending_rows:
         return ()
+    state_record = build_state_record()
+    if type(state_record) is not CompositionStateRecord:
+        raise TypeError("dead-site supersession requires an exact CompositionStateRecord head")
 
     def _extinguished_site_error(kind: InterpretationKind, affected_node_id: str, user_term: str) -> str | None:
         """Return the derivation error when the new head extinguished the site, else None."""

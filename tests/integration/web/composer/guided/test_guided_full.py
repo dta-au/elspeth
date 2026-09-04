@@ -512,7 +512,11 @@ def test_guided_full_failure_settlement_error_surfaces_integrity_error(
 
     secondary_secret = "secondary-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
 
-    async def fail_cleanup(_command):
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
         raise RuntimeError(secondary_secret)
 
     composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
@@ -553,7 +557,10 @@ def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcom
 
     real_reserve = reserve_or_replay_guided_operation
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def no_winner_lookup(**kwargs):
@@ -1662,7 +1669,11 @@ def test_guided_full_cancellation_settlement_error_surfaces_integrity_error(
             self.started.set()
             await asyncio.Event().wait()
 
-    async def fail_cleanup(_command):
+    # The double carries the real writer's keyword-only fence argument. A
+    # narrower stub raises TypeError inside the route's failure arm, so the
+    # secondary diagnostic below would read that TypeError instead of the
+    # failure this test injects.
+    async def fail_cleanup(_command, *, session_operation_context):
         raise RuntimeError(secondary_secret)
 
     planner = _BlockingPlanner()
@@ -1721,7 +1732,10 @@ def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preservi
     real_reserve = reserve_or_replay_guided_operation
     winner_lookups = 0
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def no_winner_lookup(**kwargs):
@@ -1806,7 +1820,10 @@ def test_guided_full_cancellation_fence_loss_propagates_a_failed_winner_lookup(
     planner = _BlockingPlanner()
     real_reserve = reserve_or_replay_guided_operation
 
-    async def lose_failure_fence(command):
+    # The double carries the real writer's keyword-only fence argument: a
+    # narrower stub raises TypeError before it can raise the fence loss this
+    # test is about.
+    async def lose_failure_fence(command, *, session_operation_context):
         raise GuidedOperationFenceLostError(command.fence)
 
     async def failing_winner_lookup(**kwargs):

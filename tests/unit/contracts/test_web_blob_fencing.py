@@ -3168,9 +3168,18 @@ def test_route_gate_accepts_annotated_direct_binding() -> None:
     assert _route_violations(ast.parse(_blob_read_endpoint_source(annotated=True)), contract) == []
 
 
-def test_blob_read_vocabulary_is_present_in_epoch_44_without_protocol_bump() -> None:
+def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> None:
+    """The blob-read fence kind ships inside the session schema, not beside it.
+
+    The number is the substrate's live epoch, re-pinned by decision D3: the
+    coordination substrate carried 44 and then 48 on its own lane and shipped
+    under neither, because both integers already name different schemas on the
+    release line. The claim the test makes is unchanged -- the vocabulary is in
+    the session schema and the web coordination PROTOCOL version does not move
+    with it -- so the name has to state the epoch that is true.
+    """
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 44
+    assert SESSION_SCHEMA_EPOCH == 51
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

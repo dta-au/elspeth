@@ -694,6 +694,64 @@ class TestConvertEmptySession:
         assert response.json()["detail"]["failure_code"] == "stale_conflict"
         assert [entry for entry in cap_logs if entry.get("event") == "guided.operation_terminal_failure"] == []
 
+    def test_losing_the_race_after_the_compose_lock_conflicts_instead_of_discarding_the_goal(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """The post-lock loser gets 409, not a 200 carrying the winner's session.
+
+        The pre-lock classification (409 ``guided_already_started``) is reachable
+        only when the head is ALREADY guided when this request arrives. The other
+        half of that contract — "returning it unchanged would silently discard
+        the goal this request carries" — belongs to the post-lock re-read, where
+        a competing start or convert won between classification and the compose
+        lock. Every other test in this file seeds the guided state before the
+        request and therefore exercises only the pre-lock branch, which is why a
+        post-lock branch that settled and answered 200 could pass the whole
+        suite while dropping the loser's intent on the floor.
+
+        The race is made deterministic without a second thread by hiding the
+        head from the probes that run BEFORE the operation row is reserved: the
+        durable ``guided_convert`` row is the marker, so this keys on a fact the
+        route itself creates rather than on a call count.
+
+        ``post_guided_start`` may answer 200 in the same position because
+        ``_verify_start_root`` first proves the durable root carries THIS
+        request's intent. A conversion has no such equality, so it must conflict.
+        """
+        client = composer_test_client
+        session_id = _create_session(client, profile="live")
+        service = client.app.state.session_service
+        engine = client.app.state.session_engine
+        real_get_current_state = service.get_current_state
+
+        async def _head_visible_only_after_reservation(observed_session_id):
+            record = await real_get_current_state(observed_session_id)
+            with engine.connect() as conn:
+                reserved = (
+                    conn.execute(
+                        select(guided_operations_table.c.operation_id).where(
+                            guided_operations_table.c.session_id == str(observed_session_id),
+                            guided_operations_table.c.kind == "guided_convert",
+                        )
+                    ).first()
+                    is not None
+                )
+            return record if reserved else None
+
+        with patch.object(service, "get_current_state", new=_head_visible_only_after_reservation):
+            response = _convert_raw(client, session_id)
+
+        assert response.status_code == 409, response.json()
+        assert response.json()["detail"]["failure_code"] == "stale_conflict"
+        # The loser's goal never became anyone's durable root intent, and the
+        # winner's rooted session is exactly as it was.
+        messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
+        assert [message for message in messages if message.content == _CONVERT_INTENT] == []
+        surviving = client.get(f"/api/sessions/{session_id}/guided")
+        assert surviving.status_code == 200, surviving.json()
+        assert [turn["content"] for turn in surviving.json()["guided_session"]["chat_history"] if turn["role"] == "user"] == [_START_INTENT]
+
     def test_expected_head_conflict_is_terminal_409_and_exactly_replayed(self, composer_test_client: TestClient) -> None:
         client = composer_test_client
         session_id = _create_session(client)

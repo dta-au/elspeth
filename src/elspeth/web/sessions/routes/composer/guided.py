@@ -2169,17 +2169,17 @@ async def post_guided_convert(
             # race to a start or a competing convert before this lock. That is
             # an ordinary settlement conflict — the caller reloads and sees the
             # guided session — not a fault to page on.
+            #
+            # It is NOT an idempotent settlement. ``post_guided_start`` may
+            # settle the winner's checkpoint and answer 200 because it first
+            # proves, in ``_verify_start_root``, that the durable root carries
+            # THIS request's intent; a conversion has no such equality and
+            # answering 200 here would report success while silently discarding
+            # the goal the loser typed. The reserved lease is still settled:
+            # the handler below fails the operation as ``stale_conflict`` and
+            # answers 409, so nothing is left holding the session.
             if state_record is not None and _state_from_record(state_record).guided_session is not None:
-                settled_record = await service.complete_existing_state_guided_operation(
-                    reserved.fence,
-                    state_id=state_record.id,
-                    expected_current_state_id=state_record.id,
-                    expected_current_state_version=state_record.version,
-                    actor="composer_route",
-                    response_hash_factory=lambda record: guided_response_hash(_response_from_record(record)),
-                    session_operation_context=reserved.session_operation_context,
-                )
-                return _response_from_record(settled_record)
+                raise GuidedOperationSettlementConflictError()
 
             # Branches 1 & 3: seed a fresh guided wizard rooted in the author's
             # goal, the same shape ``/guided/start`` seeds.

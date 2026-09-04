@@ -49,6 +49,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
+from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -660,6 +661,11 @@ class _RepositoryCompositionStateMutations:
             ).scalar_one()
         )
         data = creation.data
+        # An active guided pair that cannot bind would re-raise on every read of
+        # this row; refuse it here, under the operation fence, before it becomes
+        # the tip. Every composition-state INSERT in this repository runs the
+        # same admission, matching ``SessionServiceImpl._insert_composition_state``.
+        assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
@@ -706,7 +712,7 @@ class _RepositoryCompositionStateMutations:
         supersede_dead_site_pending_interpretation_events(
             connection,
             session_id=state._session_id,
-            state_record=record,
+            build_state_record=lambda: record,
             now=state._database_now,
         )
         return record
@@ -1063,6 +1069,12 @@ class _RepositoryInterpretationMutations:
                 ).scalar_one()
             )
             data = appended_state.data
+            # This append is a genuine session HEAD (version MAX+1, derived_from
+            # set), so it owes the same two obligations as every other head
+            # writer: refuse an unbindable active guided pair before it becomes
+            # the tip, and retire in THIS transaction the pending reviews whose
+            # site the new head extinguished.
+            assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
             connection.execute(
                 insert(composition_states_table).values(
                     id=str(appended_state.id),
@@ -1081,6 +1093,30 @@ class _RepositoryInterpretationMutations:
                     provenance=appended_state.provenance,
                     created_at=appended_state.created_at,
                 )
+            )
+            from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
+
+            appended_record = CompositionStateRecord(
+                id=appended_state.id,
+                session_id=UUID(state._session_id),
+                version=version,
+                source=None,
+                sources=data.sources,
+                nodes=data.nodes,
+                edges=data.edges,
+                outputs=data.outputs,
+                metadata_=data.metadata_,
+                is_valid=data.is_valid,
+                validation_errors=data.validation_errors,
+                created_at=appended_state.created_at,
+                derived_from_state_id=appended_state.derived_from_state_id,
+                composer_meta=data.composer_meta,
+            )
+            supersede_dead_site_pending_interpretation_events(
+                connection,
+                session_id=state._session_id,
+                build_state_record=lambda: appended_record,
+                now=state._database_now,
             )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
         return self._event_record(row)
@@ -3298,6 +3334,10 @@ class _ForkChildSessionMutations:
         if type(creation) is not SessionForkChildStateCreation:
             raise TypeError("fork child state creation must be exact")
         state = creation.data
+        # The child's first state is copied custody: an active guided pair that
+        # cannot bind in the child would re-raise on every read of the forked
+        # row, so it is refused here rather than at the child's first read.
+        assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
         connection = self._require_exact_child_context()
         next_version = connection.execute(
             select(func.coalesce(func.max(composition_states_table.c.version), 0) + 1).where(
@@ -3668,6 +3708,29 @@ class _ForkCreationTransaction:
             .all()
         )
 
+    def read_parent_blob_custody(self) -> tuple[Any, ...]:
+        """Read every parent blob's id and storage path, at ANY status.
+
+        Distinct from :meth:`read_parent_ready_blobs`, which is the FORK PLAN's
+        reader and is scoped to ``ready``. Custody detection needs the wider
+        set: a ``pending`` or ``failed`` parent blob is outside every plan, so
+        a reference to it in the source state can never be rebased onto a child
+        copy — precisely the custody
+        ``sessions/service.py::_refuse_unrewritable_fork_custody`` refuses
+        before the child is staged. Scoping this to ``ready`` would make the
+        refusal blind to exactly the rows it exists to catch.
+        """
+        self._require_active()
+        return tuple(
+            _resolve_mutation_connection(self.__connection_token)
+            .execute(
+                select(blobs_table.c.id, blobs_table.c.storage_path)
+                .where(blobs_table.c.session_id == self.__parent_session_id)
+                .order_by(blobs_table.c.id)
+            )
+            .all()
+        )
+
     def read_parent_proposal(self, proposal_id: UUID) -> Any | None:
         self._require_active()
         proposal_id_str = self._require_uuid(proposal_id, field_name="proposal_id")
@@ -3700,6 +3763,33 @@ class _ForkCreationTransaction:
             .all()
         )
 
+    def read_parent_proposal_rebase_events(
+        self,
+        proposal_id: UUID,
+    ) -> tuple[Any, ...]:
+        """Read the appended ``proposal.rebased`` hops for one parent proposal.
+
+        The fork transaction's reader set is closed, so without this accessor
+        ``sessions/service.py::_effective_pipeline_proposal_base`` could not
+        run on the fork path and the anchor was held at the immutable creation
+        base — which refuses a parent whose pending proposal has been rebased,
+        the ordinary outcome of a guided local replan (elspeth-ed67eb9d0d).
+        Scoped and shaped exactly like its ``proposal.created`` sibling.
+        """
+        self._require_active()
+        proposal_id_str = self._require_uuid(proposal_id, field_name="proposal_id")
+        return tuple(
+            _resolve_mutation_connection(self.__connection_token)
+            .execute(
+                select(proposal_events_table).where(
+                    proposal_events_table.c.session_id == self.__parent_session_id,
+                    proposal_events_table.c.proposal_id == proposal_id_str,
+                    proposal_events_table.c.event_type == "proposal.rebased",
+                )
+            )
+            .all()
+        )
+
     def count_parent_proposal_terminal_events(self, proposal_id: UUID) -> int:
         self._require_active()
         proposal_id_str = self._require_uuid(proposal_id, field_name="proposal_id")
@@ -3721,6 +3811,17 @@ class _ForkCreationTransaction:
         self,
         message_id: UUID,
     ) -> tuple[Any | None, tuple[Any, ...], Any | None]:
+        """Read the parent rows one guided root-intent derivation needs.
+
+        The operation filter admits ``guided_convert`` as well as
+        ``guided_start``: a converted session's root intent is claimed by a
+        ``guided_convert`` row, and scoping this accessor to starts left the
+        fork path deriving root authority from ZERO operations for such a
+        parent. The rows are returned unjudged so
+        ``sessions/service.py::_verified_guided_root_authority`` — the single
+        derivation both the ordinary-connection and the fork-transaction path
+        run — decides kind, profile and hash.
+        """
         self._require_active()
         message_id_str = self._require_uuid(message_id, field_name="message_id")
         connection = _resolve_mutation_connection(self.__connection_token)
@@ -3738,7 +3839,7 @@ class _ForkCreationTransaction:
             connection.execute(
                 select(guided_operations_table).where(
                     guided_operations_table.c.session_id == self.__parent_session_id,
-                    guided_operations_table.c.kind == "guided_start",
+                    guided_operations_table.c.kind.in_(("guided_start", "guided_convert")),
                     guided_operations_table.c.status == "completed",
                     guided_operations_table.c.originating_message_id == message_id_str,
                     guided_operations_table.c.result_kind == "composition_state",
