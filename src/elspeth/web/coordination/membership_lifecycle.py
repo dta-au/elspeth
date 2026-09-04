@@ -15,18 +15,19 @@ both database modes.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import threading
 from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import final
 
 import structlog
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     WebInstanceIdentity,
+    WebInstanceMembershipLost,
 )
 
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
@@ -47,6 +48,14 @@ def heartbeat_interval_seconds(lease_seconds: int) -> int:
     return max(1, lease_seconds // 3)
 
 
+class MembershipShutdownOutcome(StrEnum):
+    """What a shutdown step's row write did; the local draining signal is set regardless."""
+
+    RECORDED = "recorded"
+    FAILED = "failed"
+    NO_MEMBERSHIP = "no_membership"
+
+
 class WebInstanceMembership(ABC):
     """What the lifespan and the readiness gate need from membership."""
 
@@ -64,10 +73,10 @@ class WebInstanceMembership(ABC):
     async def start(self) -> None: ...
 
     @abstractmethod
-    async def begin_drain(self) -> None: ...
+    async def begin_drain(self) -> MembershipShutdownOutcome: ...
 
     @abstractmethod
-    async def stop(self) -> None: ...
+    async def stop(self) -> MembershipShutdownOutcome: ...
 
 
 @final
@@ -79,11 +88,12 @@ class SingleProcessWebInstanceMembership(WebInstanceMembership):
     async def start(self) -> None:
         return None
 
-    async def begin_drain(self) -> None:
+    async def begin_drain(self) -> MembershipShutdownOutcome:
         self._draining.set()
+        return MembershipShutdownOutcome.NO_MEMBERSHIP
 
-    async def stop(self) -> None:
-        return None
+    async def stop(self) -> MembershipShutdownOutcome:
+        return MembershipShutdownOutcome.NO_MEMBERSHIP
 
 
 @final
@@ -165,30 +175,47 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
                     consecutive_failures=consecutive_failures,
                 )
 
-    async def begin_drain(self) -> None:
-        """Fail readiness locally first; the row write is best effort on the way out."""
+    async def begin_drain(self) -> MembershipShutdownOutcome:
+        """Fail readiness locally first; the row write's outcome is returned, never hidden."""
         self._draining.set()
         try:
             await run_sync_in_worker(self._authority.begin_drain, self._identity.instance_id, lease_seconds=self._lease_seconds)
-        except Exception as exc:
-            # Shutdown proceeds whether or not the database can be reached:
-            # a drain write that fails leaves the row active with a live
-            # lease, which peers treat as a dead owner once it expires.
+        except (SQLAlchemyError, WebInstanceMembershipLost) as exc:
+            # Shutdown proceeds whether or not the database can be reached or
+            # the row still exists: a drain write that fails leaves the row
+            # active with a live lease, which peers treat as a dead owner once
+            # it expires. Any other failure class is a defect and propagates.
             self._log.error("web_instance_drain_failed", exc_class=type(exc).__name__)
+            return MembershipShutdownOutcome.FAILED
+        return MembershipShutdownOutcome.RECORDED
 
-    async def stop(self) -> None:
-        """Cancel renewal and record ``stopped`` with an expired lease."""
+    async def stop(self) -> MembershipShutdownOutcome:
+        """Cancel renewal and record ``stopped`` with an expired lease.
+
+        A heartbeat task that had already died re-raises its stored failure
+        here, after the stop write has been attempted, so the fault that
+        cancelled the lifespan surfaces at shutdown instead of being lost.
+        """
         task = self._heartbeat_task
         self._heartbeat_task = None
+        heartbeat_failure: BaseException | None = None
+        if task is not None:
+            task.cancel()
+            # Wait for the task to settle without letting its own
+            # cancellation surface here.
+            await asyncio.wait({task})
+            if not task.cancelled():
+                heartbeat_failure = task.exception()
         try:
-            if task is not None:
-                task.cancel()
-                # A heartbeat task that already died re-raises its stored
-                # failure here, after the stop write below has been attempted.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        finally:
-            try:
-                await run_sync_in_worker(self._authority.stop, self._identity.instance_id)
-            except Exception as exc:
-                self._log.error("web_instance_stop_failed", exc_class=type(exc).__name__)
+            await run_sync_in_worker(self._authority.stop, self._identity.instance_id)
+        except (SQLAlchemyError, WebInstanceMembershipLost) as exc:
+            # A stop write that fails leaves the row active or draining with a
+            # live lease; peers take over once it expires instead of at once.
+            # Any other failure class propagates.
+            self._log.error("web_instance_stop_failed", exc_class=type(exc).__name__)
+            if heartbeat_failure is not None:
+                raise heartbeat_failure from exc
+            return MembershipShutdownOutcome.FAILED
+        if heartbeat_failure is not None:
+            raise heartbeat_failure
+        return MembershipShutdownOutcome.RECORDED

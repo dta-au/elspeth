@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import Engine, select, update
 from sqlalchemy.exc import OperationalError
 
+from elspeth.web.async_workers import run_sync_in_worker as real_run_sync_in_worker
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination import membership_lifecycle as lifecycle_module
 from elspeth.web.coordination.contracts import CompatibilityKey, InstanceState
@@ -25,6 +26,7 @@ from elspeth.web.coordination.membership_authority import (
     web_instance_identity_from_settings,
 )
 from elspeth.web.coordination.membership_lifecycle import (
+    MembershipShutdownOutcome,
     RegisteredWebInstanceMembership,
     SingleProcessWebInstanceMembership,
     heartbeat_interval_seconds,
@@ -350,9 +352,9 @@ class TestSingleProcessMembership:
         membership = SingleProcessWebInstanceMembership()
         await membership.start()
         assert not membership.draining.is_set()
-        await membership.begin_drain()
+        assert await membership.begin_drain() is MembershipShutdownOutcome.NO_MEMBERSHIP
         assert membership.draining.is_set()
-        await membership.stop()
+        assert await membership.stop() is MembershipShutdownOutcome.NO_MEMBERSHIP
         assert _row_count(engine) == 0
 
 
@@ -409,11 +411,11 @@ class TestRegisteredMembership:
         membership = RegisteredWebInstanceMembership(authority, identity, lease_seconds=30, interval_seconds=1)
         await membership.start()
 
-        await membership.begin_drain()
+        assert await membership.begin_drain() is MembershipShutdownOutcome.RECORDED
         assert membership.draining.is_set()
         assert _row(engine, identity.instance_id).state == "draining"
 
-        await membership.stop()
+        assert await membership.stop() is MembershipShutdownOutcome.RECORDED
         row = _row(engine, identity.instance_id)
         assert row.state == "stopped"
         assert row.lease_expires_at == row.last_heartbeat_at
@@ -428,8 +430,8 @@ class TestRegisteredMembership:
         with engine.begin() as conn:
             conn.execute(web_instances_table.delete().where(web_instances_table.c.instance_id == identity.instance_id))
 
-        await membership.begin_drain()
-        await membership.stop()
+        assert await membership.begin_drain() is MembershipShutdownOutcome.FAILED
+        assert await membership.stop() is MembershipShutdownOutcome.FAILED
 
         assert membership.draining.is_set()
         assert _row_count(engine) == 0
@@ -441,7 +443,6 @@ class TestRegisteredMembership:
         authority = RepositoryWebInstanceMembershipAuthority(engine)
         identity = _identity()
         calls = 0
-        real_run_sync_in_worker = lifecycle_module.run_sync_in_worker
 
         async def contended_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
             nonlocal calls

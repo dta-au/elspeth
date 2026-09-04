@@ -59,9 +59,9 @@ def _database_clock_value(value: object) -> datetime:
     treats a connection passed to any callable as an escaped handle, so each
     authority method reads the clock through the connection's own methods.
     """
-    if isinstance(value, str):
+    if type(value) is str:
         value = datetime.fromisoformat(value)
-    if not isinstance(value, datetime):
+    if type(value) is not datetime:
         raise RuntimeError("sessions database clock returned a non-datetime value")
     return _ensure_utc(value)
 
