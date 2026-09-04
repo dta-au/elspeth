@@ -261,7 +261,17 @@ class ContractLoopStub:
                     "id": self.INITIAL_NODE_ID,
                     "node_type": "transform",
                     "plugin": "passthrough",
-                    "input": None,
+                    # The channel the source publishes to, NOT the source's key
+                    # in the ``sources`` mapping: ``state.py`` builds
+                    # ``runtime_connections`` from source.on_success /
+                    # node.on_success / node.on_error / routes / fork_to, so
+                    # ``"source"`` would fail ``node_input_not_reachable``.
+                    # ``None`` is likewise unemittable — ``_SetPipelineNodePayload``
+                    # types ``input`` as ``str`` and the schema marks it required,
+                    # so ``SetPipelineArgumentsModel`` rejects it at
+                    # ``nodes.0.input``, evaluating the LLM against an impossible
+                    # state.
+                    "input": self.INITIAL_NODE_ID,
                     "on_success": f"output:{self.INITIAL_OUTPUT_NAME}",
                     "on_error": None,
                     "options": ({"schema": self.clean_schema} if self.clean_schema is not None else {}),
