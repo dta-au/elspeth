@@ -256,7 +256,12 @@ def create_auth_router() -> APIRouter:
                 request,
                 provider=settings.auth_provider,
                 username=body.username,
-                failure_category="invalid_credentials",
+                # Classified, not hardcoded. Login can now fail for reasons
+                # that are not a bad credential — an identity awaiting
+                # approval, or one that has been disabled — and recording
+                # those as invalid_credentials would hide an approval queue
+                # inside the trail that is supposed to surface brute force.
+                failure_category=classify_authentication_failure(exc),
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
 

@@ -42,14 +42,14 @@ describe("UserAdminDialog", () => {
   });
 
   it("lists accounts on open", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     expect(await screen.findByText("Alice")).toBeInTheDocument();
     expect(screen.getByText("John")).toBeInTheDocument();
     expect(screen.getByText("alice@example.com")).toBeInTheDocument();
   });
 
   it("mounts the modal chrome on the app-dialog primitive (elspeth-e6fcd8d703)", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     // The frame was a copy-pasted inline style object at literal z-index 101
@@ -72,7 +72,7 @@ describe("UserAdminDialog", () => {
   });
 
   it("offers no Delete button on the signed-in admin's own row", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
     // One row (alice) has Delete; john's row must not.
     expect(screen.getAllByRole("button", { name: /^delete$/i })).toHaveLength(
@@ -82,7 +82,7 @@ describe("UserAdminDialog", () => {
 
   it("creates a user and shows the one-time password with copy", async () => {
     createAdminUser.mockResolvedValue({ user_id: "bob", password: "s3cretpw" });
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     await userEvent.type(screen.getByLabelText(/username/i), "bob");
@@ -107,7 +107,7 @@ describe("UserAdminDialog", () => {
       user_id: "alice",
       password: "n3wpw",
     });
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     await userEvent.click(
@@ -124,7 +124,7 @@ describe("UserAdminDialog", () => {
 
   it("requires a second click to delete", async () => {
     deleteAdminUser.mockResolvedValue(undefined);
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     await userEvent.click(screen.getByRole("button", { name: /^delete$/i }));
@@ -137,7 +137,7 @@ describe("UserAdminDialog", () => {
   });
 
   it("holds the delete control's width across the confirm step (elspeth-a0700fefff)", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     const deleteBtn = screen.getByRole("button", { name: /^delete$/i });
@@ -167,7 +167,7 @@ describe("UserAdminDialog", () => {
   });
 
   it("separates the row actions with a styled gap, not a literal text space", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     const resetBtn = screen.getAllByRole("button", {
@@ -186,7 +186,7 @@ describe("UserAdminDialog", () => {
 
   it("surfaces API failures in an alert region", async () => {
     resetAdminUserPassword.mockRejectedValue(new Error("User not found"));
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     await userEvent.click(
@@ -199,7 +199,7 @@ describe("UserAdminDialog", () => {
   });
 
   it("Escape closes the dialog", async () => {
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
     await userEvent.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalled();
@@ -207,7 +207,7 @@ describe("UserAdminDialog", () => {
 
   it("moves focus to the password banner after a create", async () => {
     createAdminUser.mockResolvedValue({ user_id: "bob", password: "s3cretpw" });
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
 
     await userEvent.type(screen.getByLabelText(/username/i), "bob");
@@ -223,7 +223,7 @@ describe("UserAdminDialog", () => {
       user_id: "alice",
       password: "n3wpw",
     });
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     await screen.findByText("Alice");
     await userEvent.click(
       screen.getAllByRole("button", { name: /reset password/i })[1],
@@ -242,7 +242,7 @@ describe("UserAdminDialog", () => {
 
   it("shows an empty state when no accounts exist", async () => {
     fetchAdminUsers.mockResolvedValue({ users: [] });
-    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    render(<UserAdminDialog onClose={onClose} currentUsername="john" />);
     expect(await screen.findByText(/no accounts yet/i)).toBeInTheDocument();
   });
 });

@@ -16,7 +16,8 @@ from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.web.auth import audit as audit_module
-from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
+from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -335,3 +336,44 @@ def test_every_writer_propagates_and_redacts_expected_database_failures(
         "/api/auth/login",
     ):
         assert sentinel not in rendered
+
+
+class TestAdmissionFailureCategories:
+    """A correct password refused at the D12 wall is not a bad credential.
+
+    Recording it as one poisons both trails an administrator reads: the queue
+    of people waiting for approval, and the trail that would show a
+    brute-force attempt. These four categories are what the login route now
+    derives instead of hardcoding ``invalid_credentials``.
+    """
+
+    def test_a_pending_identity_is_not_a_credential_failure(self) -> None:
+        exc = AuthenticationError("Account is pending — awaiting administrator approval")
+        assert classify_authentication_failure(exc) == "access_pending"
+
+    def test_a_disabled_identity_is_its_own_category(self) -> None:
+        """A revocation taking effect, not a failed guess."""
+        exc = AuthenticationError("Account is disabled — contact an administrator")
+        assert classify_authentication_failure(exc) == "identity_disabled"
+
+    def test_a_genuinely_bad_credential_keeps_its_category(self) -> None:
+        """The control: adding the arms above must not lose this one."""
+        exc = AuthenticationError("Invalid credentials")
+        assert classify_authentication_failure(exc) == "invalid_credentials"
+
+    def test_an_unverified_email_is_distinguishable(self) -> None:
+        exc = AuthenticationError("Email verification required")
+        assert classify_authentication_failure(exc) == "email_unverified"
+
+    def test_the_four_admission_outcomes_are_all_distinct(self) -> None:
+        """A classifier that collapsed any two would defeat the point."""
+        categories = {
+            classify_authentication_failure(AuthenticationError(detail))
+            for detail in (
+                "Account is pending — awaiting administrator approval",
+                "Account is disabled — contact an administrator",
+                "Invalid credentials",
+                "Email verification required",
+            )
+        }
+        assert len(categories) == 4

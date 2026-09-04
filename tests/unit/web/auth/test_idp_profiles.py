@@ -10,6 +10,7 @@ gap between those two statements.
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 from typing import Any
 
@@ -181,7 +182,12 @@ class TestIdentityMapping:
         """D17: IdP groups are organisation facts, never compartment facts."""
         claims = profile_claims = {"sub": "s", "preferred_username": "ada", "groups": ["admins", "everyone"]}
         mapped = get_profile("entra").map_identity(claims, None)
-        assert not hasattr(mapped, "groups")
+        # Asserted against the DECLARED fields, not probed with hasattr.
+        # IdentityClaims is a type we own, so its shape is knowable
+        # statically; probing it would be attribute masquerading, and it
+        # would also pass vacuously if the class were ever renamed out from
+        # under this test.
+        assert "groups" not in {declared.name for declared in dataclasses.fields(mapped)}
         assert profile_claims["groups"] == ["admins", "everyone"]  # untouched, just unread
 
     def test_vanguard_assembles_a_display_name_and_carries_the_abn(self) -> None:

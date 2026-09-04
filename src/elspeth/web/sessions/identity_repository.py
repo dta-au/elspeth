@@ -29,6 +29,7 @@ not read settings.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, cast, get_args
@@ -177,6 +178,7 @@ def ensure_identity(
     activate: bool,
     quota_tokens_per_day: int | None,
     quota_storage_bytes: int | None,
+    record_admission: Callable[[str, str], None] | None = None,
 ) -> EnsureIdentityOutcome:
     """Resolve ``(provider, subject)`` to its identity row, creating it once.
 
@@ -189,6 +191,27 @@ def ensure_identity(
     admitted a cohort by ``(provider, subject)`` before anyone logged in has
     already made the activation decision, and their ``access_state`` outranks
     ``activate``. This is why the function never downgrades an existing row.
+
+    WHY ``record_admission`` IS CALLED INSIDE THE TRANSACTION
+    --------------------------------------------------------
+    It writes the ``identity_activated`` + ``quota_set`` pair, and it runs
+    BEFORE this transaction commits so that a failed audit rolls the
+    activation back. Called after the commit instead, an audit failure would
+    leave a row that is already ``active`` while the retry -- finding it
+    active -- would never attempt the audit again. That is an activation no
+    audit trail records and no path can repair: exactly the unauditable
+    authority change the spec treats as corruption evidence.
+
+    Two costs are accepted deliberately:
+
+    * the sessions write lock is held across one Landscape write. It happens
+      once per identity, at first admission, never on a returning login.
+    * if the audit commits and THIS transaction then fails, Landscape carries
+      an activation that did not take. That residual is chosen over its
+      opposite: an over-recorded activation is a visible contradiction (an
+      ``identity_activated`` event for an identity that is pending or absent),
+      while an under-recorded one is invisible, and an audit trail that can be
+      silently short is worth less than one that can be provably wrong.
     """
     now = datetime.now(UTC)
     with engine.begin() as conn:
@@ -244,6 +267,10 @@ def ensure_identity(
                     tokens_per_day=quota_tokens_per_day,
                     storage_bytes=quota_storage_bytes,
                 )
+            if activate and record_admission is not None:
+                # Raises on audit failure, which rolls this transaction back
+                # and leaves no activated-but-unaudited identity behind.
+                record_admission(identity_id, claims.username)
             record = IdentityRecord(
                 identity_id=identity_id,
                 provider=claims.provider,

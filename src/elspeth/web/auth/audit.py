@@ -174,6 +174,20 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
         return "provider_unavailable"
 
     detail = exc.detail
+    # Admission outcomes come FIRST and are their own categories. A correct
+    # password refused at the D12 wall is not a bad credential, and recording
+    # it as one poisons both trails an administrator reads: the queue of
+    # people waiting for approval, and the one that would show a brute-force
+    # attempt. Same for a disabled identity, which is a revocation taking
+    # effect, not a failed guess.
+    if detail.startswith("Account is pending"):
+        return "access_pending"
+    if detail.startswith("Account is disabled"):
+        return "identity_disabled"
+    if detail.startswith("Invalid credentials"):
+        return "invalid_credentials"
+    if detail.startswith("Email verification required"):
+        return "email_unverified"
     if detail.startswith("Invalid tenant") or detail.startswith("Missing tenant claim"):
         return "tenant_claim_invalid"
     if detail.startswith("Missing required") or "group overage marker" in detail or detail.startswith("OIDC profile claim"):

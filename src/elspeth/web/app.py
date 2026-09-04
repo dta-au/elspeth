@@ -1005,7 +1005,12 @@ def _session_token_audience(settings: WebSettings) -> str:
     return public_base_url.strip()
 
 
-def _build_local_auth_provider(settings: WebSettings, session_engine: Engine) -> LocalAuthProvider:
+def _build_local_auth_provider(
+    settings: WebSettings,
+    session_engine: Engine,
+    *,
+    resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
+) -> LocalAuthProvider:
     """Assemble the local provider from its three separate concerns.
 
     ``auth.db`` holds credentials, the identities substrate holds admission,
@@ -1013,12 +1018,30 @@ def _build_local_auth_provider(settings: WebSettings, session_engine: Engine) ->
     all three, which is what keeps ``LocalAuthProvider`` from needing an
     engine and the issuer from needing settings.
     """
-    audit_recorder = AuthAuditRecorder.from_settings(settings)
+    # The SAME resolved mode the app-state recorder gets. Letting this one
+    # re-resolve would be two recorders that can disagree about which
+    # landscape_url to open and whether to create tables — the admission pair
+    # would land in a different database from the login row it belongs to.
+    audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
 
     def _principal_is_active(identity_id: str) -> bool:
         record = read_identity(session_engine, identity_id)
         # An absent row is never an implicit grant.
         return record is not None and record.is_active
+
+    def _record_admission(identity_id: str, username: str) -> None:
+        # Runs INSIDE ensure_identity's transaction, so a failed audit rolls
+        # the activation back rather than leaving an activated identity that
+        # no later login will ever audit. The surrounding ``login`` event
+        # carries the request context; this pair carries the authority
+        # decision and joins to it by identity_id.
+        audit_recorder.record_identity_admitted(
+            provider="local",
+            identity_id=identity_id,
+            username=username,
+            tokens_per_day=settings.quota_default_tokens_per_day,
+            storage_bytes=settings.quota_default_storage_bytes,
+        )
 
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
@@ -1026,26 +1049,14 @@ def _build_local_auth_provider(settings: WebSettings, session_engine: Engine) ->
         # may admit themselves, so it would be incoherent to hold back the
         # people who did so before this table existed while admitting every
         # newcomer instantly.
-        activate = settings.registration_mode == "open"
-        outcome = ensure_identity(
+        return ensure_identity(
             session_engine,
             claims=claims,
-            activate=activate,
+            activate=settings.registration_mode == "open",
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
+            record_admission=_record_admission,
         )
-        if outcome.activated_now:
-            # Written only on the transition. The surrounding ``login`` event
-            # carries the request context; this pair carries the authority
-            # decision and joins to it by identity_id.
-            audit_recorder.record_identity_admitted(
-                provider="local",
-                identity_id=outcome.record.identity_id,
-                username=outcome.record.username,
-                tokens_per_day=settings.quota_default_tokens_per_day,
-                storage_bytes=settings.quota_default_storage_bytes,
-            )
-        return outcome
 
     issuer = SessionTokenIssuer(
         signing_key=derive_session_token_key(settings.secret_key),
@@ -1434,7 +1445,7 @@ def _create_app(
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
     if settings.auth_provider == "local":
-        local_provider = _build_local_auth_provider(settings, session_engine)
+        local_provider = _build_local_auth_provider(settings, session_engine, resolved_state_mode=resolved_state_mode)
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
     elif settings.auth_provider == "oidc":

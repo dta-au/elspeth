@@ -287,3 +287,127 @@ def test_a_row_whose_state_left_the_vocabulary_is_refused_not_coerced(engine) ->
 
     with pytest.raises(IdentityRowCorruptionError, match="access_state"):
         read_identity(engine, outcome.record.identity_id)
+
+
+# --------------------------------------------------------------------------
+# The admission audit is part of the activation, not a follow-up.
+# --------------------------------------------------------------------------
+
+
+def test_the_admission_audit_runs_before_the_activation_commits(engine) -> None:
+    """It must see the row it is auditing, inside the same transaction."""
+    seen: list[tuple[str, str]] = []
+
+    outcome = ensure_identity(
+        engine,
+        claims=_claims(),
+        activate=True,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=lambda identity_id, username: seen.append((identity_id, username)),
+    )
+
+    assert seen == [(outcome.record.identity_id, "ada")]
+
+
+def test_a_failed_admission_audit_rolls_the_whole_activation_back(engine) -> None:
+    """The defect this ordering exists to prevent.
+
+    Audited AFTER the commit, a Landscape outage would leave the identity
+    already ``active`` while the retry — finding it active — would never
+    attempt the audit again. That is an authority change no trail records and
+    no path repairs. Rolling back instead means the next login retries both.
+    """
+
+    def _audit_fails(_identity_id: str, _username: str) -> None:
+        raise RuntimeError("landscape unavailable")
+
+    with pytest.raises(RuntimeError, match="landscape unavailable"):
+        ensure_identity(
+            engine,
+            claims=_claims(),
+            activate=True,
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record_admission=_audit_fails,
+        )
+
+    # Nothing survives: no identity, and therefore no quota row either.
+    with engine.connect() as conn:
+        identities = conn.execute(select(identities_table.c.identity_id)).all()
+        quotas = conn.execute(select(quota_policies_table.c.policy_id)).all()
+    assert identities == []
+    assert quotas == []
+
+
+def test_a_retry_after_a_failed_audit_admits_and_audits(engine) -> None:
+    """Recovery must be automatic — the person just logs in again."""
+    attempts: list[str] = []
+
+    def _fails_once(identity_id: str, _username: str) -> None:
+        attempts.append(identity_id)
+        if len(attempts) == 1:
+            raise RuntimeError("landscape unavailable")
+
+    with pytest.raises(RuntimeError):
+        ensure_identity(
+            engine,
+            claims=_claims(),
+            activate=True,
+            quota_tokens_per_day=_TOKENS,
+            quota_storage_bytes=_STORAGE,
+            record_admission=_fails_once,
+        )
+
+    outcome = ensure_identity(
+        engine,
+        claims=_claims(),
+        activate=True,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=_fails_once,
+    )
+
+    assert outcome.record.is_active is True
+    assert len(attempts) == 2
+
+
+def test_a_pending_admission_writes_no_audit(engine) -> None:
+    """Nothing was granted, so there is no authority change to record."""
+    seen: list[str] = []
+
+    ensure_identity(
+        engine,
+        claims=_claims(),
+        activate=False,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=lambda identity_id, _username: seen.append(identity_id),
+    )
+
+    assert seen == []
+
+
+def test_a_returning_active_user_writes_no_second_audit(engine) -> None:
+    """Otherwise every visit would claim an administrator acted."""
+    seen: list[str] = []
+    recorder = lambda identity_id, _username: seen.append(identity_id)  # noqa: E731
+
+    ensure_identity(
+        engine,
+        claims=_claims(),
+        activate=True,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=recorder,
+    )
+    ensure_identity(
+        engine,
+        claims=_claims(),
+        activate=True,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=recorder,
+    )
+
+    assert len(seen) == 1

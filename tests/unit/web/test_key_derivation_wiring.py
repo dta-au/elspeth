@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 import elspeth.web as web_package
+from elspeth_lints.core.ast_walker import iter_python_files
 
 _WEB_ROOT = Path(web_package.__file__).parent
 
@@ -105,7 +106,13 @@ def test_no_web_module_feeds_the_raw_secret_key_to_a_byte_consumer() -> None:
     that no raw use can ever exist.
     """
     offenders: list[str] = []
-    for path in sorted(_WEB_ROOT.rglob("*.py")):
+    # Walked through ``ast_walker``, the single authority for Python-file
+    # discovery. A private ``rglob`` here would quietly disagree with every
+    # other gate about what "the source tree" means — which files are
+    # excluded, which directories are skipped — and a sweep that scans a
+    # different set from the rest of the suite is a sweep whose empty result
+    # means nothing.
+    for path in sorted(iter_python_files(_WEB_ROOT)):
         if path.name == "config.py" and path.parent == _WEB_ROOT:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))

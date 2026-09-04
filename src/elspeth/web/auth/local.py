@@ -1017,11 +1017,18 @@ class LocalAuthProvider:
 
         admission = self._admit(username)
         if not admission.record.is_active:
-            # The credential was correct. Admission is a separate decision and
-            # this identity has not received it, so no token is issued. The
-            # detail names the state so the login page can say "awaiting
-            # approval" rather than implying the password was wrong.
-            raise AuthenticationError(f"Account is {admission.record.access_state} — awaiting administrator approval")
+            # The credential was CORRECT. Admission is a separate decision and
+            # this identity does not have it, so no token is issued. The two
+            # states get different words because they mean different things to
+            # the person reading them, and because the audit classifier keys
+            # on this prefix: waiting is a queue an administrator can clear,
+            # disabled is a decision already taken.
+            #
+            # Naming the state leaks nothing: the caller has already proven
+            # the password, so there is no enumeration left to protect.
+            if admission.record.access_state == "disabled":
+                raise AuthenticationError("Account is disabled — contact an administrator")
+            raise AuthenticationError("Account is pending — awaiting administrator approval")
         return self._issue_token(admission.record.identity_id, username)
 
     def _admit(self, username: str) -> EnsureIdentityOutcome:

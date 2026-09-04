@@ -29,16 +29,23 @@ import type { AdminUserSummary } from "@/types/index";
 
 interface UserAdminDialogProps {
   onClose: () => void;
-  /** The signed-in admin's user_id — its row gets no delete button
-   *  (the backend refuses self-deletion with a 400 anyway). */
-  currentUserId: string;
+  /** The signed-in admin's USERNAME — its row gets no delete button
+   *  (the backend refuses self-deletion with a 400 anyway).
+   *
+   *  Not `user_id`: since sessions became identity-keyed, `/me` returns an
+   *  opaque identity_id there, while this dialog lists LOCAL ACCOUNTS whose
+   *  `user_id` is the username. Comparing the two never matched, so the admin
+   *  was shown a delete button on their own row that the backend then
+   *  refused. `username` is the field that kept its meaning across that
+   *  change. */
+  currentUsername: string;
 }
 
 type CopyState = "idle" | "copied" | "failed";
 
 export function UserAdminDialog({
   onClose,
-  currentUserId,
+  currentUsername,
 }: UserAdminDialogProps): JSX.Element {
   const modalRef = useRef<HTMLDivElement>(null);
   const bannerRef = useRef<HTMLDivElement>(null);
@@ -268,7 +275,7 @@ export function UserAdminDialog({
                         >
                           Reset password
                         </Button>
-                        {user.user_id !== currentUserId && (
+                        {user.user_id !== currentUsername && (
                           // The delete control shares a grid cell with a
                           // hidden sizer carrying the longest label it can
                           // take (elspeth-a0700fefff). The cell is
