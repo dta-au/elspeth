@@ -1923,11 +1923,23 @@ def _resolve_composer_auth_db(*, data_dir: Path, auth_db: Path | None) -> Path:
 
 
 def _composer_auth_provider(auth_db: Path) -> LocalAuthProvider:
+    """Open auth.db for ACCOUNT administration only.
+
+    These commands create and delete local accounts. Neither touches a session
+    token, so this deliberately does not build a token issuer or reach the
+    identity substrate — the CLI runs from a shell with no sessions engine,
+    and requiring one to add a user would be asking for a collaborator the
+    operation never uses.
+
+    The old ``ELSPETH_WEB__SECRET_KEY`` read is gone with the argument it fed.
+    It defaulted to the literal ``"composer-cli-user-management"``, which was
+    already meaningless here: no token was ever signed on this path, so the
+    key was read, passed, and never used.
+    """
     from elspeth.web.auth.local import LocalAuthProvider
 
     auth_db.parent.mkdir(parents=True, exist_ok=True)
-    secret_key = os.environ.get("ELSPETH_WEB__SECRET_KEY", "composer-cli-user-management")
-    return LocalAuthProvider(db_path=auth_db, secret_key=secret_key)
+    return LocalAuthProvider.for_account_administration(auth_db)
 
 
 @composer_users_app.command("add")

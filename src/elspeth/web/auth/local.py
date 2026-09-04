@@ -77,6 +77,17 @@ class LocalAuthStorageSecurityError(RuntimeError):
     """The local credential store failed its owner-only file admission."""
 
 
+class LocalAuthSessionsUnavailable(RuntimeError):
+    """A session operation was attempted on an account-administration provider.
+
+    Not an ``AuthenticationError``: nobody failed to authenticate. This is a
+    wiring mistake — a provider built by
+    :meth:`LocalAuthProvider.for_account_administration` was asked to mint or
+    verify a token — and it must surface as a programming error rather than a
+    401 that would read as a credential problem.
+    """
+
+
 def bcrypt_password_bytes(password: str) -> bytes:
     """Encode a password after enforcing bcrypt's UTF-8 byte limit."""
     encoded_password = password.encode("utf-8")
@@ -228,12 +239,28 @@ class LocalAuthProvider:
     def _get_dummy_hash(cls) -> bytes:
         return cls._dummy_hash
 
+    @classmethod
+    def for_account_administration(cls, db_path: Path) -> LocalAuthProvider:
+        """Build a provider that manages ACCOUNTS but cannot issue sessions.
+
+        ``create_user``, ``delete_user``, ``list_users`` and ``set_password``
+        touch ``auth.db`` alone. The CLI does exactly those, from a shell that
+        has no sessions engine and no Landscape recorder — so requiring it to
+        construct a token issuer and an identity substrate to add one local
+        account would be asking for collaborators the operation does not use.
+
+        Every token path refuses on a provider built this way, by name rather
+        than by AttributeError. Reach for this ONLY where no session is
+        issued; anything serving HTTP wants the full constructor.
+        """
+        return cls(db_path, token_issuer=None, admit_identity=None)
+
     def __init__(
         self,
         db_path: Path,
         *,
-        token_issuer: SessionTokenIssuer,
-        admit_identity: AdmitIdentity,
+        token_issuer: SessionTokenIssuer | None,
+        admit_identity: AdmitIdentity | None,
     ) -> None:
         """Bind the credential store to the token issuer and the identity substrate.
 
@@ -247,6 +274,13 @@ class LocalAuthProvider:
         The token issuer owns expiry and the refresh bound. They used to be
         constructor arguments here, which meant every provider that ever
         wanted a token would have had its own copy of a security bound.
+
+        Both collaborators are OPTIONAL, and the two halves that split apart
+        are visible in the type rather than in a comment: a credential store
+        over ``auth.db``, and a session-issuing half needing the issuer and
+        the identity substrate. Use :meth:`for_account_administration` for the
+        first alone; mypy then forces every token path to say what it does
+        without them.
         """
         self._db_path = db_path
         self._token_issuer = token_issuer
@@ -450,8 +484,11 @@ class LocalAuthProvider:
         # registration. Failing here leaves the intent uncleared, which is the
         # documented crash-between-commit-and-audit case the reclaim sweep
         # already quarantines.
-        admission = self._admit(user_id)
-        access_token = self._issue_token(admission.record.identity_id, user_id)
+        # Registration is an ISSUANCE path, so it meets the same D12 wall as
+        # login. Reachable with consequence: an identity already disabled (or
+        # pre-provisioned pending) whose credential row was deleted can be
+        # re-registered, and without this it would be handed a token.
+        access_token = self._issue_token(self._admitted_identity_id(user_id), user_id)
         try:
             record_token_issued(access_token)
         except BaseException as audit_error:
@@ -934,9 +971,15 @@ class LocalAuthProvider:
 
         # Outside the auth.db transaction, for the same reason as the open
         # registration path: the identity write lands in a different database.
-        admission = self._admit(user_id)
-        identity = UserIdentity(user_id=admission.record.identity_id, username=user_id)
-        access_token = self._issue_token(admission.record.identity_id, user_id)
+        # Same wall. This is the path that actually fires in a
+        # ``registration_mode="email_verified"`` deployment, where admission
+        # defaults to pending: without it the user completes verification,
+        # receives a 200 with a token, and then every authenticated route
+        # refuses that token with an error they cannot distinguish from an
+        # expired session.
+        identity_id = self._admitted_identity_id(user_id)
+        identity = UserIdentity(user_id=identity_id, username=user_id)
+        access_token = self._issue_token(identity_id, user_id)
 
         try:
             record_token_issued(identity, access_token)
@@ -1015,28 +1058,30 @@ class LocalAuthProvider:
         if not row[1]:
             raise AuthenticationError("Email verification required")
 
-        admission = self._admit(username)
-        if not admission.record.is_active:
-            # The credential was CORRECT. Admission is a separate decision and
-            # this identity does not have it, so no token is issued. The two
-            # states get different words because they mean different things to
-            # the person reading them, and because the audit classifier keys
-            # on this prefix: waiting is a queue an administrator can clear,
-            # disabled is a decision already taken.
-            #
-            # Naming the state leaks nothing: the caller has already proven
-            # the password, so there is no enumeration left to protect.
-            if admission.record.access_state == "disabled":
-                raise AuthenticationError("Account is disabled — contact an administrator")
-            raise AuthenticationError("Account is pending — awaiting administrator approval")
-        return self._issue_token(admission.record.identity_id, username)
+        # The credential was CORRECT; admission is a separate decision.
+        return self._issue_token(self._admitted_identity_id(username), username)
+
+    @property
+    def _issuer(self) -> SessionTokenIssuer:
+        """The token issuer, or a refusal naming why there isn't one."""
+        if self._token_issuer is None:
+            raise LocalAuthSessionsUnavailable(
+                "This LocalAuthProvider was built for account administration and cannot issue or verify session tokens"
+            )
+        return self._token_issuer
 
     def _admit(self, username: str) -> EnsureIdentityOutcome:
         """Resolve this local username to its identity row.
 
         ``subject`` is the username: for local auth the credential store IS
         the namespace, so the username is the stable per-provider subject.
+
+        Resolving is NOT admitting. Callers that are about to mint a token
+        must go through :meth:`_admitted_identity_id`, which is the one place
+        the D12 wall stands.
         """
+        if self._admit_identity is None:
+            raise LocalAuthSessionsUnavailable("This LocalAuthProvider was built for account administration and has no identity substrate")
         return self._admit_identity(
             IdentityClaims(
                 provider="local",
@@ -1045,8 +1090,36 @@ class LocalAuthProvider:
             )
         )
 
+    def _admitted_identity_id(self, username: str) -> str:
+        """Resolve the identity and refuse unless it may actually act.
+
+        THE SINGLE ADMISSION WALL. Every path that mints a token calls this,
+        not ``_admit``, because D12 is a property of ISSUANCE and not of
+        logging in: registration and email verification hand out a token too,
+        and a wall that only one of the three paths honours is not a wall.
+
+        Getting this wrong is quiet rather than loud. The issued token is
+        inert -- ``principal_is_active`` refuses it at authenticate and
+        refresh -- so the person is handed a credential that never works and
+        an error indistinguishable from an expired session, while a
+        ``token_issued`` row claims a token was issued to a principal that has
+        no admission. A false audit row is worse than a refusal.
+        """
+        admission = self._admit(username)
+        record = admission.record
+        if not record.is_active:
+            # Two states, two messages: the audit classifier keys on these
+            # prefixes, and waiting is a queue an administrator can clear
+            # while disabled is a decision already taken. Naming the state
+            # leaks nothing here -- the caller has already proven the
+            # credential, or just created it.
+            if record.access_state == "disabled":
+                raise AuthenticationError("Account is disabled — contact an administrator")
+            raise AuthenticationError("Account is pending — awaiting administrator approval")
+        return record.identity_id
+
     def _issue_token(self, identity_id: str, username: str, *, issued_at: int | None = None) -> str:
-        return self._token_issuer.mint(identity_id=identity_id, username=username, issued_at=issued_at)
+        return self._issuer.mint(identity_id=identity_id, username=username, issued_at=issued_at)
 
     async def refresh(self, token: str) -> str:
         """Issue a successor token for an already-authenticated caller.
@@ -1068,10 +1141,10 @@ class LocalAuthProvider:
         account deleted or un-verified since the token was minted must not be
         renewable. Both halves must hold, and neither implies the other.
         """
-        claims = self._token_issuer.decode(token)
+        claims = self._issuer.decode(token)
         if not self._credential_is_current(claims.username):
             raise AuthenticationError("Invalid token")
-        return self._token_issuer.refresh(token)
+        return self._issuer.refresh(token)
 
     def _credential_is_current(self, username: str) -> bool:
         """Does a verified credential row still back this login?
@@ -1099,13 +1172,23 @@ class LocalAuthProvider:
 
         ``user_id`` on the returned identity is the ``identity_id``, not the
         username. That is the value every ownership row points at.
+
+        ALL THREE run in ONE worker hop. Check 2 reaches the sessions store
+        through ``principal_is_active``, and that store is PostgreSQL in an
+        external-state deployment -- so leaving it on the event loop would put
+        a network round trip (two, with ``pool_pre_ping``) in front of every
+        authenticated request, and a pool-exhaustion wait would block the
+        whole ASGI worker rather than the one request. The credential read was
+        already offloaded; the identity read joins it rather than paying a
+        second hop. This is the shape ``_refresh_sync`` already uses.
         """
-        claims = self._token_issuer.authenticate(token)
+        return await run_sync_in_worker(self._authenticate_sync, token)
 
-        credential_current = await run_sync_in_worker(self._credential_is_current, claims.username)
-        if not credential_current:
+    def _authenticate_sync(self, token: str) -> UserIdentity:
+        """Verify token, admission, and credential together off the loop."""
+        claims = self._issuer.authenticate(token)
+        if not self._credential_is_current(claims.username):
             raise AuthenticationError("Invalid token")
-
         return UserIdentity(
             user_id=claims.identity_id,
             username=claims.username,

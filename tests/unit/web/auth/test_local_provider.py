@@ -24,6 +24,9 @@ from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import LOCAL_AUDIENCE
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
+from elspeth.web.sessions.schema import initialize_session_schema
 
 from .conftest import build_local_auth_provider
 
@@ -1536,3 +1539,96 @@ class TestSetPassword:
         provider.create_user("alice", "old-password-1", display_name="Alice")
         with pytest.raises(ValueError, match="72"):
             provider.set_password("alice", "x" * 80)
+
+
+class TestD12AdmissionWallOnEveryIssuancePath:
+    """The pending wall belongs to ISSUANCE, not to logging in.
+
+    Three paths hand out a session token: login, open registration, and email
+    verification. A wall that only ``login`` honours is not a wall — and the
+    failure is quiet rather than loud, because the token an unadmitted path
+    issues is inert. The person receives a credential that never works and an
+    error they cannot tell apart from an expired session, while a
+    ``token_issued`` audit row asserts a token was issued to a principal that
+    has no admission. A provably false audit row is worse than a refusal.
+
+    Every test here uses a CLOSED provider (``registration_open=False``),
+    which is what a ``registration_mode`` of ``email_verified`` or ``closed``
+    produces in app.py. The shared fixture defaults to open, so none of these
+    paths were exercised against a pending identity before this class existed.
+    """
+
+    @pytest.fixture
+    def closed(self, tmp_path):
+        """A deployment where D12 actually bites: first sight lands pending."""
+        return build_local_auth_provider(tmp_path / "auth.db", registration_open=False)
+
+    @pytest.mark.asyncio
+    async def test_login_refuses_a_pending_identity(self, closed) -> None:
+        closed.create_user("alice", "pw", display_name="Alice")
+        with pytest.raises(AuthenticationError, match="Account is pending"):
+            await closed.login("alice", "pw")
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_not_a_credential_failure(self, closed) -> None:
+        """The password was RIGHT. Saying otherwise misreports it to the admin."""
+        closed.create_user("alice", "pw", display_name="Alice")
+        with pytest.raises(AuthenticationError) as excinfo:
+            await closed.login("alice", "pw")
+        assert "Invalid credentials" not in excinfo.value.detail
+
+    def test_email_verification_refuses_a_pending_identity(self, closed) -> None:
+        """The path that actually fires in a registration_mode=email_verified deployment.
+
+        Without the wall this returns 200 with a token that every
+        authenticated route then rejects.
+        """
+        closed.create_user("alice", "pw", display_name="Alice", email="a@example.com", email_verified=False)
+        verification = closed.create_email_verification_token("alice")
+
+        with pytest.raises(AuthenticationError, match="Account is pending"):
+            closed.verify_email_and_issue_token(
+                verification,
+                record_token_issued=lambda _identity, _token: None,
+            )
+
+    def test_no_token_issued_audit_is_written_for_a_refused_admission(self, closed) -> None:
+        """The audit trail must not claim a token that was never issued."""
+        closed.create_user("alice", "pw", display_name="Alice", email="a@example.com", email_verified=False)
+        verification = closed.create_email_verification_token("alice")
+        recorded: list[str] = []
+
+        with pytest.raises(AuthenticationError):
+            closed.verify_email_and_issue_token(
+                verification,
+                record_token_issued=lambda _identity, token: recorded.append(token),
+            )
+
+        assert recorded == []
+
+    def test_open_registration_refuses_a_disabled_identity(self, tmp_path) -> None:
+        """Re-registering a freed username must not resurrect a disabled admission.
+
+        Reachable on the OPEN path, which is why this one does not use the
+        ``closed`` fixture: an identity already disabled, whose credential row
+        was then deleted, can be re-registered under the same username.
+        Without the wall that returns a token bound to the disabled identity.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'identities.db'}")
+        initialize_session_schema(engine)
+        provider = build_local_auth_provider(tmp_path / "auth.db", session_engine=engine)
+
+        provider.create_user("alice", "pw", display_name="Alice")
+        identity_id = provider._admit("alice").record.identity_id
+        with engine.begin() as conn:
+            conn.execute(identities_table.update().where(identities_table.c.identity_id == identity_id).values(access_state="disabled"))
+        _delete_user(provider, "alice")
+
+        with pytest.raises(AuthenticationError, match="Account is disabled"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "new-password",
+                "Alice Again",
+                None,
+                record_token_issued=lambda _token: None,
+            )
