@@ -461,6 +461,28 @@ describe("buildProposalDiff", () => {
     expect(diff?.optionValuesNotCompared).toBe(true);
   });
 
+  it("records the skip even when a differing key comes BEFORE options on the wire", () => {
+    // The ledger must not depend on iteration order. providedKeysDiffer stops
+    // at the first differing key, and on the wire `plugin` precedes `options`
+    // (index 0 vs 2 on a source, 1 vs 2 on an output), so a changed plugin
+    // short-circuits before `options` is ever examined. This payload has no
+    // nodes on purpose: a node carries `options` at index 1, immediately after
+    // `id`, so any overlapping node would record the skip and mask the bug.
+    //
+    // Driven from the fixture, which now preserves the producer's key ORDER —
+    // sorted, `options` would precede `plugin` and this path would never run.
+    const diff = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments("set_pipeline_plugin_changed_no_nodes"),
+      makeState({ nodes: [], edges: [] }),
+    );
+
+    // Rows ARE produced, so this is the rows-present caveat path: without the
+    // ledger write the card would show a partial diff with no caveat at all.
+    expect(diff?.entries.length).toBeGreaterThan(0);
+    expect(diff?.optionValuesNotCompared).toBe(true);
+  });
+
   it("does not raise the caveat for a projection that compared everything it was given", () => {
     // upsert_node's arm never calls providedKeysDiffer, so nothing is skipped
     // — the flag must not be set merely because the payload CONTAINS a

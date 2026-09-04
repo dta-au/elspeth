@@ -400,6 +400,17 @@ function setPipelineEntries(
  * proposal, whether or not the options differed. A skip under-reports a real
  * options change; the alternative asserted a change that may not exist, on
  * the surface an operator uses to approve one.
+ *
+ * THE LOOP RUNS TO COMPLETION rather than returning at the first difference,
+ * and that is load-bearing, not style. The ledger has to see every skippable
+ * key, and an early return makes what it records depend on ITERATION ORDER:
+ * on the wire `plugin` precedes `options` (index 0 vs 2 on a source, 1 vs 2
+ * on an output), so a changed plugin would short-circuit before `options` was
+ * ever examined and the skip would go unrecorded — producing rows with no
+ * caveat, a partial diff presented as complete. Nodes happened to be immune
+ * (their `options` sits at index 1), which is exactly the kind of accident
+ * that makes such a bug survive. The loop is over a handful of keys, so
+ * completing it costs nothing.
  */
 function providedKeysDiffer(
   before: Record<string, unknown>,
@@ -407,20 +418,21 @@ function providedKeysDiffer(
   keyAliases: Map<string, string>,
   ledger: ComparisonLedger,
 ): boolean {
+  let differs = false;
   for (const [key, value] of Object.entries(provided)) {
     const beforeKey = keyAliases.get(key) ?? key;
     if (!(beforeKey in before)) continue;
     if (isRedactedOptionSummary(value)) {
-      // Record the blind spot. An empty result must not be reported as "no
-      // difference" when a key was never compared — see ComparisonLedger.
+      // Record the blind spot. A result must not be reported as complete when
+      // a key was never compared — see ComparisonLedger.
       ledger.skippedRedactedOptions = true;
       continue;
     }
     if (stableStringify(before[beforeKey]) !== stableStringify(value)) {
-      return true;
+      differs = true;
     }
   }
-  return false;
+  return differs;
 }
 
 function replaceCollectionEntries<T>(

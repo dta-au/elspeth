@@ -163,6 +163,41 @@ def test_uncovered_projected_tools_really_do_carry_no_summarized_argument() -> N
     )
 
 
+def _key_order(value: Any) -> Any:
+    """Recursively project a payload down to its key ORDER alone."""
+    if isinstance(value, dict):
+        return [(key, _key_order(inner)) for key, inner in value.items()]
+    if isinstance(value, list):
+        return [_key_order(item) for item in value]
+    return None
+
+
+@pytest.mark.parametrize("case_name", sorted(_cases()))
+def test_recorded_payload_preserves_the_producers_key_order(case_name: str) -> None:
+    """Key ORDER is fixture content, because the consumer depends on it.
+
+    ``providedKeysDiffer`` walks ``Object.entries`` and, before this was
+    caught, returned at the first differing key — so WHERE a summarized key
+    sits among its siblings decided whether it was examined at all. On the
+    wire ``plugin`` precedes ``options`` on a source and an output; sorted, it
+    follows them. A sorted fixture therefore exercises a path the live payload
+    never takes, and no equality assertion notices, because ``==`` on dicts
+    ignores order.
+
+    This is the assertion the ordinary drift test cannot make:
+    ``test_recorded_redaction_matches_the_live_redactor`` compares parsed
+    dicts and would stay green against a re-sorted fixture.
+    """
+    case = _cases()[case_name]
+    actual = redact_tool_call_arguments(case["tool"], case["arguments"], telemetry=NoopRedactionTelemetry())
+
+    assert _key_order(json.loads(json.dumps(actual))) == _key_order(case["redacted"]), (
+        f"Key-order drift for fixture case '{case_name}'. The generator must NOT "
+        f"sort keys — the frontend's short-circuit depends on the producer's own "
+        f"order. {REGENERATE_HINT}"
+    )
+
+
 def test_projected_tools_all_exist_in_the_manifest() -> None:
     """PROJECTED_TOOLS is hand-maintained; catch a typo or a renamed tool."""
     unknown = PROJECTED_TOOLS - set(MANIFEST)

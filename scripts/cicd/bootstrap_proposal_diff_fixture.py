@@ -19,8 +19,18 @@ read:
   equality, so a change to the redactor fails a Python test that names this
   script — the frontend cannot silently drift behind the backend again.
 
-Idempotent: ``sort_keys=True`` plus a fixed case ordering means re-running on
-an unchanged redactor produces a byte-identical file.
+KEY ORDER IS PART OF THE FIXTURE. Serialization deliberately does NOT sort
+keys: the consumer walks ``Object.entries`` and short-circuits, so WHERE a
+summarized key sits among its siblings changes which branch runs. On the wire
+``plugin`` precedes ``options`` on a source and an output, but sorted it
+follows them — a sorted fixture silently exercises the wrong path and cannot
+reproduce an early return that skips ``options`` entirely. Recording the
+producer's own insertion order is what makes a fixture-driven test of that
+path possible at all.
+
+Idempotent all the same: the case list is fixed and the redactor's insertion
+order is deterministic, so re-running on an unchanged redactor produces a
+byte-identical file.
 
 Usage::
 
@@ -198,6 +208,28 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
             "outputs": [{"sink_name": "results", "plugin": "json", "options": {"path": "out.json"}}],
         },
     ),
+    # --- a differing key AHEAD of `options`, with no node to rescue it -----
+    # providedKeysDiffer returns on the first differing key, and on the wire
+    # `plugin` precedes `options` (index 0 vs 2 on a source, 1 vs 2 on an
+    # output) — so a changed plugin short-circuits before `options` is ever
+    # examined, and the skip goes unrecorded. Nodes are omitted deliberately:
+    # a node carries `options` at index 1, immediately after `id`, so any
+    # overlapping node would record the skip and mask the defect.
+    (
+        "set_pipeline_plugin_changed_no_nodes",
+        "set_pipeline",
+        {
+            "source": {
+                "plugin": "json",
+                "options": {"path": "input.csv"},
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [{"sink_name": "results", "plugin": "csv", "options": {"path": "out.json"}}],
+        },
+    ),
 )
 
 
@@ -229,8 +261,13 @@ def build_fixture() -> dict[str, Any]:
 
 
 def render(fixture: dict[str, Any]) -> str:
-    """Canonical serialization: stable across runs, reviewable as a diff."""
-    return json.dumps(fixture, indent=2, sort_keys=True) + "\n"
+    """Canonical serialization: stable across runs, reviewable as a diff.
+
+    ``sort_keys`` stays OFF on purpose — see the module docstring. The order
+    the redactor emits is behaviour the consumer depends on, so the fixture
+    records it rather than normalising it away.
+    """
+    return json.dumps(fixture, indent=2) + "\n"
 
 
 def main() -> int:
