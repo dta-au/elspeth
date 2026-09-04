@@ -7554,6 +7554,96 @@ def test_violated_plugin_contract_is_withheld_for_a_config_owned_component() -> 
     assert resolved == []
 
 
+def test_schema_contract_detail_withholding_follows_the_participants_not_the_entry() -> None:
+    """A contract fact is withheld when a PARTICIPANT is config-owned, not only its own component.
+
+    ``_contract_participant_refs`` exists because a ``SchemaContractDetail``
+    names two components — producer and consumer — and either can be the
+    finalizer-bound one. An entry ABOUT a model-authored node can therefore
+    still quote a reviewed source's or sink's field set through its contract
+    payload, which is why the withholding decision reads the participants and
+    not just ``_entry_component_ref``. That cross-reference arm had no test:
+    ``_contract_participant_refs`` was referenced nowhere under ``tests/``
+    before this one, so nothing would have caught a narrowing that dropped
+    the participant check and disclosed reviewed field names.
+
+    It is pinned in both directions deliberately. Withholding too little is a
+    custody leak; withholding too much is the failure recorded in
+    ``_allowlisted_candidate_feedback``'s own docstring, where a
+    candidate-global predecessor predicate "made guided repair permanently
+    blind" because the guided binder always mutates the candidate. The
+    forwarding arm below is what keeps a model-authored-to-model-authored
+    edge repairable, and it is load-bearing for diagnosing repair thrash
+    (elspeth-15c60e7c66): whether the planner was shown ``extra_fields``
+    decides whether a wasted repair turn is an observability defect or a
+    briefing one.
+    """
+    guided_binder_owns_reviewed_ends = _FinalizerOwnedRefs(
+        config=frozenset({"source", "output:json_out"}),
+        routing=frozenset(),
+    )
+
+    def _summary(producer: str, consumer: str, component: str) -> ValidationSummary:
+        return ValidationSummary(
+            is_valid=False,
+            errors=(
+                ValidationEntry(
+                    component=component,
+                    message="Schema contract violation: producer -> consumer.",
+                    severity="high",
+                    error_code="locked_input_extras",
+                    contract=SchemaContractDetail(
+                        producer=producer,
+                        consumer=consumer,
+                        extra_fields=("content", "fingerprint"),
+                    ),
+                ),
+            ),
+        )
+
+    # Both ends model-authored: the planner already holds every name in the
+    # payload, so the repair turn gets the fields it must act on.
+    between_transforms = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert between_transforms["validation"]["errors"][0]["contract"] == {
+        "producer": "llm_1",
+        "consumer": "field_mapper_1",
+        "extra_fields": ["content", "fingerprint"],
+    }
+
+    # THE ARM THIS TEST EXISTS FOR. Same entry component class as above — a
+    # model-authored node — but the PRODUCER is the reviewed source the binder
+    # wrote. An entry-only ownership check passes this through; only the
+    # participant check withholds it. Verified by mutation: neutering
+    # ``_contract_participant_refs`` to return no refs makes exactly this
+    # assertion fail, and it is the only one that fails.
+    from_reviewed_source = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("source", "web_scrape_1", "node:web_scrape_1"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in from_reviewed_source["validation"]["errors"][0]
+
+    # A reviewed SINK as consumer is withheld too, but NOT by the participant
+    # arm: its entry component IS ``output:json_out``, so the entry-own check
+    # already owns it and this survives the mutation above. Kept because the
+    # two paths overlapping here is the reason the participant arm looks
+    # redundant from a sink-consumer example and is not — do not treat this
+    # assertion as coverage of the cross-reference.
+    into_reviewed_sink = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "output:json_out", "output:json_out"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in into_reviewed_sink["validation"]["errors"][0]
+
+    # Freeform baseline: no finalizer ownership, nothing to withhold against.
+    freeform = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+    )
+    assert freeform["validation"]["errors"][0]["contract"]["extra_fields"] == ["content", "fingerprint"]
+
+
 def test_an_entry_without_a_carried_identity_attaches_nothing() -> None:
     """Fail closed on absence — there is no parse fallback.
 
