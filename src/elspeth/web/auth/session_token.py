@@ -92,14 +92,26 @@ class SessionTokenClaims:
 
 
 def _required_visible_claim(payload: dict[str, object], claim: str) -> str:
-    value = payload.get(claim)
+    """Read one required claim, treating absence as distinct from a bad value.
+
+    Membership-then-index rather than ``.get()``: a missing claim and a claim
+    present as ``None`` are different facts about a token, and ``.get()``
+    collapses them into one. Both are refused here, but the distinction has to
+    survive to the point of refusal for the refusal to mean anything. This is
+    the same shape ``auth/audit.py`` uses for issued-token claims.
+    """
+    if claim not in payload:
+        raise AuthenticationError("Invalid token")
+    value = payload[claim]
     if type(value) is not str or not has_visible_content(value):
         raise AuthenticationError("Invalid token")
     return value
 
 
 def _required_int_claim(payload: dict[str, object], claim: str) -> int:
-    value = payload.get(claim)
+    if claim not in payload:
+        raise AuthenticationError("Invalid token")
+    value = payload[claim]
     # ``bool`` is an ``int`` subclass in Python, and ``True`` would otherwise
     # read as the epoch second 1.
     if type(value) is not int:
