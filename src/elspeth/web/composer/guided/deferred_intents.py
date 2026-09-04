@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol, cast, get_args
@@ -606,6 +606,41 @@ _REVERSED_PREDICATE_OPERATOR: dict[str, str] = {
     "less_than": "greater_than",
     "less_than_or_equal": "greater_than_or_equal",
 }
+# The exact private edit command. ONE authority for two readers: the user-
+# authority check in ``intent_management`` (the whole message must be this
+# command) and ``deferred_intent_instruction_text`` (the demand and its
+# grounding read the replacement instruction, never the envelope). Computing
+# the stated demand over ``Edit exact intent <UUID>: ...`` made the only
+# documented exit from an unsatisfiable demand subject to that same demand
+# (elspeth-3d392c04ca, falsification addendum 7992 #4).
+DEFERRED_INTENT_EDIT_COMMAND = re.compile(
+    r"\s*edit\s+exact\s+intent\s+"
+    r"(?P<intent_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"\s*:\s*(?P<instruction>\S(?:[\s\S]*\S)?)\s*",
+    re.IGNORECASE,
+)
+
+
+def deferred_intent_instruction_text(originating_message_content: str) -> str:
+    """The text a stated demand and its grounding are computed over.
+
+    For an ordinary message this is the message. For the exact edit command
+    it is the replacement instruction after the colon: the ``Edit exact
+    intent <UUID>:`` envelope is user authority, not structural prose, and
+    it defeats the closed affirmative-prefix grammar if left in place. The
+    audit binding (``message_content_hash``) stays on the WHOLE message —
+    only what is read for grounding changes.
+    """
+
+    command = DEFERRED_INTENT_EDIT_COMMAND.fullmatch(originating_message_content)
+    return command.group("instruction") if command is not None else originating_message_content
+
+
+# Reach of the column token before an operator in ``_stated_predicate_match``
+# — named once so the candidate enumeration that DERIVES the demand from the
+# grounding path uses the same bound the grounding regex does.
+_STATED_PREDICATE_COLUMN_REACH = 80
+_STATED_COLUMN_TOKEN = re.compile(r"[A-Za-z0-9_]+(?:[.-][A-Za-z0-9_]+)*")
 _MESSAGE_OPERATOR_PATTERN: dict[str, str] = {
     "equals": r"(?:==|(?<![!<>])=(?!=)|\bequals?\b|\bequal\s+to\b)",
     "not_equals": r"(?:!=|\bdoes\s+not\s+equal\b|\bnot\s+equal\s+to\b|\bis\s+not\b)",
@@ -697,20 +732,39 @@ def _stated_preceding_context_is_benign(
     subject = constraint.subject
     if type(subject) is not PluginSubject:
         return False
-    description = re.compile(
+    return _source_description_sentence(_message_token_pattern(subject.plugin_name)).fullmatch(context) is not None
+
+
+def _source_description_sentence(plugin_pattern: str) -> re.Pattern[str]:
+    return re.compile(
         r"^\s*(?:this|it)\s+is\s+(?:(?:a|an|the)\s+)?"
-        r"(?:[A-Za-z0-9_-]+\s+){0,2}" + _message_token_pattern(subject.plugin_name) + r"(?:\s+(?:source|input|file|data))?\s*\.\s*$",
+        r"(?:[A-Za-z0-9_-]+\s+){0,2}" + plugin_pattern + r"(?:\s+(?:source|input|file|data))?\s*\.\s*$",
         re.IGNORECASE,
     )
-    return description.fullmatch(context) is not None
+
+
+_ANY_SOURCE_DESCRIPTION_SENTENCE = _source_description_sentence(r"[A-Za-z0-9_-]+")
+
+
+def _preceding_context_has_benign_shape(context: str) -> bool:
+    """Subject-free twin of ``_stated_preceding_context_is_benign``: could SOME
+    plugin subject accept this preceding context? Used only to decide whether
+    a demand is admissible at all."""
+
+    return not context.strip() or _ANY_SOURCE_DESCRIPTION_SENTENCE.fullmatch(context) is not None
 
 
 def _stated_predicate_message_match(
     message: str,
     constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
 ) -> re.Match[str] | None:
-    prefix = _message_token_pattern(constraint.column) + r"[\s\S]{0,80}?" + _MESSAGE_OPERATOR_PATTERN[constraint.operator] + r"\s*"
-    value = constraint.value
+    return _stated_predicate_match(message, column=constraint.column, operator=constraint.operator, value=constraint.value)
+
+
+def _stated_predicate_match(message: str, *, column: str, operator: str, value: object) -> re.Match[str] | None:
+    prefix = (
+        _message_token_pattern(column) + rf"[\s\S]{{0,{_STATED_PREDICATE_COLUMN_REACH}}}?" + _MESSAGE_OPERATOR_PATTERN[operator] + r"\s*"
+    )
     if type(value) in {int, float}:
         pattern = re.compile(
             prefix + r"(?P<literal>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
@@ -733,15 +787,28 @@ def _stated_predicate_message_match(
     return re.search(prefix + literal_pattern, message, re.IGNORECASE)
 
 
-def _stated_constraint_is_grounded(
-    message: str,
-    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
-    *,
-    guided: GuidedSession | None = None,
-) -> bool:
-    predicate = _stated_predicate_message_match(message, constraint)
+@dataclass(frozen=True, slots=True)
+class _StatedPredicateSpan:
+    """A stated comparison located in the message with every SUBJECT-INDEPENDENT
+    grounding veto already applied.
+
+    ``_stated_constraint_is_grounded`` adds the subject-dependent checks on
+    top of a span; ``_message_admits_stated_constraint`` asks whether ANY span
+    exists. One computation, two readers — the demand is derived from the
+    supply rather than restated beside it, which is the fix-shape ruling on
+    elspeth-3d392c04ca: two independently written predicates on this axis
+    drifted apart twice already.
+    """
+
+    predicate: re.Match[str]
+    clause_start: int
+    explicit_subjects: tuple[str, ...]
+
+
+def _stated_predicate_span(message: str, *, column: str, operator: str, value: object) -> _StatedPredicateSpan | None:
+    predicate = _stated_predicate_match(message, column=column, operator=operator, value=value)
     if predicate is None:
-        return False
+        return None
     clause_start = 0
     clause_end = len(message)
     # Qualifiers before ``and``/``then``/``;`` remain part of the command.
@@ -753,20 +820,56 @@ def _stated_constraint_is_grounded(
         if boundary.start() >= predicate.end():
             clause_end = boundary.start()
             break
-    if not _stated_preceding_context_is_benign(message[:clause_start], constraint):
-        return False
     predicate_prefix = message[clause_start : predicate.start()]
     # Only promote a stated fact from a closed affirmative command grammar.
     # Free-form text before the predicate can carry approval, review, or other
     # preconditions that the closed constraint tuple cannot represent.
     prefix_match = _AFFIRMATIVE_STATED_PREFIX.fullmatch(predicate_prefix)
     if prefix_match is None:
-        return False
+        return None
+    if _GATE_OR_ROUTE_WORD.search(message[clause_start:clause_end]) is None:
+        return None
+    if type(value) in {int, float} and _STATED_UNIT_AFTER_LITERAL.search(message[predicate.end() :]) is not None:
+        return None
+    # The closed tuple has no polarity/exception field.  Reject prose whose
+    # remaining words contradict or qualify the matched predicate rather than
+    # laundering it into affirmative mandatory authority.
+    unrepresented = message[: predicate.start()] + " " + message[predicate.end() :]
+    if _UNREPRESENTED_NEGATION.search(unrepresented) is not None:
+        return None
+    if any(_clause_has_stated_comparison(clause) for clause in _STATED_CLAUSE_BOUNDARY.split(unrepresented)):
+        return None
     explicit_subjects = tuple(
         value for value in (prefix_match.group("subject_before_rows"), prefix_match.group("subject_after_connector")) if value is not None
     )
+    return _StatedPredicateSpan(predicate=predicate, clause_start=clause_start, explicit_subjects=explicit_subjects)
+
+
+def _stated_routing_segments(message: str, predicate: re.Match[str]) -> tuple[str, str] | None:
+    """The true/false destination segments after a predicate, or None when the
+    message states no false route — the shape a StatedPredicateConstraint
+    binds and a StatedGateRoutingConstraint cannot."""
+
+    routing_tail = message[predicate.end() :]
+    false_marker = _FALSE_ROUTE_MARKER.search(routing_tail)
+    if false_marker is None:
+        return None
+    return routing_tail[: false_marker.start()], routing_tail[false_marker.end() :]
+
+
+def _stated_constraint_is_grounded(
+    message: str,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+    *,
+    guided: GuidedSession | None = None,
+) -> bool:
+    span = _stated_predicate_span(message, column=constraint.column, operator=constraint.operator, value=constraint.value)
+    if span is None:
+        return False
+    if not _stated_preceding_context_is_benign(message[: span.clause_start], constraint):
+        return False
     subject = constraint.subject
-    if explicit_subjects:
+    if span.explicit_subjects:
         if type(subject) is PluginSubject:
             allowed_subject_tokens = {subject.plugin_name.casefold()}
         elif type(subject) is StableSubject and guided is not None:
@@ -787,52 +890,137 @@ def _stated_constraint_is_grounded(
             )
         else:
             allowed_subject_tokens = set()
-        if any(value.casefold() not in allowed_subject_tokens for value in explicit_subjects):
+        if any(value.casefold() not in allowed_subject_tokens for value in span.explicit_subjects):
             return False
-    if _GATE_OR_ROUTE_WORD.search(message[clause_start:clause_end]) is None:
-        return False
-    if type(constraint.value) in {int, float} and _STATED_UNIT_AFTER_LITERAL.search(message[predicate.end() :]) is not None:
-        return False
-    # The closed tuple has no polarity/exception field.  Reject prose whose
-    # remaining words contradict or qualify the matched predicate rather than
-    # laundering it into affirmative mandatory authority.
-    unrepresented = message[: predicate.start()] + " " + message[predicate.end() :]
-    if _UNREPRESENTED_NEGATION.search(unrepresented) is not None:
-        return False
-    if any(_clause_has_stated_comparison(clause) for clause in _STATED_CLAUSE_BOUNDARY.split(unrepresented)):
-        return False
+    segments = _stated_routing_segments(message, span.predicate)
     if type(constraint) is StatedPredicateConstraint:
         # An explicit else/otherwise clause is a routing obligation, not a
         # condition-only statement.  Do not let the solver retain the weaker
         # constraint and thereby omit the operator's branch destinations.
-        return _FALSE_ROUTE_MARKER.search(message[predicate.end() :]) is None
-    routing_constraint = cast(StatedGateRoutingConstraint, constraint)
-    routing_tail = message[predicate.end() :]
-    false_marker = _FALSE_ROUTE_MARKER.search(routing_tail)
-    if false_marker is None:
+        return segments is None
+    if segments is None:
         return False
-    true_segment = routing_tail[: false_marker.start()]
-    false_segment = routing_tail[false_marker.end() :]
+    routing_constraint = cast(StatedGateRoutingConstraint, constraint)
+    true_segment, false_segment = segments
     return _message_segment_affirmatively_targets(true_segment, routing_constraint.true_target) and _message_segment_affirmatively_targets(
         false_segment, routing_constraint.false_target
     )
 
 
-def _message_segment_affirmatively_targets(segment: str, target: str) -> bool:
-    if _UNREPRESENTED_NEGATION.search(segment) is not None:
-        return False
-    destination = re.compile(
+def _destination_segment_pattern(target_pattern: str) -> re.Pattern[str]:
+    return re.compile(
         r"^\s*(?:(?:(?:go(?:es)?|land(?:s|ing)?|route[sd]?|send(?:s|ing)?|sent)"
         r"(?:\s+(?:them|rows?))?\s+(?:to|into|in))|(?:to|into))\s+"
-        r"(?:(?:a|the)\s+)?" + _message_token_pattern(target) + r"(?:\s+(?:json\s+)?sink)?\s*(?:(?:,\s*and|[.;])\s*)?"
+        r"(?:(?:a|the)\s+)?" + target_pattern + r"(?:\s+(?:json\s+)?sink)?\s*(?:(?:,\s*and|[.;])\s*)?"
         r"(?:Every\s+row\s+must\s+land\s+in\s+exactly\s+one\s+of\s+them\.)?\s*$",
         re.IGNORECASE,
     )
-    return destination.fullmatch(segment) is not None
 
 
-def _message_requires_stated_constraint(message: str) -> Literal["predicate", "routing"] | None:
-    """Classify explicit gate prose that weaker constraint kinds cannot encode."""
+_ANY_DESTINATION_SEGMENT = _destination_segment_pattern(r"(?P<target>[A-Za-z0-9_-]+)")
+
+
+def _message_segment_affirmatively_targets(segment: str, target: str) -> bool:
+    if _UNREPRESENTED_NEGATION.search(segment) is not None:
+        return False
+    return _destination_segment_pattern(_message_token_pattern(target)).fullmatch(segment) is not None
+
+
+def _segment_destination(segment: str) -> str | None:
+    """The one destination name a segment affirmatively targets, if any —
+    the same grammar ``_message_segment_affirmatively_targets`` holds a
+    named target to, read with a capture instead of a name."""
+
+    if _UNREPRESENTED_NEGATION.search(segment) is not None:
+        return None
+    destination = _ANY_DESTINATION_SEGMENT.fullmatch(segment)
+    return destination.group("target") if destination is not None else None
+
+
+def _stated_literal_value(text: str) -> object:
+    """Type a matched comparison literal the way the planner would state it.
+
+    A quoted literal is returned WITHOUT its quotes, which is not what
+    ``_stated_predicate_match`` binds (the operator must be followed by the
+    bare token) — so a quoted comparison admits no demand. That is the
+    conservative direction: no demand is raised that only a pathological
+    quoted value could satisfy.
+    """
+
+    lowered = text.casefold()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text) is not None:
+        number = Decimal(text)
+        return int(number) if number == number.to_integral_value() else float(number)
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1]
+    return text
+
+
+def _candidate_stated_predicates(message: str) -> Iterator[tuple[str, str, object]]:
+    """Every ``(column, operator, value)`` that ``_stated_predicate_match`` could
+    bind in this message. Complete, not sampled: the match is the column as a
+    token, at most ``_STATED_PREDICATE_COLUMN_REACH`` characters, an operator,
+    then the literal immediately after it — so every admissible column is a
+    token ending within reach before an operator occurrence and every
+    admissible value is the literal that follows one."""
+
+    tokens = [(token.group(), token.end()) for token in _STATED_COLUMN_TOKEN.finditer(message)]
+    seen: set[tuple[str, str, object]] = set()
+    for operator, operator_pattern in _MESSAGE_OPERATOR_PATTERN.items():
+        for occurrence in re.finditer(operator_pattern, message, re.IGNORECASE):
+            literal = _STATED_COMPARISON_LITERAL.match(message, occurrence.end())
+            if literal is None:
+                continue
+            value = _stated_literal_value(literal.group().strip())
+            for token, token_end in tokens:
+                if token_end > occurrence.start() or token_end < occurrence.start() - _STATED_PREDICATE_COLUMN_REACH:
+                    continue
+                candidate = (token, operator, value)
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                yield candidate
+
+
+def _message_admits_stated_constraint(message: str) -> Literal["predicate", "routing"] | None:
+    """The strongest stated-constraint kind the grounding path could admit for
+    SOME closed tuple drawn from this message's own tokens — or None.
+
+    Derived, not restated: every veto here IS the grounding veto, applied to
+    enumerated candidates, so a demand computed from this answer is
+    satisfiable by construction. The subject-dependent checks (which plugin
+    or component the explicit subject names; that a target is not a source
+    name) are the only ones not folded in, because a demand has no subject:
+    a message whose explicit subject names nothing live can still deadlock
+    on the subject layer, and that residual is recorded on the ticket.
+    """
+
+    admits_predicate = False
+    for column, operator, value in _candidate_stated_predicates(message):
+        span = _stated_predicate_span(message, column=column, operator=operator, value=value)
+        if span is None or not _preceding_context_has_benign_shape(message[: span.clause_start]):
+            continue
+        segments = _stated_routing_segments(message, span.predicate)
+        if segments is None:
+            admits_predicate = True
+            continue
+        true_segment, false_segment = segments
+        if _segment_destination(true_segment) is not None and _segment_destination(false_segment) is not None:
+            return "routing"
+    return "predicate" if admits_predicate else None
+
+
+def _message_states_gate_prose(message: str) -> Literal["predicate", "routing"] | None:
+    """Classify explicit gate prose that weaker constraint kinds cannot encode.
+
+    This is the DEMAND side on its own: what the prose asks for, before
+    asking whether the supply side could ever bind it. Never call it for a
+    demand — ``_message_requires_stated_constraint`` is the only reader.
+    """
 
     false_marker = _FALSE_ROUTE_MARKER.search(message)
     routing_word_present = _GATE_OR_ROUTE_WORD.search(message) is not None
@@ -854,6 +1042,35 @@ def _message_requires_stated_constraint(message: str) -> Literal["predicate", "r
     if not routing_comparison_present:
         return None
     return "routing" if destination_count else "predicate"
+
+
+def _message_requires_stated_constraint(message: str) -> Literal["predicate", "routing"] | None:
+    """The stated-constraint kind a retained intent from this message must
+    carry — never a kind the grounding path could not admit.
+
+    Demand and supply were two independently written predicates (route
+    words + destination count here; operator regexes + false marker +
+    affirmative prefix + negation ban in grounding), and any message that
+    tripped the first without satisfying the second had a provably empty
+    acceptance set: every retain was rejected ``stated_fact_unproven``,
+    degraded to constraint-free clarification debt that nothing can claim,
+    and wire confirmation 409'd with no planner-side exit
+    (elspeth-3d392c04ca — one word, "split", did it). The 2026-08-26 ruling:
+    derive the demand from the grounding preconditions so the two cannot
+    drift, accepting with eyes open that genuine routing prose the closed
+    grammar cannot bind now retains a weaker constraint instead of
+    deadlocking (elspeth-6155f11add carries that class).
+    """
+
+    stated = _message_states_gate_prose(message)
+    if stated is None:
+        return None
+    admitted = _message_admits_stated_constraint(message)
+    if admitted is None:
+        return None
+    if stated == "routing" and admitted == "routing":
+        return "routing"
+    return "predicate"
 
 
 def _clause_has_stated_comparison(clause: str) -> bool:
@@ -1820,9 +2037,8 @@ def validate_deferred_intent_action(
             conjunction_is_consistent=lambda remaining: _constraint_conjunction_contradiction(remaining, guided=guided) is None,
         )
 
-    stated_requirement = (
-        _message_requires_stated_constraint(originating_message_content) if type(originating_message_content) is str else None
-    )
+    instruction = deferred_intent_instruction_text(originating_message_content) if type(originating_message_content) is str else None
+    stated_requirement = _message_requires_stated_constraint(instruction) if instruction is not None else None
     stated_types = {type(constraint) for constraint in action.constraints}
     if (stated_requirement == "routing" and StatedGateRoutingConstraint not in stated_types) or (
         stated_requirement == "predicate" and not stated_types.intersection({StatedPredicateConstraint, StatedGateRoutingConstraint})
@@ -1836,9 +2052,9 @@ def validate_deferred_intent_action(
     for constraint in action.constraints:
         if isinstance(constraint, (StatedPredicateConstraint, StatedGateRoutingConstraint)):
             if (
-                type(originating_message_content) is not str
-                or not _stated_subject_is_grounded(originating_message_content, constraint, guided)
-                or not _stated_constraint_is_grounded(originating_message_content, constraint, guided=guided)
+                instruction is None
+                or not _stated_subject_is_grounded(instruction, constraint, guided)
+                or not _stated_constraint_is_grounded(instruction, constraint, guided=guided)
             ):
                 return DeferredIntentRejected(reason="stated_fact_unproven")
             if isinstance(constraint, StatedGateRoutingConstraint):
@@ -2262,7 +2478,8 @@ def create_deferred_stage_intent(
     if type(action) is not DeferredIntentAction:
         raise TypeError("action must be an exact DeferredIntentAction")
     _require_nonempty_exact_str(originating_message_content, "originating_message_content")
-    stated_requirement = _message_requires_stated_constraint(originating_message_content)
+    instruction = deferred_intent_instruction_text(originating_message_content)
+    stated_requirement = _message_requires_stated_constraint(instruction)
     stated_types = {type(constraint) for constraint in action.constraints}
     if (stated_requirement == "routing" and StatedGateRoutingConstraint not in stated_types) or (
         stated_requirement == "predicate" and not stated_types.intersection({StatedPredicateConstraint, StatedGateRoutingConstraint})
@@ -2270,7 +2487,7 @@ def create_deferred_stage_intent(
         raise InvariantError("explicit stated gate prose is not represented by a closed stated constraint")
     if any(
         isinstance(constraint, (StatedPredicateConstraint, StatedGateRoutingConstraint))
-        and not _stated_constraint_is_grounded(originating_message_content, constraint, guided=guided)
+        and not _stated_constraint_is_grounded(instruction, constraint, guided=guided)
         for constraint in action.constraints
     ):
         raise InvariantError("stated deferred constraint is not grounded in its originating user message")

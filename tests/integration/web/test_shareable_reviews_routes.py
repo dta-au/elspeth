@@ -226,6 +226,71 @@ def test_get_shared_inspect_happy_path(
     }
 
 
+def _seed_session_with_described_state(client: TestClient, *, user_id: str) -> UUID:
+    """The conftest passthrough fixture with an authored description on the
+    source, the node and the sink — the shape the freeform tool surface
+    instructs the planner to produce on every step (``_STEP_DESCRIPTION_
+    DESCRIPTION``, tools/_common.py) and which the share mirror did not
+    declare from 2026-08-15 until elspeth-989d369d82."""
+    session_service = client.app.state.session_service
+    settings = client.app.state.settings
+
+    async def _seed() -> UUID:
+        record = await session_service.create_session(
+            user_id=user_id,
+            title="described fixture",
+            auth_provider_type=settings.auth_provider,
+        )
+        (settings.data_dir / "blobs" / str(record.id)).mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "outputs" / str(record.id)).mkdir(parents=True, exist_ok=True)
+        base = _passthrough_composition_state(settings.data_dir, record.id)
+        state = replace(
+            base,
+            sources={name: replace(source, description="Orders export") for name, source in base.sources.items()},
+            nodes=tuple(replace(node, description="Pass every row through unchanged") for node in base.nodes),
+            outputs=tuple(replace(output, description="Rows as received") for output in base.outputs),
+        )
+        state_d = state.to_dict()
+        await _save_composition_state_with_compose_authority(
+            session_service,
+            record.id,
+            CompositionStateData(
+                sources=state_d["sources"],
+                nodes=state_d["nodes"],
+                edges=state_d["edges"],
+                outputs=state_d["outputs"],
+                metadata_=state_d["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+        return record.id
+
+    return asyncio.run(_seed())
+
+
+def test_get_shared_inspect_resolves_a_pipeline_with_authored_step_descriptions(
+    audit_readiness_test_client: TestClient,
+) -> None:
+    """elspeth-989d369d82, the collector-free arm, end to end through the real
+    stack: persistence round-trip (``state_from_record`` keeps every key),
+    the mark-ready gate (200, token minted — the owner never runs the strict
+    mirror, so they got no signal), then resolve. Before the fix the resolve
+    was a bare 500 for the recipient; the mirror must now carry the prose."""
+    client = audit_readiness_test_client
+    session_id = _seed_session_with_described_state(client, user_id=_TEST_AUTHED_USER_ID)
+    token = _mint_token(client, session_id)
+
+    response = client.get(f"/api/sessions/shared/{token}")
+
+    assert response.status_code == 200, response.text
+    snapshot = response.json()["composition_snapshot"]
+    assert snapshot["sources"]["source"]["description"] == "Orders export"
+    assert [node["description"] for node in snapshot["nodes"]] == ["Pass every row through unchanged"]
+    assert [output["description"] for output in snapshot["outputs"]] == ["Rows as received"]
+
+
 def test_get_shared_inspect_attributes_the_share_to_the_username(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:

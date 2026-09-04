@@ -111,19 +111,27 @@ class SourceSpecResponse(_StrictResponse):
     # plugin system. The envelope keys are closed; the values are not.
     options: CompositionObject
     on_validation_failure: str
+    description: str | None = None
 
 
 class NodeSpecResponse(_StrictResponse):
     """Strict wire mirror of ``NodeSpec`` (web/composer/state.py).
 
     Optional fields (condition, routes, fork_to, branches, policy, merge,
-    trigger, output_mode, expected_output_count, timeout_seconds) default to None to match
+    trigger, output_mode, expected_output_count, timeout_seconds, description,
+    scope_name, scope_opener, scope_policy) default to None to match
     ``CompositionState.to_dict()`` which omits these keys when the
     underlying dataclass field is None.
+
+    The field set is pinned REFLECTIVELY against ``dataclasses.fields(NodeSpec)``
+    and ``node_type`` against ``NodeType`` (tests/unit/web/shareable_reviews/
+    test_models.py) — a hand-listed restatement let ``queue``, ``description``
+    and ``collector`` each drift past this mirror and 500 the share-resolve
+    route (elspeth-a5b86149d4, elspeth-989d369d82).
     """
 
     id: str
-    node_type: Literal["transform", "gate", "aggregation", "coalesce", "queue", "row_union"]
+    node_type: Literal["transform", "gate", "aggregation", "coalesce", "queue", "row_union", "collector"]
     plugin: str | None
     input: str
     on_success: str | None
@@ -141,6 +149,17 @@ class NodeSpecResponse(_StrictResponse):
     output_mode: str | None = None
     expected_output_count: int | None = None
     timeout_seconds: float | None = None
+    description: str | None = None
+    # Collector-only scope binding. The authored ``scope_name`` is ADMITTED
+    # here, not stripped: the share surface is canonical (node ids are public
+    # in ``nodes[].id`` and the edge list) and the public YAML consumer
+    # ``generate_public_pipeline_dict`` requires it to lower the ``scopes:``
+    # block (yaml_generator.py ``_require_node_key(c, "scope_name", ...)``).
+    # The guided ``_CollectorBehavior`` privacy ruling governs the stable-id'd
+    # proposal projection, which this mirror is not.
+    scope_name: str | None = None
+    scope_opener: str | None = None
+    scope_policy: str | None = None
 
 
 class EdgeSpecResponse(_StrictResponse):
@@ -160,6 +179,7 @@ class OutputSpecResponse(_StrictResponse):
     plugin: str
     options: CompositionObject
     on_write_failure: str
+    description: str | None = None
 
 
 class CompositionStateResponse(_StrictResponse):
