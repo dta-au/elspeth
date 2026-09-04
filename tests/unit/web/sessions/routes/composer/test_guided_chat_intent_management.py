@@ -457,7 +457,12 @@ def test_responsible_stage_rejection_keeps_its_diagnostic_and_retains_clarificat
 
 def test_unproven_stated_routing_retains_instruction_as_clarification_debt() -> None:
     """A stated-fact-unproven rejection keeps the instruction as constraint-free
-    clarification debt; the unproven routing facts never persist."""
+    clarification debt; the unproven routing facts never persist.
+
+    The copy must name the retained intent and its two exact commands: the
+    UUID reaches the user through this message and nowhere else, and the
+    debt blocks wire confirmation until one of them is sent
+    (elspeth-3d392c04ca, addendum 7992 #2)."""
 
     result = _apply(
         _action("passthrough"),
@@ -468,6 +473,9 @@ def test_unproven_stated_routing_retains_instruction_as_clarification_debt() -> 
     assert result.retained_intent_ids == (_INTENT_ID,)
     assert result.chat.error_class == "DeferredIntentRejected"
     assert "pending clarification" in result.chat.assistant_message
+    assert f"Edit exact intent {_INTENT_ID}:" in result.chat.assistant_message
+    assert f"Cancel exact intent {_INTENT_ID}." in result.chat.assistant_message
+    assert "Restate" not in result.chat.assistant_message
     (intent,) = result.guided.deferred_intents
     assert intent.constraints == ()
     assert intent.catalog_kind is None
