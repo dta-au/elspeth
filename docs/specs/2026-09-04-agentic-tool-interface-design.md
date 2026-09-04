@@ -36,9 +36,18 @@ built on.** `_candidate_shape_hash` does not distinguish what its name and its
 | add a schema field | differs |
 | add a node | differs |
 
-`_value_free_shape` drops dict KEYS and maps every string to the literal
-`"string"`, so the hash sees sequence LENGTHS and container nesting and
-essentially nothing else.
+`_value_free_shape` maps every string to the literal `"string"`. Stated
+exactly, because the first draft of this paragraph overstated it and was
+corrected by measurement:
+
+- **Visible:** the `node_type` set (transform → gate DOES differ), the presence
+  or absence of a key, node counts and sequence lengths.
+- **Invisible:** plugin identity, node ids, route targets, sink aliases,
+  `schema.mode`, and every other string VALUE.
+
+So the hash is not structure-blind — it is IDENTITY-blind. It answers "is this
+the same arrangement of the same kinds of things", not "is this the same
+graph".
 
 **Therefore "attempts 2 and 3 share a shape hash" means only: same node count,
 same field count, same nesting.** It licenses NO inference about values versus
@@ -50,9 +59,23 @@ would have been invisible to this instrument.
 
 **It also inverts the reading.** `guided_reviewed_name_shadowed`,
 `guided_route_target_unknown` and `guided_output_alias_collision` all prescribe
-RENAMES or ROUTE SWAPS — exactly the edits measured invisible above — and all
-three mask to `validation_error`. A well-informed model following good guidance
-produces precisely the signature that was read as blindness.
+RENAMES or ROUTE SWAPS — exactly the edits measured invisible above. So a model
+following good guidance can perform a large, correct, structural repair and
+leave the hash unchanged: the signature read as blindness is equally the
+signature of competence.
+
+**Correction to the first version of this paragraph, which claimed those three
+"mask to `validation_error`". They do not**, and the peer session caught it.
+Each is constructed with an explicit `error_code=` AND a `connectivity={...}`
+fact payload (`guided/planning.py:2794`, `:2814`, `:3048`) and each is
+catalogued (`tools/generation.py:1103`, `:1114`, `:1125`). They announce
+themselves properly.
+
+That correction NARROWS the hunt rather than weakening it: whatever produced
+`validation_error` at attempt #2 was therefore NOT one of these — they would
+have shown their own code — so the population to chase is the codeless
+rejection constructors. "An address without a fault" survives intact and now
+has a smaller search space.
 
 **Retracted with it:** the claim, committed earlier in this branch, that the
 one-turn structural repair at attempt #4 is behavioural proof the contract

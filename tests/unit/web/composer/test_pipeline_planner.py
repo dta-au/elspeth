@@ -11,7 +11,7 @@ import ast
 import asyncio
 import json
 import threading
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -1223,6 +1223,48 @@ def test_candidate_shape_hash_retains_closed_node_type_sequence(tmp_path: Path) 
     gate_candidate["nodes"][0]["node_type"] = "gate"
 
     assert _candidate_shape_hash(transform_candidate) != _candidate_shape_hash(gate_candidate)
+
+
+def test_candidate_shape_hash_is_identity_blind_not_structure_preserving(tmp_path: Path) -> None:
+    """Pin what this hash CANNOT see, because its name misled a whole investigation.
+
+    On 2026-09-04 two agents spent a day reasoning from "attempts 2 and 3 share
+    a candidate_shape_hash, therefore the repair between them changed only
+    VALUES inside an identical structure". That inference does not hold. The
+    hash is IDENTITY-blind, not merely value-free: a repair that renamed every
+    node, re-pointed every route and swapped a plugin produces the SAME hash.
+    Three real rejection codes — ``guided_reviewed_name_shadowed``,
+    ``guided_route_target_unknown`` and ``guided_output_alias_collision`` —
+    prescribe exactly those edits, so a model following good guidance produces
+    the signature that was read as blindness.
+
+    The two tests above pin what it DOES retain. This one pins what it does
+    not, so the next reader takes the instrument's resolution from an assertion
+    rather than from ``_value_free_shape``'s name. A hash's discriminating
+    power is measured, never inferred from its identifier.
+    """
+    base = _pipeline(tmp_path)
+    base["nodes"] = [
+        {"id": "scrape", "node_type": "transform", "plugin": "web_scrape", "input": "rows", "on_success": "scraped"},
+        {"id": "llm1", "node_type": "transform", "plugin": "llm", "input": "scraped", "on_success": "out"},
+    ]
+    baseline = _candidate_shape_hash(base)
+
+    def mutated(apply: Callable[[dict[str, Any]], None]) -> str:
+        candidate = deepcopy(base)
+        apply(candidate)
+        return _candidate_shape_hash(candidate)
+
+    # INVISIBLE — every one of these is a real repair a rejection can demand.
+    assert mutated(lambda c: c["nodes"][1].__setitem__("plugin", "coalesce")) == baseline
+    assert mutated(lambda c: c["nodes"][0].__setitem__("id", "renamed")) == baseline
+    assert mutated(lambda c: c["nodes"][1].__setitem__("input", "rows")) == baseline
+    assert mutated(lambda c: c["nodes"][0].__setitem__("on_success", "elsewhere")) == baseline
+
+    # VISIBLE — the kind set, key presence, and cardinality.
+    assert mutated(lambda c: c["nodes"][1].__setitem__("node_type", "gate")) != baseline
+    assert mutated(lambda c: c["nodes"][0].pop("on_success")) != baseline
+    assert mutated(lambda c: c["nodes"].append({"id": "x", "node_type": "transform", "plugin": "llm"})) != baseline
 
 
 @pytest.mark.asyncio
