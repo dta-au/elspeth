@@ -226,7 +226,11 @@ function metadataPatchEntries(
       after: undefined,
       beforeSummary:
         before === null || before === undefined ? "(not set)" : valueSummary(before),
-      afterSummary: "new value redacted",
+      // "written, value redacted" and not "new value redacted": the sentinel
+      // proves the field is in the patch, not that the patch carries a value
+      // to show. A patch clearing the field to null looks identical here, so
+      // the row must not imply there is a new value behind the redaction.
+      afterSummary: "written, value redacted",
     });
   }
   if (summary.touchesUnknownField) {
@@ -237,7 +241,7 @@ function metadataPatchEntries(
       before: undefined,
       after: undefined,
       beforeSummary: "not a pipeline metadata field",
-      afterSummary: "field name and value redacted",
+      afterSummary: "written, field name and value redacted",
     });
   }
   return entries;

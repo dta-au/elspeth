@@ -239,21 +239,23 @@ describe("buildProposalDiff", () => {
 
     // "changed", not "added", even for the unset description: the sentinel
     // names the key but not the value, and a patch that clears a field to
-    // null is indistinguishable from one that sets it.
+    // null is indistinguishable from one that sets it. For the same reason
+    // the row says the field is WRITTEN rather than promising a new value
+    // sits behind the redaction.
     expect(entries).toEqual([
       expect.objectContaining({
         kind: "changed",
         section: "metadata",
         identity: "description",
         beforeSummary: "(not set)",
-        afterSummary: "new value redacted",
+        afterSummary: "written, value redacted",
       }),
       expect.objectContaining({
         kind: "changed",
         section: "metadata",
         identity: "name",
         beforeSummary: '"My pipeline"',
-        afterSummary: "new value redacted",
+        afterSummary: "written, value redacted",
       }),
     ]);
   });
@@ -273,7 +275,7 @@ describe("buildProposalDiff", () => {
       expect.objectContaining({
         section: "metadata",
         identity: "(unrecognised field)",
-        afterSummary: "field name and value redacted",
+        afterSummary: "written, field name and value redacted",
       }),
     ]);
   });
