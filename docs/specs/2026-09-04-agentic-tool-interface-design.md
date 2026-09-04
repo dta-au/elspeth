@@ -182,21 +182,42 @@ marks a component config-owned by structural diff of authored against
 finalized, so in the guided lane the reviewed source and sink are owned and
 the model-authored transforms are not.
 
-**Two narrowings that follow.** `locked_input_extras` is emitted only for NODE
-consumers — sinks emit `sink_locked_extras`, a different code — so the only
-way this detail is withheld is a **source producer**. And the peer's own
-evidence has the extras being `web_scrape`'s six emitted fields, which makes
-`web_scrape` the producer: a model-authored transform, hence **forwarded**.
+**One narrowing that follows, and one that does NOT.**
 
-On that reading the planner was shown `content` and `fingerprint` by name and
-still spent a repair turn, which would move the work to the brief and mean
-layer 1 buys nothing for this walk. **Held as an inference, not a result:** it
-rests on the accepted graph, and the rejected candidates are not persisted. So
-the persistence work below is still what closes the question — it has simply
-become a narrower question, and a less likely one to land on observability.
+The narrowing that holds: `locked_input_extras` is emitted only for NODE
+consumers — sinks emit `sink_locked_extras`, a different code, from
+`_sink_locked_extras_error` (`state.py:5474`) — so the only way this detail is
+withheld is a **source producer**.
 
-The original framing of the two branches, retained because the second is now
-the favoured one and the first is not excluded:
+**A second narrowing was attempted here and is WITHDRAWN.** Revision 2 argued:
+the extras are `web_scrape`'s six emitted fields, so `web_scrape` is the
+producer, so the producer is model-authored, so the detail was forwarded — and
+therefore the planner was shown `content` and `fingerprint` by name and the
+work moves to the brief. That chain breaks at its first step, and the break was
+found by the peer session that supplied the evidence.
+
+The field-set reading comes from the **accepted** graph, attempt #4. Attempts 2
+and 3 carry candidate shape hash `a63068f5a5` against the accepted `49f300e14a`,
+and `_candidate_shape_hash` is value-free — so the rejected candidates
+demonstrably had a different TOPOLOGY, not merely different values. If the
+second repair is what introduced `web_scrape`, then on attempts 2 and 3 the
+locked consumer's producer may have been the reviewed `csv` source directly,
+which IS config-owned, which withholds. The observability branch is fully live.
+
+This is worth naming as a method failure and not just a wrong answer: it is a
+claim about the ACCEPTED candidate extended to the REJECTED ones, which is the
+same class of error as revision 1's — a measurement of one thing carried into a
+conclusion about another. That the ticket's headline finding is *precisely
+that the rejected candidates differed structurally* makes it worse, not better.
+
+**Corrected position: both branches are live and neither is favoured.** What
+survives is the RULE, which is determinate and pinned. What does not survive is
+any claim about which arm applied on this walk. The topology of the rejected
+candidates is not merely uncertain, it is unrecoverable from persisted data —
+so the persistence work is not one way of settling this, it is the only way,
+and it must persist the projected detail AND the rejected shape.
+
+The two branches, neither favoured: as written below.
 
 - **Withheld** — the model was blind to `extra_fields` and the defect is
   custody scoping. Note the standing hazard: the `_allowlisted_candidate_feedback`
