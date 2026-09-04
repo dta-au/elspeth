@@ -162,9 +162,41 @@ So the observability gap is **narrower and sharper** than first written: we
 cannot tell what the model was shown, because what it was shown is not
 recorded. That is a persistence defect, not a derivation defect.
 
-**The decisive next measurement, and it must precede any fix.** Was
-`withholding.contract` set for that entry? The two answers demand different
-work and there is currently no data to choose between them:
+**ANSWERED IN PART, 2026-09-04 — the rule is determinate and now pinned.**
+The question "was `withholding.contract` set?" has no single answer: it is
+**edge-dependent**, and the rule was measured by exercising
+`_allowlisted_candidate_feedback` directly and pinned in
+`test_schema_contract_detail_withholding_follows_the_participants_not_the_entry`.
+
+| failing edge | contract detail |
+|---|---|
+| model-authored → model-authored (`llm` → `field_mapper`) | **forwarded**, `extra_fields` included |
+| producer is the guided-reviewed **source** | **withheld** |
+| consumer is the reviewed **sink** | withheld — but by the entry-own check, not the participant arm |
+| entry component unattributable | withheld (fail-closed) |
+
+`_entry_withholding` (`pipeline_planner.py:2286`) sets `contract` when the
+entry's own component is config-owned OR when any participant of the contract
+is (`_contract_participant_refs`). `_derive_finalizer_owned_refs` (`:853`)
+marks a component config-owned by structural diff of authored against
+finalized, so in the guided lane the reviewed source and sink are owned and
+the model-authored transforms are not.
+
+**Two narrowings that follow.** `locked_input_extras` is emitted only for NODE
+consumers — sinks emit `sink_locked_extras`, a different code — so the only
+way this detail is withheld is a **source producer**. And the peer's own
+evidence has the extras being `web_scrape`'s six emitted fields, which makes
+`web_scrape` the producer: a model-authored transform, hence **forwarded**.
+
+On that reading the planner was shown `content` and `fingerprint` by name and
+still spent a repair turn, which would move the work to the brief and mean
+layer 1 buys nothing for this walk. **Held as an inference, not a result:** it
+rests on the accepted graph, and the rejected candidates are not persisted. So
+the persistence work below is still what closes the question — it has simply
+become a narrower question, and a less likely one to land on observability.
+
+The original framing of the two branches, retained because the second is now
+the favoured one and the first is not excluded:
 
 - **Withheld** — the model was blind to `extra_fields` and the defect is
   custody scoping. Note the standing hazard: the `_allowlisted_candidate_feedback`
