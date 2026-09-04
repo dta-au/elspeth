@@ -438,11 +438,17 @@ class HandoffStore(Protocol):
     def consume(self, *, code_hash: str) -> str | None:
         """Atomically claim a handoff, returning its identity_id or None.
 
-        MUST be one conditional UPDATE against the DATABASE clock — never a
-        SELECT then an UPDATE. Two ``complete`` calls racing on one code is
-        the expected case (a double-submitted form, a retried request), and a
-        read-then-write would let both win and mint two sessions from one
-        login.
+        The CLAIM must be one conditional UPDATE: the row is claimed by the
+        same statement that decides it may be claimed. Two ``complete`` calls
+        racing on one code is the expected case (a double-submitted form, a
+        retried request), and reading the row first and updating it second
+        would let both win and mint two sessions from one login.
+
+        Its expiry bound must come from the DATABASE's clock, not the
+        replica's — otherwise a single-use code is single-use only as far as
+        clock drift between replicas allows. Reading that clock is a separate
+        statement and must be, since it reads the clock rather than the row;
+        the ban is on reading the ROW before claiming it.
 
         ``None`` covers unknown, already-consumed and expired alike. The
         caller cannot distinguish them and must not: telling a caller which
