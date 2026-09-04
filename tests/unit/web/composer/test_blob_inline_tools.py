@@ -999,3 +999,78 @@ def test_state_options_reference_blob_finds_nested_reference() -> None:
     blob_id = "0be5905a-3e69-49a5-a8e9-9617b691c665"
     options = {"outer": {"items": ({"blob_ref": blob_id},)}}
     assert _state_options_reference_blob(options, blob_id, "blobs/session/file.csv", owner="node 'n1'")
+
+
+_GUARD_BLOB_ID = "0be5905a-3e69-49a5-a8e9-9617b691c665"
+_GUARD_STORAGE_PATH = "blobs/session/file.csv"
+
+
+def _state_options_reference(options: Mapping[str, Any]) -> bool:
+    from elspeth.web.composer.tools.blobs import _state_options_reference_blob
+
+    return _state_options_reference_blob(options, _GUARD_BLOB_ID, _GUARD_STORAGE_PATH, owner="source 'input'")
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"blob_id": _GUARD_BLOB_ID}, True, id="blob_id-top-level"),
+        pytest.param({"custody": {"upload_blob_id": _GUARD_BLOB_ID}}, True, id="suffix-_blob_id-nested"),
+        pytest.param({"provider_config": {"source_blob_id": _GUARD_BLOB_ID}}, True, id="suffix-_blob_id-provider-config"),
+        pytest.param({"blob_id": "11111111-2222-3333-4444-555555555555"}, False, id="blob_id-other-blob"),
+        pytest.param({"blob_identifier": _GUARD_BLOB_ID}, False, id="not-vocabulary-blob_identifier"),
+        pytest.param({"blob_ids": [_GUARD_BLOB_ID]}, False, id="not-vocabulary-plural-scalar-list"),
+        pytest.param({"blob_id": None}, False, id="blob_id-none-is-unbound"),
+    ],
+)
+def test_state_options_reference_blob_recognises_blob_id_vocabulary(options: Mapping[str, Any], expected: bool) -> None:
+    """``blob_id`` and ``*_blob_id`` are binding vocabulary for every other walker.
+
+    Regression for elspeth-4f3cd4155b: the retention guard recognised only
+    ``blob_ref``/``path``/``file``, so a blob bound through the custody
+    vocabulary ``guided/stage_transitions._option_blob_ids`` and
+    ``web/blobs/service._option_value_references_blob`` both honour read as
+    unbound here and became updatable/deletable under an accepted
+    composition. Negative rows pin that the vocabulary is exact: a
+    near-miss key is not a binding, and neither is the id as a bare list
+    element.
+    """
+    assert _state_options_reference(options) is expected
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"inputs": [[{"blob_ref": _GUARD_BLOB_ID}]]}, True, id="list-of-lists-mapping"),
+        pytest.param({"inputs": ([({"path": _GUARD_STORAGE_PATH},)],)}, True, id="tuple-list-tuple-mapping"),
+        pytest.param({"inputs": [["x", 1, None, {"nested": {"file": f"blob:{_GUARD_BLOB_ID}"}}]]}, True, id="scalars-then-deep-mapping"),
+        pytest.param({"inputs": [[_GUARD_STORAGE_PATH]]}, False, id="bare-string-in-nested-list-is-not-a-binding"),
+        pytest.param({"inputs": [[{"blob_ref": "11111111-2222-3333-4444-555555555555"}]]}, False, id="deep-other-blob"),
+    ],
+)
+def test_state_options_reference_blob_descends_every_sequence_level(options: Mapping[str, Any], expected: bool) -> None:
+    """Sequence recursion is unconditional and shape-dispatched at every depth.
+
+    Regression for elspeth-4f3cd4155b: the walker descended one level into
+    a list/tuple and only into mapping elements, so a binding inside a
+    list of lists was invisible while the DB-side twin
+    ``_option_value_references_blob`` recursed into every list child.
+    """
+    assert _state_options_reference(options) is expected
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"blob_id": 7}, id="blob_id-int"),
+        pytest.param({"custody": {"upload_blob_id": ["not", "a", "str"]}}, id="suffix-_blob_id-list"),
+        pytest.param({"inputs": [[{"source_blob_id": 3.5}]]}, id="deep-suffix-_blob_id-float"),
+    ],
+)
+def test_state_options_reference_blob_crashes_on_non_str_blob_id_vocabulary(options: Mapping[str, Any]) -> None:
+    """The same escalation ``blob_ref`` already had: a non-str binding value is
+    audited-state corruption, and reading it as unbound would defeat the guard."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    with pytest.raises(AuditIntegrityError, match=r"non-str [a-z_]*blob_id"):
+        _state_options_reference(options)
