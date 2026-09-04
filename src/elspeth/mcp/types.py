@@ -291,8 +291,21 @@ class CollisionRecord(TypedDict):
     """Field name → originating branch for all union-merged fields."""
 
 
-# Dataclass mirror types: dict[str, Any] aliases for dataclass_to_dict()
-# conversions where the exact shape depends on the dataclass variant.
+# Dataclass mirror types: dict[str, Any] aliases for dataclass_to_dict() projections.
+#
+# These are NOT TypedDicts. Each is `dict[str, Any]` wearing a descriptive name, so an
+# annotation like `-> RunDetail | None` reads as typed while carrying no field contract
+# at all. Say so plainly rather than letting the name do the talking.
+#
+# Each alias projects exactly ONE owned dataclass — not a variant family (measured
+# 2026-09-04: run_lifecycle.get_run -> `Run | None`, data_flow.get_nodes -> `list[Node]`,
+# query.get_calls -> `list[Call]`; all three defined in contracts/audit.py). They stay
+# soft because `dataclass_to_dict` (core/landscape/serialization.py:56) builds a recursive
+# JSON projection, and a hand-written TypedDict would duplicate the dataclass's field list
+# with nothing pinning the copies equal. The fix is a DERIVED mirror or serializing at the
+# MCP boundary, not a second hand-maintained declaration.
+#
+# config/cicd/contracts-whitelist.yaml carries the six affected returns and this rationale.
 
 RunDetail = dict[str, Any]
 """Run detail dict from ``dataclass_to_dict(Run)``."""

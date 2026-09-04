@@ -8,6 +8,34 @@ Scans the codebase for:
 
 Also validates that all whitelist entries are still valid (not stale).
 
+SCOPE OF CHECK 2 — read this before treating a green run as "no soft types".
+This scan is syntactic and deliberately narrow. It reports a site only when ALL
+of the following hold, and a green result says nothing about anything else:
+
+  * the annotation spells ``dict[str, Any]`` / ``Dict[str, Any]`` — directly,
+    unioned with ``None``, wrapped in ``list[...]``, or through a module-level
+    alias resolved by :class:`DictAliasIndex`;
+  * the value type is ``Any`` — ``dict[str, object]`` and ``Mapping[str,
+    object]`` are out of scope by design, because ``object`` already forces
+    narrowing at every use site;
+  * the container is ``dict`` — ``Mapping``, ``MutableMapping`` and every other
+    mapping ABC are NOT scanned, even with an ``Any`` value type;
+  * the annotation sits on a function PARAMETER (positional-or-keyword or
+    keyword-only) or a RETURN. Positional-only parameters, ``*args`` and
+    ``**kwargs`` are not scanned, and neither is any variable or class-attribute
+    annotation (``ast.AnnAssign``);
+  * the file lives under ``src/elspeth`` and outside ``src/elspeth/contracts``.
+
+Measured at 2026-09-04 against ``src/elspeth``: 2,162 soft-mapping annotations
+exist in total, of which 1,601 are ``Any``-valued. This check can reach roughly a
+third of them. Widening it to the remaining forms is tracked work, not an
+oversight — see the ``[str, Any]`` burn-down epic — and the point of stating the
+scope here is that the gap stays visible while that work is outstanding.
+
+``tests/unit/scripts/test_check_contracts.py`` pins this scope: each exclusion
+above has a test that asserts the scanner does NOT report it, so widening the
+scanner without updating the record fails loudly.
+
 Usage:
     python scripts/check_contracts.py
     python scripts/check_contracts.py --no-fail-on-stale  # Skip stale check
@@ -209,8 +237,105 @@ def find_type_definitions(file_path: Path) -> list[tuple[str, int, str]]:
     return definitions
 
 
-def _is_dict_str_any(annotation: ast.expr | None) -> bool:
-    """Check if annotation is dict[str, Any] or Dict[str, Any]."""
+@dataclass
+class DictAliasIndex:
+    """Module-level ``X = dict[str, Any]`` aliases, resolved per importing module.
+
+    The dict-pattern matcher below is syntactic: it recognises the *spelling*
+    ``dict[str, Any]``. A name bound to that type at module scope therefore
+    launders it — ``def get_run(...) -> RunDetail | None`` and
+    ``def get_run(...) -> dict[str, Any] | None`` are the same type, and without
+    this index only the second is ever scanned.
+
+    Resolution is by import, not by name: an alias counts for a file only if that
+    file defines it or imports it from the module that does. Two modules may bind
+    the same name to different types without one poisoning the other.
+
+    SCOPE, stated so callers do not over-trust it. Resolved: module-level
+    ``X = dict[str, Any]`` and ``X: TypeAlias = dict[str, Any]``, reached through
+    ``from <module> import <name>`` (absolute or relative). NOT resolved: aliases
+    bound inside a function or class body, aliases reached as an attribute
+    (``import types_mod`` then ``types_mod.RunDetail``), aliases re-exported
+    through an intermediate module, aliases renamed on import (``as``), and
+    annotations written as string forward references. Each is a known hole, not
+    an oversight; widen this only with a test that witnesses the new form.
+    """
+
+    # Dotted module name -> the alias names it defines
+    _by_module: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    @staticmethod
+    def _module_name(py_file: Path, src_dir: Path) -> str:
+        """Return the dotted module name for ``py_file`` (``src/elspeth/mcp/types.py`` -> ``elspeth.mcp.types``)."""
+        relative = py_file.relative_to(src_dir.parent).with_suffix("")
+        parts = list(relative.parts)
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    @classmethod
+    def build(cls, src_dir: Path) -> DictAliasIndex:
+        """Parse every file once and record its module-level dict[str, Any] aliases."""
+        index = cls()
+        for py_file in src_dir.rglob("*.py"):
+            try:
+                tree = ast.parse(py_file.read_text())
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            names: set[str] = set()
+            # Module scope only: tree.body, never ast.walk. An alias bound inside a
+            # function is not importable, so resolving it would report a name the
+            # annotation cannot actually refer to.
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and _is_dict_str_any(node.value):
+                    names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+                elif (
+                    isinstance(node, ast.AnnAssign)
+                    and node.value is not None
+                    and _is_dict_str_any(node.value)
+                    and isinstance(node.target, ast.Name)
+                ):
+                    names.add(node.target.id)
+            if names:
+                index._by_module[cls._module_name(py_file, src_dir)] = frozenset(names)
+        return index
+
+    def names_in_scope(self, py_file: Path, src_dir: Path) -> frozenset[str]:
+        """Return the alias names ``py_file`` can refer to: its own plus those it imports."""
+        module = self._module_name(py_file, src_dir)
+        in_scope = set(self._by_module.get(module, frozenset()))
+        try:
+            tree = ast.parse(py_file.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            return frozenset(in_scope)
+        package = module.rsplit(".", 1)[0] if "." in module else module
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level:
+                # from .types import X / from ..mcp.types import X
+                base = package.split(".")
+                trimmed = base[: len(base) - (node.level - 1)] if node.level > 1 else base
+                source = ".".join([*trimmed, node.module]) if node.module else ".".join(trimmed)
+            else:
+                source = node.module or ""
+            defined = self._by_module.get(source)
+            if not defined:
+                continue
+            # asname is deliberately not followed: the renamed name is a different
+            # binding and resolving it would need scope tracking this index lacks.
+            in_scope.update(alias.name for alias in node.names if alias.asname is None and alias.name in defined)
+        return frozenset(in_scope)
+
+
+def _is_dict_str_any(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is dict[str, Any], Dict[str, Any], or an alias of one.
+
+    ``aliases`` carries the module-level ``X = dict[str, Any]`` names in scope for
+    the file being scanned (see :class:`DictAliasIndex`). Without it this matcher
+    is purely syntactic, so ``-> RunDetail`` and ``-> dict[str, Any]`` — the same
+    type — are treated differently and only the second is ever reported.
+    """
     if annotation is None:
         return False
 
@@ -221,6 +346,11 @@ def _is_dict_str_any(annotation: ast.expr | None) -> bool:
         if isinstance(expr, ast.Name) and expr.id == "Any":
             return True
         return isinstance(expr, ast.Attribute) and expr.attr == "Any" and isinstance(expr.value, ast.Name) and expr.value.id == "typing"
+
+    # A bare name bound to dict[str, Any] at module scope, e.g. mcp/types.py's
+    # RunDetail. Resolved from the alias index, never from the name's spelling.
+    if isinstance(annotation, ast.Name) and annotation.id in aliases:
+        return True
 
     # dict[str, Any] - modern syntax
     if (
@@ -236,55 +366,60 @@ def _is_dict_str_any(annotation: ast.expr | None) -> bool:
     return False
 
 
-def _is_list_of_dict_str_any(annotation: ast.expr | None) -> bool:
-    """Check if annotation is list[dict[str, Any]]."""
+def _is_list_of_dict_str_any(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is list[dict[str, Any]] (or list of an alias of one)."""
     if annotation is None:
         return False
 
     if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name) and annotation.value.id in ("list", "List"):
-        return _is_dict_str_any(annotation.slice)
+        return _is_dict_str_any(annotation.slice, aliases)
     return False
 
 
-def _is_optional_dict(annotation: ast.expr | None) -> bool:
-    """Check if annotation is dict[str, Any] | None."""
+def _is_optional_dict(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation is dict[str, Any] | None (or an alias of one)."""
     if annotation is None:
         return False
 
     # dict[str, Any] | None
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        left_is_dict = _is_dict_str_any(annotation.left)
+        left_is_dict = _is_dict_str_any(annotation.left, aliases)
         right_is_none = isinstance(annotation.right, ast.Constant) and annotation.right.value is None
         if left_is_dict and right_is_none:
             return True
         # None | dict[str, Any]
         left_is_none = isinstance(annotation.left, ast.Constant) and annotation.left.value is None
-        right_is_dict = _is_dict_str_any(annotation.right)
+        right_is_dict = _is_dict_str_any(annotation.right, aliases)
         if left_is_none and right_is_dict:
             return True
     return False
 
 
-def _is_union_with_dict(annotation: ast.expr | None) -> bool:
-    """Check if annotation contains dict[str, Any] in a union."""
+def _is_union_with_dict(annotation: ast.expr | None, aliases: frozenset[str] = frozenset()) -> bool:
+    """Check if annotation contains dict[str, Any] (or an alias) in a union."""
     if annotation is None:
         return False
 
     # Check direct dict
-    if _is_dict_str_any(annotation):
+    if _is_dict_str_any(annotation, aliases):
         return True
 
     # Check union types (X | Y | Z)
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
-        return _is_union_with_dict(annotation.left) or _is_union_with_dict(annotation.right)
+        return _is_union_with_dict(annotation.left, aliases) or _is_union_with_dict(annotation.right, aliases)
 
     return False
 
 
-def find_dict_patterns_in_file(file_path: Path) -> list[str]:
+def find_dict_patterns_in_file(file_path: Path, aliases: frozenset[str] = frozenset()) -> list[str]:
     """Find all dict[str, Any] patterns in a file.
 
     Returns list of qualified names like "path:Class.method:param"
+
+    ``aliases`` must match what :func:`find_dict_violations` was given for the same
+    file. The stale-entry check compares whitelist rows against this function's
+    output, so a narrower view here reports a legitimately whitelisted alias site
+    as stale and fails the gate closed on a row that is doing its job.
     """
     try:
         source = file_path.read_text()
@@ -316,23 +451,42 @@ def find_dict_patterns_in_file(file_path: Path) -> list[str]:
                 param_name = arg.arg
                 annotation = arg.annotation
 
-                if _is_dict_str_any(annotation) or _is_optional_dict(annotation) or _is_union_with_dict(annotation):
+                if (
+                    _is_dict_str_any(annotation, aliases)
+                    or _is_optional_dict(annotation, aliases)
+                    or _is_union_with_dict(annotation, aliases)
+                ):
                     patterns.append(f"{relative_path}:{context}:{param_name}")
-                elif _is_list_of_dict_str_any(annotation):
+                elif _is_list_of_dict_str_any(annotation, aliases):
                     patterns.append(f"{relative_path}:{context}:{param_name} (list)")
 
             # Check return type
             if node.returns:
-                if _is_dict_str_any(node.returns) or _is_optional_dict(node.returns) or _is_union_with_dict(node.returns):
+                if (
+                    _is_dict_str_any(node.returns, aliases)
+                    or _is_optional_dict(node.returns, aliases)
+                    or _is_union_with_dict(node.returns, aliases)
+                ):
                     patterns.append(f"{relative_path}:{context}:return")
-                elif _is_list_of_dict_str_any(node.returns):
+                elif _is_list_of_dict_str_any(node.returns, aliases):
                     patterns.append(f"{relative_path}:{context}:return (list)")
 
     return patterns
 
 
-def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: dict[str, bool]) -> list[DictViolation]:
-    """Find dict[str, Any] type hints that should be typed contracts."""
+def find_dict_violations(
+    file_path: Path,
+    whitelist: set[str],
+    matched_entries: dict[str, bool],
+    aliases: frozenset[str] = frozenset(),
+) -> list[DictViolation]:
+    """Find dict[str, Any] type hints that should be typed contracts.
+
+    Scans function PARAMETERS and RETURN annotations only. Variable and
+    class-attribute annotations (``ast.AnnAssign``) are not scanned, and neither
+    are positional-only parameters, ``*args`` or ``**kwargs`` — see this module's
+    docstring for the full scope statement.
+    """
     try:
         source = file_path.read_text()
         tree = ast.parse(source)
@@ -369,7 +523,11 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                 param_name = arg.arg
                 annotation = arg.annotation
 
-                if _is_dict_str_any(annotation) or _is_optional_dict(annotation) or _is_union_with_dict(annotation):
+                if (
+                    _is_dict_str_any(annotation, aliases)
+                    or _is_optional_dict(annotation, aliases)
+                    or _is_union_with_dict(annotation, aliases)
+                ):
                     # Build qualified name for whitelist check
                     qualified = f"{relative_path}:{context}:{param_name}"
                     if qualified in whitelist:
@@ -383,7 +541,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                                 param_name=param_name,
                             )
                         )
-                elif _is_list_of_dict_str_any(annotation):
+                elif _is_list_of_dict_str_any(annotation, aliases):
                     # List types have "(list)" suffix in whitelist
                     qualified = f"{relative_path}:{context}:{param_name} (list)"
                     if qualified in whitelist:
@@ -400,7 +558,11 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
 
             # Check return type
             if node.returns:
-                if _is_dict_str_any(node.returns) or _is_optional_dict(node.returns) or _is_union_with_dict(node.returns):
+                if (
+                    _is_dict_str_any(node.returns, aliases)
+                    or _is_optional_dict(node.returns, aliases)
+                    or _is_union_with_dict(node.returns, aliases)
+                ):
                     qualified = f"{relative_path}:{context}:return"
                     if qualified in whitelist:
                         matched_entries[qualified] = True
@@ -413,7 +575,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                                 param_name="return",
                             )
                         )
-                elif _is_list_of_dict_str_any(node.returns):
+                elif _is_list_of_dict_str_any(node.returns, aliases):
                     # List types have "(list)" suffix in whitelist
                     qualified = f"{relative_path}:{context}:return (list)"
                     if qualified in whitelist:
@@ -629,7 +791,7 @@ def validate_type_entry(entry: str, src_dir: Path) -> str | None:
     return None
 
 
-def validate_dict_pattern_entry(entry: str, src_dir: Path) -> str | None:
+def validate_dict_pattern_entry(entry: str, src_dir: Path, alias_index: DictAliasIndex | None = None) -> str | None:
     """Validate that an allowed_dict_patterns entry exists.
 
     Entry format: "src/elspeth/path/file.py:Class.method:param"
@@ -651,7 +813,8 @@ def validate_dict_pattern_entry(entry: str, src_dir: Path) -> str | None:
         return f"File not found: {file_path}"
 
     # Find all dict patterns in the file
-    patterns = find_dict_patterns_in_file(file_path)
+    aliases = alias_index.names_in_scope(file_path, src_dir) if alias_index is not None else frozenset()
+    patterns = find_dict_patterns_in_file(file_path, aliases)
 
     # Check if this entry matches any pattern
     if entry in patterns:
@@ -677,6 +840,7 @@ def find_stale_entries(
     matched_dict_patterns: dict[str, bool],
     matched_type_patterns: set[str],
     src_dir: Path,
+    alias_index: DictAliasIndex | None = None,
 ) -> list[StaleEntry]:
     """Find whitelist entries that don't match any code."""
     stale = []
@@ -695,7 +859,7 @@ def find_stale_entries(
             if matched_dict_patterns.get(entry.value, False):
                 continue
             # Validate the entry
-            error = validate_dict_pattern_entry(entry.value, src_dir)
+            error = validate_dict_pattern_entry(entry.value, src_dir, alias_index)
             if error:
                 stale.append(StaleEntry(entry=entry.value, category="dict_pattern", reason=error))
 
@@ -1276,6 +1440,9 @@ def main() -> int:
 
     # Build import index once (O(files) instead of O(files x types))
     import_index = ImportIndex.build(src_dir)
+    # Module-level `X = dict[str, Any]` aliases, so a name bound to the pattern is
+    # scanned like the pattern itself rather than walked past.
+    alias_index = DictAliasIndex.build(src_dir)
 
     # Scan all Python files outside contracts/
     for py_file in src_dir.rglob("*.py"):
@@ -1305,10 +1472,12 @@ def main() -> int:
                 )
 
         # Check for dict[str, Any] patterns
-        dict_violations.extend(find_dict_violations(py_file, whitelist["dicts"], matched_dict_patterns))
+        dict_violations.extend(
+            find_dict_violations(py_file, whitelist["dicts"], matched_dict_patterns, alias_index.names_in_scope(py_file, src_dir))
+        )
 
     # Find stale whitelist entries
-    stale_entries = find_stale_entries(all_entries, matched_dict_patterns, matched_type_patterns, src_dir)
+    stale_entries = find_stale_entries(all_entries, matched_dict_patterns, matched_type_patterns, src_dir, alias_index)
 
     # Check Settings → Runtime alignment
     config_path = src_dir / "core" / "config.py"

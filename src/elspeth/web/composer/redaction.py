@@ -2379,6 +2379,25 @@ def _redact_via_schema(
     return dumped
 
 
+def policy_closes_unknown_arguments(policy: ToolRedactionPolicy) -> bool:
+    """Return whether ``policy`` drops argument keys it does not recognise.
+
+    Declaring ``known_argument_keys`` is enough on its own:
+    ``redact_unknown_argument_keys`` opts a tool into the closed mode without an
+    allowlist, but a tool that supplies an allowlist is already closed. The two
+    conditions are therefore OR-ed, and both spellings reach the same behaviour.
+
+    Exported because a test that restates this rule instead of calling it will
+    drift from it. That is not hypothetical: the first version of
+    ``tests/unit/web/composer/test_tool_argument_wire_parity.py`` filtered on
+    ``redact_unknown_argument_keys`` alone, which silently excluded
+    ``request_advisor_hint`` -- a tool production does close -- and left the gate
+    describing itself as covering more than it iterated. A guard must derive its
+    scope from the authority it guards, not re-derive it alongside.
+    """
+    return bool(policy.known_argument_keys or policy.redact_unknown_argument_keys)
+
+
 def _redact_via_policy(
     tool_name: str,
     arguments: dict[str, Any],
@@ -2415,7 +2434,7 @@ def _redact_via_policy(
     # Non-sensitive keys are passthrough unless the policy opts into a closed
     # argument allowlist.
     redacted: dict[str, Any] = dict(arguments)
-    if policy.known_argument_keys or policy.redact_unknown_argument_keys:
+    if policy_closes_unknown_arguments(policy):
         known_argument_keys = set(policy.known_argument_keys)
         unknown_keys = [key for key in arguments if key not in known_argument_keys]
         for key in unknown_keys:
@@ -3722,6 +3741,12 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "scope_name",
                     "scope_opener",
                     "scope_policy",
+                    # Advertised since 80fa17fed (2026-08-15) and absent here until
+                    # 2026-09-04: composer-authored prose shown to reviewers on the
+                    # Spec tab. While unlisted, this fail-closed policy replaced the
+                    # key NAME with the unknown-argument sentinel, so the audit row
+                    # could not say which knob the planner had set.
+                    "description",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={
@@ -3807,6 +3832,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "plugin",
                     "options",
                     "on_write_failure",
+                    # See the note on upsert_node's "description": same schema
+                    # property, added by the same commit, missing here for the
+                    # same 20 days.
+                    "description",
                 ),
                 sensitive_argument_keys=("options",),
                 argument_summarizers={"options": _summarize_set_source_options},

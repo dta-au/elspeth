@@ -2186,6 +2186,19 @@
   color: var(--color-text-muted);
 }
 
+/* Completeness caveat for a projection that had to SKIP a comparison rather
+   than make it. Sits under the rows (or under the empty-state line) because it
+   qualifies the whole list, not any single row: option values are redacted
+   before this surface sees them, so a change confined to them cannot appear
+   above. Muted like the empty-state text — it is a limit on the evidence, not
+   a warning about the proposal. */
+.proposal-diff-caveat {
+  margin: var(--space-xs) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
 .proposal-diff-list {
   margin: 0;
 }
