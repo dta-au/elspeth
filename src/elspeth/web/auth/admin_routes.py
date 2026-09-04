@@ -106,7 +106,11 @@ async def _require_dev_admin(request: Request) -> UserIdentity:
     if settings.auth_provider != "local" or settings.dev_admin_user is None:
         raise HTTPException(status_code=404, detail="Not found")
     user = await get_current_user(request)
-    if user.user_id != settings.dev_admin_user:
+    # Compared against USERNAME, not user_id. ``dev_admin_user`` names a
+    # local-auth account (its validator says so), while ``user_id`` is now the
+    # identity_id — an opaque uuid that no operator ever configures. Comparing
+    # the two would silently 404 the admin out of their own surface.
+    if user.username != settings.dev_admin_user:
         raise HTTPException(status_code=404, detail="Not found")
     return user
 
@@ -180,7 +184,11 @@ def create_dev_admin_router() -> APIRouter:
         request: Request,
         admin: UserIdentity = Depends(_require_dev_admin),  # noqa: B008
     ) -> Response:
-        if user_id == admin.user_id:
+        # ``user_id`` here is the LOCAL ACCOUNT name in the path, and the
+        # thing to compare it with is the admin's username — ``admin.user_id``
+        # is the identity_id and would never match, silently disarming this
+        # guard and letting the admin delete their own credentials.
+        if user_id == admin.username:
             # The admin deleting themself would orphan the surface mid-session.
             raise HTTPException(status_code=400, detail="The dev admin account cannot delete itself")
         provider: LocalAuthProvider = request.app.state.auth_provider

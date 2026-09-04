@@ -1205,8 +1205,12 @@ class TestAuthenticate:
         token = await provider.login("alice", "pw")
         identity = await provider.authenticate(token)
         assert isinstance(identity, UserIdentity)
-        assert identity.user_id == "alice"
         assert identity.username == "alice"
+        # user_id is the IDENTITY_ID, not the username. It is the value every
+        # ownership row points at, so it must be the identity substrate's key
+        # and not a display string an administrator can change.
+        assert identity.user_id != "alice"
+        assert provider._token_issuer.decode(token).identity_id == identity.user_id
 
     @pytest.mark.asyncio
     async def test_authenticate_garbage_token(self, provider) -> None:
@@ -1326,7 +1330,9 @@ class TestGetUserInfo:
         token = await provider.login("alice", "pw")
         profile = await provider.get_user_info(token)
         assert isinstance(profile, UserProfile)
-        assert profile.user_id == "alice"
+        # The profile is read from auth.db by USERNAME while user_id carries
+        # the identity_id — the two are different keys into different stores.
+        assert profile.user_id == provider._token_issuer.decode(token).identity_id
         assert profile.username == "alice"
         assert profile.display_name == "Alice Smith"
         assert profile.email == "alice@example.com"
@@ -1399,57 +1405,87 @@ class TestTimingDefense:
 class TestRefresh:
     """Tests for the token refresh method."""
 
+    async def _logged_in(self, provider) -> str:
+        provider.create_user("alice", "pw", display_name="Alice")
+        return await provider.login("alice", "pw")
+
+    @staticmethod
+    def _backdated(provider, token: str, *, age_seconds: int) -> str:
+        """Re-mint a real token with its chain start pushed into the past.
+
+        Refresh now takes the TOKEN, so a test can no longer hand it a
+        fabricated ``original_iat`` — which is the point: no caller can claim
+        a chain age the signature does not support. To age a chain, the test
+        must mint a genuine token with an old ``iat``.
+        """
+        claims = provider._token_issuer.decode(token)
+        return provider._token_issuer.mint(
+            identity_id=claims.identity_id,
+            username=claims.username,
+            issued_at=int(time.time()) - age_seconds,
+        )
+
     @pytest.mark.asyncio
     async def test_refresh_deleted_user_raises(self, provider) -> None:
         """A deleted user cannot obtain fresh tokens via refresh."""
-        provider.create_user("alice", "pw", display_name="Alice")
+        token = await self._logged_in(provider)
         # Access _db_path directly — no public API to delete users by design
         _delete_user(provider, "alice")
-        with pytest.raises(AuthenticationError, match="User not found"):
-            await provider.refresh("alice", "alice", original_iat=int(time.time()))
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await provider.refresh(token)
 
     @pytest.mark.asyncio
     async def test_refresh_valid_user_returns_jwt(self, provider) -> None:
-        provider.create_user("alice", "pw", display_name="Alice")
-        token = await provider.refresh("alice", "alice", original_iat=int(time.time()))
+        token = await provider.refresh(await self._logged_in(provider))
         assert isinstance(token, str)
         assert len(token.split(".")) == 3
 
     @pytest.mark.asyncio
     async def test_refresh_with_iat_within_limit_succeeds(self, provider) -> None:
-        """Refresh with original_iat within max_refresh_chain_hours succeeds."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        recent_iat = int(time.time()) - 3600  # 1 hour ago
-        token = await provider.refresh("alice", "alice", original_iat=recent_iat)
+        """A chain inside max_refresh_chain_hours is renewed."""
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=3600)
+        token = await provider.refresh(aged)
         assert isinstance(token, str)
         assert len(token.split(".")) == 3
 
     @pytest.mark.asyncio
     async def test_refresh_with_expired_chain_raises(self, provider) -> None:
-        """Refresh with original_iat older than max_refresh_chain_hours raises."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        # Default max_refresh_chain_hours=168 (7 days). Set iat to 8 days ago.
-        old_iat = int(time.time()) - (8 * 24 * 3600)
+        """A chain older than max_refresh_chain_hours (168h) is refused."""
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=8 * 24 * 3600)
         with pytest.raises(AuthenticationError, match="Token refresh chain expired"):
-            await provider.refresh("alice", "alice", original_iat=old_iat)
+            await provider.refresh(aged)
 
     @pytest.mark.asyncio
     async def test_refresh_carries_original_iat_forward(self, provider) -> None:
-        """Refreshed token preserves the original iat, not a fresh one."""
-        import jwt
+        """Refreshed token preserves the original iat, not a fresh one.
 
-        provider.create_user("alice", "pw", display_name="Alice")
-        original_iat = int(time.time()) - 7200  # 2 hours ago
-        token = await provider.refresh("alice", "alice", original_iat=original_iat)
-        claims = jwt.decode(token, "test-secret-key-for-unit-tests", algorithms=["HS256"])
-        assert claims["iat"] == original_iat
+        The expected value is READ BACK from the aged token rather than
+        recomputed from the clock. Computing it twice raced a one-second tick
+        and failed roughly once per full-suite run.
+        """
+        aged = self._backdated(provider, await self._logged_in(provider), age_seconds=7200)
+        original_iat = provider._token_issuer.decode(aged).issued_at
+
+        renewed = await provider.refresh(aged)
+
+        assert provider._token_issuer.decode(renewed).issued_at == original_iat
 
     @pytest.mark.asyncio
-    async def test_refresh_without_iat_raises(self, provider) -> None:
-        """Refresh without original_iat must not start a fresh chain."""
-        provider.create_user("alice", "pw", display_name="Alice")
-        with pytest.raises(AuthenticationError, match="Token missing iat"):
-            await provider.refresh("alice", "alice", original_iat=None)
+    async def test_refresh_of_a_token_without_iat_raises(self, provider) -> None:
+        """A chain with no start cannot be bounded, so it is refused.
+
+        Previously the ROUTE checked this against the middleware's unverified
+        claims. It is now a decode requirement, which means a token missing
+        ``iat`` cannot reach any refresh path at all.
+        """
+        token = await self._logged_in(provider)
+        claims = provider._token_issuer.decode(token)
+        payload = _envelope(sub=claims.identity_id)
+        del payload["iat"]
+        no_iat = _signed_local_token(provider, payload)
+
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await provider.refresh(no_iat)
 
 
 class TestListUsers:

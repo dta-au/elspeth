@@ -97,8 +97,7 @@ class _FakeAuthProvider:
         self.login_calls += 1
         raise AssertionError("login should not be called")
 
-    async def refresh(self, _user_id: str, _username: str, *, original_iat: int) -> str:
-        _ = original_iat
+    async def refresh(self, _token: str) -> str:
         self.refresh_calls += 1
         if self.refresh_error is not None:
             raise self.refresh_error
@@ -191,28 +190,25 @@ def _token_bearing_401_case(case: str, tmp_path):
             (sensitive_token, sensitive_exception, "SENSITIVE_IAT_VALUE"),
         )
 
-    claims: dict[str, object]
-    refresh_error = None
-    if case == "unparseable_refresh_claims":
-        sensitive_token = "SENSITIVE_UNPARSEABLE_REFRESH_TOKEN"
-    else:
-        claims = {
-            "sub": "alice",
-            "username": "alice",
-            "exp": 9_999_999_999,
-        }
-        if case == "non_integer_refresh_iat":
-            claims["iat"] = "SENSITIVE_IAT_VALUE"
-        elif case == "provider_refresh_error":
-            claims["iat"] = 1
-            refresh_error = AuthenticationError(f"Token refresh rejected: {sensitive_exception}")
-        elif case != "missing_refresh_iat":
-            raise AssertionError(f"unknown token-bearing failure case: {case}")
-        sensitive_token = pyjwt.encode(
-            claims,
-            "test-key-that-is-at-least-32-bytes",
-            algorithm="HS256",
-        )
+    # The three former "refresh_claims" cases (missing / non-integer /
+    # unparseable iat) are gone from this list on purpose, not by oversight.
+    # The route used to read iat from the middleware's UNVERIFIED decode and
+    # own those failures itself; the provider's issuer now reads iat from its
+    # own verified decode, so a route-owned claims stage no longer exists to
+    # test. What those cases protected — a malformed iat cannot reach the
+    # chain bound, and its value never lands in the audit trail — is now
+    # covered by test_refresh_of_a_token_without_iat_raises in
+    # test_local_provider.py, and by this file's provider_refresh_error case
+    # for the audit shape.
+    if case != "provider_refresh_error":
+        raise AssertionError(f"unknown token-bearing failure case: {case}")
+
+    sensitive_token = pyjwt.encode(
+        {"sub": "alice", "username": "alice", "iat": 1, "exp": 9_999_999_999},
+        "test-key-that-is-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    refresh_error = AuthenticationError(f"Token refresh rejected: {sensitive_exception}")
 
     fake_provider = _FakeAuthProvider(refresh_error=refresh_error)
     app = _create_test_app(fake_provider)
@@ -226,9 +222,6 @@ def _token_bearing_401_case(case: str, tmp_path):
 
 _ROUTE_OWNED_TOKEN_FAILURES = [
     ("invalid_verification_token", "invalid_token", "verify_email", None, "AuthenticationError"),
-    ("unparseable_refresh_claims", "claims_invalid", "refresh_claims", "alice", None),
-    ("missing_refresh_iat", "claims_invalid", "refresh_claims", "alice", None),
-    ("non_integer_refresh_iat", "claims_invalid", "refresh_claims", "alice", None),
     ("provider_refresh_error", "authentication_error", "refresh", "alice", "AuthenticationError"),
 ]
 
@@ -836,7 +829,10 @@ class TestTokenRefreshEndpoint:
         metadata = json.loads(event.metadata_json)
         assert event.outcome == "success"
         assert event.provider == "local"
-        assert event.user_id == "alice"
+        # The audit principal is now the identity_id, matching the token's
+        # ``sub``, so an event can be joined to the identity substrate even
+        # after a username changes. ``username`` keeps the readable name.
+        assert event.user_id == claims["sub"]
         assert event.username == "alice"
         assert event.request_id == "refresh-token-1"
         assert metadata["token_type"] == "bearer"
@@ -846,12 +842,16 @@ class TestTokenRefreshEndpoint:
         assert old_token not in serialized
         assert new_token not in serialized
 
-    async def test_token_refresh_unparseable_claims_rejected(self, tmp_path) -> None:
-        """Refresh must fail if pre-verification claim decode failed.
+    async def test_refresh_does_not_read_the_unverified_claim_decode(self, tmp_path) -> None:
+        """The chain bound must survive the middleware's decode failing.
 
-        When the middleware can't decode claims (auth_claims=None), the refresh
-        endpoint cannot enforce chain lifetime. It must reject with 401 rather
-        than silently skipping the chain age check.
+        The route used to read ``iat`` from ``request.state.auth_claims``, an
+        UNVERIFIED decode, and 401 when it was unavailable. It now hands the
+        provider the token and the provider's issuer reads ``iat`` from its
+        own VERIFIED decode — so a failed unverified decode is no longer able
+        to influence the refresh path at all, and a genuine token still
+        refreshes. This asserts the stronger property that replaced the old
+        one: unverified claims are not an input.
         """
         from unittest.mock import patch
 
@@ -862,15 +862,12 @@ class TestTokenRefreshEndpoint:
         app = _create_test_app(provider)
 
         async with _client_for(app) as client:
-            # Login to get a valid token
             login_resp = await client.post(
                 "/api/auth/login",
                 json={"username": "alice", "password": "pw"},
             )
             valid_token = login_resp.json()["access_token"]
 
-            # Patch jwt.decode to fail on unverified decode but let authenticate()
-            # succeed (it uses the provider's own decode path, not the middleware's).
             original_decode = pyjwt.decode
 
             def selective_decode(token, *args, **kwargs):
@@ -884,33 +881,45 @@ class TestTokenRefreshEndpoint:
                     "/api/auth/token",
                     headers={"Authorization": f"Bearer {valid_token}"},
                 )
-        assert response.status_code == 401
-        assert "claims could not be parsed" in response.json()["detail"]
+
+        assert response.status_code == 200
+        assert response.json()["access_token"]
 
     async def test_token_refresh_missing_iat_rejected(self, tmp_path) -> None:
-        """Refresh must reject valid local tokens whose chain origin is absent."""
+        """A token with no chain origin cannot be bounded, so refresh refuses.
+
+        Now enforced by the issuer's ``require`` list rather than by the
+        route, which is why the token below must be signed with the
+        provider's REAL key: an unsigned forgery would be refused for the
+        signature and the iat requirement would go untested.
+        """
         provider = build_local_auth_provider(tmp_path / "auth.db")
         provider.create_user("alice", "pw", display_name="Alice")
         app = _create_test_app(provider)
-        token_without_iat = pyjwt.encode(
-            {
-                "sub": "alice",
-                "username": "alice",
-                "exp": 9_999_999_999,
-            },
-            "test-key",
-            algorithm="HS256",
-        )
 
         async with _client_for(app) as client:
+            login_resp = await client.post("/api/auth/login", json={"username": "alice", "password": "pw"})
+            claims = provider._token_issuer.decode(login_resp.json()["access_token"])
+            token_without_iat = pyjwt.encode(
+                {
+                    "sub": claims.identity_id,
+                    "username": "alice",
+                    "provider": "local",
+                    "iss": "elspeth",
+                    "aud": provider._token_issuer.audience,
+                    "jti": "no-iat",
+                    "exp": 9_999_999_999,
+                },
+                provider._token_issuer._signing_key,
+                algorithm="HS256",
+            )
+
             response = await client.post(
                 "/api/auth/token",
                 headers={"Authorization": f"Bearer {token_without_iat}"},
             )
 
         assert response.status_code == 401
-        assert "iat" in response.json()["detail"]
-        assert "re-authenticate" in response.json()["detail"]
 
     async def test_token_refresh_invalid_token(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")
@@ -1029,7 +1038,10 @@ class TestMeEndpoint:
             )
         assert me_resp.status_code == 200
         body = me_resp.json()
-        assert body["user_id"] == "alice"
+        # The identity_id, not the username — /me reports the key that owns
+        # this person's sessions, secrets and preferences.
+        assert body["user_id"] != "alice"
+        assert body["username"] == "alice"
         assert body["display_name"] == "Alice Smith"
         assert body["email"] == "alice@example.com"
         assert body["groups"] == []

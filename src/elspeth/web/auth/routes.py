@@ -503,8 +503,12 @@ def create_auth_router() -> APIRouter:
             display_name=profile.display_name,
             email=profile.email,
             groups=list(profile.groups),
+            # Username, not user_id: ``dev_admin_user`` names a local account,
+            # while user_id is the identity_id. Must agree with the same
+            # comparison in admin_routes._require_dev_admin, or the frontend
+            # shows an admin surface the backend then 404s.
             dev_admin=(
-                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.user_id == settings.dev_admin_user
+                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.username == settings.dev_admin_user
             ),
         )
 
