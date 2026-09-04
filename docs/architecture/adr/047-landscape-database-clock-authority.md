@@ -124,10 +124,54 @@ Concretely:
 
    `CURRENT_TIMESTAMP` (not `clock_timestamp()`) is chosen on PostgreSQL so
    that the in-SQL fence expression (item 2) and the read-once value are the
-   **same instant** within one transaction. The Sessions authority uses
-   `clock_timestamp()`; the two domains are separate and the difference is
-   deliberate: Landscape transactions are `BEGIN IMMEDIATE` write
-   transactions whose decisions must be internally consistent.
+   **same instant** within one transaction (ruled 2026-09-05, comment 9425
+   on elspeth-0ff11aa42e). The Sessions authority uses `clock_timestamp()`;
+   the two domains are separate and the difference is deliberate: Landscape
+   transactions are `BEGIN IMMEDIATE` write transactions whose decisions
+   must be internally consistent.
+
+   **Timezone contract.** The helper returns an *aware UTC* `datetime` on
+   both dialects: PostgreSQL `CURRENT_TIMESTAMP` is `timestamptz` and is
+   converted with `astimezone(UTC)` (never `replace`), SQLite returns naive
+   UTC text and is parsed then given `tzinfo=UTC`. This is the same
+   contract the consolidated web helper carries
+   (`src/elspeth/web/coordination/database_clock.py`, identity branch
+   `df17f22e5`), and it is a measured defect class, not a nicety: the three
+   web-side `_database_now` copies it replaces were not identical — on an
+   aware non-UTC value (psycopg with a non-UTC session timezone) one
+   converted and two returned `+10:00` unchanged, so every "UTC" log line
+   and date bucket lied by the session offset while comparisons still
+   agreed. The pin tests in C6.0 (Notes, below) cover an aware non-UTC
+   input and a non-UTC session timezone.
+
+   **Transaction time is the conservative direction — and its one
+   exception.** Inside a transaction every read of `CURRENT_TIMESTAMP` is
+   the transaction's *start*, so a verb that waited on a lock sees a `now`
+   that is *earlier* than wall time by its lock wait. For every
+   expiry/takeover/recovery predicate in the corpus the stale-early side is
+   the safe side: `stored_deadline < now` becomes true *later*, so a
+   takeover, lease recovery, dead-worker eviction, or expiry-driven
+   `NonResumableRunError` cannot fire early, and an extension writes
+   `start + window`, which is never later than the truth. The exception is
+   any check whose *permissive* outcome is "still live": a stale-early
+   `now` can over-report liveness by at most the transaction's age. Two
+   sites are of that shape — `admit_follower` (admits a follower while the
+   seat reads live) and the `seat_live` projection `worker_heartbeat` returns
+   to the heartbeat thread — and both are bounded and self-correcting: the
+   transaction is one statement long with no I/O inside it, so its age is
+   the lock wait plus one round trip; and an over-admitted follower is
+   refused at its first fenced verb (`verify_and_extend_leader_fence` is
+   identity+epoch, not time) while the heartbeat thread re-reads on its next
+   beat. The ordering proof for everything else is locks-before-read: every
+   verb holds its transaction's write lock (`BEGIN IMMEDIATE` on SQLite; the
+   row lock of its `SELECT … FOR UPDATE` or of the CAS `UPDATE … WHERE
+   deadline < now`, which re-evaluates its predicate on the locked row, on
+   PostgreSQL) at the moment it *decides* on a deadline, and a sibling's
+   fence or release committed after our transaction began is visible to
+   that locked decision (READ COMMITTED sees committed rows) and is compared
+   against our earlier `now` — which, by the paragraph above, can only make
+   the sibling's row look *less* expired. No Landscape verb needs to observe
+   a sibling's write as *already expired* to be correct.
 
 2. **The first fence writes database time in SQL.**
    `verify_and_extend_leader_fence(conn, *, token, window_seconds, verb)` loses
@@ -199,10 +243,24 @@ Concretely:
    past and calls the verb; a test that asserted `expires_at == NOW + WINDOW`
    asserts the window instead. `MockClock` stays for engine poll budgets.
 
-7. **The clock domains never cross.** Nothing under `core/landscape` or
-   `core/checkpoint` imports the Sessions authority; nothing passes a Sessions
-   `database_now` into a Landscape verb or vice versa. The web tier's
-   adapters call each authority with its own transaction and no time.
+7. **The clock domains never cross, and the Landscape clock is a distinct
+   authority.** Nothing under `core/landscape` or `core/checkpoint` imports
+   the Sessions authority or the consolidated web helper
+   `elspeth.web.coordination.database_clock` — the two clocks share a
+   *contract* (aware UTC, read once per transaction, transaction time), not
+   *code*; nothing passes a Sessions `database_now` into a Landscape verb or
+   vice versa; the web tier's adapters call each authority with its own
+   transaction and no time. The proof is already a gate, not prose:
+   `_sessions_import_violations` in the clock-authority test fails any
+   module under `core/landscape` or `core/checkpoint` that imports
+   `elspeth.web.coordination` or `elspeth.web.sessions` directly, via
+   `importlib`, or transitively, and the `cross-database-clock-comparison` /
+   `cross-database-clock-forwarding` scanner kinds fail any comparison or
+   forwarding between a Sessions-derived and a Landscape-derived time. Both
+   are exercised by gate id 1. Consistency between the two helpers is proven
+   by the shared pin tests (aware-UTC on both dialects, same value across two
+   calls in one transaction) run against each helper, not by importing one
+   from the other.
 
 What this ADR does **not** do:
 
@@ -327,7 +385,7 @@ whose per-family arm goes green as that family lands.
 
 | # | commit | production files | corpus | tests to re-express | mutation |
 |---|---|---|---|---|---|
-| C6.0 | `landscape_database_now(conn)` in `core/landscape/database.py`; dialect parse; docstring on the fence-text artefact | `core/landscape/database.py` | 0 (new) | new unit test: SQLite + PostgreSQL (testcontainer) round-trip, UTC-aware, raises on unknown dialect; positive control that the scanner classifies it as a database clock | return `datetime.now(UTC)` → scanner classifies as process clock (gate id 1 grows) |
+| C6.0 | `landscape_database_now(conn)` in `core/landscape/database.py`; dialect parse; docstring on the fence-text artefact | `core/landscape/database.py` | 0 (new) | pin tests: (i) aware non-UTC input (`+10:00`) → aware UTC result, and a PostgreSQL session with `SET TIME ZONE` non-UTC → aware UTC result; (ii) two calls inside one PostgreSQL transaction return the SAME value and differ from `clock_timestamp()` (the property the fence relies on); (iii) SQLite round-trip is aware UTC; (iv) unknown dialect raises; (v) fence-text artefact: a fence-written expiry and a `.ffffff` bound value for the same instant differ by < 1 s, and every production liveness/lease window constant is ≥ 10 s; (vi) positive control: the scanner classifies the helper as a database clock. PostgreSQL cases run under testcontainer (tests/testcontainer/core — the sessions-schema fixture defect elspeth-d0e62aea41 does not apply) | return `datetime.now(UTC)` → scanner classifies as process clock (gate id 1 grows); drop `astimezone(UTC)` → pin (i) fails |
 | C6.1 | first fence + `fenced_leader_transaction` without `now`; 11 forwarders drop `now=` | `run_coordination_repository.py:244-320`, `checkpoint/manager.py`, `data_flow/tokens.py`, `execution/source_completion_recovery.py`, `run_lifecycle_repository.py`, `scheduler/{barrier,dispositions,fencing,group_losses,queue}.py` | ~15 | `test_leader_fence_stale_token.py`, `test_coordination_fence_constructs.py`, `test_run_coordination_repository.py` (fence cases), checkpoint tests | reintroduce `now` on the verifier → gate id 3 fails; write `now + timedelta` → `caller-or-process-deadline` |
 | C6.2 | leadership + worker family | `run_coordination_repository.py` (register/acquire/release/live_leader/worker_heartbeat/admit_follower/depart/evict/dead_non_leader_workers/_insert_worker_row), `run_lifecycle_repository.py`, `checkpoint/recovery.py`, `engine/orchestrator/{resume,run_lifecycle,follower,join_admission,heartbeat}.py` | ~55 | `test_run_coordination_repository.py` (85 sites), `test_run_coordination_liveness.py`, `test_join_run_admission.py`, `test_evict_worker_housekeeping.py`, `test_run_coordination_release_postgres.py`, `e2e/recovery/*`, `tests/fixtures/landscape.py` (`expire_leader_seat`, `leader_coordination_token`) | in `_acquire_run_leadership_on` compare against `datetime.now(UTC)` → gate ids 1/2 and the divergent test's `takeover accepted Sessions clock` arm fail |
 | C6.3 | scheduler family | `scheduler/leases.py`, `scheduler_repository.py`, `scheduler/dispositions.py`, `scheduler/barrier.py` (raw SQL binds `database_now`), `scheduler/queue.py`, `scheduler/group_losses.py`, `scheduler/fencing.py`, `data_flow/tokens.py` | ~80 | `test_scheduler_events.py`, `test_scheduler_lease_recovery_races.py`, `test_scheduler_lease_eviction_postgres.py`, `test_scheduler_repository_complete_barrier.py`, `test_lease_recovery_sweep.py`, `test_multi_source_foundation.py`, `test_count_ready_in_set.py`, property state machine | in `claim_ready` compare `available_at <= now()` → gate id 2 `scheduler` family fails |
@@ -338,17 +396,25 @@ Estimate: 60–90 h as planned (C6.2 and C6.3 carry most of the test surface).
 C6 starts only after C1 → C2 → C4 land (lane C's critical path) and after
 the hub replies to this design; the ADR moves to **Accepted** on C6.5.
 
-Open questions for the hub (answer before C6.0):
+Rulings (2026-09-05, hub comment 9425 on elspeth-0ff11aa42e; no merge-writer
+veto):
 
-1. `CURRENT_TIMESTAMP` (transaction time) versus `clock_timestamp()`
-   (statement time) on PostgreSQL. The ADR chooses transaction time for
-   in-transaction consistency with the fence expression; the Sessions
-   authority chose statement time. Confirm, or rule that both domains should
-   match.
-2. Whether `updated_at` on `run_coordination` / `run_workers` should also move
-   to database time (the ADR says yes, for consistency; it is forensic either
-   way).
-3. Whether the SQLite fence-text artefact (a fence-written expiry reads as
-   expired within its final second) is acceptable as documented, or whether
-   the fence should be followed by a normalising `UPDATE` (rejected here as
-   a second effect the gate would flag).
+1. `CURRENT_TIMESTAMP` (transaction time) on PostgreSQL — **confirmed**; the
+   in-SQL fence write and the read-once value being the same instant is the
+   property that matters. The Sessions clock stays on `clock_timestamp()`;
+   the domains are distinct authorities that never cross (item 7 carries the
+   import-boundary proof).
+2. `updated_at` on `run_coordination` / `run_workers` → database time —
+   **yes**.
+3. The SQLite fraction-less `datetime()` fence text — **accepted as
+   documented**; no normalising second `UPDATE` (the gate would rightly flag
+   the extra effect); pin test (v) above.
+4. Added requirements: the aware-UTC contract with its pin tests (item 1),
+   the conservative-direction argument with its named exception (item 1),
+   and the same-value-across-two-calls pin (C6.0 (ii)).
+
+Typing note for the implementation (hook rule since `c63bed73a`): the
+contracts-check hook refuses a new `dict[str, Any]` return type, so any
+receipt or probe result C6 introduces (for example the fixture helpers'
+"before/after" windows) is a frozen dataclass or a `TypedDict`, never a
+dict.
