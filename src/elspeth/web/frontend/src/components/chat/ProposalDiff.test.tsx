@@ -305,13 +305,16 @@ describe("buildProposalDiff", () => {
 
     // This is an approval surface: an operator must not be shown a partial
     // account of what they are approving. The field cannot be named because
-    // the producer collapses every unrecognised key to one token.
+    // the producer collapses every unrecognised key to one token — and for
+    // the same reason the row must stay CARDINALITY-NEUTRAL: that one token
+    // is emitted for a three-unknown-key patch exactly as for a one-key one,
+    // so "(unrecognised field)" would claim a count the payload cannot carry.
     expect(entries).toEqual([
       expect.objectContaining({ section: "metadata", identity: "name" }),
       expect.objectContaining({
         section: "metadata",
-        identity: "(unrecognised field)",
-        afterSummary: "written, field name and value redacted",
+        identity: "(one or more unrecognised fields)",
+        afterSummary: "written, names and values redacted",
       }),
     ]);
   });
@@ -331,7 +334,7 @@ describe("buildProposalDiff", () => {
       expect.objectContaining({
         kind: "changed",
         section: "metadata",
-        identity: "(unrecognised field)",
+        identity: "(one or more unrecognised fields)",
       }),
     ]);
   });
@@ -513,6 +516,47 @@ describe("ProposalChanges", () => {
         "No difference in what this view can compare. Plugin option values are redacted, so a change to them would not appear here.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("labels redaction-limited rows 'Writes', not 'Changed'", () => {
+    // "Changed option" asserts a delta this projection cannot measure: a patch
+    // setting an option to the value it already holds is byte-identical, on
+    // the wire, to one that changes it. The pre-redaction code could suppress
+    // that no-op; this code cannot, so the label must not imply it did.
+    const optionDiff = buildProposalDiff(
+      "patch_node_options",
+      redactedArguments("patch_node_options_one_mapping"),
+      makeState(),
+    );
+    const { unmount } = render(<ProposalChanges diff={optionDiff!} />);
+
+    expect(screen.getByText("Writes option")).toBeInTheDocument();
+    expect(screen.queryByText("Changed option")).not.toBeInTheDocument();
+    unmount();
+
+    const metadataDiff = buildProposalDiff(
+      "set_metadata",
+      redactedArguments("set_metadata_name_only"),
+      makeState(),
+    );
+    render(<ProposalChanges diff={metadataDiff!} />);
+
+    expect(screen.getByText("Writes metadata")).toBeInTheDocument();
+    expect(screen.queryByText("Changed metadata")).not.toBeInTheDocument();
+  });
+
+  it("keeps the kind-derived label on rows built from values it can actually see", () => {
+    // The override is scoped to the two redaction-limited sections. A node row
+    // is compared against unredacted state, so "Changed node" is a measured
+    // claim and must survive.
+    const diff = buildProposalDiff(
+      "upsert_node",
+      redactedArguments("upsert_node_with_options"),
+      makeState(),
+    );
+    render(<ProposalChanges diff={diff!} />);
+
+    expect(screen.getByText("Changed node")).toBeInTheDocument();
   });
 
   it("renders rows normally when the caveat is set but differences were found", () => {

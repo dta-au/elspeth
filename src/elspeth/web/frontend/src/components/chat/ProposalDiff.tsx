@@ -178,6 +178,15 @@ function removeEntry(
  * state — so the row still contrasts the real current option set against the
  * measured size of the proposed patch.
  *
+ * WHAT THE ROW DOES NOT CLAIM. A row means "the proposal writes options", not
+ * "these options change value". The pre-redaction code suppressed no-op keys
+ * (`stableStringify(before) !== stableStringify(value)`); that comparison is
+ * gone, and a patch setting an option to the value it already holds is
+ * byte-identical on the wire to one that changes it. The row is therefore
+ * labelled "Writes option" rather than "Changed option" — see
+ * redactionLimitedLabel — and metadataPatchEntries carries the same
+ * concession for the same reason.
+ *
  * Returns null when the patch is not a summary this module recognises ("no
  * projection"), and [] for an empty patch, which merges to a no-op.
  */
@@ -260,11 +269,16 @@ function metadataPatchEntries(
     entries.push({
       kind: "changed",
       section: "metadata",
-      identity: "(unrecognised field)",
+      // CARDINALITY-NEUTRAL, deliberately. The producer appends ONE `unknown`
+      // token however many unrecognised keys the patch carries, so
+      // `touchesUnknownField` is a boolean and the payload supports only "at
+      // least one". A singular "(unrecognised field)" told the operator one
+      // field was written when three might be.
+      identity: "(one or more unrecognised fields)",
       before: undefined,
       after: undefined,
-      beforeSummary: "not a pipeline metadata field",
-      afterSummary: "written, field name and value redacted",
+      beforeSummary: "not part of the pipeline's metadata",
+      afterSummary: "written, names and values redacted",
     });
   }
   return entries;
@@ -627,6 +641,43 @@ function projectEntries(
   }
 }
 
+/**
+ * The sections whose rows are built from REDACTED values, and therefore know
+ * only that the proposal writes the field — never that the written value
+ * differs from the current one.
+ *
+ * "option" and "metadata" are exactly the two sections the proposal
+ * projection emits and RecoveryDiff's own buildDiff never does (stated at
+ * RecoveryDiff.tsx:16-18), so membership here is equivalent to "came from a
+ * redaction-limited arm". Every other section is built by comparing values
+ * this view can actually see, and keeps the derived Added/Removed/Changed
+ * label.
+ */
+const REDACTION_LIMITED_SECTIONS: ReadonlySet<DiffSection> = new Set<DiffSection>([
+  "option",
+  "metadata",
+]);
+
+/**
+ * An honest label for a row whose "after" side was redacted.
+ *
+ * "Changed option" asserts a delta this projection cannot measure: a patch
+ * setting an option to the value it already holds is byte-identical, on the
+ * wire, to one that changes it. "Writes option" states exactly what the
+ * payload proves. Returns undefined for every other row, leaving the shared
+ * kind-derived label in place.
+ *
+ * Both redaction-limited arms emit only `kind: "changed"`; the guard keeps the
+ * override off any future added/removed row in those sections, where "Writes"
+ * would be the wrong verb.
+ */
+function redactionLimitedLabel(entry: DiffEntry): string | undefined {
+  if (entry.kind !== "changed" || !REDACTION_LIMITED_SECTIONS.has(entry.section)) {
+    return undefined;
+  }
+  return `Writes ${entry.section}`;
+}
+
 interface ProposalChangesProps {
   diff: ProposalDiffResult;
 }
@@ -659,6 +710,7 @@ export function ProposalChanges({ diff }: ProposalChangesProps) {
           {entries.map((entry) => (
             <DiffEntryRow
               entry={entry}
+              label={redactionLimitedLabel(entry)}
               key={`${entry.kind}:${entry.section}:${entry.identity}`}
             />
           ))}

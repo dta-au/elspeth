@@ -229,11 +229,21 @@ function buildDiff(
   return groups.filter((group) => group.entries.length > 0);
 }
 
-export function DiffEntryRow({ entry }: { entry: DiffEntry }) {
+/**
+ * `label` overrides the "Added/Removed/Changed <section>" text derived from
+ * `kind`. It exists because a caller can know something `DiffKind` cannot
+ * express: the proposal projection's option and metadata rows are built from
+ * REDACTED arguments, so they know the proposal WRITES a field but not that
+ * the written value differs from the current one. Labelling those "Changed"
+ * asserts a delta nobody measured. Omitting the prop keeps the derived label,
+ * so the recovery view — which diffs two unredacted states and can prove a
+ * difference — is unaffected.
+ */
+export function DiffEntryRow({ entry, label }: { entry: DiffEntry; label?: string }) {
   return (
     <li className={`recovery-diff-row recovery-diff-row--${entry.kind}`}>
       <div className="recovery-diff-row-title">
-        <span>{labelForEntry(entry)}</span>
+        <span>{label ?? labelForEntry(entry)}</span>
         <code>{entry.identity}</code>
       </div>
       {entry.kind === "changed" ? (
