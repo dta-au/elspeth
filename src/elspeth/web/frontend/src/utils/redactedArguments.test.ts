@@ -191,6 +191,26 @@ describe("decodeMetadataPatchSummary (live path)", () => {
     });
   });
 
+  it("decodes a sentinel whose only token is the unknown catch-all", () => {
+    const args = redactedArguments("set_metadata_only_unknown_key");
+
+    expect(decodeMetadataPatchSummary(args.patch)).toEqual({
+      kind: "keys",
+      keys: [],
+      touchesUnknownField: true,
+    });
+  });
+
+  it("survives an absent patch, which redaction really does produce", () => {
+    // set_metadata with no arguments redacts to `{}` — `patch` is missing
+    // rather than summarised. This is read off the real payload, not a
+    // hand-passed undefined.
+    const args = redactedArguments("set_metadata_no_arguments");
+
+    expect("patch" in args).toBe(false);
+    expect(decodeMetadataPatchSummary(args.patch)).toBeNull();
+  });
+
   it("distinguishes an empty patch from an unreadable one", () => {
     // empty → a projection exists and reports nothing.
     expect(decodeMetadataPatchSummary(redactedArguments("set_metadata_empty").patch)).toEqual({

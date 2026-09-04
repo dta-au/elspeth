@@ -97,14 +97,29 @@ def test_every_summarized_argument_is_recorded_as_a_string() -> None:
     STRING after redaction, never a mapping. A frontend reader that treats it
     as a mapping is dead code, and this is the assertion that says so in the
     language that can see the producer.
+
+    `patch` may also be ABSENT — set_metadata called with no arguments
+    redacts to ``{}``. Absent is a third state, distinct from both a mapping
+    and a summary string, and a decoder that only handles strings has to
+    survive it. What is asserted here is the narrow fact that matters: when
+    `patch` is present it is a string, never a mapping.
     """
+    summarized_patch_tools = {
+        "patch_source_options",
+        "patch_node_options",
+        "patch_output_options",
+        "set_metadata",
+    }
+    saw_absent_patch = False
     for case_name, case in _cases().items():
-        if case["tool"] not in {
-            "patch_source_options",
-            "patch_node_options",
-            "patch_output_options",
-            "set_metadata",
-        }:
+        if case["tool"] not in summarized_patch_tools:
+            continue
+        if "patch" not in case["redacted"]:
+            saw_absent_patch = True
             continue
         patch = case["redacted"]["patch"]
         assert isinstance(patch, str), f"Fixture case '{case_name}' records a non-string patch ({type(patch).__name__}). {REGENERATE_HINT}"
+
+    # Keep the absent-patch case in the corpus deliberately: it is the only
+    # one that exercises `args.patch === undefined` on the consumer side.
+    assert saw_absent_patch, f"Fixture no longer records a case with an absent `patch`. {REGENERATE_HINT}"

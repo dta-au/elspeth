@@ -130,6 +130,22 @@
       },
       "tool": "set_metadata"
     },
+    "set_metadata_no_arguments": {
+      "arguments": {},
+      "redacted": {},
+      "tool": "set_metadata"
+    },
+    "set_metadata_only_unknown_key": {
+      "arguments": {
+        "patch": {
+          "colour": "red"
+        }
+      },
+      "redacted": {
+        "patch": "<metadata-patch:unknown>"
+      },
+      "tool": "set_metadata"
+    },
     "set_metadata_unknown_key": {
       "arguments": {
         "patch": {

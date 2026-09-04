@@ -280,6 +280,40 @@ describe("buildProposalDiff", () => {
     ]);
   });
 
+  it("renders the unrecognised-field row alone when it is the patch's only key", () => {
+    // Producible: a patch whose every key is outside {name, description}
+    // collapses to the bare `unknown` token, so there is no named key to
+    // pair it with. The proposal must not render as empty — it writes
+    // something, and the operator is being asked to approve it.
+    const entries = buildProposalDiff(
+      "set_metadata",
+      redactedArguments("set_metadata_only_unknown_key"),
+      makeState(),
+    );
+
+    expect(entries).toEqual([
+      expect.objectContaining({
+        kind: "changed",
+        section: "metadata",
+        identity: "(unrecognised field)",
+      }),
+    ]);
+  });
+
+  it("returns null when set_metadata carries no patch argument at all", () => {
+    // `patch` is ABSENT from this redacted payload, not summarised — a third
+    // state beside "mapping" and "summary string". No projection is derivable,
+    // so the caller falls back to the argument fields rather than rendering an
+    // empty diff that would read as "changes nothing".
+    expect(
+      buildProposalDiff(
+        "set_metadata",
+        redactedArguments("set_metadata_no_arguments"),
+        makeState(),
+      ),
+    ).toBeNull();
+  });
+
   it("separates an empty metadata patch from an unreadable one", () => {
     // empty → the projection ran and found nothing to report.
     expect(

@@ -119,6 +119,15 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
         {"patch": {"name": "Renamed", "colour": "red"}},
     ),
     ("set_metadata_invalid", "set_metadata", {"patch": "not-a-mapping"}),
+    # A patch whose ONLY key is unrecognized: `keys` comes back empty and the
+    # `unknown` token stands alone, so the consumer has a proposal it can say
+    # nothing specific about but must not silently render as empty.
+    ("set_metadata_only_unknown_key", "set_metadata", {"patch": {"colour": "red"}}),
+    # set_metadata with no arguments at all. `patch` is ABSENT from the
+    # redacted payload rather than summarized, so every decoder must survive
+    # `args.patch === undefined` — a case a fixture keyed only on sentinel
+    # STRINGS would never surface.
+    ("set_metadata_no_arguments", "set_metadata", {}),
     # --- the identity-bearing arms, which DO survive redaction -------------
     # Pinned so a future redaction change that starts summarizing `plugin` or
     # `id` fails here instead of silently emptying the proposal card.
