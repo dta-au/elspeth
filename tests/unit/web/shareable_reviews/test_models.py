@@ -9,19 +9,33 @@ six-row readiness panel the owner sees.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
+from typing import get_args
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot, ReadinessRow
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    NodeType,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+)
+from elspeth.web.composer.yaml_generator import generate_public_composition_dict, generate_public_pipeline_dict
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.shareable_reviews.models import (
+    CompositionStateResponse,
     MarkReadyForReviewResponse,
     NodeSpecResponse,
+    OutputSpecResponse,
     ShareableLinkResponse,
     SharedInspectResponse,
+    SourceSpecResponse,
 )
 
 
@@ -358,3 +372,150 @@ def test_node_spec_response_accepts_row_union_timeout() -> None:
 
     assert node.node_type == "row_union"
     assert node.timeout_seconds == 30.0
+
+
+# ── Producer-mirror pins (elspeth-989d369d82) ──────────────────────────────
+#
+# ``CompositionState.to_dict()`` emits every dataclass field of each spec
+# (optional ones only when non-None) and ``_StrictResponse`` forbids extras,
+# so any field the producer grows that the mirror lacks raises inside
+# ``resolve_token`` (shareable_reviews/service.py ``CompositionStateResponse
+# .model_validate``) and reaches the recipient as a bare 500 — while the
+# owner, whose mint path never runs the mirror, gets a working-looking link.
+# ``queue`` (elspeth-a5b86149d4), then ``description`` and ``collector``
+# (elspeth-989d369d82) each got through a hand-listed mirror exactly this way.
+# These pins are REFLECTIVE over the producer so the next field cannot.
+
+
+@pytest.mark.parametrize(
+    ("producer", "mirror"),
+    (
+        (SourceSpec, SourceSpecResponse),
+        (NodeSpec, NodeSpecResponse),
+        (OutputSpec, OutputSpecResponse),
+    ),
+)
+def test_response_model_field_set_mirrors_its_producer_dataclass(
+    producer: type[SourceSpec | NodeSpec | OutputSpec],
+    mirror: type[SourceSpecResponse | NodeSpecResponse | OutputSpecResponse],
+) -> None:
+    """Equality in BOTH directions: a mirror field the producer never emits is
+    drift too, just the silent kind."""
+    assert {field.name for field in dataclasses.fields(producer)} == set(mirror.model_fields)
+
+
+def test_node_type_literal_mirrors_the_composer_node_type_vocabulary() -> None:
+    """``models.py`` carried six of seven kinds for 11 days after ``collector``
+    landed; the vocabulary is the composer's, not this file's."""
+    mirror_literal = NodeSpecResponse.model_fields["node_type"].annotation
+    assert set(get_args(mirror_literal)) == set(get_args(NodeType))
+
+
+def _collector_composition_state() -> CompositionState:
+    """A Stage-1-shaped composition carrying every field this ticket found
+    undeclared: a collector with its scope binding, and an authored
+    description on the source, a node and the sink."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="src_out",
+            options={"path": "documents.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+            description="Multi-document export",
+        ),
+        nodes=(
+            NodeSpec(
+                id="explode",
+                node_type="transform",
+                plugin="passthrough",
+                input="src_out",
+                on_success="sections",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                description="One row per section",
+            ),
+            NodeSpec(
+                id="gather",
+                node_type="collector",
+                plugin="report_assemble",
+                input="sections",
+                on_success="out",
+                on_error=None,
+                options={"schema": {"mode": "observed"}, "text_field": "gist"},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+                scope_name="per_document",
+                scope_opener="explode",
+                scope_policy="require_all",
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="out",
+                plugin="csv",
+                options={"path": "summaries.csv", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+                description="One summary row per document",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Collector share", description="Fixture for the share mirror"),
+        version=1,
+    )
+
+
+def test_public_projection_of_a_collector_composition_round_trips_the_strict_mirror() -> None:
+    """The exact seam that 500'd: ``generate_public_composition_dict`` passes
+    ``node_type`` and the scope binding through verbatim (it rewrites
+    ``options`` only), and the mirror must admit what it passes."""
+    projected = generate_public_composition_dict(_collector_composition_state())
+    gather_wire = next(node for node in projected["nodes"] if node["id"] == "gather")
+    assert gather_wire["node_type"] == "collector"
+    assert {"scope_name", "scope_opener", "scope_policy"} <= set(gather_wire)
+
+    response = CompositionStateResponse.model_validate(projected)
+
+    gather = next(node for node in response.nodes if node.id == "gather")
+    assert (gather.node_type, gather.scope_name, gather.scope_opener, gather.scope_policy) == (
+        "collector",
+        "per_document",
+        "explode",
+        "require_all",
+    )
+
+
+def test_public_projection_keeps_authored_descriptions_and_the_mirror_admits_them() -> None:
+    """The collector-free arm: any pipeline whose author (or the planner,
+    which the freeform tools instruct to do so on every step) gave a source,
+    node or sink a description hit the same 500 from 2026-08-15."""
+    response = CompositionStateResponse.model_validate(generate_public_composition_dict(_collector_composition_state()))
+
+    assert response.sources["source"].description == "Multi-document export"
+    assert next(node for node in response.nodes if node.id == "explode").description == "One row per section"
+    assert response.outputs[0].description == "One summary row per document"
+
+
+def test_scope_name_is_admitted_because_the_public_yaml_consumer_requires_it() -> None:
+    """Why the mirror ADMITS ``scope_name`` rather than the projection
+    stripping it: ``generate_public_pipeline_dict`` lowers the ``scopes:``
+    block from the SAME public dict and refuses to lower without the name
+    (yaml_generator ``_require_node_key(c, "scope_name", ...)``). Stripping
+    it would trade the share 500 for a public-YAML download failure on every
+    collector pipeline. The guided ``_CollectorBehavior`` privacy ruling
+    governs the stable-id'd proposal projection, which this surface is not —
+    node ids are already public here."""
+    public_yaml = generate_public_pipeline_dict(_collector_composition_state())
+
+    assert public_yaml["scopes"] == [
+        {"name": "per_document", "opener": "explode", "closer": "gather", "policy": "require_all"},
+    ]
