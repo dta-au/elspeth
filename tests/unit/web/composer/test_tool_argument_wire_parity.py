@@ -26,17 +26,26 @@ so this gate cannot itself drift out of step with what it checks. That is the
 point: a gate needing a hand-edit alongside the thing it guards reproduces the
 defect it is meant to catch.
 
-Scope, stated so a green run is not over-read: this pins the ADMITTED wire only.
-It says nothing about READ (a knob the handler ignores), about TAUGHT (skill text
-naming a knob that does not exist), or about the TypeScript decoder -- pytest
-cannot see the frontend in this repository.
+SCOPE, MEASURED -- stated so a green run is not over-read. This pins the ADMITTED
+wire only, and only for tools that HAVE an argument allowlist: 15 of 42 tools and
+52 of 104 advertised knobs at 2026-09-04. The other 27 tools declare no allowlist
+and run open, so there is nothing to compare and they are unguarded here BY
+CONSTRUCTION, not by passing. A green run is silent about them.
+
+It is also silent about READ (a knob the handler ignores), TAUGHT (skill text
+naming a knob that does not exist), and the TypeScript decoder -- pytest cannot
+see the frontend in this repository.
+
+An earlier revision of this docstring claimed the gate covered "all 42 tools".
+It iterated 14. That overstatement is the same defect the file exists to catch,
+one level up, which is why the numbers above are measured rather than described.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from elspeth.web.composer.redaction import MANIFEST
+from elspeth.web.composer.redaction import MANIFEST, policy_closes_unknown_arguments
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 
 
@@ -74,8 +83,17 @@ def _argument_allowlists() -> dict[str, frozenset[str]]:
 
 
 def _fail_closed_tools() -> frozenset[str]:
-    """Tools that redact argument keys they do not recognise."""
-    return frozenset(name for name, entry in MANIFEST.items() if entry.policy is not None and entry.policy.redact_unknown_argument_keys)
+    """Tools that redact argument keys they do not recognise.
+
+    The predicate is IMPORTED from production, not restated here. The first
+    version of this file restated it as ``redact_unknown_argument_keys`` alone;
+    production's rule is ``known_argument_keys or redact_unknown_argument_keys``,
+    so this gate silently skipped ``request_advisor_hint`` -- a tool whose
+    unadmitted keys production really does replace with the sentinel (verified by
+    sending it a bogus key). A guard that re-derives its own scope drifts from the
+    authority it guards while reading as though it covered what it skipped.
+    """
+    return frozenset(name for name, entry in MANIFEST.items() if entry.policy is not None and policy_closes_unknown_arguments(entry.policy))
 
 
 def test_every_advertised_knob_on_a_fail_closed_tool_is_admitted_by_its_allowlist() -> None:
@@ -107,8 +125,8 @@ def test_every_advertised_knob_on_a_fail_closed_tool_is_admitted_by_its_allowlis
 
     assert unadmitted == {}, (
         "These tools advertise argument keys their allowlist does not admit, and they "
-        "run redact_unknown_argument_keys=True, so the audit trail will replace each "
-        f"key NAME with the unknown-argument sentinel: {unadmitted}. Add the key to "
+        "close over unknown arguments, so the audit trail will replace each key NAME "
+        f"with the unknown-argument sentinel: {unadmitted}. Add the key to "
         "known_argument_keys in redaction.py's MANIFEST, or stop advertising it."
     )
 
@@ -145,3 +163,35 @@ def test_every_tool_in_the_redaction_manifest_is_a_live_registered_tool() -> Non
 
     assert sorted(set(MANIFEST) - set(shipped)) == [], "redaction manifest entries with no live registered tool"
     assert sorted(set(shipped) - set(MANIFEST)) == [], "registered tools absent from the redaction manifest"
+
+
+def test_this_gates_fail_closed_filter_is_the_one_production_applies() -> None:
+    """The gate's scope must equal production's, not merely resemble it.
+
+    ``_fail_closed_tools`` calls ``policy_closes_unknown_arguments``, the same
+    predicate ``_redact_via_policy`` branches on. This test fails if a future
+    edit inlines the condition here again, because the two spellings that look
+    equivalent are not: filtering on ``redact_unknown_argument_keys`` alone drops
+    every tool that closes by declaring an allowlist without setting the flag.
+
+    Asserted against a locally recomputed truth rather than the imported helper,
+    so replacing the helper with a wrong one still fails this.
+    """
+    production_closed = {
+        name
+        for name, entry in MANIFEST.items()
+        if entry.policy is not None and (entry.policy.known_argument_keys or entry.policy.redact_unknown_argument_keys)
+    }
+
+    assert _fail_closed_tools() == production_closed, (
+        "This gate's fail-closed set has diverged from the rule _redact_via_policy "
+        "applies. Tools it would skip: "
+        f"{sorted(production_closed - _fail_closed_tools())}"
+    )
+
+    flag_only = {name for name, entry in MANIFEST.items() if entry.policy is not None and entry.policy.redact_unknown_argument_keys}
+    assert production_closed - flag_only, (
+        "Expected at least one tool that closes by declaring known_argument_keys "
+        "without setting redact_unknown_argument_keys. If none remains, this test's "
+        "premise is gone and it should be retired rather than left passing vacuously."
+    )
