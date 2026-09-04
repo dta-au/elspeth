@@ -204,6 +204,39 @@ def probe_current_schema(bind: Engine | Connection) -> bool:
     return True
 
 
+def explain_non_current_schema(bind: Engine | Connection) -> NoReturn:
+    """Raise the reason ``probe_current_schema`` collapsed into ``False``.
+
+    The precise diagnosis is not missing from this module — it is COMPUTED and
+    then discarded. ``_validate_current_schema`` builds a message naming the
+    table, the constraint and both sides of the mismatch; ``probe_current_schema``
+    catches it to answer a yes/no question, and three frames later the
+    initializer raises a sentence that names nothing. A real defect
+    (elspeth-d0e62aea41: one CHECK constraint whose PostgreSQL-reflected form
+    had no reverse) therefore reached operators as "did not produce the
+    current schema", and diagnosing it meant rebuilding the schema against a
+    container by hand and diffing ``pg_get_constraintdef`` against the model.
+
+    So this runs the same validators UN-guarded and lets the first one raise.
+    Re-validating is deliberate: every caller is on a path that is already
+    fatal, so the cost of a second pass is irrelevant and the loss of the
+    reason is not. ``probe_current_schema`` keeps its boolean contract, which
+    its callers depend on.
+
+    Returning is not a valid outcome. If both validators pass, the probe and
+    the explainer disagree about the same database — which is a defect in one
+    of them, not a healthy schema — so that case gets its own message rather
+    than silently reusing the vague one it was written to replace.
+    """
+    _assert_schema_sentinels(bind)
+    _validate_current_schema(bind)
+    raise SessionSchemaError(
+        "Session database schema was reported as not current, but re-validating it found nothing wrong. "
+        "The probe and the schema validator disagree about the same database, which is a defect in one of "
+        f"them rather than a schema an operator can repair. SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}."
+    )
+
+
 def _stamp_schema_sentinels(bind: Engine | Connection) -> None:
     """Write the SQLite PRAGMAs and cross-dialect identity row after creation.
 
@@ -220,7 +253,18 @@ def _stamp_schema_sentinels(bind: Engine | Connection) -> None:
 
 def _stamp_schema_sentinels_on_connection(connection: Connection) -> None:
     if SCHEMA_IDENTITY_TABLE_NAME not in _user_tables(inspect(connection)):
-        raise SessionSchemaError("Session database initialization did not produce the current schema.")
+        # Distinct wording from the initializer's post-verify failure in
+        # ``schema_probe``. Both once said "initialization did not produce the
+        # current schema", which made two unrelated faults indistinguishable
+        # in a log: this one is "create_all ran and the table set is still
+        # wrong", a first-party defect; that one is "the tables exist and
+        # their SHAPE does not match", which is drift.
+        raise SessionSchemaError(
+            f"Session database initialization created no {SCHEMA_IDENTITY_TABLE_NAME} table, so the "
+            f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH} sentinels cannot be stamped. The table set is "
+            "incomplete after create_all rather than merely out of date, which is a defect in this build "
+            "and not a database an operator can fix by deleting."
+        )
     if connection.dialect.name == "sqlite":
         connection.execute(text(f"PRAGMA application_id = {SESSION_DB_APPLICATION_ID}"))
         connection.execute(text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH}"))

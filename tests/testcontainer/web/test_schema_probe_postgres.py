@@ -105,6 +105,36 @@ def test_fresh_create_reaches_current(postgres_engine: Engine, kind: str) -> Non
         assert probe_landscape_schema(postgres_engine) is SchemaState.CURRENT
 
 
+def test_a_drifted_check_constraint_names_itself_on_postgresql(postgres_engine: Engine) -> None:
+    """The message an operator actually gets, on the dialect that produced the
+    defect (elspeth-d0e62aea41).
+
+    The unit suite stages this drift on SQLite, which stores a CHECK verbatim.
+    PostgreSQL rewrites it — and rewrites ``IN`` by ARITY, so the declared
+    one-element form and the drifted two-element form come back in two
+    DIFFERENT shapes (``= 'approver'::text`` versus ``= ANY(ARRAY[...])``).
+    A message assembled from the reflected text rather than from the
+    collector's comparison would read differently here, or not resolve at all.
+    """
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE identity_relationships DROP CONSTRAINT ck_identity_relationships_type")
+        conn.exec_driver_sql(
+            "ALTER TABLE identity_relationships ADD CONSTRAINT ck_identity_relationships_type "
+            "CHECK (relationship_type IN ('approver', 'sponsor'))"
+        )
+
+    with pytest.raises(SessionSchemaError) as raised:
+        init_session_schema(postgres_engine)
+
+    message = str(raised.value)
+    assert "identity_relationships.ck_identity_relationships_type" in message
+    assert "CHECK constraint SQL mismatch" in message
+    assert "sponsor" in message, "the FOUND side must survive the reflection round trip"
+    assert "Delete the old session database and restart" in message
+    assert "did not produce the current schema" not in message
+
+
 @pytest.mark.parametrize("kind", ["session", "landscape"])
 def test_postgres_fresh_schema_stamps_cross_dialect_identity(postgres_engine: Engine, kind: str) -> None:
     if kind == "session":
