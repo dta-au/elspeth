@@ -401,16 +401,21 @@ function setPipelineEntries(
  * options change; the alternative asserted a change that may not exist, on
  * the surface an operator uses to approve one.
  *
- * THE LOOP RUNS TO COMPLETION rather than returning at the first difference,
- * and that is load-bearing, not style. The ledger has to see every skippable
- * key, and an early return makes what it records depend on ITERATION ORDER:
- * on the wire `plugin` precedes `options` (index 0 vs 2 on a source, 1 vs 2
- * on an output), so a changed plugin would short-circuit before `options` was
- * ever examined and the skip would go unrecorded — producing rows with no
- * caveat, a partial diff presented as complete. Nodes happened to be immune
- * (their `options` sits at index 1), which is exactly the kind of accident
- * that makes such a bug survive. The loop is over a handful of keys, so
- * completing it costs nothing.
+ * TWO PASSES, and the split is load-bearing rather than style. The ledger
+ * must be complete over every key walked BEFORE any difference is examined —
+ * not merely complete because the comparison happened to reach the end.
+ *
+ * The single-pass version returned at the first differing key, which made
+ * what the ledger recorded depend on ITERATION ORDER. On the wire `plugin`
+ * precedes `options` (index 0 vs 2 on a source, 1 vs 2 on an output), so a
+ * changed plugin short-circuited before `options` was ever examined and the
+ * skip went unrecorded — rows with no caveat, a partial diff presented as
+ * complete. Nodes were immune by accident (their `options` sits at index 1),
+ * which is exactly the kind of luck that lets such a bug survive.
+ *
+ * Splitting the passes makes that class of mistake unreachable rather than
+ * merely absent: pass 2 may short-circuit freely, because by then there is
+ * nothing left for it to suppress.
  */
 function providedKeysDiffer(
   before: Record<string, unknown>,
@@ -418,7 +423,11 @@ function providedKeysDiffer(
   keyAliases: Map<string, string>,
   ledger: ComparisonLedger,
 ): boolean {
-  let differs = false;
+  // PASS 1 — record what cannot be compared, and collect what can.
+  // This pass completes before any difference is examined, so the ledger is
+  // complete over every key walked rather than being a side effect of the
+  // comparison happening to run to the end.
+  const comparable: Array<[string, unknown]> = [];
   for (const [key, value] of Object.entries(provided)) {
     const beforeKey = keyAliases.get(key) ?? key;
     if (!(beforeKey in before)) continue;
@@ -428,11 +437,14 @@ function providedKeysDiffer(
       ledger.skippedRedactedOptions = true;
       continue;
     }
-    if (stableStringify(before[beforeKey]) !== stableStringify(value)) {
-      differs = true;
-    }
+    comparable.push([beforeKey, value]);
   }
-  return differs;
+
+  // PASS 2 — the ledger is already complete, so short-circuiting here cannot
+  // suppress a skip. That safety is the whole reason for the split.
+  return comparable.some(
+    ([beforeKey, value]) => stableStringify(before[beforeKey]) !== stableStringify(value),
+  );
 }
 
 function replaceCollectionEntries<T>(

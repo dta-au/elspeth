@@ -483,6 +483,39 @@ describe("buildProposalDiff", () => {
     expect(diff?.optionValuesNotCompared).toBe(true);
   });
 
+  it("CONTROL: the same shape with matching keys still records the skip", () => {
+    // Pairs with the test above. Here no key differs, so the comparison runs
+    // to the end either way — which is exactly why this case stayed green
+    // while the G2 shape was broken, and why it cannot stand alone as
+    // evidence that the ledger works.
+    const diff = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments("set_pipeline_replaying_current_state"),
+      makeState(),
+    );
+
+    expect(diff?.entries).toEqual([]);
+    expect(diff?.optionValuesNotCompared).toBe(true);
+  });
+
+  it("RENDERS the caveat for a payload whose differing key precedes options", () => {
+    // The ledger flag is an internal; what protects the operator is the
+    // rendered note. A ledger that silently under-reports produces the same
+    // false affirmative one indirection later, so this asserts the caveat is
+    // actually on screen BESIDE the rows — not merely that a boolean is true.
+    const diff = buildProposalDiff(
+      "set_pipeline",
+      redactedArguments("set_pipeline_plugin_changed_no_nodes"),
+      makeState({ nodes: [], edges: [] }),
+    );
+    render(<ProposalChanges diff={diff!} />);
+
+    expect(screen.getAllByText(/^Changed /).length).toBeGreaterThan(0);
+    expect(screen.getByTestId("proposal-diff-caveat")).toHaveTextContent(
+      "Option values are not compared, so a change to them would not appear here.",
+    );
+  });
+
   it("does not raise the caveat for a projection that compared everything it was given", () => {
     // upsert_node's arm never calls providedKeysDiffer, so nothing is skipped
     // — the flag must not be set merely because the payload CONTAINS a

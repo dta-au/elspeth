@@ -132,6 +132,12 @@ def test_fixture_records_every_projected_tool_whose_arguments_are_summarized() -
     lies about it. ``PROJECTED_TOOLS`` is the one hand-maintained input, and
     only because the frontend ``switch`` is its authority and Python cannot
     read it.
+
+    KNOWN RESIDUE (elspeth-f491fca94e): because that one input is a
+    transcription rather than a derivation, a tool absent from BOTH
+    ``PROJECTED_TOOLS`` and the fixture is invisible here — most realistically
+    a new frontend ``switch`` arm whose author never learns this frozenset
+    exists. Measured: such an omission leaves every test in this file green.
     """
     tools_recorded = {case["tool"] for case in _cases().values()}
     must_record = {name for name, entry in MANIFEST.items() if name in PROJECTED_TOOLS and _summarizes_an_argument(entry)}
