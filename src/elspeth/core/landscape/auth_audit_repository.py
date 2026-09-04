@@ -185,12 +185,14 @@ class AuthAuditRepository:
         user_agent: str | None,
         login_metadata: Mapping[str, object],
         token_metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> tuple[str, str]:
         """Record successful login and token issuance in one transaction."""
         login_event_id, login_values = self._auth_event_values(
             event_type="login",
             outcome=AUTH_AUDIT_SUCCESS,
             provider=provider,
+            identity_id=identity_id,
             user_id=user_id,
             username=username,
             failure_category=None,
@@ -203,6 +205,7 @@ class AuthAuditRepository:
             event_type="token_issued",
             outcome=AUTH_AUDIT_SUCCESS,
             provider=provider,
+            identity_id=identity_id,
             user_id=user_id,
             username=username,
             failure_category=None,
@@ -229,6 +232,7 @@ class AuthAuditRepository:
         client_host: str | None,
         user_agent: str | None,
         metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> str:
         """Record a local login success or failed credential attempt."""
         return self.record_auth_event(
@@ -242,6 +246,7 @@ class AuthAuditRepository:
             client_host=client_host,
             user_agent=user_agent,
             metadata=metadata,
+            identity_id=identity_id,
         )
 
     def record_token_issued(
@@ -254,6 +259,7 @@ class AuthAuditRepository:
         client_host: str | None,
         user_agent: str | None,
         metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> str:
         """Record access-token issuance without storing the bearer token."""
         return self.record_auth_event(
@@ -267,6 +273,7 @@ class AuthAuditRepository:
             client_host=client_host,
             user_agent=user_agent,
             metadata=metadata,
+            identity_id=identity_id,
         )
 
     def record_auth_failure(
@@ -280,6 +287,7 @@ class AuthAuditRepository:
         client_host: str | None,
         user_agent: str | None,
         metadata: Mapping[str, object],
+        identity_id: str | None = None,
     ) -> str:
         """Record an authentication or profile-lookup failure classification."""
         return self.record_auth_event(
@@ -293,4 +301,5 @@ class AuthAuditRepository:
             client_host=client_host,
             user_agent=user_agent,
             metadata=metadata,
+            identity_id=identity_id,
         )

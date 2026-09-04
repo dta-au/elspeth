@@ -829,11 +829,15 @@ class TestTokenRefreshEndpoint:
         metadata = json.loads(event.metadata_json)
         assert event.outcome == "success"
         assert event.provider == "local"
-        # The audit principal is now the identity_id, matching the token's
-        # ``sub``, so an event can be joined to the identity substrate even
-        # after a username changes. ``username`` keeps the readable name.
-        assert event.user_id == claims["sub"]
+        # ONE meaning per column, and both populated. ``user_id`` is the
+        # principal as the request named it; ``identity_id`` is the substrate
+        # key the token carries, so the event joins to quota_policies and to
+        # every ownership row even after a username changes. Asserting both
+        # together is what pins the convention: either alone was satisfied by
+        # the split that made no query return a person's complete trail.
+        assert event.user_id == "alice"
         assert event.username == "alice"
+        assert event.identity_id == claims["sub"]
         assert event.request_id == "refresh-token-1"
         assert metadata["token_type"] == "bearer"
         assert metadata["issued_at"] == claims["iat"]
@@ -1466,3 +1470,54 @@ class TestAuthRateLimiting:
             # Second should be rate-limited
             resp = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
         assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+class TestAuthEventPrincipalConsistency:
+    """One meaning per column, so a single query returns a whole trail.
+
+    Before this, the columns disagreed with each other: ``login`` and
+    ``token_issued`` rows recorded a username in ``user_id`` and left the new
+    ``identity_id`` NULL, while the admission pair recorded the identity_id in
+    ``user_id``. An administrator querying by username silently missed the
+    admission; one querying by identity_id missed the login. There was no
+    query that returned a person's complete history — which is precisely what
+    an audit trail is for.
+    """
+
+    async def test_one_query_by_username_returns_the_whole_trail(self, tmp_path) -> None:
+        audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "pw", display_name="Alice")
+        app = _create_test_app(provider, landscape_url=audit_url)
+        _enable_auth_audit(app)
+
+        async with _client_for(app) as client:
+            login = await client.post("/api/auth/login", json={"username": "alice", "password": "pw"})
+            assert login.status_code == 200
+            token = login.json()["access_token"]
+            assert (await client.post("/api/auth/token", headers={"Authorization": f"Bearer {token}"})).status_code == 200
+
+        rows = _read_auth_event_rows(audit_url)
+        assert rows, "no auth events were recorded at all — this test has gone blind"
+        assert {row.user_id for row in rows} == {"alice"}
+
+    async def test_every_recorded_event_carries_the_same_identity(self, tmp_path) -> None:
+        """The join column must be populated, and must agree across events."""
+        audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "pw", display_name="Alice")
+        app = _create_test_app(provider, landscape_url=audit_url)
+        _enable_auth_audit(app)
+
+        async with _client_for(app) as client:
+            login = await client.post("/api/auth/login", json={"username": "alice", "password": "pw"})
+            token = login.json()["access_token"]
+            await client.post("/api/auth/token", headers={"Authorization": f"Bearer {token}"})
+
+        claims = pyjwt.decode(token, options={"verify_signature": False})
+        rows = _read_auth_event_rows(audit_url)
+        identities = {row.identity_id for row in rows}
+
+        assert None not in identities, f"an event left identity_id NULL: {[r.event_type for r in rows if r.identity_id is None]}"
+        assert identities == {claims["sub"]}

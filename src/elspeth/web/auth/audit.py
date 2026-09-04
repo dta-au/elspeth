@@ -85,6 +85,7 @@ class AuthAuditWriter(Protocol):
         user_id: str | None,
         username: str | None,
         exception_class: str | None,
+        identity_id: str | None = None,
     ) -> None: ...
 
     # The one member with no ``request``: a self-admitting deployment
@@ -147,6 +148,27 @@ def _issued_token_claims(access_token: str) -> dict[str, object]:
     except pyjwt.PyJWTError as exc:
         raise AuditIntegrityError("Issued access token could not be decoded for auth audit metadata") from exc
     return cast(dict[str, object], decoded)
+
+
+def _issued_identity_id(access_token: str) -> str:
+    """The identity a just-issued token authorises, read from its own ``sub``.
+
+    Taken from the token rather than threaded down from the provider on
+    purpose: the recorder ALREADY decodes this token for ``iat``/``exp``, and
+    the value it records must be the one the token actually carries. A value
+    passed alongside could disagree with the token — and the row would then
+    attribute a session to an identity the session does not name.
+
+    Unverified decode is correct here: the token was minted by this process
+    moments ago, and a signature check would only re-prove what we just did.
+    """
+    claims = _issued_token_claims(access_token)
+    if "sub" not in claims:
+        raise AuditIntegrityError("Issued access token missing 'sub' claim for auth audit identity")
+    subject = claims["sub"]
+    if type(subject) is not str or not subject:
+        raise AuditIntegrityError("Issued access token 'sub' claim must be a non-empty string")
+    return subject
 
 
 def _required_int_claim(claims: dict[str, object], claim_name: str) -> int:
@@ -282,6 +304,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS_AND_TOKEN_ISSUED) as db:
             RecorderFactory(db).auth_audit.record_login_success_and_token_issued(
                 provider=provider,
+                identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
                 username=username,
                 request_id=_request_id(request),
@@ -308,6 +331,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.TOKEN_ISSUED) as db:
             RecorderFactory(db).auth_audit.record_token_issued(
                 provider=provider,
+                identity_id=_issued_identity_id(access_token),
                 user_id=user_id,
                 username=username,
                 request_id=_request_id(request),
@@ -330,6 +354,7 @@ class AuthAuditRecorder:
         user_id: str | None,
         username: str | None,
         exception_class: str | None,
+        identity_id: str | None = None,
     ) -> None:
         metadata = _request_metadata(request)
         metadata["failure_stage"] = failure_stage
@@ -337,6 +362,7 @@ class AuthAuditRecorder:
         with self._open_landscape(AuthAuditOperation.AUTH_FAILURE) as db:
             RecorderFactory(db).auth_audit.record_auth_failure(
                 provider=provider,
+                identity_id=identity_id,
                 user_id=user_id,
                 username=username,
                 failure_category=failure_category,
@@ -397,7 +423,11 @@ class AuthAuditRecorder:
                 outcome="success",
                 provider=provider,
                 identity_id=identity_id,
-                user_id=identity_id,
+                # The USERNAME, matching every request-bound event. The
+                # admission pair used to put the identity_id here, which meant
+                # an administrator querying by either value saw half the
+                # trail and no query returned a person's complete history.
+                user_id=username,
                 username=username,
                 failure_category=None,
                 request_id=None,
@@ -419,7 +449,11 @@ class AuthAuditRecorder:
                 outcome="success",
                 provider=provider,
                 identity_id=identity_id,
-                user_id=identity_id,
+                # The USERNAME, matching every request-bound event. The
+                # admission pair used to put the identity_id here, which meant
+                # an administrator querying by either value saw half the
+                # trail and no query returned a person's complete history.
+                user_id=username,
                 username=username,
                 failure_category=None,
                 request_id=None,

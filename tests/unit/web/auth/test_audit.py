@@ -134,7 +134,14 @@ def _request() -> Request:
 def _writer_kwargs(method_name: str) -> dict[str, object]:
     common: dict[str, object] = {"provider": "local"}
     if method_name == "record_login_success_and_token_issued":
-        token = jwt.encode({"iat": 1, "exp": 2}, "bounded-test-key-that-is-at-least-32-bytes", algorithm="HS256")
+        # ``sub`` is required: the recorder reads the identity it is
+        # attributing from the token itself rather than from a value passed
+        # alongside, so a token without one is an audit-integrity error.
+        token = jwt.encode(
+            {"sub": "identity-1", "iat": 1, "exp": 2},
+            "bounded-test-key-that-is-at-least-32-bytes",
+            algorithm="HS256",
+        )
         return {
             **common,
             "user_id": "user-1",
@@ -146,7 +153,14 @@ def _writer_kwargs(method_name: str) -> dict[str, object]:
     if method_name == "record_login_failure":
         return {**common, "username": "alice", "failure_category": "invalid_credentials"}
     if method_name == "record_token_issued":
-        token = jwt.encode({"iat": 1, "exp": 2}, "bounded-test-key-that-is-at-least-32-bytes", algorithm="HS256")
+        # ``sub`` is required: the recorder reads the identity it is
+        # attributing from the token itself rather than from a value passed
+        # alongside, so a token without one is an audit-integrity error.
+        token = jwt.encode(
+            {"sub": "identity-1", "iat": 1, "exp": 2},
+            "bounded-test-key-that-is-at-least-32-bytes",
+            algorithm="HS256",
+        )
         return {
             **common,
             "user_id": "user-1",

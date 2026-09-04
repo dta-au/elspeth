@@ -172,8 +172,12 @@ def _route_auth_failure(
         provider=settings.auth_provider,
         failure_category=failure_category,
         failure_stage=failure_stage,
-        user_id=None if user is None else user.user_id,
+        # ``user_id`` is the principal as the request named it; the
+        # identity_id goes in its own column. Splitting them keeps one query
+        # per question instead of a column that means two things.
+        user_id=None if user is None else user.username,
         username=None if user is None else user.username,
+        identity_id=None if user is None else user.user_id,
         exception_class=None if exc is None else type(exc).__name__,
     )
     return HTTPException(status_code=401, detail=detail)
@@ -373,7 +377,7 @@ def create_auth_router() -> APIRouter:
             recorder.record_token_issued(
                 request,
                 provider=settings.auth_provider,
-                user_id=identity.user_id,
+                user_id=identity.username,
                 username=identity.username,
                 access_token=access_token,
                 issuance_path="email_verification",
@@ -431,7 +435,7 @@ def create_auth_router() -> APIRouter:
         recorder.record_token_issued(
             request,
             provider=settings.auth_provider,
-            user_id=user.user_id,
+            user_id=user.username,
             username=user.username,
             access_token=new_token,
             issuance_path="refresh",
@@ -484,8 +488,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category="provider_unavailable",
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=503, detail=exc.detail) from exc
@@ -496,8 +501,9 @@ def create_auth_router() -> APIRouter:
                 provider=settings.auth_provider,
                 failure_category=classify_authentication_failure(exc),
                 failure_stage="profile_lookup",
-                user_id=user.user_id,
+                user_id=user.username,
                 username=user.username,
+                identity_id=user.user_id,
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=401, detail=exc.detail) from exc
