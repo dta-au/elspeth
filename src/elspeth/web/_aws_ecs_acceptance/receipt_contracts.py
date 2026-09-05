@@ -883,13 +883,17 @@ def _validate_stored_receipt(
             subject_id=subject_id,
         )
     if kind == TESTCONTAINER_RUN_RECEIPT_KIND:
-        # Subject is the junit report's sha256 (the terraform-plan shape).
-        return validate_testcontainer_run_receipt(
-            document,
-            provider="aws",
-            candidate_sha=candidate_sha,
-            scenario_id=scenario_id,
-            subject_sha256=subject_sha256,
+        # Subject is the junit report's sha256 (the terraform-plan shape). The
+        # validator returns the owned TestcontainerRunReceipt; this dispatcher's
+        # common return is the plain document every other kind yields.
+        return dict(
+            validate_testcontainer_run_receipt(
+                document,
+                provider="aws",
+                candidate_sha=candidate_sha,
+                scenario_id=scenario_id,
+                subject_sha256=subject_sha256,
+            )
         )
     if kind not in _RECEIPT_KINDS:
         raise AcceptanceCheckError("receipt_store_schema")

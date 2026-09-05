@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Final, Literal, TypedDict
 from xml.etree import ElementTree
 
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -69,24 +69,45 @@ MAX_JUNIT_BYTES: Final = 16 * 1024 * 1024
 """Upper bound on a junit report the driver will read (CI's whole-tree run is well under 1 MiB)."""
 
 _MAX_COUNT: Final = 100_000
-_RECEIPT_FIELDS: Final = frozenset(
-    {
-        "schema",
-        "kind",
-        "candidate_sha",
-        "scenario_id",
-        "selection",
-        "exit_code",
-        "collected",
-        "passed",
-        "failed",
-        "errors",
-        "skipped",
-        "junit_sha256",
-        "recorded_at",
-    }
-)
 _OUTCOME_TAGS: Final = frozenset({"failure", "error", "skipped"})
+
+
+class TestcontainerRunReceipt(TypedDict):
+    """The owned ``testcontainer-run`` receipt document: every field required, none optional.
+
+    A ``TypedDict`` (not a dataclass) because the receipt IS the stored JSON
+    document — ``json.dumps(receipt, sort_keys=True)`` is the wire form both
+    providers hash and store, and the field set here is the closed set
+    :func:`validate_testcontainer_run_receipt` admits.
+    """
+
+    schema: str
+    kind: str
+    candidate_sha: str
+    scenario_id: str
+    selection: list[str]
+    exit_code: int
+    collected: int
+    passed: int
+    failed: int
+    errors: int
+    skipped: int
+    junit_sha256: str
+    recorded_at: str
+
+
+_RECEIPT_FIELDS: Final[frozenset[str]] = frozenset(TestcontainerRunReceipt.__required_keys__)
+"""The closed field set, derived from the owned type so the validator cannot drift from it."""
+
+
+class ReceiptIndexRow(TypedDict):
+    """One row of a provider's already-validated receipt index (the ECS control manifest's ``evidence.receipts``)."""
+
+    scenario_id: str
+    kind: str
+    subject_sha256: str
+    receipt_sha256: str
+    stored_at: str
 
 
 @dataclass(frozen=True)
@@ -192,7 +213,7 @@ def build_testcontainer_run_receipt(
     exit_code: int,
     record: TestcontainerRunRecord,
     recorded_at: datetime,
-) -> dict[str, object]:
+) -> TestcontainerRunReceipt:
     """The receipt the driver stores; refuses inputs the validator would refuse."""
 
     if provider not in TESTCONTAINER_RUN_SCHEMAS:
@@ -207,7 +228,7 @@ def build_testcontainer_run_receipt(
     # holds the caller to it); only the clock needs a runtime check.
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
         raise AcceptanceInputError("recorded_at must be an aware datetime")
-    receipt: dict[str, object] = {
+    receipt: TestcontainerRunReceipt = {
         "schema": TESTCONTAINER_RUN_SCHEMAS[provider],
         "kind": TESTCONTAINER_RUN_RECEIPT_KIND,
         "candidate_sha": candidate_sha,
@@ -222,14 +243,13 @@ def build_testcontainer_run_receipt(
         "junit_sha256": record.junit_sha256,
         "recorded_at": _utc_timestamp(recorded_at),
     }
-    validate_testcontainer_run_receipt(
+    return validate_testcontainer_run_receipt(
         receipt,
         provider=provider,
         candidate_sha=candidate_sha,
         scenario_id=scenario_id,
         subject_sha256=_sha256(record.junit_sha256.encode("utf-8")),
     )
-    return receipt
 
 
 @trust_boundary(
@@ -253,8 +273,13 @@ def validate_testcontainer_run_receipt(
     candidate_sha: str,
     scenario_id: str,
     subject_sha256: str,
-) -> dict[str, object]:
-    """Admit one stored ``testcontainer-run`` receipt for ``provider`` or raise."""
+) -> TestcontainerRunReceipt:
+    """Admit one stored ``testcontainer-run`` receipt for ``provider`` or raise.
+
+    Returns a freshly constructed :class:`TestcontainerRunReceipt` built from the
+    owned constants and the validated scalars — never the caller's payload
+    object — so what leaves the boundary is the owned type by construction.
+    """
 
     if provider not in TESTCONTAINER_RUN_SCHEMAS:
         raise AcceptanceInputError("provider must be aws or azure")
@@ -297,7 +322,21 @@ def validate_testcontainer_run_receipt(
         or _sha256(junit_sha256.encode("utf-8")) != subject_sha256
     ):
         raise AcceptanceCheckError("receipt_store_binding")
-    return payload
+    return TestcontainerRunReceipt(
+        schema=TESTCONTAINER_RUN_SCHEMAS[provider],
+        kind=TESTCONTAINER_RUN_RECEIPT_KIND,
+        candidate_sha=candidate_sha,
+        scenario_id=scenario_id,
+        selection=list(TESTCONTAINER_SELECTION),
+        exit_code=exit_code,
+        collected=counts["collected"],
+        passed=counts["passed"],
+        failed=counts["failed"],
+        errors=counts["errors"],
+        skipped=counts["skipped"],
+        junit_sha256=junit_sha256,
+        recorded_at=recorded_at,
+    )
 
 
 GateReason = Literal[
@@ -327,12 +366,12 @@ class TestcontainerRunGateVerdict:
             raise ValueError("gate reason must be one of the closed set")
 
 
-def _canonical_sha256(document: Mapping[str, object]) -> str:
+def _canonical_sha256(document: TestcontainerRunReceipt) -> str:
     return _sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def testcontainer_run_gate(
-    receipt_index: Sequence[Mapping[str, object]],
+    receipt_index: Sequence[ReceiptIndexRow],
     *,
     provider: Provider,
     candidate_sha: str,
@@ -371,8 +410,8 @@ def testcontainer_run_gate(
                 read_receipt(receipt_sha256),
                 provider=provider,
                 candidate_sha=candidate_sha,
-                scenario_id=str(row["scenario_id"]),
-                subject_sha256=str(row["subject_sha256"]),
+                scenario_id=row["scenario_id"],
+                subject_sha256=row["subject_sha256"],
             )
         except AcceptanceCheckError:
             return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)

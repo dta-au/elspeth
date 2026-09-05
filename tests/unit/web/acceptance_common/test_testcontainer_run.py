@@ -114,7 +114,9 @@ def test_build_receipt_validates_under_its_own_binding_only(provider: tr.Provide
     assert receipt["schema"] == tr.TESTCONTAINER_RUN_SCHEMAS[provider]
     assert set(receipt) == tr._RECEIPT_FIELDS
     assert receipt["selection"] == list(tr.TESTCONTAINER_SELECTION)
-    assert _validate(receipt, provider=provider) is receipt
+    # The validator constructs the owned TestcontainerRunReceipt rather than
+    # returning the caller's object; what it admits is value-identical.
+    assert _validate(receipt, provider=provider) == receipt
     other: tr.Provider = "azure" if provider == "aws" else "aws"
     with pytest.raises(AcceptanceCheckError, match="receipt_store_schema"):
         _validate(receipt, provider=other)
@@ -204,7 +206,7 @@ def test_ecs_binding_accepts_the_aws_receipt_and_refuses_the_azure_one() -> None
     accepted = receipt_contracts._validate_stored_receipt(
         aws, kind=tr.TESTCONTAINER_RUN_RECEIPT_KIND, scenario_id="A", subject_sha256=subject_sha256, candidate_sha=CANDIDATE
     )
-    assert accepted is aws
+    assert accepted == aws
     with pytest.raises(AcceptanceCheckError, match="receipt_store_schema"):
         receipt_contracts._validate_stored_receipt(
             _receipt("azure"),
@@ -225,7 +227,7 @@ def test_command_emits_a_storable_receipt_and_mirrors_its_input_failures(tmp_pat
     argv = ["--provider", "aws", "--junit", str(report), "--exit-code", "1", "--candidate-sha", CANDIDATE, "--scenario-id", "A"]
     assert tr.main(argv) == 0
     receipt = json.loads(capsys.readouterr().out)
-    assert _validate(receipt) is receipt
+    assert _validate(receipt) == receipt
     assert receipt["junit_sha256"] == RECORD.junit_sha256
     assert (
         tr.main(

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
-from elspeth.web._acceptance_common.testcontainer_run import testcontainer_run_gate
+from elspeth.web._acceptance_common.testcontainer_run import ReceiptIndexRow, testcontainer_run_gate
 
 from .contracts import (
     _EVIDENCE_KINDS,
@@ -391,7 +391,7 @@ def create_evidence_export_receipt(
     # `tests` stage — the run-level slot — recorded that receipt's hash.
     receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
     verdict = testcontainer_run_gate(
-        cast(list[dict[str, object]], cast(Mapping[str, object], manifest["evidence"])["receipts"]),
+        cast(list[ReceiptIndexRow], cast(Mapping[str, object], manifest["evidence"])["receipts"]),
         provider="aws",
         candidate_sha=cast(str, manifest["candidate_sha"]),
         read_receipt=lambda receipt_sha256: _read_protected_document(
