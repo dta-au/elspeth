@@ -52,6 +52,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
 
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
@@ -147,7 +148,7 @@ class ProbeResult:
             raise ValueError("reasons must be non-empty bounded strings")
         if any(type(key) is not str or not key for key in self.evidence):
             raise ValueError("evidence keys must be non-empty strings")
-        object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
+        freeze_fields(self, "evidence")
 
     def to_receipt_details(self) -> ProbeReceiptDetails:
         return {

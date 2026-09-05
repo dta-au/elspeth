@@ -27,8 +27,8 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from types import MappingProxyType
 
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 
 from .errors import AcceptanceCheckError
@@ -315,7 +315,7 @@ class ExecReceiptDescriptor:
             raise ValueError("check kinds must be bounded kebab-case identifiers")
         # The registry is the closed check-kind set: freeze it so a provider
         # cannot grow it after construction.
-        object.__setattr__(self, "detail_validators", MappingProxyType(dict(self.detail_validators)))
+        freeze_fields(self, "detail_validators")
 
     @property
     def check_kinds(self) -> frozenset[str]:

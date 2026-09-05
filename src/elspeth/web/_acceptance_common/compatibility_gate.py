@@ -56,14 +56,6 @@ GATE_CLAUSES: Final = (
 )
 """The four clauses, in the runbook filter's order; a verdict names the failed ones."""
 
-_CLAUSE_PATHS: Final[Mapping[str, tuple[str, ...]]] = {
-    "backward_compatible": ("backward_compatible",),
-    "rollback_permitted": ("rollback_permitted",),
-    "previous": ("schema_facts", "previous"),
-    "previous_landscape_epoch": ("schema_facts", "previous", "landscape_epoch"),
-    "candidate_landscape_epoch": ("schema_facts", "candidate", "landscape_epoch"),
-}
-
 
 @dataclass(frozen=True)
 class CompatibilityGateVerdict:
@@ -104,28 +96,23 @@ def compatibility_record_gate(record: object, *, scenario_id: str) -> Compatibil
         raise AcceptanceInputError("compatibility-record-gate requires scenario_id A or B")
     previous_is_null = _expected_schema_facts(scenario_id)["previous"] is None
 
-    # ``.a.b.c`` with jq semantics: any missing step yields null.
-    values: dict[str, object] = {}
-    for clause, keys in _CLAUSE_PATHS.items():
-        node = record
-        for key in keys:
-            if not isinstance(node, Mapping) or key not in node:
-                node = None
-                break
-            node = node[key]
-        values[clause] = node
+    # ``.a.b.c`` with jq semantics: any missing step yields null. Each value is
+    # read straight off the record so the boundary's provenance is visible.
+    backward_compatible = record["backward_compatible"] if isinstance(record, Mapping) and "backward_compatible" in record else None
+    rollback_permitted = record["rollback_permitted"] if isinstance(record, Mapping) and "rollback_permitted" in record else None
+    facts = record["schema_facts"] if isinstance(record, Mapping) and "schema_facts" in record else None
+    previous = facts["previous"] if isinstance(facts, Mapping) and "previous" in facts else None
+    candidate = facts["candidate"] if isinstance(facts, Mapping) and "candidate" in facts else None
+    previous_epoch = previous["landscape_epoch"] if isinstance(previous, Mapping) and "landscape_epoch" in previous else None
+    candidate_epoch = candidate["landscape_epoch"] if isinstance(candidate, Mapping) and "landscape_epoch" in candidate else None
 
-    # jq ``value == false``: only the boolean itself compares equal.
-    backward_compatible = values["backward_compatible"]
-    rollback_permitted = values["rollback_permitted"]
-    # jq ``value == <number>``: booleans are not numbers, floats compare by value.
-    previous_epoch = values["previous_landscape_epoch"]
-    candidate_epoch = values["candidate_landscape_epoch"]
+    # jq ``value == false``: only the boolean itself compares equal;
+    # ``value == <number>``: booleans are not numbers, floats compare by value.
     held = {
         "backward_compatible": isinstance(backward_compatible, bool) and backward_compatible is False,
         "rollback_permitted": isinstance(rollback_permitted, bool) and rollback_permitted is False,
         "previous_landscape_epoch": (
-            values["previous"] is None
+            previous is None
             if previous_is_null
             else (
                 not isinstance(previous_epoch, bool)
