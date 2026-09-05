@@ -747,13 +747,19 @@ jobs:
         if: matrix.coverage
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
+          # No `-m` here: the marker selection is pyproject addopts' (the
+          # single source of truth, pinned in tests/unit/cicd). A later `-m`
+          # on the command line REPLACES the addopts one, and the copy that
+          # lived here had drifted to omit `not live_provider`: 56 live nodes
+          # were selected, tests/conftest.py refused them with a UsageError
+          # inside every xdist worker, and xdist reported that as a crashed
+          # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
           uv run pytest tests/ \
             --cov=src/elspeth \
             --cov-report=xml \
             --cov-report=term-missing \
             --cov-fail-under=85 \
-            -v \
-            -m "not slow and not stress and not performance and not testcontainer"
+            -v
 
       - name: Enforce audit-critical coverage floors
         if: matrix.coverage
@@ -782,9 +788,9 @@ jobs:
         if: ${{ !matrix.coverage }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
+          # No `-m`: same reason as the coverage step above.
           uv run pytest tests/ \
-            -v \
-            -m "not slow and not stress and not performance and not testcontainer"
+            -v
 
       - name: Upload coverage report
         if: matrix.coverage && always()

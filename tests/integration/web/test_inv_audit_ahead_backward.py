@@ -4,83 +4,27 @@ below must return zero rows."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from uuid import UUID, uuid5
+from uuid import UUID
 
 import pytest
 import structlog
-from sqlalchemy import insert, text
+from sqlalchemy import text
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.helpers.session_fences import FencedComposeTurnHarness
 
 # ``_make_session`` lives in ``tests/integration/web/conftest.py`` — a
 # duplicate of the unit-test conftest helper. Importing the helper
 # here keeps the per-test session-insert site uniform with the rest
-# of the suite.
-from .conftest import _make_session as _make_session_row
-
-_TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
-
-
-def _test_compose_context(session_id: str) -> SessionOperationContext:
-    """The exact COMPOSE context ``_make_session`` seeds a matching fence for."""
-    operation_id = str(uuid5(_TEST_FENCE_NAMESPACE, session_id))
-    return SessionOperationContext(
-        fence=SessionOperationFence(
-            session_id=session_id,
-            operation_id=operation_id,
-            lease_token=f"test-compose-token-{operation_id}",
-            operation_epoch=1,
-        ),
-        operation_kind=SessionOperationKind.COMPOSE,
-    )
-
-
-def _make_session(conn, *, session_id: str, **kwargs) -> None:
-    """The conftest session row plus the one live exact COMPOSE fence.
-
-    These tests insert ``sessions`` rows by hand, so the retained fence the
-    lifecycle would have written is absent and every fenced writer refuses.
-    Seeding it here is the same repair ``tests/helpers/session_fences.py``
-    performs for the async writers -- no production check is bypassed.
-    """
-    _make_session_row(conn, session_id=session_id, **kwargs)
-    context = _test_compose_context(session_id)
-    conn.execute(
-        insert(session_operation_fences_table).values(
-            session_id=session_id,
-            operation_id=context.fence.operation_id,
-            lease_token=context.fence.lease_token,
-            operation_kind=context.operation_kind.value,
-            owner_instance_id="inv-audit-ahead-backward-test-owner",
-            operation_epoch=context.fence.operation_epoch,
-            lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
-            released_at=None,
-        )
-    )
-
-
-class _FencedComposeTurnHarness(DualFencedSessionServiceHarness):
-    """Supply the sync ``persist_compose_turn`` primitive its COMPOSE authority.
-
-    The harness's other adapters are async and cannot cover this one: the sync
-    primitive refuses to run inside an event loop. The context is the exact one
-    ``_make_session`` seeded a fence for, so the writer's authority check runs
-    for real -- no optional-context arm and no relaxed signature.
-    """
-
-    def persist_compose_turn(self, **kwargs):
-        if "session_operation_context" not in kwargs:
-            kwargs["session_operation_context"] = _test_compose_context(kwargs["session_id"])
-        return super().persist_compose_turn(**kwargs)
+# of the suite. These tests insert ``sessions`` rows by hand, so the
+# live COMPOSE fence a compose turn requires is seeded by the shared
+# ``FencedComposeTurnHarness`` on the session's first turn.
+from .conftest import _make_session
 
 
 @pytest.fixture
@@ -97,7 +41,7 @@ def service(tmp_path):
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    return _FencedComposeTurnHarness(
+    return FencedComposeTurnHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -366,7 +310,6 @@ def test_get_messages_orders_assistant_before_tool_rows_within_one_turn(service)
     (assistant first, tool rows in plan order). This test would have
     failed on the pre-B2 codebase.
     """
-    from uuid import UUID
 
     # B2 (Phase 1 plan-review synthesis): pre-B2 this test bound
     # ``sid="ord1"`` and ``sid_uuid=UUID("00000000-...-001")``, then

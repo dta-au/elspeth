@@ -18,7 +18,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -27,9 +27,10 @@ from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundErro
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, sessions_table
+from elspeth.web.sessions.models import blob_run_links_table, blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
+from tests.unit.web.blobs.test_service import _seed_active_run
 
 
 @pytest.fixture()
@@ -144,6 +145,36 @@ class TestSessionCustody:
             await blob_service.read_blob_content(record.id, session_operation_context=other_context)
         with pytest.raises(BlobNotFoundError):
             await blob_service.delete_blob(record.id, session_operation_context=other_context)
+        assert Path(record.storage_path).exists()
+
+    @pytest.mark.asyncio
+    async def test_run_link_refuses_a_blob_outside_the_fence_session(self, blob_service, db_engine, session_id, compose_context) -> None:
+        """The fence's session owns the blob it links, or the blob reads as missing.
+
+        ``link_blob_to_run`` checks the blob's custody against the EXECUTE
+        fence's session inside the link transaction (verification finding,
+        comment 9599 on elspeth-f4a4a3d000). A blob of session A linked under
+        session B's run fence is refused as missing — the non-leaking answer —
+        before the blob/run same-session guard can even name the mismatch.
+        """
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        other = _insert_session(db_engine)
+        other_run_id = await _seed_active_run(
+            db_engine,
+            other,
+            session_operation_context=seed_live_compose_context(db_engine, other),
+            source={
+                "plugin": "csv",
+                "on_success": "output",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+        )
+        other_execute = seed_live_operation_context(db_engine, other, operation_kind=SessionOperationKind.EXECUTE)
+        with pytest.raises(BlobNotFoundError):
+            await blob_service.link_blob_to_run(record.id, UUID(other_run_id), "input", session_operation_context=other_execute)
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(record.id))).all() == []
         assert Path(record.storage_path).exists()
 
     @pytest.mark.asyncio
