@@ -39,7 +39,7 @@ INGRESS_REQUEST_TIMEOUT_SECONDS = 240
 MECHANISMS = (
     "session_operation_fence",
     "session_operation_fence_execute",
-    "web_instances_lease_expiry",
+    "role_revocation_lease_expiry",
     "graceful_stop",
     "postgresql_and_nfs",
     "owner_affine",
@@ -201,7 +201,7 @@ def test_replica_probes_name_their_mechanism_and_run_in_order() -> None:
     for phrase in (
         "ALTER ROLE elspeth_runtime_a NOLOGIN;",
         "pg_terminate_backend(pid)",
-        "usename = current_user AND pid <> ${a_pid}",
+        "usename = current_user AND pid <> pg_backend_pid()",
         "ALTER ROLE elspeth_runtime_a LOGIN;",
         "terminationGracePeriodSeconds: 0",
         "downgrades to `graceful_stop`",

@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import SecretStr
@@ -767,7 +767,7 @@ class TestReadinessDatabaseChecks:
         runner = ReadinessProbeRunner()
         try:
             with capture_logs() as logs:
-                report = await readiness_report(settings, _FakeEngine(), runner)
+                report = await readiness_report(settings, _FakeEngine(), runner, instance_draining=threading.Event())
         finally:
             runner.close()
         rendered = repr((report, logs))
@@ -974,16 +974,16 @@ class TestReadinessAuthAndReport:
         monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
         runner = ReadinessProbeRunner()
         try:
-            report = await readiness_report(settings, session_engine, runner)
+            report = await readiness_report(settings, session_engine, runner, instance_draining=threading.Event())
         finally:
             runner.close()
             session_engine.dispose()
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
-        assert len({check.name for check in report.checks}) == 8
+        assert len({check.name for check in report.checks}) == 9
         assert report.ready is True
 
     @pytest.mark.asyncio
-    async def test_unexpected_gather_error_becomes_static_eight_check_report(self, tmp_path: Path) -> None:
+    async def test_unexpected_gather_error_becomes_static_nine_check_report(self, tmp_path: Path) -> None:
         settings = _settings_stub(tmp_path)
 
         class BrokenRunner:
@@ -991,7 +991,7 @@ class TestReadinessAuthAndReport:
                 raise RuntimeError("RAW_URL_SENTINEL /private/path")
 
         with capture_logs() as logs:
-            report = await readiness_report(settings, _FakeEngine(), BrokenRunner())
+            report = await readiness_report(settings, _FakeEngine(), BrokenRunner(), instance_draining=threading.Event())
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
         assert all(not check.ok and check.detail == "readiness evaluation failed (RuntimeError)" for check in report.checks)
         assert "RAW_URL_SENTINEL" not in repr((report, logs))
@@ -1003,5 +1003,51 @@ class TestReadinessAuthAndReport:
         assert report.ready is False
         assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)
         assert all(check.detail == "readiness request timed out" for check in report.checks)
-        assert len(logs) == 8
+        assert len(logs) == 9
         assert all(set(log) >= {"check", "detail"} for log in logs)
+
+
+class TestInstanceMembershipCheck:
+    """The draining gate: not ready once the lifespan has begun draining."""
+
+    @pytest.mark.parametrize("state_mode", ["sqlite-single", "external-postgresql"])
+    def test_draining_signal_fails_readiness_on_both_database_modes(
+        self, state_mode: Literal["sqlite-single", "external-postgresql"]
+    ) -> None:
+        draining = threading.Event()
+        draining.set()
+        check = readiness._check_instance_membership(state_mode, draining)
+        assert check == ReadinessCheck("instance_membership", False, "instance draining; new work refused")
+
+    def test_not_draining_is_ready_and_names_the_mode(self) -> None:
+        assert readiness._check_instance_membership("sqlite-single", threading.Event()) == ReadinessCheck(
+            "instance_membership", True, "single-process deployment; no membership lease"
+        )
+        assert readiness._check_instance_membership("external-postgresql", threading.Event()) == ReadinessCheck(
+            "instance_membership", True, "instance not draining"
+        )
+
+    @pytest.mark.parametrize("impostor", [None, True, object(), asyncio.Event()])
+    def test_signal_must_be_an_exact_threading_event(self, impostor: object) -> None:
+        with pytest.raises(TypeError, match=r"threading\.Event"):
+            readiness._check_instance_membership("sqlite-single", impostor)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_report_is_not_ready_while_draining_and_names_only_that_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = _settings_stub(tmp_path)
+        session_engine = create_session_engine(f"sqlite:///{tmp_path / 'session.db'}")
+        monkeypatch.setattr(readiness, "probe_session_schema", lambda conn: SchemaState.CURRENT)
+        monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
+        draining = threading.Event()
+        draining.set()
+        runner = ReadinessProbeRunner()
+        try:
+            report = await readiness_report(settings, session_engine, runner, instance_draining=draining)
+        finally:
+            runner.close()
+            session_engine.dispose()
+        assert report.ready is False
+        assert [check.name for check in report.checks if not check.ok] == ["instance_membership"]
+        assert [check.name for check in report.checks] == list(readiness.READINESS_CHECK_NAMES)

@@ -31,10 +31,11 @@ from elspeth.web.sessions.models import (
 _SQLITE_INTERNAL_TABLES: frozenset[str] = frozenset({"sqlite_sequence"})
 _SESSION_METADATA_CREATE_LOCK = Lock()
 
-_COORDINATION_HARD_CUT_EPOCH = 52
+_COORDINATION_HARD_CUT_EPOCH = 53
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
+    "session_read_admissions": "ix_session_read_admissions_expires_at",
     "run_start_permits": "ix_run_start_permits_retention_expires_at",
     "websocket_tickets": "ix_websocket_tickets_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
@@ -370,8 +371,9 @@ def _validate_coordination_hard_cut_metadata() -> None:
     The generic metadata/live-schema comparison catches deployment drift, but
     cannot catch an accidental edit that removes the same table or expiry index
     from the declared metadata. The coordination substrate landed at epoch 51
-    (the multi-replica hard cut, 44 then 48 on the original lane), and the
-    pluggable-SSO identity substrate took 52 in the same release. This constant
+    (the multi-replica hard cut, 44 then 48 on the original lane), the
+    pluggable-SSO identity substrate took 52 in the same release, and the
+    per-admission read records (``session_read_admissions``) took 53. This constant
     tracks ``SESSION_SCHEMA_EPOCH`` by exact equality, so it moves with every
     epoch bump: it names the CURRENT declared schema, not the release in which
     coordination first shipped. Leaving it behind an epoch is why the check is

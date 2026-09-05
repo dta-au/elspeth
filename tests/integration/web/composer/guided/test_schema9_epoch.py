@@ -39,7 +39,10 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # one service-stop window, which is why this test pins them as a PAIR:
     # a change that moved only one of them would be a deployment with two
     # stores disagreeing about which release they belong to.
-    assert SESSION_SCHEMA_EPOCH == 52
+    # Session epoch 53 (elspeth-f98e0ae8b2) adds the per-admission read
+    # records on the session side only; Landscape stays at 37, so the pair
+    # is (53, 37) and both stores still name the same release.
+    assert SESSION_SCHEMA_EPOCH == 53
     assert SQLITE_SCHEMA_EPOCH == 37
 
 

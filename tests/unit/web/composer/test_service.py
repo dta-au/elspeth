@@ -5011,10 +5011,10 @@ class TestPluginCrashSessionPersistence:
         assert "ValueError" not in row_text
 
     @pytest.mark.asyncio
-    async def test_persist_crashed_session_failure_does_not_mask_plugin_bug(
+    async def test_crash_breadcrumb_failure_does_not_mask_plugin_bug(
         self,
     ) -> None:
-        """If _persist_crashed_session itself raises a recoverable audit-path
+        """If the fenced breadcrumb mutation raises a recoverable audit-path
         exception (SQLAlchemyError / OSError), slog.error fires and the
         original plugin-bug exception still propagates unchanged.
 
@@ -5039,10 +5039,11 @@ class TestPluginCrashSessionPersistence:
 
         catalog = _mock_catalog()
         settings = _make_settings(data_dir=self.data_dir)
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
         service = ComposerServiceImpl.for_trained_operator(
             catalog=catalog,
             settings=settings,
-            sessions_service=_test_sessions_service(self.engine, self.data_dir),
+            sessions_service=sessions_service,
             session_engine=self.engine,
         )
         state = _empty_state()
@@ -5069,8 +5070,8 @@ class TestPluginCrashSessionPersistence:
                 side_effect=ValueError("original plugin bug"),
             ),
             patch.object(
-                service,
-                "_persist_crashed_session",
+                sessions_service.session_operation_authority,
+                "mutate",
                 side_effect=OperationalError("UPDATE sessions", {}, Exception("db unavailable")),
             ),
             capture_logs() as cap_logs,
@@ -5112,16 +5113,16 @@ class TestPluginCrashSessionPersistence:
         assert "UPDATE sessions" not in str(event)
 
     @pytest.mark.asyncio
-    async def test_persist_crashed_session_real_path_slog_emission(self) -> None:
-        """Smoke test for Step 4a-pre: exercise the real _persist_crashed_session
-        path (no patching of the private method).  If structlog is not
-        imported in service.py, this test will surface the NameError that
-        `test_persist_crashed_session_failure_does_not_mask_plugin_bug`
-        misses (because that test patches the method itself).
+    async def test_crash_breadcrumb_real_path_slog_emission(self) -> None:
+        """Exercise the real fenced breadcrumb path (no patching of the
+        authority).  If structlog is not imported in service.py, this test
+        will surface the NameError that
+        `test_crash_breadcrumb_failure_does_not_mask_plugin_bug` misses
+        (because that test patches the mutation itself).
 
-        The real _persist_crashed_session should succeed here (the sessions
-        engine is live), so we assert the crash propagates without any
-        persistence-failure slog event.
+        The real mutation should succeed here (the sessions engine is live
+        and the compose runs under a COMPOSE lease), so we assert the crash
+        propagates without any persistence-failure slog event.
         """
         from structlog.testing import capture_logs
 
@@ -5169,19 +5170,19 @@ class TestPluginCrashSessionPersistence:
         assert persistence_failure_events == [], cap_logs
 
     @pytest.mark.asyncio
-    async def test_persist_crashed_session_programmer_bug_propagates_past_catch(
+    async def test_crash_breadcrumb_programmer_bug_propagates_past_catch(
         self,
     ) -> None:
-        """Programmer-bug exceptions inside _persist_crashed_session MUST NOT
-        be absorbed by the audit-cleanup catch in compose().
+        """Programmer-bug exceptions inside the fenced breadcrumb mutation
+        MUST NOT be absorbed by the audit-cleanup catch in compose().
 
         This test is the guardrail for the narrowed catch at
-        ComposerServiceImpl.compose: replacing ``except Exception`` with
-        ``except (SQLAlchemyError, OSError)`` means AttributeError, TypeError,
-        AssertionError, NameError and the like now escape the handler.
+        ComposerServiceImpl.compose: ``except (SQLAlchemyError, OSError,
+        SessionOperationFenceLost)`` means AttributeError, TypeError,
+        AssertionError, NameError and the like escape the handler.
         A future regression that re-widens the catch (e.g., "catch everything
         so audit never crashes the request") would silently pass the sibling
-        ``test_persist_crashed_session_failure_does_not_mask_plugin_bug``
+        ``test_crash_breadcrumb_failure_does_not_mask_plugin_bug``
         test because that path raises an audit-family exception. This test
         closes the loop by asserting AttributeError — a canonical Tier 1/2
         programmer bug — bubbles out of the compose() call unchanged, NOT
@@ -5199,10 +5200,11 @@ class TestPluginCrashSessionPersistence:
 
         catalog = _mock_catalog()
         settings = _make_settings(data_dir=self.data_dir)
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
         service = ComposerServiceImpl.for_trained_operator(
             catalog=catalog,
             settings=settings,
-            sessions_service=_test_sessions_service(self.engine, self.data_dir),
+            sessions_service=sessions_service,
             session_engine=self.engine,
         )
         state = _empty_state()
@@ -5229,8 +5231,8 @@ class TestPluginCrashSessionPersistence:
                 side_effect=ValueError("original plugin bug"),
             ),
             patch.object(
-                service,
-                "_persist_crashed_session",
+                sessions_service.session_operation_authority,
+                "mutate",
                 side_effect=AttributeError("sessions_table has no attribute 'c'"),
             ),
             capture_logs() as cap_logs,
@@ -5251,15 +5253,15 @@ class TestPluginCrashSessionPersistence:
         assert persistence_failure_events == [], cap_logs
 
     @pytest.mark.asyncio
-    async def test_persist_crashed_session_runs_off_event_loop(self) -> None:
-        """_persist_crashed_session must execute in a worker thread, not
-        on the event loop thread.
+    async def test_crash_breadcrumb_runs_off_event_loop(self) -> None:
+        """The fenced breadcrumb mutation must execute in a worker thread,
+        not on the event loop thread.
 
-        The method performs a synchronous ``Engine.begin()`` + UPDATE,
-        which holds the GIL and (more importantly) blocks the asyncio
-        event loop for the duration of the DB round-trip. Every other
-        sync DB path in the compose flow is already wrapped in
-        ``asyncio.to_thread(...)``; the crash-path persistence was
+        ``authority.mutate`` performs a synchronous fenced transaction +
+        UPDATE, which holds the GIL and (more importantly) blocks the
+        asyncio event loop for the duration of the DB round-trip. Every
+        other sync DB path in the compose flow is already offloaded
+        through ``run_sync_in_worker``; the crash-path persistence was
         hoisted out of the main loop but not wrapped.
 
         Blast radius: a stalled persist blocks websocket heartbeats,
@@ -5272,10 +5274,11 @@ class TestPluginCrashSessionPersistence:
 
         catalog = _mock_catalog()
         settings = _make_settings(data_dir=self.data_dir)
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
         service = ComposerServiceImpl.for_trained_operator(
             catalog=catalog,
             settings=settings,
-            sessions_service=_test_sessions_service(self.engine, self.data_dir),
+            sessions_service=sessions_service,
             session_engine=self.engine,
         )
         state = _empty_state()
@@ -5283,12 +5286,13 @@ class TestPluginCrashSessionPersistence:
         event_loop_thread = threading.current_thread()
         persist_thread: threading.Thread | None = None
 
-        original_persist = service._persist_crashed_session
+        authority = sessions_service.session_operation_authority
+        original_mutate = authority.mutate
 
-        def capture_thread(session_id: str) -> None:
+        def capture_thread(context: Any, mutation: Any) -> Any:
             nonlocal persist_thread
             persist_thread = threading.current_thread()
-            original_persist(session_id)
+            return original_mutate(context, mutation)
 
         valid_call = _make_llm_response(
             tool_calls=[
@@ -5311,18 +5315,170 @@ class TestPluginCrashSessionPersistence:
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
             ),
-            patch.object(service, "_persist_crashed_session", side_effect=capture_thread),
+            patch.object(authority, "mutate", side_effect=capture_thread),
         ):
             mock_llm.return_value = valid_call
             with pytest.raises(ComposerPluginCrashError):
                 await service.compose("Setup", [], state, session_id=self.session_id)
 
-        assert persist_thread is not None, "_persist_crashed_session was never called"
+        assert persist_thread is not None, "the crash breadcrumb mutation was never called"
         assert persist_thread is not event_loop_thread, (
-            "_persist_crashed_session ran on the event loop thread — "
-            "the synchronous Engine.begin() call blocks all concurrent "
-            "requests. It must be offloaded via asyncio.to_thread(...)"
+            "the crash breadcrumb mutation ran on the event loop thread — "
+            "the synchronous fenced transaction blocks all concurrent "
+            "requests. It must be offloaded via run_sync_in_worker(...)"
         )
+
+    @pytest.mark.asyncio
+    async def test_session_bound_compose_without_its_lease_never_writes_the_breadcrumb(self) -> None:
+        """A session-bound compose that crashes without a COMPOSE context
+        must not write the breadcrumb on a raw engine.
+
+        The breadcrumb is a ``sessions`` write and every such write goes
+        through the fenced authority (P4-D3 elspeth-f3bbe79753). Before D3
+        this path fell back to an unfenced ``UPDATE sessions`` on the raw
+        engine. Now two gates refuse it, in order: the crashed tool's turn
+        audit is persisted under the same authority BEFORE the crash arm
+        runs, and refuses an unleased session-bound turn
+        (``AuditIntegrityError``); were a crash ever to reach the arm
+        without a context, the arm itself raises ``RuntimeError`` rather
+        than mutate unfenced. Either way nothing is logged as an audit-path
+        failure (that catch is for the authority's own refusals) and the
+        seeded ``updated_at`` stays untouched.
+
+        The conftest lease adapter fences every legacy ``compose(session_id=
+        ...)`` call, which is exactly the caller behaviour this test must
+        NOT have, so the call goes to the real ``compose`` the adapter
+        closed over. (``monkeypatch.undo()`` would also revert the
+        environment fixtures the composer's availability depends on.)
+        """
+        import inspect
+
+        from structlog.testing import capture_logs
+
+        from elspeth.web.sessions.models import sessions_table
+
+        adapter_closure = inspect.getclosurevars(ComposerServiceImpl.compose).nonlocals
+        real_compose = adapter_closure.get("real_compose", ComposerServiceImpl.compose)
+
+        catalog = _mock_catalog()
+        settings = _make_settings(data_dir=self.data_dir)
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=catalog,
+            settings=settings,
+            sessions_service=_test_sessions_service(self.engine, self.data_dir),
+            session_engine=self.engine,
+        )
+        state = _empty_state()
+
+        valid_call = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {},
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch(
+                "elspeth.web.composer.tool_batch.execute_tool",
+                side_effect=ValueError("plugin bug"),
+            ),
+            capture_logs() as cap_logs,
+        ):
+            mock_llm.return_value = valid_call
+            with pytest.raises(AuditIntegrityError, match="session operation authority"):
+                await real_compose(service, "Setup", [], state, session_id=self.session_id)
+
+        persistence_failure_events = [entry for entry in cap_logs if entry.get("event") == "composer_crash_persistence_failed"]
+        assert persistence_failure_events == [], cap_logs
+
+        with self.engine.begin() as conn:
+            row = conn.execute(sessions_table.select().where(sessions_table.c.id == self.session_id)).one()
+        row_updated_at = row.updated_at
+        seeded = self.seeded_at.replace(tzinfo=None) if row_updated_at.tzinfo is None else self.seeded_at
+        assert row_updated_at == seeded, "an unfenced compose must not bump updated_at"
+
+    @pytest.mark.asyncio
+    async def test_crash_breadcrumb_lost_fence_is_logged_and_never_written(self) -> None:
+        """A COMPOSE fence lost by the time the crash arm runs refuses the write.
+
+        This is the exception-set widening of P4-D3: the authority raises
+        ``SessionOperationFenceLost`` when the context it is handed no
+        longer holds the session fence, and the crash arm treats that like
+        any other audit-path failure -- logged as
+        ``composer_crash_persistence_failed`` with the fence-loss class,
+        the original plugin crash still propagating, and NO ``updated_at``
+        bump (nothing falls back to a raw-engine UPDATE).
+
+        The loss is raised by the authority's ``mutate`` rather than by
+        releasing a real lease mid-turn: the crashed tool's turn audit is
+        persisted under the same fence BEFORE the crash arm runs, so a
+        fence released inside the tool call is observed there first and
+        never reaches the arm. The facet's own refusal of a context that
+        does not hold the fence is pinned at the repository level
+        (``test_operation_fence_wiring``).
+        """
+        from structlog.testing import capture_logs
+
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+        from elspeth.web.sessions.models import sessions_table
+
+        catalog = _mock_catalog()
+        settings = _make_settings(data_dir=self.data_dir)
+        sessions_service = _test_sessions_service(self.engine, self.data_dir)
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=catalog,
+            settings=settings,
+            sessions_service=sessions_service,
+            session_engine=self.engine,
+        )
+        state = _empty_state()
+        authority = sessions_service.session_operation_authority
+
+        valid_call = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "name": "set_source",
+                    "arguments": {
+                        "plugin": "csv",
+                        "on_success": "out",
+                        "options": {},
+                        "on_validation_failure": "quarantine",
+                    },
+                }
+            ],
+        )
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=ValueError("plugin bug")),
+            patch.object(authority, "mutate", side_effect=SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)),
+            capture_logs() as cap_logs,
+        ):
+            mock_llm.return_value = valid_call
+            with pytest.raises(ComposerPluginCrashError) as exc_info:
+                await service.compose("Setup", [], state, session_id=self.session_id)
+
+        assert isinstance(exc_info.value.original_exc, ValueError)
+        persistence_failure_events = [entry for entry in cap_logs if entry.get("event") == "composer_crash_persistence_failed"]
+        assert len(persistence_failure_events) == 1, cap_logs
+        assert persistence_failure_events[0]["audit_exc_class"] == "SessionOperationFenceLost"
+        assert persistence_failure_events[0]["original_exc_class"] == "ValueError"
+
+        with self.engine.begin() as conn:
+            row = conn.execute(sessions_table.select().where(sessions_table.c.id == self.session_id)).one()
+        row_updated_at = row.updated_at
+        seeded = self.seeded_at.replace(tzinfo=None) if row_updated_at.tzinfo is None else self.seeded_at
+        assert row_updated_at == seeded, "a lost fence must not bump updated_at"
 
 
 class TestToolExecutionThreadOffloading:

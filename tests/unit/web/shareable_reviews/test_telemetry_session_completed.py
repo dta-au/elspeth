@@ -218,7 +218,7 @@ def session_operation_context(
     authority = SQLiteLocalSessionOperationAuthority(session_engine_with_row)
     context = authority.acquire(
         session_id=session_record.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="shareable-telemetry-test",
         lease_seconds=30,
     )

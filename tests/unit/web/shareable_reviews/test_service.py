@@ -328,11 +328,11 @@ def session_operation_context(
     session_engine_with_row,
     session_record: _SessionRecord,
 ):
-    """Acquire one real BLOB_READ context for the full mark operation."""
+    """Acquire one real COMPOSE context for the full mark operation (a completion event is a write)."""
     authority = SQLiteLocalSessionOperationAuthority(session_engine_with_row)
     context = authority.acquire(
         session_id=session_record.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="shareable-review-test",
         lease_seconds=30,
     )
@@ -1485,7 +1485,7 @@ async def test_mark_ready_for_review_stale_authority_has_no_audit_blob_token_or_
     authority.release(session_operation_context)
     successor = authority.acquire(
         session_id=session_record.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="shareable-review-test-successor",
         lease_seconds=30,
     )

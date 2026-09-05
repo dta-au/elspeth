@@ -37,6 +37,7 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
     BlobStateError,
     blob_record_snapshot_hash,
+    names_same_blob,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_interpretation import (
@@ -88,6 +89,7 @@ from elspeth.web.sessions.models import (
     run_events_table,
     runs_table,
     session_operation_fences_table,
+    session_read_admissions_table,
     sessions_table,
     web_instances_table,
 )
@@ -298,6 +300,10 @@ _BLOB_DELETION_RECOVERY_OPERATION_KINDS = frozenset(
         SessionOperationKind.SESSION_FORK,
     }
 )
+# Recovery ledgers are READ by every custodian kind, but retiring or aborting a
+# plan is a write: a shareable BLOB_READ admission (no fence row) must never
+# hold it, so the writer set is the recovery set minus the read kind.
+_BLOB_RECOVERY_WRITE_OPERATION_KINDS = _BLOB_DELETION_RECOVERY_OPERATION_KINDS - {SessionOperationKind.BLOB_READ}
 _GUIDED_INLINE_CUSTODY_OPERATION_KINDS = frozenset({"guided_plan", "guided_respond"})
 
 _ACTIVE_RUN_COMPOSITION_COLUMNS = (
@@ -340,11 +346,26 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
-    """Recursively inspect one plugin option value for exact blob markers."""
+    """Recursively inspect one plugin option value for blob identity markers.
+
+    The vocabulary is the union the blob store's own walker recognises: an
+    inline ``blob_ref`` marker, the ``blob_id`` custody key ``blob_rows``
+    persists (elspeth-0c6a343921), and the legacy ``path``/``file`` storage
+    path. This is the PostgreSQL multi-replica delete path's copy of that
+    walker; it must never recognise less than its twin.
+
+    Id values are compared by UUID identity through the contract's
+    ``names_same_blob`` (the same helper the blob store's walker uses): the
+    binding path accepts either hex case, so a spelling comparison read a
+    bound blob as unbound on this delete path (elspeth-f123a7b3d2). A
+    present-but-non-str id value is a non-match here, as on the twin.
+    """
     if type(value) is dict:
-        if value.get("blob_ref") == blob_id:
+        if "blob_ref" in value and type(value["blob_ref"]) is str and names_same_blob(value["blob_ref"], blob_id):
             return True
-        if any(value.get(key) == storage_path for key in ("path", "file")):
+        if "blob_id" in value and type(value["blob_id"]) is str and names_same_blob(value["blob_id"], blob_id):
+            return True
+        if any(key in value and value[key] == storage_path for key in ("path", "file")):
             return True
         return any(_option_value_references_blob(child, blob_id, storage_path) for child in value.values())
     if type(value) is list:
@@ -2058,7 +2079,7 @@ class _RepositoryBlobMutations:
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool:
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_replacement_plan(plan)
         deletion = self._read_blob_deletion_locked(blob_id=plan.blob_id)
         if deletion is not None:
@@ -2078,7 +2099,7 @@ class _RepositoryBlobMutations:
     def abort_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool:
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_replacement_plan(plan)
         deletion = self._read_blob_deletion_locked(blob_id=plan.blob_id)
         if deletion is not None:
@@ -2905,7 +2926,7 @@ class _RepositoryBlobMutations:
         """Retire exact cleanup evidence after the caller settles filesystem state."""
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_deletion_plan(plan)
         if self._read_blob_deletion_locked(blob_id=plan.blob_id) is None:
             return False
@@ -2925,7 +2946,7 @@ class _RepositoryBlobMutations:
         """Abort an exact uncommitted plan after the caller restores live bytes."""
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_deletion_plan(plan)
         if self._read_blob_deletion_locked(blob_id=plan.blob_id) is None:
             return False
@@ -4105,13 +4126,26 @@ class _SessionOperationAuthorityRepository:
         owner_instance_id: str,
         lease_seconds: int,
     ) -> SessionOperationContext:
-        """Advance one retained row and return its immutable authority context."""
+        """Advance one retained row and return its immutable authority context.
+
+        ``BLOB_READ`` is the one shareable kind: it is admitted against session
+        custody without taking or advancing the row (:meth:`_admit_blob_read`),
+        so readers coexist with each other and with one live writer. Every
+        other kind is exclusive and advances the row by epoch.
+        """
         if type(session_id) is not UUID:
             raise ValueError("session_id must be a UUID")
         _validate_kind(operation_kind)
         _validate_owner(owner_instance_id)
         _validate_lease_seconds(lease_seconds)
         session_id_text = str(session_id)
+
+        if operation_kind is SessionOperationKind.BLOB_READ:
+            return self._admit_blob_read(
+                session_id=session_id_text,
+                owner_instance_id=owner_instance_id,
+                lease_seconds=lease_seconds,
+            )
 
         with self._locked_transaction(session_id_text) as conn:
             session_row = conn.execute(
@@ -4173,6 +4207,115 @@ class _SessionOperationAuthorityRepository:
             operation_kind=operation_kind,
         )
 
+    def _admit_blob_read(
+        self,
+        *,
+        session_id: str,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionOperationContext:
+        """Admit one shareable read against session custody and record it.
+
+        A read admission holds no fence row, so nothing it does can conflict
+        with another reader or with the one live writer, and an exclusive
+        acquire (compose, execute, archive) proceeds over open readers. Its
+        authority is the session's custody — the session row exists and is not
+        archived, the fence row exists — proven under the session lock here
+        and re-proven on every renew, compare-and-swap and mutation through
+        :meth:`_lock_fence_and_read_database_time`. The minted fence carries a
+        fresh operation id and lease token and the row's CURRENT epoch as the
+        custody generation it was admitted under; it never matches the row's
+        exact-active predicates, so no row-bound arm can mistake it for a
+        writer.
+
+        The admission is RECORDED as one ``session_read_admissions`` row
+        (epoch 53, elspeth-f98e0ae8b2) keyed by the minted operation id, with
+        a database-time expiry ``lease_seconds`` ahead. That row is what every
+        later proof compares the context against (:meth:`_prove_read_admission`):
+        without it a released or expired read context was indistinguishable
+        from a live one. Many rows per session coexist — reads stay shareable.
+
+        Admission also sweeps this session's expired read rows under the
+        session lock it already holds. Two admissions sweeping the same rows
+        is harmless: each deletes only rows whose expiry has passed at the
+        database clock it read, and a row deleted by one sweep is simply
+        absent for the other, so no live admission can be lost to the race.
+        """
+        with self._locked_transaction(session_id) as conn:
+            session_row = conn.execute(
+                select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id).with_for_update()
+            ).one_or_none()
+            if session_row is None:
+                raise SessionOperationFenceLost(FenceLossReason.MISSING)
+            if session_row.archived_at is not None:
+                raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+            row = self._select_fence(conn, session_id=session_id)
+            if row is None:
+                raise SessionOperationFenceLost(FenceLossReason.MISSING)
+            custody_epoch = row.operation_epoch
+            database_now = self._database_now(conn)
+            conn.execute(
+                delete(session_read_admissions_table).where(
+                    session_read_admissions_table.c.session_id == session_id,
+                    session_read_admissions_table.c.expires_at <= database_now,
+                )
+            )
+            operation_id = _new_operation_id()
+            lease_token = _new_lease_token(owner_instance_id=owner_instance_id)
+            conn.execute(
+                insert(session_read_admissions_table).values(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    lease_token=lease_token,
+                    owner_instance_id=owner_instance_id,
+                    operation_epoch=custody_epoch,
+                    admitted_at=database_now,
+                    expires_at=database_now + timedelta(seconds=lease_seconds),
+                )
+            )
+        return SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=session_id,
+                operation_id=operation_id,
+                lease_token=lease_token,
+                operation_epoch=custody_epoch,
+            ),
+            operation_kind=SessionOperationKind.BLOB_READ,
+        )
+
+    @staticmethod
+    def _prove_read_admission(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        database_now: datetime,
+    ) -> None:
+        """Refuse a read context whose admission row is gone, foreign, or expired.
+
+        Runs AFTER the custody proof (session present, not archived, fence
+        row present), so a deleted session still reads MISSING. The row is
+        selected by ``(session_id, operation_id)``: absent means the admission
+        was RELEASED (release deletes its row); a lease token that does not
+        match is TOKEN_MISMATCH; an expiry at or before the database clock is
+        LEASE_EXPIRED. The recorded ``operation_epoch`` is informational and
+        deliberately NOT compared: a writer's epoch advance must not
+        invalidate a shareable read (the validate route holds a read while
+        its repair pass takes its own COMPOSE inside it).
+        """
+        fence = context.fence
+        row = conn.execute(
+            select(session_read_admissions_table.c.lease_token, session_read_admissions_table.c.expires_at).where(
+                session_read_admissions_table.c.session_id == fence.session_id,
+                session_read_admissions_table.c.operation_id == fence.operation_id,
+            )
+        ).one_or_none()
+        if row is None:
+            raise SessionOperationFenceLost(FenceLossReason.RELEASED)
+        if row.lease_token != fence.lease_token:
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        if _ensure_utc(row.expires_at) <= database_now:
+            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+
     @staticmethod
     def _exact_active_predicates(
         context: SessionOperationContext,
@@ -4225,6 +4368,15 @@ class _SessionOperationAuthorityRepository:
         *,
         database_now: datetime,
     ) -> None:
+        if context.operation_kind is SessionOperationKind.BLOB_READ:
+            # A read admission holds no fence row: its authority is the session
+            # custody that _lock_fence_and_read_database_time has just proven
+            # under this connection (session present, not archived, fence row
+            # present) PLUS its own admission row, which must still be live.
+            # Nothing is swapped and nothing is written: an ordinary read
+            # proof leaves the row untouched.
+            self._prove_read_admission(conn, context, database_now=database_now)
+            return
         result = conn.execute(
             update(session_operation_fences_table)
             .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4285,6 +4437,25 @@ class _SessionOperationAuthorityRepository:
         fence = context.fence
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_and_read_database_time(conn, context)
+            if context.operation_kind is SessionOperationKind.BLOB_READ:
+                # Renewal of a read admission: custody proof (just made above),
+                # then its own row must be live, then the expiry is extended
+                # from the database clock. This is the ONLY per-proof write a
+                # read admission ever makes.
+                self._prove_read_admission(conn, context, database_now=database_now)
+                renewed = conn.execute(
+                    update(session_read_admissions_table)
+                    .where(
+                        session_read_admissions_table.c.session_id == fence.session_id,
+                        session_read_admissions_table.c.operation_id == fence.operation_id,
+                        session_read_admissions_table.c.lease_token == fence.lease_token,
+                        session_read_admissions_table.c.expires_at > database_now,
+                    )
+                    .values(expires_at=database_now + timedelta(seconds=lease_seconds))
+                )
+                if renewed.rowcount != 1:
+                    raise SessionOperationFenceLost(FenceLossReason.RELEASED)
+                return context
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4814,6 +4985,23 @@ class _SessionOperationAuthorityRepository:
         fence = context.fence
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_for_release_and_read_database_time(conn, context)
+            if context.operation_kind is SessionOperationKind.BLOB_READ:
+                # A read admission releases by DELETING its own row after the
+                # terminal-tolerant custody proof above (archived session still
+                # releasable, missing session still refused — the writers'
+                # contract) and its own liveness proof: a released, foreign or
+                # expired read context cannot release twice.
+                self._prove_read_admission(conn, context, database_now=database_now)
+                released = conn.execute(
+                    delete(session_read_admissions_table).where(
+                        session_read_admissions_table.c.session_id == fence.session_id,
+                        session_read_admissions_table.c.operation_id == fence.operation_id,
+                        session_read_admissions_table.c.lease_token == fence.lease_token,
+                    )
+                )
+                if released.rowcount != 1:
+                    raise SessionOperationFenceLost(FenceLossReason.RELEASED)
+                return
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4973,7 +5161,10 @@ class _RepositoryComposerCompletionMutations:
         state = self.__state
         state._require_active()
         context = state._operation_context
-        if context is None or context.operation_kind is not SessionOperationKind.BLOB_READ:
+        # A completion event is a write on the composition, so it takes
+        # writer authority. The shareable BLOB_READ admission holds no fence
+        # row and can never carry one (elspeth-bf52d495a2, option A).
+        if context is None or context.operation_kind is not SessionOperationKind.COMPOSE:
             raise AuditIntegrityError("composer completion mutation is not authorized for this operation kind")
         state._validate_uuid(composition_state_id, field_name="composition_state_id")
         connection = _resolve_mutation_connection(state._connection_token)

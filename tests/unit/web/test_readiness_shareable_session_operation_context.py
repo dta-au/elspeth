@@ -65,12 +65,16 @@ def test_shareable_reuses_one_context_for_direct_and_nested_validation() -> None
         assert forwarded.id == "session_operation_context"
 
 
-def test_http_entrypoints_own_one_blob_read_lease() -> None:
+def test_http_entrypoints_own_one_lease_of_their_kind() -> None:
+    """Each entrypoint acquires exactly one lease and closes it, of the kind its
+    effect needs: the readiness snapshot only reads (shareable BLOB_READ
+    admission); marking ready writes a completion event (COMPOSE authority,
+    elspeth-bf52d495a2 option A)."""
     targets = (
-        (Path("src/elspeth/web/audit_readiness/routes.py"), "snapshot"),
-        (Path("src/elspeth/web/shareable_reviews/routes.py"), "mark_ready_for_review"),
+        (Path("src/elspeth/web/audit_readiness/routes.py"), "snapshot", "SessionOperationKind.BLOB_READ"),
+        (Path("src/elspeth/web/shareable_reviews/routes.py"), "mark_ready_for_review", "SessionOperationKind.COMPOSE"),
     )
-    for path, function_name in targets:
+    for path, function_name, expected_kind in targets:
         node = _async_function(path, function_name)
         acquires = [
             call
@@ -93,4 +97,4 @@ def test_http_entrypoints_own_one_blob_read_lease() -> None:
         assert len(acquires) == 1
         assert len(closes) == 1
         operation_kind = next(keyword.value for keyword in acquires[0].keywords if keyword.arg == "operation_kind")
-        assert ast.unparse(operation_kind) == "SessionOperationKind.BLOB_READ"
+        assert ast.unparse(operation_kind) == expected_kind, function_name

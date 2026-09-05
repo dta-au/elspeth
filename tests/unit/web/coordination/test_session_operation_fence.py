@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast as _ast
+import inspect as _inspect
 from datetime import UTC, datetime, timedelta
 from threading import Thread
 from uuid import UUID, uuid4
@@ -846,9 +848,10 @@ async def test_composer_completion_mutations_write_fixed_shapes_under_exact_blob
             )
         )
     authority = service.session_operation_authority
+    # Completion events are writes: COMPOSE authority (elspeth-bf52d495a2, option A).
     context = authority.acquire(
         session_id=created.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="sqlite-test-instance",
         lease_seconds=30,
     )
@@ -929,9 +932,10 @@ async def test_composer_completion_mutations_enforce_kind_session_and_latest_sta
                 )
             )
     authority = service.session_operation_authority
+    # A shareable read admission is the wrong kind for a completion write.
     wrong_kind = authority.acquire(
         session_id=owned.id,
-        operation_kind=SessionOperationKind.COMPOSE,
+        operation_kind=SessionOperationKind.BLOB_READ,
         owner_instance_id="sqlite-test-instance",
         lease_seconds=30,
     )
@@ -948,7 +952,7 @@ async def test_composer_completion_mutations_enforce_kind_session_and_latest_sta
 
     context = authority.acquire(
         session_id=owned.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="sqlite-test-instance",
         lease_seconds=30,
     )
@@ -1015,7 +1019,7 @@ async def test_composer_completion_released_authority_writes_zero_and_successor_
     authority = service.session_operation_authority
     first = authority.acquire(
         session_id=created.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="sqlite-test-instance",
         lease_seconds=30,
     )
@@ -1031,7 +1035,7 @@ async def test_composer_completion_released_authority_writes_zero_and_successor_
         )
     successor = authority.acquire(
         session_id=created.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id="sqlite-test-instance",
         lease_seconds=30,
     )
@@ -1056,3 +1060,117 @@ async def test_composer_completion_released_authority_writes_zero_and_successor_
         rows = conn.execute(select(composer_completion_events_table)).all()
     assert len(rows) == 1
     assert rows[0].composition_state_id == str(state_id)
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): a BLOB_READ admission is refused by every writer ---
+
+
+def _writer_kind_gates() -> list[tuple[str, str]]:
+    """Derive the writer inventory from the repository source: every method that
+    gates on ``_require_operation_kinds(<SET>)`` and issues DML in its body."""
+    source = _inspect.getsource(coordination_repository)
+    module = _ast.parse(source)
+    writers: list[tuple[str, str]] = []
+    for node in _ast.walk(module):
+        if not isinstance(node, _ast.FunctionDef):
+            continue
+        gate_sets = [
+            call.args[0].id
+            for call in _ast.walk(node)
+            if isinstance(call, _ast.Call)
+            and isinstance(call.func, _ast.Attribute)
+            and call.func.attr == "_require_operation_kinds"
+            and call.args
+            and isinstance(call.args[0], _ast.Name)
+        ]
+        if not gate_sets:
+            continue
+        issues_dml = any(
+            isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name) and call.func.id in {"update", "insert", "delete"}
+            for call in _ast.walk(node)
+        )
+        if issues_dml:
+            writers.extend((node.name, gate_set) for gate_set in gate_sets)
+    assert writers, "writer inventory is empty: the AST derivation no longer sees the repository"
+    return sorted(set(writers))
+
+
+# Closed map, direct access: a writer gated by a set NOT listed here fails
+# this test with a KeyError, which is the intended alarm for a new writer set.
+_KIND_SETS_BY_NAME: dict[str, frozenset[SessionOperationKind]] = {
+    "_BLOB_CREATION_OPERATION_KINDS": coordination_repository._BLOB_CREATION_OPERATION_KINDS,
+    "_BLOB_DELETION_OPERATION_KINDS": coordination_repository._BLOB_DELETION_OPERATION_KINDS,
+    "_BLOB_REPLACEMENT_OPERATION_KINDS": coordination_repository._BLOB_REPLACEMENT_OPERATION_KINDS,
+    "_BLOB_RECOVERY_WRITE_OPERATION_KINDS": coordination_repository._BLOB_RECOVERY_WRITE_OPERATION_KINDS,
+    "_BLOB_DELETION_RECOVERY_OPERATION_KINDS": coordination_repository._BLOB_DELETION_RECOVERY_OPERATION_KINDS,
+    "_BLOB_READ_OPERATION_KINDS": coordination_repository._BLOB_READ_OPERATION_KINDS,
+}
+
+
+@pytest.mark.parametrize(("writer", "gate_set"), _writer_kind_gates())
+def test_every_repository_writer_kind_set_excludes_blob_read(writer: str, gate_set: str) -> None:
+    allowed = _KIND_SETS_BY_NAME[gate_set]
+    assert SessionOperationKind.BLOB_READ not in allowed, f"{writer} admits a shareable read admission through {gate_set}"
+
+
+def _read_admission(service, session_id):
+    return service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id="sqlite-test-instance",
+        lease_seconds=30,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gate",
+    [
+        pytest.param(lambda t: t.interpretations._require_compose(), id="interpretations._require_compose"),
+        pytest.param(
+            lambda t: t.interpretations._require_pending_creation_authority(), id="interpretations._require_pending_creation_authority"
+        ),
+        pytest.param(lambda t: t.runs._require_execute(), id="runs._require_execute"),
+        pytest.param(lambda t: t.blobs._require_execute(), id="blobs._require_execute"),
+        pytest.param(
+            lambda t: t.blobs._require_operation_kinds(coordination_repository._BLOB_CREATION_OPERATION_KINDS), id="blobs.creation"
+        ),
+        pytest.param(
+            lambda t: t.blobs._require_operation_kinds(coordination_repository._BLOB_DELETION_OPERATION_KINDS), id="blobs.deletion"
+        ),
+        pytest.param(
+            lambda t: t.blobs._require_operation_kinds(coordination_repository._BLOB_REPLACEMENT_OPERATION_KINDS), id="blobs.replacement"
+        ),
+        pytest.param(
+            lambda t: t.blobs._require_operation_kinds(coordination_repository._BLOB_RECOVERY_WRITE_OPERATION_KINDS),
+            id="blobs.recovery-write",
+        ),
+        pytest.param(
+            lambda t: t.composer_completion._require_state(uuid4(), require_latest=False),
+            id="composer_completion._require_state",
+        ),
+    ],
+)
+async def test_live_read_admission_is_refused_by_every_writer_gate(service, gate) -> None:
+    """The refusal is live, through mutate over the real authority, not a set comparison.
+
+    Each facet refuses in its own voice: the interpretation and run gates raise
+    a token-mismatch fence loss, the blob gates an AuditIntegrityError.
+    """
+    session = await service.create_session("alice", "Read admission", "local")
+    reader = _read_admission(service, session.id)
+    with pytest.raises((SessionOperationFenceLost, AuditIntegrityError)) as refused:
+        service.session_operation_authority.mutate(reader, gate)
+    if isinstance(refused.value, SessionOperationFenceLost):
+        assert refused.value.reason is FenceLossReason.TOKEN_MISMATCH
+    else:
+        assert "not authorized for this operation kind" in str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_live_read_admission_reads_blob_metadata_through_the_recovery_read_gate(service) -> None:
+    session = await service.create_session("alice", "Read admission", "local")
+    reader = _read_admission(service, session.id)
+    # The read gates admit it (recovery ledger READ); nothing is written.
+    assert service.session_operation_authority.mutate(reader, lambda t: t.blobs.list_blob_deletions()) == ()
+    assert service.session_operation_authority.mutate(reader, lambda t: t.blobs.list_blob_replacements()) == ()
