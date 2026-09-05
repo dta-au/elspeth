@@ -53,6 +53,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
 RUN_1 = "run-fence-construct-1"
@@ -736,7 +737,8 @@ class TestVerifyAndExtendLeaderFence:
 
     def _seat(self, db: LandscapeDB) -> CoordinationToken:
         _insert_run(db, RUN_1)
-        return RunCoordinationRepository(db.engine).register_run_leader(
+        return register_run_leader(
+            RunCoordinationRepository(db.engine),
             run_id=RUN_1,
             worker_id="worker-leader",
             now=NOW,

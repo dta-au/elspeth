@@ -58,6 +58,7 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
 )
+from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-coord-1"
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
@@ -198,7 +199,7 @@ class TestSeatMint:
     def test_register_mints_epoch_one_token(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
         wid = mint_worker_id(RUN_ID)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
         assert token == CoordinationToken(run_id=RUN_ID, worker_id=wid, leader_epoch=1)
 
         seat = _seat_row(engine)
@@ -209,7 +210,7 @@ class TestSeatMint:
     def test_register_creates_leader_registry_row_with_forensics(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
         wid = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
 
         worker = _worker_row(engine, wid)
         assert worker["role"] == "leader"
@@ -222,7 +223,7 @@ class TestSeatMint:
     def test_register_events_worker_register_then_leader_acquire(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
         wid = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=wid, now=NOW, window_seconds=WINDOW)
 
         events = _events(engine)
         assert [e["event_type"] for e in events] == ["worker_register", "leader_acquire"]
@@ -252,7 +253,7 @@ class TestAcquireRunLeadershipCAS:
     def test_takeover_of_expired_seat_bumps_epoch_and_flips_run_status(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
         leader_a = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
 
         leader_b = mint_worker_id(RUN_ID)
         token = repo.acquire_run_leadership(run_id=RUN_ID, worker_id=leader_b, now=AFTER_EXPIRY, window_seconds=WINDOW)
@@ -271,7 +272,7 @@ class TestAcquireRunLeadershipCAS:
     def test_dead_leader_running_takeover_arm_skips_status_flip(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """RUNNING + expired seat: admissible takeover; the flip predicate skips."""
         _seed_run(engine, status="running")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         token = repo.acquire_run_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=AFTER_EXPIRY, window_seconds=WINDOW)
         assert token.leader_epoch == 2
@@ -281,7 +282,7 @@ class TestAcquireRunLeadershipCAS:
     def test_loser_against_live_seat_is_refused_with_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """Two racers: B wins the expired seat; C's CAS rowcount-0 is side-effect-free."""
         _seed_run(engine, status="failed")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         leader_b = mint_worker_id(RUN_ID)
         repo.acquire_run_leadership(run_id=RUN_ID, worker_id=leader_b, now=AFTER_EXPIRY, window_seconds=WINDOW)
         events_before = _events(engine)
@@ -323,7 +324,7 @@ class TestAcquireRunLeadershipCAS:
         """
         _seed_run(engine, status=terminal_status)
         leader_a = mint_worker_id(RUN_ID)
-        token_a = repo.register_run_leader(run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
+        token_a = register_run_leader(repo, run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
         # The completed winner released its seat on the way out — the seat is
         # VACANT, so without the backstop the CAS would happily seize it.
         repo.release_seat(token=token_a, now=NOW)
@@ -350,7 +351,7 @@ class TestIdentityEviction:
     def test_deposed_leader_evicted_even_with_fresh_worker_heartbeat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
         leader_a = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
         # The dangerous skew: seat clock expired, worker-row clock FRESH.
         _expire_seat(engine)
         with engine.begin() as conn:
@@ -374,7 +375,7 @@ class TestIdentityEviction:
     def test_takeover_never_bulk_evicts_followers(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """§B.4 correction 2: a stale-heartbeat follower survives the takeover."""
         _seed_run(engine, status="failed")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         stale_follower = mint_worker_id(RUN_ID)
         with engine.begin() as conn:
             conn.execute(
@@ -399,7 +400,7 @@ class TestVerifyAndExtendLeaderFence:
 
     def test_fence_hit_extends_seat_as_side_effect(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         later = NOW + timedelta(seconds=30)
         with begin_write(engine) as conn:
@@ -417,7 +418,7 @@ class TestVerifyAndExtendLeaderFence:
         verb doubles as the seat heartbeat instead.
         """
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         _expire_seat(engine)
 
         with begin_write(engine) as conn:
@@ -428,7 +429,7 @@ class TestVerifyAndExtendLeaderFence:
 
     def test_fence_miss_on_stale_epoch_raises_leadership_lost(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
-        stale = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        stale = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         # The in-DB image of a takeover: bump the epoch directly (§H doctrine).
         with engine.begin() as conn:
             conn.execute(
@@ -445,7 +446,7 @@ class TestVerifyAndExtendLeaderFence:
 
     def test_fence_miss_on_foreign_worker_identity(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         foreign = CoordinationToken(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), leader_epoch=1)
 
         with begin_write(engine) as conn, pytest.raises(RunLeadershipLostError):
@@ -457,7 +458,7 @@ class TestFencedLeaderTransaction:
 
     def test_fence_hit_commits_payload(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         probe = mint_worker_id(RUN_ID)
         with fenced_leader_transaction(engine, token=token, now=NOW, window_seconds=WINDOW, verb="test_verb") as conn:
@@ -478,7 +479,7 @@ class TestFencedLeaderTransaction:
     ) -> None:
         """The refused payload txn rolls back; the fence_refusal event survives it."""
         _seed_run(engine)
-        stale = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        stale = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         with engine.begin() as conn:
             conn.execute(update(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID).values(leader_epoch=99))
         probe = mint_worker_id(RUN_ID)
@@ -527,7 +528,7 @@ class TestWriteLockHeld:
         engine, holder_engine = engines
         _seed_run(engine, status="failed")
         leader_a = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_a, now=NOW, window_seconds=WINDOW)
 
         # Shrink busy_timeout for the repo engine's FUTURE connections so the
         # BEGIN IMMEDIATE poll fails fast instead of taking the full 5000 ms.
@@ -561,7 +562,7 @@ class TestWriteLockHeld:
 class TestReleaseSeatAndLiveLeader:
     def test_release_vacates_seat_departs_worker_and_events(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         repo.release_seat(token=token, now=NOW)
 
@@ -575,7 +576,7 @@ class TestReleaseSeatAndLiveLeader:
 
     def test_release_is_idempotent(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         repo.release_seat(token=token, now=NOW)
         events_after_first = _events(engine)
 
@@ -585,7 +586,7 @@ class TestReleaseSeatAndLiveLeader:
 
     def test_release_with_stale_epoch_is_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         seat_before = _seat_row(engine)
         worker_before = _worker_row(engine, token.worker_id)
         events_before = _events(engine)
@@ -603,8 +604,9 @@ class TestReleaseSeatAndLiveLeader:
         foreign_run_id = "run-coord-foreign"
         _seed_run(engine)
         _seed_run(engine, run_id=foreign_run_id)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
-        foreign = repo.register_run_leader(
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        foreign = register_run_leader(
+            repo,
             run_id=foreign_run_id,
             worker_id=mint_worker_id(foreign_run_id),
             now=NOW,
@@ -634,8 +636,9 @@ class TestReleaseSeatAndLiveLeader:
         foreign_run_id = "run-coord-foreign-membership"
         _seed_run(engine)
         _seed_run(engine, run_id=foreign_run_id)
-        original = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
-        foreign = repo.register_run_leader(
+        original = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        foreign = register_run_leader(
+            repo,
             run_id=foreign_run_id,
             worker_id=mint_worker_id(foreign_run_id),
             now=NOW,
@@ -669,7 +672,7 @@ class TestReleaseSeatAndLiveLeader:
     def test_vacant_seat_is_acquirable_at_next_epoch(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """The CAS's vacant-seat arm: release then re-acquire without waiting for expiry."""
         _seed_run(engine, status="failed")
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         repo.release_seat(token=token, now=NOW)
 
         new_token = repo.acquire_run_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
@@ -681,7 +684,7 @@ class TestReleaseSeatAndLiveLeader:
         _seed_run(engine)
         assert repo.live_leader(run_id=RUN_ID, now=NOW) is None  # no seat row yet
 
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         live = repo.live_leader(run_id=RUN_ID, now=NOW)
         assert live is not None
         assert live.leader_worker_id == token.worker_id
@@ -701,7 +704,7 @@ class TestRegistryVerbs:
 
     def test_worker_heartbeat_leader_beats_both_rows(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         later = NOW + timedelta(seconds=30)
         snapshot = repo.worker_heartbeat(worker_id=token.worker_id, now=later, window_seconds=WINDOW)
@@ -715,7 +718,7 @@ class TestRegistryVerbs:
 
     def test_worker_heartbeat_cas_miss_after_eviction(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
-        deposed = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        deposed = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         usurper = mint_worker_id(RUN_ID)
         repo.acquire_run_leadership(run_id=RUN_ID, worker_id=usurper, now=AFTER_EXPIRY, window_seconds=WINDOW)
 
@@ -726,7 +729,7 @@ class TestRegistryVerbs:
 
     def test_admit_follower_happy_path_and_refusals(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         follower = mint_worker_id(RUN_ID)
         repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", now=NOW, window_seconds=WINDOW)
@@ -749,7 +752,7 @@ class TestRegistryVerbs:
 
     def test_depart_worker_idempotent_cas(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         follower = mint_worker_id(RUN_ID)
         repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", now=NOW, window_seconds=WINDOW)
 
@@ -764,7 +767,7 @@ class TestRegistryVerbs:
 
     def test_evict_worker_grace_predicate_and_fence(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         fresh = mint_worker_id(RUN_ID)
         stale = mint_worker_id(RUN_ID)
         with engine.begin() as conn:
@@ -817,7 +820,7 @@ class TestRunCoordinationTruthTables:
         monkeypatch.setattr(coordination_module, "record_coordination_event", fail_leader_acquire)
 
         with pytest.raises(RuntimeError, match="forced leader-acquire event failure"):
-            repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+            register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
 
         assert _coordination_image(engine) == before
 
@@ -827,7 +830,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine, status="failed")
-        incumbent = repo.register_run_leader(run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
+        incumbent = register_run_leader(repo, run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
         exact_expiry = NOW + timedelta(seconds=WINDOW)
         before = _coordination_image(engine)
 
@@ -843,7 +846,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine, status="failed")
-        incumbent = repo.register_run_leader(run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
+        incumbent = register_run_leader(repo, run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
 
         winner = repo.acquire_run_leadership(
             run_id=RUN_ID,
@@ -883,7 +886,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine)
-        leader = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
         repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
@@ -915,7 +918,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine)
-        repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
         repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
@@ -948,7 +951,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
         release_at = NOW + timedelta(seconds=10)
 
         repo.release_seat(token=token, now=release_at)
@@ -972,7 +975,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine)
-        leader = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
 
         repo.admit_follower(
             run_id=RUN_ID,
@@ -1015,7 +1018,7 @@ class TestRunCoordinationTruthTables:
         repo: RunCoordinationRepository,
     ) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
         evict_at = NOW + timedelta(seconds=200)
         grace = 10.0
         with engine.begin() as conn:
@@ -1078,7 +1081,7 @@ class TestEventLedgerDiscipline:
     def test_same_transaction_eventing_rolls_back_with_state_change(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """Loser CAS leaves NO leader_acquire/worker_register ghost events."""
         _seed_run(engine, status="failed")
-        repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         before = [e["event_id"] for e in _events(engine)]
 
         with pytest.raises(NonResumableRunError):
@@ -1088,7 +1091,7 @@ class TestEventLedgerDiscipline:
 
     def test_event_id_dedup_is_enforced_by_unique_index(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
         existing = _events(engine)[0]
         with pytest.raises(IntegrityError), engine.begin() as conn:
             conn.execute(

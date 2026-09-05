@@ -40,6 +40,11 @@ from elspeth.web.sessions.protocol import (
 )
 
 _ACTOR = "composer_route"
+# The lease guard's audit-free terminal writes carry their own actor so the
+# durable record says WHO terminalised the operation: a guard-authored
+# ``failed`` event (empty evidence cohort) is the route's own evidence
+# settlement having failed or never run, not a route-recorded failure.
+_GUARD_ACTOR = "guided_operation_lease_guard"
 
 
 _LEASE_SECONDS = 300
@@ -315,7 +320,7 @@ class _GuidedOperationLeaseGuard:
                 self.service.fail_guided_operation(
                     self.lease.fence,
                     failure_code="operation_failed",
-                    actor=_ACTOR,
+                    actor=_GUARD_ACTOR,
                     session_operation_context=self.lease.session_operation_context,
                 ),
                 name="guided-operation-guard-prove-terminal",
@@ -333,7 +338,7 @@ class _GuidedOperationLeaseGuard:
                 self.service.fail_guided_operation(
                     self.lease.fence,
                     failure_code=_guided_failure_code_for_exception(exc_value),
-                    actor=_ACTOR,
+                    actor=_GUARD_ACTOR,
                     session_operation_context=self.lease.session_operation_context,
                 ),
                 name="guided-operation-guard-fail",

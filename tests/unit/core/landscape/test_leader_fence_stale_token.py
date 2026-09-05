@@ -68,6 +68,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-fence-1"
 OTHER_RUN_ID = "run-fence-2"
@@ -125,7 +126,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                     registered_at=NOW,
                 )
             )
-    return RunCoordinationRepository(db.engine).register_run_leader(run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
 
 
 def _bump_epoch(db: LandscapeDB) -> None:

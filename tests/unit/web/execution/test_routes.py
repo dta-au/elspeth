@@ -58,6 +58,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionServiceProtocol,
 )
+from tests.helpers.session_fences import RecordingSessionOperationAuthority
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -219,6 +220,13 @@ def _create_test_app(
     mock_session_service = _session_service()
     mock_session_service.get_session.return_value = _session_record()
     mock_session_service.get_run.return_value = _run_record()
+    # The validate and execute routes acquire a real SessionOperationLease
+    # (BLOB_READ / EXECUTE) through these three members before delegating; an
+    # autospec property is a NonCallableMagicMock, which the lifecycle's exact
+    # lease_seconds check rejects. Model them as the platform does.
+    mock_session_service.session_operation_authority = RecordingSessionOperationAuthority()
+    mock_session_service.session_operation_owner_instance_id = "execution-route-test"
+    mock_session_service.session_operation_lease_seconds = 30
     # The validate backstop probes the head state; None (no state yet) keeps
     # tests that never stage a state on the pre-backstop delegation path.
     mock_session_service.get_current_state.return_value = None

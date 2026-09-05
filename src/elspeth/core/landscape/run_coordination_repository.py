@@ -28,7 +28,7 @@ Slice ownership of the §G verb surface (this module is slice 2):
 ==========================  =======================================================
 verb                        consumer
 ==========================  =======================================================
-register_run_leader         slice 2/3: ``begin_run`` (uniformity rule, epoch 1)
+register_run_leader_on      slice 2/3: ``begin_run`` (uniformity rule, epoch 1)
 acquire_run_leadership      slice 2/3: ``resume()``'s first durable act (§B.4)
 release_seat                slice 2/3: run/resume teardown + ceremony arms
 live_leader                 implemented now; WIRED in slice 4 (entry-guard precision)
@@ -333,32 +333,6 @@ class RunCoordinationRepository:
         self._engine = engine
 
     # ── seat lifecycle ───────────────────────────────────────────────────
-
-    def register_run_leader(
-        self,
-        *,
-        run_id: str,
-        worker_id: str,
-        now: datetime,
-        window_seconds: float,
-        entry_point: str = "run",
-    ) -> CoordinationToken:
-        """Mint the run's seat at epoch 1 (uniformity rule: N=1 = leader-of-its-own-run).
-
-        Standalone-transaction form for repository-level callers and test
-        fixtures; ``begin_run`` composes :meth:`register_run_leader_on` into
-        ITS transaction instead so the runs INSERT and the seat mint commit
-        atomically (design §B.4 closing line).
-        """
-        with begin_write(self._engine) as conn:
-            return self.register_run_leader_on(
-                conn,
-                run_id=run_id,
-                worker_id=worker_id,
-                now=now,
-                window_seconds=window_seconds,
-                entry_point=entry_point,
-            )
 
     def register_run_leader_on(
         self,

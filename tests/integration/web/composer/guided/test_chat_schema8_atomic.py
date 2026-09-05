@@ -51,6 +51,7 @@ from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatPr
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.helpers.session_fences import acquire_compose_context
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -1190,18 +1191,10 @@ def test_expired_operation_takeover_fences_stale_worker_and_both_join_winner(
         async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
             stale = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
             await asyncio.wait_for(stale_provider_started.wait(), timeout=3)
-            with engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "UPDATE guided_operations SET lease_expires_at = :expired "
-                        "WHERE session_id = :session_id AND operation_id = :operation_id"
-                    ),
-                    {
-                        "expired": datetime.now(UTC) - timedelta(seconds=1),
-                        "session_id": session_id,
-                        "operation_id": body["operation_id"],
-                    },
-                )
+            # The stale worker is modelled as abandoned: its guided lease
+            # expires AND its session-operation generation is released, so
+            # the winner can acquire the session fence the takeover needs.
+            abandon_guided_worker_leases(engine, session_id=session_id, operation_id=body["operation_id"])
             winner = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
             await asyncio.wait_for(takeover_provider_started.wait(), timeout=3)
             winner_response = await asyncio.wait_for(winner, timeout=3)

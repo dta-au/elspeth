@@ -48,6 +48,7 @@ from elspeth.core.landscape.schema import (
 )
 from tests.fixtures.landscape import make_landscape_db
 from tests.helpers.checkpoint import checkpoint_draft
+from tests.helpers.run_coordination import register_run_leader
 
 
 @pytest.fixture
@@ -350,7 +351,8 @@ def test_can_resume_rejects_running_run_with_live_seat(db: LandscapeDB, recovery
         _insert_run(conn, "run-running", status=RunStatus.RUNNING)
     # Register a live leader seat so the guard fires the refusal.
     leader_id = mint_worker_id("run-running")
-    RunCoordinationRepository(db.engine).register_run_leader(
+    register_run_leader(
+        RunCoordinationRepository(db.engine),
         run_id="run-running",
         worker_id=leader_id,
         now=datetime.now(UTC),
