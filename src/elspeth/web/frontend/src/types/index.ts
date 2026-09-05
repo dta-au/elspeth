@@ -24,10 +24,13 @@ export interface AuthConfig {
   /** Effective registration mode — the LoginPage only renders its
    *  "Create an account" affordance when this is "open" (local auth). */
   registration_mode: "open" | "email_verified" | "closed";
-  oidc_issuer: string | null;
-  oidc_client_id: string | null;
-  authorization_endpoint: string | null;
-  token_endpoint?: string | null;
+  /** Where "Sign in with SSO" sends the browser: the backend's
+   *  /api/auth/sso/start, absolute from public_base_url. `null` whenever the
+   *  deployment is not wired for SSO — the same fact that makes the backend's
+   *  SSO routes refuse — so the button is hidden by the condition that would
+   *  make it fail. The browser never sees an IdP endpoint or client id: the
+   *  backend is the confidential client and does the exchange itself. */
+  sso_start_url: string | null;
 }
 
 /**

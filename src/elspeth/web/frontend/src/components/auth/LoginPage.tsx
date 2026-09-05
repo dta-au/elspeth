@@ -3,6 +3,7 @@ import { useAuth } from "../../hooks/useAuth";
 import * as api from "../../api/client";
 import type { ApiError, AuthConfig } from "../../types/index";
 import { Button, Input, AlertBanner, WordMark } from "../ui";
+import { captureSsoCallback, ssoFailureMessage, type SsoCallbackOutcome } from "./ssoCallback";
 
 /**
  * Login page that adapts to the configured auth provider.
@@ -12,13 +13,19 @@ import { Button, Input, AlertBanner, WordMark } from "../ui";
  *   registration_mode is "open" or "email_verified", also offers a
  *   "Create an account" view. Open registration auto-logs the account in;
  *   email-verified registration waits for the verification link.
- * - "oidc" or "entra": renders a "Sign in with SSO" button that
- *   redirects to config.authorization_endpoint (resolved from OIDC
- *   discovery by the backend)
+ * - any SSO provider: renders a "Sign in with SSO" button that navigates
+ *   to config.sso_start_url — the BACKEND's /api/auth/sso/start. The
+ *   backend is the confidential client: it builds the authorization
+ *   request, holds the transaction in a sealed cookie, exchanges the code
+ *   itself, and sends the browser back to the `#/auth/callback` hash route
+ *   with a single-use handoff code in the fragment (never a token, never
+ *   in the query). This page exchanges that code for the session token
+ *   with POST /api/auth/sso/complete. There is no browser-side PKCE, no
+ *   token endpoint in the SPA, and nothing here ever holds a client id.
  *
- * OIDC/Entra uses authorization code + S256 PKCE. On return, the callback
- * query and its single-use transaction are consumed before any decision or
- * network request. Email verification remains a separate local-auth path.
+ * The callback is captured and scrubbed from the address bar synchronously
+ * during the first render, before any effect can start network IO. Email
+ * verification remains a separate local-auth path on the query string.
  *
  * Failed sign-in attempts keep the username and clear only the
  * password (WCAG 3.3.7 Redundant Entry, elspeth-d49f8ad511); the
@@ -30,179 +37,42 @@ import { Button, Input, AlertBanner, WordMark } from "../ui";
 const LOGIN_ERROR_ID = "login-error";
 /** id linking the registration error banner to its targeted fields. */
 const REGISTER_ERROR_ID = "register-error";
-const OIDC_TRANSACTION_KEY = "oidc_transaction";
-const OIDC_TRANSACTION_VERSION = 1;
-const OIDC_TRANSACTION_MAX_AGE_MS = 5 * 60 * 1000;
-const OIDC_TRANSACTION_FUTURE_SKEW_MS = 30 * 1000;
-const CALLBACK_MAX_BYTES = 64 * 1024;
-const ACCESS_TOKEN_MAX_BYTES = 16 * 1024;
-const PKCE_VALUE = /^[A-Za-z0-9._~-]{43,128}$/;
+const VERIFY_TOKEN_MAX_BYTES = 16 * 1024;
 
-interface OidcTransaction {
-  version: 1;
-  state: string;
-  verifier: string;
-  created_at: number;
-}
-
-interface CallbackCapture {
-  kind: "oidc" | "verify";
-  params: URLSearchParams;
-  transactionJson: string | null;
-  started: boolean;
-}
+type CallbackCapture =
+  | { kind: "verify"; token: string | null; started: boolean }
+  | { kind: "sso"; outcome: SsoCallbackOutcome; started: boolean };
 
 // React StrictMode constructs the component twice. The callback must be
 // scrubbed during the first render, while the second render must receive the
-// same bounded in-memory capture rather than rereading URL/storage secrets.
+// same bounded in-memory capture rather than rereading the URL.
 let pendingCallbackCapture: CallbackCapture | null = null;
-
-function scrubCallbackUrl(): void {
-  window.history.replaceState(null, "", window.location.pathname);
-}
 
 function captureCallback(): CallbackCapture | null {
   if (pendingCallbackCapture !== null && !pendingCallbackCapture.started) {
     return pendingCallbackCapture;
   }
 
-  const rawSearch = window.location.search;
-  const oversizedCallback =
-    new TextEncoder().encode(rawSearch).byteLength > CALLBACK_MAX_BYTES;
-  const params = new URLSearchParams(
-    oversizedCallback ? "?malformed=1" : rawSearch,
-  );
-  const oidcKeys = ["code", "state", "error", "error_description", "token"];
-  const sharedInspectionRoute = window.location.hash.startsWith("#/shared/");
-  const hasOidcSignal =
-    oversizedCallback ||
-    oidcKeys.some((key) => params.has(key)) ||
-    (window.location.hash.length > 0 && !sharedInspectionRoute);
-  const verificationOnly = params.has("verify_token") && !hasOidcSignal;
-
-  if (!hasOidcSignal && !verificationOnly) return null;
-
-  if (verificationOnly) {
-    const capture: CallbackCapture = {
-      kind: "verify",
-      params,
-      transactionJson: null,
-      started: false,
-    };
-    scrubCallbackUrl();
+  const sso = captureSsoCallback();
+  if (sso !== null) {
+    const capture: CallbackCapture = { kind: "sso", outcome: sso, started: false };
     pendingCallbackCapture = capture;
     return capture;
   }
 
-  let transactionJson = sessionStorage.getItem(OIDC_TRANSACTION_KEY);
-  sessionStorage.removeItem(OIDC_TRANSACTION_KEY);
-  if (
-    transactionJson !== null &&
-    new TextEncoder().encode(transactionJson).byteLength > CALLBACK_MAX_BYTES
-  ) {
-    transactionJson = null;
-  }
-  const capture: CallbackCapture = {
-    kind: "oidc",
-    params,
-    transactionJson,
-    started: false,
-  };
-  scrubCallbackUrl();
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has("verify_token")) return null;
+  const verificationTokens = params.getAll("verify_token");
+  const token =
+    verificationTokens.length === 1 &&
+    verificationTokens[0].length > 0 &&
+    new TextEncoder().encode(verificationTokens[0]).byteLength <= VERIFY_TOKEN_MAX_BYTES
+      ? verificationTokens[0]
+      : null;
+  window.history.replaceState(null, "", window.location.pathname + window.location.hash);
+  const capture: CallbackCapture = { kind: "verify", token, started: false };
   pendingCallbackCapture = capture;
   return capture;
-}
-
-function parseOidcTransaction(raw: string | null, now: number): OidcTransaction | null {
-  if (raw === null) return null;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-    const record = parsed as Record<string, unknown>;
-    if (
-      Object.keys(record).sort().join(",") !== "created_at,state,verifier,version" ||
-      record.version !== OIDC_TRANSACTION_VERSION ||
-      typeof record.state !== "string" ||
-      !/^[A-Za-z0-9._~-]{8,256}$/.test(record.state) ||
-      typeof record.verifier !== "string" ||
-      !PKCE_VALUE.test(record.verifier) ||
-      typeof record.created_at !== "number" ||
-      !Number.isSafeInteger(record.created_at) ||
-      now - record.created_at > OIDC_TRANSACTION_MAX_AGE_MS ||
-      record.created_at - now > OIDC_TRANSACTION_FUTURE_SKEW_MS
-    ) {
-      return null;
-    }
-    return record as unknown as OidcTransaction;
-  } catch {
-    return null;
-  }
-}
-
-function randomBase64Url(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function pkceChallenge(verifier: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  let binary = "";
-  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function readBoundedTokenResponse(response: Response): Promise<string> {
-  if (!response.ok || response.redirected || response.type === "opaqueredirect") {
-    throw new Error("token response failed status check");
-  }
-  const contentType = response.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
-  if (contentType !== "application/json") {
-    throw new Error("token response failed media-type check");
-  }
-  const contentLength = response.headers.get("Content-Length");
-  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > CALLBACK_MAX_BYTES) {
-    throw new Error("token response failed size check");
-  }
-
-  const reader = response.body?.getReader();
-  if (reader === undefined) throw new Error("token response failed body check");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value !== undefined) {
-      total += value.byteLength;
-      if (total > CALLBACK_MAX_BYTES) {
-        await reader.cancel();
-        throw new Error("token response failed size check");
-      }
-      chunks.push(value);
-    }
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  const decoded: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
-    throw new Error("token response failed shape check");
-  }
-  const token = decoded as Record<string, unknown>;
-  if (
-    typeof token.token_type !== "string" ||
-    token.token_type.toLowerCase() !== "bearer" ||
-    typeof token.access_token !== "string" ||
-    token.access_token.trim().length === 0 ||
-    new TextEncoder().encode(token.access_token).byteLength > ACCESS_TOKEN_MAX_BYTES
-  ) {
-    throw new Error("token response failed bearer-token check");
-  }
-  return token.access_token;
 }
 
 /** Which registration fields the current registration error is about. */
@@ -230,7 +100,6 @@ export function LoginPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [configLoading, setConfigLoading] = useState(true);
-  const [configFailed, setConfigFailed] = useState(false);
   const [view, setView] = useState<"signin" | "register">("signin");
   const [registerError, setRegisterError] = useState<string | null>(null);
   const [registerNotice, setRegisterNotice] = useState<string | null>(null);
@@ -255,101 +124,53 @@ export function LoginPage() {
         setAuthConfig({
           provider: "local",
           registration_mode: "closed",
-          oidc_issuer: null,
-          oidc_client_id: null,
-          authorization_endpoint: null,
-          token_endpoint: null,
+          sso_start_url: null,
         });
-        setConfigFailed(true);
         setConfigLoading(false);
       });
   }, []);
 
   // Process the already-consumed callback. The capture happens synchronously
   // during render, before this or the config-fetch effect can start network IO.
+  // Neither branch waits for the auth config: the handoff code is complete in
+  // itself, and the backend refuses it on its own authority.
   useEffect(() => {
     if (callbackCapture === null || callbackCapture.started) return;
-
-    if (callbackCapture.kind === "verify") {
-      callbackCapture.started = true;
-      const verificationTokens = callbackCapture.params.getAll("verify_token");
-      const verificationToken = verificationTokens.length === 1 ? verificationTokens[0] : "";
-      pendingCallbackCapture = null;
-      if (
-        !verificationToken ||
-        new TextEncoder().encode(verificationToken).byteLength > ACCESS_TOKEN_MAX_BYTES
-      ) {
-        setVerificationError("Email verification failed. Please request a new link.");
-        return;
-      }
-      api
-        .verifyEmail(verificationToken)
-        .then(({ access_token }) => loginWithToken(access_token))
-        .catch(() => {
-          setVerificationError(
-            "Email verification failed. Please request a new link.",
-          );
-        });
-      return;
-    }
-
-    if (configLoading) return;
     callbackCapture.started = true;
-    const fail = () => setVerificationError("Single sign-on failed. Please try again.");
     const finish = () => {
       pendingCallbackCapture = null;
     };
 
-    const codeValues = callbackCapture.params.getAll("code");
-    const stateValues = callbackCapture.params.getAll("state");
-    const errorValues = callbackCapture.params.getAll("error");
-    const descriptionValues = callbackCapture.params.getAll("error_description");
-    const transaction = parseOidcTransaction(callbackCapture.transactionJson, Date.now());
-    const callbackValid =
-      !configFailed &&
-      authConfig !== null &&
-      (authConfig.provider === "oidc" || authConfig.provider === "entra") &&
-      typeof authConfig.token_endpoint === "string" &&
-      typeof authConfig.oidc_client_id === "string" &&
-      codeValues.length === 1 &&
-      stateValues.length === 1 &&
-      errorValues.length === 0 &&
-      descriptionValues.length === 0 &&
-      !callbackCapture.params.has("token") &&
-      !callbackCapture.params.has("verify_token") &&
-      transaction !== null &&
-      codeValues[0].length > 0 &&
-      new TextEncoder().encode(codeValues[0]).byteLength <= ACCESS_TOKEN_MAX_BYTES &&
-      stateValues[0] === transaction.state;
-
-    if (!callbackValid || transaction === null || authConfig?.token_endpoint == null || authConfig.oidc_client_id == null) {
-      fail();
-      finish();
+    if (callbackCapture.kind === "verify") {
+      if (callbackCapture.token === null) {
+        setVerificationError("Email verification failed. Please request a new link.");
+        finish();
+        return;
+      }
+      api
+        .verifyEmail(callbackCapture.token)
+        .then(({ access_token }) => loginWithToken(access_token))
+        .catch(() => {
+          setVerificationError("Email verification failed. Please request a new link.");
+        })
+        .finally(finish);
       return;
     }
 
-    const redirectUri = new URL(window.location.pathname, window.location.origin).toString();
-    const form = new URLSearchParams();
-    form.set("grant_type", "authorization_code");
-    form.set("code", codeValues[0]);
-    form.set("client_id", authConfig.oidc_client_id);
-    form.set("redirect_uri", redirectUri);
-    form.set("code_verifier", transaction.verifier);
-
-    void fetch(authConfig.token_endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form,
-      credentials: "omit",
-      redirect: "error",
-      cache: "no-store",
-      referrerPolicy: "no-referrer",
-    })
-      .then(readBoundedTokenResponse)
-      .then((accessToken) => loginWithToken(accessToken))
-      .catch(fail)
+    const { outcome } = callbackCapture;
+    if (outcome.kind !== "code") {
+      setVerificationError(ssoFailureMessage(outcome));
+      finish();
+      return;
+    }
+    api
+      .completeSsoLogin(outcome.code)
+      .then(({ access_token }) => loginWithToken(access_token))
+      .catch(() => {
+        setVerificationError("Single sign-on failed. Please try again.");
+      })
       .finally(finish);
-  }, [authConfig, callbackCapture, configFailed, configLoading, loginWithToken]);
+  }, [callbackCapture, loginWithToken]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -449,39 +270,15 @@ export function LoginPage() {
     setRegisterErrorTargets(NO_REGISTER_TARGETS);
   }
 
-  async function handleSsoRedirect() {
-    if (!authConfig?.authorization_endpoint || !authConfig?.token_endpoint || !authConfig?.oidc_client_id) return;
-
-    try {
-      const state = randomBase64Url();
-      const verifier = randomBase64Url();
-      const challenge = await pkceChallenge(verifier);
-      const transaction: OidcTransaction = {
-        version: OIDC_TRANSACTION_VERSION,
-        state,
-        verifier,
-        created_at: Date.now(),
-      };
-      sessionStorage.setItem(OIDC_TRANSACTION_KEY, JSON.stringify(transaction));
-
-      const redirectUri = new URL(window.location.pathname, window.location.origin).toString();
-      const url = new URL(authConfig.authorization_endpoint);
-      url.searchParams.set("client_id", authConfig.oidc_client_id);
-      url.searchParams.set("response_type", "code");
-      url.searchParams.set("redirect_uri", redirectUri);
-      url.searchParams.set("scope", "openid profile email");
-      url.searchParams.set("state", state);
-      url.searchParams.set("code_challenge", challenge);
-      url.searchParams.set("code_challenge_method", "S256");
-
-      const anchor = document.createElement("a");
-      anchor.href = url.toString();
-      anchor.rel = "noreferrer";
-      anchor.click();
-    } catch {
-      sessionStorage.removeItem(OIDC_TRANSACTION_KEY);
-      setVerificationError("Single sign-on failed. Please try again.");
-    }
+  function handleSsoRedirect() {
+    if (authConfig?.sso_start_url == null) return;
+    // A real navigation, not fetch: the backend answers with a 302 to the
+    // IdP and sets the transaction cookie on the way. rel=noreferrer keeps
+    // this page's URL out of the IdP's logs.
+    const anchor = document.createElement("a");
+    anchor.href = authConfig.sso_start_url;
+    anchor.rel = "noreferrer";
+    anchor.click();
   }
 
   if (configLoading) {
@@ -507,8 +304,11 @@ export function LoginPage() {
     );
   }
 
-  const isOidc =
-    authConfig?.provider === "oidc" || authConfig?.provider === "entra";
+  // Any provider that is not local signs in through the backend's SSO walk.
+  const isSso = authConfig !== null && authConfig.provider !== "local";
+  // Wired means the backend published a start URL; the same condition that
+  // makes its /sso/* routes refuse hides the button, rather than a guess.
+  const ssoWired = isSso && authConfig.sso_start_url !== null;
   // Registration is a local-auth capability; email_verified creates a
   // pending account and completes via the emailed verification link.
   const registrationAvailable =
@@ -581,21 +381,26 @@ export function LoginPage() {
           </p>
         </div>
 
-        {isOidc ? (
+        {isSso ? (
           <>
             {loginError && <AlertBanner tone="error">{loginError}</AlertBanner>}
             {verificationError && (
               <AlertBanner tone="error">{verificationError}</AlertBanner>
             )}
-            {/* OIDC / Entra SSO: single "Sign in with SSO" button */}
-            <Button
-              variant="primary"
-              type="button"
-              onClick={handleSsoRedirect}
-              aria-label="Sign in with single sign-on"
-            >
-              Sign in with SSO
-            </Button>
+            {ssoWired ? (
+              <Button
+                variant="primary"
+                type="button"
+                onClick={handleSsoRedirect}
+                aria-label="Sign in with single sign-on"
+              >
+                Sign in with SSO
+              </Button>
+            ) : (
+              <AlertBanner tone="error">
+                Single sign-on is not configured on this deployment.
+              </AlertBanner>
+            )}
           </>
         ) : showRegister ? (
           /* Local auth: registration form */

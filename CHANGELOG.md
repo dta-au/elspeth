@@ -295,6 +295,24 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   trust domain), 033 (deferred-intent admission contract), 036 (Textract
   profile-bound bucket), 037 (interpretation caps govern LLM churn only), and
   038 (non-terminal ABANDONED path).
+- **Pluggable single sign-on and one identity substrate** (elspeth-07cd19ba73,
+  design in `docs/specs/2026-09-02-pluggable-sso-design.md`) — the web service
+  exchanges the authorization code itself as a confidential client, hands the
+  browser a single-use code in the URL fragment, and resolves every login,
+  local or SSO, to one `identities` row that carries admission and quota.
+  Token validation has one decode path: the accepted signature algorithms are
+  fixed at construction from the identity-provider profile, and the header-
+  driven bearer decoder is removed (elspeth-e8a9973c37). Bearer tokens
+  presented by the legacy `oidc` and `entra` providers are therefore held to
+  the same envelope as an ID token — `exp`, `iat`, `iss`, `sub` and `aud` are
+  all required, with a 60-second clock-skew allowance — so a provider that
+  omits `iat` or `sub` from its access tokens is refused where it was accepted
+  before. The Cognito access-token mode (`oidc_audience_claim="client_id"`)
+  is removed and refused at startup; Cognito registers as a confidential
+  client through the SSO profile. Deleting a local account from the CLI now
+  retires its identity exactly as the web service does, so a re-created
+  username starts with a fresh identity rather than inheriting the old one's
+  admission and quota.
 
 ### Critical fixes
 

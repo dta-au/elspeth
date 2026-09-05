@@ -17,10 +17,14 @@ vi.mock("../../api/client", () => ({
   login: vi.fn(),
   register: vi.fn(),
   verifyEmail: vi.fn(),
+  completeSsoLogin: vi.fn(),
   fetchCurrentUser: vi.fn(),
   fetchUserComposerPreferences: vi.fn(),
   updateUserComposerPreferences: vi.fn(),
 }));
+
+const SSO_START_URL = "https://elspeth.example.gov.au/api/auth/sso/start";
+const HANDOFF_CODE = "H".repeat(43);
 
 function localConfig(
   mode: AuthConfig["registration_mode"] = "open",
@@ -28,44 +32,30 @@ function localConfig(
   return {
     provider: "local",
     registration_mode: mode,
-    oidc_issuer: null,
-    oidc_client_id: null,
-    authorization_endpoint: null,
-    token_endpoint: null,
+    sso_start_url: null,
   };
 }
 
-function oidcConfig(): AuthConfig {
+function ssoConfig(
+  provider: Exclude<AuthConfig["provider"], "local"> = "oidc",
+  ssoStartUrl: string | null = SSO_START_URL,
+): AuthConfig {
   return {
-    provider: "oidc",
+    provider,
     registration_mode: "closed",
-    oidc_issuer: "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-    oidc_client_id: "public-client-id",
-    authorization_endpoint:
-      "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
-    token_endpoint:
-      "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
+    sso_start_url: ssoStartUrl,
   };
 }
 
-function setOidcTransaction(overrides: Record<string, unknown> = {}) {
-  sessionStorage.setItem(
-    "oidc_transaction",
-    JSON.stringify({
-      version: 1,
-      state: "callback-state",
-      verifier: "v".repeat(64),
-      created_at: Date.now(),
-      ...overrides,
-    }),
-  );
-}
-
-function jsonResponse(body: object): Response {
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+function signedInUser() {
+  return {
+    user_id: "sso-user",
+    username: "sso-user",
+    display_name: null,
+    email: null,
+    groups: [],
+    dev_admin: false,
+  };
 }
 
 async function failOneSignIn(user: ReturnType<typeof userEvent.setup>) {
@@ -109,206 +99,127 @@ describe("LoginPage", () => {
     );
   });
 
-  describe("OIDC authorization code with PKCE", () => {
-    it("uses one single-use PKCE transaction and an authorization-code request", async () => {
-      vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
-      let navigatedTo = "";
-      const click = vi
-        .spyOn(HTMLAnchorElement.prototype, "click")
-        .mockImplementation(function (this: HTMLAnchorElement) {
-          navigatedTo = this.href;
-        });
-      const user = userEvent.setup();
-      render(<LoginPage />);
-
-      await user.click(await screen.findByRole("button", { name: /single sign-on/i }));
-
-      expect(click).toHaveBeenCalledTimes(1);
-      const request = new URL(navigatedTo);
-      const transaction = JSON.parse(sessionStorage.getItem("oidc_transaction") ?? "null");
-      expect(request.origin + request.pathname).toBe(oidcConfig().authorization_endpoint);
-      expect(request.searchParams.get("response_type")).toBe("code");
-      expect(request.searchParams.get("client_id")).toBe("public-client-id");
-      expect(request.searchParams.get("state")).toBe(transaction.state);
-      expect(request.searchParams.get("code_challenge_method")).toBe("S256");
-      expect(request.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-      const digest = await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(transaction.verifier),
-      );
-      let encoded = "";
-      for (const byte of new Uint8Array(digest)) encoded += String.fromCharCode(byte);
-      const expectedChallenge = btoa(encoded)
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/, "");
-      expect(request.searchParams.get("code_challenge")).toBe(expectedChallenge);
-      expect(request.searchParams.has("nonce")).toBe(false);
-      expect(request.searchParams.has("client_secret")).toBe(false);
-      expect(request.searchParams.has("code_verifier")).toBe(false);
-      expect(transaction).toEqual({
-        version: 1,
-        state: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
-        verifier: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
-        created_at: expect.any(Number),
-      });
-    });
-
-    it.each(["Bearer", "bearer", "BEARER", "BeArEr"])(
-      "scrubs and exchanges a matching callback exactly once in StrictMode for token type %s",
-      async (tokenType) => {
-        window.history.replaceState(null, "", "/?code=short-code&state=callback-state#old");
-        setOidcTransaction();
-        vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
-        vi.mocked(api.fetchCurrentUser).mockResolvedValue({
-          user_id: "oidc-user",
-          username: "oidc-user",
-          display_name: null,
-          email: null,
-          groups: [],
-          dev_admin: false,
-        });
-        vi.mocked(fetch).mockResolvedValue(
-          new Response(JSON.stringify({ token_type: tokenType, access_token: "access-token" }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }),
-        );
-
-        render(
-          <StrictMode>
-            <LoginPage />
-          </StrictMode>,
-        );
-
-        expect(window.location.search).toBe("");
-        expect(window.location.hash).toBe("");
-        expect(sessionStorage.getItem("oidc_transaction")).toBeNull();
-        await waitFor(() => expect(useAuthStore.getState().token).toBe("access-token"));
-        expect(fetch).toHaveBeenCalledTimes(1);
-        const [endpoint, options] = vi.mocked(fetch).mock.calls[0];
-        expect(endpoint).toBe(oidcConfig().token_endpoint);
-        expect(options).toMatchObject({
-          method: "POST",
-          credentials: "omit",
-          redirect: "error",
-          cache: "no-store",
-          referrerPolicy: "no-referrer",
-        });
-        const form = new URLSearchParams(String(options?.body));
-        expect(Object.fromEntries(form)).toEqual({
-          grant_type: "authorization_code",
-          code: "short-code",
-          client_id: "public-client-id",
-          redirect_uri: window.location.origin + "/",
-          code_verifier: "v".repeat(64),
-        });
-        expect(localStorage.getItem("auth_token")).toBe("access-token");
-        expect(localStorage.getItem("refresh_token")).toBeNull();
-      },
-    );
-
-    it.each([
-      ["mismatched state", { state: "different" }, "/?code=code&state=callback-state"],
-      ["missing state", {}, "/?code=code"],
-      ["missing code", {}, "/?state=callback-state"],
-      ["duplicate code", {}, "/?code=one&code=two&state=callback-state"],
-      ["mixed error", {}, "/?code=code&state=callback-state&error=denied&error_description=secret"],
-      ["expired transaction", { created_at: Date.now() - 300_001 }, "/?code=code&state=callback-state"],
-      ["future transaction", { created_at: Date.now() + 60_000 }, "/?code=code&state=callback-state"],
-      ["malformed verifier", { verifier: "short" }, "/?code=code&state=callback-state"],
-      ["tampered metadata", { token_endpoint: "https://evil.example/token" }, "/?code=code&state=callback-state"],
-    ])("fails closed for %s after synchronous cleanup", async (_name, overrides, url) => {
-      window.history.replaceState(null, "", url);
-      setOidcTransaction(overrides);
-      vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
-
-      render(<LoginPage />);
-
-      expect(window.location.search).toBe("");
-      expect(sessionStorage.getItem("oidc_transaction")).toBeNull();
-      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
-      expect(fetch).not.toHaveBeenCalled();
-      expect(useAuthStore.getState().token).toBeNull();
-      expect(screen.getByRole("alert")).not.toHaveTextContent(/secret|evil|code|callback-state/);
-    });
-
-    it.each([
-      ["redirected", new Response("", { status: 200 }), { redirected: true }],
-      ["non-2xx", new Response("provider secret", { status: 400 }), {}],
-      ["malformed JSON", new Response("not json", { status: 200 }), {}],
-      ["wrong token type", jsonResponse({ token_type: "Basic", access_token: "secret" }), {}],
-      ["blank access token", jsonResponse({ token_type: "Bearer", access_token: " " }), {}],
-      [
-        "oversized access token",
-        jsonResponse({ token_type: "Bearer", access_token: "x".repeat(16_385) }),
-        {},
-      ],
-      ["oversized response", new Response("x".repeat(65_537), { status: 200 }), {}],
-    ])("rejects a %s token response without adopting secrets", async (_name, response, responseOverrides) => {
-      Object.defineProperties(response, {
-        ...Object.fromEntries(
-          Object.entries(responseOverrides).map(([key, value]) => [key, { value }]),
-        ),
-      });
-      window.history.replaceState(null, "", "/?code=short-code&state=callback-state");
-      setOidcTransaction();
-      vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
-      vi.mocked(fetch).mockResolvedValue(response);
-
-      render(<LoginPage />);
-
-      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
-      expect(useAuthStore.getState().token).toBeNull();
-      expect(screen.getByRole("alert")).not.toHaveTextContent(/provider secret|short-code|access-token/);
-    });
-
-    it("fails closed on a token endpoint network error", async () => {
-      window.history.replaceState(null, "", "/?code=short-code&state=callback-state");
-      setOidcTransaction();
-      vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
-      vi.mocked(fetch).mockRejectedValue(new Error("network credential"));
-      render(<LoginPage />);
-      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
-      expect(screen.getByRole("alert")).not.toHaveTextContent("credential");
-      expect(useAuthStore.getState().token).toBeNull();
-    });
-
-    it.each([null, "not-json", JSON.stringify({ version: 1 })])(
-      "rejects a missing or malformed transaction",
-      async (transaction) => {
-        window.history.replaceState(null, "", "/?code=short-code&state=callback-state");
-        if (transaction !== null) sessionStorage.setItem("oidc_transaction", transaction);
-        vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
+  describe("SSO handoff", () => {
+    it.each(["oidc", "entra", "vanguard", "google"] as const)(
+      "sends the browser to the backend's start URL for %s, with nothing of the IdP in the page",
+      async (provider) => {
+        vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig(provider));
+        let navigatedTo = "";
+        const click = vi
+          .spyOn(HTMLAnchorElement.prototype, "click")
+          .mockImplementation(function (this: HTMLAnchorElement) {
+            navigatedTo = this.href;
+          });
+        const user = userEvent.setup();
         render(<LoginPage />);
-        expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
+
+        await user.click(await screen.findByRole("button", { name: /single sign-on/i }));
+
+        expect(click).toHaveBeenCalledTimes(1);
+        expect(navigatedTo).toBe(SSO_START_URL);
+        // No browser-side transaction: the backend holds it in a sealed cookie.
+        expect(sessionStorage.length).toBe(0);
         expect(fetch).not.toHaveBeenCalled();
+        expect(screen.queryByLabelText("Username")).toBeNull();
       },
     );
 
-    it("does not exchange when fresh auth configuration fails", async () => {
-      window.history.replaceState(null, "", "/?code=short-code&state=callback-state");
-      setOidcTransaction();
-      vi.mocked(api.fetchAuthConfig).mockRejectedValue(new Error("config secret"));
+    it("shows that SSO is not configured instead of a button when the backend publishes no start URL", async () => {
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig("oidc", null));
       render(<LoginPage />);
-      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
+      expect(await screen.findByRole("alert")).toHaveTextContent("not configured");
+      expect(screen.queryByRole("button", { name: /single sign-on/i })).toBeNull();
+      expect(screen.queryByLabelText("Username")).toBeNull();
+    });
+
+    it("scrubs the fragment before any network call and exchanges the code exactly once in StrictMode", async () => {
+      window.history.replaceState(null, "", `/#/auth/callback?code=${HANDOFF_CODE}`);
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig());
+      vi.mocked(api.fetchCurrentUser).mockResolvedValue(signedInUser());
+      let hashWhenCompleteWasCalled: string | null = null;
+      vi.mocked(api.completeSsoLogin).mockImplementation(async () => {
+        hashWhenCompleteWasCalled = window.location.hash;
+        return { access_token: "session-token", token_type: "bearer" };
+      });
+
+      render(
+        <StrictMode>
+          <LoginPage />
+        </StrictMode>,
+      );
+
+      expect(window.location.hash).toBe("");
+      await waitFor(() => expect(useAuthStore.getState().token).toBe("session-token"));
+      expect(api.completeSsoLogin).toHaveBeenCalledTimes(1);
+      expect(api.completeSsoLogin).toHaveBeenCalledWith(HANDOFF_CODE);
+      expect(hashWhenCompleteWasCalled).toBe("");
+      expect(localStorage.getItem("auth_token")).toBe("session-token");
       expect(fetch).not.toHaveBeenCalled();
     });
 
-    it("removes legacy token URLs without adopting them", async () => {
-      window.history.replaceState(null, "", "/?token=legacy-secret&state=callback-state#access_token=fragment-secret");
-      setOidcTransaction();
-      vi.mocked(api.fetchAuthConfig).mockResolvedValue(oidcConfig());
+    it("does not wait for the auth config to exchange the code", async () => {
+      window.history.replaceState(null, "", `/#/auth/callback?code=${HANDOFF_CODE}`);
+      // fetchAuthConfig never resolves (the beforeEach default).
+      vi.mocked(api.fetchCurrentUser).mockResolvedValue(signedInUser());
+      vi.mocked(api.completeSsoLogin).mockResolvedValue({ access_token: "session-token" });
       render(<LoginPage />);
-      expect(window.location.search).toBe("");
+      await waitFor(() => expect(useAuthStore.getState().token).toBe("session-token"));
+    });
+
+    it.each([
+      ["sso_access_pending", /awaiting approval/],
+      ["sso_identity_disabled", /disabled/],
+      ["provider_unavailable", /unavailable/],
+      ["sso_state_mismatch", /Single sign-on failed/],
+    ])("shows the sentence for a refused callback (%s) without exchanging anything", async (category, expected) => {
+      window.history.replaceState(null, "", `/#/auth/callback?error=${category}`);
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig());
+      render(<LoginPage />);
       expect(window.location.hash).toBe("");
+      expect(await screen.findByRole("alert")).toHaveTextContent(expected);
+      expect(api.completeSsoLogin).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().token).toBeNull();
+    });
+
+    it.each([
+      ["an unknown category", "/#/auth/callback?error=access_denied&error_description=secret"],
+      ["a token in the fragment", "/#/auth/callback?access_token=fragment-secret"],
+      ["a duplicated code", `/#/auth/callback?code=${HANDOFF_CODE}&code=other`],
+      ["a code with a state riding along", `/#/auth/callback?code=${HANDOFF_CODE}&state=x`],
+    ])("fails closed on %s after scrubbing, echoing nothing", async (_name, url) => {
+      window.history.replaceState(null, "", url);
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig());
+      render(<LoginPage />);
+      expect(window.location.hash).toBe("");
+      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
+      expect(screen.getByRole("alert")).not.toHaveTextContent(/secret|access_denied|other/);
+      expect(api.completeSsoLogin).not.toHaveBeenCalled();
+      expect(useAuthStore.getState().token).toBeNull();
+    });
+
+    it("fails closed when the backend refuses the handoff, keeping the page signed out", async () => {
+      window.history.replaceState(null, "", `/#/auth/callback?code=${HANDOFF_CODE}`);
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig());
+      vi.mocked(api.completeSsoLogin).mockRejectedValue({ status: 401, detail: "handoff refused" });
+      render(<LoginPage />);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Single sign-on failed");
+      expect(screen.getByRole("alert")).not.toHaveTextContent(/handoff refused|H{10}/);
+      expect(useAuthStore.getState().token).toBeNull();
+      expect(localStorage.getItem("auth_token")).toBeNull();
+    });
+
+    it("leaves a legacy query-string callback alone: nothing on the query is a credential here", async () => {
+      window.history.replaceState(null, "", "/?code=legacy&state=legacy&token=legacy-secret");
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(ssoConfig());
+      render(<LoginPage />);
+      await screen.findByRole("button", { name: /single sign-on/i });
+      expect(api.completeSsoLogin).not.toHaveBeenCalled();
       expect(fetch).not.toHaveBeenCalled();
       expect(useAuthStore.getState().token).toBeNull();
     });
 
     it("keeps verify_token on the separate email-verification path", async () => {
       window.history.replaceState(null, "", "/?verify_token=email-token");
-      sessionStorage.setItem("oidc_transaction", "unrelated");
       vi.mocked(api.fetchAuthConfig).mockResolvedValue(localConfig("email_verified"));
       vi.mocked(api.verifyEmail).mockResolvedValue({ access_token: "verified-token" });
       vi.mocked(api.fetchCurrentUser).mockResolvedValue({
@@ -320,8 +231,9 @@ describe("LoginPage", () => {
         dev_admin: false,
       });
       render(<LoginPage />);
+      expect(window.location.search).toBe("");
       await waitFor(() => expect(api.verifyEmail).toHaveBeenCalledWith("email-token"));
-      expect(sessionStorage.getItem("oidc_transaction")).toBe("unrelated");
+      expect(api.completeSsoLogin).not.toHaveBeenCalled();
     });
   });
 
