@@ -88,11 +88,17 @@ def test_state_import_owns_one_compose_lease_and_threads_its_context() -> None:
 
 
 def test_yaml_export_owns_one_blob_read_lease_and_threads_its_context() -> None:
+    # The export route records a composer-completion event (record_yaml_export),
+    # whose facet requires COMPOSE authority (A-3, elspeth-bf52d495a2): the
+    # route takes one exclusive COMPOSE lease and answers 409 while another
+    # compose is live. The name is kept: the test still pins that exactly one
+    # lease is acquired and threaded, only the kind moved from the shareable
+    # read admission to the writer kind.
     tree = ast.parse(inspect.getsource(state_routes))
     endpoint = _function(tree, "get_state_yaml")
     _assert_exact_route_lease(
         endpoint,
-        operation_kind="BLOB_READ",
+        operation_kind="COMPOSE",
         helper_name="_verified_yaml_export_blob_ids",
     )
 
