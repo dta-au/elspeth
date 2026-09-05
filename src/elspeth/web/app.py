@@ -64,9 +64,10 @@ from elspeth.web.auth.routes import create_auth_router
 from elspeth.web.auth.session_token import (
     DEFAULT_MAX_REFRESH_CHAIN_HOURS,
     DEFAULT_TOKEN_EXPIRY_HOURS,
-    LOCAL_AUDIENCE,
     SessionTokenIssuer,
+    session_token_audience,
 )
+from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
 from elspeth.web.auth.urls import (
     oidc_browser_endpoint_origin,
     validate_oidc_browser_endpoints,
@@ -154,6 +155,7 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry, build_sessions_te
 from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 from elspeth.web.shareable_reviews.service import ShareableReviewService
 from elspeth.web.shareable_reviews.signer import ShareTokenSigner
+from elspeth.web.sso_wiring import SsoWiring, build_sso_wiring, resolve_sso_runtime, sso_missing_settings
 
 if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
@@ -230,7 +232,6 @@ def _validate_browser_endpoint_discovery_document(
     discovery: object,
     *,
     issuer: str,
-    allowed_origins: tuple[str, ...] = (),
 ) -> tuple[str, str]:
     """Validate discovery issuer and return its exact browser endpoint pair."""
     try:
@@ -243,7 +244,6 @@ def _validate_browser_endpoint_discovery_document(
         document.authorization_endpoint,
         document.token_endpoint,
         issuer=issuer,
-        allowed_origins=allowed_origins,
     )
 
 
@@ -556,8 +556,25 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             attributes={"source": "startup", "excluded_live_runs": 0},
         )
 
+    # An SSO deployment resolves its IdP endpoints (break-glass override or
+    # discovery) and binds the runtime the three /api/auth/sso routes read.
+    # Discovery is a hard IdP dependency at startup, which is why the
+    # override exists: the moment rollback is forbidden is the moment an IdP
+    # outage must not stop the service from booting.
+    sso_wiring: SsoWiring | None = app.state.sso_wiring
+    if sso_wiring is not None:
+        try:
+            app.state.sso = await resolve_sso_runtime(sso_wiring, settings)
+        except SsoDiscoveryFailed as exc:
+            raise SystemExit(
+                f"FATAL: SSO discovery failed ({type(exc).__name__}). "
+                "Configure the sso_authorization_endpoint/sso_token_endpoint/sso_jwks_uri override or fix discovery."
+            ) from None
+
     # Resolve the paired browser endpoints from discovery or explicit config.
-    if settings.auth_provider in ("oidc", "entra"):
+    # LEGACY browser-client path: served only while an oidc/entra deployment
+    # is NOT wired for SSO (identity sprint step E deletes it).
+    if settings.auth_provider in ("oidc", "entra") and sso_wiring is None:
         if settings.oidc_issuer:
             issuer = validate_oidc_issuer(settings.oidc_issuer)
         elif settings.auth_provider == "entra" and settings.entra_tenant_id:
@@ -570,7 +587,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.oidc_authorization_endpoint,
                 settings.oidc_token_endpoint,
                 issuer=issuer,
-                allowed_origins=settings.oidc_authorization_allowed_origins,
             )
             app.state.oidc_authorization_endpoint = authorization_endpoint
             app.state.oidc_token_endpoint = token_endpoint
@@ -583,7 +599,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                     authorization_endpoint, token_endpoint = _validate_browser_endpoint_discovery_document(
                         resp.json(),
                         issuer=issuer,
-                        allowed_origins=settings.oidc_authorization_allowed_origins,
                     )
                     app.state.oidc_authorization_endpoint = authorization_endpoint
                     app.state.oidc_token_endpoint = token_endpoint
@@ -999,18 +1014,8 @@ def _configure_web_logging(settings: WebSettings) -> None:
 
 
 def _session_token_audience(settings: WebSettings) -> str:
-    """Bind tokens to THIS deployment.
-
-    Without an audience, two deployments configured from the same
-    ``secret_key`` -- a staging clone of production, most obviously -- would
-    each accept the other's tokens. ``LOCAL_AUDIENCE`` is the fallback for a
-    deployment with no public URL, where there is no second deployment to be
-    confused with.
-    """
-    public_base_url = settings.public_base_url
-    if public_base_url is None or not public_base_url.strip():
-        return LOCAL_AUDIENCE
-    return public_base_url.strip()
+    """The audience rule lives with the issuer; every builder reads it from there."""
+    return session_token_audience(settings.public_base_url)
 
 
 def _build_local_auth_provider(
@@ -1482,26 +1487,40 @@ def _create_app(
     # provider needs the identities substrate to mint a token at all -- ``sub``
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
+    if settings.auth_provider == "oidc" and settings.oidc_audience_claim != "aud":
+        # The Cognito access-token decode branch is deleted (spec §ID-token
+        # validation); a deployment still configured for it must hear that at
+        # boot, not as every login failing its audience check. The setting
+        # itself goes with the rest of ``oidc_*`` in identity sprint step E.
+        raise RuntimeError(
+            "oidc_audience_claim='client_id' (Cognito access-token mode) is no longer supported: "
+            "register Cognito as a confidential client through the SSO profile."
+        )
+    # Wired for SSO when the active profile has every setting it requires
+    # (the same rule readiness reports on). ``None`` means the legacy bearer
+    # path below serves an oidc/entra deployment, and the /api/auth/sso
+    # routes refuse — one fact, read by both.
+    sso_wiring = build_sso_wiring(
+        settings,
+        session_engine=session_engine,
+        identity_authority=identity_authority,
+        resolved_state_mode=resolved_state_mode,
+    )
+    app.state.sso_wiring = sso_wiring
     if settings.auth_provider == "local":
         local_provider = _build_local_auth_provider(settings, identity_authority, resolved_state_mode=resolved_state_mode)
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
+    elif sso_wiring is not None:
+        # Every bearer after ``complete`` is an ELSPETH session token; the
+        # IdP's tokens never leave the backend (spec D2).
+        auth_provider = SsoAuthProvider(issuer=sso_wiring.token_issuer, read_identity=sso_wiring.read_identity)
     elif settings.auth_provider == "oidc":
         from elspeth.web.auth.oidc import OIDCAuthProvider
 
         # Validator _validate_auth_fields guarantees non-None
         assert settings.oidc_issuer is not None
         assert settings.oidc_audience is not None
-        if settings.oidc_audience_claim != "aud":
-            # The Cognito access-token decode branch is deleted (spec
-            # §ID-token validation); a deployment still configured for it
-            # must hear that at boot, not as every login failing its
-            # audience check. The setting itself goes with the rest of
-            # ``oidc_*`` in identity sprint step E.
-            raise RuntimeError(
-                "oidc_audience_claim='client_id' (Cognito access-token mode) is no longer supported: "
-                "register Cognito as a confidential client through the SSO profile."
-            )
         auth_provider = OIDCAuthProvider(
             issuer=settings.oidc_issuer,
             audience=settings.oidc_audience,
@@ -1522,7 +1541,10 @@ def _create_app(
             jwks_max_stale_seconds=settings.jwks_max_stale_seconds,
         )
     else:
-        raise RuntimeError(f"Unsupported auth provider: {settings.auth_provider}")
+        # A registered profile with no legacy bearer path and an incomplete
+        # SSO configuration cannot serve anyone; readiness names the same
+        # fields, this names them before the first request.
+        raise RuntimeError(f"{settings.auth_provider} is not wired for single sign-on: missing {', '.join(sso_missing_settings(settings))}")
     app.state.auth_provider = auth_provider
     app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
     app.state.oidc_authorization_endpoint = settings.oidc_authorization_endpoint

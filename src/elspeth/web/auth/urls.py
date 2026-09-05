@@ -136,19 +136,6 @@ def _parse_browser_endpoint(raw_value: str, *, field_name: str) -> tuple[str, _O
     return value, origin
 
 
-def validate_oidc_browser_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
-    """Validate and canonicalize a closed set of exact HTTPS origins."""
-    normalized: list[str] = []
-    seen: set[_Origin] = set()
-    for raw_origin in origins:
-        value, origin = _parse_bare_origin(raw_origin, field_name="OIDC browser allowed origin")
-        if origin in seen:
-            raise ValueError("OIDC browser allowed origin failed duplicate check")
-        seen.add(origin)
-        normalized.append(value)
-    return tuple(normalized)
-
-
 def _canonical_origin(origin: _Origin) -> str:
     host = f"[{origin.host}]" if ":" in origin.host else origin.host
     port = "" if origin.port == _HTTPS_DEFAULT_PORT else f":{origin.port}"
@@ -183,9 +170,15 @@ def validate_oidc_browser_endpoints(
     token_endpoint: str,
     *,
     issuer: str,
-    allowed_origins: tuple[str, ...] = (),
 ) -> tuple[str, str]:
-    """Return a validated authorization/token pair bound to one exact origin."""
+    """Return a validated authorization/token pair on the issuer's exact origin.
+
+    Legacy browser-client path only (deleted with it in identity sprint step
+    E). The per-deployment origin allowlist it used to accept is gone: an IdP
+    whose endpoints live off the issuer's origin -- Cognito's hosted domain --
+    is served by the SSO profile, whose ``sso_endpoint_origins`` is checked
+    per profile at discovery, never by a browser-facing allowlist.
+    """
     authorization_value, authorization_origin = _parse_browser_endpoint(
         authorization_endpoint,
         field_name="authorization_endpoint",
@@ -193,12 +186,9 @@ def validate_oidc_browser_endpoints(
     token_value, token_origin = _parse_browser_endpoint(token_endpoint, field_name="token_endpoint")
     _issuer_value, _issuer_parsed, issuer_origin = _parse_https_url(issuer, field_name="issuer")
 
-    normalized_allowed = validate_oidc_browser_origins(allowed_origins)
-    allowed = {_parse_bare_origin(value, field_name="OIDC browser allowed origin")[1] for value in normalized_allowed}
-
     if authorization_origin != token_origin:
         raise ValueError("authorization_endpoint and token_endpoint must use the same origin")
-    if authorization_origin != issuer_origin and authorization_origin not in allowed:
+    if authorization_origin != issuer_origin:
         raise ValueError("browser endpoint origin is not allowed")
     return authorization_value, token_value
 

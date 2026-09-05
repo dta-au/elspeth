@@ -53,6 +53,7 @@ from elspeth.web.app import (
 )
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.providers import get_profile
+from elspeth.web.auth.sso import SsoAuthProvider, SsoRuntime
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
@@ -72,6 +73,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
+from elspeth.web.sso_wiring import SsoWiring
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -1561,12 +1563,14 @@ class TestOidcDiscoveryStartup:
                 assert app.state.oidc_token_endpoint == "https://issuer.example.com/oauth2/token"
 
     @pytest.mark.asyncio
-    async def test_lifespan_accepts_exact_allowlisted_cognito_discovery_pair(self, tmp_path) -> None:
+    async def test_lifespan_refuses_a_cross_origin_discovery_pair_without_an_allowlist(self, tmp_path) -> None:
+        """The browser-origin allowlist is deleted: the legacy path is issuer-origin only.
+
+        Cognito's hosted domain differs from its pool issuer, which is exactly
+        the deployment the SSO profile (sso_endpoint_origins) now serves.
+        """
         settings = self._oidc_settings(tmp_path).model_copy(
-            update={
-                "oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-                "oidc_authorization_allowed_origins": ("https://example.auth.ap-southeast-2.amazoncognito.com",),
-            }
+            update={"oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id"}
         )
         app = create_app(settings)
         payload = {
@@ -1574,9 +1578,83 @@ class TestOidcDiscoveryStartup:
             "authorization_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
             "token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
         }
-        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])):
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])),
+            pytest.raises(SystemExit, match="OIDC discovery failed"),
+        ):
             async with lifespan(app):
-                assert app.state.oidc_token_endpoint == payload["token_endpoint"]
+                pass
+
+
+class TestSsoWiring:
+    """A deployment whose profile is fully configured is wired for SSO at boot; anything less refuses closed."""
+
+    @staticmethod
+    def _vanguard_settings(tmp_path: Path, **overrides: object) -> WebSettings:
+        base: dict[str, object] = {
+            "auth_provider": "vanguard",
+            "composer_boot_probe_enabled": False,
+            "secret_key": "dev-secret",
+            "sso_issuer": "https://idp.example.gov.au",
+            "sso_client_id": "elspeth",
+            "sso_client_secret": "s" * 40,
+            "sso_transaction_secret": "t" * 40,
+            "public_base_url": "https://elspeth.example.gov.au",
+            "compartment_id": "example-compartment",
+            "quota_default_tokens_per_day": 100_000,
+            "quota_default_storage_bytes": 1_000_000,
+            # Break-glass endpoints: no discovery request at startup, so the
+            # test proves the wiring rather than a fake IdP.
+            "sso_authorization_endpoint": "https://idp.example.gov.au/authorize",
+            "sso_token_endpoint": "https://idp.example.gov.au/token",
+            "sso_jwks_uri": "https://idp.example.gov.au/keys",
+            "sso_userinfo_endpoint": "https://idp.example.gov.au/userinfo",
+        }
+        base.update(overrides)
+        return _settings(tmp_path, **base)
+
+    def test_a_configured_profile_makes_the_session_token_provider_the_bearer_authority(self, tmp_path) -> None:
+        app = create_app(self._vanguard_settings(tmp_path))
+        assert isinstance(app.state.auth_provider, SsoAuthProvider)
+        assert isinstance(app.state.sso_wiring, SsoWiring)
+        assert app.state.sso_wiring.token_issuer.audience == "https://elspeth.example.gov.au"
+
+    @pytest.mark.asyncio
+    async def test_lifespan_binds_the_runtime_and_the_config_publishes_the_start_url(self, tmp_path) -> None:
+        app = create_app(self._vanguard_settings(tmp_path))
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                runtime = app.state.sso
+                assert isinstance(runtime, SsoRuntime)
+                assert runtime.client.redirect_uri == "https://elspeth.example.gov.au/api/auth/sso/callback"
+                assert runtime.client.start_url == "https://elspeth.example.gov.au/api/auth/sso/start"
+                assert runtime.client.endpoints.jwks_uri == "https://idp.example.gov.au/keys"
+                assert runtime.client.userinfo is True
+                client = TestClient(app)
+                config = client.get("/api/auth/config").json()
+                assert config["provider"] == "vanguard"
+                assert config["sso_start_url"] == "https://elspeth.example.gov.au/api/auth/sso/start"
+                started = client.get("/api/auth/sso/start", follow_redirects=False)
+                assert started.status_code == 302
+                assert started.headers["location"].startswith("https://idp.example.gov.au/authorize?")
+
+    def test_an_unwired_oidc_deployment_keeps_the_legacy_bearer_path_and_refuses_the_sso_routes(self, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                auth_provider="oidc",
+                composer_boot_probe_enabled=False,
+                oidc_issuer="https://issuer.example.com",
+                oidc_audience="test-audience",
+                oidc_client_id="test-client-id",
+                secret_key="dev-secret",
+            )
+        )
+        assert app.state.sso_wiring is None
+        assert not isinstance(app.state.auth_provider, SsoAuthProvider)
+        client = TestClient(app)
+        assert client.get("/api/auth/config").json()["sso_start_url"] is None
+        assert client.get("/api/auth/sso/start", follow_redirects=False).status_code == 503
 
 
 class TestLifespanShutdown:
@@ -2325,27 +2403,6 @@ class TestSettingsFromEnv:
             settings_from_env()
 
         assert marker not in str(exc_info.value)
-
-    def test_oidc_authorization_allowed_origins_from_json(self, monkeypatch) -> None:
-        monkeypatch.setenv(
-            "ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS",
-            '["https://Login.Example.com:443/"]',
-        )
-        monkeypatch.setenv("ELSPETH_WEB__AUTH_PROVIDER", "oidc")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_ISSUER", "https://issuer.example.com")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUDIENCE", "audience")
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_CLIENT_ID", "client")
-        settings = settings_from_env()
-        assert settings.oidc_authorization_allowed_origins == ("https://login.example.com",)
-
-    @pytest.mark.parametrize("raw", ["not-json", "null", "{}", '"string"', "[1]", '["https://a.example", null]'])
-    def test_oidc_authorization_allowed_origins_rejects_bad_json_without_echo(self, monkeypatch, raw: str) -> None:
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS", raw)
-        with pytest.raises((RuntimeError, ValidationError)) as raised:
-            settings_from_env()
-        rendered = str(raised.value)
-        assert "oidc_authorization_allowed_origins" in rendered.lower()
-        assert raw not in rendered
 
     @pytest.mark.parametrize(
         ("raw_allowlist", "match"),

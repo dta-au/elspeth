@@ -52,8 +52,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.id_token import JWKSTokenValidator
-from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims
+from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import SessionTokenIssuer
 from elspeth.web.auth.urls import DiscoveredEndpoints, validate_discovered_endpoints
 
@@ -1311,6 +1312,48 @@ def complete_login(
 
 
 # ── what the routes are given ────────────────────────────────────────────
+
+
+class SsoAuthProvider:
+    """The bearer authority for an SSO deployment: ELSPETH session tokens, nothing else.
+
+    Every API call after ``complete`` carries the token ``complete`` minted --
+    an ELSPETH session token, never the IdP's. This provider verifies that
+    token through the same issuer that minted it, and refuses -- through
+    ``principal_is_active`` inside the issuer -- any identity that may no
+    longer act, so a disable is felt on the next request rather than at the
+    end of the token's life.
+
+    Both methods run the issuer in a worker thread: ``authenticate`` reads
+    the identity row, which under external-postgresql is a network round
+    trip that must not sit on the event loop.
+    """
+
+    def __init__(self, *, issuer: SessionTokenIssuer, read_identity: Callable[[str], AdmittedIdentity | None]) -> None:
+        self._issuer = issuer
+        self._read_identity = read_identity
+
+    async def authenticate(self, token: str) -> UserIdentity:
+        return await run_sync_in_worker(self._authenticate_sync, token)
+
+    def _authenticate_sync(self, token: str) -> UserIdentity:
+        claims = self._issuer.authenticate(token)
+        return UserIdentity(user_id=claims.identity_id, username=claims.username)
+
+    async def get_user_info(self, token: str) -> UserProfile:
+        return await run_sync_in_worker(self._get_user_info_sync, token)
+
+    def _get_user_info_sync(self, token: str) -> UserProfile:
+        claims = self._issuer.authenticate(token)
+        identity = self._read_identity(claims.identity_id)
+        if identity is None:
+            # The issuer just confirmed this identity is active; a row that
+            # vanished between the two reads is a refusal, not a blank profile.
+            raise AuthenticationError("Invalid token")
+        # Display name and email live on the identities row only from the
+        # identity-summary read that lands with the admin surface; until then
+        # the profile carries what the token itself proves.
+        return UserProfile(user_id=identity.identity_id, username=identity.username)
 
 
 @dataclass(frozen=True, slots=True)
