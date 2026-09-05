@@ -4512,7 +4512,39 @@ def _check_schema_contracts(
             "transform_string_input_field_type_incompatible",
         )
 
+    # One vote per producer per walk (elspeth-e5a38115a6). The pass-through
+    # vote below recurses upstream through _connection_propagation_vote, and
+    # each hop used to construct that producer's transform afresh, so a chain
+    # of n pass-through transforms re-derived edge k's k upstream votes:
+    # n(n+1)/2 constructions per validate (820 at n=40), on every import,
+    # seed and review-debt check. The memo lives and dies with THIS
+    # _check_schema_contracts call, so it is cached against exactly the
+    # sources/nodes/outputs the walk reads and never outlives them. The key
+    # is exact: a producer id names one resolver entry (ProducerEntry is
+    # built only by ProducerResolver.build, one per node or source), and the
+    # cycle-guard set is part of the key because a revisited fan-in votes
+    # abstention. The warning/probe-failed side effects were already
+    # set-deduped per producer, so a memoized call emits what a repeat
+    # call would have: nothing.
+    _producer_vote_memo: dict[tuple[str, str | None, frozenset[str]], tuple[bool, frozenset[str]]] = {}
+
     def _effective_producer_vote(
+        producer: ProducerEntry,
+        *,
+        visited_fan_in_ids: frozenset[str] = frozenset(),
+    ) -> tuple[bool, frozenset[str]]:
+        """Return (participates, guarantees) for preview propagation, memoized per walk.
+
+        See ``_effective_producer_vote_uncached`` for the vote itself.
+        """
+        key = (producer.producer_id, producer.plugin_name, visited_fan_in_ids)
+        if key in _producer_vote_memo:
+            return _producer_vote_memo[key]
+        vote = _effective_producer_vote_uncached(producer, visited_fan_in_ids=visited_fan_in_ids)
+        _producer_vote_memo[key] = vote
+        return vote
+
+    def _effective_producer_vote_uncached(
         producer: ProducerEntry,
         *,
         visited_fan_in_ids: frozenset[str] = frozenset(),
@@ -5174,7 +5206,28 @@ def _check_schema_contracts(
     def _format_fields(fields: frozenset[str]) -> str:
         return ", ".join(sorted(fields)) if fields else "(none)"
 
+    # Same memo discipline as _effective_producer_vote (elspeth-e5a38115a6):
+    # _connection_definite_emits walks upstream through every propagating
+    # transform and asked for each hop's emit profile afresh, constructing
+    # the transform every time — the second n(n+1)/2 walk on a chain. The
+    # profile is a pure function of the resolver entry; a ValueError (Tier-3
+    # parse fault, caught per arm by _arm_emit_profile) is deliberately not
+    # cached so a repeat call still raises exactly as an uncached one did.
+    _producer_emit_profile_memo: dict[tuple[str, str | None], _ProducerEmitProfile] = {}
+
     def _producer_emit_profile(producer: ProducerEntry) -> _ProducerEmitProfile:
+        """Return the producer's emit profile, memoized per walk.
+
+        See ``_producer_emit_profile_uncached`` for the derivation.
+        """
+        key = (producer.producer_id, producer.plugin_name)
+        if key in _producer_emit_profile_memo:
+            return _producer_emit_profile_memo[key]
+        profile = _producer_emit_profile_uncached(producer)
+        _producer_emit_profile_memo[key] = profile
+        return profile
+
+    def _producer_emit_profile_uncached(producer: ProducerEntry) -> _ProducerEmitProfile:
         """Return ``(predicted emit set, propagates upstream arrivals, removals)``.
 
         The emit set is distinct from ``_effective_producer_guarantees``: that
