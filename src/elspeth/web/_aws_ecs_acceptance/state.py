@@ -14,13 +14,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
 
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web._acceptance_common.http_client import AcceptanceCredentials as AcceptanceCredentials
 
 from .contracts import (
     _ARTIFACT_ID_PATTERN,
     _SHA256_PATTERN,
     MAX_STATE_FILE_BYTES,
-    AcceptanceInputError,
     AcceptanceStateError,
     _parse_utc_z_timestamp,
     acceptance_step,
@@ -45,46 +44,6 @@ _STATE_FIELDS = frozenset(
         "completed_at",
     }
 )
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptanceCredentials:
-    """One mutually exclusive acceptance authentication mode."""
-
-    mode: Literal["local", "bearer"]
-    username: str | None = None
-    password: str | None = None
-    bearer_token: str | None = None
-
-    @classmethod
-    @trust_boundary(
-        tier=3,
-        source="the acceptance authentication assignment (ELSPETH_ACCEPTANCE_USERNAME / ELSPETH_ACCEPTANCE_PASSWORD / ELSPETH_ACCEPTANCE_BEARER_TOKEN) in the acceptance harness process environment",
-        source_param="env",
-        suppresses=("R1", "R5"),
-        invariant=(
-            "raises AcceptanceInputError before use unless the environment supplies exactly one complete "
-            "authentication mode - both local names and no bearer token, or a bearer token and neither "
-            "local name - and never echoes a credential value into the error; returns only the owned "
-            "frozen AcceptanceCredentials"
-        ),
-        test_ref=(
-            "tests/unit/web/aws_ecs_acceptance/test_contracts_secure_state.py::"
-            "test_auth_input_rejects_missing_partial_or_mixed_modes_without_echo"
-        ),
-        test_fingerprint="a51e2c2305179ac0b8a94f65977545487d6286a11eb0206a4cd2e138505ca35c",
-    )
-    def from_env(cls, env: Mapping[str, str]) -> Self:
-        username = env.get("ELSPETH_ACCEPTANCE_USERNAME") or None
-        password = env.get("ELSPETH_ACCEPTANCE_PASSWORD") or None
-        bearer_token = env.get("ELSPETH_ACCEPTANCE_BEARER_TOKEN") or None
-        has_local_part = username is not None or password is not None
-        has_local = username is not None and password is not None
-        if bearer_token is not None and not has_local_part:
-            return cls(mode="bearer", bearer_token=bearer_token)
-        if has_local and bearer_token is None:
-            return cls(mode="local", username=username, password=password)
-        raise AcceptanceInputError("acceptance authentication must use exactly one complete environment mode")
 
 
 @dataclass(frozen=True, slots=True)
