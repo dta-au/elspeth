@@ -2426,6 +2426,42 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionOperationAuthority",
         line=4746,
     ),
+    # ── P4-D6 step 4 facet admissions (elspeth-e483fe7f85): writers and contained
+    # acquisitions the scanner already attributes to a named authority, admitted
+    # method-exact from live scanner output. blobs/service.py's phase helpers
+    # (_reserve_pending_blob / _finalize_reserved_blob) hand their connection to
+    # sub-helpers and stay in step 5's escape corpus. ────────────────────────
+    # src/elspeth/web/blobs/service.py :: SessionBlobMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_finalize_reserved_blob",
+        "<sessions-write-connection>",
+        "write_connection",
+        "5fcbd10db9a8bb6a",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1291,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_finalize_reserved_blob",
+        "blobs",
+        "update",
+        "38de196d17740a2c",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1302,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_reserve_pending_blob",
+        "<sessions-write-connection>",
+        "write_connection",
+        "ed8bc9f6e94ae399",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1218,
+    ),
 )
 
 # These exact connection flows are proven read-only but cannot be resolved to
@@ -2620,6 +2656,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=817,
     ),
+    # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
+    # to ``read_schema_identities`` behind a plain import, whose body executes
+    # only a SELECT on it; same acquisition, same fingerprint, no escape.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "_landscape_identity_issue",
@@ -2629,7 +2668,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=842,
-        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2662,6 +2700,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=1279,
         connection_escape=True,
     ),
+    # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
+    # ``_landscape_identity_issue`` above -- the forward is inspected, not assumed.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._sync_schema_identity",
@@ -2671,7 +2711,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=1300,
-        connection_escape=True,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -3376,12 +3415,20 @@ _NESTED_SCOPES = (
 
 
 class _ProductionWriterCollector(ast.NodeVisitor):
-    def __init__(self, path: str, tree: ast.AST) -> None:
+    def __init__(self, path: str, tree: ast.AST, *, anchor: Path | None = None) -> None:
         self.path = path
         self.tree = tree
         # Parallel to ``sites``: the node each site was emitted from, so a
         # tree-wide post-pass can reason about a site's enclosing function.
         self.site_nodes: list[ast.AST] = []
+        # A forwarded connection's callee behind a plain ``from x import f``
+        # is inspected in ITS module (P4-D6 step 5, cross-module ruling): the
+        # scanned collectors register here by path, and a module the scan did
+        # not include is parsed from disk under ``anchor`` on demand, so the
+        # verdict for a site never depends on which files a caller passed.
+        # No anchor and no peer: an imported callee is unresolvable.
+        self.anchor = anchor
+        self.peers: dict[str, _ProductionWriterCollector] = {}
         self.import_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.assignment_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.definition_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
@@ -5703,6 +5750,60 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return None
         return definition
 
+    def _resolvable_imported_callee(
+        self,
+        call: ast.Call,
+    ) -> tuple[_ProductionWriterCollector, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+        """The callee behind a plain ``from elspeth.<module> import f`` binding, located in the peer
+        collector that scanned that module: every reaching binding of the name must be that one
+        import (no alias, no reassignment), the module must be under ``src/elspeth`` and among the
+        scanned peers, and it must define exactly one module-level function of that name."""
+
+        func = call.func
+        if not isinstance(func, ast.Name):
+            return None
+        qualified = self._imported_qualified_name(func)
+        if qualified is None or not qualified.startswith("elspeth."):
+            return None
+        module, _, name = qualified.rpartition(".")
+        if name != func.id:
+            return None
+        reaching, complete, _ = self._visible_reaching_bindings(call, func.id)
+        if not complete or not reaching or any(binding.imported != qualified or binding.value is not None for binding in reaching):
+            return None
+        peer = self._peer_collector(f"src/{module.replace('.', '/')}.py")
+        if peer is None:
+            return None
+        definitions = [
+            node
+            for node in ast.iter_child_nodes(peer.tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ]
+        if len(definitions) != 1 or any(isinstance(node, ast.ClassDef) and node.name == name for node in ast.iter_child_nodes(peer.tree)):
+            return None
+        return peer, definitions[0]
+
+    def _peer_collector(self, path: str) -> _ProductionWriterCollector | None:
+        """The collector for ``path``: a scanned peer, else the module parsed from disk under the anchor."""
+
+        peer = self.peers.get(path)
+        if peer is not None:
+            return peer
+        if self.anchor is None:
+            return None
+        source_file = self.anchor / path
+        if not source_file.is_file():
+            return None
+        try:
+            tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=str(source_file))
+        except (SyntaxError, UnicodeDecodeError):
+            return None
+        _attach_parents(tree)
+        peer = _ProductionWriterCollector(path, tree, anchor=self.anchor)
+        peer.peers = self.peers
+        self.peers[path] = peer
+        return peer
+
     def _is_static_method(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
         return any(
             (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
@@ -5755,17 +5856,24 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         depth: int,
         active: frozenset[tuple[int, str]],
         allow_yield: bool = False,
+        strict: bool = False,
     ) -> bool:
         """Every use of connection ``name`` inside ``scope`` keeps the capability there.
 
         Permitted: the name is executed on (``_EXECUTE_RECEIVER_METHODS``), its
         ``dialect`` is read, it opens an anonymous ``with name.begin_nested():``,
-        or it is forwarded to a resolvable private callee whose own uses are
-        contained (recursively, ``_FORWARDING_MAX_DEPTH``, cycle-refusing).
-        ``allow_yield`` admits the one ``yield name`` a contextmanager wrapper
-        is. Anything else -- a store, return, comparison, closure or
-        comprehension capture, star-argument, reassignment, raw DBAPI access,
-        a bound nested transaction, or an unresolvable forward -- refuses.
+        is ``del``-ed, or is forwarded to a resolvable callee whose own uses are
+        contained (recursively, ``_FORWARDING_MAX_DEPTH``, cycle-refusing) -- a
+        same-class method, a same-module private function, or a module-level
+        function behind a plain ``from elspeth.<module> import f`` inspected in
+        its own module. Past a module boundary the walk is ``strict``: every
+        execution on the forwarded connection must be a provably read-only or
+        advisory-lock statement, so an imported callee can never carry table
+        DML. ``allow_yield`` admits the one ``yield name`` a contextmanager
+        wrapper is. Anything else -- a store, return, comparison, closure or
+        comprehension capture, star-argument, reassignment, raw DBAPI access, a
+        bound nested transaction, an aliased import, a callee outside
+        ``src/elspeth`` or an unresolvable forward -- refuses.
         """
 
         if depth > _FORWARDING_MAX_DEPTH or self._name_reassigned_in(scope, name):
@@ -5777,7 +5885,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 continue
             if not (isinstance(node, ast.Name) and node.id == name):
                 continue
-            if not self._connection_use_is_contained(node, depth=depth, active=active, allow_yield=allow_yield):
+            if not self._connection_use_is_contained(node, depth=depth, active=active, allow_yield=allow_yield, strict=strict):
                 return False
         return True
 
@@ -5788,6 +5896,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         depth: int,
         active: frozenset[tuple[int, str]],
         allow_yield: bool,
+        strict: bool,
     ) -> bool:
         parent = getattr(use, "_inventory_parent", None)
         if isinstance(use.ctx, ast.Del):
@@ -5802,7 +5911,12 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 return True
             if isinstance(grandparent, ast.Call) and grandparent.func is parent:
                 if parent.attr in _EXECUTE_RECEIVER_METHODS:
-                    return True
+                    if not strict:
+                        return True
+                    # Past a module boundary only a provably read-only /
+                    # advisory-lock statement may run on the forwarded connection.
+                    statement = grandparent.args[0] if grandparent.args else None
+                    return statement is not None and self._is_obviously_read_only_statement(statement, use=grandparent)
                 if parent.attr in {"begin", "begin_nested"}:
                     item = getattr(grandparent, "_inventory_parent", None)
                     return isinstance(item, ast.withitem) and item.context_expr is grandparent and item.optional_vars is None
@@ -5814,27 +5928,41 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return False
         if use not in call.args and not any(keyword.value is use for keyword in call.keywords):
             return False
+        return self._forward_is_contained(call, use, depth=depth + 1, active=active, strict=strict)
+
+    def _forward_is_contained(
+        self,
+        call: ast.Call,
+        argument: ast.Name,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        strict: bool,
+    ) -> bool:
+        """``callee(conn)`` keeps the connection contained iff the callee is inspectable and proves it.
+
+        A same-file callee is inspected here; an imported one in its own module's
+        collector, and from there on the walk is strict.
+        """
+
+        owner: _ProductionWriterCollector = self
         callee = self._resolvable_private_callee(call)
         if callee is None:
-            return False
-        parameter = self._forwarded_parameter(call, callee, use)
+            imported = self._resolvable_imported_callee(call)
+            if imported is None:
+                return False
+            owner, callee = imported
+            strict = True
+        parameter = owner._forwarded_parameter(call, callee, argument)
         if parameter is None:
             return False
         key = (id(callee), parameter)
         if key in active:
             return False
-        return self._connection_uses_are_contained(callee, parameter, depth=depth + 1, active=active | {key})
+        return owner._connection_uses_are_contained(callee, parameter, depth=depth, active=active | {key}, strict=strict)
 
     def _forwarding_is_contained(self, call: ast.Call, argument: ast.Name) -> bool:
-        """``helper(conn)`` keeps the connection contained iff the callee is inspectable and proves it."""
-
-        callee = self._resolvable_private_callee(call)
-        if callee is None:
-            return False
-        parameter = self._forwarded_parameter(call, callee, argument)
-        if parameter is None:
-            return False
-        return self._connection_uses_are_contained(callee, parameter, depth=1, active=frozenset({(id(callee), parameter)}))
+        return self._forward_is_contained(call, argument, depth=1, active=frozenset(), strict=False)
 
     def _collect_unresolved_connection_flows(self) -> None:
         """Fail closed when an acquired connection reaches an unknown write-capable sink."""
@@ -6057,8 +6185,14 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
             raise InventoryScanError(f"cannot parse production source {source_file}: {error}") from error
         _attach_parents(tree)
         relative = relative_path.as_posix()
-        collector = _ProductionWriterCollector(relative, tree)
-        collected.append((collector, collector.collect()))
+        collected.append((_ProductionWriterCollector(relative, tree, anchor=anchor.resolve()), []))
+    # Two phases: every collector exists before any collects, so a forwarded
+    # connection's imported callee can be inspected in its own module (one it
+    # was not scanned with is parsed from disk under the anchor on demand).
+    peers = {collector.path: collector for collector, _ in collected}
+    for collector, _ in collected:
+        collector.peers = peers
+    collected = [(collector, collector.collect()) for collector, _ in collected]
     proven = _CallerSideProof(collected).proven_site_indexes()
     contained = _WrapperContainmentProof(collected).contained_site_indexes()
     sites: list[WriterIdentity] = []
@@ -9556,6 +9690,120 @@ def test_wrapper_containment_is_all_callers_and_same_class_only(tmp_path: Path) 
         "Repo._foreign_reference": True,
         "Repo._escapes_inside": True,
         "Repo._passed_not_entered": True,
+    }
+
+
+_CROSS_MODULE_LOCKING = """\
+    def acquire_lock(conn, key):
+        conn.exec_driver_sql("SELECT pg_catalog.pg_advisory_xact_lock(%s)", (key,))
+
+    def custody_lock(conn, key):
+        _advisory(conn, key)
+
+    def _advisory(conn, key):
+        conn.exec_driver_sql("SELECT pg_catalog.pg_advisory_xact_lock(%s)", (key,))
+
+    def poison(conn, key):
+        conn.exec_driver_sql("UPDATE sessions SET status = 'x'")
+
+    def hop1(conn, key):
+        _hop2(conn, key)
+
+    def _hop2(conn, key):
+        _hop3(conn, key)
+
+    def _hop3(conn, key):
+        _hop4(conn, key)
+
+    def _hop4(conn, key):
+        conn.exec_driver_sql("SELECT 1")
+    """
+
+_CROSS_MODULE_CALLERS = """\
+    from elspeth.web.sessions.locking import acquire_lock, custody_lock, hop1, poison
+    from elspeth.web.sessions.locking import acquire_lock as grab
+    from lib.outside import outside_lock
+    from elspeth.web.missing import ghost_lock
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        def phase(self, key):
+            with self._engine.begin() as conn:
+                _lock(conn, key)
+
+        def two_hops(self, key):
+            with self._engine.begin() as conn:
+                custody_lock(conn, key)
+
+        def dml_behind_import(self, key):
+            with self._engine.begin() as conn:
+                poison(conn, key)
+
+        def aliased(self, key):
+            with self._engine.begin() as conn:
+                grab(conn, key)
+
+        def outside(self, key):
+            with self._engine.begin() as conn:
+                outside_lock(conn, key)
+
+        def unscanned(self, key):
+            with self._engine.begin() as conn:
+                ghost_lock(conn, key)
+
+        def too_deep(self, key):
+            with self._engine.begin() as conn:
+                hop1(conn, key)
+
+    def _lock(conn, key):
+        acquire_lock(conn, key)
+    """
+
+_OUTSIDE_LOCKING = """\
+    def outside_lock(conn, key):
+        conn.exec_driver_sql("SELECT 1")
+    """
+
+
+def test_forwarding_proof_inspects_an_imported_callee_in_its_own_module(tmp_path: Path) -> None:
+    """Cross-module ruling: behind a plain ``from elspeth.<module> import f`` the callee is inspected
+    in its own module; one hop (through a same-module private helper) and two hops (the imported
+    function forwarding to its module's private helper) prove contained when every execution on the
+    connection is an advisory-lock SELECT."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {
+            "src/elspeth/web/phase.py": _CROSS_MODULE_CALLERS,
+            "src/elspeth/web/sessions/locking.py": _CROSS_MODULE_LOCKING,
+            "lib/outside.py": _OUTSIDE_LOCKING,
+        },
+    )
+    assert escapes["Repo.phase"] is False
+    assert escapes["Repo.two_hops"] is False
+
+
+def test_forwarding_proof_refuses_imports_it_cannot_inspect_or_that_carry_dml(tmp_path: Path) -> None:
+    """Adversarial, cross-module: table DML on the forwarded connection behind the import, an aliased
+    import, a callee outside ``src/elspeth``, a module with no source file under the anchor, and a
+    chain beyond the depth bound each keep the acquisition escaped."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {
+            "src/elspeth/web/phase.py": _CROSS_MODULE_CALLERS,
+            "src/elspeth/web/sessions/locking.py": _CROSS_MODULE_LOCKING,
+            "lib/outside.py": _OUTSIDE_LOCKING,
+        },
+    )
+    assert {symbol for symbol, escaped in escapes.items() if escaped} == {
+        "Repo.dml_behind_import",
+        "Repo.aliased",
+        "Repo.outside",
+        "Repo.unscanned",
+        "Repo.too_deep",
     }
 
 
