@@ -28,8 +28,10 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import (
 )
 from elspeth.plugins.transforms.aws.textract_regions import is_well_formed_aws_region
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
-from elspeth.web.auth.providers import get_profile
+from elspeth.web.auth.providers import IdPProfile, get_profile
 from elspeth.web.auth.urls import (
+    DiscoveredEndpoints,
+    validate_discovered_endpoints,
     validate_oidc_browser_endpoints,
     validate_oidc_browser_origins,
     validate_oidc_issuer,
@@ -1139,7 +1141,61 @@ class WebSettings(BaseModel):
                 missing = [name for name in profile.required_settings if not configured_settings[name]]
                 if missing:
                     raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
+            self._validate_sso_endpoint_overrides(profile)
         return self
+
+    def _validate_sso_endpoint_overrides(self, profile: IdPProfile) -> None:
+        """Hold the break-glass endpoint overrides to the same origin policy.
+
+        The four ``sso_*`` endpoint settings exist so an operator can bypass
+        discovery when an IdP's document is wrong or unreachable. Until now
+        they were accepted unvalidated beyond a blank check, which made the
+        break-glass path the weakest way into the deployment: an operator
+        typo, or an environment variable set by something other than the
+        operator, could point the token endpoint anywhere.
+
+        ALL OR NONE. A partial override silently mixes operator-supplied and
+        discovered endpoints, so which origin policy applied to which URL
+        would depend on which variables happened to be set. Refusing the
+        mixture is the only reading that keeps the answer knowable.
+
+        The origin policy is the profile's, exactly as it is for discovery.
+        An override is a way to name a DIFFERENT URL on an origin the IdP is
+        expected to serve from — not a way to leave the expected origins.
+        """
+        overrides = {
+            "sso_authorization_endpoint": self.sso_authorization_endpoint,
+            "sso_token_endpoint": self.sso_token_endpoint,
+            "sso_jwks_uri": self.sso_jwks_uri,
+        }
+        supplied = sorted(name for name, value in overrides.items() if value is not None)
+        if not supplied:
+            # userinfo alone is not an override: with no endpoints to pair it
+            # with there is nothing for discovery to be bypassed FOR.
+            if self.sso_userinfo_endpoint is not None:
+                raise ValueError("sso_userinfo_endpoint requires the other sso endpoint overrides: " + ", ".join(overrides))
+            return
+        if len(supplied) != len(overrides):
+            missing = sorted(set(overrides) - set(supplied))
+            raise ValueError(f"sso endpoint overrides are all-or-none; missing: {', '.join(missing)}")
+
+        assert self.sso_issuer is not None
+        assert self.sso_authorization_endpoint is not None
+        assert self.sso_token_endpoint is not None
+        assert self.sso_jwks_uri is not None
+        validated = validate_discovered_endpoints(
+            DiscoveredEndpoints(
+                authorization_endpoint=self.sso_authorization_endpoint,
+                token_endpoint=self.sso_token_endpoint,
+                jwks_uri=self.sso_jwks_uri,
+                userinfo_endpoint=self.sso_userinfo_endpoint,
+            ),
+            expected_origins=profile.expected_origins(self, profile.resolve_issuer(self)),
+        )
+        object.__setattr__(self, "sso_authorization_endpoint", validated.authorization_endpoint)
+        object.__setattr__(self, "sso_token_endpoint", validated.token_endpoint)
+        object.__setattr__(self, "sso_jwks_uri", validated.jwks_uri)
+        object.__setattr__(self, "sso_userinfo_endpoint", validated.userinfo_endpoint)
 
     @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
