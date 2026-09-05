@@ -72,6 +72,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationC
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import create_blob_under_fence
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -6036,8 +6037,12 @@ class TestStep2IntraStep:
 
         def _rival(label: str) -> UUID:
             """One approval-required blob-only proposal that will later share the settled state."""
+            # Created the way the upload routes do: under a real CREATE context
+            # held only for the call, so the session is free for the next one.
             blob = asyncio.run(
-                blob_service.create_blob(
+                create_blob_under_fence(
+                    session_service,
+                    blob_service,
                     UUID(session_id),
                     f"{label}.csv",
                     b"order_id,total\n1,10\n",
