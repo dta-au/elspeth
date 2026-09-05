@@ -36,6 +36,7 @@ import elspeth.web.app as app_module
 import elspeth.web.deployment_contract as deployment_contract_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -51,6 +52,7 @@ from elspeth.web.app import (
     lifespan,
 )
 from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.providers import get_profile
 from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartupContractError
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
@@ -1452,31 +1454,37 @@ class TestOidcDiscoveryStartup:
             secret_key="dev-secret",
         )
 
-    def test_create_app_threads_client_id_mode_only_to_oidc(self, tmp_path) -> None:
-        oidc_app = create_app(
-            _settings(
-                tmp_path / "oidc",
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="client",
-                oidc_client_id="client",
-                oidc_audience_claim="client_id",
-                secret_key="dev-secret",
+    def test_create_app_refuses_the_deleted_cognito_access_token_mode_at_boot(self, tmp_path) -> None:
+        """The decode branch is gone; a deployment still configured for it must not boot into 401s."""
+        with pytest.raises(RuntimeError, match="oidc_audience_claim"):
+            create_app(
+                _settings(
+                    tmp_path / "oidc",
+                    auth_provider="oidc",
+                    oidc_issuer="https://issuer.example.com",
+                    oidc_audience="client",
+                    oidc_client_id="client",
+                    oidc_audience_claim="client_id",
+                    secret_key="dev-secret",
+                )
             )
-        )
-        assert oidc_app.state.auth_provider._validator._audience_claim == "client_id"
 
-        entra_app = create_app(
-            _settings(
-                tmp_path / "entra",
-                auth_provider="entra",
-                oidc_audience="client",
-                oidc_client_id="client",
-                entra_tenant_id="tenant",
-                secret_key="dev-secret",
-            )
-        )
-        assert entra_app.state.auth_provider._validator._audience_claim == "aud"
+    @pytest.mark.parametrize("auth_provider", ["oidc", "entra"])
+    def test_create_app_pins_the_profiles_algorithms_on_the_validator(self, tmp_path, auth_provider: AuthProviderType) -> None:
+        settings = {
+            "auth_provider": auth_provider,
+            "oidc_audience": "client",
+            "oidc_client_id": "client",
+            "secret_key": "dev-secret",
+        }
+        if auth_provider == "oidc":
+            settings["oidc_issuer"] = "https://issuer.example.com"
+        else:
+            settings["entra_tenant_id"] = "tenant"
+
+        app = create_app(_settings(tmp_path / auth_provider, **settings))
+
+        assert app.state.auth_provider._validator._algorithms == get_profile(auth_provider).id_token_algorithms
 
     @pytest.mark.parametrize("auth_provider", ["oidc", "entra"])
     def test_create_app_threads_jwks_max_stale_age(self, tmp_path, auth_provider: str) -> None:

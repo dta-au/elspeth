@@ -24,9 +24,13 @@ AUDIENCE = "elspeth-client"
 NONCE = "nonce-from-the-sealed-cookie"
 
 
+def _validator(algorithms: tuple[str, ...] = ("RS256",)) -> JWKSTokenValidator:
+    return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=algorithms)
+
+
 @pytest.fixture
 def validator() -> JWKSTokenValidator:
-    return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE)
+    return _validator()
 
 
 def _claims(**overrides: Any) -> dict[str, Any]:
@@ -48,7 +52,6 @@ _ABSENT = object()
 
 def _decode(validator: JWKSTokenValidator, token: str, jwks: dict[str, Any], **overrides: Any) -> Any:
     kwargs: dict[str, Any] = {
-        "algorithms": ("RS256",),
         "audience": AUDIENCE,
         "nonce": NONCE,
         "client_id": AUDIENCE,
@@ -81,12 +84,36 @@ class TestAlgorithmConfusion:
         with pytest.raises(AuthenticationError, match="Invalid token"):
             _decode(validator, token, build_rsa_jwk(public_key, alg="PS256"))
 
-    def test_pinning_is_per_profile_not_global(self, validator, rsa_keypair) -> None:
-        """A profile that pinned PS256 would accept the same token."""
+    def test_pinning_is_per_profile_not_global(self, rsa_keypair) -> None:
+        """A validator BUILT for a PS256 profile accepts the same token.
+
+        The pin is the tuple the validator was constructed with -- there is
+        no per-call override to reach for, so a caller cannot widen it.
+        """
         private_key, public_key = rsa_keypair
         token = make_rsa_token(private_key, _claims(), algorithm="PS256")
-        payload = _decode(validator, token, build_rsa_jwk(public_key, alg="PS256"), algorithms=("PS256",))
+        payload = _decode(_validator(("PS256",)), token, build_rsa_jwk(public_key, alg="PS256"))
         assert payload["sub"] == "subject-1"
+
+    def test_the_bearer_path_is_the_same_pin(self, validator, rsa_keypair) -> None:
+        """``decode_token`` used to read ``alg`` from the header. It cannot now."""
+        private_key, public_key = rsa_keypair
+        token = make_rsa_token(private_key, _claims(), algorithm="PS256")
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            validator.decode_token(token, build_rsa_jwk(public_key, alg="PS256"))
+        accepted = validator.decode_token(make_rsa_token(private_key, _claims()), build_rsa_jwk(public_key))
+        assert accepted["sub"] == "subject-1"
+
+    @pytest.mark.parametrize("algorithms", [(), ("RS256", "HS256"), ("none",), ("HS256",), ("RS256", "")])
+    def test_a_profile_cannot_declare_a_symmetric_or_absent_signature(self, algorithms: tuple[str, ...]) -> None:
+        """A JWKS is public. An HMAC or ``none`` entry would make it the secret."""
+        with pytest.raises(ValueError, match="algorithm"):
+            _validator(algorithms)
+
+    def test_the_pin_must_be_a_tuple(self) -> None:
+        not_a_tuple: Any = ["RS256"]
+        with pytest.raises(ValueError, match="tuple"):
+            JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=not_a_tuple)
 
 
 class TestKeyTypeConfusion:
@@ -120,6 +147,13 @@ class TestNonceBinding:
         token = make_rsa_token(private_key, _claims(nonce="a-different-login"))
         with pytest.raises(AuthenticationError, match="nonce check failed"):
             _decode(validator, token, build_rsa_jwk(public_key))
+
+    def test_the_sso_path_refuses_to_run_without_a_nonce_to_compare(self, validator, rsa_keypair) -> None:
+        """An empty expected nonce is a caller defect, refused before the token is read."""
+        private_key, public_key = rsa_keypair
+        token = make_rsa_token(private_key, _claims(nonce=""))
+        with pytest.raises(ValueError, match="nonce"):
+            _decode(validator, token, build_rsa_jwk(public_key), nonce="")
 
     def test_a_token_with_no_nonce_is_refused(self, validator, rsa_keypair) -> None:
         """Required, not optional: absence must not skip the comparison."""
@@ -249,13 +283,9 @@ class TestJWKSValidatorBoundaryRaises:
     boundary contract at the function granularity the decorator attests.
     """
 
-    @staticmethod
-    def _validator() -> JWKSTokenValidator:
-        return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE)
-
     def test_validate_discovery_document_non_dict_raises(self) -> None:
         """A non-object discovery payload is rejected at the boundary, not coerced."""
-        validator = self._validator()
+        validator = _validator()
         with pytest.raises(AuthenticationError, match="not a JSON object"):
             validator._validate_discovery_document(discovery=["not", "a", "dict"])
 
@@ -263,36 +293,3 @@ class TestJWKSValidatorBoundaryRaises:
         """A JWKS document without a 'keys' list is rejected at the boundary."""
         with pytest.raises(AuthenticationError, match="missing 'keys' list"):
             JWKSTokenValidator._validate_jwks_document(jwks={"not_keys": []})
-
-    def test_get_token_algorithm_missing_alg_raises(self) -> None:
-        """A token header without a non-empty string 'alg' is rejected at the boundary."""
-        with pytest.raises(AuthenticationError, match="non-empty string 'alg'"):
-            JWKSTokenValidator._get_token_algorithm(header={"kid": "k1"})
-
-    def test_get_jwk_algorithm_invalid_alg_raises(self) -> None:
-        """A matched JWK with a non-string 'alg' is rejected at the boundary.
-
-        The no-match / missing-alg paths return None (honest absence); the
-        boundary only RAISES when a matched key advertises an invalid 'alg'
-        value, which is the invariant the decorator attests.
-        """
-        jwks = {"keys": [{"kid": "k1", "alg": 42}]}
-        with pytest.raises(AuthenticationError, match="invalid non-empty string 'alg'"):
-            JWKSTokenValidator._get_jwk_algorithm(jwks=jwks, kid="k1")
-
-    def test_manual_claim_helper_is_a_trust_boundary(self) -> None:
-        from elspeth.web.auth.id_token import _validate_cognito_access_claims
-
-        with pytest.raises(AuthenticationError, match="token_use"):
-            _validate_cognito_access_claims(
-                {"client_id": AUDIENCE, "token_use": "id"},
-                audience=AUDIENCE,
-            )
-
-        metadata = _validate_cognito_access_claims.__trust_boundary__  # type: ignore[attr-defined]
-        assert metadata.tier == 3
-        assert metadata.test_ref == (
-            "tests/unit/web/auth/test_id_token_decode.py::TestJWKSValidatorBoundaryRaises::test_manual_claim_helper_is_a_trust_boundary"
-        )
-        assert "client_id" in metadata.invariant
-        assert "token_use" in metadata.invariant

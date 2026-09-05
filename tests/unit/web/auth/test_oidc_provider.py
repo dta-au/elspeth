@@ -16,6 +16,7 @@ from structlog.testing import capture_logs
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
 from elspeth.web.auth.oidc import OIDCAuthProvider
+from tests.helpers.fake_idp import FakeIdP, IssuedCode
 from tests.unit.web.auth.conftest import build_rsa_jwk, make_rs256_token, make_rsa_token
 
 ISSUER = "https://login.example.com"
@@ -47,6 +48,7 @@ def _valid_claims(overrides: dict[str, object] | None = None) -> dict[str, objec
         "email": "alice@example.com",
         "iss": ISSUER,
         "aud": AUDIENCE,
+        "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
     }
     if overrides:
@@ -117,7 +119,7 @@ class TestOIDCDiscovery:
             patch("elspeth.web.auth.id_token.httpx.AsyncClient") as async_client,
             pytest.raises(ValueError),
         ):
-            JWKSTokenValidator(issuer=issuer, audience=AUDIENCE)
+            JWKSTokenValidator(issuer=issuer, audience=AUDIENCE, algorithms=("RS256",))
 
         async_client.assert_not_called()
 
@@ -449,9 +451,10 @@ class TestOIDCTokenValidation:
     ) -> None:
         private_key, _ = rsa_keypair
         provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
-        claims = _valid_claims({"exp": int(time.time()) - 10})
+        # Beyond the bounded 60s skew the one decode core allows.
+        claims = _valid_claims({"exp": int(time.time()) - 120})
         token = make_rs256_token(private_key, claims)
-        with mock_httpx_discovery, pytest.raises(AuthenticationError):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="ExpiredSignatureError"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -466,7 +469,7 @@ class TestOIDCTokenValidation:
         claims = _valid_claims()
         del claims["sub"]
         token = make_rs256_token(private_key, claims)
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Missing required 'sub' claim"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Invalid token: MissingRequiredClaimError"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -511,112 +514,32 @@ class TestOIDCTokenValidation:
         assert identity.username == "user-123"
 
 
-class TestOIDCAudienceClaimModes:
-    """Generic aud and Cognito client_id are closed, non-fallback modes."""
+class TestOIDCBearerRequiredClaims:
+    """The bearer path requires the same envelope the SSO path does, minus the nonce."""
 
-    def test_default_aud_mode_requires_exp(self, rsa_keypair, jwks_response) -> None:
+    @pytest.mark.parametrize("claim", ["exp", "iat", "iss", "sub", "aud"])
+    def test_every_required_claim_is_required(self, rsa_keypair, jwks_response, claim: str) -> None:
         private_key, _ = rsa_keypair
         claims = _valid_claims()
-        del claims["exp"]
+        del claims[claim]
         token = make_rs256_token(private_key, claims)
-        validator = JWKSTokenValidator(ISSUER, AUDIENCE)
+        validator = JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",))
         with pytest.raises(AuthenticationError, match="MissingRequiredClaimError"):
             validator.decode_token(token, jwks_response)
 
-    def test_client_id_mode_accepts_cognito_access_token(self, rsa_keypair, jwks_response) -> None:
-        private_key, _ = rsa_keypair
-        claims = _valid_claims(
-            {
-                "aud": "wrong-generic-audience",
-                "client_id": AUDIENCE,
-                "token_use": "access",
-                "iat": int(time.time()),
-            }
-        )
-        token = make_rs256_token(private_key, claims)
-        validator = JWKSTokenValidator(ISSUER, AUDIENCE, audience_claim="client_id")
-        assert validator.decode_token(token, jwks_response)["sub"] == "user-123"
-
-    @pytest.mark.parametrize(
-        ("claim", "value"),
-        [
-            ("client_id", None),
-            ("client_id", True),
-            ("client_id", [AUDIENCE]),
-            ("client_id", ""),
-            ("client_id", "wrong-client"),
-            ("token_use", None),
-            ("token_use", True),
-            ("token_use", "id"),
-            ("iat", None),
-            ("exp", None),
-        ],
-    )
-    def test_client_id_mode_rejects_missing_or_wrong_required_claim(
-        self,
-        rsa_keypair,
-        jwks_response,
-        claim: str,
-        value: object,
-    ) -> None:
-        private_key, _ = rsa_keypair
-        claims = _valid_claims(
-            {
-                "client_id": AUDIENCE,
-                "token_use": "access",
-                "iat": int(time.time()),
-            }
-        )
-        if value is None:
-            claims.pop(claim, None)
-        else:
-            claims[claim] = value
-        token = make_rs256_token(private_key, claims)
-        validator = JWKSTokenValidator(ISSUER, AUDIENCE, audience_claim="client_id")
-        with pytest.raises(AuthenticationError) as raised:
-            validator.decode_token(token, jwks_response)
-        rendered = str(raised.value)
-        assert AUDIENCE not in rendered
-        assert "wrong-client" not in rendered
-
-    def test_modes_never_fall_back_to_other_audience_claim(self, rsa_keypair, jwks_response) -> None:
+    def test_a_cognito_access_token_is_a_wrong_audience_token_here(self, rsa_keypair, jwks_response) -> None:
+        """The client_id/token_use mode is deleted; ``aud`` is the only audience claim."""
         private_key, _ = rsa_keypair
         now = int(time.time())
-        cognito_only = make_rs256_token(
+        cognito_shaped = make_rs256_token(
             private_key,
-            _valid_claims({"aud": "wrong", "client_id": AUDIENCE, "token_use": "access", "iat": now}),
+            _valid_claims({"aud": "wrong-generic-audience", "client_id": AUDIENCE, "token_use": "access", "iat": now}),
         )
-        generic_only = make_rs256_token(
-            private_key,
-            _valid_claims({"client_id": "wrong", "token_use": "access", "iat": now}),
-        )
-        with pytest.raises(AuthenticationError):
-            JWKSTokenValidator(ISSUER, AUDIENCE).decode_token(cognito_only, jwks_response)
-        with pytest.raises(AuthenticationError):
-            JWKSTokenValidator(ISSUER, AUDIENCE, audience_claim="client_id").decode_token(
-                generic_only,
-                jwks_response,
-            )
-
-    def test_client_id_mode_requires_rs256(self, rsa_keypair) -> None:
-        private_key, public_key = rsa_keypair
-        token = make_rsa_token(
-            private_key,
-            _valid_claims(
-                {
-                    "client_id": AUDIENCE,
-                    "token_use": "access",
-                    "iat": int(time.time()),
-                }
-            ),
-            algorithm="PS256",
-        )
-        validator = JWKSTokenValidator(ISSUER, AUDIENCE, audience_claim="client_id")
-        with pytest.raises(AuthenticationError, match="algorithm"):
-            validator.decode_token(token, build_rsa_jwk(public_key, alg=None))
+        with pytest.raises(AuthenticationError, match="InvalidAudienceError"):
+            JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",)).decode_token(cognito_shaped, jwks_response)
 
     def test_jwks_discovery_requires_exact_issuer(self) -> None:
-        validator = JWKSTokenValidator(ISSUER, AUDIENCE)
+        validator = JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",))
         with pytest.raises(AuthenticationError, match="issuer"):
             validator._validate_discovery_document({"issuer": "https://wrong.example.com", "jwks_uri": f"{ISSUER}/keys"})
 
@@ -736,7 +659,7 @@ class TestOIDCGetUserInfo:
         claims = _valid_claims()
         del claims["sub"]
         token = make_rs256_token(private_key, claims)
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Missing required 'sub' claim"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Invalid token: MissingRequiredClaimError"):
             await provider.get_user_info(token)
 
     @pytest.mark.asyncio
@@ -1155,14 +1078,11 @@ class TestOIDCJWKSShapeValidation:
 
 
 class TestOIDCAlgorithmSelection:
-    """Tests for algorithm selection when the JWK omits `alg`."""
+    """The profile's pinned list decides, never the JWK's or the header's ``alg``."""
 
     @pytest.mark.asyncio
-    async def test_alg_less_rsa_jwks_accepts_ps256_token(
-        self,
-        rsa_keypair,
-    ) -> None:
-        """The token header algorithm, not PyJWT's RSA fallback, should drive verification."""
+    async def test_alg_less_rsa_jwks_does_not_widen_the_pin(self, rsa_keypair) -> None:
+        """A JWK that omits ``alg`` used to let the token header choose; now the profile still does."""
         private_key, public_key = rsa_keypair
         provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
         token = make_rsa_token(private_key, _valid_claims(), algorithm="PS256")
@@ -1171,10 +1091,59 @@ class TestOIDCAlgorithmSelection:
             {"issuer": ISSUER, "jwks_uri": f"{ISSUER}/keys"},
             build_rsa_jwk(public_key, alg=None),
         ):
-            identity = await provider.authenticate(token)
+            with pytest.raises(AuthenticationError, match="Invalid token"):
+                await provider.authenticate(token)
+            identity = await provider.authenticate(make_rs256_token(private_key, _valid_claims()))
 
         assert identity.user_id == "user-123"
-        assert identity.username == "alice"
+
+
+class TestOIDCBearerPathAgainstAForgingProvider:
+    """Through ``authenticate``, against the fake IdP, with its forgeries.
+
+    Evidence for elspeth-e8a9973c37 at the surface a bearer token actually
+    arrives on. The positive control comes first: if it fails, every refusal
+    below is vacuous.
+    """
+
+    @staticmethod
+    def _provider(idp: FakeIdP) -> OIDCAuthProvider:
+        return OIDCAuthProvider(issuer=idp.issuer, audience=idp.client_id, transport=idp.transport())
+
+    @staticmethod
+    def _bearer(idp: FakeIdP) -> str:
+        return idp.mint_id_token(IssuedCode(code="unused", nonce="unused", subject="ada", claims={}))
+
+    @pytest.mark.asyncio
+    async def test_the_well_behaved_provider_is_accepted(self) -> None:
+        idp = FakeIdP()
+        identity = await self._provider(idp).authenticate(self._bearer(idp))
+        assert identity.user_id == "ada"
+
+    @pytest.mark.asyncio
+    async def test_an_hmac_token_keyed_on_the_public_key_is_refused(self) -> None:
+        """The classic confusion: HS256 over the RSA public key the JWKS publishes."""
+        idp = FakeIdP(id_token_algorithm="HS256")
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await self._provider(idp).authenticate(self._bearer(idp))
+
+    @pytest.mark.asyncio
+    async def test_an_unsigned_token_is_refused(self) -> None:
+        idp = FakeIdP(id_token_algorithm="none")
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await self._provider(idp).authenticate(self._bearer(idp))
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_signature_under_an_unpinned_algorithm_is_refused(self) -> None:
+        """PS256 with the SAME key is a valid signature. It is not the profile's, so it is refused.
+
+        This is the case that proves the pin is the profile and not PyJWT's
+        key-type checks: widen ``id_token_algorithms`` to include PS256 and
+        this test, alone, flips.
+        """
+        idp = FakeIdP(id_token_algorithm="PS256")
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            await self._provider(idp).authenticate(self._bearer(idp))
 
 
 class TestOIDCStaleCacheBackoff:

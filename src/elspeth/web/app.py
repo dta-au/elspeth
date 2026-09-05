@@ -1487,13 +1487,22 @@ def _create_app(
         # Validator _validate_auth_fields guarantees non-None
         assert settings.oidc_issuer is not None
         assert settings.oidc_audience is not None
+        if settings.oidc_audience_claim != "aud":
+            # The Cognito access-token decode branch is deleted (spec
+            # §ID-token validation); a deployment still configured for it
+            # must hear that at boot, not as every login failing its
+            # audience check. The setting itself goes with the rest of
+            # ``oidc_*`` in identity sprint step E.
+            raise RuntimeError(
+                "oidc_audience_claim='client_id' (Cognito access-token mode) is no longer supported: "
+                "register Cognito as a confidential client through the SSO profile."
+            )
         auth_provider = OIDCAuthProvider(
             issuer=settings.oidc_issuer,
             audience=settings.oidc_audience,
             jwks_cache_ttl_seconds=settings.jwks_cache_ttl_seconds,
             jwks_failure_retry_seconds=settings.jwks_failure_retry_seconds,
             jwks_max_stale_seconds=settings.jwks_max_stale_seconds,
-            audience_claim=settings.oidc_audience_claim,
         )
     elif settings.auth_provider == "entra":
         from elspeth.web.auth.entra import EntraAuthProvider

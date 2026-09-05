@@ -40,7 +40,7 @@ def _recording_transport(idp: FakeIdP, seen: list[str]) -> httpx.MockTransport:
 
 
 def _validator(idp: FakeIdP, transport: httpx.AsyncBaseTransport) -> JWKSTokenValidator:
-    return JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, jwks_uri=idp.jwks_uri, transport=transport)
+    return JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, algorithms=("RS256",), jwks_uri=idp.jwks_uri, transport=transport)
 
 
 @pytest.mark.asyncio
@@ -61,9 +61,7 @@ async def test_the_full_decode_with_refresh_accepts_the_well_behaved_provider(id
     code = idp.authorize(nonce="n-1", subject="ada")
     token = idp.mint_id_token(idp.codes[code])
 
-    claims = await validator.decode_id_token_with_refresh(
-        token, algorithms=("RS256",), audience=idp.client_id, nonce="n-1", client_id=idp.client_id
-    )
+    claims = await validator.decode_id_token_with_refresh(token, audience=idp.client_id, nonce="n-1", client_id=idp.client_id)
 
     assert claims["sub"] == "ada"
 
@@ -104,9 +102,7 @@ async def test_a_key_miss_refreshes_from_the_same_resolved_uri(idp: FakeIdP) -> 
     code = rotated.authorize(nonce="n-1", subject="ada")
     token = rotated.mint_id_token(rotated.codes[code])  # signed with the NEW key
 
-    claims = await validator.decode_id_token_with_refresh(
-        token, algorithms=("RS256",), audience=idp.client_id, nonce="n-1", client_id=idp.client_id
-    )
+    claims = await validator.decode_id_token_with_refresh(token, audience=idp.client_id, nonce="n-1", client_id=idp.client_id)
 
     assert claims["sub"] == "ada"
     assert seen == [idp.jwks_uri, idp.jwks_uri], "one initial fetch, one key-miss refresh, both to the resolved URL"

@@ -695,10 +695,9 @@ allowed_dict_patterns:
   # Same foreign JWKS document as decode_token above: PyJWKSet.from_dict
   # requires a real dict, and this is the SSO ID-token path's copy of it.
   - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator.decode_id_token:jwks"
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator.decode_token:return"
+  # The one decode core both entry points delegate to; same document again.
+  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._decode:jwks"
   - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._parse_jwk_set:jwks"
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._get_token_algorithm:header"
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._get_jwk_algorithm:jwks"
   # Shape validator returns the same external JWKS dict after top-level type
   # checks; PyJWKSet.from_dict consumes the raw IdP structure so the return
   # type must stay dict[str, Any].
@@ -1119,7 +1118,6 @@ allowed_dict_patterns:
   - "src/elspeth/telemetry/serialization.py:serialize_otlp_event_attributes:return"
   - "src/elspeth/web/interpretation_state.py:serialize_authoring_review_options:return"
   - "src/elspeth/web/readiness.py:_readiness_engine_kwargs:return"
-  - "src/elspeth/web/auth/id_token.py:_validate_cognito_access_claims:payload"
   - "src/elspeth/web/execution/preflight.py:_authored_options:return"
   - "src/elspeth/web/execution/preflight.py:audit_safe_resolved_config:return"
   - "src/elspeth/web/execution/preflight.py:restore_options:component"
