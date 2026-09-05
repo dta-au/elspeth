@@ -866,3 +866,20 @@ def blob_record_snapshot_hash(record: BlobRecord) -> str:
         "creating_arguments_hash": record.creating_arguments_hash,
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def names_same_blob(value: str, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance — ``is_widened_blob_ref``
+    matches a ``blob_ref`` against the hyphenated UUID form with ``[0-9a-fA-F]``
+    digits and the runtime binds it through ``UUID(...)`` — so an upper-case
+    marker the LLM authored is the SAME bound blob as the lower-case id the
+    store records. A retention guard that compared spellings read such a
+    bound blob as unbound (elspeth-f123a7b3d2). Two hyphenated UUID texts
+    denote one UUID iff they are equal ignoring case, so that is the whole
+    comparison; a braced or unhyphenated spelling is rejected by the contract,
+    never bound, and therefore a non-match here — as is any non-UUID string,
+    which cannot name a blob at all. No parse, no exception path.
+    """
+    return value.lower() == blob_id.lower()

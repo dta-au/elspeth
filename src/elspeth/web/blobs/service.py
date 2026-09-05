@@ -63,6 +63,7 @@ from elspeth.web.blobs.protocol import (
     InlineCustodyRequest,
     StorageMimeType,
     fork_blob_id,
+    names_same_blob,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
 from elspeth.web.sessions.converters import pipeline_dict_from_record
@@ -1835,15 +1836,22 @@ def persist_inline_custody_blob_on_connection(
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
-    """Recursively inspect an option value for blob identity markers."""
+    """Recursively inspect an option value for blob identity markers.
+
+    Id values are compared by UUID identity (``names_same_blob``): the binding
+    path accepts either hex case, so a spelling comparison read a bound blob
+    as unbound (elspeth-f123a7b3d2). A present-but-non-str id value is a
+    non-match here, as it always was on this walker; the composer-side walker
+    is the one that escalates it.
+    """
     if type(value) is dict:
-        if "blob_ref" in value and value["blob_ref"] == blob_id:
+        if "blob_ref" in value and type(value["blob_ref"]) is str and names_same_blob(value["blob_ref"], blob_id):
             return True
         # blob_rows persists custody as blobs[].blob_id (elspeth-0c6a343921);
         # without this the delete guard misses the window between run
         # creation and _link_blob_rows_to_run, when only this composition
         # scan protects a pending run's inputs.
-        if "blob_id" in value and value["blob_id"] == blob_id:
+        if "blob_id" in value and type(value["blob_id"]) is str and names_same_blob(value["blob_id"], blob_id):
             return True
         if any(key in value and value[key] == storage_path for key in ("path", "file")):
             return True
