@@ -109,7 +109,7 @@ files:
   src/elspeth/contracts/transform_contract.py:
     dict[str, Any]: 1
   src/elspeth/core/blobs_inline.py:
-    dict[str, Any]: 19
+    dict[str, Any]: 18
   src/elspeth/core/canonical.py:
     dict[str, Any]: 1
   src/elspeth/core/checkpoint/recovery.py:
@@ -1021,6 +1021,6 @@ totals:
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
   boundary: 63
-  dict[str, Any]: 1155
+  dict[str, Any]: 1154
   dict[str, object]: 389
-  soft: 2739
+  soft: 2738
