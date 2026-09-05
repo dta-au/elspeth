@@ -253,20 +253,23 @@ class LocalAuthProvider:
         return cls._dummy_hash
 
     @classmethod
-    def for_account_administration(cls, db_path: Path) -> LocalAuthProvider:
+    def for_account_administration(cls, db_path: Path, *, retire_identity: RetireIdentity) -> LocalAuthProvider:
         """Build a provider that manages ACCOUNTS but cannot issue sessions.
 
         ``create_user``, ``delete_user``, ``list_users`` and ``set_password``
-        touch ``auth.db`` alone. The CLI does exactly those, from a shell that
-        has no sessions engine and no Landscape recorder — so requiring it to
-        construct a token issuer and an identity substrate to add one local
-        account would be asking for collaborators the operation does not use.
+        never mint a token, so the CLI that does exactly those need not build
+        a token issuer or an admission path. It DOES need the retirer:
+        ``delete_user`` is one of the four, and a credential deleted without
+        its identity retired leaves that username's admission, quota and
+        history to whoever registers it next (elspeth-9c171c00fa). The
+        retirer is therefore required here, not defaulted -- the version that
+        defaulted it to ``None`` is how the CLI shipped without one.
 
         Every token path refuses on a provider built this way, by name rather
         than by AttributeError. Reach for this ONLY where no session is
         issued; anything serving HTTP wants the full constructor.
         """
-        return cls(db_path, token_issuer=None, admit_identity=None)
+        return cls(db_path, token_issuer=None, admit_identity=None, retire_identity=retire_identity)
 
     def __init__(
         self,
@@ -274,27 +277,30 @@ class LocalAuthProvider:
         *,
         token_issuer: SessionTokenIssuer | None,
         admit_identity: AdmitIdentity | None,
-        retire_identity: RetireIdentity | None = None,
+        retire_identity: RetireIdentity,
     ) -> None:
         """Bind the credential store to the token issuer and the identity substrate.
 
         ``auth.db`` is CREDENTIALS ONLY from here on (D7). It answers "is this
         password right and is this email verified"; it does not decide who a
         person is or whether they may act. Those live in the ``identities``
-        substrate, which this provider reaches through ``admit_identity``
-        rather than by holding an engine -- so ``web.auth`` keeps its one-way
-        dependency on ``web.sessions``.
+        substrate, which this provider reaches through ``admit_identity`` and
+        ``retire_identity`` rather than by holding an engine -- so ``web.auth``
+        keeps its one-way dependency on ``web.sessions``.
 
         The token issuer owns expiry and the refresh bound. They used to be
         constructor arguments here, which meant every provider that ever
         wanted a token would have had its own copy of a security bound.
 
-        Both collaborators are OPTIONAL, and the two halves that split apart
-        are visible in the type rather than in a comment: a credential store
-        over ``auth.db``, and a session-issuing half needing the issuer and
-        the identity substrate. Use :meth:`for_account_administration` for the
-        first alone; mypy then forces every token path to say what it does
-        without them.
+        The issuer and the admission path are OPTIONAL, and the two halves
+        that split apart are visible in the type rather than in a comment: a
+        credential store over ``auth.db``, and a session-issuing half needing
+        the issuer and the identity substrate. Use
+        :meth:`for_account_administration` for the first alone; mypy then
+        forces every token path to say what it does without them. The
+        retirer is NOT optional: both halves delete credentials, and a
+        deletion that cannot retire is the inheritance defect, not a
+        smaller provider.
         """
         self._db_path = db_path
         self._token_issuer = token_issuer
@@ -612,12 +618,18 @@ class LocalAuthProvider:
         credential whose identity retirement failed leaves an unreachable
         identity that the next registration would inherit — worse, but it is
         the ordering that fails safe for the person who is still using the
-        account, and the retirement is retried by the next delete.
+        account.
+
+        Retirement runs whether or not a credential row was found. That is
+        what makes the failure above recoverable: an operator who re-runs
+        the removal after a retirement error gets "not found" for the
+        credential and the retirement it owed. Retiring is idempotent (the
+        natural key is rewritten, so a second pass finds nothing), and a
+        username that never logged in has no identity to retire.
         """
         with self._connect() as conn:
             deleted = self._delete_user_rows(conn, user_id)
-        if deleted and self._retire_identity is not None:
-            self._retire_identity(user_id)
+        self._retire_identity(user_id)
         return deleted
 
     def list_users(self) -> list[LocalUserAccount]:

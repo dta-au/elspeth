@@ -139,8 +139,8 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import (
     EnsureIdentityOutcome,
     ensure_identity,
+    local_identity_retirer,
     read_identity,
-    retire_identity,
 )
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
@@ -1086,19 +1086,14 @@ def _build_local_auth_provider(
         principal_is_active=_principal_is_active,
     )
 
-    def _retire_identity(username: str) -> None:
-        retire_identity(
-            session_engine,
-            provider="local",
-            subject=username,
-            reason="local credential deleted",
-        )
-
     return LocalAuthProvider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
-        retire_identity=_retire_identity,
+        # The same authority the CLI's ``composer users remove`` uses, so a
+        # local credential deleted from either surface retires its identity
+        # the same way.
+        retire_identity=local_identity_retirer(session_engine),
     )
 
 

@@ -24,7 +24,7 @@ from elspeth.web.auth.session_token import (
     SessionTokenIssuer,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, read_identity
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, local_identity_retirer, read_identity
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -145,4 +145,5 @@ def build_local_auth_provider(
             principal_is_active=_principal_is_active,
         ),
         admit_identity=_admit_identity,
+        retire_identity=local_identity_retirer(engine),
     )

@@ -39,6 +39,7 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.auth import IdentityProviderType
+from elspeth.web.auth.local import RetireIdentity
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.sessions.models import identities_table, quota_policies_table
 
@@ -475,3 +476,26 @@ def retire_identity(engine: Engine, *, provider: str, subject: str, reason: str)
         username=existing.username,
         access_state="disabled",
     )
+
+
+def local_identity_retirer(engine: Engine) -> RetireIdentity:
+    """The ONE retirement authority for a deleted local credential.
+
+    Every surface that deletes a local credential -- the web app's provider
+    and the ``elspeth composer users remove`` command -- gets its
+    ``retire_identity`` collaborator from here, so the provider, subject and
+    reason that :func:`retire_identity` binds on are decided in exactly one
+    place. Two hand-written closures agreeing today is not an invariant; a
+    CLI built without one at all (elspeth-9c171c00fa) left every
+    CLI-deleted username inheritable by its next holder.
+    """
+
+    def retire(username: str) -> None:
+        retire_identity(
+            engine,
+            provider="local",
+            subject=username,
+            reason="local credential deleted",
+        )
+
+    return retire

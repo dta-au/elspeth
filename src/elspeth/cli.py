@@ -38,6 +38,8 @@ from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_f
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine import Engine
+
     from elspeth.contracts import SinkProtocol, SourceProtocol
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
@@ -49,7 +51,7 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator import RowPlugin
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
     from elspeth.telemetry import TelemetryManager
-    from elspeth.web.auth.local import LocalAuthProvider
+    from elspeth.web.auth.local import LocalAuthProvider, RetireIdentity
 __all__ = [
     "app",
     "load_settings",  # Re-exported from config for convenience
@@ -1922,14 +1924,61 @@ def _resolve_composer_auth_db(*, data_dir: Path, auth_db: Path | None) -> Path:
     return path.expanduser().resolve()
 
 
-def _composer_auth_provider(auth_db: Path) -> LocalAuthProvider:
-    """Open auth.db for ACCOUNT administration only.
+def _resolve_composer_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
+    """The sessions store these commands retire identities in.
 
-    These commands create and delete local accounts. Neither touches a session
-    token, so this deliberately does not build a token issuer or reach the
-    identity substrate — the CLI runs from a shell with no sessions engine,
-    and requiring one to add a user would be asking for a collaborator the
-    operation never uses.
+    Same rule as the web app (``WebSettings.get_session_db_url``): an explicit
+    URL wins, then the ``ELSPETH_WEB__SESSION_DB_URL`` the container exports,
+    then ``data_dir/sessions.db``. The environment read is by the same name
+    ``settings_from_env`` would read it under, so a shell inside a deployed
+    container reaches the deployment's store without restating it.
+    """
+    from elspeth.web.config import resolve_session_db_url
+
+    configured = session_db_url if session_db_url is not None else os.environ.get("ELSPETH_WEB__SESSION_DB_URL")
+    return resolve_session_db_url(data_dir=data_dir.expanduser().resolve(), session_db_url=configured)
+
+
+def _composer_session_engine(session_db_url: str) -> Engine:
+    """Open the sessions store the way the web app opens it (PRAGMAs, pool)."""
+    from elspeth.web.schema_probe import postgres_engine_kwargs
+    from elspeth.web.sessions.engine import create_session_engine
+
+    return create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
+
+
+def _deferred_identity_retirer(session_db_url: str) -> RetireIdentity:
+    """A retirer that opens the sessions store only if it is ever asked to retire.
+
+    ``add`` never deletes, but the provider's retirer is required -- a
+    provider that cannot retire is the inheritance defect, not a smaller
+    provider -- and opening the store eagerly is not free: the engine
+    probes its PRAGMAs on construction, which creates an empty
+    ``sessions.db`` beside an ``auth.db`` the operator only meant to add a
+    user to. So ``add`` binds the real authority behind a first-call open.
+    """
+    from elspeth.web.sessions.identity_repository import local_identity_retirer
+
+    def retire(username: str) -> None:
+        engine = _composer_session_engine(session_db_url)
+        try:
+            local_identity_retirer(engine)(username)
+        finally:
+            engine.dispose()
+
+    return retire
+
+
+def _composer_auth_provider(auth_db: Path, *, retire_identity: RetireIdentity) -> LocalAuthProvider:
+    """Open auth.db for ACCOUNT administration, bound to a retirement authority.
+
+    These commands create and delete local accounts. Neither mints a session
+    token, so no token issuer or admission path is built. Deleting DOES
+    reach the identity substrate: a local credential's identity is keyed on
+    its username, and a deletion that leaves the identity in place hands
+    its admission, quota and history to the next holder of that username
+    (elspeth-9c171c00fa). The retirer is the same authority the web app
+    binds, ``local_identity_retirer``, never a CLI copy of it.
 
     The old ``ELSPETH_WEB__SECRET_KEY`` read is gone with the argument it fed.
     It defaulted to the literal ``"composer-cli-user-management"``, which was
@@ -1939,7 +1988,7 @@ def _composer_auth_provider(auth_db: Path) -> LocalAuthProvider:
     from elspeth.web.auth.local import LocalAuthProvider
 
     auth_db.parent.mkdir(parents=True, exist_ok=True)
-    return LocalAuthProvider.for_account_administration(auth_db)
+    return LocalAuthProvider.for_account_administration(auth_db, retire_identity=retire_identity)
 
 
 @composer_users_app.command("add")
@@ -1972,7 +2021,10 @@ def composer_users_add(
 ) -> None:
     """Add a local user for the Composer web interface."""
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
-    provider = _composer_auth_provider(db_path)
+    provider = _composer_auth_provider(
+        db_path,
+        retire_identity=_deferred_identity_retirer(_resolve_composer_session_db_url(data_dir=data_dir, session_db_url=None)),
+    )
     try:
         provider.create_user(
             username,
@@ -2000,6 +2052,11 @@ def composer_users_remove(
         "--auth-db",
         help="Explicit auth.db path; overrides --data-dir.",
     ),
+    session_db_url: str | None = typer.Option(
+        None,
+        "--session-db-url",
+        help="Sessions store URL; defaults to ELSPETH_WEB__SESSION_DB_URL, then <data-dir>/sessions.db.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -2007,7 +2064,10 @@ def composer_users_remove(
         help="Remove without an interactive confirmation prompt.",
     ),
 ) -> None:
-    """Remove a local Composer web user."""
+    """Remove a local Composer web user and retire the identity it was bound to."""
+    from elspeth.web.sessions.identity_repository import local_identity_retirer
+    from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
+
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
     if not db_path.exists():
         typer.echo(f"Error: composer auth database not found: {db_path}", err=True)
@@ -2015,10 +2075,30 @@ def composer_users_remove(
     if not yes and not typer.confirm(f"Remove composer user {username} from {db_path}?"):
         typer.echo("Aborted.")
         raise typer.Exit(1)
-    provider = _composer_auth_provider(db_path)
-    if not provider.delete_user(username):
-        typer.echo(f"Error: composer user not found: {username}", err=True)
-        raise typer.Exit(1)
+    resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
+    session_engine = _composer_session_engine(resolved_session_db_url)
+    provider = _composer_auth_provider(db_path, retire_identity=local_identity_retirer(session_engine))
+    # The store must carry the current schema BEFORE the credential goes:
+    # a deletion whose retirement then fails is the inheritance defect with
+    # extra steps. Same create-or-validate rule the web app applies to this
+    # URL at boot -- an empty store is initialised, a stale one is refused
+    # unaltered, and the credential is untouched either way until this
+    # returns.
+    if session_engine.dialect.name == "sqlite":
+        sqlite_store = session_engine.url.database
+        if sqlite_store is not None and sqlite_store != ":memory:":
+            Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        initialize_session_schema(session_engine)
+    except SessionSchemaError as exc:
+        typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    try:
+        if not provider.delete_user(username):
+            typer.echo(f"Error: composer user not found: {username}", err=True)
+            raise typer.Exit(1)
+    finally:
+        session_engine.dispose()
     typer.echo(f"Removed composer user {username} from {db_path}")
 
 
