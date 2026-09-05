@@ -1140,10 +1140,12 @@ async def login_callback(
     5. userinfo, only if the profile needs it, bound to the ID token's sub;
     6. ``map_identity`` — the Tier-3 boundary that yields the owned claims;
     7. the IdP's tokens are dropped: nothing after this line can see them;
-    8. upsert, admit, audit ``login``, THEN issue the handoff.
+    8. upsert, audit ``login``, THEN issue the handoff.
 
     The login row is written before the handoff exists, so a handoff can
-    never be redeemed for a login the trail does not record.
+    never be redeemed for a login the trail does not record. Admission
+    (active / pending / disabled) is NOT decided here — see the comment at
+    the upsert, and ``complete_login``.
 
     ``AuthProviderUnavailable`` is re-raised as itself: it is a 503 and the
     browser's remedy is to wait, so it must not be reclassified as an
@@ -1209,8 +1211,13 @@ async def login_callback(
     # ELSPETH never stores IdP tokens. From here on nothing can read them.
     del tokens
 
+    # NO admission check here, by ruling (R6, elspeth-61b35227fa comment
+    # 9156): the IdP has authenticated this person, and that fact is recorded
+    # as a ``login`` row whether or not the container has admitted them — a
+    # first login is exactly how a pending row comes to exist. The refusal
+    # for a pending or disabled identity belongs to ``complete``, where the
+    # token would otherwise be minted, and it is recorded there.
     identity = upsert_identity(claims)
-    admit(identity)
     record_login(identity)
 
     handoff = new_handoff_code()
