@@ -23,6 +23,7 @@ from sqlalchemy import Engine, event, func, insert, select, update
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.blobs import BlobForkWriteFence
 from elspeth.web.blobs.protocol import BlobForkFenceLostError
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
@@ -62,6 +63,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationClaimed,
     GuidedOperationFenceLostError,
     GuidedOperationTakenOver,
+    SessionForkAuthority,
     SessionForkParentAuthority,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -566,120 +568,131 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
 
 
 @pytest.mark.asyncio
-async def test_postgres_composer_preferences_stale_predecessor_writes_nothing_and_successor_wins(
+async def test_postgres_composer_preferences_concurrent_updates_serialise_under_the_session_write_lock(
     deployment,
-    monkeypatch,
 ) -> None:
+    """Two instances' preference updates serialise on the per-session write lock.
+
+    RETIRED property (elspeth-0b82d8e1db, class A): "a stale predecessor
+    holding an expired COMPOSE lease writes nothing and the successor wins".
+    ``update_composer_preferences`` deliberately takes NO session-operation
+    context since eb987d543 (elspeth-4d6c0dd0f5): a preferences PATCH must
+    never queue behind the route-level compose lock, or a mid-plan downgrade
+    could never beat an auto-commit. Its ordering authority is the per-session
+    write lock (``pg_advisory_xact_lock`` on PostgreSQL) held while the
+    transaction reads the prior row, appends the audit event and updates the
+    session. This proves that claim on real PostgreSQL across two instances:
+    the second update waits on the advisory lock until the first commits, its
+    ``prior`` is the first's ``current``, and the audit rows chain
+    ``prior_trust_mode`` in commit order.
+    """
     first_engine, second_engine, first, second, _shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
-    session_id = (await first.create_session(f"pg-preferences-{uuid4()}", "Preferences takeover", "local")).id
-    with first_engine.connect() as conn:
-        before = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one()
+    session_id = (await first.create_session(f"pg-preferences-{uuid4()}", "Preferences contention", "local")).id
 
-    predecessor = first.session_operation_authority.acquire(
-        session_id=session_id,
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=first.session_operation_owner_instance_id,
-        lease_seconds=first.session_operation_lease_seconds,
-    )
     entered = threading.Event()
     release = threading.Event()
-    original_record = session_service_module._SessionComposerMutations.record_preferences_changed
-    blocked = False
+    paused = False
 
-    def block_first_event(self: Any, *args: Any, **kwargs: Any) -> None:
-        nonlocal blocked
-        if not blocked:
-            blocked = True
-            entered.set()
-            if not release.wait(timeout=10):
-                raise AssertionError("preferences predecessor barrier timed out")
-        original_record(self, *args, **kwargs)
+    def pause_first_audit_insert(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        nonlocal paused
+        if paused or "insert into proposal_events" not in statement.lower():
+            return
+        paused = True
+        entered.set()
+        if not release.wait(timeout=10):
+            raise AssertionError("preferences contention barrier timed out")
 
-    monkeypatch.setattr(session_service_module._SessionComposerMutations, "record_preferences_changed", block_first_event)
-    predecessor_task = asyncio.create_task(
-        first.update_composer_preferences(
-            session_id,
-            trust_mode="explicit_approve",
-            density_default="medium",
-            actor="user:alice",
-            session_operation_context=predecessor,
-        )
-    )
-    assert await asyncio.to_thread(entered.wait, 10)
-    with second_engine.begin() as conn:
-        now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
-        conn.execute(
-            update(session_operation_fences_table)
-            .where(session_operation_fences_table.c.session_id == str(session_id))
-            .values(lease_expires_at=now - timedelta(seconds=1))
-        )
-        conn.execute(
-            update(web_instances_table)
-            .where(web_instances_table.c.instance_id == first.session_operation_owner_instance_id)
-            .values(lease_expires_at=now - timedelta(seconds=1))
-        )
-
-    successor_task = asyncio.create_task(
-        asyncio.to_thread(
-            second.session_operation_authority.acquire,
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=second.session_operation_owner_instance_id,
-            lease_seconds=second.session_operation_lease_seconds,
-        )
-    )
-    await asyncio.sleep(0.1)
-    assert not successor_task.done()
-    release.set()
-    with pytest.raises(SessionOperationFenceLost):
-        await predecessor_task
-    successor = await asyncio.wait_for(successor_task, timeout=10)
+    event.listen(first_engine, "before_cursor_execute", pause_first_audit_insert)
     try:
-        with second_engine.connect() as conn:
-            after_predecessor = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one()
-            assert after_predecessor.trust_mode == before.trust_mode
-            assert after_predecessor.density_default == before.density_default
-            assert after_predecessor.updated_at == before.updated_at
-            assert (
-                conn.execute(
-                    select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.session_id == str(session_id))
-                ).scalar_one()
-                == 0
+        first_task = asyncio.create_task(
+            first.update_composer_preferences(
+                session_id,
+                trust_mode="explicit_approve",
+                density_default="medium",
+                actor="user:alice",
             )
-
-        transition = await second.update_composer_preferences(
-            session_id,
-            trust_mode="explicit_approve",
-            density_default="medium",
-            actor="user:alice",
-            session_operation_context=successor,
         )
-        assert transition.prior.trust_mode == "auto_commit"
-        assert transition.prior.density_default == "high"
-        assert transition.current.trust_mode == "explicit_approve"
-        assert transition.current.density_default == "medium"
-        with second_engine.connect() as conn:
-            winner_row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one()
-            events = conn.execute(
-                select(proposal_events_table).where(
-                    proposal_events_table.c.session_id == str(session_id),
-                    proposal_events_table.c.event_type == "trust_mode.changed",
-                )
-            ).all()
-        assert winner_row.trust_mode == "explicit_approve"
-        assert winner_row.density_default == "medium"
-        assert len(events) == 1
-        assert events[0].proposal_id is None
-        assert events[0].payload == {
-            "trust_mode": "explicit_approve",
-            "prior_trust_mode": "auto_commit",
-            "density_default": "medium",
-        }
-        assert events[0].created_at == winner_row.updated_at
+        assert await asyncio.to_thread(entered.wait, 10)
+        second_task = asyncio.create_task(
+            second.update_composer_preferences(
+                session_id,
+                trust_mode="auto_commit",
+                density_default="low",
+                actor="user:bob",
+            )
+        )
+        # The first transaction holds the session's advisory lock with its
+        # audit insert paused. The second instance's transaction must be
+        # observable as a backend WAITING on an advisory lock, not interposed.
+        waiting_on_advisory_lock = 0
+        for _ in range(50):
+            with second_engine.connect() as conn:
+                waiting_on_advisory_lock = conn.exec_driver_sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' "
+                    "AND query LIKE '%%pg_advisory_xact_lock%%'"
+                ).scalar_one()
+            if waiting_on_advisory_lock:
+                break
+            await asyncio.sleep(0.1)
+        assert waiting_on_advisory_lock == 1
+        assert not second_task.done()
+        release.set()
+        first_transition = await asyncio.wait_for(first_task, timeout=10)
+        second_transition = await asyncio.wait_for(second_task, timeout=10)
     finally:
-        second.session_operation_authority.release(successor)
+        release.set()
+        event.remove(first_engine, "before_cursor_execute", pause_first_audit_insert)
+
+    assert (first_transition.prior.trust_mode, first_transition.prior.density_default) == ("auto_commit", "high")
+    assert (first_transition.current.trust_mode, first_transition.current.density_default) == ("explicit_approve", "medium")
+    assert second_transition.prior == first_transition.current
+    assert (second_transition.current.trust_mode, second_transition.current.density_default) == ("auto_commit", "low")
+    with second_engine.connect() as conn:
+        final_row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one()
+        events = conn.execute(
+            select(proposal_events_table)
+            .where(
+                proposal_events_table.c.session_id == str(session_id),
+                proposal_events_table.c.event_type == "trust_mode.changed",
+            )
+            .order_by(proposal_events_table.c.created_at)
+        ).all()
+    assert (final_row.trust_mode, final_row.density_default) == ("auto_commit", "low")
+    assert [row.payload for row in events] == [
+        {"trust_mode": "explicit_approve", "prior_trust_mode": "auto_commit", "density_default": "medium"},
+        {"trust_mode": "auto_commit", "prior_trust_mode": "explicit_approve", "density_default": "low"},
+    ]
+    assert [row.actor for row in events] == ["user:alice", "user:bob"]
+    assert events[0].created_at == first_transition.current.updated_at
+    assert events[1].created_at == second_transition.current.updated_at == final_row.updated_at
+
+
+def _fork_write_fence(
+    authority: SessionForkAuthority,
+    *,
+    source_session_id: UUID,
+    target_session_id: UUID,
+) -> BlobForkWriteFence:
+    """Mint the blob write fence exactly as the fork route does.
+
+    ``copy_blobs_for_fork`` takes an exact ``BlobForkWriteFence`` (the guided
+    lease projected onto the source/target pair), not the whole fork
+    authority; ``routes/sessions.py`` derives it from the parent's guided
+    fence, and so does this helper. A fence minted from a superseded
+    authority carries the old lease token and attempt, so the blob service
+    refuses it with ``BlobForkFenceLostError``.
+    """
+    guided = authority.parent.guided_fence
+    return BlobForkWriteFence(
+        source_session_id=source_session_id,
+        target_session_id=target_session_id,
+        operation_id=guided.operation_id,
+        lease_token=guided.lease_token,
+        attempt=guided.attempt,
+    )
 
 
 async def _claim(
@@ -847,7 +860,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
             parent.id,
             staged.session.id,
             staged.blob_plan,
-            staged.authority,
+            _fork_write_fence(staged.authority, source_session_id=parent.id, target_session_id=staged.session.id),
             checkpoint=checkpoint,
         )
 
@@ -866,7 +879,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
                 parent.id,
                 resumed.session.id,
                 resumed.blob_plan,
-                resumed.authority,
+                _fork_write_fence(resumed.authority, source_session_id=parent.id, target_session_id=resumed.session.id),
                 checkpoint=checkpoint,
             )
         )
@@ -900,7 +913,12 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
             actor="composer_route",
         )
     with pytest.raises(BlobForkFenceLostError):
-        await blobs.cleanup_blobs_for_fork(staged.authority)
+        await blobs.cleanup_blobs_for_fork(
+            parent.id,
+            staged.session.id,
+            operation_id,
+            live_write_fence=_fork_write_fence(staged.authority, source_session_id=parent.id, target_session_id=staged.session.id),
+        )
     with pytest.raises(SessionOperationConflictError):
         await first.archive_session(parent.id)
     with pytest.raises(SessionOperationConflictError):
@@ -1035,7 +1053,7 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
                     parent.id,
                     staged.session.id,
                     staged.blob_plan,
-                    staged.authority,
+                    _fork_write_fence(staged.authority, source_session_id=parent.id, target_session_id=staged.session.id),
                     checkpoint=checkpoint,
                 )
             )
