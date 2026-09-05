@@ -1128,6 +1128,9 @@ class TestAuthConfigEndpoint:
         assert body["oidc_client_id"] == "my-client-id"
         assert body["authorization_endpoint"] == "https://login.example.com/oauth2/authorize"
         assert body["token_endpoint"] == "https://login.example.com/oauth2/token"
+        # No app.state.sso on this app: the SPA's SSO button is hidden by the
+        # same fact that makes the /sso/* routes refuse (test_sso_routes.py).
+        assert body["sso_start_url"] is None
         assert set(body) == {
             "provider",
             "registration_mode",
@@ -1135,6 +1138,7 @@ class TestAuthConfigEndpoint:
             "oidc_client_id",
             "authorization_endpoint",
             "token_endpoint",
+            "sso_start_url",
         }
         assert "oidc_authorization_allowed_origins" not in body
         assert "oidc_audience_claim" not in body
