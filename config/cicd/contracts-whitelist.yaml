@@ -21,6 +21,13 @@ allowed_external_types:
   - "core/dag/group_bindings:GroupBindingRegistry"
   # Plugin bundle type shared between runtime construction, CLI, and web preflight
   - "plugins/infrastructure/runtime_factory:PluginBundle"
+  # The identity-retirement outcome and the Landscape auth recorder cross from
+  # web/ into the CLI: `composer users remove` audits its retirement to the
+  # same Landscape row the web app writes, through the same recorder. Neither
+  # is a serializable L0 DTO -- the outcome carries an IdentityRecord the
+  # authority just wrote, the recorder holds a Landscape URL and passphrase.
+  - "web/coordination/identity_authority:IdentityRetired"
+  - "web/auth/audit:AuthAuditRecorder"
   # SSRF safety type - security infrastructure, tightly coupled to validation logic
   - "core/security/web:SSRFSafeRequest"
   # Engine types used in testing factories - test infrastructure wraps these for convenience
