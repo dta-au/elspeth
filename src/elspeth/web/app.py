@@ -132,7 +132,12 @@ from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
+from elspeth.web.sessions.identity_repository import (
+    EnsureIdentityOutcome,
+    ensure_identity,
+    local_identity_retirer,
+    read_identity,
+)
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -1113,10 +1118,10 @@ def _build_local_auth_provider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
-        # The same retirement collaborator every surface that deletes a local
-        # credential binds, so the provider, subject and reason are decided
-        # in exactly one place.
-        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
+        # The same authority the CLI's ``composer users remove`` uses, so a
+        # local credential deleted from either surface retires its identity
+        # the same way.
+        retire_identity=local_identity_retirer(session_engine),
     )
 
 

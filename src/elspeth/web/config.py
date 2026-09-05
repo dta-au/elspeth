@@ -1381,10 +1381,19 @@ class WebSettings(BaseModel):
 
     def get_session_db_url(self) -> str:
         """Resolve session DB URL, defaulting to data_dir-relative path."""
-        if self.session_db_url is not None:
-            return self.session_db_url
-        db_path = self.data_dir / "sessions.db"
-        return f"sqlite:///{db_path}"
+        return resolve_session_db_url(data_dir=self.data_dir, session_db_url=self.session_db_url)
+
+
+def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
+    """Where the sessions store lives: the configured URL, else ``data_dir/sessions.db``.
+
+    Module-level so the ``composer users`` CLI -- which takes ``--data-dir``
+    rather than a full :class:`WebSettings` -- resolves the store by the same
+    rule the web app does, instead of by a copy of it.
+    """
+    if session_db_url is not None:
+        return session_db_url
+    return f"sqlite:///{data_dir / 'sessions.db'}"
 
 
 # Fields that accept JSON-encoded collection values from environment variables.
