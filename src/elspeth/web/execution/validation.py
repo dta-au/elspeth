@@ -23,7 +23,7 @@ only to be rejected pre-token at /execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -41,6 +41,7 @@ from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import (
     CompositionState,
 )
+from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
 )
@@ -253,6 +254,19 @@ def _identity_state_for_compiled_ids(authored_state: CompositionState) -> Compos
     return strict_state
 
 
+type _AuthoredDocumentValue = str | int | float | bool | None | Mapping[str, _AuthoredDocumentValue] | Sequence[_AuthoredDocumentValue]
+"""A value inside the compiled identity document, before or after freezing.
+
+The document is the composer's own :class:`LoweredPipelineDocument` after a
+YAML round trip, so every leaf is a JSON scalar: the graph mints node identity
+by ``canonical_json``-hashing the authored options this document supplies, and
+``canonical_json`` rejects anything else. The containers are the abstract
+``Mapping`` / ``Sequence`` because the same value is true on both sides of
+``freeze_fields``: dicts and lists on construction, ``MappingProxyType`` and
+tuples once frozen.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class _CompiledIdentityDocument:
     """Audit-safe authored pipeline document that feeds compiled node identity.
@@ -261,14 +275,21 @@ class _CompiledIdentityDocument:
     mapping exists solely to be handed to ``_audit_safe_plugin_configs`` as its
     ``audit_safe_settings``; naming that contract here keeps the identity
     document from travelling as an anonymous ``dict[str, Any]``.
+
+    ``config`` is the deep-frozen :class:`LoweredPipelineDocument` — the closed
+    set of top-level sections the composer lowers to — typed by what freezing
+    makes of it rather than as the ``TypedDict`` itself, because a frozen
+    ``MappingProxyType`` is not a ``dict`` and the type must stay true of the
+    stored value. The ``TypedDict`` reappears at the egress, where the thaw
+    rebuilds exactly that plain document.
     """
 
-    config: Mapping[str, Any]
+    config: Mapping[str, _AuthoredDocumentValue]
 
     def __post_init__(self) -> None:
         freeze_fields(self, "config")
 
-    def audit_safe_settings(self) -> Mapping[str, Any]:
+    def audit_safe_settings(self) -> LoweredPipelineDocument:
         """Detached plain-container copy for the preflight config swap.
 
         The swap's extractors parse the document nominally (``type(x) is dict``
@@ -277,7 +298,7 @@ class _CompiledIdentityDocument:
         Thawing builds fresh dicts and lists on every call: nothing the swap or
         a plugin does to them can reach ``config``.
         """
-        return cast(Mapping[str, Any], deep_thaw(self.config))
+        return cast(LoweredPipelineDocument, deep_thaw(self.config))
 
 
 def _compiled_identity_settings(
