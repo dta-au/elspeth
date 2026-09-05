@@ -43,7 +43,7 @@ Before diving into the documents below, know which sources they aggregate. **If 
 
 | Document | What it answers | Intended reader |
 |----------|-----------------|-----------------|
-| [`composer-guide.md`](composer-guide.md) | What the Composer can do, how guided/freeform authoring works, what readiness checks mean, and how a user completes or recovers a composition. | **Evaluators, programme teams, operators, and technical reviewers.** Public-facing / lightly technical. |
+| [`composer-guide.md`](composer-guide.md) | What the Composer can do, how guided/freeform authoring works, what readiness checks mean, and how a user completes or recovers a composition. | **Evaluators, program teams, operators, and technical reviewers.** Public-facing / lightly technical. |
 | [`platform-architecture.md`](platform-architecture.md) | Current runtime surfaces, trust boundaries, audit-first behaviour, configuration validation, external-system boundaries, and adopter responsibilities. | **Evaluators, technical leaders, architects, and assurance reviewers.** Public-facing / technical. |
 | [`sink-effect-recovery.md`](../runbooks/sink-effect-recovery.md) | The durable sink-effect recovery protocol, target-ledger requirements, and operator decisions after interrupted publication. | **Operators, plugin maintainers, and database owners.** Recovery runbook. |
 

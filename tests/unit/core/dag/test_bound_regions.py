@@ -22,6 +22,7 @@ from elspeth.core.config import (
 )
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.bound_regions import (
+    BOUND_REGION_EXIT_RULE,
     BoundRegion,
     compute_bound_regions,
     derive_escalation_fixpoint_bound,
@@ -1393,6 +1394,29 @@ class TestSESEWalk:
     def test_sink_inside_bound_region_rejected(self) -> None:
         with pytest.raises(GraphValidationError, match=r"reaches sink .* before the region's closer"):
             _build_fork_coalesce_with_in_region_sink()
+
+    def test_sink_inside_message_states_the_exit_rule_scoped_to_success_paths(self) -> None:
+        """Tripwire for elspeth-46825d0055.
+
+        The sink-inside rejection is the sentence an operator re-derives the
+        rule-4 invariant from. It shipped as an unqualified universal ("no token
+        may leave a bound region except through its closer") for 10 days after
+        12 engine runs had refuted it: an on_error DIVERT leg CAN leave a bound
+        region, by construction, and the loss ledger carries it
+        (``test_on_error_divert_inside_region_stays_legal`` below is the
+        build-time witness). Pin three things: the message carries the shared
+        rule sentence verbatim (the composer mirror imports the same constant,
+        so one edit moves both surfaces); the sentence scopes the guarantee to
+        success paths and names the DIVERT exception; and the refuted
+        unqualified form never comes back.
+        """
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_fork_coalesce_with_in_region_sink()
+        message = str(exc_info.value)
+        assert BOUND_REGION_EXIT_RULE in message
+        assert "on a success path except through its closer" in BOUND_REGION_EXIT_RULE
+        assert "DIVERT" in BOUND_REGION_EXIT_RULE
+        assert "No token may leave a bound region except" not in message
 
     def test_on_error_divert_inside_region_stays_legal(self) -> None:
         # F6 (review): pin something OBSERVABLE, not just "did not raise" —

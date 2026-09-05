@@ -92,6 +92,7 @@ from elspeth.engine.orchestrator.run_state import (
     _RunFailedWithPartialResultError,
 )
 from elspeth.engine.orchestrator.run_status import (
+    assert_bound_groups_settled_from_audit,
     cli_completion_for,
     derive_resume_terminal_status_from_audit,
 )
@@ -818,11 +819,17 @@ class ResumeCoordinator:
         *,
         factory: RecorderFactory,
         run_id: str,
+        graph: ExecutionGraph,
         coordination_token: CoordinationToken,
         heartbeat: RunHeartbeatThread,
         duration_seconds: float,
     ) -> RunResult:
         """Complete the shared successful-resume ceremony."""
+        # Durable post-condition, same as the fresh-run path
+        # (elspeth-76e936568e): no bound group converged unsettled. Raises
+        # before the terminal status is derived, so it takes the resume
+        # failure ceremony like sweep_deferred_invariants_or_crash.
+        assert_bound_groups_settled_from_audit(self._db, run_id, graph)
         terminal_status, audit_counters = derive_resume_terminal_status_from_audit(factory, run_id)
         factory.run_lifecycle.finalize_run(run_id, status=terminal_status, token=coordination_token)
         result = audit_counters.to_run_result(run_id, terminal_status)
@@ -1099,6 +1106,7 @@ class ResumeCoordinator:
                 return self._finalize_successful_resume(
                     factory=factory,
                     run_id=run_id,
+                    graph=graph,
                     coordination_token=coordination_token,
                     heartbeat=_heartbeat,
                     duration_seconds=0.0,
@@ -1177,6 +1185,7 @@ class ResumeCoordinator:
             return self._finalize_successful_resume(
                 factory=factory,
                 run_id=run_id,
+                graph=graph,
                 coordination_token=coordination_token,
                 heartbeat=_heartbeat,
                 duration_seconds=time.perf_counter() - resume_start_time,

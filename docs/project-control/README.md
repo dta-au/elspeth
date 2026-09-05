@@ -13,7 +13,7 @@ ADR-024 defines four living artefacts, each one to two pages. One is written:
 | Milestone and forecast register — commitments, forecasts, and change | Not written |
 
 The folder also holds working documents that are **not** part of the ADR-024
-control set and do not substitute for the artefacts above: a programme
+control set and do not substitute for the artefacts above: a program
 work-package inventory and a product requirements document, with PDF
 renderings of all three documents for briefing. Where an artefact is not
 written, ADR-024's requirement for it stands unmet; no other document in this

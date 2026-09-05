@@ -25,13 +25,51 @@ from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import derive_terminal_run_status
+from elspeth.core.checkpoint.recovery import check_group_satisfiability_resumable, group_binding_view_from_graph
 from elspeth.engine.orchestrator.counter_classification import TERMINAL_PAIR_COUNTER_EFFECTS, apply_counter_increments
 from elspeth.engine.orchestrator.types import ExecutionCounters
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit import TokenOutcome
     from elspeth.contracts.run_result import RunResult
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.core.landscape import LandscapeDB
     from elspeth.core.landscape.factory import RecorderFactory
+
+
+def assert_bound_groups_settled_from_audit(db: LandscapeDB, run_id: str, graph: ExecutionGraph) -> None:
+    """End-of-run post-condition: every bound group settled, judged from the audit DB.
+
+    The end-of-input drain (``leader_drain.run_end_of_input_barrier_flush``)
+    keeps looping while ``has_blocked_barrier_work()`` is true — a proxy that
+    is only accidentally correlated with "did every group close": a buffered
+    sibling holds a BLOCKED row, so a multi-member group with one missing
+    member fails closed there, but a group whose EVERY member was removed
+    without a ``group_losses`` row leaves nothing buffered, the proxy reads
+    false, and the run converged quietly with the group never closed
+    (elspeth-76e936568e; the single-member group is the minimal shape).
+
+    This asks the durable question instead, and asks it of the ONE existing
+    authority: the spec §8 group-satisfiability gate
+    (:func:`check_group_satisfiability_resumable`), which already serves the
+    advisory ``can_resume`` surface and the enforcing ``resume()`` entry
+    guard — every minted member of every bound group must be live, arrived at
+    its closer, or named in ``group_losses``. The verdict text is the gate's
+    own (``check.reason``), not restated here. Runs on both terminal paths
+    (fresh run and successful resume) BEFORE the terminal status is derived,
+    while the run is still RUNNING, so a refusal takes the same failure
+    ceremony as ``sweep_deferred_invariants_or_crash``: the run finalizes
+    FAILED and the exception propagates. Unbound groups never refuse; a
+    pipeline with no bound groups issues no member queries at all.
+    """
+    gate = check_group_satisfiability_resumable(db, run_id, group_binding_view_from_graph(graph))
+    if gate.unsatisfiable_members:
+        raise OrchestrationInvariantError(
+            f"Run '{run_id}' reached end of run with bound-group members that never settled: "
+            f"{gate.check.reason}. The end-of-input drain saw no BLOCKED hold because no sibling was "
+            "buffered; the loss ledger, not leader memory, decides whether a group closed "
+            "(elspeth-76e936568e)."
+        )
 
 
 def _require_routed_sink_name(outcome_record: TokenOutcome, pair: tuple[TerminalOutcome | None, TerminalPath]) -> str:
