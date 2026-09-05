@@ -513,7 +513,9 @@ output identityClientId string = identity.outputs.clientId
 output keyVaultName string = keyVault.outputs.name
 output keyVaultUri string = keyVault.outputs.uri
 output postgresServerResourceId string = postgres.outputs.resourceId
-output postgresFqdn string = postgres.outputs.fqdn
+// AVM types fqdn as nullable (tryGet over fullyQualifiedDomainName); a created
+// Flexible Server always carries one, so assert it rather than widen the output.
+output postgresFqdn string = postgres.outputs.fqdn!
 output logAnalyticsWorkspaceResourceId string = logAnalytics.outputs.resourceId
 output logAnalyticsCustomerId string = logAnalytics.outputs.logAnalyticsWorkspaceId
 output fileStorageAccountName string = fileStorage.outputs.name
