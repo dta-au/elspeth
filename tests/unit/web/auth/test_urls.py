@@ -11,7 +11,6 @@ from elspeth.web.auth.urls import (
     https_url_origin,
     validate_discovered_endpoints,
     validate_oidc_browser_endpoints,
-    validate_oidc_browser_origins,
 )
 
 ISSUER = "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id"
@@ -32,16 +31,12 @@ def test_same_issuer_origin_pair_is_accepted_without_allowlist() -> None:
     )
 
 
-def test_cross_origin_pair_requires_exact_allowlist_member() -> None:
+def test_cross_origin_pair_is_refused_there_is_no_allowlist() -> None:
+    """Cognito's hosted domain is off the pool issuer's origin. The legacy
+    browser path no longer carries an allowlist for that; the SSO profile's
+    ``sso_endpoint_origins`` serves it."""
     with pytest.raises(ValueError, match="browser endpoint origin is not allowed"):
         validate_oidc_browser_endpoints(AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT, issuer=ISSUER)
-
-    assert validate_oidc_browser_endpoints(
-        AUTHORIZATION_ENDPOINT,
-        TOKEN_ENDPOINT,
-        issuer=ISSUER,
-        allowed_origins=(COGNITO_ORIGIN,),
-    ) == (AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT)
 
 
 @pytest.mark.parametrize(
@@ -85,7 +80,6 @@ def test_adversarial_endpoint_values_fail_closed(
             authorization_endpoint,
             token_endpoint,
             issuer="https://issuer.example.com/pool",
-            allowed_origins=("https://issuer.example.com",),
         )
     rendered = str(raised.value)
     if authorization_endpoint:
@@ -134,34 +128,7 @@ def test_endpoint_paths_preserve_ordinary_non_root_segments() -> None:
 
 
 @pytest.mark.parametrize(
-    "origin",
-    [
-        "http://example.com",
-        "https://example.com/path",
-        "https://example.com/;params",
-        "https://example.com/?query=secret",
-        "https://example.com/#fragment",
-        "https://user@example.com",
-        "https://user:password@example.com",
-        "https://*.example.com",
-        "https://example.com.",
-        "https://bücher.example",
-    ],
-)
-def test_allowlist_entries_are_bare_safe_origins(origin: str) -> None:
-    with pytest.raises(ValueError, match="allowed origin") as raised:
-        validate_oidc_browser_origins((origin,))
-    assert origin not in str(raised.value)
-
-
-def test_allowlist_normalizes_and_rejects_duplicate_origins() -> None:
-    assert validate_oidc_browser_origins((" https://EXAMPLE.com:8443/ ",)) == ("https://example.com:8443",)
-    with pytest.raises(ValueError, match="duplicate"):
-        validate_oidc_browser_origins(("https://example.com", "https://example.com:443/"))
-
-
-@pytest.mark.parametrize(
-    "allowed_origin",
+    "issuer_origin",
     [
         "https://sibling.auth.ap-southeast-2.amazoncognito.com",
         "https://auth.ap-southeast-2.amazoncognito.com",
@@ -170,38 +137,31 @@ def test_allowlist_normalizes_and_rejects_duplicate_origins() -> None:
         "https://xn--bcher-kva.example",
     ],
 )
-def test_origin_equality_does_not_use_suffix_or_similarity(allowed_origin: str) -> None:
+def test_origin_equality_does_not_use_suffix_or_similarity(issuer_origin: str) -> None:
+    """The issuer's origin is the only origin the pair may use, compared exactly."""
     with pytest.raises(ValueError, match="browser endpoint origin is not allowed"):
-        validate_oidc_browser_endpoints(
-            AUTHORIZATION_ENDPOINT,
-            TOKEN_ENDPOINT,
-            issuer=ISSUER,
-            allowed_origins=(allowed_origin,),
-        )
+        validate_oidc_browser_endpoints(AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT, issuer=f"{issuer_origin}/pool")
 
 
 def test_default_port_and_mixed_host_case_compare_by_normalized_origin() -> None:
     assert validate_oidc_browser_endpoints(
         "https://EXAMPLE.AUTH.ap-southeast-2.amazoncognito.com:443/oauth2/authorize",
         "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-        issuer=ISSUER,
-        allowed_origins=(COGNITO_ORIGIN,),
+        issuer=f"{COGNITO_ORIGIN}/pool",
     )[0].startswith("https://EXAMPLE.AUTH")
 
 
-def test_nondefault_port_must_match_allowlist_and_both_endpoints() -> None:
+def test_nondefault_port_must_match_the_issuer_and_both_endpoints() -> None:
     with pytest.raises(ValueError, match="same origin"):
         validate_oidc_browser_endpoints(
             f"{COGNITO_ORIGIN}:8443/oauth2/authorize",
             f"{COGNITO_ORIGIN}/oauth2/token",
-            issuer=ISSUER,
-            allowed_origins=(f"{COGNITO_ORIGIN}:8443",),
+            issuer=f"{COGNITO_ORIGIN}:8443/pool",
         )
     assert validate_oidc_browser_endpoints(
         f"{COGNITO_ORIGIN}:8443/oauth2/authorize",
         f"{COGNITO_ORIGIN}:8443/oauth2/token",
-        issuer=ISSUER,
-        allowed_origins=(f"{COGNITO_ORIGIN}:8443",),
+        issuer=f"{COGNITO_ORIGIN}:8443/pool",
     )
 
 
@@ -209,8 +169,7 @@ def test_public_ipv6_literal_compares_using_canonical_address() -> None:
     assert validate_oidc_browser_endpoints(
         "https://[2606:4700:4700::1111]/authorize",
         "https://[2606:4700:4700:0:0:0:0:1111]:443/token",
-        issuer="https://issuer.example.com/pool",
-        allowed_origins=("https://[2606:4700:4700::1111]",),
+        issuer="https://[2606:4700:4700::1111]/pool",
     )
 
 
@@ -219,8 +178,7 @@ def test_authorization_and_token_endpoint_origins_must_match() -> None:
         validate_oidc_browser_endpoints(
             AUTHORIZATION_ENDPOINT,
             "https://other.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-            issuer=ISSUER,
-            allowed_origins=(COGNITO_ORIGIN, "https://other.auth.ap-southeast-2.amazoncognito.com"),
+            issuer=f"{COGNITO_ORIGIN}/pool",
         )
 
 
@@ -235,12 +193,7 @@ def test_authorization_and_token_endpoint_origins_must_match() -> None:
 )
 def test_embedding_allowed_url_does_not_authorize_initial_destination(smuggled: str) -> None:
     with pytest.raises(ValueError):
-        validate_oidc_browser_endpoints(
-            smuggled,
-            TOKEN_ENDPOINT,
-            issuer=ISSUER,
-            allowed_origins=(COGNITO_ORIGIN,),
-        )
+        validate_oidc_browser_endpoints(smuggled, TOKEN_ENDPOINT, issuer=f"{COGNITO_ORIGIN}/pool")
 
 
 class _LyingStr(str):
@@ -267,8 +220,8 @@ class _LyingStr(str):
 )
 def test_url_values_must_be_exact_str_not_a_subclass_or_lookalike(impostor: Any) -> None:
     _LyingStr.consulted = False
-    with pytest.raises(ValueError, match="OIDC browser allowed origin failed string check"):
-        validate_oidc_browser_origins((impostor,))
+    with pytest.raises(ValueError, match="issuer failed string check"):
+        https_url_origin(impostor)
     assert _LyingStr.consulted is False
 
 
@@ -330,7 +283,7 @@ def _endpoints(**overrides: Any) -> DiscoveredEndpoints:
         "userinfo_endpoint": f"{_SSO_ORIGIN}/userinfo",
     }
     base.update(overrides)
-    return DiscoveredEndpoints(**base)  # type: ignore[arg-type]
+    return DiscoveredEndpoints(**base)
 
 
 # --- positive controls ----------------------------------------------------

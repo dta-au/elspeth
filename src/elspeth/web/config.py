@@ -33,7 +33,6 @@ from elspeth.web.auth.urls import (
     DiscoveredEndpoints,
     validate_discovered_endpoints,
     validate_oidc_browser_endpoints,
-    validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
 from elspeth.web.composer.reasoning import ReasoningEffort
@@ -507,7 +506,6 @@ class WebSettings(BaseModel):
     oidc_client_id: str | None = None
     oidc_authorization_endpoint: str | None = None
     oidc_token_endpoint: str | None = None
-    oidc_authorization_allowed_origins: tuple[str, ...] = ()
     oidc_audience_claim: Literal["aud", "client_id"] = "aud"
     entra_tenant_id: str | None = None
 
@@ -692,11 +690,6 @@ class WebSettings(BaseModel):
         if value is not None and not is_well_formed_aws_region(value):
             raise ValueError("deployment_aws_region must be a non-blank well-formed AWS region identifier")
         return value
-
-    @field_validator("oidc_authorization_allowed_origins")
-    @classmethod
-    def _validate_oidc_authorization_allowed_origins(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        return validate_oidc_browser_origins(v)
 
     @field_validator("landscape_url", "session_db_url")
     @classmethod
@@ -1042,8 +1035,6 @@ class WebSettings(BaseModel):
         if self.auth_provider == "local":
             if self.oidc_audience_claim != "aud":
                 raise ValueError("Local auth does not permit the OIDC client_id audience claim mode")
-            if self.oidc_authorization_allowed_origins:
-                raise ValueError("Local auth does not permit the OIDC browser origin allowlist")
             configured = [
                 name
                 for name, val in (
@@ -1052,10 +1043,6 @@ class WebSettings(BaseModel):
                     ("oidc_client_id", self.oidc_client_id),
                     ("oidc_authorization_endpoint", self.oidc_authorization_endpoint),
                     ("oidc_token_endpoint", self.oidc_token_endpoint),
-                    (
-                        "oidc_authorization_allowed_origins",
-                        self.oidc_authorization_allowed_origins or None,
-                    ),
                     ("entra_tenant_id", self.entra_tenant_id),
                 )
                 if val is not None
@@ -1085,7 +1072,6 @@ class WebSettings(BaseModel):
                     self.oidc_authorization_endpoint,
                     self.oidc_token_endpoint,
                     issuer=self.oidc_issuer,
-                    allowed_origins=self.oidc_authorization_allowed_origins,
                 )
                 object.__setattr__(self, "oidc_authorization_endpoint", authorization_endpoint)
                 object.__setattr__(self, "oidc_token_endpoint", token_endpoint)
@@ -1103,8 +1089,6 @@ class WebSettings(BaseModel):
             ]
             if missing:
                 raise ValueError(f"Entra auth requires: {', '.join(missing)}")
-            if self.oidc_authorization_allowed_origins:
-                raise ValueError("Entra auth does not permit the OIDC browser origin allowlist")
             if self.oidc_audience_claim != "aud":
                 raise ValueError("Entra auth does not permit the OIDC client_id audience claim mode")
             if (self.oidc_authorization_endpoint is None) != (self.oidc_token_endpoint is None):
@@ -1403,7 +1387,6 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     {
         "cors_origins",
         "server_secret_allowlist",
-        "oidc_authorization_allowed_origins",
         # Both arrive from the ECS task definition as JSON, so they decode the
         # same way every other collection setting does.
         "sso_endpoint_origins",
