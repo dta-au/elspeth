@@ -512,7 +512,6 @@ class TierModelVisitor(ast.NodeVisitor):
         "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"AzureSearchProvider._parse_response"}),
         "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"ChromaSearchProvider._parse_and_build_chunks"}),
         "plugins/transforms/azure/prompt_shield.py": frozenset({"AzurePromptShield._analyze_prompt"}),
-        "web/auth/local.py": frozenset({"_required_visible_string_claim"}),
         "web/auth/oidc.py": frozenset(
             {
                 "JWKSTokenValidator._get_jwk_algorithm",
@@ -632,7 +631,7 @@ class TierModelVisitor(ast.NodeVisitor):
             }
         ),
         "web/sessions/_auto_title.py": frozenset({"_auto_title_exception_class", "maybe_auto_title_session"}),
-        "web/sessions/service.py": frozenset({"SessionServiceImpl._unwrap_envelope", "_patch_llm_transform_prompt"}),
+        "web/sessions/service.py": frozenset({"SessionServiceImpl._unwrap_envelope"}),
         "web/sessions/telemetry.py": frozenset({"observed_value"}),
     }
 
