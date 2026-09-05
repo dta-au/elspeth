@@ -1050,7 +1050,6 @@ class SsoClient:
     transaction_secret: str = field(repr=False)
     public_base_url: str
     endpoints: DiscoveredEndpoints
-    id_token_algorithms: tuple[str, ...]
     userinfo: bool
     scopes: tuple[str, ...] = ("openid", "profile", "email")
 
@@ -1183,9 +1182,10 @@ async def login_callback(
     )
 
     try:
+        # The accepted algorithms are not passed here: the validator was
+        # built with the profile's pinned list and owns it.
         id_claims = await validator.decode_id_token_with_refresh(
             tokens.id_token,
-            algorithms=client.id_token_algorithms,
             audience=client.client_id,
             nonce=transaction.nonce,
             client_id=client.client_id,

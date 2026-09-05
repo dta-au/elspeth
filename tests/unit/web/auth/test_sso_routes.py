@@ -177,13 +177,16 @@ def _runtime(idp: FakeIdP, substrate: _Substrate, *, jwks_transport: httpx.Async
             jwks_uri=idp.jwks_uri,
             userinfo_endpoint=idp.userinfo_endpoint,
         ),
-        id_token_algorithms=("RS256",),
         userinfo=False,
     )
     return SsoRuntime(
         client=client,
         validator=JWKSTokenValidator(
-            issuer=idp.issuer, audience=idp.client_id, jwks_uri=idp.jwks_uri, transport=jwks_transport or idp.transport()
+            issuer=idp.issuer,
+            audience=idp.client_id,
+            algorithms=("RS256",),
+            jwks_uri=idp.jwks_uri,
+            transport=jwks_transport or idp.transport(),
         ),
         claim_checks=lambda _claims: None,
         map_identity=_mechanics.map_generic_oidc,

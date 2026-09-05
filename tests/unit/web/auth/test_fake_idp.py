@@ -266,13 +266,12 @@ class TestHarnessAgainstTheRealValidator:
 
     @staticmethod
     def _decode(idp: FakeIdP, *, nonce: str = "n-1", subject: str = "ada"):
-        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id)
+        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, algorithms=("RS256",))
         code = idp.authorize(nonce=nonce, subject=subject)
         token = idp.mint_id_token(idp.codes[code])
         return validator.decode_id_token(
             token,
             idp.jwks_document(),
-            algorithms=["RS256"],
             audience=idp.client_id,
             nonce=nonce,
             client_id=idp.client_id,
@@ -318,14 +317,13 @@ class TestHarnessAgainstTheRealValidator:
 
     def test_a_replayed_nonce_from_another_login_is_refused(self, idp: FakeIdP) -> None:
         """The nonce binds the token to THIS browser's login attempt."""
-        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id)
+        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, algorithms=("RS256",))
         code = idp.authorize(nonce="nonce-from-a-different-login", subject="ada")
         token = idp.mint_id_token(idp.codes[code])
         with pytest.raises(AuthenticationError, match="Invalid token"):
             validator.decode_id_token(
                 token,
                 idp.jwks_document(),
-                algorithms=["RS256"],
                 audience=idp.client_id,
                 nonce="the-nonce-this-browser-actually-sent",
                 client_id=idp.client_id,
@@ -334,14 +332,13 @@ class TestHarnessAgainstTheRealValidator:
     def test_a_token_signed_by_a_different_provider_is_refused(self, idp: FakeIdP) -> None:
         """Two providers, independent keys — the JWKS must not verify a stranger."""
         other = FakeIdP(issuer=idp.issuer, client_id=idp.client_id)
-        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id)
+        validator = JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, algorithms=("RS256",))
         code = other.authorize(nonce="n-1", subject="ada")
         token = other.mint_id_token(other.codes[code])
         with pytest.raises(AuthenticationError, match="Invalid token"):
             validator.decode_id_token(
                 token,
                 idp.jwks_document(),  # OUR provider's keys, THEIR token
-                algorithms=["RS256"],
                 audience=idp.client_id,
                 nonce="n-1",
                 client_id=idp.client_id,
