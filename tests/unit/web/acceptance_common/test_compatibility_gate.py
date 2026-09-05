@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -204,14 +205,21 @@ class TestCommand:
 
     def test_module_is_executable_and_mirrors_jq_exit_codes(self, tmp_path: Path) -> None:
         path = self._write(tmp_path, _record("B"))
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(str(Path(__file__).resolve().parents[4] / part) for part in ("src", "elspeth-lints/src"))
+        # Spawn the interpreter running this test (sys.executable), never a bare
+        # ``python`` from PATH: on a checkout whose shell lacks the venv that
+        # resolves to the system interpreter and the import fails on a missing
+        # dependency, not on the module under test. The child inherits nothing
+        # from the calling shell: cwd is the scratch dir (so the module is found
+        # through PYTHONPATH, not through an editable install or the cwd), and
+        # the environment is exactly the two source roots plus a default PATH.
+        source_roots = os.pathsep.join(str(Path(__file__).resolve().parents[4] / part) for part in ("src", "elspeth-lints/src"))
         completed = subprocess.run(
-            ["python", "-m", "elspeth.web._acceptance_common.compatibility_gate", "--record", str(path), "--scenario-id", "B"],
+            [sys.executable, "-m", "elspeth.web._acceptance_common.compatibility_gate", "--record", str(path), "--scenario-id", "B"],
             capture_output=True,
             text=True,
             check=False,
-            env=env,
+            cwd=tmp_path,
+            env={"PYTHONPATH": source_roots, "PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         assert completed.returncode == 0, completed.stderr
         assert json.loads(completed.stdout)["passed"] is True
