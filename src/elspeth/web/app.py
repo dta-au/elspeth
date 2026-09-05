@@ -72,12 +72,6 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_endpoints,
     validate_oidc_issuer,
 )
-from elspeth.web.aws_ecs_startup import (
-    AwsEcsSchemaNotReadyError,
-    enforce_aws_ecs_contract,
-    require_runtime_directories_mounted,
-    validate_only_schema_or_raise,
-)
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
@@ -101,30 +95,22 @@ from elspeth.web.coordination.membership_lifecycle import (
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
-from elspeth.web.external_state_startup import (
-    _CONNECT_TIMEOUT_SECONDS,
-    ExternalStateSchemaNotReadyError,
-    enforce_external_state_contract,
-)
-from elspeth.web.external_state_startup import (
-    require_runtime_directories_mounted as require_external_runtime_directories_mounted,
-)
-from elspeth.web.external_state_startup import (
-    validate_only_schema_or_raise as validate_external_schema_or_raise,
-)
+from elspeth.web.external_state_startup import _CONNECT_TIMEOUT_SECONDS
 from elspeth.web.key_derivation import (
     derive_binding_generation_key,
     derive_session_token_key,
     derive_user_secret_master_key,
 )
 from elspeth.web.landscape_access import open_landscape_db
+from elspeth.web.middleware.instance_identity import InstanceIdentityMiddleware
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
@@ -1175,14 +1161,27 @@ def _create_app(
 
     resolved_state_mode = resolve_deployment_state_mode(settings)
     external_state = resolved_state_mode == "external-postgresql"
+    # One closed profile per deployment target names the startup hooks this
+    # process boots through and the platform variables that carry its replica
+    # identity (web/deployment_profiles.py); app.py never branches on the
+    # target vocabulary itself.
+    profile = deployment_startup_profile(settings.deployment_target)
+    # The identity this process presents: on every response as
+    # X-Elspeth-Instance, in /api/system/status, and as the owner of the
+    # session-operation fences it acquires. Minted once per process unless
+    # WebSettings.instance_id pins it.
+    instance_id = resolve_instance_id(settings)
+    # Tier-3 read of the platform-stamped revision/replica names (absent off
+    # the platform; a malformed value refuses the boot).
+    platform_identity = read_platform_identity(profile)
 
     # Reject incomplete deployment policy before installing the process-global
     # provider. A failed first create_app() must not strand a later corrected
-    # boot on a provider selected from invalid settings.
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-        enforce_aws_ecs_contract(settings, resolved_state_mode=resolved_state_mode)
-    elif external_state:
-        enforce_external_state_contract(settings, resolved_state_mode=resolved_state_mode)
+    # boot on a provider selected from invalid settings. The aws-ecs contract
+    # is enforced in every state mode (it is the contract that rejects a
+    # non-external mode); the provider-neutral one only under external state.
+    if external_state or profile.contract_family == "aws-ecs":
+        profile.enforce_contract(settings, resolved_state_mode=resolved_state_mode)
 
     operator_runtime = bootstrap_operator_telemetry(settings)
     operator_meter = operator_runtime.provider.get_meter(__name__, __version__)
@@ -1400,15 +1399,21 @@ def _create_app(
     # a body-too-large rejection has no useful pairing to a slog event.
     app.add_middleware(_BodySizeLimitMiddleware)
     app.add_middleware(_BrowserDocumentHeadersMiddleware)
+    # Instance identity registered after every other middleware so it runs
+    # OUTERMOST: every response — the body-size 413, the request-id
+    # middleware's synthesized 500, error envelopes — carries
+    # X-Elspeth-Instance, because a probe scoring a cross-replica conflict
+    # needs the identity of the replica that refused as much as the one that
+    # served. It only wraps send; nothing inbound is read.
+    app.add_middleware(InstanceIdentityMiddleware, instance_id=instance_id)
 
     app.state.settings = settings
+    app.state.instance_id = instance_id
+    app.state.platform_identity = platform_identity
 
     external_session_engine: Engine | None = None
     if external_state:
-        if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-            require_runtime_directories_mounted(settings)
-        else:
-            require_external_runtime_directories_mounted(settings)
+        profile.require_runtime_directories_mounted(settings)
         raw_session_url = settings.session_db_url
         assert raw_session_url is not None
         try:
@@ -1418,21 +1423,12 @@ def _create_app(
                 **postgres_engine_kwargs(raw_session_url),
             )
         except (SQLAlchemyError, ImportError):
-            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-                raise AwsEcsSchemaNotReadyError(
-                    "AWS ECS session_schema engine could not be constructed. Run 'elspeth doctor aws-ecs' for full diagnostics."
-                ) from None
-            raise ExternalStateSchemaNotReadyError(
-                "External-state session_schema engine could not be constructed. Run 'elspeth doctor deployment' for full diagnostics."
-            ) from None
+            raise profile.session_engine_not_ready_error() from None
         session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         try:
-            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-                validate_only_schema_or_raise(settings, external_session_engine)
-            else:
-                validate_external_schema_or_raise(settings, external_session_engine)
+            profile.validate_only_schema_or_raise(settings, external_session_engine)
         except BaseException as exc:
             _run_session_engine_finalizer(session_engine_finalizer, primary_error=exc)
             raise
@@ -1645,6 +1641,9 @@ def _create_app(
         session_operation_authority=session_operation_authority,
         audit_access_log_authority=audit_access_log_authority,
         skill_markdown_history_authority=skill_markdown_history_authority,
+        # The fence rows this replica writes name the same identity the wire
+        # shows, so a 409 from one replica pairs with the 2xx from the other.
+        owner_instance_id=instance_id,
     )
     app.state.session_service = session_service
 
@@ -2103,6 +2102,17 @@ def _create_app(
             # renders it as the classification banner in the reserved
             # overlay band.
             "classification_banner": settings.classification_banner,
+            # The answering process's identity — the same value every
+            # response carries as X-Elspeth-Instance and the session-
+            # operation fences record as their owner; distinct per replica.
+            "instance_id": instance_id,
+            "deployment_target": settings.deployment_target,
+            # Platform-stamped revision/replica names when the target's
+            # platform publishes them through the environment (Azure
+            # Container Apps: CONTAINER_APP_REVISION /
+            # CONTAINER_APP_REPLICA_NAME); null elsewhere.
+            "deployment_revision": platform_identity.revision,
+            "deployment_replica": platform_identity.replica,
         }
 
     # --- Prometheus metrics scrape endpoint ---
