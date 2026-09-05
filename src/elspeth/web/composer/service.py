@@ -209,6 +209,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
@@ -2098,6 +2099,83 @@ async def surface_pending_interpretation_reviews_for_state(
             session_id=session_id,
             current_state_id=current_state_id,
         )
+    if not _has_unsurfaced_site(state, already_surfaced):
+        return
+    # Surfacing is a write: the interpretation writer admits only COMPOSE or
+    # PROPOSAL authority. A caller holding a shareable BLOB_READ admission
+    # (the validate route's repair pass) escalates to its own COMPOSE lease
+    # for the write step only — the read lease stays what it is, and a
+    # pass with nothing to repair (the common page load) never takes one.
+    if session_operation_context.operation_kind is SessionOperationKind.BLOB_READ:
+        write_lease = await SessionOperationLease.acquire(
+            sessions_service.session_operation_authority,
+            session_id=UUID(session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        try:
+            await _surface_pending_interpretation_reviews_under_writer(
+                state,
+                sessions_service=sessions_service,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                model_identifier=model_identifier,
+                model_version=model_version,
+                provider=provider,
+                composer_skill_hash=composer_skill_hash,
+                already_surfaced=already_surfaced,
+                only_missing_evidence=only_missing_evidence,
+                session_operation_context=write_lease.context,
+            )
+        finally:
+            await write_lease.close()
+        return
+    await _surface_pending_interpretation_reviews_under_writer(
+        state,
+        sessions_service=sessions_service,
+        session_id=session_id,
+        current_state_id=current_state_id,
+        model_identifier=model_identifier,
+        model_version=model_version,
+        provider=provider,
+        composer_skill_hash=composer_skill_hash,
+        already_surfaced=already_surfaced,
+        only_missing_evidence=only_missing_evidence,
+        session_operation_context=session_operation_context,
+    )
+
+
+def _has_unsurfaced_site(
+    state: CompositionState,
+    already_surfaced: frozenset[tuple[str, str, InterpretationKind]],
+) -> bool:
+    """Whether the surfacer would write at least once: one predicate for both arms."""
+    for site in interpretation_sites(state):
+        surfaced = _backend_surface_args_for_site(state, site)
+        if surfaced is None:
+            continue
+        affected_node_id, user_term, _draft = surfaced
+        if (affected_node_id, user_term, site.kind) not in already_surfaced:
+            return True
+    return False
+
+
+async def _surface_pending_interpretation_reviews_under_writer(
+    state: CompositionState,
+    *,
+    sessions_service: SessionServiceProtocol,
+    session_id: str,
+    current_state_id: str,
+    model_identifier: str,
+    model_version: str,
+    provider: str,
+    composer_skill_hash: str,
+    already_surfaced: frozenset[tuple[str, str, InterpretationKind]],
+    only_missing_evidence: bool,
+    session_operation_context: SessionOperationContext,
+) -> None:
+    """Both surfacing arms under one writer's authority."""
     # llm_prompt_template is already handled by the existing surfacer,
     # which carries the exact draft-aware dedup the writer boundary needs.
     await _auto_surface_prompt_template_reviews_for_state(
