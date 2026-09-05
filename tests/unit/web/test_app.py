@@ -33,7 +33,9 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from structlog.testing import capture_logs
 
 import elspeth.web.app as app_module
+import elspeth.web.aws_ecs_startup as aws_ecs_startup_module
 import elspeth.web.deployment_contract as deployment_contract_module
+import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import FrameworkBugError
@@ -55,6 +57,11 @@ from elspeth.web.aws_ecs_startup import AwsEcsSchemaNotReadyError, AwsEcsStartup
 from elspeth.web.composer.boot_probe import ComposerBootConfigError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import _JSON_COLLECTION_FIELDS, WebSettings, settings_from_env
+from elspeth.web.coordination.membership_lifecycle import (
+    MembershipShutdownOutcome,
+    SingleProcessWebInstanceMembership,
+    WebInstanceMembership,
+)
 from elspeth.web.dependencies import get_settings
 from elspeth.web.deployment_contract import DeploymentConfigurationError
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
@@ -572,7 +579,7 @@ class TestHealthEndpoint:
 
 
 class TestReadinessEndpoint:
-    def test_ready_returns_200_with_exact_eight_check_json(self, tmp_path, monkeypatch) -> None:
+    def test_ready_returns_200_with_exact_nine_check_json(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))
         checks = tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES)
 
@@ -3495,8 +3502,8 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(app_module, "resolve_deployment_state_mode", resolve)
         monkeypatch.setattr(deployment_contract_module, "resolve_deployment_state_mode", resolve)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
 
         app = create_app(settings)
 
@@ -3532,8 +3539,8 @@ class TestDeploymentStateModeStartup:
             original_mkdir(path, *args, **kwargs)
 
         monkeypatch.setattr(app_module, "create_session_engine", build_engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", validate, raising=False)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", validate)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", validate)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", validate)
         monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
         monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
         monkeypatch.setattr(Path, "mkdir", mkdir)
@@ -3581,7 +3588,7 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", reject)
         monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("external startup ran session DDL"))
         monkeypatch.setattr(app_module, "open_landscape_db", lambda *_args: pytest.fail("external startup ran Landscape DDL"))
 
@@ -3612,7 +3619,7 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", reject)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", reject)
 
         with capture_logs() as logs, pytest.raises(ExternalStateSchemaNotReadyError) as exc_info:
             create_app(settings)
@@ -3654,7 +3661,7 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None, raising=False)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
 
         with pytest.raises(type(failure)):
@@ -3684,7 +3691,7 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(app_module, "create_catalog_service", fail_catalog)
 
         with capture_logs() as logs, pytest.raises(KeyboardInterrupt) as exc_info:
@@ -3731,7 +3738,7 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_external_schema_or_raise", lambda *_args, **_kwargs: None, raising=False)
+        monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
 
         with (
@@ -3777,7 +3784,7 @@ class TestAwsEcsValidateOnlyStartup:
             probe_calls += 1
 
         monkeypatch.setattr(app_module, "create_session_engine", build_engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", probe, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", probe)
 
         with pytest.raises(AwsEcsStartupContractError):
             create_app(settings)
@@ -3876,7 +3883,7 @@ class TestAwsEcsValidateOnlyStartup:
             pytest.fail("AWS startup must not initialize schema")
 
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", reject)
         monkeypatch.setattr(app_module, "initialize_session_schema", initialize)
 
         with pytest.raises(AwsEcsSchemaNotReadyError, match=label):
@@ -3915,7 +3922,7 @@ class TestAwsEcsValidateOnlyStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", reject, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", reject)
         monkeypatch.setattr(
             app_module,
             "initialize_session_schema",
@@ -4004,10 +4011,10 @@ class TestAwsEcsValidateOnlyStartup:
             mkdir_calls.append(path)
             original_mkdir(path, *args, **kwargs)
 
-        monkeypatch.setattr(app_module, "enforce_aws_ecs_contract", enforce, raising=False)
-        monkeypatch.setattr(app_module, "require_runtime_directories_mounted", directories, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "enforce_aws_ecs_contract", enforce)
+        monkeypatch.setattr(aws_ecs_startup_module, "require_runtime_directories_mounted", directories)
         monkeypatch.setattr(app_module, "create_session_engine", build_engine)
-        monkeypatch.setattr(app_module, "validate_only_schema_or_raise", validate, raising=False)
+        monkeypatch.setattr(aws_ecs_startup_module, "validate_only_schema_or_raise", validate)
         monkeypatch.setattr(app_module, "create_catalog_service", catalog)
         monkeypatch.setattr(app_module, "initialize_session_schema", lambda *_args: pytest.fail("initializer called"))
         monkeypatch.setattr(app_module.weakref, "finalize", finalize)
@@ -4180,3 +4187,60 @@ class TestBootPrimeOpenRouterCatalogGate:
         assert prime_calls == 1
         failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
         assert failed["log_level"] == "warning"
+
+
+class TestWebInstanceMembershipWiring:
+    """The web_instances writer is wired through the lifespan and the readiness route (6b-2)."""
+
+    def test_sqlite_app_owns_a_single_process_membership_and_the_draining_signal(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path))
+        assert type(app.state.web_instance_membership) is SingleProcessWebInstanceMembership
+        assert type(app.state.instance_draining) is threading.Event
+        assert app.state.instance_draining is app.state.web_instance_membership.draining
+        assert not app.state.instance_draining.is_set()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_starts_membership_and_drains_as_the_first_act_of_shutdown(self, tmp_path) -> None:
+        class _SpyMembership(WebInstanceMembership):
+            """Records the lifespan's calls; the concrete arms are slotted and final."""
+
+            __slots__ = ("order",)
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.order: list[str] = []
+
+            async def start(self) -> None:
+                self.order.append("start")
+
+            async def begin_drain(self) -> MembershipShutdownOutcome:
+                self.order.append("begin_drain")
+                self._draining.set()
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+            async def stop(self) -> MembershipShutdownOutcome:
+                self.order.append("stop")
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        spy = _SpyMembership()
+        app.state.web_instance_membership = spy
+        app.state.instance_draining = spy.draining
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                assert spy.order == ["start"]
+                assert not app.state.instance_draining.is_set()
+        assert spy.order == ["start", "begin_drain", "stop"]
+        assert app.state.instance_draining.is_set()
+
+    def test_ready_route_passes_the_process_draining_signal(self, tmp_path, monkeypatch) -> None:
+        app = create_app(_settings(tmp_path))
+        seen: dict[str, object] = {}
+
+        async def capture(*_args: object, **kwargs: object) -> ReadinessReport:
+            seen.update(kwargs)
+            return ReadinessReport(True, tuple(ReadinessCheck(name, True, "ok") for name in READINESS_CHECK_NAMES))
+
+        monkeypatch.setattr(app_module, "readiness_report", capture)
+        assert TestClient(app).get("/api/ready").status_code == 200
+        assert seen["instance_draining"] is app.state.instance_draining

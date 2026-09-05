@@ -410,6 +410,25 @@ URL secret they reference: `rA` runs as `elspeth_runtime_a`, `rB` as
 asserts two distinct `X-Elspeth-Instance` values before scoring a trial and
 cross-checks every replica name against `az containerapp replica list`.
 
+Both runtime roles need write access to `web_instances`. Each replica registers
+itself in that table at boot, so a role holding only `SELECT` fails startup with
+`permission denied for table web_instances` and P3 never gets a row to expire.
+The minimum on the session database is read on every table plus two verbs on
+this one:
+
+```sql
+GRANT USAGE ON SCHEMA public TO elspeth_runtime_a;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO elspeth_runtime_a;
+GRANT INSERT, UPDATE ON web_instances TO elspeth_runtime_a;
+```
+
+Repeat for `elspeth_runtime_b`. Grant it when you provision the roles: the app
+does not fall back to a single-process mode when the role cannot write, because
+a PostgreSQL deployment silently running without membership is the failure this
+table exists to prevent. The AWS ECS Terraform path covers the same requirement
+through `ALTER DEFAULT PRIVILEGES` in
+`deploy/aws-ecs/terraform/modules/scenario/database_bootstrap.tf`.
+
 ```bash
 # One deployment per runtime role: the label selects the role's URL secrets
 # and the doctor Job name (doctor-runtime-a / doctor-runtime-b).
@@ -447,7 +466,7 @@ tree proves, and overclaiming is a schema violation rather than a convention.
 | **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
 | **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. The receipt asserts that no `run_start_permits` row exists: the table has no writer, and the driver has no code path that could claim one | `session_operation_fence_execute` |
 | **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the live progress stream and the WebSocket ticket are owner-affine; the driver records the production sticky-session setting as the mitigation | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
-| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); wait past `session_operation_lease_seconds` (30) and the membership lease; then `az containerapp revision deactivate` on `rA`; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `web_instances_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); wait past `session_operation_lease_seconds` (30) and the membership lease; then `az containerapp revision deactivate` on `rA`; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
 
 ### P3 primary primitive: role revocation by self-termination
 
@@ -456,25 +475,44 @@ The Flexible Server admin is not a superuser and cannot grant
 a session opened *as* the runtime role may always terminate that role's other
 backends, and `NOLOGIN` affects only new connections.
 
+The runtime session `S` must therefore be **one session held open across the
+admin step**, exactly as `RoleRevocationPartition.partition` implements it in
+`src/elspeth/web/_azure_container_apps_acceptance/controller.py`. Three
+separate `psql_capture -c` calls would be three separate logins, and the third
+one — the terminate — would be refused by the `NOLOGIN` it is supposed to
+follow. `S` reads its statements from a FIFO, so the shell can run the admin
+step between them while `S` stays connected; the terminate then runs inside
+`S`, where `pg_backend_pid()` is `S`'s own backend and needs no captured pid.
+`ELSPETH_PSQL_CALL_CEILING_SECONDS` (60) bounds the whole kept-open session,
+the admin step included.
+
 ```bash
 partition_runtime_a() {
-  local a_pid
+  local sql_fifo runtime_session
+  sql_fifo=$(mktemp -u -p /tmp elspeth-partition.XXXXXX) || return 1
+  mkfifo -m 600 "$sql_fifo" || return 1
+  trap 'rm -f -- "$sql_fifo"' RETURN
   (
     export PGDATABASE=elspeth_sessions PGUSER=elspeth_runtime_a PGSSLMODE=verify-full PGSSLROOTCERT=system
     PGPASSWORD=$(az_capture keyvault secret show --vault-name "$KEY_VAULT_NAME" \
       --name elspeth-runtime-a-password --query value --output tsv)
     export PGPASSWORD
-    a_pid=$(psql_capture -c 'SELECT pg_backend_pid();')
-    (
-      export PGUSER="$PG_ADMIN_USER"
-      PGPASSWORD=$(az_capture keyvault secret show --vault-name "$KEY_VAULT_NAME" \
-        --name elspeth-admin-password --query value --output tsv)
-      export PGPASSWORD
-      psql_capture -c 'ALTER ROLE elspeth_runtime_a NOLOGIN;'
-    )
-    psql_capture -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
-      WHERE usename = current_user AND pid <> ${a_pid};"
+    psql_capture -f "$sql_fifo"
+  ) &
+  runtime_session=$!
+  exec {partition_sql}>"$sql_fifo"
+  printf '%s\n' 'SELECT pg_backend_pid();' >&"$partition_sql"
+  (
+    export PGDATABASE=elspeth_sessions PGUSER="$PG_ADMIN_USER" PGSSLMODE=verify-full PGSSLROOTCERT=system
+    PGPASSWORD=$(az_capture keyvault secret show --vault-name "$KEY_VAULT_NAME" \
+      --name elspeth-admin-password --query value --output tsv)
+    export PGPASSWORD
+    psql_capture -c 'ALTER ROLE elspeth_runtime_a NOLOGIN;'
   )
+  printf '%s\n' 'SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+    WHERE usename = current_user AND pid <> pg_backend_pid();' >&"$partition_sql"
+  exec {partition_sql}>&-
+  wait "$runtime_session"
 }
 
 restore_runtime_a() {
