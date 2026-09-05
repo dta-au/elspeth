@@ -1,0 +1,10 @@
+// The doctor Job's `--json` report, by job name and execution name.
+// Column names are the documented Log Analytics shapes (facts §5.1); the
+// first live run verifies them and never a unit test. The driver substitutes
+// the __TOKENS__ before submission.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated between (datetime(__WINDOW_START__) .. datetime(__WINDOW_END__))
+| where ContainerAppName_s == "__JOB_NAME__"
+| where Log_s startswith "[" or Log_s startswith "{"
+| project TimeGenerated, RevisionName_s, ContainerGroupName_g, Log_s
+| order by TimeGenerated asc

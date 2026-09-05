@@ -1,0 +1,8 @@
+// Revision and replica lifecycle for the P3 window: provisioning, traffic
+// weight changes, deactivation and any mount error (system log messages,
+// facts §5.1).
+ContainerAppSystemLogs_CL
+| where TimeGenerated between (datetime(__WINDOW_START__) .. datetime(__WINDOW_END__))
+| where ContainerAppName_s == "__APP_NAME__"
+| project TimeGenerated, RevisionName_s, Log_s
+| order by TimeGenerated asc

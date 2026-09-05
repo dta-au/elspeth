@@ -220,7 +220,7 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "mark_blocked_barrier_terminal",
             "adopt_blocked_barrier_item",
             "reset_adoption_marker_to_pending",
-            "adopt_coalesce_branch_losses",
+            "adopt_group_losses",
         ),
     ),
     *_apis(
@@ -356,10 +356,33 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # represent the pre-Task-6 surface; production migration may satisfy the
 # authority tests without silently adding, deleting, moving, or replacing a
 # write/caller identity.
-_EXPECTED_DML_COUNT = 126
-_EXPECTED_DML_INVENTORY_SHA256 = "a18761e893e6837d20cd2437fbcc371fac1d1c461438ae2b432e9ba27d862ee7"
+#
+# Re-derived for P4-D5 (elspeth-284f68c493) by running this file's scanners
+# as a library over the fec6a4f32 pin tree and the landed tree; the current
+# scanner reproduces every fec6a4f32 pin exactly, so each delta below is
+# production change only (line-insensitive identity terms).
+#
+# DML 126 -> 139 (-16 +29): coalesce_branch_losses -> group_losses, three
+# sites including the fenced adopt verb (a68ad6a2e); unified lineage adds the
+# token_lineage_frames writer (_insert_lineage_frames) and group_records
+# writers in collect_tokens / expand_token / fork_token /
+# record_empty_expansion, and rotates every tokens / token_outcomes insert that
+# dropped the tri-field lineage columns (879d007dd, d176c5d2c, 27414bbb0);
+# aggregation result receipts add three inserts in complete_aggregation_result
+# and nest complete_batch's UPDATE in _complete_on (8408eaf3b, 4e0781695);
+# record_terminal_outcome_guarded and fail_open_effect_operations_for_run are
+# new caller-fenced helpers (9ca934b7e); link_validation_error_to_row -> _on
+# (67f6e1e02); fingerprint rotations in mark_pending_sink_terminal_many
+# (49a7bb16c), _recover_expired_leases (55a8a94f4) and
+# SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
+# its typed authority.
+_EXPECTED_DML_COUNT = 139
+_EXPECTED_DML_INVENTORY_SHA256 = "36fe6994523f2119c2da6b76b18337b7ae931da3f1b8b9385d5417dc6cd536cc"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
+        ("aggregation_result_members", "insert"),
+        ("aggregation_result_outputs", "insert"),
+        ("aggregation_results", "insert"),
         ("artifacts", "insert"),
         ("audit_export_snapshot_chunks", "insert"),
         ("audit_export_snapshots", "insert"),
@@ -371,13 +394,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("calls", "update"),
         ("checkpoints", "delete"),
         ("checkpoints", "insert"),
-        ("coalesce_branch_losses", "insert"),
-        ("coalesce_branch_losses", "update"),
         ("coalesce_effect_members", "insert"),
         ("coalesce_effect_members", "update"),
         ("coalesce_effects", "insert"),
         ("coalesce_effects", "update"),
         ("edges", "insert"),
+        ("group_losses", "insert"),
+        ("group_losses", "update"),
+        ("group_records", "insert"),
         ("node_states", "insert"),
         ("node_states", "update"),
         ("nodes", "insert"),
@@ -406,6 +430,7 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("sink_effect_members", "update"),
         ("sink_effect_streams", "update"),
         ("sink_effects", "update"),
+        ("token_lineage_frames", "insert"),
         ("token_outcomes", "insert"),
         ("token_parents", "insert"),
         ("token_work_items", "insert"),
@@ -416,14 +441,46 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("validation_errors", "update"),
     }
 )
-_EXPECTED_CALL_COUNT = 241
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "c7fe84414c114833d87406c1b76122f4664901c878cc9a87bc8c9788beb77c7b"
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 70
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "0b49ee25a1763bd528a195560b2348a14ac5f937cdfe0360f3305711bc2b54c2"
+# Callers 241 -> 266 (-15 +40; the count is measured with adopt_group_losses
+# in the API set above, which is why it is one more than a scan against the
+# retired adopt_coalesce_branch_losses name reports). Removed: the branch-loss
+# replay and coalesce-row adoption in barrier_coordination, the
+# coalesce_executor / RowProcessor._route_transform_results outcome writers,
+# AggregationExecutor's complete_batch, TokenManager.create_quarantine_token's
+# two calls, openrouter's four recorder calls, bedrock's three top-level
+# failure calls. Added: collector and row_union barrier kinds in
+# barrier_coordination, CollectorExecutor, RowUnionExecutor,
+# RowProcessor.complete_barrier x4 and _record_group_member_terminals,
+# GateExecutor.record_routing_event, SinkExecutor's boundary-failure
+# operation pair, TokenTraversalEngine.handle_gate_error_outcome, the four
+# LLMAuditParent recorder calls that replaced openrouter's, the two source
+# record_validation_error calls, bedrock's record_guardrails_failure closure
+# (the same three calls, now ordinal 1 inside the closure), and
+# _replay_group_losses -> adopt_group_losses.
+_EXPECTED_CALL_COUNT = 266
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "0ab9f676d17ec706d2e4027440197bdc9aa87d31c7eb237b5cc8bb0d536d591f"
+# Subordinate edges 70 -> 80 (-5 +15): create_row_with_token's second
+# insert_row_with_token_on edge and record_coalesce_branch_loss's two edges
+# retired; _transition_on's two edges rotated with the group_losses
+# collection; added: link_validation_error_to_row_on x2,
+# record_terminal_outcome_guarded <- complete_barrier, _insert_lineage_frames
+# x5, insert_row_with_token_on <- create_quarantine_row_with_token,
+# fail_open_effect_operations_for_run <- _complete_run_in, record_group_loss
+# x3 (complete_barrier, _transition_on, stage_escalation_loss).
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 80
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "dccb6ab7403f684b881ea3aad3d4c4046c20a4359e3e81c272d93b9d72fc72f6"
+# Coordination callers: unchanged between the pin tree and the landed tree.
 _EXPECTED_COORDINATION_CALL_COUNT = 15
 _EXPECTED_COORDINATION_CALL_SHA256 = "e2c82952e49763ee53e8772dcaedd9afbeecd1448c7c93a99659e25037e8d511"
-_EXPECTED_INTERNAL_EDGE_COUNT = 98
-_EXPECTED_INTERNAL_EDGE_SHA256 = "f015f32f3a7e4ababa7bdc3af16309a402c4ca404955d189079033202fa65f3b"
+# Internal edges 98 -> 101 (-2 +5): create_row_with_token's second
+# insert_row_with_token_on edge and TokenSchedulerRepository's
+# adopt_coalesce_branch_losses forward retired; added:
+# DataFlowRepository.create_quarantine_row_with_token,
+# ExecutionRepository.complete_aggregation_result -> complete_batch and
+# complete_node_state, RunLifecycleRepository._abandon_undecided_tokens_in ->
+# record_token_outcome, TokenSchedulerRepository.adopt_group_losses.
+_EXPECTED_INTERNAL_EDGE_COUNT = 101
+_EXPECTED_INTERNAL_EDGE_SHA256 = "61f1c9b9264d11a6537402b0a956248b160914b5185fe44cae7a303ec1880786"
 
 
 def _repo_root() -> Path:
