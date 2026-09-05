@@ -32,6 +32,25 @@ class TargetCensus:
     exact_covered_count: int
     per_file_covered_count: int
     uncovered_count: int
+    diagnosis_assigned_count: int = 0
+    resign_assigned_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TargetCoverage:
+    """Canonical keys that already have authority in the target tree.
+
+    ``exact_keys`` are live allowlist keys. ``diagnosis_assigned_keys`` are
+    different live keys that the judge-signature diagnosis has paired with a
+    drifted allowlist entry. ``resign_assigned_keys`` are live keys a planned
+    non-judge rotation will own. Keeping the sets separate in the API prevents
+    one covered fingerprint from silently covering another finding with the
+    same identity prefix.
+    """
+
+    exact_keys: frozenset[str]
+    diagnosis_assigned_keys: frozenset[str] = frozenset()
+    resign_assigned_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,23 +100,49 @@ def scan_tree_findings(*, root: Path) -> list[Any]:
 def census_tree_targets(
     *,
     root: Path,
-    covered_keys: frozenset[str] | set[str],
+    findings: tuple[Any, ...] | None = None,
+    covered_prefixes: frozenset[str] | set[str] | None = None,
+    coverage: TargetCoverage | None = None,
     per_file_rules: list[PerFileRule],
 ) -> TargetCensusResult:
-    """Run the raw scan, then classify every target against live coverage."""
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import _finding_covered_by_per_file_rule
+    """Run the raw scan, then classify every target against live coverage.
 
-    findings = tuple(scan_tree_findings(root=root))
+    Callers supply ``coverage`` so coverage is exact at the canonical-finding-
+    key level; pass ``findings`` when the raw scan has already been run so the
+    census and the rotation plan classify one population. ``covered_prefixes``
+    is the legacy prefix-wide arm: it is accepted for compatibility but a
+    prefix covers every fingerprint under it, so it must not be used for
+    completeness or security decisions.
+    """
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+        _finding_covered_by_per_file_rule,
+        identity_prefix,
+    )
+
+    if coverage is not None and covered_prefixes is not None:
+        raise ValueError("provide coverage or covered_prefixes, not both")
+    if coverage is None and covered_prefixes is None:
+        raise ValueError("coverage is required")
+
+    findings = tuple(scan_tree_findings(root=root)) if findings is None else findings
     seen: set[str] = set()
     uncovered: list[Any] = []
     exact_covered_count = 0
+    diagnosis_assigned_count = 0
+    resign_assigned_count = 0
     per_file_covered_count = 0
     for finding in findings:
         key = _finding_canonical_key(finding)
         if key in seen:
             raise ValueError(f"target census produced duplicate canonical key {key!r}")
         seen.add(key)
-        if key in covered_keys:
+        if coverage is not None and key in coverage.exact_keys:
+            exact_covered_count += 1
+        elif coverage is not None and key in coverage.diagnosis_assigned_keys:
+            diagnosis_assigned_count += 1
+        elif coverage is not None and key in coverage.resign_assigned_keys:
+            resign_assigned_count += 1
+        elif covered_prefixes is not None and identity_prefix(key) in covered_prefixes:
             exact_covered_count += 1
         elif _finding_covered_by_per_file_rule(finding, per_file_rules):
             per_file_covered_count += 1
@@ -109,6 +154,8 @@ def census_tree_targets(
             exact_covered_count=exact_covered_count,
             per_file_covered_count=per_file_covered_count,
             uncovered_count=len(uncovered),
+            diagnosis_assigned_count=diagnosis_assigned_count,
+            resign_assigned_count=resign_assigned_count,
         ),
         findings=findings,
         uncovered_findings=tuple(uncovered),

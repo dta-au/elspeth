@@ -19,7 +19,8 @@ from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.enums import OutputMode
+from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode
+from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
@@ -70,7 +71,45 @@ NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", 
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
 CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
-COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"))
+# DERIVED from the ``NodeType`` Literal above, never restated: this one
+# constant is an operand of BOTH node-kind drift guards (yaml_generator's
+# lowering guard and the capability-skill guidance pin), so deriving it here
+# re-points both at the authority ``NodeSpec.node_type`` is annotated
+# against. Their OTHER operands stay hand-written on purpose — a guard with
+# both operands derived is ``x != x`` (elspeth-b3117ec3ac, comment 7980).
+COMPOSER_NODE_TYPES: frozenset[str] = frozenset(get_args(NodeType))
+
+# The composer-authorable vocabulary is a PARTITION of the runtime graph
+# vocabulary (``contracts.enums.NodeType``, stored in ``nodes.node_type``):
+# every runtime kind except the two the composer authors as ``sources:`` and
+# ``outputs`` rather than as nodes. The Literal above stays hand-written
+# (it is the type ``NodeSpec.node_type`` carries); the enum is the derived
+# operand, so a kind added on either side without the other fails at import.
+_RUNTIME_KINDS_THE_COMPOSER_DOES_NOT_AUTHOR_AS_NODES: Final[frozenset[str]] = frozenset(
+    {RuntimeNodeType.SOURCE.value, RuntimeNodeType.SINK.value}
+)
+
+
+def check_composer_vocabulary_partitions_runtime(composer_kinds: frozenset[str], runtime_kinds: frozenset[str]) -> None:
+    """Refuse a composer vocabulary that is not runtime minus {source, sink}.
+
+    A function rather than a bare ``assert`` so it survives ``python -O``
+    (a module-load guard that only exists un-optimised is a guard that does
+    not exist in a deployment — elspeth-37941f1731) and so a test can feed
+    it a drifted pair.
+    """
+
+    expected = runtime_kinds - _RUNTIME_KINDS_THE_COMPOSER_DOES_NOT_AUTHOR_AS_NODES
+    if composer_kinds != expected:
+        raise RuntimeError(
+            "Composer node-kind vocabulary drift against contracts.enums.NodeType: "
+            f"composer-only kinds {sorted(composer_kinds - expected)}; "
+            f"runtime kinds the composer does not author {sorted(expected - composer_kinds)}. "
+            "Add the kind to BOTH the composer NodeType Literal and the runtime enum, or to neither."
+        )
+
+
+check_composer_vocabulary_partitions_runtime(COMPOSER_NODE_TYPES, frozenset(member.value for member in RuntimeNodeType))
 
 # Structural marker the bind tools stamp into a composer/LLM-authored source's
 # options (content-hash-bound authoring metadata; ``tools/sources.py`` writes
@@ -941,6 +980,13 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
 
 _COLLECTOR_SCOPE_BINDING_FIELDS: Final[tuple[str, ...]] = ("scope_name", "scope_opener", "scope_policy")
 
+# The node kinds whose top-level ``timeout_seconds`` the composer accepts. A
+# queue is excluded from the rule that reads this for a different reason —
+# it refuses the field through ``queue_node_contract_error`` — so queue is
+# named at that rule, not here, and the message derives from THIS tuple so
+# it cannot describe a membership it does not report on (elspeth-1768ad240c).
+_TIMEOUT_ACCEPTING_NODE_TYPES: Final[tuple[str, ...]] = ("coalesce", "row_union")
+
 
 def _scope_binding_value(node: NodeSpec, field_name: str) -> str | None:
     """Return a collector scope-binding field as an authored string, or None.
@@ -1103,6 +1149,25 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
                     "scope_opener to the transform whose expanded rows this collector closes.",
                     "high",
                     "scope_opener_unknown",
+                )
+            )
+        elif (
+            opener_node.plugin is not None
+            and opener_node.plugin in _known_transform_plugin_names()
+            and opener_node.plugin not in _known_multi_row_transform_plugins()
+        ):
+            # Mirror of the builder's "Scope '{}' opener '{}' is not a
+            # multi-row transform (creates_tokens=False)" rejection. An
+            # unknown plugin name is owned by the plugin-availability checks.
+            errors.append(
+                _err(
+                    component,
+                    f"Collector '{node.id}' scope_opener '{scope_opener}' names transform '{opener_node.plugin}', "
+                    "which is not a multi-row transform (creates_tokens=False), so it expands no rows into "
+                    "the group this collector would close. Set scope_opener to an expanding transform "
+                    "(for example json_explode or line_explode).",
+                    "high",
+                    "scope_opener_not_multi_row",
                 )
             )
 
@@ -1580,6 +1645,18 @@ def _known_transform_plugin_names() -> frozenset[str]:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
     return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms())
+
+
+def _known_multi_row_transform_plugins() -> frozenset[str]:
+    """Return registered transform names that expand rows (creates_tokens=True).
+
+    The scope-opener candidates (barrier-scopes spec §7 rule 5) — read from
+    the same plugin attribute the builder's opener check and the rule-5
+    census read, so the Stage-1 mirror cannot drift from the runtime.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.creates_tokens)
 
 
 def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[str]:
@@ -6910,8 +6987,7 @@ class CompositionState:
                 errors.append(
                     _err(
                         f"node:{node.id}",
-                        f"Node name '{node.id}' is used by both {node.node_type} and {other}. All node names must be "
-                        "unique across transforms, gates, aggregations, coalesce nodes, row_union nodes, collectors, sources, queues, and sinks.",
+                        f"Node name '{node.id}' is used by both {node.node_type} and {other}. {UNIQUE_NODE_NAMES_RULE}",
                         "high",
                         "node_id_collides_with_source_or_sink",
                     )
@@ -6984,12 +7060,13 @@ class CompositionState:
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every
             # queue consumer shares the same canonical-shape guard.
-            if node.timeout_seconds is not None and node.node_type not in ("coalesce", "row_union", "queue"):
+            if node.timeout_seconds is not None and node.node_type not in (*_TIMEOUT_ACCEPTING_NODE_TYPES, "queue"):
+                accepting = " and ".join(_TIMEOUT_ACCEPTING_NODE_TYPES)
                 errors.append(
                     _err(
                         f"node:{node.id}",
                         f"Node '{node.id}' of type '{node.node_type}' does not accept top-level timeout_seconds; "
-                        "only coalesce and row_union nodes accept that field.",
+                        f"only {accepting} nodes accept that field.",
                         "high",
                         "node_timeout_unsupported",
                     )

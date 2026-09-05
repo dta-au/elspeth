@@ -17,7 +17,9 @@ from evals.lib.battery_scenario import (
 )
 from evals.lib.battery_topology import observed_option_values, topologies_match, topology_from_pipeline
 
+from elspeth.web.composer.guided.deferred_intents import _message_requires_stated_constraint
 from elspeth.web.composer.no_tool_policy import PipelineMutationIntentDecision, classify_pipeline_mutation_intent
+from tests.unit.web.composer.guided.stated_demand_oracle import assert_demand_is_satisfiable
 
 REPO = Path(__file__).resolve().parents[4]
 EXPECTED_CASES = {
@@ -111,6 +113,42 @@ def test_prompt_stays_on_the_compose_loop(case: str) -> None:
     decision = classify_pipeline_mutation_intent(cases[case].prompt)
     assert decision is not PipelineMutationIntentDecision.EXPLICIT_MUTATION, f"{case}: prompt would route to the planner"
     assert decision.name == sc.classifier_decision, f"{case}: recorded classifier_decision {sc.classifier_decision} != {decision.name}"
+
+
+# elspeth-b24ec0945f option 2: the standing corpus pin for the guided
+# stated-constraint DEMAND. The three frozen canary prompts never reach the
+# message-level classifier at all, so this is the only place a demand-side
+# grammar edit shows up as a diff before a user hits it. Values are MEASURED
+# (2026-09-05, after elspeth-3d392c04ca derived the demand from grounding);
+# fork_coalesce / deep_routing / error_routing still read as routing prose
+# but nothing in them can ground, so no demand is raised. A change here is a
+# deliberate change to what the planner is required to state — record why.
+_EXPECTED_STATED_DEMAND: dict[str, str | None] = dict.fromkeys(EXPECTED_CASES)
+
+
+@pytest.mark.parametrize("case", _present_cases())
+def test_prompt_raises_only_a_satisfiable_stated_demand(case: str) -> None:
+    """elspeth-b24ec0945f: the canary is blind to the deferred-intent rejection
+    class, so pin it over the corpus instead. Two assertions per verbatim
+    prompt: the demand the classifier raises is the recorded one, and — the
+    property elspeth-3d392c04ca asked for — any demand raised is satisfiable
+    by some stated action the production validator accepts, judged by a
+    brute-force oracle written independently of the demand derivation.
+    Provider-free: the classifier and the validator are pure."""
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.catalog.service import CatalogServiceImpl
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+    _, cases = load_corpus()
+    prompt = cases[case].prompt
+    demand = _message_requires_stated_constraint(prompt)
+    assert demand == _EXPECTED_STATED_DEMAND[case], f"{case}: stated demand {demand!r} != recorded {_EXPECTED_STATED_DEMAND[case]!r}"
+    pm = PluginManager()
+    pm.register_builtin_plugins()
+    catalog_service = CatalogServiceImpl(pm)
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog_service)
+    assert_demand_is_satisfiable(prompt, demand, PolicyCatalogView.for_trained_operator(catalog_service, snapshot))
 
 
 def test_corpus_version_matches_every_scenario() -> None:

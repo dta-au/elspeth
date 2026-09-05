@@ -297,19 +297,6 @@ def _deferred_disposition_chat(
 
 
 _MAX_POLICY_VISIBLE_ALTERNATIVES = 5
-# DERIVED, not restated. This was a hand-written tuple byte-identical to
-# ``chat_solver.PLUGIN_FREE_NODE_TYPES`` — same four members, same order, same
-# feature — and the two agreed only by hand. They answer the identical
-# question: a kind belongs here exactly when "a {x} is a built-in topology
-# node, not a transform plugin" is TRUE of it, which is the plugin-free
-# partition. Importing it means the module-load assert over ``NodeType`` that
-# guards that partition now guards this clause too, so a new or renamed node
-# kind cannot leave this teaching surface quietly incomplete.
-#
-# ORDER is load-bearing and is inherited deliberately: the ``next()`` scan
-# below returns the first member in TUPLE order that the message names, so
-# reordering the authority changes which clause "a queue and a gate" teaches.
-_STRUCTURAL_NODE_TYPES = PLUGIN_FREE_NODE_TYPES
 
 
 def _message_names_identifier(message: str, identifier: str) -> bool:
@@ -369,6 +356,7 @@ def _policy_visible_alternatives(
 def _retained_unverified_chat(
     disposition: DeferredIntentClarification | DeferredIntentRejected,
     *,
+    intent_id: UUID,
     latency_ms: int,
 ) -> StepChatResult:
     """Render one retained-but-unverified disposition (R2-F15).
@@ -376,32 +364,35 @@ def _retained_unverified_chat(
     The instruction is kept as constraint-free clarification debt, so the copy
     must say it was kept and name the specific missing detail — never the
     collapsed "couldn't retain" catch-all that implies the instruction is gone.
+
+    It must also name the intent and the EXACT commands that act on it. The
+    debt blocks wire confirmation (409) and nothing can claim it; the only
+    exits are ``Edit exact intent <UUID>: ...`` and ``Cancel exact intent
+    <UUID>.``, and the UUID reaches the user only through this message —
+    "restate it" mints a NEW intent and leaves the old one standing
+    (elspeth-3d392c04ca, addendum 7992 #2). ``_contradiction_chat`` already
+    names its recourse this way.
     """
 
     if type(disposition) is DeferredIntentClarification:
         kinds = ", ".join(disposition.plugin_kinds)
-        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}). Which category did you mean?"
+        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}), so say which category you meant."
         error_class = "DeferredIntentClarification"
     else:
         reason = cast(DeferredIntentRejected, disposition).reason
         if reason == "wrong_responsible_stage":
-            detail = (
-                "Its target stage does not match the stage its structural content belongs to. "
-                "Tell me the stage that should own it and I'll firm it up."
-            )
+            detail = "Its target stage does not match the stage its structural content belongs to, so name the stage that should own it."
         elif reason in {"catalog_kind_mismatch", "malformed_catalog_identity"}:
-            detail = (
-                "The plugin it names does not match the catalog under that category. "
-                "Name the exact plugin and its category and I'll firm it up."
-            )
+            detail = "The plugin it names does not match the catalog under that category, so name the exact plugin and its category."
         else:
-            detail = (
-                "I couldn't verify its structural details against your message. "
-                "Restate the concrete structural requirement and I'll firm it up."
-            )
+            detail = "I couldn't verify its structural details against your message, so state the concrete structural requirement."
         error_class = "DeferredIntentRejected"
+    recourse = (
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
     return StepChatResult(
-        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail}",
+        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail} {recourse}",
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
         latency_ms=latency_ms,
         error_class=error_class,
@@ -422,7 +413,7 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     * Nothing true is lost. A collector arm that WON would have taken the gate
       clause away from "add a collector and a gate", trading one teaching line
       for another; appending buys the collector case at no price.
-    * It deletes the ordering question. `_STRUCTURAL_NODE_TYPES` is scanned with
+    * It deletes the ordering question. `PLUGIN_FREE_NODE_TYPES` is scanned with
       `next()`, which returns the first member in TUPLE order that the message
       names — for "a queue and a gate" that is `gate`, because `gate` precedes
       `queue` in the tuple, NOT because of where the words appear in the
@@ -503,8 +494,8 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     aggregation whose plugin is not batch-aware. The sentence states the
     contract correctly; the composer simply does not check that half of it.
 
-    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES`, and
-    that is now enforced rather than merely intended: the tuple IS
+    Collector is also deliberately absent from `PLUGIN_FREE_NODE_TYPES`, and
+    that is enforced rather than merely intended: the scanned tuple IS
     `chat_solver.PLUGIN_FREE_NODE_TYPES`, whose membership rule is exactly "a
     {x} is a built-in topology node, not a transform plugin" is TRUE of x. A
     collector is plugin-BEARING (barrier-scopes spec §3 types it as a
@@ -514,8 +505,17 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     no longer possible to add it here at all.
     """
     clauses: list[str] = []
+    # ``chat_solver.PLUGIN_FREE_NODE_TYPES`` is read directly, not through a
+    # local alias: the alias this used to carry shared its name with an
+    # engine constant answering a DIFFERENT predicate (traversal-inert;
+    # elspeth-ea38638721). The membership rule is exactly the clause below —
+    # "a {x} is a built-in topology node, not a transform plugin" — which is
+    # the plugin-free partition, guarded at module load against ``NodeType``.
+    # ORDER is load-bearing: ``next()`` returns the first member in TUPLE
+    # order the message names, so "a queue and a gate" teaches ``gate``
+    # because it precedes ``queue`` there.
     structural_node = next(
-        (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
+        (node_type for node_type in PLUGIN_FREE_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
         None,
     )
     if structural_node is not None:
@@ -670,7 +670,7 @@ def _apply_one_deferred_action(
             # copy (precedence).
             return (
                 _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
-                _retained_unverified_chat(structural_rejection, latency_ms=latency_ms),
+                _retained_unverified_chat(structural_rejection, intent_id=intent_id, latency_ms=latency_ms),
                 intent_id,
             )
         # target_not_later: by its own claim this is not a future-stage
@@ -717,6 +717,7 @@ def _apply_one_deferred_action(
             _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
             _retained_unverified_chat(
                 cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
+                intent_id=intent_id,
                 latency_ms=latency_ms,
             ),
             intent_id,

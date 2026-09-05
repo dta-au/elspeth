@@ -2140,7 +2140,11 @@ def _expression_asts_equivalent(expected: _Ast, actual: _Ast, context: _Expressi
     if expected == actual:
         return True
     if expected[0] == "in":
+        # Two shapes, because PostgreSQL rewrites IN differently by arity:
+        # >=2 literals become = ANY(ARRAY[...]), exactly 1 becomes a plain =.
         reflected_in = _actual_any_as_in(expected, actual, context)
+        if reflected_in is None:
+            reflected_in = _actual_equality_as_single_valued_in(expected, actual, context)
         if reflected_in is not None:
             actual = reflected_in
     if expected[0] != actual[0]:
@@ -2462,6 +2466,42 @@ def _literal_reflection_cast_types(
     if inner[0] == "column" and inner[1] in context.char_columns:
         return _TEXT_CAST_TYPES
     return frozenset()
+
+
+def _actual_equality_as_single_valued_in(expected: _Ast, actual: _Ast, _context: _ExpressionContext) -> _Ast | None:
+    """Recognise a ONE-element ``IN`` in the shape PostgreSQL stores it.
+
+    PostgreSQL rewrites ``col IN (a, b)`` to ``col = ANY(ARRAY[a, b])``, which
+    ``_actual_any_as_in`` reverses. It rewrites a SINGLE-element ``col IN (a)``
+    differently — to a plain ``col = a``, since with one value there is no
+    array to scan. That shape had no reverse, so a one-element CHECK compared
+    unequal against its own model text and every fresh PostgreSQL database
+    failed schema validation at startup (elspeth-d0e62aea41). SQLite stores the
+    ``IN`` verbatim, which is why it went unseen until the first PostgreSQL
+    boot at epoch 52.
+
+    WHY THIS CANNOT WIDEN WHAT THE COLLECTOR ACCEPTS
+    ------------------------------------------------
+    It re-labels a node; it decides nothing. Both operands are carried through
+    UNTOUCHED — casts included — exactly as ``_actual_any_as_in`` carries
+    ``actual[2]`` through, and the caller then compares the relabelled tree by
+    the ordinary rules. So a reflected ``amount::integer = 1`` against a
+    declared ``amount IN (1)`` still fails on the non-text cast, and a
+    reflected ``b = 'y'`` against a declared ``a IN ('x')`` still fails on the
+    operands. Stripping casts here would be a SECOND, differently-guarded copy
+    of a relaxation that already exists downstream, and the two could drift.
+
+    ``_context`` is unused for the same reason: every judgement this function
+    could make from it is made downstream, on the tree it returns.
+    """
+    negated = bool(expected[1])
+    if actual[:2] != ("binary", "<>" if negated else "="):
+        return None
+    # Two or more values is the ANY(ARRAY[...]) shape, which has its own
+    # reverse; claiming it here would silently shadow that path.
+    if len(cast("tuple[_Ast, ...]", expected[3])) != 1:
+        return None
+    return ("in", negated, actual[2], (actual[3],))
 
 
 def _actual_any_as_in(expected: _Ast, actual: _Ast, context: _ExpressionContext) -> _Ast | None:

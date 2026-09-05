@@ -28,6 +28,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_files
+
 _ROOT = Path(__file__).resolve().parents[4]
 
 # These verbs decide custody, liveness, expiry, takeover, or stale-owner
@@ -53,7 +55,6 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
         "live_leader",
         "peer_active_leases",
         "recover_expired_leases",
-        "register_run_leader",
         "register_run_leader_on",
         "release_seat",
         "takeover_expired",
@@ -121,7 +122,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/engine/orchestrator/",
 )
-_CLOCK_BOUNDARY_DIGEST = "a8c603ffcfbb77610fb244c53e16130f1baac12be8a81f814753d87c0d1fcb19"
+_CLOCK_BOUNDARY_DIGEST = "6e256864b43ab502abee6032acd80b880f1acfff40af3ff98db89eca96000497"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -189,6 +190,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.get_resume_point"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token_transaction"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._finalize_on"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._validate_effect_authority"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization.finalize"),
@@ -211,7 +213,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.dead_non_leader_workers"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.evict_worker"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.release_seat"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
@@ -227,7 +228,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_pending_sink_many"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_terminal"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.adopt_blocked_barrier_item"),
-        ("src/elspeth/core/landscape/scheduler/branch_losses.py", "CoalesceBranchLossRepository.adopt_coalesce_branch_losses"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_on"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_with_ready_children"),
@@ -244,6 +244,8 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
             "src/elspeth/core/landscape/scheduler/dispositions.py",
             "SchedulerDispositionRepository.terminalize_pending_sinks_with_terminal_outcomes",
         ),
+        ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.adopt_group_losses"),
+        ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.stage_escalation_loss"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._recover_expired_leases"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_ready"),
@@ -2587,7 +2589,7 @@ def _scan_production(paths: Iterable[str] | None = None) -> tuple[ClockViolation
         if paths is not None
         else (
             relative
-            for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+            for source_file in iter_gate_files(_ROOT / "src/elspeth")
             if (relative := source_file.relative_to(_ROOT).as_posix()).startswith(_AUTHORITY_SCOPE_PREFIXES)
         )
     )
@@ -2711,7 +2713,7 @@ def _sessions_import_violations(sources: dict[str, str]) -> tuple[str, ...]:
 def _clock_boundary_inventory() -> tuple[ClockBoundary, ...]:
     sources = {
         source_file.relative_to(_ROOT).as_posix(): source_file.read_text(encoding="utf-8")
-        for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+        for source_file in iter_gate_files(_ROOT / "src/elspeth")
     }
     return _discover_authority_boundaries(sources)
 
@@ -5451,6 +5453,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         token_work_items_table,
     )
     from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+    from tests.helpers.run_coordination import register_run_leader
 
     sessions_database_now = datetime(2040, 1, 1, tzinfo=UTC)
 
@@ -5522,7 +5525,8 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             )
 
         token = call_with_legacy_now(
-            factory.run_coordination.register_run_leader,
+            register_run_leader,
+            factory.run_coordination,
             run_id=run_id,
             worker_id=leader_worker_id,
             window_seconds=80.0,
@@ -5740,7 +5744,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
 
 
 def test_landscape_core_does_not_import_sessions_clock_authority() -> None:
-    source_files = sorted((_ROOT / "src/elspeth").rglob("*.py"))
+    source_files = iter_gate_files(_ROOT / "src/elspeth")
     sources = {file.relative_to(_ROOT).as_posix(): file.read_text(encoding="utf-8") for file in source_files}
     forbidden = _sessions_import_violations(sources)
     assert forbidden == (), "Landscape imported Sessions clock authority:\n" + "\n".join(forbidden)
@@ -5748,7 +5752,7 @@ def test_landscape_core_does_not_import_sessions_clock_authority() -> None:
 
 def test_no_cross_database_clock_name_crosses_authority_adapters() -> None:
     offenders: list[str] = []
-    for source_file in sorted((_ROOT / "src/elspeth").rglob("*.py")):
+    for source_file in iter_gate_files(_ROOT / "src/elspeth"):
         relative = source_file.relative_to(_ROOT).as_posix()
         tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=relative)
         for node in ast.walk(tree):

@@ -703,6 +703,22 @@ jobs:
           unzip -o -q /tmp/terraform.zip -d /usr/local/bin terraform
           terraform version
 
+      - name: Install Bicep (Azure Container Apps bundle contract tests)
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # tests/unit/deployment/test_azure_container_apps_bundle.py compiles
+        # the tracked Bicep bundle and asserts on the compiled ARM. Like the
+        # Terraform step above, the binary is pinned by version and SHA-256
+        # (the pin the platform facts record) and the tests fail loudly under
+        # GITHUB_ACTIONS when it is absent rather than skipping silently.
+        run: |
+          BICEP_VERSION=0.46.1
+          BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
+          curl -fsSLo /tmp/bicep \
+            "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
+          printf '%s  /tmp/bicep\n' "$BICEP_SHA256" | sha256sum -c -
+          install -m 0755 /tmp/bicep /usr/local/bin/bicep
+          bicep --version
+
       - name: Install dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
@@ -897,6 +913,60 @@ jobs:
 
       - name: Validate state-engine documentation links
         run: uv run python scripts/state_engine_assessment.py check-links
+
+  # ===========================================================================
+  # Azure Container Apps bundle: compile every template and parameter file
+  # with the pinned Bicep CLI, then run the compiled-ARM contract test. The
+  # bundle is deploy/azure-container-apps/ (Phase 6b, elspeth-25e9b67d05).
+  # ===========================================================================
+  azure-container-apps-bicep:
+    name: Azure Container Apps Bicep bundle
+    runs-on: ubuntu-24.04
+    needs: [static-analysis]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Bicep (pinned)
+        run: |
+          BICEP_VERSION=0.46.1
+          BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
+          curl -fsSLo /tmp/bicep \
+            "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
+          printf '%s  /tmp/bicep\n' "$BICEP_SHA256" | sha256sum -c -
+          sudo install -m 0755 /tmp/bicep /usr/local/bin/bicep
+          bicep --version
+
+      - name: Compile the bundle
+        run: |
+          set -euo pipefail
+          bicep build deploy/azure-container-apps/main.bicep --stdout >/dev/null
+          bicep build deploy/azure-container-apps/environment.bicep --stdout >/dev/null
+          bicep build deploy/azure-container-apps/workload.bicep --stdout >/dev/null
+          bicep build-params deploy/azure-container-apps/main.example.bicepparam --stdout >/dev/null
+          bicep build-params deploy/azure-container-apps/main.acceptance.bicepparam --stdout >/dev/null
+          bicep build-params deploy/azure-container-apps/environment.example.bicepparam --stdout >/dev/null
+          bicep build-params deploy/azure-container-apps/workload.production.bicepparam --stdout >/dev/null
+          bicep build-params deploy/azure-container-apps/workload.acceptance.bicepparam --stdout >/dev/null
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libsqlcipher-dev
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Run the compiled-ARM bundle contract test
+        run: uv run pytest tests/unit/deployment/test_azure_container_apps_bundle.py -v
 
   supply-chain-audit:
     name: Dependency and License Audit
@@ -1126,6 +1196,7 @@ jobs:
       - test
       - testcontainer
       - state-engine-validation
+      - azure-container-apps-bicep
       - supply-chain-audit
       - e2e-frontend
       - frontend-unit
@@ -1147,6 +1218,10 @@ jobs:
           fi
           if [[ "${{ needs.state-engine-validation.result }}" != "success" ]]; then
             echo "State-engine catalog and selector validation job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.azure-container-apps-bicep.result }}" != "success" ]]; then
+            echo "Azure Container Apps Bicep bundle job failed"
             exit 1
           fi
           if [[ "${{ needs.supply-chain-audit.result }}" != "success" ]]; then

@@ -52,6 +52,7 @@ from pydantic import SecretBytes
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import content_hash as _content_hash
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -63,6 +64,7 @@ from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.evals.conftest import _clean_advisor_checkpoint
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -164,7 +166,18 @@ def _make_settings(data_dir: Path) -> WebSettings:
     )
 
 
-def _session_engine() -> tuple[Any, str, SessionServiceImpl]:
+def _session_engine() -> tuple[Any, str, SessionServiceImpl, SessionOperationContext]:
+    """One in-memory session plus the exact COMPOSE authority a compose turn requires.
+
+    The compose-turn audit persist refuses to run without an exact
+    session-operation context, so the harness mints one through the
+    PRODUCTION authority (no fake, no optional-context arm): the hand-inserted
+    session row first receives the released epoch-1 fence the lifecycle would
+    have written, then a real COMPOSE lease is acquired on it. The lease
+    spans the whole scenario (real preflights run inside), so it is longer
+    than the HTTP default. The engine dies with the test; nothing contends
+    for the lease, so no release is needed.
+    """
     engine = create_session_engine(
         "sqlite:///:memory:",
         poolclass=StaticPool,
@@ -176,6 +189,7 @@ def _session_engine() -> tuple[Any, str, SessionServiceImpl]:
         data_dir=None,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.convergence-scenarios"),
+        session_operation_lease_seconds=600,
     )
     session_id = str(uuid4())
     now = datetime.now(UTC)
@@ -191,7 +205,14 @@ def _session_engine() -> tuple[Any, str, SessionServiceImpl]:
                 updated_at=now,
             )
         )
-    return engine, session_id, sessions_service
+        seed_session_operation_fence(conn, session_id, owner_instance_id=sessions_service.session_operation_owner_instance_id)
+    compose_context = sessions_service.session_operation_authority.acquire(
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    return engine, session_id, sessions_service, compose_context
 
 
 def _seed_blob(engine: Any, session_id: str, *, body: bytes, filename: str, mime_type: str, storage_dir: Path) -> str:
@@ -307,7 +328,7 @@ class TestCsvClassifierScenario:
 
     @pytest.mark.asyncio
     async def test_csv_classifier_converges_in_two_repair_turns(self, tmp_path: Path) -> None:
-        engine, session_id, sessions_service = _session_engine()
+        engine, session_id, sessions_service, compose_context = _session_engine()
         # Five observed columns, mirroring the scenario's prompt CSV.
         body = b"ticket_id,customer_name,subject,body,received_at\nT-001,Alice,Issue,desc,2026-05-06\n"
         blob_id = _seed_blob(
@@ -451,6 +472,7 @@ class TestCsvClassifierScenario:
                 empty,
                 session_id=session_id,
                 user_id="test-user",
+                session_operation_context=compose_context,
             )
 
         # Convergence behaviour: two forced repair turns (schema-mode repair +
@@ -510,7 +532,7 @@ class TestNumericGateScenario:
 
     @pytest.mark.asyncio
     async def test_numeric_gate_first_pass_success(self, tmp_path: Path) -> None:
-        engine, session_id, sessions_service = _session_engine()
+        engine, session_id, sessions_service, compose_context = _session_engine()
         body = b"order_id,customer,price,shipped_at\nO-1,Alice,49.95,2026-05-01\nO-2,Bob,150.00,2026-05-02\n"
         blob_id = _seed_blob(
             engine,
@@ -615,6 +637,7 @@ class TestNumericGateScenario:
                 empty,
                 session_id=session_id,
                 user_id="test-user",
+                session_operation_context=compose_context,
             )
 
         # First-pass success: zero forced repair turns.
@@ -634,7 +657,7 @@ class TestNumericGateScenario:
 
     @pytest.mark.asyncio
     async def test_numeric_gate_direct_observed_csv_gate_repairs_with_one_turn(self, tmp_path: Path) -> None:
-        engine, session_id, sessions_service = _session_engine()
+        engine, session_id, sessions_service, compose_context = _session_engine()
         body = b"order_id,customer,price,shipped_at\nO-1,Alice,49.95,2026-05-01\nO-2,Bob,150.00,2026-05-02\n"
         blob_id = _seed_blob(
             engine,
@@ -798,6 +821,7 @@ class TestNumericGateScenario:
                 empty,
                 session_id=session_id,
                 user_id="test-user",
+                session_operation_context=compose_context,
             )
 
         assert mock_llm.call_count == 4, f"expected 4 LLM calls, got {mock_llm.call_count}"
@@ -831,7 +855,7 @@ class TestUrlTextSmokeScenario:
 
     @pytest.mark.asyncio
     async def test_url_text_smoke_converges_with_one_repair_turn(self, tmp_path: Path) -> None:
-        engine, session_id, sessions_service = _session_engine()
+        engine, session_id, sessions_service, compose_context = _session_engine()
         # Single-line text blob containing only a URL — exactly the shape
         # the proof step's text_source_url_without_web_scrape blocker keys
         # off. inspect_blob_content sets source_kind="text" and populates
@@ -976,6 +1000,7 @@ class TestUrlTextSmokeScenario:
                 empty,
                 session_id=session_id,
                 user_id="test-user",
+                session_operation_context=compose_context,
             )
 
         # Convergence behaviour: exactly one forced repair turn.
@@ -1083,7 +1108,7 @@ class TestPreflightRepairContinue:
 
     @pytest.mark.asyncio
     async def test_preflight_invalid_finalize_repairs_before_finalising(self, tmp_path: Path) -> None:
-        engine, session_id, sessions_service = _session_engine()
+        engine, session_id, sessions_service, compose_context = _session_engine()
         body = b"url\nhttps://example.gov.au\n"
         blob_id = _seed_blob(
             engine,
@@ -1152,6 +1177,7 @@ class TestPreflightRepairContinue:
                 empty,
                 session_id=session_id,
                 user_id="test-user",
+                session_operation_context=compose_context,
             )
 
         # Post-Fix-2: the preflight-invalid finalize injected one repair turn,

@@ -383,10 +383,24 @@ def test_coordination_latch_interrupts_predecessor_wait_before_peer_finalization
     class _Deposed(RuntimeError):
         pass
 
+    # The latch is polled three times before the wait can be interrupted after
+    # one poll interval, and each call proves one ordering fact:
+    #   1. `_persist_pipeline_member_payloads` guards the payload-store write
+    #      BEFORE the reservation, so caller authority is checked before any
+    #      external effect (call 1, no sleep yet);
+    #   2. `_wait_until_predecessor_finalized` checks the latch at the top of
+    #      its loop BEFORE sleeping, so a deposed worker never sleeps on a
+    #      predecessor it no longer has authority to wait for (call 2, still
+    #      no sleep);
+    #   3. after exactly one poll interval the loop re-checks the latch before
+    #      re-reading the predecessor, so the interruption lands before any
+    #      peer finalization is observed (call 3, `sleep.calls == [0.5]`).
+    # Raising on the third call is therefore the first interruption that can
+    # observe a completed poll interval.
     def latch() -> None:
         nonlocal latch_calls
         latch_calls += 1
-        if latch_calls == 2:
+        if latch_calls == 3:
             raise _Deposed("worker epoch was deposed")
 
     try:
@@ -400,7 +414,7 @@ def test_coordination_latch_interrupts_predecessor_wait_before_peer_finalization
                 check_coordination_latch=latch,
             ).execute_with_lease_wait(successor_request, _CumulativeObservableSink(target))
 
-        assert latch_calls == 2
+        assert latch_calls == 3
         assert sleep.calls == [0.5]
         assert target.published_rows == []
         current_predecessor = factory.execution.sink_effects.get_effect(predecessor.effect_id)

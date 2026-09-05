@@ -726,6 +726,7 @@ def test_validation_row_warns_when_advisor_completion_is_pending():
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1008,6 +1009,7 @@ def test_llm_source_is_a_nondeterministic_external_boundary(
         _make_service(state, _OK).compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1219,6 +1221,7 @@ def test_llm_interpretations_are_source_specific_and_not_applicable_for_source_o
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 
@@ -1262,6 +1265,7 @@ def test_llm_source_does_not_override_transform_interpretation_semantics() -> No
         svc.compute_snapshot(
             session_id=UUID("11111111-1111-1111-1111-111111111111"),
             user_id="alice",
+            session_operation_context=_blob_read_context(),
         )
     )
 

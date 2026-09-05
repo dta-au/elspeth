@@ -22,6 +22,7 @@ from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, ru
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
+from tests.helpers.session_fences import seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 from tests.property.web.composer.strategies import (
     CANCELLATION_ARRIVAL_TIMES,
@@ -40,6 +41,7 @@ from tests.property.web.composer.strategies import (
 )
 
 import elspeth.web.composer.tool_batch as composer_tool_batch_module
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -48,6 +50,7 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -111,6 +114,17 @@ class _Harness:
     service: ComposerServiceImpl
     sessions_service: SessionServiceImpl
     session_id: str
+    # A real COMPOSE context minted through the production authority at
+    # construction time, BEFORE any trace installs commit gates or commit
+    # failures on the engine: the first instrumented commit must be the
+    # compose-turn audit persist, exactly as it was before the composer
+    # required session-operation authority. No optional-context arm.
+    compose_context: SessionOperationContext
+
+    def release(self) -> None:
+        """Release the harness lease; a lost fence means a trace already consumed it."""
+        with contextlib.suppress(SessionOperationFenceLost):
+            self.sessions_service.session_operation_authority.release(self.compose_context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,11 +204,23 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
         data_dir=data_dir,
         telemetry=telemetry,
         log=structlog.get_logger("test.property.compose-loop"),
+        # One lease spans a whole example, including the deliberately stalled
+        # cancellation traces; the 30 s HTTP default would expire under them.
+        session_operation_lease_seconds=600,
     )
     session_id = str(uuid.uuid4())
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        # The hand-inserted row needs the released epoch-1 fence the lifecycle
+        # method would have written, or every fenced writer reports ``missing``.
+        seed_session_operation_fence(conn, session_id, owner_instance_id=sessions_service.session_operation_owner_instance_id)
         conn.execute(text("UPDATE sessions SET trust_mode = 'auto_commit' WHERE id = :session_id"), {"session_id": session_id})
+    compose_context = sessions_service.session_operation_authority.acquire(
+        session_id=uuid.UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions_service.session_operation_owner_instance_id,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
     service = ComposerServiceImpl.for_trained_operator(
         catalog=_mock_catalog(),
         settings=_web_settings(data_dir),
@@ -217,7 +243,7 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
                 ),
                 {"id": str(uuid.uuid4()), "session_id": session_id},
             )
-    return _Harness(service=service, sessions_service=sessions_service, session_id=session_id)
+    return _Harness(service=service, sessions_service=sessions_service, session_id=session_id, compose_context=compose_context)
 
 
 async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
@@ -225,6 +251,7 @@ async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
     return await driver._run_one_turn_for_test(
         llm=llm,
         session_id=harness.session_id,
+        session_operation_context=harness.compose_context,
         initial_state=CompositionState(
             source=None,
             nodes=(),
@@ -523,6 +550,26 @@ def _drive_single_example_trace(
     tmp_path = Path(os.environ.get("PYTEST_TMPDIR", "/tmp")) / f"cl_pp_prop_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     harness = _make_harness(tmp_path, session_state=session_state)
+    try:
+        return _drive_single_example_trace_with(
+            harness,
+            cancellation_arrival_time=cancellation_arrival_time,
+            tool_call=tool_call,
+            argument_dict=argument_dict,
+            failure_injection_point=failure_injection_point,
+        )
+    finally:
+        harness.release()
+
+
+def _drive_single_example_trace_with(
+    harness: _Harness,
+    *,
+    cancellation_arrival_time: CancellationArrivalTime,
+    tool_call: ToolCallSpec | None,
+    argument_dict: Mapping[str, object] | None,
+    failure_injection_point: FailureInjectionPoint,
+) -> _TraceOutcome:
     chosen_tool_call = tool_call or ToolCallSpec(name="set_metadata", call_id=f"call_{uuid.uuid4().hex[:12]}")
     chosen_arguments = argument_dict or {"patch": {"name": "property trace"}}
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-openrouter-key"}):
