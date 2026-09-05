@@ -79,10 +79,16 @@ def _worker(
     n: int,
     errors: list,
     tracebacks: list,
+    session_operation_context,
 ) -> None:
     """Concurrent-write worker. Captures the traceback alongside any
     exception so test failures are diagnosable rather than just
-    showing the exception class. Closes synthesised review nit P-N-2."""
+    showing the exception class. Closes synthesised review nit P-N-2.
+
+    ``session_operation_context`` is the live COMPOSE lease for
+    ``session_id``: since dual fencing became mandatory every
+    ``persist_compose_turn`` proves its session authority on the write
+    connection, so the worker carries the lease its caller acquired."""
     try:
         for i in range(n):
             tool_call_id = f"{session_id}_{writer_id}_tc_{i}"
@@ -101,6 +107,7 @@ def _worker(
                 expected_current_state_id=None,
                 writer_principal="compose_loop",
                 plugin_crash_pending=False,
+                session_operation_context=session_operation_context,
             )
     except Exception as exc:
         errors.append(exc)
@@ -121,27 +128,47 @@ def test_concurrent_DIFFERENT_sessions_do_not_deadlock(service):
     ``test_concurrent_SAME_session_serialises_via_advisory_lock``
     below — that is the test the spec's CL-PP-11 description was
     actually targeting."""
+    # Session ids are UUIDs and each session carries a released CREATE
+    # fence: the session-operation authority validates both before it
+    # will hand a worker the COMPOSE lease its writes are fenced on.
+    session_uuids = (uuid.uuid4(), uuid.uuid4())
+    session_ids = tuple(str(session_uuid) for session_uuid in session_uuids)
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s_a")
-        _make_session(conn, session_id="s_b")
+        for sid in session_ids:
+            _make_session(conn, session_id=sid)
+    for session_uuid in session_uuids:
+        _ensure_released_session_operation_fence(service, session_uuid)
+    contexts = [
+        service.session_operation_authority.acquire(
+            session_id=session_uuid,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        for session_uuid in session_uuids
+    ]
 
     errors: list[Exception] = []
     tracebacks: list[str] = []
 
     threads = [
-        threading.Thread(target=_worker, args=(service, "s_a", "writer_a", 5, errors, tracebacks)),
-        threading.Thread(target=_worker, args=(service, "s_b", "writer_b", 5, errors, tracebacks)),
+        threading.Thread(target=_worker, args=(service, session_ids[0], "writer_a", 5, errors, tracebacks, contexts[0])),
+        threading.Thread(target=_worker, args=(service, session_ids[1], "writer_b", 5, errors, tracebacks, contexts[1])),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        for context in contexts:
+            service.session_operation_authority.release(context)
 
     assert not errors, f"errors: {errors}\ntracebacks:\n" + "\n---\n".join(tracebacks)
 
     # Both sessions reached 10 messages each (1 assistant + 1 tool per turn × 5).  # noqa: RUF003
     with service._engine.begin() as conn:
-        for sid in ("s_a", "s_b"):
+        for sid in session_ids:
             count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id = :sid"), {"sid": sid}).scalar()
             assert count == 10, f"session {sid} count: {count}"
             seqs = [
@@ -173,8 +200,21 @@ def test_concurrent_SAME_session_serialises_via_advisory_lock(service):
 
     Closes synthesised review finding F-02 / Q-F-02 (CL-PP-11
     coverage gap)."""
+    # One writer process holding the session's COMPOSE lease drives two
+    # threads: the property under test is the advisory lock serialising
+    # sequence allocation beneath a single session authority, so both
+    # threads carry the same lease.
+    session_uuid = uuid.uuid4()
+    sid = str(session_uuid)
     with service._engine.begin() as conn:
-        _make_session(conn, session_id="s_shared")
+        _make_session(conn, session_id=sid)
+    _ensure_released_session_operation_fence(service, session_uuid)
+    session_operation_context = service.session_operation_authority.acquire(
+        session_id=session_uuid,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
 
     errors: list[Exception] = []
     tracebacks: list[str] = []
@@ -182,26 +222,29 @@ def test_concurrent_SAME_session_serialises_via_advisory_lock(service):
     threads = [
         threading.Thread(
             target=_worker,
-            args=(service, "s_shared", "writer_A", 10, errors, tracebacks),
+            args=(service, sid, "writer_A", 10, errors, tracebacks, session_operation_context),
             name="writer_A",
         ),
         threading.Thread(
             target=_worker,
-            args=(service, "s_shared", "writer_B", 10, errors, tracebacks),
+            args=(service, sid, "writer_B", 10, errors, tracebacks, session_operation_context),
             name="writer_B",
         ),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        service.session_operation_authority.release(session_operation_context)
 
     assert not errors, f"advisory-lock serialisation failed; errors:\n{errors}\ntracebacks:\n" + "\n---\n".join(tracebacks)
 
     # Both writers must have completed; total rows = 2 × 10 turns ×  # noqa: RUF003
     # 2 rows/turn (one assistant + one tool) = 40.
     with service._engine.begin() as conn:
-        count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id = 's_shared'")).scalar()
+        count = conn.execute(text("SELECT COUNT(*) FROM chat_messages WHERE session_id = :sid"), {"sid": sid}).scalar()
         assert count == 40, f"expected 40 rows, got {count}"
 
         # sequence_no values must be unique across both writers.
@@ -211,7 +254,9 @@ def test_concurrent_SAME_session_serialises_via_advisory_lock(service):
         # (instead of the lock) still fails the test.
         seqs = [
             row.sequence_no
-            for row in conn.execute(text("SELECT sequence_no FROM chat_messages WHERE session_id = 's_shared' ORDER BY sequence_no"))
+            for row in conn.execute(
+                text("SELECT sequence_no FROM chat_messages WHERE session_id = :sid ORDER BY sequence_no"), {"sid": sid}
+            )
         ]
         assert len(seqs) == len(set(seqs)), f"duplicate sequence_no values: {[s for s in seqs if seqs.count(s) > 1]}"
         # Strict monotonicity: 1..40 with no gaps under successful
@@ -447,9 +492,20 @@ def test_concurrent_persist_compose_turn_same_state_stale_rejects_without_integr
     from elspeth.web.sessions.service import StaleComposeStateError
     from elspeth.web.sessions.telemetry import observed_value
 
-    sid = "s_b1_concurrent"
+    session_uuid = uuid.uuid4()
+    sid = str(session_uuid)
     with service._engine.begin() as conn:
         _make_session(conn, session_id=sid)
+    _ensure_released_session_operation_fence(service, session_uuid)
+    # Both racing writers belong to the one process that holds the
+    # session's COMPOSE lease; the race under test is the same-state
+    # allocation beneath that authority.
+    session_operation_context = service.session_operation_authority.acquire(
+        session_id=session_uuid,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
 
     starting_counter = observed_value(service._telemetry.tool_row_integrity_violation_total)
 
@@ -480,6 +536,7 @@ def test_concurrent_persist_compose_turn_same_state_stale_rejects_without_integr
                 expected_current_state_id=None,
                 writer_principal="compose_loop",
                 plugin_crash_pending=False,
+                session_operation_context=session_operation_context,
             )
         except StaleComposeStateError as exc:
             stale_rejections.append(exc)
@@ -499,10 +556,13 @@ def test_concurrent_persist_compose_turn_same_state_stale_rejects_without_integr
             name="b1_writer_B",
         ),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        service.session_operation_authority.release(session_operation_context)
 
     # B1/stale-guard: NO IntegrityError on either path. The loser of the
     # same-state race is a stale compose, not an audit-integrity event.
