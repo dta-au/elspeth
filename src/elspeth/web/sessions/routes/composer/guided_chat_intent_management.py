@@ -369,6 +369,7 @@ def _policy_visible_alternatives(
 def _retained_unverified_chat(
     disposition: DeferredIntentClarification | DeferredIntentRejected,
     *,
+    intent_id: UUID,
     latency_ms: int,
 ) -> StepChatResult:
     """Render one retained-but-unverified disposition (R2-F15).
@@ -376,32 +377,35 @@ def _retained_unverified_chat(
     The instruction is kept as constraint-free clarification debt, so the copy
     must say it was kept and name the specific missing detail — never the
     collapsed "couldn't retain" catch-all that implies the instruction is gone.
+
+    It must also name the intent and the EXACT commands that act on it. The
+    debt blocks wire confirmation (409) and nothing can claim it; the only
+    exits are ``Edit exact intent <UUID>: ...`` and ``Cancel exact intent
+    <UUID>.``, and the UUID reaches the user only through this message —
+    "restate it" mints a NEW intent and leaves the old one standing
+    (elspeth-3d392c04ca, addendum 7992 #2). ``_contradiction_chat`` already
+    names its recourse this way.
     """
 
     if type(disposition) is DeferredIntentClarification:
         kinds = ", ".join(disposition.plugin_kinds)
-        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}). Which category did you mean?"
+        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}), so say which category you meant."
         error_class = "DeferredIntentClarification"
     else:
         reason = cast(DeferredIntentRejected, disposition).reason
         if reason == "wrong_responsible_stage":
-            detail = (
-                "Its target stage does not match the stage its structural content belongs to. "
-                "Tell me the stage that should own it and I'll firm it up."
-            )
+            detail = "Its target stage does not match the stage its structural content belongs to, so name the stage that should own it."
         elif reason in {"catalog_kind_mismatch", "malformed_catalog_identity"}:
-            detail = (
-                "The plugin it names does not match the catalog under that category. "
-                "Name the exact plugin and its category and I'll firm it up."
-            )
+            detail = "The plugin it names does not match the catalog under that category, so name the exact plugin and its category."
         else:
-            detail = (
-                "I couldn't verify its structural details against your message. "
-                "Restate the concrete structural requirement and I'll firm it up."
-            )
+            detail = "I couldn't verify its structural details against your message, so state the concrete structural requirement."
         error_class = "DeferredIntentRejected"
+    recourse = (
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
     return StepChatResult(
-        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail}",
+        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail} {recourse}",
         status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
         latency_ms=latency_ms,
         error_class=error_class,
@@ -670,7 +674,7 @@ def _apply_one_deferred_action(
             # copy (precedence).
             return (
                 _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
-                _retained_unverified_chat(structural_rejection, latency_ms=latency_ms),
+                _retained_unverified_chat(structural_rejection, intent_id=intent_id, latency_ms=latency_ms),
                 intent_id,
             )
         # target_not_later: by its own claim this is not a future-stage
@@ -717,6 +721,7 @@ def _apply_one_deferred_action(
             _append_clarification_intent(guided, intent_id=intent_id, originating_message=originating_message),
             _retained_unverified_chat(
                 cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
+                intent_id=intent_id,
                 latency_ms=latency_ms,
             ),
             intent_id,

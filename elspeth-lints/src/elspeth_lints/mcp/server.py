@@ -493,9 +493,11 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     )
     from elspeth_lints.core.review_bundle import BundleAction
     from elspeth_lints.core.tier_model_scan import (
+        TargetCoverage,
         census_tree_targets,
         plan_non_judge_rotations,
         routable_new_judgment_findings,
+        scan_tree_findings,
     )
     from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
@@ -520,16 +522,26 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     # Scan once, classify full coverage, then remove findings already assigned
     # to judge-gated diagnosis before planning the residual pre-judge lane.
     allowlist = _load_tier_model_allowlist(ctx.allowlist_dir)
-    covered_keys = {entry.key for entry in allowlist.entries}
-    target_scan = census_tree_targets(
-        root=ctx.root,
-        covered_keys=covered_keys,
-        per_file_rules=allowlist.per_file_rules,
-    )
+    raw_findings = tuple(scan_tree_findings(root=ctx.root))
     rotation_plan = plan_non_judge_rotations(
-        findings=target_scan.findings,
+        findings=raw_findings,
         allowlist=allowlist,
         diagnosis_items=diagnosis.items,
+    )
+    # Coverage is exact at the canonical-key level; see bundle_verify.py for
+    # why the three sets stay separate.
+    target_coverage = TargetCoverage(
+        exact_keys=frozenset(entry.key for entry in allowlist.entries),
+        diagnosis_assigned_keys=frozenset(
+            item.repair_key for item in diagnosis.items if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.repair_key is not None
+        ),
+        resign_assigned_keys=frozenset(rotation.new_key for rotation in rotation_plan.rotations),
+    )
+    target_scan = census_tree_targets(
+        root=ctx.root,
+        findings=raw_findings,
+        coverage=target_coverage,
+        per_file_rules=allowlist.per_file_rules,
     )
     if rotation_plan.ambiguous:
         groups = ", ".join(

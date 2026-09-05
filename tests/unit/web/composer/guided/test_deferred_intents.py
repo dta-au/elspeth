@@ -20,8 +20,10 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentManagementActionShapeError,
     DeferredIntentRejected,
     DeferredIntentUnsupported,
+    _message_requires_stated_constraint,
     create_deferred_stage_intent,
     deferred_intent_action_from_dict,
+    deferred_intent_instruction_text,
     deferred_intent_management_action_from_dict,
     validate_deferred_intent_action,
 )
@@ -46,6 +48,8 @@ from elspeth.web.composer.guided.stage_subjects import (
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
+
+from .stated_demand_oracle import assert_demand_is_satisfiable
 
 INTENT_ID = "11111111-1111-4111-8111-111111111111"
 MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
@@ -1376,15 +1380,15 @@ def test_stated_grounding_rejects_semantic_negation_outside_the_matched_tokens(m
         "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard.",
         "Later send csv rows where amount > 500 into high_value; the rest go into standard.",
         "Later send csv rows where amount > 500 to high_value; the rest go to standard.",
-        "Later route csv rows where amount > 500 into high_value, with remaining rows landing in standard.",
         "Later route csv rows where status equals priority to high_value, and everything else to standard.",
-        "Later route csv rows where amount exceeds 500 to high_value, and everything else to standard.",
-        "Later route csv rows where amount is higher than 500 to high_value, and everything else to standard.",
-        "Later route csv rows where amount is between 500 and 1000 to high_value, and everything else to standard.",
-        "Later route csv rows where status is priority to high_value, and everything else to standard.",
     ),
 )
 def test_explicit_gate_routing_prose_cannot_be_retained_as_a_weaker_constraint_kind(message: str) -> None:
+    """Every message here can ground a StatedGateRoutingConstraint drawn from
+    its own tokens (see the oracle test below), so the routing demand is
+    satisfiable and a weaker kind is still refused. The five messages that
+    used to sit in this list and could NOT ground one are now in
+    ``test_gate_prose_the_closed_grammar_cannot_bind_no_longer_deadlocks``."""
     action = DeferredIntentAction(
         target_stage="topology",
         catalog_kind="transform",
@@ -1413,82 +1417,297 @@ def test_explicit_gate_routing_prose_cannot_be_retained_as_a_weaker_constraint_k
     ) == DeferredIntentRejected(reason="stated_fact_unproven")
 
 
+_CSV_SOURCE_SUBJECT = PluginSubject(
+    kind="plugin",
+    subject_id="33333333-3333-4333-8333-333333333333",
+    plugin_kind="source",
+    plugin_name="csv",
+)
+_WEAKER_KIND_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind="transform",
+    catalog_name="passthrough",
+    redacted_summary="Preserve a source during topology authoring.",
+    constraints=(SubjectPresenceConstraint(kind="subject_presence", subject=_CSV_SOURCE_SUBJECT, present=True),),
+)
+_STATED_PREDICATE_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind=None,
+    catalog_name=None,
+    redacted_summary="Apply the stated predicate.",
+    constraints=(
+        StatedPredicateConstraint(
+            kind="stated_predicate",
+            subject=_CSV_SOURCE_SUBJECT,
+            column="amount",
+            operator="greater_than",
+            value=500,
+        ),
+    ),
+)
+_UNBINDABLE_GATE_PROSE: tuple[tuple[str, str | None], ...] = (
+    # (message, demand the derived classifier now raises)
+    # No operator the closed grammar recognises — nothing can ground.
+    ("Later route csv rows where amount exceeds 500 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where amount is higher than 500 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where amount is between 500 and 1000 to high_value, and everything else to standard.", None),
+    ("Later route csv rows where status is priority to high_value, and everything else to standard.", None),
+    ("Later add a gate for csv rows whose amount exceeds 500.", None),
+    ("Later add a gate for csv rows whose amount is higher than 500.", None),
+    ("Later add a gate for csv rows whose amount is between 500 and 1000.", None),
+    ("Later add a gate for csv rows where status is priority.", None),
+    ("Later add a gate which routes csv rows with amount exceeding 500 to high_value.", None),
+    ("Later route csv rows with amount exceeding 500 to high_value.", None),
+    # The true segment ends in ", with", which the destination grammar does not close.
+    ("Later route csv rows where amount > 500 into high_value, with remaining rows landing in standard.", None),
+    # One destination and no false branch: a gate-routing constraint needs
+    # both targets, so only the predicate half is bindable.
+    ("Later add a gate that routes csv rows with amount greater than 500 to high_value.", "predicate"),
+    ("Later send csv rows with amount greater than 500 to high_value.", "predicate"),
+)
+
+
+@pytest.mark.parametrize(("message", "expected_demand"), _UNBINDABLE_GATE_PROSE)
+def test_gate_prose_the_closed_grammar_cannot_bind_no_longer_deadlocks(message: str, expected_demand: str | None) -> None:
+    """The accepted cost of elspeth-3d392c04ca, stated so nobody mistakes it
+    for a regression.
+
+    Each of these messages used to raise a routing demand that NO closed
+    tuple could satisfy (proven per message by the oracle test below), so
+    every retain was rejected ``stated_fact_unproven``, degraded to
+    constraint-free clarification debt, and wire confirmation 409'd with no
+    exit. The 2026-08-26 fix-shape ruling accepted, with eyes open, that
+    such prose now retains the strongest kind that CAN bind — a predicate
+    where one grounds, otherwise the planner's weaker kind — instead of
+    deadlocking. The genuine-routing-the-grammar-cannot-express class is
+    tracked on elspeth-6155f11add; do not widen the grammar from here.
+    """
+
+    catalog = _view((("source", "csv"), ("transform", "passthrough")))
+    assert _message_requires_stated_constraint(message) == expected_demand
+    weaker = validate_deferred_intent_action(
+        _WEAKER_KIND_ACTION,
+        receiving_stage="source",
+        catalog=catalog,
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    )
+    if expected_demand is None:
+        assert weaker == DeferredIntentAccepted(action=_WEAKER_KIND_ACTION)
+        return
+    # A predicate demand still refuses the weaker kind, and the predicate
+    # that grounds is accepted: the condition is kept, the lone destination
+    # (which the closed tuple cannot carry) is the recorded loss.
+    assert weaker == DeferredIntentRejected(reason="stated_fact_unproven")
+    assert validate_deferred_intent_action(
+        _STATED_PREDICATE_ACTION,
+        receiving_stage="source",
+        catalog=catalog,
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentAccepted(action=_STATED_PREDICATE_ACTION)
+
+
+_CONTROL_ROUTING_MESSAGE = (
+    "This is an orders CSV. Later on I want a gate that routes rows with amount greater than 500 to a "
+    "high_value JSON sink, and everything else to a standard JSON sink. Every row must land in exactly one of them."
+)
+_LIVE_COLLECTOR_MESSAGE = (
+    "Read this synthetic multi-document JSON file, split each document into one row per section, "
+    "have an LLM write a one-sentence gist of each section, then gather each document's section rows back "
+    "together into a single batch per document (every section must make it back — fail the document if one is lost) "
+    "and write one summary row per document to a JSON file.\n"
+    "https://dta-au.github.io/elspeth/tutorial-site/multi-doc-sections.json"
+)
+
+
+_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS = (
+    # elspeth-6155f11add's six: genuine routing prose the closed grammar
+    # cannot bind (categorical / boolean / null-check gates, and two whose
+    # destinations are joined by a bare " and " the destination grammar does
+    # not close on). The false-negative direction of the canary
+    # (elspeth-b24ec0945f option (b)): the derived demand must stay silent
+    # here BECAUSE nothing grounds, and the oracle proves nothing grounds.
+    "route flagged rows to review and everything else to standard",
+    "a gate that sends approved records to approved and the rest to rejected",
+    "send rows where the urgent flag is set to fast, otherwise to slow",
+    "route records with a missing email to quarantine and the rest to main",
+    "route rows where status equals cancelled to review and everything else to main",
+    "route rows where amount is greater than 500 to high_value and the rest to standard",
+)
+
+
 @pytest.mark.parametrize(
     "message",
     (
-        "Later add a gate for csv rows whose amount exceeds 500.",
-        "Later add a gate for csv rows whose amount is higher than 500.",
-        "Later add a gate for csv rows whose amount is between 500 and 1000.",
-        "Later add a gate for csv rows where status is priority.",
-        "Later add a gate which routes csv rows with amount exceeding 500 to high_value.",
-        "Later route csv rows with amount exceeding 500 to high_value.",
+        _CONTROL_ROUTING_MESSAGE,
+        _CONTROL_ROUTING_MESSAGE.replace("greater than 500", "greater than\n500"),
+        "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard.",
+        "Later send csv rows where amount > 500 into high_value; the rest go into standard.",
+        "Later send csv rows where amount > 500 to high_value; the rest go to standard.",
+        "Later route csv rows where status equals priority to high_value, and everything else to standard.",
+        _LIVE_COLLECTOR_MESSAGE,
+        *(message for message, _ in _UNBINDABLE_GATE_PROSE),
+        *_ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS,
     ),
 )
-def test_explicit_condition_only_gate_prose_cannot_be_retained_as_a_weaker_constraint_kind(message: str) -> None:
-    action = DeferredIntentAction(
+def test_a_stated_demand_is_raised_only_when_the_real_validator_accepts_some_stated_action(message: str) -> None:
+    """The property the ticket asked to pin, with the production validator as
+    the oracle: demand raised ⇒ at least one satisfying action exists.
+
+    Not tautological — the demand is derived inside ``deferred_intents`` from
+    the grounding span, while this oracle enumerates the token space on its
+    own and asks ``validate_deferred_intent_action``, which also runs subject
+    grounding and the catalog. The hard-wrapped control (``\\n`` between the
+    operator and its literal) is the counterexample that refuted a
+    grammar-keyed guard on 2026-08-26: grounding tolerates the newline, so
+    the demand must survive it too.
+    """
+
+    demand = _message_requires_stated_constraint(message)
+    assert_demand_is_satisfiable(message, demand, _view((("source", "csv"),)))
+
+
+def test_hard_wrapped_routing_prose_keeps_its_demand_and_refuses_the_weaker_kind() -> None:
+    """The whitespace wedge, pinned directly: the same control that grounds on
+    one line grounds with a line break before the literal, so the demand
+    must still be raised there and the weaker kind still refused."""
+
+    wrapped = _CONTROL_ROUTING_MESSAGE.replace("greater than 500", "greater than\n500")
+    assert _message_requires_stated_constraint(wrapped) == "routing"
+    assert validate_deferred_intent_action(
+        _WEAKER_KIND_ACTION,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
+        guided=GuidedSession.initial(),
+        originating_message_content=wrapped,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_the_live_collector_message_raises_no_stated_demand_and_its_structural_retains_are_accepted() -> None:
+    """elspeth-3d392c04ca verbatim: one word ("split") tripped the routing
+    demand on a message with no comparison anywhere, so every retain was
+    rejected. Both retains the planner actually sent now validate."""
+
+    assert _message_requires_stated_constraint(_LIVE_COLLECTOR_MESSAGE) is None
+    catalog = _view((("source", "json"), ("sink", "json"), ("transform", "llm")))
+    llm_presence = DeferredIntentAction(
         target_stage="topology",
         catalog_kind="transform",
-        catalog_name="passthrough",
-        redacted_summary="Preserve a source during topology authoring.",
+        catalog_name="llm",
+        redacted_summary="LLM gist per section row.",
         constraints=(
             SubjectPresenceConstraint(
                 kind="subject_presence",
                 subject=PluginSubject(
                     kind="plugin",
-                    subject_id="33333333-3333-4333-8333-333333333333",
-                    plugin_kind="source",
-                    plugin_name="csv",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="transform",
+                    plugin_name="llm",
                 ),
                 present=True,
             ),
         ),
     )
-
-    assert validate_deferred_intent_action(
-        action,
-        receiving_stage="source",
-        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
-        guided=GuidedSession.initial(),
-        originating_message_content=message,
-    ) == DeferredIntentRejected(reason="stated_fact_unproven")
-
-
-@pytest.mark.parametrize(
-    "message",
-    (
-        "Later add a gate that routes csv rows with amount greater than 500 to high_value.",
-        "Later send csv rows with amount greater than 500 to high_value.",
-    ),
-)
-def test_condition_only_constraint_cannot_drop_an_explicit_single_branch_destination(message: str) -> None:
-    action = DeferredIntentAction(
+    node_count = DeferredIntentAction(
         target_stage="topology",
         catalog_kind=None,
         catalog_name=None,
-        redacted_summary="Apply the stated predicate.",
+        redacted_summary="At least one topology node.",
         constraints=(
-            StatedPredicateConstraint(
-                kind="stated_predicate",
-                subject=PluginSubject(
-                    kind="plugin",
-                    subject_id="33333333-3333-4333-8333-333333333333",
-                    plugin_kind="source",
-                    plugin_name="csv",
-                ),
+            ComponentCountConstraint(
+                kind="component_count", component_kind="node", plugin_kind=None, plugin_name=None, operator="at_least", count=1
+            ),
+        ),
+    )
+    for action in (llm_presence, node_count):
+        assert validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=catalog,
+            guided=GuidedSession.initial(),
+            originating_message_content=_LIVE_COLLECTOR_MESSAGE,
+        ) == DeferredIntentAccepted(action=action)
+
+
+def _control_gate_routing_action() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route amount-threshold rows to the two named outputs.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=_CSV_SOURCE_SUBJECT,
                 column="amount",
                 operator="greater_than",
                 value=500,
+                true_target="high_value",
+                false_target="standard",
             ),
         ),
     )
 
-    assert validate_deferred_intent_action(
-        action,
+
+def test_edit_command_demand_and_grounding_read_the_replacement_instruction_while_the_hash_binds_the_envelope() -> None:
+    """The only documented exit from clarification debt is ``Edit exact intent
+    <UUID>: <instruction>``. The demand and grounding used to be computed
+    over that whole envelope — so a restated routing instruction tripped the
+    demand again and raised out of the persistence path (addendum 7992 #4),
+    and even a perfectly grounded gate constraint failed the affirmative
+    prefix because the envelope preceded it. Now the instruction is what is
+    read; the audit hash still binds the whole message."""
+
+    instruction = "Later add a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard."
+    envelope = f"Edit exact intent {INTENT_ID}: {instruction}"
+    assert deferred_intent_instruction_text(envelope) == instruction
+    assert deferred_intent_instruction_text(instruction) == instruction
+
+    gate = _control_gate_routing_action()
+    created = create_deferred_stage_intent(
+        gate,
         receiving_stage="source",
-        catalog=_view((("source", "csv"),)),
+        intent_id=INTENT_ID,
+        originating_message_id=MESSAGE_ID,
+        originating_message_content=envelope,
         guided=GuidedSession.initial(),
-        originating_message_content=message,
-    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+    )
+    assert created.message_content_hash == stable_hash(envelope)
+    assert created.constraints == gate.constraints
+
+    # The demand is computed on the instruction, so a weaker kind on the
+    # same envelope is refused at the persistence seam, not persisted.
+    with pytest.raises(InvariantError, match="closed stated constraint"):
+        create_deferred_stage_intent(
+            _WEAKER_KIND_ACTION,
+            receiving_stage="source",
+            intent_id=INTENT_ID,
+            originating_message_id=MESSAGE_ID,
+            originating_message_content=envelope,
+            guided=GuidedSession.initial(),
+        )
+
+    prior = create_deferred_stage_intent(
+        _action(),
+        receiving_stage="source",
+        intent_id=INTENT_ID,
+        originating_message_id=MESSAGE_ID,
+        originating_message_content="private prior instruction",
+    )
+    result = resolve_deferred_intent_management(
+        DeferredIntentEditAction(
+            intent_id=prior.intent_id,
+            selection_token=intent_management_module.deferred_intent_management_option(prior).selection_token,
+            replacement=gate,
+        ),
+        guided=replace(GuidedSession.initial(), deferred_intents=(prior,)),
+        catalog=_view((("source", "csv"), ("transform", "llm"))),
+        originating_message_id="55555555-5555-4555-8555-555555555555",
+        originating_message_content=envelope,
+    )
+    assert type(result) is DeferredIntentManagementApplied
+    assert result.effective_intent.constraints == gate.constraints
 
 
 @pytest.mark.parametrize(

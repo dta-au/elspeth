@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from tests.helpers.tree_gate import iter_gate_files
+
 from elspeth.web.sessions.models import metadata as sessions_metadata
 
 Scope = Literal["session", "global"]
@@ -7676,7 +7678,7 @@ def test_writer_authority_must_match_the_table_policy() -> None:
 def test_all_production_sessions_writers_are_reviewed_typed_authorities() -> None:
     root = _repo_root()
     production_root = root / "src" / "elspeth"
-    scanned = scan_production_writers(production_root.rglob("*.py"), anchor=root)
+    scanned = scan_production_writers(iter_gate_files(production_root), anchor=root)
     reviewed_read_policy_violations = reviewed_read_connection_policy_violations(_REVIEWED_READ_CONNECTIONS)
     sessions_domain, stale_non_session_connections = subtract_reviewed_identities(
         scanned,

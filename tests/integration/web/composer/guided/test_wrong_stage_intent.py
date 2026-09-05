@@ -83,6 +83,20 @@ from tests.integration.web.composer.guided.test_step_chat import (
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
+def _retained_unverified_copy(intent_id: str) -> str:
+    """The exact retained-but-unverified copy for a stated_fact_unproven or
+    option-literal rejection: it names the intent and both exact commands,
+    because the UUID reaches the user nowhere else and the debt blocks wire
+    confirmation until one of them is sent (elspeth-3d392c04ca)."""
+
+    return (
+        "I kept your instruction as a pending clarification instead of applying it. "
+        "I couldn't verify its structural details against your message, so state the concrete structural requirement. "
+        f"It is saved as instruction {intent_id} with no structural constraint, and wiring cannot be confirmed while it stands: "
+        f"send 'Edit exact intent {intent_id}: <corrected instruction>' to firm it up, or 'Cancel exact intent {intent_id}.' to drop it."
+    )
+
+
 def _dml_target_table(context: ExecutionContext) -> FromClause | None:
     """Return the table a compiled DML statement writes to, else ``None``.
 
@@ -2388,14 +2402,10 @@ def test_real_route_unproven_option_literal_retains_clarification_debt_without_l
 
     assert response.status_code == 200, response.json()
     response_json = response.json()
-    assert response_json["assistant_message"] == (
-        "I kept your instruction as a pending clarification instead of applying it. "
-        "I couldn't verify its structural details against your message. "
-        "Restate the concrete structural requirement and I'll firm it up."
-    )
     assert private_message not in _text_outside_chat_history(response_json)
     guided = _guided(client, session_id)
     (retained_intent,) = guided.deferred_intents
+    assert response_json["assistant_message"] == _retained_unverified_copy(retained_intent.intent_id)
     assert retained_intent.constraints == ()
     assert retained_intent.catalog_kind is None
     assert private_message not in repr(retained_intent)
@@ -2505,14 +2515,10 @@ def test_boolean_property_schema_retains_constraint_free_clarification_debt(
     )
 
     assert response.status_code == 200, response.json()
-    assert response.json()["assistant_message"] == (
-        "I kept your instruction as a pending clarification instead of applying it. "
-        "I couldn't verify its structural details against your message. "
-        "Restate the concrete structural requirement and I'll firm it up."
-    )
     assert private_message not in _text_outside_chat_history(response.json())
     guided = _guided(client, session_id)
     (retained_intent,) = guided.deferred_intents
+    assert response.json()["assistant_message"] == _retained_unverified_copy(retained_intent.intent_id)
     assert retained_intent.constraints == ()
     assert private_message not in repr(retained_intent)
     assert guided.chat_history[-2].content == private_message

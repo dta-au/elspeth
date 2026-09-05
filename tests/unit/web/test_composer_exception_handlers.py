@@ -20,6 +20,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, Fr
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.middleware.request_id import MAX_REQUEST_ID_LENGTH
 from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
@@ -650,6 +652,11 @@ async def test_run_already_active_error_handler_returns_correlated_409(tmp_path:
     assert body["request_id"] == "req-run-active-1"
 
 
+# The two app-level handlers that are exempt from the envelope invariant below
+# BECAUSE their bodies must equal the ordinary ownership refusal exactly.
+_NONLEAKING_HANDLERS: tuple[type[Exception], ...] = (SessionOperationFenceLost, SessionOperationConflictError)
+
+
 @pytest.mark.asyncio
 async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path) -> None:
     """R2-F16b, stated once as a whole-surface invariant.
@@ -665,6 +672,16 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
     of field errors but have no ``error_type`` discriminator, so neither is a
     composer envelope. The ``HTTPException`` boundary is excluded because it
     is the injector.
+
+    The two session-operation handlers (:data:`_NONLEAKING_HANDLERS`) are
+    excluded by construction too, and for the opposite reason: they are
+    deliberately NOT envelopes. A fence loss and a claim conflict render a
+    fixed body that is byte-identical to the ordinary ownership 404 / 409, so
+    a caller cannot tell "you never owned this session" from "your lease was
+    just taken". Correlating them would add a key the ordinary responses do
+    not carry and reopen exactly that distinction.
+    :func:`test_the_nonleaking_session_operation_handlers_render_fixed_parity_bodies`
+    pins that construction positively so this exclusion cannot rot.
     """
     app = create_app(_settings(tmp_path))
     cases: list[tuple[type[Exception], Exception]] = [
@@ -684,7 +701,7 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
     ]
     # Every registered handler that can render an ``error_type`` body is
     # covered; if a new one is registered, this assertion names it.
-    excluded = (StarletteHTTPException, RequestValidationError, WebSocketRequestValidationError)
+    excluded = (StarletteHTTPException, RequestValidationError, WebSocketRequestValidationError, *_NONLEAKING_HANDLERS)
     structured = {key for key in app.exception_handlers if isinstance(key, type) and issubclass(key, Exception) and key not in excluded}
     assert structured == {case[0] for case in cases}
 
@@ -692,3 +709,37 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         response = await app.exception_handlers[exc_type](_audit_request("req-invariant-1"), exc)
         body = json.loads(response.body)
         assert body["request_id"] == "req-invariant-1", exc_type.__name__
+
+
+@pytest.mark.asyncio
+async def test_the_nonleaking_session_operation_handlers_render_fixed_parity_bodies(tmp_path: Path) -> None:
+    """Positive pin for the construction the envelope invariant relies on.
+
+    Both handlers must render a body with exactly one key, ``detail``, whose
+    value is the same string the ownership routes raise through the
+    ``HTTPException`` boundary — so the two responses are byte-identical and
+    a fence loss is indistinguishable from never having owned the session.
+    Parity is measured against the boundary's own rendering of the ordinary
+    refusal, not against a literal copied into this test, so a change to
+    either side fails here. No ``error_type`` and no ``request_id`` may
+    appear: either would be a key the ordinary response lacks.
+    """
+    app = create_app(_settings(tmp_path))
+    http_boundary = app.exception_handlers[StarletteHTTPException]
+    parity: list[tuple[type[Exception], Exception, int, str]] = [
+        (SessionOperationFenceLost, SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH), 404, "Session not found"),
+        (SessionOperationConflictError, SessionOperationConflictError(), 409, "Session operation is already active"),
+    ]
+    assert tuple(case[0] for case in parity) == _NONLEAKING_HANDLERS
+
+    for exc_type, exc, status_code, detail in parity:
+        response = await app.exception_handlers[exc_type](_audit_request("req-nonleaking-1"), exc)
+        ordinary = await http_boundary(_audit_request("req-nonleaking-2"), HTTPException(status_code=status_code, detail=detail))
+
+        assert isinstance(response, JSONResponse), exc_type.__name__
+        assert response.status_code == status_code, exc_type.__name__
+        assert json.loads(response.body) == {"detail": detail}, exc_type.__name__
+        assert response.body == ordinary.body, exc_type.__name__
+        assert "req-nonleaking" not in response.body.decode(), exc_type.__name__
+        # The leak-safe message on the exception itself never reaches the body.
+        assert str(exc) not in response.body.decode(), exc_type.__name__

@@ -12,6 +12,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import (
+    DEFERRED_INTENT_EDIT_COMMAND,
     DeferredIntentAccepted,
     DeferredIntentCancelAction,
     DeferredIntentEditAction,
@@ -164,14 +165,16 @@ def deferred_intent_management_user_authority_matches(
     matching_current_ids = tuple(intent.intent_id for intent in deferred_intents if intent.intent_id == action.intent_id)
     if matching_current_ids != (action.intent_id,):
         return False
-    escaped_intent_id = re.escape(action.intent_id)
     if type(action) is DeferredIntentCancelAction:
-        pattern = rf"\s*cancel\s+exact\s+intent\s+{escaped_intent_id}\.?\s*"
-    elif type(action) is DeferredIntentEditAction:
-        pattern = rf"\s*edit\s+exact\s+intent\s+{escaped_intent_id}\s*:\s*\S(?:[\s\S]*\S)?\s*"
-    else:  # pragma: no cover - the closed action union owns this guard
-        return False
-    return re.fullmatch(pattern, originating_message_content, flags=re.IGNORECASE) is not None
+        pattern = rf"\s*cancel\s+exact\s+intent\s+{re.escape(action.intent_id)}\.?\s*"
+        return re.fullmatch(pattern, originating_message_content, flags=re.IGNORECASE) is not None
+    if type(action) is DeferredIntentEditAction:
+        # The same regex ``deferred_intent_instruction_text`` reads the
+        # replacement instruction from: authority and extraction cannot
+        # disagree about what the command is.
+        command = DEFERRED_INTENT_EDIT_COMMAND.fullmatch(originating_message_content)
+        return command is not None and command.group("intent_id").casefold() == action.intent_id.casefold()
+    return False  # pragma: no cover - the closed action union owns this guard
 
 
 @dataclass(frozen=True, slots=True)

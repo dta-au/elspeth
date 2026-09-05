@@ -11,7 +11,7 @@ import ast
 import asyncio
 import json
 import threading
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -1223,6 +1223,48 @@ def test_candidate_shape_hash_retains_closed_node_type_sequence(tmp_path: Path) 
     gate_candidate["nodes"][0]["node_type"] = "gate"
 
     assert _candidate_shape_hash(transform_candidate) != _candidate_shape_hash(gate_candidate)
+
+
+def test_candidate_shape_hash_is_identity_blind_not_structure_preserving(tmp_path: Path) -> None:
+    """Pin what this hash CANNOT see, because its name misled a whole investigation.
+
+    On 2026-09-04 two agents spent a day reasoning from "attempts 2 and 3 share
+    a candidate_shape_hash, therefore the repair between them changed only
+    VALUES inside an identical structure". That inference does not hold. The
+    hash is IDENTITY-blind, not merely value-free: a repair that renamed every
+    node, re-pointed every route and swapped a plugin produces the SAME hash.
+    Three real rejection codes — ``guided_reviewed_name_shadowed``,
+    ``guided_route_target_unknown`` and ``guided_output_alias_collision`` —
+    prescribe exactly those edits, so a model following good guidance produces
+    the signature that was read as blindness.
+
+    The two tests above pin what it DOES retain. This one pins what it does
+    not, so the next reader takes the instrument's resolution from an assertion
+    rather than from ``_value_free_shape``'s name. A hash's discriminating
+    power is measured, never inferred from its identifier.
+    """
+    base = _pipeline(tmp_path)
+    base["nodes"] = [
+        {"id": "scrape", "node_type": "transform", "plugin": "web_scrape", "input": "rows", "on_success": "scraped"},
+        {"id": "llm1", "node_type": "transform", "plugin": "llm", "input": "scraped", "on_success": "out"},
+    ]
+    baseline = _candidate_shape_hash(base)
+
+    def mutated(apply: Callable[[dict[str, Any]], None]) -> str:
+        candidate = deepcopy(base)
+        apply(candidate)
+        return _candidate_shape_hash(candidate)
+
+    # INVISIBLE — every one of these is a real repair a rejection can demand.
+    assert mutated(lambda c: c["nodes"][1].__setitem__("plugin", "coalesce")) == baseline
+    assert mutated(lambda c: c["nodes"][0].__setitem__("id", "renamed")) == baseline
+    assert mutated(lambda c: c["nodes"][1].__setitem__("input", "rows")) == baseline
+    assert mutated(lambda c: c["nodes"][0].__setitem__("on_success", "elsewhere")) == baseline
+
+    # VISIBLE — the kind set, key presence, and cardinality.
+    assert mutated(lambda c: c["nodes"][1].__setitem__("node_type", "gate")) != baseline
+    assert mutated(lambda c: c["nodes"][0].pop("on_success")) != baseline
+    assert mutated(lambda c: c["nodes"].append({"id": "x", "node_type": "transform", "plugin": "llm"})) != baseline
 
 
 @pytest.mark.asyncio
@@ -7552,6 +7594,204 @@ def test_violated_plugin_contract_is_withheld_for_a_config_owned_component() -> 
     # Never even asked: the resolver call itself would be a policy read keyed
     # on a withheld identity.
     assert resolved == []
+
+
+def test_schema_contract_detail_withholding_follows_the_participants_not_the_entry() -> None:
+    """A contract fact is withheld when a PARTICIPANT is config-owned, not only its own component.
+
+    ``_contract_participant_refs`` exists because a ``SchemaContractDetail``
+    names two components — producer and consumer — and either can be the
+    finalizer-bound one. An entry ABOUT a model-authored node can therefore
+    still quote a reviewed source's or sink's field set through its contract
+    payload, which is why the withholding decision reads the participants and
+    not just ``_entry_component_ref``.
+
+    CORRECTION (red-team seat, 2026-09-04). This docstring originally claimed
+    the arm "had no test", on the grounds that ``_contract_participant_refs``
+    was referenced nowhere under ``tests/``. That measured a SYMBOL NAME, not
+    coverage, and the claim was false.
+    ``test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads``
+    (landed 2026-08-04) already covers this arm and covers it BETTER: it kills
+    a mutant this test survives — dropping the ``f"node:{participant}"``
+    normalization. Treat that test as the guard and this one as a readable
+    matrix of the rule.
+
+    It is pinned in both directions deliberately. Withholding too little is a
+    custody leak; withholding too much is the failure recorded in
+    ``_allowlisted_candidate_feedback``'s own docstring, where a
+    candidate-global predecessor predicate "made guided repair permanently
+    blind" because the guided binder always mutates the candidate. The
+    forwarding arm below is what keeps a model-authored-to-model-authored
+    edge repairable, and it is load-bearing for diagnosing repair thrash
+    (elspeth-15c60e7c66): whether the planner was shown ``extra_fields``
+    decides whether a wasted repair turn is an observability defect or a
+    briefing one.
+    """
+    guided_binder_owns_reviewed_ends = _FinalizerOwnedRefs(
+        config=frozenset({"source", "output:json_out"}),
+        routing=frozenset(),
+    )
+
+    def _summary(producer: str, consumer: str, component: str) -> ValidationSummary:
+        return ValidationSummary(
+            is_valid=False,
+            errors=(
+                ValidationEntry(
+                    component=component,
+                    message="Schema contract violation: producer -> consumer.",
+                    severity="high",
+                    error_code="locked_input_extras",
+                    contract=SchemaContractDetail(
+                        producer=producer,
+                        consumer=consumer,
+                        extra_fields=("content", "fingerprint"),
+                    ),
+                ),
+            ),
+        )
+
+    # Both ends model-authored: the planner already holds every name in the
+    # payload, so the repair turn gets the fields it must act on.
+    between_transforms = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert between_transforms["validation"]["errors"][0]["contract"] == {
+        "producer": "llm_1",
+        "consumer": "field_mapper_1",
+        "extra_fields": ["content", "fingerprint"],
+    }
+
+    # THE ARM THIS TEST EXISTS FOR. Same entry component class as above — a
+    # model-authored node — but the PRODUCER is the reviewed source the binder
+    # wrote. An entry-only ownership check passes this through; only the
+    # participant check withholds it. Verified by mutation: neutering
+    # ``_contract_participant_refs`` to return no refs makes exactly this
+    # assertion fail, and it is the only one that fails.
+    from_reviewed_source = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("source", "web_scrape_1", "node:web_scrape_1"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in from_reviewed_source["validation"]["errors"][0]
+
+    # A reviewed SINK as consumer is withheld too, but NOT by the participant
+    # arm: its entry component IS ``output:json_out``, so the entry-own check
+    # already owns it and this survives the mutation above. Kept because the
+    # two paths overlapping here is the reason the participant arm looks
+    # redundant from a sink-consumer example and is not — do not treat this
+    # assertion as coverage of the cross-reference.
+    into_reviewed_sink = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "output:json_out", "output:json_out"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in into_reviewed_sink["validation"]["errors"][0]
+
+    # THE THIRD ROUTE. An entry whose subject cannot be attributed
+    # (``rejected_mutation`` with no ``rejected_component``) makes
+    # ``_entry_component_ref`` return None, and ``config = ref is None or ...``
+    # then fails CLOSED while the finalizer owns anything. Withholding has
+    # three routes, not one: the entry's own component is config-owned, a
+    # participant is config-owned, or the subject is unattributable. A fix
+    # aimed only at the reviewed-source case leaves the other two live (peer
+    # finding on elspeth-aad0394b95, 2026-09-04).
+    #
+    # REDUNDANT FOR DETECTION, kept for the matrix. Measured: mutating
+    # ``_entry_component_ref`` to never return None fails this assertion, but
+    # ALSO fails ``test_violated_plugin_contract_is_withheld_for_a_config_owned_component``
+    # and ``test_rejection_subject_is_read_structurally_never_parsed_from_the_message``
+    # with this test deselected. Those two are the guards; this line exists so
+    # the three routes read as one matrix. Stated because the first version of
+    # this test claimed coverage it did not add, and the same claim was nearly
+    # made again here.
+    unattributable = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "rejected_mutation"))),
+        finalizer_owned=guided_binder_owns_reviewed_ends,
+    )
+    assert "contract" not in unattributable["validation"]["errors"][0]
+
+    # Freeform baseline: no finalizer ownership, nothing to withhold against.
+    freeform = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=_summary("llm_1", "field_mapper_1", "node:field_mapper_1"))),
+    )
+    assert freeform["validation"]["errors"][0]["contract"]["extra_fields"] == ["content", "fingerprint"]
+
+
+def test_connectivity_facts_are_withheld_per_change_kind_not_per_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routing ownership withholds connectivity but KEEPS the component id; config ownership takes both.
+
+    The sibling of ``_contract_participant_refs``: the other arm of the same
+    withholding predicate, and it was uncovered the same way. Six tests
+    reference ``coalesce_branch_unreachable``, but the only one that exercises
+    the code path calls ``_allowlisted_candidate_feedback`` with no
+    ``finalizer_owned``, so it runs against ``_FINALIZER_OWNS_NOTHING`` and
+    asserts the missing-fact ``KeyError``. It never reaches the withholding
+    branch at all. Exercising a function is not covering a branch.
+
+    Both failure directions are live here. Over-withholding is not theoretical:
+    the code comment at that branch records guided session 277fb6c4 burning its
+    WHOLE repair budget re-emitting a coalesce because nothing named the
+    connections that actually existed. Under-withholding discloses
+    finalizer-written routing destinations. The middle row below is the whole
+    point of scoping ownership per CHANGE KIND rather than per component — a
+    routing retarget suppresses the facts that would quote it, and nothing
+    else.
+
+    Mutation-verified: dropping the ``routing`` set from the withholding
+    predicate makes the middle assertion below fail. A first attempt at that
+    mutation emptied ``_CONNECTIVITY_FACT_CODES`` instead and the pin survived
+    — that constant feeds the aggregate ``withheld`` flag, while the
+    projection guard reads ``withholding.connectivity``. Recorded because the
+    surviving mutant looked like a worthless test and was actually a
+    mis-aimed mutation.
+    """
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    facts = {"co": {"reachable_branches": ["a"], "published_connections": ["straight_to_sink"]}}
+    monkeypatch.setattr(planner_module, "coalesce_reachability_facts", lambda _state: facts)
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:co",
+                message="closed diagnostic",
+                severity="error",
+                error_code="coalesce_branch_unreachable",
+            ),
+        ),
+    )
+    result = cast(Any, SimpleNamespace(validation=summary, updated_state=object()))
+
+    def entry_for(owned: _FinalizerOwnedRefs | None) -> Mapping[str, Any]:
+        feedback = (
+            _allowlisted_candidate_feedback(result) if owned is None else _allowlisted_candidate_feedback(result, finalizer_owned=owned)
+        )
+        return feedback["validation"]["errors"][0]
+
+    # Nothing owned: the planner gets the wiring facts it needs to repair.
+    disclosed = entry_for(None)
+    assert disclosed["connectivity"] == facts["co"]
+    assert disclosed["component"] == "node:co"
+
+    # THE ARM THIS TEST EXISTS FOR. A routing-only retarget suppresses the
+    # connectivity facts — they would quote finalizer-written destinations —
+    # while KEEPING the true component id, because the node's options are
+    # still exactly what the model authored.
+    routing_owned = entry_for(_FinalizerOwnedRefs(routing=frozenset({"node:co"})))
+    assert "connectivity" not in routing_owned
+    assert routing_owned["component"] == "node:co"
+
+    # Config ownership takes both: facts AND identity.
+    config_owned = entry_for(_FinalizerOwnedRefs(config=frozenset({"node:co"})))
+    assert "connectivity" not in config_owned
+    assert config_owned["component"] == "pipeline"
+
+    # Ownership of an UNRELATED component must not withhold anything here —
+    # the predecessor candidate-global predicate did exactly that, and it is
+    # what made guided repair permanently blind.
+    unrelated = entry_for(_FinalizerOwnedRefs(config=frozenset({"source"})))
+    assert unrelated["connectivity"] == facts["co"]
+    assert unrelated["component"] == "node:co"
 
 
 def test_an_entry_without_a_carried_identity_attaches_nothing() -> None:

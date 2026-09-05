@@ -100,13 +100,12 @@ async def acquire_compose_context(sessions_service, session_id):
             await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
 
 
-def make_compose_context(session_id):
-    """Build an exact synthetic COMPOSE context for pure-unit direct calls.
+def _make_context(session_id, operation_kind: SessionOperationKind):
+    """Build one exact synthetic context of ``operation_kind`` bound to ``session_id``.
 
-    For tests that monkeypatch the code the context would otherwise reach
-    (no live authority to acquire from). Nominal validators check exact type,
-    kind, and session binding — all satisfied honestly here; anything that
-    proves liveness against the database will (correctly) reject it.
+    Nominal validators check exact type, kind, and session binding — all
+    satisfied honestly here; anything that proves liveness against the
+    database will (correctly) reject it.
     """
     from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
 
@@ -117,8 +116,39 @@ def make_compose_context(session_id):
             lease_token=uuid4().hex,
             operation_epoch=2,
         ),
-        operation_kind=SessionOperationKind.COMPOSE,
+        operation_kind=operation_kind,
     )
+
+
+def make_compose_context(session_id):
+    """Build an exact synthetic COMPOSE context for pure-unit direct calls.
+
+    For tests that monkeypatch the code the context would otherwise reach
+    (no live authority to acquire from).
+    """
+    return _make_context(session_id, SessionOperationKind.COMPOSE)
+
+
+def make_execute_context(session_id):
+    """Build an exact synthetic EXECUTE context for pure-unit direct calls.
+
+    For the context-taking execution seams (``update_run_status``,
+    ``append_run_event``, the blob finalizers) when no lease lifetime is under
+    test. Methods that take a *lease* (``execute``, ``_run_pipeline``) need
+    :func:`execute_lease` or :func:`adopt_execute_lease` instead — their exact
+    ``SessionOperationLease`` check cannot be satisfied by a bare context.
+    """
+    return _make_context(session_id, SessionOperationKind.EXECUTE)
+
+
+def make_blob_read_context(session_id):
+    """Build an exact synthetic BLOB_READ context for pure-unit direct calls.
+
+    For ``validate`` / ``validate_state`` / ``compute_snapshot`` and the other
+    read-side seams that take ``session_operation_context`` and are reached in
+    production under a BLOB_READ lease acquired by the route.
+    """
+    return _make_context(session_id, SessionOperationKind.BLOB_READ)
 
 
 class RecordingSessionOperationAuthority:
@@ -128,31 +158,39 @@ class RecordingSessionOperationAuthority:
     a test can assert what authority was requested. No production bypass: code
     under test still receives and threads exact contexts; anything verifying
     liveness against a real database does not belong on this fake.
+
+    ``renew`` returns the identical context, so a real
+    ``SessionOperationLease`` built over this authority stays alive across
+    renewals exactly as it would over the SQLite authority. The two error knobs
+    model authority loss as a resource: set ``compare_and_swap_error`` to make
+    the next ``guard_external_effect`` fail, ``renew_error`` to make the next
+    renewal record a loss. Both raise the exact exception assigned.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
         self.active: list[object] = []
+        self.compare_and_swap_error: BaseException | None = None
+        self.renew_error: BaseException | None = None
 
     def acquire(self, *, session_id, operation_kind, owner_instance_id, lease_seconds):
         del owner_instance_id, lease_seconds
-        from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
-
-        context = SessionOperationContext(
-            fence=SessionOperationFence(
-                session_id=str(session_id),
-                operation_id=str(uuid4()),
-                lease_token=uuid4().hex,
-                operation_epoch=2,
-            ),
-            operation_kind=operation_kind,
-        )
+        context = _make_context(session_id, operation_kind)
         self.calls.append(("acquire", context))
         self.active.append(context)
         return context
 
+    def renew(self, context, *, lease_seconds):
+        del lease_seconds
+        self.calls.append(("renew", context))
+        if self.renew_error is not None:
+            raise self.renew_error
+        return context
+
     def compare_and_swap(self, context):
         self.calls.append(("compare_and_swap", context))
+        if self.compare_and_swap_error is not None:
+            raise self.compare_and_swap_error
         return context
 
     def release(self, context):
@@ -162,6 +200,85 @@ class RecordingSessionOperationAuthority:
 
     def validate_fork_child_lease(self, *args, **kwargs):
         self.calls.append(("validate_fork_child_lease", (args, kwargs)))
+
+
+_TEST_EXECUTE_OWNER_INSTANCE_ID = "test-execute-owner"
+
+
+@__import__("contextlib").asynccontextmanager
+async def execute_lease(
+    session_id,
+    *,
+    authority: RecordingSessionOperationAuthority | None = None,
+    lease_seconds: int = 30,
+    renew_interval_seconds: float | None = None,
+    owner_instance_id: str = _TEST_EXECUTE_OWNER_INSTANCE_ID,
+):
+    """Hold a real EXECUTE ``SessionOperationLease`` for one async test body.
+
+    Acquires through ``SessionOperationLease.acquire`` — the same call the
+    execution route makes — over ``authority`` (a fresh recording authority
+    when omitted; pass your own to assert on its ``calls``). The lease is a
+    genuine lifecycle object: its renewal task runs, ``guard_external_effect``
+    reproves through the authority, and ``close`` releases on exit. Nothing
+    the production guard checks is bypassed; a raising ``compare_and_swap``
+    surfaces from the guard exactly as it does under the SQLite authority.
+    """
+    from uuid import UUID as _UUID
+
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+
+    if authority is None:
+        authority = RecordingSessionOperationAuthority()
+    sid = session_id if isinstance(session_id, _UUID) else _UUID(str(session_id))
+    lease = await SessionOperationLease.acquire(
+        authority,
+        session_id=sid,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=owner_instance_id,
+        lease_seconds=lease_seconds,
+        renew_interval_seconds=renew_interval_seconds,
+    )
+    async with lease:
+        yield lease
+
+
+def adopt_execute_lease(
+    loop,
+    session_id,
+    authority: RecordingSessionOperationAuthority | None = None,
+    *,
+    lease_seconds: int = 30,
+    renew_interval_seconds: float | None = None,
+):
+    """Adopt a real EXECUTE lease onto ``loop`` for a synchronous direct call.
+
+    For tests that drive a sync internal (``_run_pipeline``,
+    ``_finalize_output_blobs``, ``_on_pipeline_done``) from the test thread
+    and own an event loop for the service's ``_call_async`` bridge. The lease
+    is built by ``SessionOperationLease.adopt`` — its compare-and-swap runs
+    through ``authority`` and its renewal task is bound to ``loop`` — so the
+    sync guard calls the code under test makes reprove through the authority
+    exactly as in production. Close it with :func:`close_adopted_lease` on the
+    same loop; the loop must be open and not running when either is called.
+    """
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
+
+    if authority is None:
+        authority = RecordingSessionOperationAuthority()
+    return loop.run_until_complete(
+        SessionOperationLease.adopt(
+            authority,
+            make_execute_context(session_id),
+            lease_seconds=lease_seconds,
+            renew_interval_seconds=renew_interval_seconds,
+        )
+    )
+
+
+def close_adopted_lease(loop, lease) -> None:
+    """Close a lease from :func:`adopt_execute_lease` on the loop it was adopted onto."""
+    loop.run_until_complete(lease.close())
 
 
 def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "test-live-owner", lease_seconds: int = 300):
