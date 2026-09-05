@@ -106,7 +106,6 @@ def _seat_run_with_live_leader(
     return _coord(crashed).acquire_run_leadership(
         run_id=crashed.run_id,
         worker_id=leader_id,
-        now=crashed.clock.now_utc(),
         window_seconds=window_seconds,
     )
 
@@ -127,7 +126,6 @@ def _join_follower(crashed: Any, leader_token: CoordinationToken) -> str:
         return orch.join_run(
             run_id=crashed.run_id,
             settings=types.SimpleNamespace(),
-            now=crashed.clock.now_utc(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
         )
 
@@ -227,7 +225,6 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -251,7 +248,6 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -278,7 +274,6 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -312,7 +307,6 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -353,7 +347,6 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -648,12 +641,11 @@ class TestFollowerLifecycle:
         wait_calls: list[float] | None = None,
         drain_results: list[list[Any]] | None = None,
     ) -> tuple[FollowerProcessor, Any, Any]:
-        """Build a FollowerProcessor with stub processor and injected now_fn.
+        """Build a FollowerProcessor with a stub processor and a recording wait_fn.
 
         Returns (follower, stub_processor, stub_coord_repo).
         """
         run_id = crashed.run_id
-        clock = crashed.clock
         coord_repo = crashed.factory.run_coordination
         factory = crashed.factory
 
@@ -677,7 +669,6 @@ class TestFollowerLifecycle:
             token=follower_token,
             run_coordination=coord_repo,
             factory=factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=_wait,
             idle_poll_seconds=0.001,
         )
@@ -723,7 +714,6 @@ class TestFollowerLifecycle:
             token=follower_token,
             run_coordination=real_coord,
             factory=real_factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=_wait,
             idle_poll_seconds=0.001,
         )
@@ -760,7 +750,6 @@ class TestFollowerLifecycle:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=lambda _: None,
         )
 
@@ -788,7 +777,6 @@ class TestFollowerLifecycle:
         leader_token = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=leader_id,
-            now=clock.now_utc(),
             window_seconds=5.0,
         )
         follower_id = _join_follower(crashed, leader_token)
@@ -804,7 +792,6 @@ class TestFollowerLifecycle:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=lambda _: None,
         )
 
@@ -851,7 +838,6 @@ class TestFollowerLifecycle:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=lambda _: None,
         )
 
@@ -1132,7 +1118,6 @@ def _run_real_follower(
     before_follower_run: Callable[[Any, str, Any], None] | None = None,
 ) -> tuple[Any, str, str, Any, Path]:
     """Run one real follower through CLI graph/lifecycle and FollowerProcessor."""
-    from datetime import UTC, datetime
 
     from elspeth.cli import (
         _build_resume_graphs,
@@ -1173,17 +1158,14 @@ def _run_real_follower(
 
     with db.engine.begin() as conn:
         conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
-    now = datetime.now(UTC)
     factory.run_coordination.acquire_run_leadership(
         run_id=run_id,
         worker_id=f"worker:{run_id}:real-leader",
-        now=now,
         window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
     worker_id = Orchestrator(db).join_run(
         run_id,
         settings,
-        now=now,
         window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
 

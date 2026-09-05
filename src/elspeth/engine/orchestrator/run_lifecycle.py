@@ -539,7 +539,7 @@ class RunLifecycleCoordinator:
             # leaves the seat to lapse on its liveness window; it must never
             # un-complete a completed run.
             with best_effort("Seat release after finalize", run_id=run.run_id):
-                factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                factory.run_coordination.release_seat(token=coordination_token)
 
             # Emit telemetry AFTER Landscape finalize succeeds
             run_duration = time.perf_counter() - run_start_time
@@ -611,7 +611,7 @@ class RunLifecycleCoordinator:
                 # succeeded (same best_effort block), so a finalize failure
                 # leaves the seat to lapse rather than vacating a run whose
                 # terminal status was never recorded.
-                factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                factory.run_coordination.release_seat(token=coordination_token)
             raise  # Propagate to CLI
         except _RunFailedWithPartialResultError as failed_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
@@ -635,7 +635,7 @@ class RunLifecycleCoordinator:
                         token=coordination_token,
                     )
                     # Seat hygiene: after the FAILED finalize succeeded.
-                    factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                    factory.run_coordination.release_seat(token=coordination_token)
             raise failed_exc.original_error.with_traceback(failed_exc.original_traceback) from None
         except Exception:
             # Outer broad-except: any unhandled exception type is a run failure
@@ -656,7 +656,7 @@ class RunLifecycleCoordinator:
                 else:
                     self._ceremony.emit_failed_ceremony(run.run_id, factory, run_start_time, token=coordination_token)
                     # Seat hygiene: after the FAILED finalize succeeded.
-                    factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                    factory.run_coordination.release_seat(token=coordination_token)
             raise  # CRITICAL: Always re-raise - observability doesn't suppress errors
         finally:
             # ADR-030 §A.3: safety-net stop (idempotent) — covers any exit

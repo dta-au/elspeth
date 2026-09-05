@@ -250,7 +250,6 @@ class TestCheckRunStatusResumable:
             RunCoordinationRepository(db.engine),
             run_id="run-seat-parity",
             worker_id=leader_id,
-            now=datetime.now(UTC),
             window_seconds=80.0,
         )
         run_status, check = check_run_status_resumable(db, "run-seat-parity")
@@ -281,7 +280,6 @@ class TestResumeEntryGuard:
             RunCoordinationRepository(db.engine),
             run_id="run-running",
             worker_id=leader_id,
-            now=datetime.now(UTC),
             window_seconds=80.0,
         )
         coordinator, checkpoints = _coordinator(db)
@@ -316,7 +314,6 @@ class TestResumeEntryGuard:
             RunCoordinationRepository(db.engine),
             run_id="run-live-leader",
             worker_id=leader_id,
-            now=datetime.now(UTC),
             window_seconds=80.0,
         )
         coordinator, checkpoints = _coordinator(db)
@@ -366,7 +363,6 @@ class TestResumeEntryGuard:
             RunCoordinationRepository(db.engine),
             run_id="run-dead-leader",
             worker_id=mint_worker_id("run-dead-leader"),
-            now=datetime.now(UTC),
             window_seconds=80.0,
         )
         with db.write_connection() as conn:

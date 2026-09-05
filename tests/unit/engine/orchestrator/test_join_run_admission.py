@@ -13,8 +13,10 @@ Plus the four refusal arms and atomicity guarantee:
 - atomicity: the admission is ONE BEGIN IMMEDIATE transaction — leader +
   follower registered OR nothing (no ghost follower row on refusal)
 
-Clock-injection via the ``now`` keyword argument; real file-backed SQLite for
-the permission-failure test (in-memory has no filesystem).  The filesystem
+Seat liveness is judged against the Landscape database clock (ADR-047):
+``join_run`` carries no clock, the live seat is minted from database time and
+the expired-seat arms lapse it through the database. Real file-backed SQLite
+for the permission-failure test (in-memory has no filesystem).  The filesystem
 preflight test uses ``unittest.mock.patch`` on ``os.access`` — no real chmod,
 no process re-exec.
 """
@@ -33,6 +35,7 @@ from sqlalchemy import insert, select
 from elspeth.contracts.coordination import mint_worker_id
 from elspeth.contracts.errors import JoinRefusedError
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -40,19 +43,18 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.core import Orchestrator
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 RUN_ID = "run-join-test-1"
-NOW = datetime(2026, 6, 13, 10, 0, 0, tzinfo=UTC)
+NOW = datetime(2026, 6, 13, 10, 0, 0, tzinfo=UTC)  # forensic seed stamps only
 WINDOW = 80.0
-AFTER_EXPIRY = NOW + timedelta(seconds=200)
 
 # Sentinel config_hash used for all tests that need a matching hash.
-# Raw insert bypasses begin_run so timing of NOW is fully controlled.
+# Raw insert bypasses begin_run so the seat image is fully controlled.
 _SENTINEL_HASH = "sentinel-config-hash-abc123"
 
 # Patches for resolve_config+stable_hash so joiner_config_hash == _SENTINEL_HASH.
@@ -70,14 +72,15 @@ def _orchestrator(db: LandscapeDB) -> Orchestrator:
 
 
 def _begin_run_with_leader(db: LandscapeDB, *, run_id: str = RUN_ID, config_hash: str = _SENTINEL_HASH) -> str:
-    """Seed a RUNNING run via raw INSERT with deterministic clock at NOW.
+    """Seed a RUNNING run via raw INSERT whose seat is live for WINDOW seconds of database time.
 
     Returns the minted leader worker_id.  Uses raw INSERT (not begin_run) so
-    the seat's ``leader_heartbeat_expires_at`` is pinned to ``NOW + WINDOW``,
-    making clock-injected ``join_run(now=NOW)`` deterministic.
+    the seat image is fully controlled; the deadline is minted from the
+    Landscape database clock because that is what admission compares against.
     """
     leader_id = mint_worker_id(run_id)
     with db.write_connection() as conn:
+        live_until = read_landscape_transaction_time(conn) + timedelta(seconds=WINDOW)
         conn.execute(
             insert(runs_table).values(
                 run_id=run_id,
@@ -95,7 +98,7 @@ def _begin_run_with_leader(db: LandscapeDB, *, run_id: str = RUN_ID, config_hash
                 run_id=run_id,
                 leader_worker_id=leader_id,
                 leader_epoch=1,
-                leader_heartbeat_expires_at=NOW + timedelta(seconds=WINDOW),
+                leader_heartbeat_expires_at=live_until,
                 updated_at=NOW,
             )
         )
@@ -106,7 +109,7 @@ def _begin_run_with_leader(db: LandscapeDB, *, run_id: str = RUN_ID, config_hash
                 role="leader",
                 status="active",
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(seconds=WINDOW),
+                heartbeat_expires_at=live_until,
             )
         )
     return leader_id
@@ -143,12 +146,12 @@ class TestJoinAdmissionHappyPath:
     def test_join_attaches_follower_to_running_run(self) -> None:
         """Happy path: returns worker_id; follower row active; event in ledger."""
         db = make_landscape_db()
-        _begin_run_with_leader(db)  # seeds run with _SENTINEL_HASH, seat live until NOW+WINDOW
+        _begin_run_with_leader(db)  # seeds run with _SENTINEL_HASH, seat live for WINDOW s of database time
 
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            worker_id = orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            worker_id = orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         # worker_id has the expected shape
         assert worker_id.startswith(f"worker:{RUN_ID}:")
@@ -177,8 +180,8 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
-            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         assert wid1 != wid2
 
@@ -222,7 +225,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         assert exc_info.value.run_id == RUN_ID
         assert "terminal" in str(exc_info.value).lower()
@@ -256,7 +259,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         # Should mention resume (not terminal)
         assert "resume" in str(exc_info.value).lower()
@@ -273,7 +276,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -287,6 +290,7 @@ class TestJoinAdmissionRefusals:
         """No live leader — expired seat — tells operator to use resume."""
         db = make_landscape_db()
         _begin_run_with_leader(db)
+        expire_leader_seat(db, RUN_ID)  # the seat lapsed in the database clock's past
 
         fake_settings = types.SimpleNamespace()
         with (
@@ -295,8 +299,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            # AFTER_EXPIRY is 200 s past the 80 s window → seat expired
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=AFTER_EXPIRY)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -337,7 +340,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         assert "no live leader" in str(exc_info.value).lower()
 
@@ -358,7 +361,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -385,7 +388,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -414,7 +417,7 @@ class TestJoinAdmissionAtomicity:
             pytest.raises(JoinRefusedError),
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=NOW)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         # run_workers: still only the leader row
         workers = _worker_rows(db)
@@ -428,13 +431,14 @@ class TestJoinAdmissionAtomicity:
         """Dead-seat refusal: zero mutation — no ghost follower, no new event."""
         db = make_landscape_db()
         _begin_run_with_leader(db)
+        expire_leader_seat(db, RUN_ID)
 
         events_before = _coord_events(db)
 
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings, now=AFTER_EXPIRY)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
         workers = _worker_rows(db)
         assert len(workers) == 1

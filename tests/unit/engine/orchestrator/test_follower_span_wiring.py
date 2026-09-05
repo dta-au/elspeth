@@ -39,17 +39,16 @@ class _RunCoordination:
     def __init__(self) -> None:
         self.departed: list[str] = []
 
-    def live_leader(self, *, run_id: str, now: datetime) -> LeaderInfo:
+    def live_leader(self, *, run_id: str) -> LeaderInfo:
         return LeaderInfo(
             run_id=run_id,
             leader_worker_id=f"worker:{run_id}:leader",
             leader_epoch=1,
-            leader_heartbeat_expires_at=now + timedelta(seconds=80),
+            leader_heartbeat_expires_at=datetime.now(UTC) + timedelta(seconds=80),
             seat_live=True,
         )
 
-    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-        del now
+    def depart_worker(self, *, worker_id: str) -> None:
         self.departed.append(worker_id)
 
 

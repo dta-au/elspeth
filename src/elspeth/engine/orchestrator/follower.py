@@ -92,7 +92,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import OperationalError
@@ -191,8 +191,6 @@ class FollowerProcessor:
         Liveness window for the heartbeat (default 80 s).
     idle_poll_seconds:
         Sleep interval between idle polls (default 2 s).
-    now_fn:
-        Injectable ``datetime.now(UTC)`` supplier for tests.
     wait_fn:
         Injectable sleep function ``wait_fn(seconds)`` for tests.
     span_factory:
@@ -214,7 +212,6 @@ class FollowerProcessor:
         heartbeat_seconds: float = DEFAULT_RUN_HEARTBEAT_SECONDS,
         window_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         idle_poll_seconds: float = _IDLE_POLL_SECONDS,
-        now_fn: Callable[[], datetime] | None = None,
         wait_fn: Callable[[float], None] | None = None,
         span_factory: SpanFactory | None = None,
         trace_started_at: datetime | None = None,
@@ -226,7 +223,6 @@ class FollowerProcessor:
         self._heartbeat_seconds = heartbeat_seconds
         self._window_seconds = window_seconds
         self._idle_poll_seconds = idle_poll_seconds
-        self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._wait_fn: Callable[[float], None] = wait_fn if wait_fn is not None else time.sleep
         from elspeth.engine.clock import DEFAULT_CLOCK
         from elspeth.engine.spans import SpanFactory
@@ -286,7 +282,6 @@ class FollowerProcessor:
             token=self._token,
             heartbeat_seconds=self._heartbeat_seconds,
             window_seconds=self._window_seconds,
-            now_fn=self._now_fn,
         )
         heartbeat.start()
         terminal_exit = False
@@ -369,8 +364,7 @@ class FollowerProcessor:
             ):
                 return
             last_leader_check_monotonic = monotonic_now
-            now = self._now_fn()
-            seat = self._run_coordination.live_leader(run_id=run_id, now=now)
+            seat = self._run_coordination.live_leader(run_id=run_id)
             if seat is None or not seat.seat_live:
                 raise _SeatDeadError(worker_id, run_id)
 
@@ -476,10 +470,7 @@ class FollowerProcessor:
         and programming failures — propagates.
         """
         try:
-            self._run_coordination.depart_worker(
-                worker_id=self._token.worker_id,
-                now=self._now_fn(),
-            )
+            self._run_coordination.depart_worker(worker_id=self._token.worker_id)
         except OperationalError:
             logger.warning(
                 "follower %r: depart_worker hit a transient DB failure; lease expiry will reclaim the seat",

@@ -467,7 +467,6 @@ class SchedulerQueueRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="ingest_row_with_initial_claim",
         ) as conn:

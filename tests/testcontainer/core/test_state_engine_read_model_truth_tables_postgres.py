@@ -11,10 +11,10 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import make_factory, register_test_node, stamp_inside_next_transaction
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
@@ -302,22 +302,31 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
     _begin_run(factory, run_id, leader)
     coordination = RunCoordinationRepository(postgres_db.engine)
 
-    occupied = coordination.live_leader(run_id=run_id, now=NOW)
+    occupied = coordination.live_leader(run_id=run_id)
     assert occupied is not None
     assert occupied.leader_worker_id == leader
     assert occupied.seat_live is True
-    equality = coordination.live_leader(run_id=run_id, now=occupied.leader_heartbeat_expires_at)
+    # Liveness is judged against the reading transaction's own database time
+    # (ADR-047): a deadline stamped EQUAL to it inside that transaction is live.
+    seat_at_equality = (
+        update(run_coordination_table)
+        .where(run_coordination_table.c.run_id == run_id)
+        .values(leader_heartbeat_expires_at=func.current_timestamp())
+    )
+    with stamp_inside_next_transaction(postgres_db.engine, seat_at_equality):
+        equality = coordination.live_leader(run_id=run_id)
     assert equality is not None
     assert equality.seat_live is True
-    assert coordination.live_leader(run_id="rm-postgresql-missing", now=NOW) is None
+    assert coordination.live_leader(run_id="rm-postgresql-missing") is None
 
-    threshold = NOW - timedelta(seconds=10)
+    # NOW is in the database clock's past: these deadlines are all beyond the
+    # grace threshold; "equality" is re-stamped inside the sweep's transaction.
     registered_at = NOW - timedelta(minutes=2)
     workers = (
-        ("dead-z", "follower", "active", threshold - timedelta(seconds=1), registered_at),
-        ("dead-a", "follower", "active", threshold - timedelta(seconds=1), registered_at),
-        ("equality", "follower", "active", threshold, registered_at + timedelta(seconds=1)),
-        ("departed", "follower", "departed", threshold - timedelta(seconds=2), registered_at),
+        ("dead-z", "follower", "active", NOW - timedelta(seconds=11), registered_at),
+        ("dead-a", "follower", "active", NOW - timedelta(seconds=11), registered_at),
+        ("equality", "follower", "active", NOW - timedelta(seconds=10), registered_at + timedelta(seconds=1)),
+        ("departed", "follower", "departed", NOW - timedelta(seconds=12), registered_at),
     )
     with postgres_db.engine.begin() as conn:
         for worker_id, role, status, expires_at, registered in workers:
@@ -332,12 +341,18 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
                     departed_at=NOW if status == "departed" else None,
                 )
             )
-    assert coordination.dead_non_leader_workers(
-        run_id=run_id,
-        leader_worker_id=leader,
-        now=NOW,
-        grace_seconds=10,
-    ) == ("dead-a", "dead-z")
+    member_at_threshold = (
+        update(run_workers_table)
+        .where(run_workers_table.c.worker_id == "equality")
+        .values(heartbeat_expires_at=func.current_timestamp() - timedelta(seconds=10))
+    )
+    with stamp_inside_next_transaction(postgres_db.engine, member_at_threshold):
+        dead = coordination.dead_non_leader_workers(
+            run_id=run_id,
+            leader_worker_id=leader,
+            grace_seconds=10,
+        )
+    assert dead == ("dead-a", "dead-z")
 
     with postgres_db.engine.begin() as conn:
         conn.execute(
@@ -345,7 +360,7 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
             .where(run_coordination_table.c.run_id == run_id)
             .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=NOW)
         )
-    assert coordination.live_leader(run_id=run_id, now=NOW) is None
+    assert coordination.live_leader(run_id=run_id) is None
 
 
 def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(

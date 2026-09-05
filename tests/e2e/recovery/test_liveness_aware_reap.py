@@ -163,7 +163,6 @@ class TestLivenessAwareReap:
         leader_token = coord_repo.acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="sweep-leader",
-            now=sweep_at,
             window_seconds=_GRACE,
         )
 
@@ -219,7 +218,6 @@ class TestLivenessAwareReap:
         leader_token = coord_repo.acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="sweep-leader-2",
-            now=sweep_at,
             window_seconds=_GRACE,
         )
 
@@ -227,7 +225,6 @@ class TestLivenessAwareReap:
         coord_repo.evict_worker(
             token=leader_token,
             target_worker_id="dead-worker-evicted",
-            now=sweep_at,
             grace_seconds=_GRACE,
             window_seconds=_GRACE,
         )
@@ -294,7 +291,6 @@ class TestLivenessAwareReap:
         leader_token = coord_repo.acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="sweep-leader-3",
-            now=sweep_at,
             window_seconds=_GRACE,
         )
 
@@ -398,7 +394,6 @@ class TestLivenessAwareReap:
         leader_token = coord_repo.acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="sweep-leader-4",
-            now=sweep_at,
             window_seconds=_GRACE,
         )
 

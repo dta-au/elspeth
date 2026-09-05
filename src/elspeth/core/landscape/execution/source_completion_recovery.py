@@ -139,7 +139,6 @@ class SourceCompletionReconciler:
         with fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
-            now=at,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="reconcile_source_completions_from_scheduler",
         ) as conn:
