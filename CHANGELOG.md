@@ -6,6 +6,28 @@ All notable changes to ELSPETH are documented here.
 
 ## Unreleased
 
+### Changed
+
+- **Blob custody lock keyed in its own advisory-lock class.** The
+  PostgreSQL session-level lock a blob write holds across its reservation,
+  file write and finalize (`_blob_custody_session_lock`) now uses
+  `ELSPETH_BLOB_CUSTODY_LOCK_CLASSID` (`0x424C4F42`, "BLOB") instead of
+  sharing `ELSPETH_SESSIONS_LOCK_CLASSID` with the session-operation fence.
+  Session- and transaction-level advisory locks share one lock space, so
+  under the shared class every fence acquire, renew and release on a session
+  queued behind that session's filesystem persistence; on a multi-replica
+  deployment a renew starved past the lease window becomes a spurious
+  takeover. The transaction-scoped phase locks inside the reservation and
+  finalize transactions keep the sessions class. Pinned by the PostgreSQL
+  proof that a lease renew completes while a blob persist for the same
+  session is paused inside its rename
+  (`tests/testcontainer/web/test_blob_custody_lock_isolation_postgres.py`).
+  The class is internal to PostgreSQL advisory locking: no schema, bundle or
+  operator action. Replicas of different versions serialise custody on
+  different keys; every maintained platform's rollout contract is zero-overlap
+  replacement (`docs/reference/deployment-platforms.md`), and an overlap of
+  old and new replicas is outside it. elspeth-ee9861baf6.
+
 ### Removed
 
 - **Wardline trust-boundary gate** — the `weft.toml` stanza, `.mcp.json`

@@ -262,10 +262,14 @@ test.describe("composer-guided — source/output live walk", () => {
         await page.getByRole("button", { name: "Continue", exact: true }).click();
 
         // ── Step 2 required fields: MULTI_SELECT_WITH_CUSTOM ──────────────
-        // "category" is already selected by default, so the required-field
-        // review can continue without adding a custom field.
-        await expect(page.getByText("category")).toBeVisible();
-        await page.getByRole("button", { name: "Continue", exact: true }).click();
+        // Since be1dccc8d the turn pre-pins nothing and offers pass-through
+        // as the primary gesture ("Let source decide") next to "Pin these
+        // fields"; there is no generic Continue. This walk is a pure
+        // pass-through, so take the primary gesture.
+        await expect(page.getByRole("button", { name: "category", exact: true })).toBeVisible();
+        await page
+          .getByRole("button", { name: "Let source decide (pass all fields through)", exact: true })
+          .click();
         await expect(
           page.getByRole("button", { name: "Finish outputs", exact: true }),
         ).toBeEnabled();
@@ -273,11 +277,13 @@ test.describe("composer-guided — source/output live walk", () => {
         // "Finish outputs" is the planner handoff and therefore requires an
         // available provider. Verify the complete live source/output walk at
         // that boundary; tutorial.spec.ts owns the deterministic later stages.
+        // Since 202f1700e the review rows drop the literal "reviewed" (the
+        // status is closed to that value) and name the plugin by its display
+        // name; each row is a listitem named "<name>, <display name>".
         const outputReview = page.getByRole("region", { name: "Review outputs" });
         await expect(outputReview).toBeVisible();
-        await expect(outputReview.getByText("output", { exact: true })).toBeVisible();
-        await expect(outputReview.getByText("json", { exact: true })).toBeVisible();
-        await expect(outputReview.getByText("reviewed", { exact: true })).toBeVisible();
+        await expect(outputReview.getByRole("listitem", { name: "output, JSON" })).toBeVisible();
+        await expect(outputReview.getByRole("button", { name: "Edit output", exact: true })).toBeVisible();
         await expect(page.getByRole("textbox", { name: "Message input" })).toBeEnabled();
         await expect(
           page.getByRole("button", { name: "Exit to freeform", exact: true }),

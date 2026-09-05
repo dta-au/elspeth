@@ -30,6 +30,7 @@ EXPECTED_MODULES = {
     "replica_probes",
     "schema_facts",
     "secure_documents",
+    "testcontainer_run",
 }
 
 

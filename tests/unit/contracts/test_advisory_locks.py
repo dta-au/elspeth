@@ -12,6 +12,7 @@ from __future__ import annotations
 from elspeth.contracts import advisory_locks
 from elspeth.contracts.advisory_locks import (
     ELSPETH_AUDIT_EXPORT_LOCK_CLASSID,
+    ELSPETH_BLOB_CUSTODY_LOCK_CLASSID,
     ELSPETH_ROUTING_GROUP_LOCK_CLASSID,
     ELSPETH_SCHEMA_INIT_LOCK_CLASSID,
     ELSPETH_SESSIONS_LOCK_CLASSID,
@@ -31,6 +32,7 @@ def test_classid_values_are_pinned_abi() -> None:
     assert ELSPETH_SCHEMA_INIT_LOCK_CLASSID == 0x53434845
     assert ELSPETH_ROUTING_GROUP_LOCK_CLASSID == 0x524F5554
     assert ELSPETH_AUDIT_EXPORT_LOCK_CLASSID == 0x41455850
+    assert ELSPETH_BLOB_CUSTODY_LOCK_CLASSID == 0x424C4F42
 
 
 def test_all_registry_constants_are_covered_by_the_pin_test() -> None:
@@ -39,6 +41,7 @@ def test_all_registry_constants_are_covered_by_the_pin_test() -> None:
         "ELSPETH_SCHEMA_INIT_LOCK_CLASSID",
         "ELSPETH_ROUTING_GROUP_LOCK_CLASSID",
         "ELSPETH_AUDIT_EXPORT_LOCK_CLASSID",
+        "ELSPETH_BLOB_CUSTODY_LOCK_CLASSID",
     }
 
 

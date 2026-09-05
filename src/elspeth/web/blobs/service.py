@@ -71,7 +71,7 @@ from elspeth.web.sessions.locking import (
     _run_lock_cleanup,
     acquire_session_advisory_xact_lock,
     locked_session_transaction,
-    postgres_session_advisory_lock,
+    postgres_blob_custody_advisory_lock,
     sqlite_process_session_lock,
 )
 from elspeth.web.sessions.models import (
@@ -1126,7 +1126,7 @@ def _blob_custody_session_lock(engine: Engine, session_id: str) -> Iterator[Conn
             yield None
         return
     if dialect == "postgresql":
-        with engine.connect() as conn, postgres_session_advisory_lock(conn, session_id):
+        with engine.connect() as conn, postgres_blob_custody_advisory_lock(conn, session_id):
             yield conn
         return
     raise NotImplementedError(f"Blob custody locking is not implemented for dialect {dialect}")

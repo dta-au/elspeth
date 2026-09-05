@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth_lints.core.ast_dump import stable_ast_dump
 
 _ROOT = Path(__file__).parents[3]
 _BLOB_ROUTES = _ROOT / "src/elspeth/web/blobs/routes.py"
@@ -711,7 +712,7 @@ def _trusted_symbol_violations(tree: ast.AST) -> list[str]:
             if candidate.name in {"SessionOperationLease", "SessionOperationKind"}:
                 violations.append(f"trusted route symbol {candidate.name!r} must not be locally defined")
                 continue
-            candidate_dump = ast.dump(candidate, include_attributes=False)
+            candidate_dump = stable_ast_dump(candidate)
             candidate_digest = hashlib.sha256(candidate_dump.encode()).hexdigest()
             if not isinstance(parents.get(candidate), ast.Module) or candidate_digest != _TRUSTED_HELPER_AST_SHA256[candidate.name]:
                 violations.append(f"trusted route helper {candidate.name!r} does not match its canonical definition")
@@ -765,7 +766,7 @@ def _callable_provenance_violations(tree: ast.AST) -> list[str]:
                     violations.append(f"protected callable {bound_name!r} has forged import provenance")
         elif isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and candidate.name in _PROTECTED_CALLABLES:
             if candidate.name in _LOCAL_CALLABLE_AST_SHA256:
-                digest = hashlib.sha256(ast.dump(candidate, include_attributes=False).encode()).hexdigest()
+                digest = hashlib.sha256(stable_ast_dump(candidate).encode()).hexdigest()
                 if isinstance(parents.get(candidate), ast.Module) and digest == _LOCAL_CALLABLE_AST_SHA256[candidate.name]:
                     exact_local_counts[candidate.name] += 1
                 else:
@@ -800,7 +801,7 @@ def _import_surface_violations(tree: ast.AST) -> list[str]:
     violations: list[str] = []
     if any(isinstance(statement, ast.ImportFrom) and any(alias.name == "*" for alias in statement.names) for statement in imports):
         violations.append("standalone blob route module must not use wildcard imports")
-    import_payload = "|".join(ast.dump(statement, include_attributes=False) for statement in imports)
+    import_payload = "|".join(stable_ast_dump(statement) for statement in imports)
     import_digest = hashlib.sha256(import_payload.encode()).hexdigest()
     if import_digest not in {
         _PRODUCTION_IMPORTS_AST_SHA256,
@@ -825,9 +826,7 @@ def _import_surface_violations(tree: ast.AST) -> list[str]:
         if len(factories) != 1:
             violations.append("production standalone blob routes require exactly one top-level create_blobs_router factory")
         else:
-            signature_payload = (
-                ast.dump(factories[0].args, include_attributes=False) + "|" + ast.dump(factories[0].returns, include_attributes=False)
-            )
+            signature_payload = stable_ast_dump(factories[0].args) + "|" + stable_ast_dump(factories[0].returns)
             if hashlib.sha256(signature_payload.encode()).hexdigest() != _ROUTER_FACTORY_SIGNATURE_AST_SHA256:
                 violations.append("create_blobs_router: signature must match exact canonical factory identity")
     return violations
@@ -837,7 +836,7 @@ def _top_level_definition_inventory_violations(tree: ast.AST, endpoint_name: str
     if not isinstance(tree, ast.Module):
         return ["standalone blob route source must parse as a module"]
     imports = [statement for statement in tree.body if isinstance(statement, (ast.Import, ast.ImportFrom))]
-    import_payload = "|".join(ast.dump(statement, include_attributes=False) for statement in imports)
+    import_payload = "|".join(stable_ast_dump(statement) for statement in imports)
     production_source = hashlib.sha256(import_payload.encode()).hexdigest() == _PRODUCTION_IMPORTS_AST_SHA256
     definitions = [statement for statement in tree.body if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
     actual = tuple((type(definition), definition.name) for definition in definitions)
@@ -885,7 +884,7 @@ def _implicit_execution_violations(tree: ast.AST) -> list[str]:
             owner: ast.AST | None = candidate
             while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 owner = parents.get(owner)
-            digest = hashlib.sha256(ast.dump(candidate, include_attributes=False).encode()).hexdigest()
+            digest = hashlib.sha256(stable_ast_dump(candidate).encode()).hexdigest()
             if not (
                 isinstance(owner, ast.AsyncFunctionDef) and owner.name == "list_blobs" and digest == _LIST_BLOBS_COMPREHENSION_AST_SHA256
             ):
@@ -919,7 +918,7 @@ def _router_binding_violations(tree: ast.AST) -> list[str]:
     exact_initializations = [
         statement
         for statement in initialization_statements
-        if hashlib.sha256(ast.dump(statement, include_attributes=False).encode()).hexdigest() == _ROUTER_INITIALIZATION_AST_SHA256
+        if hashlib.sha256(stable_ast_dump(statement).encode()).hexdigest() == _ROUTER_INITIALIZATION_AST_SHA256
     ]
     outer_calls = [candidate for candidate in runtime_nodes if isinstance(candidate, ast.Call)]
     nested_endpoints = [statement for statement in factory.body if isinstance(statement, ast.AsyncFunctionDef)]
@@ -951,15 +950,15 @@ def _router_binding_violations(tree: ast.AST) -> list[str]:
     if len(list_endpoints) != 1:
         violations.append("create_blobs_router: expected exactly one canonical list_blobs endpoint")
     else:
-        decorator_payload = "|".join(ast.dump(decorator, include_attributes=False) for decorator in list_endpoints[0].decorator_list)
+        decorator_payload = "|".join(stable_ast_dump(decorator) for decorator in list_endpoints[0].decorator_list)
         if hashlib.sha256(decorator_payload.encode()).hexdigest() != _LIST_BLOBS_DECORATOR_AST_SHA256:
             violations.append("create_blobs_router: list_blobs decorator must match exact canonical registration")
-        if hashlib.sha256(ast.dump(list_endpoints[0], include_attributes=False).encode()).hexdigest() != _LIST_BLOBS_DEFINITION_AST_SHA256:
+        if hashlib.sha256(stable_ast_dump(list_endpoints[0]).encode()).hexdigest() != _LIST_BLOBS_DEFINITION_AST_SHA256:
             violations.append("create_blobs_router: list_blobs definition must match exact canonical implementation")
     if (
         len(returns) != 1
         or factory.body[-1] is not returns[0]
-        or hashlib.sha256(ast.dump(returns[0], include_attributes=False).encode()).hexdigest() != _ROUTER_RETURN_AST_SHA256
+        or hashlib.sha256(stable_ast_dump(returns[0]).encode()).hexdigest() != _ROUTER_RETURN_AST_SHA256
     ):
         violations.append("create_blobs_router: factory must end with the sole exact return router statement")
     return violations
@@ -1017,10 +1016,10 @@ def _endpoint_definition_and_preamble_violations(tree: ast.AST, endpoint: ast.As
     )
     violations: list[str] = []
     if has_route_factory:
-        arguments_digest = hashlib.sha256(ast.dump(endpoint.args, include_attributes=False).encode()).hexdigest()
+        arguments_digest = hashlib.sha256(stable_ast_dump(endpoint.args).encode()).hexdigest()
         if arguments_digest != _PRODUCTION_ENDPOINT_ARGUMENTS_AST_SHA256[endpoint.name]:
             violations.append(f"{endpoint.name}: endpoint arguments must match the exact canonical definition surface")
-        return_digest = hashlib.sha256(ast.dump(endpoint.returns, include_attributes=False).encode()).hexdigest()
+        return_digest = hashlib.sha256(stable_ast_dump(endpoint.returns).encode()).hexdigest()
         if return_digest != _PRODUCTION_ENDPOINT_RETURN_AST_SHA256[endpoint.name]:
             violations.append(f"{endpoint.name}: endpoint return annotation must match the exact canonical definition surface")
     else:
@@ -1051,14 +1050,14 @@ def _endpoint_definition_and_preamble_violations(tree: ast.AST, endpoint: ast.As
     if len(acquisition_indexes) != 1:
         return violations
     preamble = ast.Module(body=endpoint.body[: acquisition_indexes[0]], type_ignores=[])
-    preamble_digest = hashlib.sha256(ast.dump(preamble, include_attributes=False).encode()).hexdigest()
+    preamble_digest = hashlib.sha256(stable_ast_dump(preamble).encode()).hexdigest()
     expected_digest = (
         _PRODUCTION_ENDPOINT_PREAMBLE_AST_SHA256[endpoint.name] if has_route_factory else _SYNTHETIC_ENDPOINT_PREAMBLE_AST_SHA256
     )
     if preamble_digest != expected_digest:
         violations.append(f"{endpoint.name}: pre-acquisition statements must match the exact approved preamble")
     post_acquire = ast.Module(body=endpoint.body[acquisition_indexes[0] + 1 :], type_ignores=[])
-    post_acquire_digest = hashlib.sha256(ast.dump(post_acquire, include_attributes=False).encode()).hexdigest()
+    post_acquire_digest = hashlib.sha256(stable_ast_dump(post_acquire).encode()).hexdigest()
     expected_post_acquire_digest = (
         _PRODUCTION_ENDPOINT_POST_ACQUIRE_AST_SHA256[endpoint.name]
         if has_route_factory
@@ -1434,7 +1433,7 @@ def _route_violations(tree: ast.AST, contract: _EndpointContract) -> list[str]:
         return [f"{contract.name}: expected exactly one endpoint definition; found {len(endpoints)}"]
     endpoint = endpoints[0]
     violations = _trusted_symbol_violations(tree)
-    decorator_payload = "|".join(ast.dump(decorator, include_attributes=False) for decorator in endpoint.decorator_list)
+    decorator_payload = "|".join(stable_ast_dump(decorator) for decorator in endpoint.decorator_list)
     decorator_digest = hashlib.sha256(decorator_payload.encode()).hexdigest()
     if decorator_digest != _ENDPOINT_DECORATOR_AST_SHA256[contract.name]:
         violations.append(f"{contract.name}: endpoint decorators must match the exact canonical route registration")
@@ -1588,7 +1587,7 @@ def _route_violations(tree: ast.AST, contract: _EndpointContract) -> list[str]:
         statement
         for statement in protecting_try.body
         if contract.name in _STATE_GUARD_AST_SHA256
-        and hashlib.sha256(ast.dump(statement, include_attributes=False).encode()).hexdigest() == _STATE_GUARD_AST_SHA256[contract.name]
+        and hashlib.sha256(stable_ast_dump(statement).encode()).hexdigest() == _STATE_GUARD_AST_SHA256[contract.name]
     }
 
     expected_effects: list[ast.Call] = []
@@ -1652,8 +1651,7 @@ def _route_violations(tree: ast.AST, contract: _EndpointContract) -> list[str]:
             guard_is_exact = not intervening or (
                 len(intervening) == 1
                 and contract.name in _STATE_GUARD_AST_SHA256
-                and hashlib.sha256(ast.dump(intervening[0], include_attributes=False).encode()).hexdigest()
-                == _STATE_GUARD_AST_SHA256[contract.name]
+                and hashlib.sha256(stable_ast_dump(intervening[0]).encode()).hexdigest() == _STATE_GUARD_AST_SHA256[contract.name]
             )
             if second_index < first_index or not guard_is_exact:
                 violations.append(f"{contract.name}: only the exact optional state guard may occur between required blob-read effects")

@@ -226,11 +226,11 @@ def test_postgres_unlock_failure_preserves_primary_exception() -> None:
 
     with (
         pytest.raises(LookupError, match="primary failure") as exc_info,
-        locking.postgres_session_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
+        locking.postgres_blob_custody_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
     ):
         raise LookupError("primary failure")
 
-    assert exc_info.value.__notes__ == ["PostgreSQL session advisory lock release also failed (OSError)"]
+    assert exc_info.value.__notes__ == ["PostgreSQL blob custody advisory lock release also failed (OSError)"]
 
 
 def test_postgres_unlock_failure_surfaces_without_primary() -> None:
@@ -238,7 +238,7 @@ def test_postgres_unlock_failure_surfaces_without_primary() -> None:
 
     with (
         pytest.raises(OSError, match="advisory unlock failed"),
-        locking.postgres_session_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
+        locking.postgres_blob_custody_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
     ):
         pass
 
@@ -253,7 +253,7 @@ def test_postgres_unlock_failure_surfaces_after_unrelated_caught_exception() -> 
         outer = exc
         with (
             pytest.raises(OSError, match="advisory unlock failed"),
-            locking.postgres_session_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
+            locking.postgres_blob_custody_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
         ):
             pass
 
