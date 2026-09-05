@@ -401,14 +401,24 @@ asserts two distinct `X-Elspeth-Instance` values before scoring a trial and
 cross-checks every replica name against `az containerapp replica list`.
 
 ```bash
-az_deploy_capture deployment group create \
-  --name "elspeth-workload-probes-${CANDIDATE_SHA:0:12}" \
-  --resource-group "$RESOURCE_GROUP" \
-  --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.acceptance.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}" \
-    composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
-  >"$EVIDENCE_DIR/workload-probes.json"
+# One deployment per runtime role: the label selects the role's URL secrets
+# and the doctor Job name (doctor-runtime-a / doctor-runtime-b).
+for label in a b; do
+  az_deploy_capture deployment group create \
+    --name "elspeth-workload-probes-${CANDIDATE_SHA:0:12}-${label}" \
+    --resource-group "$RESOURCE_GROUP" \
+    --template-file deploy/azure-container-apps/workload.bicep \
+    --parameters deploy/azure-container-apps/workload.acceptance.bicepparam \
+    --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}-${label}" \
+      runtimeRoleLabel="$label" \
+      composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
+    >"$EVIDENCE_DIR/workload-probes-${label}.json"
+  az_capture containerapp revision label add --name elspeth-web --resource-group "$RESOURCE_GROUP" \
+    --label "$label" --revision "elspeth-web--${CANDIDATE_SHA:0:12}-${label}"
+done
+# Traffic weights and labels are application-scope changes: no new revision.
+az_capture containerapp ingress traffic set --name elspeth-web --resource-group "$RESOURCE_GROUP" \
+  --label-weight a=50 b=50
 APP_DOMAIN=$(az_capture containerapp env show --name elspeth-env --resource-group "$RESOURCE_GROUP" \
   --query properties.defaultDomain --output tsv)
 export LABEL_A_URL="https://elspeth-web---a.${APP_DOMAIN}"
