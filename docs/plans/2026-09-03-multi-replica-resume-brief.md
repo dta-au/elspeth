@@ -225,7 +225,7 @@ state the branch is unpushed; that was true at their dates and is false now.
      `session_operation_fences` appears in 5 platform source files and 0 on
      mainline.
    - **PostgreSQL membership and epoch-fenced run ownership** — **schema only,
-     and this is the programme's core safety property.** `web_instances_table`
+     and this is the program's core safety property.** `web_instances_table`
      and `runs_table.owner_instance_id / owner_epoch / owner_lease_expires_at`
      exist, but `RunOwnershipFence` and `WebInstanceLease` appear in only four
      files (`src/elspeth/web/coordination/__init__.py`, `.../contracts.py`,
@@ -828,7 +828,7 @@ from code and the tracker only.
   branches) — remove blob/run consistency from the parent's remaining scope,
   carrying comment 8915's caveat that open decision 5 asks for a PostgreSQL
   two-connection proof of the shared-lock-domain assumption.
-- The programme's true closeout node is `elspeth-a5b07ac072` ("Complete
+- The program's true closeout node is `elspeth-a5b07ac072` ("Complete
   deployment profiles, documentation, CI gates, and release merge", open, P1,
   unassigned), which the handoff never named. Two of its three blockers —
   `elspeth-2ff97dbc70` and `elspeth-beaf1585a9` — are ready to start now and
@@ -850,7 +850,7 @@ branch is **107 lines shorter** than mainline's (287 vs 180) — no `-n 12` guid
 flaky-set gotcha, no whole-tree-gates STOP block. **Read `AGENTS.md` from
 mainline for the whole resume.** And the flaky set named there
 (`e2e/recovery`, `integration/pipeline`, `unit/engine/orchestrator`, tracking
-issue `elspeth-0077cb7789`, open) overlaps this programme's subject matter
+issue `elspeth-0077cb7789`, open) overlaps this program's subject matter
 exactly: re-run any red in those trees with `-n 0` before attributing it to the
 integration, and diff failure sets against the same run on the base commit.
 

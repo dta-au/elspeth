@@ -62,7 +62,7 @@
       ]
     },
     {
-      "_doc": "control-pack: programme corrections table",
+      "_doc": "control-pack: program corrections table",
       "cols": 2,
       "match": {
         "col_1": "prior framing",
@@ -74,7 +74,7 @@
       ]
     },
     {
-      "_doc": "control-pack: programme pilot-vs-durable options",
+      "_doc": "control-pack: program pilot-vs-durable options",
       "cols": 3,
       "match": {
         "col_2_contains": "option a",
@@ -87,7 +87,7 @@
       ]
     },
     {
-      "_doc": "control-pack: programme terminology",
+      "_doc": "control-pack: program terminology",
       "cols": 3,
       "match": {
         "col_1": "informal",

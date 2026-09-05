@@ -302,10 +302,11 @@ def derive_cacheable_names(tools: Iterable[ToolDeclaration]) -> frozenset[str]:
     """Return the names of declarations marked cacheable.
 
     Today only ``DISCOVERY``-kind tools may set ``cacheable=True``; the
-    ``ToolDeclaration`` constructor enforces this. ``discovery.py`` separately
-    asserts the cacheable set is a subset of the discovery name-set and
-    disjoint from the session-mutable forbidden set; this derivation feeds
-    those assertions during the migration.
+    ``ToolDeclaration`` constructor enforces this. ``_registry.py`` separately
+    asserts the cacheable set is a subset of the discovery name-set. (It no
+    longer asserts disjointness from the session-mutable set: that set is the
+    subtraction complement of this one, so the two are disjoint by
+    construction and the check could never fire — elspeth-235861ee32.)
     """
     return frozenset(decl.name for decl in tools if decl.cacheable)
 
