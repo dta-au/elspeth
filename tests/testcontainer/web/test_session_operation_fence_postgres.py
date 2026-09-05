@@ -27,6 +27,7 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     guided_operations_table,
     session_operation_fences_table,
+    session_read_admissions_table,
     sessions_table,
     web_instances_table,
 )
@@ -824,3 +825,287 @@ def test_postgres_waiter_cannot_act_after_expiry(
             )
             == before_fence
         )
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): concurrent BLOB_READ admissions share a session on PostgreSQL ---
+
+
+def test_postgres_two_blob_read_claimants_both_win_and_leave_the_row_untouched(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    with postgres_engine.connect() as conn:
+        before = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id))
+        ).one()
+
+    def claim(owner: str):
+        contender = PostgresSessionOperationRepository(postgres_engine)
+        try:
+            return contender.acquire(
+                session_id=created.id,
+                operation_kind=SessionOperationKind.BLOB_READ,
+                owner_instance_id=owner,
+                lease_seconds=30,
+            )
+        except SessionOperationConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(claim, (f"reader-{uuid4()}", f"reader-{uuid4()}")))
+
+    assert all(isinstance(outcome, SessionOperationContext) for outcome in outcomes), outcomes
+    assert outcomes[0].fence != outcomes[1].fence
+    with postgres_engine.connect() as conn:
+        after = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id))
+        ).one()
+    assert (after.operation_id, after.lease_token, after.operation_epoch, after.operation_kind) == (
+        before.operation_id,
+        before.lease_token,
+        before.operation_epoch,
+        before.operation_kind,
+    )
+    for reader in outcomes:
+        repository.compare_and_swap(reader)
+        repository.release(reader)
+
+
+def test_postgres_open_blob_reads_do_not_block_an_exclusive_claimant(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    reader = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    proposal = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=f"claimant-{uuid4()}",
+        lease_seconds=30,
+    )
+    assert proposal.operation_kind is SessionOperationKind.PROPOSAL
+    # Exclusive semantics are untouched: a second exclusive claimant still loses.
+    with pytest.raises(SessionOperationConflictError):
+        repository.acquire(
+            session_id=created.id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=f"claimant-{uuid4()}",
+            lease_seconds=30,
+        )
+    # The reader stays live under the writer and releases cleanly.
+    repository.compare_and_swap(reader)
+    repository.release(proposal)
+    repository.release(reader)
+
+
+# --- elspeth-f98e0ae8b2 (under A-3): read admissions are recorded, and refused across connections once released or expired ---
+
+
+class _SkewedClockRepository(PostgresSessionOperationRepository):
+    """Read PostgreSQL's clock one hour AHEAD of the real clock_timestamp().
+
+    A read admission recorded by a plain repository is live by the real clock
+    and expired by this one, so a LEASE_EXPIRED refusal through this
+    repository proves the expiry is compared against the authority's database
+    clock; a comparison against process time would still see the row as live.
+    """
+
+    @staticmethod
+    def _database_now(conn: Connection) -> datetime:
+        return PostgresSessionOperationRepository._database_now(conn) + timedelta(hours=1)
+
+
+def _postgres_read_row(engine: Engine, *, session_id: str, operation_id: str):
+    with engine.connect() as conn:
+        return conn.execute(
+            select(session_read_admissions_table).where(
+                session_read_admissions_table.c.session_id == session_id,
+                session_read_admissions_table.c.operation_id == operation_id,
+            )
+        ).one_or_none()
+
+
+def test_postgres_open_blob_reads_survive_compose_and_archive_epoch_advances(postgres_engine: Engine) -> None:
+    """PostgreSQL twin of the SQLite proof: a writer's epoch advance never invalidates a shareable read."""
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    reader = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    compose = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=f"writer-{uuid4()}",
+        lease_seconds=30,
+    )
+    assert compose.fence.operation_epoch == reader.fence.operation_epoch + 1
+    # The reader's next proof succeeds under the writer, on a second connection.
+    PostgresSessionOperationRepository(postgres_engine).compare_and_swap(reader)
+    repository.mutate(reader, lambda _transaction: None)
+    repository.release(compose)
+    archive = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id=f"archiver-{uuid4()}",
+        lease_seconds=30,
+    )
+    assert archive.fence.operation_epoch == reader.fence.operation_epoch + 2
+    repository.release(archive)
+    # ... and its release succeeds after the second advance.
+    repository.release(reader)
+    assert _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id) is None
+
+
+def test_postgres_read_release_on_one_connection_is_a_refusal_on_another(postgres_engine: Engine) -> None:
+    """Cross-connection visibility: the admission row is the shared truth, not process state."""
+    admitting = PostgresSessionOperationRepository(postgres_engine)
+    proving = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(admitting, owner=f"creator-{uuid4()}")
+    reader = admitting.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    row = _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id)
+    assert row is not None
+    assert (row.lease_token, row.operation_epoch) == (reader.fence.lease_token, reader.fence.operation_epoch)
+    with postgres_engine.connect() as conn:
+        ahead = conn.exec_driver_sql(
+            "SELECT expires_at - clock_timestamp() FROM session_read_admissions WHERE operation_id = %s",
+            (reader.fence.operation_id,),
+        ).scalar_one()
+    assert timedelta(seconds=20) < ahead <= timedelta(seconds=30)
+
+    proving.compare_and_swap(reader)
+    admitting.release(reader)
+    for proof in (
+        lambda: proving.compare_and_swap(reader),
+        lambda: proving.mutate(reader, lambda _transaction: None),
+        lambda: proving.renew(reader, lease_seconds=30),
+        lambda: proving.release(reader),
+    ):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.RELEASED
+
+
+def test_postgres_read_expiry_is_measured_against_database_time(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    reader = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    # Live by PostgreSQL's clock, expired one hour ahead of it — on a different connection.
+    skewed = _SkewedClockRepository(postgres_engine)
+    for proof in (
+        lambda: skewed.compare_and_swap(reader),
+        lambda: skewed.mutate(reader, lambda _transaction: None),
+        lambda: skewed.renew(reader, lease_seconds=30),
+        lambda: skewed.release(reader),
+    ):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.LEASE_EXPIRED
+    # The real clock still admits the same row, and renew extends it from that clock.
+    repository.compare_and_swap(reader)
+    assert repository.renew(reader, lease_seconds=3600) == reader
+    with postgres_engine.connect() as conn:
+        ahead = conn.exec_driver_sql(
+            "SELECT expires_at - clock_timestamp() FROM session_read_admissions WHERE operation_id = %s",
+            (reader.fence.operation_id,),
+        ).scalar_one()
+    assert timedelta(minutes=55) < ahead <= timedelta(hours=1)
+    # An expiry already in the past at the database clock is refused, and the
+    # next admission on the session sweeps the row.
+    with postgres_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE session_read_admissions SET admitted_at = clock_timestamp() - interval '2 seconds', "
+            "expires_at = clock_timestamp() - interval '1 second' WHERE operation_id = %s",
+            (reader.fence.operation_id,),
+        )
+    with pytest.raises(SessionOperationFenceLost) as expired:
+        repository.compare_and_swap(reader)
+    assert expired.value.reason is FenceLossReason.LEASE_EXPIRED
+    successor = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    assert _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id) is None
+    assert _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=successor.fence.operation_id) is not None
+    repository.release(successor)
+
+
+def test_postgres_archive_delete_cascades_the_read_admissions(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    reader = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    archive = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id=f"archiver-{uuid4()}",
+        lease_seconds=30,
+    )
+    repository.archive_delete(archive)
+    assert _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id) is None
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        repository.compare_and_swap(reader)
+    assert lost.value.reason is FenceLossReason.MISSING
+
+
+def test_postgres_forged_read_token_is_a_token_mismatch_on_another_connection(postgres_engine: Engine) -> None:
+    """The third refusal arm on PostgreSQL: the row's lease token is the shared truth.
+
+    The SQLite twin (``test_sqlite_forged_read_token_is_a_token_mismatch``) proves the
+    arm within one process. Here the forgery is presented on a second repository, so
+    the ``TOKEN_MISMATCH`` verdict is read from the committed row rather than from any
+    state the admitting repository holds — and the genuine holder is untouched by it.
+    """
+    admitting = PostgresSessionOperationRepository(postgres_engine)
+    proving = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(admitting, owner=f"creator-{uuid4()}")
+    reader = admitting.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    forged = SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=reader.fence.session_id,
+            operation_id=reader.fence.operation_id,
+            lease_token=f"forged-{uuid4()}",
+            operation_epoch=reader.fence.operation_epoch,
+        ),
+        operation_kind=SessionOperationKind.BLOB_READ,
+    )
+    for proof in (
+        lambda: proving.compare_and_swap(forged),
+        lambda: proving.mutate(forged, lambda _transaction: None),
+        lambda: proving.renew(forged, lease_seconds=30),
+        lambda: proving.release(forged),
+    ):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.TOKEN_MISMATCH
+    # No refused proof wrote: the genuine row still carries the genuine token.
+    row = _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id)
+    assert row is not None
+    assert row.lease_token == reader.fence.lease_token
+    proving.compare_and_swap(reader)
+    admitting.release(reader)

@@ -296,7 +296,20 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        Pre-1.0 delete-and-recreate boundary; no migration,
 #        rollback_permitted: false (sessions.db only — auth.db is never
 #        touched).
-SESSION_SCHEMA_EPOCH = 52
+#   53 -> ``session_read_admissions`` table added (elspeth-f98e0ae8b2, under
+#        A-3 elspeth-bf52d495a2): one row per shareable BLOB_READ admission
+#        so a released or expired read context is REFUSED on its next proof
+#        instead of keeping read authority until the session is archived or
+#        deleted. The row carries the admission's operation id and lease
+#        token, its database-time expiry (renew extends it), and the fence
+#        epoch it was admitted under as an informational custody
+#        generation — never compared, because a writer's epoch advance must
+#        not invalidate a shareable read. Release deletes the row; the
+#        session's ``ON DELETE CASCADE`` removes the rest. Written only by
+#        ``SessionOperationAuthority``. New table ships by DB recreation
+#        (sessions.db only — auth.db is never touched); no migration,
+#        rollback_permitted: false.
+SESSION_SCHEMA_EPOCH = 53
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -559,6 +572,39 @@ session_operation_fences_table = Table(
         "operation_kind IN ('create', 'compose', 'proposal', 'execute', 'archive', 'progress', 'blob_read', 'session_fork')",
         name="ck_session_operation_fences_kind",
     ),
+)
+
+# One row per live shareable BLOB_READ admission (epoch 53, elspeth-f98e0ae8b2).
+# A read admission takes no fence row, so without this record a released or
+# expired read context was indistinguishable from a live one. Every read
+# proof selects its row by (session_id, operation_id): row absent means the
+# admission was RELEASED (release deletes the row), a token mismatch is a
+# forged or foreign context, and ``expires_at <= database now`` is
+# LEASE_EXPIRED. ``operation_epoch`` records the fence epoch the read was
+# admitted under and is never compared — a writer advancing the fence must
+# not invalidate a shareable read. Session deletion cascades the rows away.
+session_read_admissions_table = Table(
+    "session_read_admissions",
+    metadata,
+    Column(
+        "session_id",
+        String,
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("operation_id", String, primary_key=True),
+    Column("lease_token", String, nullable=False),
+    Column("owner_instance_id", String, nullable=False),
+    Column("operation_epoch", Integer, nullable=False),
+    Column("admitted_at", DateTime(timezone=True), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
+    *_non_blank_text_constraints("session_id", name="ck_session_read_admissions_session_id_nonblank"),
+    *_non_blank_text_constraints("operation_id", name="ck_session_read_admissions_operation_id_nonblank"),
+    *_non_blank_text_constraints("lease_token", name="ck_session_read_admissions_lease_token_nonblank"),
+    *_non_blank_text_constraints("owner_instance_id", name="ck_session_read_admissions_owner_nonblank"),
+    CheckConstraint("lease_token <> owner_instance_id", name="ck_session_read_admissions_token_not_owner"),
+    CheckConstraint("operation_epoch > 0", name="ck_session_read_admissions_positive_epoch"),
+    CheckConstraint("expires_at > admitted_at", name="ck_session_read_admissions_expiry_after_admission"),
 )
 
 chat_messages_table = Table(

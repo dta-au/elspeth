@@ -931,8 +931,6 @@ files:
   src/elspeth/web/execution/service.py:
     Mapping[str, Any]: 6
     dict[str, Any]: 5
-  src/elspeth/web/execution/validation.py:
-    Mapping[str, Any]: 2
   src/elspeth/web/interpretation_state.py:
     Mapping[str, Any]: 15
     boundary: 8
@@ -1019,10 +1017,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 895
+  Mapping[str, Any]: 893
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
   boundary: 64
   dict[str, Any]: 1154
   dict[str, object]: 389
-  soft: 2736
+  soft: 2734

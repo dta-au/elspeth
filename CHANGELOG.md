@@ -77,7 +77,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 52. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 53. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -139,7 +139,12 @@ one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
 provider discriminator widens from three values to five on both `sessions` and
 `user_secrets`, and the identity, org-tree and workflow-governance tables land
 in the same epoch so the sprint costs exactly one cutover window rather than
-two (elspeth-07cd19ba73).
+two (elspeth-07cd19ba73). Epoch 53 adds `session_read_admissions`: one row per
+live shareable blob-read admission, written only by the session operation
+authority, so a released or expired read context is refused on its next proof
+instead of keeping read authority until the session is archived or deleted
+(elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
+shareable read.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 37. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their
