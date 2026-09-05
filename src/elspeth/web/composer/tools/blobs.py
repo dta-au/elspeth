@@ -850,16 +850,35 @@ def _blob_creation_provenance(content: str, context: ToolContext) -> _BlobCreati
     )
 
 
+def _names_blob(value: str, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id`` — the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance: the contract's
+    ``is_widened_blob_ref`` matches a ``blob_ref`` against the hyphenated
+    UUID form with ``[0-9a-fA-F]`` digits and the runtime binds it through
+    ``UUID(...)``, so an upper-case marker the LLM authored is the SAME
+    bound blob as the lower-case id the store records. Comparing spellings
+    here read such a bound blob as unbound (review finding A1 on
+    elspeth-4f3cd4155b). Two hyphenated UUID texts denote one UUID iff they
+    are equal ignoring case, so that is the whole comparison; a braced or
+    unhyphenated spelling is rejected by the contract, never bound, and
+    therefore a non-match here — as is any non-UUID string, which cannot
+    name a blob at all.
+    """
+    return value.lower() == blob_id.lower()
+
+
 @trust_boundary(
     tier=3,
     source="one component's frozen options tree (web/LLM-authored content retained through CompositionState freezing)",
     source_param="options",
     suppresses=("R5",),
     invariant=(
-        "returns True only on an exact blob_ref / blob_id / *_blob_id / path / file match found by full "
-        "structural traversal (mappings and sequences at any depth); raises AuditIntegrityError on a "
-        "present-but-non-str blob_ref / blob_id / *_blob_id (audited-state corruption) rather than "
-        "treating the blob as unbound"
+        "returns True only on a blob_ref / blob_id / *_blob_id value, or a blob:<uuid> path / file "
+        "sentinel, that is UUID-identical to blob_id (any hex case), or a path / file value equal to "
+        "storage_path, found by full structural traversal (mappings and list/tuple at any depth); raises "
+        "AuditIntegrityError on a present-but-non-str blob_ref / blob_id / *_blob_id (audited-state "
+        "corruption) rather than treating the blob as unbound"
     ),
     test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_state_options_reference_blob_crashes_on_non_str_blob_ref",
     test_fingerprint="cc4ab30745da588422649670128e04e05a2b19ad065a5750801cfc3a86e56a3b",
@@ -873,18 +892,21 @@ def _state_options_reference_blob(
 ) -> bool:
     """Recursively inspect one component's options for references to a blob.
 
-    Recognizes every composer-authored blob vocabulary, the same set the
-    other three walkers use (``guided/stage_transitions._option_blob_ids``,
+    Recognizes the UNION of the vocabularies the other blob walkers use
+    (``guided/stage_transitions._option_blob_ids``,
     ``web/blobs/service._option_value_references_blob``,
-    ``yaml_generator``'s public-YAML strip list): ``blob_ref`` values
-    (top-level source bindings and nested inline-content markers),
-    ``blob_id`` and any ``*_blob_id`` custody key, and ``path``/``file``
-    values equal to either the blob's canonical ``storage_path`` or its
-    ``blob:<uuid>`` sentinel.  Traversal is full: every nested mapping and
-    every sequence element at any depth is inspected, so a binding inside
-    a list of lists is seen.  Frozen state options are Mapping/tuple shaped,
-    hence the structural checks here rather than the exact ``dict``/``list``
-    checks the DB-side walker uses.
+    ``web/coordination/repository._option_value_references_blob``,
+    ``yaml_generator``'s public-YAML strip list) — no single one of them
+    knows the whole set: ``blob_ref`` values (top-level source bindings and
+    nested inline-content markers), ``blob_id`` and any ``*_blob_id``
+    custody key, and ``path``/``file`` values equal to either the blob's
+    canonical ``storage_path`` or its ``blob:<uuid>`` sentinel.  Id values
+    are compared by UUID identity (``_names_blob``), because the binding
+    path accepts either hex case.  Traversal is full: every nested mapping
+    and every list/tuple element at any depth is inspected, so a binding
+    inside a list of lists is seen.  Frozen state options are Mapping/tuple
+    shaped, hence the structural checks here rather than the exact
+    ``dict``/``list`` checks the DB-side walker uses.
 
     Before elspeth-4f3cd4155b this walker knew only ``blob_ref``/``path``/
     ``file`` and descended one level into sequences, and only into mapping
@@ -908,10 +930,12 @@ def _state_options_reference_blob(
                 continue
             if not isinstance(value, str):
                 raise AuditIntegrityError(f"{owner} has a non-str {key} ({type(value).__name__}); CompositionState integrity anomaly")
-            if value == blob_id:
+            if _names_blob(value, blob_id):
                 return True
         elif key in ("path", "file") and isinstance(value, str):
-            if value == storage_path or value == f"blob:{blob_id}":
+            if value == storage_path:
+                return True
+            if value.startswith("blob:") and _names_blob(value.removeprefix("blob:"), blob_id):
                 return True
         else:
             # Descend into the value whatever its shape. Mappings recurse so

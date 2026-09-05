@@ -1027,13 +1027,57 @@ def test_state_options_reference_blob_recognises_blob_id_vocabulary(options: Map
     """``blob_id`` and ``*_blob_id`` are binding vocabulary for every other walker.
 
     Regression for elspeth-4f3cd4155b: the retention guard recognised only
-    ``blob_ref``/``path``/``file``, so a blob bound through the custody
-    vocabulary ``guided/stage_transitions._option_blob_ids`` and
-    ``web/blobs/service._option_value_references_blob`` both honour read as
-    unbound here and became updatable/deletable under an accepted
-    composition. Negative rows pin that the vocabulary is exact: a
-    near-miss key is not a binding, and neither is the id as a bare list
-    element.
+    ``blob_ref``/``path``/``file``. A blob bound through the ``blob_id`` /
+    ``*_blob_id`` custody vocabulary, which
+    ``guided/stage_transitions._option_blob_ids`` honours, read as unbound
+    here and became updatable/deletable under an accepted composition.
+    Negative rows pin that the vocabulary is exact: a near-miss key is not
+    a binding, and neither is the id as a bare list element.
+    """
+    assert _state_options_reference(options) is expected
+
+
+_GUARD_BLOB_ID_UPPER = _GUARD_BLOB_ID.upper()
+_INLINE_MARKER_UPPER = {
+    "blob_ref": _GUARD_BLOB_ID_UPPER,
+    "mode": "inline_content",
+    "sha256": "0" * 64,
+    "encoding": "utf-8",
+}
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        pytest.param({"blob_ref": _GUARD_BLOB_ID_UPPER}, True, id="blob_ref-upper"),
+        pytest.param({"blob_id": _GUARD_BLOB_ID_UPPER}, True, id="blob_id-upper"),
+        pytest.param({"custody": {"upload_blob_id": _GUARD_BLOB_ID_UPPER}}, True, id="suffix-_blob_id-upper"),
+        pytest.param({"prompt": _INLINE_MARKER_UPPER}, True, id="nested-inline-marker-upper"),
+        pytest.param({"path": f"blob:{_GUARD_BLOB_ID_UPPER}"}, True, id="blob-sentinel-upper"),
+        pytest.param({"file": f"BLOB:{_GUARD_BLOB_ID}"}, False, id="sentinel-prefix-is-case-exact"),
+        pytest.param({"blob_id": "not-a-uuid"}, False, id="unparseable-id-is-a-non-match"),
+        pytest.param({"blob_ref": "{" + _GUARD_BLOB_ID + "}"}, False, id="braced-spelling-is-not-bindable"),
+        pytest.param({"blob_ref": _GUARD_BLOB_ID.replace("-", "")}, False, id="unhyphenated-spelling-is-not-bindable"),
+        pytest.param({"blob_id": _GUARD_BLOB_ID_UPPER.replace("0BE5", "1BE5")}, False, id="other-blob-upper"),
+        pytest.param({"path": _GUARD_STORAGE_PATH.upper()}, False, id="storage-path-is-case-exact"),
+    ],
+)
+def test_state_options_reference_blob_compares_ids_by_uuid_identity(options: Mapping[str, Any], expected: bool) -> None:
+    """A bound blob is the same blob whichever hex case names it.
+
+    Review finding A1 on elspeth-4f3cd4155b: ``is_widened_blob_ref`` accepts
+    a ``blob_ref`` in either case (``_UUID_PATTERN`` is ``[0-9a-fA-F]``),
+    prevalidation strips such a marker as a valid deferred field, and the
+    runtime binds it through ``UUID(...)`` — so an upper-case marker the LLM
+    authored IS bound, while the guard's exact string compare read it as
+    unbound and let update/delete proceed with every test green. Fails on
+    ffe3a8b2b, passes on the repair.
+
+    The comparison admits exactly the variance the contract admits — hex
+    case in the hyphenated form — and nothing more: a braced or unhyphenated
+    spelling is rejected by ``is_widened_blob_ref`` and so can never be
+    bound, the ``blob:`` prefix and the storage path are ordinary strings
+    and stay case-exact, and a non-UUID string names no blob.
     """
     assert _state_options_reference(options) is expected
 
