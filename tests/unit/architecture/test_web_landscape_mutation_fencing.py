@@ -2204,6 +2204,21 @@ def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     return tuple(violations)
 
 
+# SQLAlchemy exposes the dialect-specific ``INSERT ... ON CONFLICT`` builder
+# under the same terminal name in every dialect package, so a module that needs
+# both must alias at least one of them: the alias is forced by the library, not
+# a way of hiding a DML constructor.  Admission is decided on the import's
+# RESOLVED ORIGIN — the dialect module the binding comes from — and the alias
+# must be that origin's dialect-qualified spelling, so a same-spelled alias over
+# any other origin stays an escape.
+_DIALECT_DML_ORIGIN = re.compile(r"^sqlalchemy\.dialects\.(?P<dialect>[a-z_][a-z0-9_]*)\.(?P<operation>insert|update|delete)$")
+
+
+def _is_canonical_dialect_dml_binding(origin: str, asname: str) -> bool:
+    match = _DIALECT_DML_ORIGIN.match(origin)
+    return match is not None and asname == f"{match.group('dialect')}_{match.group('operation')}"
+
+
 def _dml_callable_escape_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     violations: list[str] = []
     for unit in units:
@@ -2212,9 +2227,14 @@ def _dml_callable_escape_violations(units: Iterable[SourceUnit]) -> tuple[str, .
         resolver = _resolver_for_unit(unit)
         for node in ast.walk(unit.tree):
             if isinstance(node, ast.ImportFrom):
+                module = resolver._absolute_import_module(node)
                 for alias in node.names:
-                    if alias.asname is not None and (alias.name in {"insert", "update", "delete"} or alias.name.endswith("_insert")):
-                        violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} aliased DML import {alias.name} as {alias.asname}")
+                    if alias.asname is None or not (alias.name in {"insert", "update", "delete"} or alias.name.endswith("_insert")):
+                        continue
+                    origin = f"{module}.{alias.name}" if module else alias.name
+                    if _is_canonical_dialect_dml_binding(origin, alias.asname):
+                        continue
+                    violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} aliased DML import {alias.name} as {alias.asname}")
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                 value = node.value
                 qualified = resolver.qualified_name(value, use=node)
@@ -4677,6 +4697,50 @@ def test_outside_landscape_dml_keys_on_the_table_metadata_module_not_the_table_n
         "    conn.execute(runs_table.update().values(status='failed'))\n",
     )
     assert _raw_write_surface_violations([bound_method_form]) == ()
+
+
+def test_aliased_dml_imports_are_admitted_by_resolved_origin_not_by_spelling() -> None:
+    """P4-D8 defect 3: a dialect DML import cannot be written without an alias."""
+
+    dialect_bindings = _parse_source(
+        "src/elspeth/core/landscape/execution/dialect_inserts.py",
+        "from sqlalchemy.dialects.postgresql import insert as postgresql_insert\n"
+        "from sqlalchemy.dialects.sqlite import insert as sqlite_insert\n",
+    )
+    assert _dml_callable_escape_violations([dialect_bindings]) == ()
+
+    non_canonical_alias = _parse_source(
+        "src/elspeth/core/landscape/execution/non_canonical.py",
+        "from sqlalchemy.dialects.sqlite import insert as fast_insert\n",
+    )
+    assert any("aliased DML import insert as fast_insert" in item for item in _dml_callable_escape_violations([non_canonical_alias]))
+
+    core_origin_wearing_a_dialect_name = _parse_source(
+        "src/elspeth/core/landscape/execution/core_origin.py",
+        "from sqlalchemy import insert as postgresql_insert\n",
+    )
+    assert any(
+        "aliased DML import insert as postgresql_insert" in item
+        for item in _dml_callable_escape_violations([core_origin_wearing_a_dialect_name])
+    )
+
+    project_origin = _parse_source(
+        "src/elspeth/core/landscape/execution/project_origin.py",
+        "from elspeth.core.landscape.helpers import insert as sqlite_insert\n",
+    )
+    assert any("aliased DML import insert as sqlite_insert" in item for item in _dml_callable_escape_violations([project_origin]))
+
+    relative_origin = _parse_source(
+        "src/elspeth/core/landscape/execution/relative_origin.py",
+        "from .helpers import insert as sqlite_insert\n",
+    )
+    assert any("aliased DML import insert as sqlite_insert" in item for item in _dml_callable_escape_violations([relative_origin]))
+
+    core_alias = _parse_source(
+        "src/elspeth/core/landscape/execution/core_alias.py",
+        "from sqlalchemy import update as mutate\n",
+    )
+    assert any("aliased DML import update as mutate" in item for item in _dml_callable_escape_violations([core_alias]))
 
 
 def test_dml_fingerprint_is_stable_when_the_required_fence_wraps_the_same_statement() -> None:
