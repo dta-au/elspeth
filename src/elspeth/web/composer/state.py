@@ -1105,6 +1105,25 @@ def _collector_intrinsic_errors(node: NodeSpec, *, nodes: tuple[NodeSpec, ...]) 
                     "scope_opener_unknown",
                 )
             )
+        elif (
+            opener_node.plugin is not None
+            and opener_node.plugin in _known_transform_plugin_names()
+            and opener_node.plugin not in _known_multi_row_transform_plugins()
+        ):
+            # Mirror of the builder's "Scope '{}' opener '{}' is not a
+            # multi-row transform (creates_tokens=False)" rejection. An
+            # unknown plugin name is owned by the plugin-availability checks.
+            errors.append(
+                _err(
+                    component,
+                    f"Collector '{node.id}' scope_opener '{scope_opener}' names transform '{opener_node.plugin}', "
+                    "which is not a multi-row transform (creates_tokens=False), so it expands no rows into "
+                    "the group this collector would close. Set scope_opener to an expanding transform "
+                    "(for example json_explode or line_explode).",
+                    "high",
+                    "scope_opener_not_multi_row",
+                )
+            )
 
     return errors
 
@@ -1580,6 +1599,18 @@ def _known_transform_plugin_names() -> frozenset[str]:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
     return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms())
+
+
+def _known_multi_row_transform_plugins() -> frozenset[str]:
+    """Return registered transform names that expand rows (creates_tokens=True).
+
+    The scope-opener candidates (barrier-scopes spec §7 rule 5) — read from
+    the same plugin attribute the builder's opener check and the rule-5
+    census read, so the Stage-1 mirror cannot drift from the runtime.
+    """
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.creates_tokens)
 
 
 def _known_batch_aware_transform_plugins_requiring_aggregation() -> frozenset[str]:

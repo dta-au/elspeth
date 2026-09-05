@@ -18,6 +18,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
 )
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.yaml_generator import PipelineLoweringError, generate_yaml
 from elspeth.web.composer.yaml_importer import (
     RuntimeYamlImportError,
@@ -33,11 +34,11 @@ def _make_output(name: str) -> OutputSpec:
     return OutputSpec(name=name, plugin="csv", options={}, on_write_failure="discard")
 
 
-def _transform(node_id: str, input_name: str, on_success: str, *, on_error: str = "discard") -> NodeSpec:
+def _transform(node_id: str, input_name: str, on_success: str, *, on_error: str = "discard", plugin: str = "passthrough") -> NodeSpec:
     return NodeSpec(
         id=node_id,
         node_type="transform",
-        plugin="passthrough",
+        plugin=plugin,
         input=input_name,
         on_success=on_success,
         on_error=on_error,
@@ -104,6 +105,7 @@ _COLLECTOR_FAMILY_CODES = (
     "collector_missing_scope",
     "collector_scope_policy_invalid",
     "scope_opener_unknown",
+    "scope_opener_not_multi_row",
     "collector_has_trigger_invalid",
     "collector_has_on_error_invalid",
     "collector_missing_plugin",
@@ -119,7 +121,7 @@ _COLLECTOR_FAMILY_CODES = (
 
 class TestCollectorIntrinsics:
     def test_bound_collector_raises_no_collector_family_code(self) -> None:
-        state = _state(_transform("explode", "rows", "pages"), _collector())
+        state = _state(_transform("explode", "rows", "pages", plugin="json_explode"), _collector())
         errors = state.validate().errors
         fired = sorted({entry.error_code for entry in errors if entry.error_code in _COLLECTOR_FAMILY_CODES})
         assert fired == [], [entry.message for entry in errors if entry.error_code in fired]
@@ -171,6 +173,30 @@ class TestCollectorIntrinsics:
             other,
         )
         assert _errors_for(state, "scope_opener_unknown")
+
+    def test_scope_opener_must_be_a_multi_row_transform(self) -> None:
+        """elspeth-9783949ed4: the message always claimed creates_tokens=True and
+        the code checked only existence + node_type. A passthrough opener
+        builds a bound region no token can enter and dies at runtime with an
+        internal error naming a phantom sink; now it is an authoring error,
+        derived from the plugin registry's creates_tokens the same way the
+        is_batch_aware mirror is."""
+        state = _state(_transform("explode", "rows", "pages", plugin="passthrough"), _collector())
+        [entry] = _errors_for(state, "scope_opener_not_multi_row")
+        assert "passthrough" in entry.message and "creates_tokens=False" in entry.message
+        assert entry.severity == "high"
+        assert explain_validation_code("scope_opener_not_multi_row") is not None
+
+    def test_an_expanding_opener_is_accepted(self) -> None:
+        state = _state(_transform("explode", "rows", "pages", plugin="json_explode"), _collector())
+        assert _errors_for(state, "scope_opener_not_multi_row") == []
+        assert _errors_for(state, "scope_opener_unknown") == []
+
+    def test_an_unknown_opener_plugin_is_left_to_the_availability_checks(self) -> None:
+        """An opener naming a plugin the registry does not know is not a
+        multi-row finding — the plugin-availability rule owns it."""
+        state = _state(_transform("explode", "rows", "pages", plugin="no_such_plugin"), _collector())
+        assert _errors_for(state, "scope_opener_not_multi_row") == []
 
     def test_trigger_is_rejected(self) -> None:
         state = _state(_transform("explode", "rows", "pages"), _collector(trigger={"count": 5}))

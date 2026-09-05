@@ -2601,6 +2601,31 @@ sites:
     at builder.py:783, so a key exists only once it holds at least one edge; ''if not upstream_edges''
     at builder.py:938 can never be true. (Stage 1 does cover the real predicate anyway: a queue''s input
     is its own id, so a producerless queue trips node_input_not_reachable — see state.py:5788-5790.)'
+- key: ca0dda9f7b36bba1
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Scope ''{}'' opener ''{}'' does not name a transforms: entry. A scope opener is a multi-row
+    transform declared in transforms:.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - scope_opener_unknown
+  note: Builder twin of ScopeSettings' name-membership check, reached with plugin instances in hand; Stage-1
+    already refuses an opener that names no transform node (state.py scope_opener_unknown).
+- key: 90913c9e624a399f
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Scope '{}' opener '{}' is not a multi-row transform (creates_tokens=False), so it expands no
+    rows into the group collector '{}' would close. A scope opener must
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - scope_opener_not_multi_row
+  note: The check core/config.py _validate_scope_bindings defers to the builder (elspeth-9783949ed4).
+    Stage-1 mirror in _collector_intrinsic_errors derives multi-row-ness from the same plugin attribute
+    (creates_tokens) via the shared plugin manager, as the is_batch_aware mirror does.
 - key: 6e3e011c4d6699d3
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
