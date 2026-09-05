@@ -65,7 +65,10 @@ def test_support_matrix_links_only_shipped_deployment_artifacts() -> None:
     ):
         assert (REPO_ROOT / shipped_path).is_file()
 
-    for absent_bundle in ("azure-container-apps", "kubernetes", "platforms"):
+    # deploy/azure-container-apps/ ships from Phase 6b (its own contract test is
+    # tests/unit/deployment/test_azure_container_apps_bundle.py); the support
+    # claim for the platform flips only with the sanitized receipt.
+    for absent_bundle in ("kubernetes", "platforms"):
         bundle_path = REPO_ROOT / "deploy" / absent_bundle
         assert not bundle_path.exists() or not any(bundle_path.rglob("*"))
 

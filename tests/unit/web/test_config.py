@@ -2197,3 +2197,45 @@ class TestDevAdminUser:
     def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__DEV_ADMIN_USER", "john")
         assert web_config.settings_from_env().dev_admin_user == "john"
+
+
+class TestInstanceId:
+    """``instance_id`` (6b-3, elspeth-31878c9787): the process identity on the wire and in the fence rows.
+
+    The value is placed verbatim on every response header, so it is held to a
+    header-safe shape; ``None`` (the production setting) mints a fresh id at
+    startup so two replicas never share one.
+    """
+
+    def test_defaults_to_none_so_each_process_mints_its_own(self) -> None:
+        assert _settings().instance_id is None
+
+    @pytest.mark.parametrize("value", ["web-7f3a2c1e-9b4d-4f6a-8c2e-1d5b7a9c3e0f", "rA--replica.1_x", "a", "A" * 128])
+    def test_accepts_header_safe_ids(self, value: str) -> None:
+        assert _settings(instance_id=value).instance_id == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("", id="blank"),
+            pytest.param("   ", id="whitespace"),
+            pytest.param(" web", id="leading-space"),
+            pytest.param("-web", id="leading-dash"),
+            pytest.param("web\r\nX-Injected: 1", id="crlf"),
+            pytest.param("has space", id="space"),
+            pytest.param("wéb", id="non-ascii"),
+            pytest.param("A" * 129, id="too-long"),
+        ],
+    )
+    def test_rejects_unsafe_ids(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="instance_id"):
+            _settings(instance_id=value)
+
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "rA--pinned.01")
+        assert web_config.settings_from_env().instance_id == "rA--pinned.01"
+
+    def test_blank_environment_value_is_refused_not_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "")
+        with pytest.raises(ValidationError, match="instance_id"):
+            web_config.settings_from_env()

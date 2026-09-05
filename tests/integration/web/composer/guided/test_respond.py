@@ -29,7 +29,7 @@ from sqlalchemy.sql.dml import Insert, Update
 from elspeth.contracts.composer_interpretation import InterpretationChoice
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -78,6 +78,21 @@ from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServi
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _assert_compose_context_for(session_operation_context: object, session_id: str | UUID) -> SessionOperationContext:
+    """Pin the fence a widened settlement double received before it forwards it.
+
+    A double that accepts ``session_operation_context`` must prove it received
+    the route's exact, session-bound COMPOSE context -- not a default it made
+    up and not a stranger's. The production writers require the keyword; the
+    fail-open double class (elspeth-bb776978e3) is exactly a double that
+    silently supplies one.
+    """
+    assert type(session_operation_context) is SessionOperationContext
+    assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+    assert session_operation_context.fence.session_id == str(session_id)
+    return session_operation_context
 
 
 @dataclass
@@ -2355,9 +2370,18 @@ class TestStep2IntraStep:
             planner_calls += 1
             raise AssertionError("wire source/output back-edit must not call the planner")
 
-        async def capture_back_edit(command: GuidedPipelineProposalBackEditCommand, *, payload_store: Any = None) -> object:
+        async def capture_back_edit(
+            command: GuidedPipelineProposalBackEditCommand,
+            *,
+            payload_store: Any = None,
+            session_operation_context: SessionOperationContext,
+        ) -> object:
             back_edit_commands.append(command)
-            return await original_back_edit(command, payload_store=payload_store)
+            return await original_back_edit(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
 
         monkeypatch.setattr(
             composer_test_client.app.state.composer_service,
@@ -4127,8 +4151,9 @@ class TestStep2IntraStep:
         original_back_edit = service.back_edit_guided_pipeline_proposal
         captured_commands = []
 
-        async def capture_without_settlement(command, *, payload_store=None):
+        async def capture_without_settlement(command, *, payload_store=None, session_operation_context):
             del payload_store
+            _assert_compose_context_for(session_operation_context, session_id)
             captured_commands.append(command)
             raise RuntimeError("capture command before settlement")
 
@@ -4311,9 +4336,13 @@ class TestStep2IntraStep:
         original = service.back_edit_guided_pipeline_proposal
         captured_commands = []
 
-        async def capture(command, *, payload_store=None):
+        async def capture(command, *, payload_store=None, session_operation_context):
             captured_commands.append(command)
-            return await original(command, payload_store=payload_store)
+            return await original(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
 
         monkeypatch.setattr(service, "back_edit_guided_pipeline_proposal", capture)
         with engine.connect() as conn:
@@ -4997,11 +5026,35 @@ class TestStep2IntraStep:
                 .mappings()
                 .one()
             )
-        assert operation["status"] == "in_progress"
-        assert operation["failure_code"] is None
-        assert operation["settled_at"] is None
+            terminal_events = (
+                conn.execute(
+                    select(guided_operation_events_table)
+                    .where(guided_operation_events_table.c.session_id == session_id)
+                    .where(guided_operation_events_table.c.operation_id == operation_id)
+                    .where(guided_operation_events_table.c.event_kind == "failed")
+                )
+                .mappings()
+                .all()
+            )
+        # Audit primacy under the Q3 ruling: the failure's evidence could not
+        # be recorded, so the lease guard's audit-free arm terminalises the
+        # row as an integrity failure and commits an EMPTY evidence cohort --
+        # the row says, durably, that it failed and that no evidence row
+        # belongs to it. The invariant is "no evidence row without its state
+        # row", never "no state row without evidence": the chat transcript is
+        # untouched and the canary never leaks.
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
+        assert operation["settled_at"] is not None
+        (terminal_event,) = terminal_events
+        assert terminal_event["failure_audit_cohort"]["count"] == 0
+        assert terminal_event["failure_audit_cohort"]["rows"] == []
+        # The missing-evidence fact is recorded by WHO wrote the terminal
+        # event: the lease guard's audit-free arm, not the route's own
+        # evidence settlement (which is what failed here).
+        assert terminal_event["actor"] == "guided_operation_lease_guard"
         assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
-        assert failure_canary not in repr((exc_info.value, operation))
+        assert failure_canary not in repr((exc_info.value, operation, terminal_event))
 
     @pytest.mark.parametrize(
         "composer_test_client",
@@ -5049,12 +5102,16 @@ class TestStep2IntraStep:
                 planner_calls += 1
                 raise AssertionError("source/output proposal back-edit must not call the planner")
 
-            async def blocking_back_edit(command, *, payload_store=None):
+            async def blocking_back_edit(command, *, payload_store=None, session_operation_context):
                 nonlocal back_edit_calls
                 back_edit_calls += 1
                 back_edit_entered.set()
                 await release_back_edit.wait()
-                return await original_back_edit(command, payload_store=payload_store)
+                return await original_back_edit(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
 
             monkeypatch.setattr(
                 composer_test_client.app.state.composer_service,
@@ -5187,26 +5244,33 @@ class TestStep2IntraStep:
         prepare_calls = []
         execute_calls = []
 
-        async def gated_admit(command):
+        async def gated_admit(command, *, session_operation_context):
             admission_commands.append(command)
             entered["confirm"].set()
             await release.wait()
             if db_winner != "confirm":
                 await winner_settled.wait()
             try:
-                return await original_admit(command)
+                return await original_admit(
+                    command,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
             finally:
                 if db_winner == "confirm":
                     winner_settled.set()
 
-        async def gated_stage(command, *, payload_store=None):
+        async def gated_stage(command, *, payload_store=None, session_operation_context):
             stage_commands.append(command)
             entered["correct"].set()
             await release.wait()
             if db_winner != "correct":
                 await winner_settled.wait()
             try:
-                return await original_stage(command, payload_store=payload_store)
+                return await original_stage(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+                )
             finally:
                 if db_winner == "correct":
                     winner_settled.set()
@@ -6547,8 +6611,9 @@ class TestStep2IntraStep:
             executions += 1
             return original_execute(*args, **kwargs)
 
-        async def fail_first_record(_command: Any):
+        async def fail_first_record(_command: Any, *, session_operation_context: SessionOperationContext):
             nonlocal record_attempts
+            _assert_compose_context_for(session_operation_context, session_id)
             record_attempts += 1
             raise RuntimeError("safe failure before durable dispatch record")
 
@@ -6815,10 +6880,14 @@ class TestStep2IntraStep:
             "chosen": ["confirm_wiring"],
         }
 
-        async def blocked_accept(command, *, payload_store=None):
+        async def blocked_accept(command, *, payload_store=None, session_operation_context):
             entered.set()
             await release.wait()
-            return await original_accept(command, payload_store=payload_store)
+            return await original_accept(
+                command,
+                payload_store=payload_store,
+                session_operation_context=_assert_compose_context_for(session_operation_context, session_id),
+            )
 
         monkeypatch.setattr(
             composer_test_client.app.state.session_service,

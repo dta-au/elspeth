@@ -552,11 +552,14 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
 ) -> None:
     """If the audit insert raises, the request fails — no token returned, no blob exposed.
 
-    Mechanism: monkey-patch the engine's ``begin`` to raise. The service's
-    ``with self._sessions_db_engine.begin() as conn`` path then fails before
-    any blob is written. TestClient defaults to ``raise_server_exceptions=True``,
-    so the test catches the exception directly; the assertion that matters is
-    that NO blob was written, confirming audit-first ordering.
+    Mechanism: the audit row is written through the session-operation
+    authority's ``mutate`` seam (``transaction.composer_completion
+    .mark_ready_for_review`` under the exact BLOB_READ context), not through
+    a bare ``engine.begin()``. Injecting at that seam makes the audit insert
+    raise before any blob is written. TestClient defaults to
+    ``raise_server_exceptions=True``, so the test catches the exception
+    directly; the assertion that matters is that NO blob was written,
+    confirming audit-first ordering.
     """
     client, session_id = audit_readiness_client_with_state
 
@@ -571,16 +574,19 @@ def test_mark_ready_for_review_audit_write_failure_returns_no_token(
 
     monkeypatch.setattr(payload_store, "store", tracking_store)
 
-    # Break the engine's begin() to raise.
+    # Break the authority's mutate seam so the audit insert raises. Only the
+    # shareable-review service's reference is replaced: the route still
+    # acquires its BLOB_READ lease from the real session-service authority.
     service = client.app.state.shareable_review_service
 
     class _AuditWriteBoom(Exception): ...
 
-    class _BadEngine:
-        def begin(self):  # type: ignore[no-untyped-def]
+    class _AuditWriteFailingAuthority:
+        def mutate(self, session_operation_context, writer):  # type: ignore[no-untyped-def]
+            del session_operation_context, writer
             raise _AuditWriteBoom("audit write injected failure")
 
-    monkeypatch.setattr(service, "_sessions_db_engine", _BadEngine())
+    monkeypatch.setattr(service, "_session_operation_authority", _AuditWriteFailingAuthority())
 
     with pytest.raises(_AuditWriteBoom):
         client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
