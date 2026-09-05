@@ -13,6 +13,7 @@ from typing import Any
 
 import psycopg
 import pytest
+from fastapi import FastAPI
 from psycopg import sql
 from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine
@@ -23,6 +24,7 @@ from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 import elspeth.web.readiness as readiness_module
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership
 from elspeth.web.readiness import READINESS_CHECK_NAMES
 from elspeth.web.schema_probe import (
     SchemaState,
@@ -191,7 +193,7 @@ def _settings(tmp_path: Path, databases: _RuntimeDatabases) -> WebSettings:
     )
 
 
-def _initialized_app(tmp_path: Path, databases: _RuntimeDatabases) -> tuple[object, Engine, Engine]:
+def _initialized_app(tmp_path: Path, databases: _RuntimeDatabases) -> tuple[FastAPI, Engine, Engine]:
     session_owner = create_session_engine(databases.session_owner_url)
     landscape_owner = create_engine(databases.landscape_owner_url)
     init_session_schema(session_owner)
@@ -218,6 +220,35 @@ def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_database
         assert all(check["ok"] for check in payload["checks"])
         assert probe_session_schema(session_owner) is SchemaState.CURRENT
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
+    finally:
+        _dispose_app(app)
+        session_owner.dispose()
+        landscape_owner.dispose()
+
+
+def test_postgres_app_registers_membership_under_its_own_fencing_identity(tmp_path: Path, runtime_databases: _RuntimeDatabases) -> None:
+    """A PostgreSQL app takes the registered arm, bound to the id it fences with.
+
+    ``_create_app`` chooses the membership implementation from the session
+    engine's dialect, and only this arm writes a ``web_instances`` row. Every
+    unit proof of the wiring runs on SQLite, so without a PostgreSQL app the
+    dialect branch is unpinned: replacing it with the single-process arm — a
+    replica that never registers, leaving a killed peer's fenced sessions
+    refused forever — leaves both the unit gate and the PostgreSQL proofs
+    green. The identity seam is the ticket's premise: a peer joins an expired
+    fence's ``owner_instance_id`` to ``web_instances.instance_id``, so the
+    registered id must be the id this process fences with, under the same
+    lease.
+    """
+    app, session_owner, landscape_owner = _initialized_app(tmp_path, runtime_databases)
+    try:
+        membership = app.state.web_instance_membership
+        session_service = app.state.session_service
+        assert type(membership) is RegisteredWebInstanceMembership
+        assert membership.identity.instance_id == session_service.session_operation_owner_instance_id
+        assert membership._lease_seconds == session_service.session_operation_lease_seconds
+        assert app.state.instance_draining is membership.draining
+        assert not app.state.instance_draining.is_set()
     finally:
         _dispose_app(app)
         session_owner.dispose()
