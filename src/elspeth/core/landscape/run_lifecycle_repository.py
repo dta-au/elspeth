@@ -418,12 +418,13 @@ class RunLifecycleRepository:
                         evidence=web_plugin_policy_evidence,
                     )
                 # Composes into THIS transaction (connection-accepting form):
-                # the runs row above satisfies the run_coordination FK.
+                # the runs row above satisfies the run_coordination FK. The
+                # seat's deadline is Landscape database time (ADR-047); the
+                # forensic ``timestamp`` above never reaches it.
                 coordination.register_run_leader_on(
                     conn,
                     run_id=run.run_id,
                     worker_id=worker_id,
-                    now=timestamp,
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                     entry_point="run",
                 )
@@ -596,7 +597,6 @@ class RunLifecycleRepository:
             else fenced_leader_transaction(
                 self._db.engine,
                 token=token,
-                now=timestamp,
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="complete_run",
             )
@@ -1458,7 +1458,6 @@ class RunLifecycleRepository:
             else fenced_leader_transaction(
                 self._db.engine,
                 token=token,
-                now=now(),
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="update_run_status",
             )

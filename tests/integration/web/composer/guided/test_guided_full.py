@@ -1972,32 +1972,46 @@ def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
     newer_operation_id = "00000000-0000-4000-8000-000000000072"
 
     async def race() -> tuple[int, int]:
-        async with AsyncClient(
-            transport=ASGITransport(app=composer_test_client.app),
-            base_url="http://test",
-        ) as client:
+        async with (
+            AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client,
+            # The abandoned worker's fence-loss with no winner for ITS operation
+            # escapes the route as production's 500; keep it as a status so the
+            # race can assert on it rather than on a re-raised exception.
+            AsyncClient(
+                transport=ASGITransport(app=composer_test_client.app, raise_app_exceptions=False), base_url="http://test"
+            ) as stale_client,
+        ):
             older = asyncio.create_task(
-                client.post(
+                stale_client.post(
                     f"/api/sessions/{session['id']}/guided/plan",
                     json={"operation_id": older_operation_id, "intent": "Build the older proposal."},
                 )
             )
             await asyncio.wait_for(planner.first_started.wait(), timeout=3)
-            newer = await asyncio.wait_for(
-                client.post(
-                    f"/api/sessions/{session['id']}/guided/plan",
-                    json={"operation_id": newer_operation_id, "intent": "Build the newer proposal."},
-                ),
-                timeout=3,
-            )
+            newer_body = {"operation_id": newer_operation_id, "intent": "Build the newer proposal."}
+            # While the older operation is live it owns the session: the newer
+            # request is refused at the session-operation lease with the
+            # platform's 409 and publishes nothing.
+            refused = await asyncio.wait_for(client.post(f"/api/sessions/{session['id']}/guided/plan", json=newer_body), timeout=3)
+            assert refused.status_code == 409, refused.json()
+            assert refused.json() == {"detail": "Session operation is already active"}
+            latest_after_refusal = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest_after_refusal.request_id == older_operation_id
+            # Once both of the older worker's leases lapse (an abandoned
+            # replica), the newer request acquires the session and completes.
+            abandon_guided_worker_leases(engine, session_id=session["id"], operation_id=older_operation_id)
+            newer = await asyncio.wait_for(client.post(f"/api/sessions/{session['id']}/guided/plan", json=newer_body), timeout=3)
             latest_after_newer = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
             assert latest_after_newer.request_id == newer_operation_id
             assert latest_after_newer.phase == "complete"
 
+            # The older worker's late progress cannot overwrite the newer
+            # operation's terminal state.
             planner.release_first.set()
             older_response = await asyncio.wait_for(older, timeout=3)
             return older_response.status_code, newer.status_code
 
+    engine = composer_test_client.app.state.session_engine
     older_status, newer_status = asyncio.run(race())
 
     assert newer_status == 200

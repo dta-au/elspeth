@@ -37,6 +37,7 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
     BlobStateError,
     blob_record_snapshot_hash,
+    names_same_blob,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_interpretation import (
@@ -340,11 +341,26 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
-    """Recursively inspect one plugin option value for exact blob markers."""
+    """Recursively inspect one plugin option value for blob identity markers.
+
+    The vocabulary is the union the blob store's own walker recognises: an
+    inline ``blob_ref`` marker, the ``blob_id`` custody key ``blob_rows``
+    persists (elspeth-0c6a343921), and the legacy ``path``/``file`` storage
+    path. This is the PostgreSQL multi-replica delete path's copy of that
+    walker; it must never recognise less than its twin.
+
+    Id values are compared by UUID identity through the contract's
+    ``names_same_blob`` (the same helper the blob store's walker uses): the
+    binding path accepts either hex case, so a spelling comparison read a
+    bound blob as unbound on this delete path (elspeth-f123a7b3d2). A
+    present-but-non-str id value is a non-match here, as on the twin.
+    """
     if type(value) is dict:
-        if value.get("blob_ref") == blob_id:
+        if "blob_ref" in value and type(value["blob_ref"]) is str and names_same_blob(value["blob_ref"], blob_id):
             return True
-        if any(value.get(key) == storage_path for key in ("path", "file")):
+        if "blob_id" in value and type(value["blob_id"]) is str and names_same_blob(value["blob_id"], blob_id):
+            return True
+        if any(key in value and value[key] == storage_path for key in ("path", "file")):
             return True
         return any(_option_value_references_blob(child, blob_id, storage_path) for child in value.values())
     if type(value) is list:

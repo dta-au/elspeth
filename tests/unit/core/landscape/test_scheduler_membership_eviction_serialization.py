@@ -264,7 +264,6 @@ class TestEvictWorkerLockOrder:
             evicted = coord.evict_worker(
                 token=token,
                 target_worker_id=WORKER_ID,
-                now=NOW,
                 grace_seconds=GRACE,
                 window_seconds=WINDOW,
             )
@@ -287,7 +286,6 @@ class TestEvictWorkerLockOrder:
         evicted = coord.evict_worker(
             token=token,
             target_worker_id="never-registered",
-            now=NOW,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )

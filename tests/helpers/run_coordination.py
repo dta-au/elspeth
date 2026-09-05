@@ -13,8 +13,6 @@ pair from the test side.
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -25,11 +23,15 @@ def register_run_leader(
     *,
     run_id: str,
     worker_id: str,
-    now: datetime,
     window_seconds: float,
     entry_point: str = "run",
 ) -> CoordinationToken:
-    """Mint ``run_id``'s epoch-1 seat on ``repo`` in a standalone transaction."""
+    """Mint ``run_id``'s epoch-1 seat on ``repo`` in a standalone transaction.
+
+    The seat's deadline is the Landscape database clock plus ``window_seconds``
+    (ADR-047); a test that needs the seat lapsed expires it through the
+    database (:func:`tests.fixtures.landscape.expire_leader_seat`).
+    """
     if type(repo) is not RunCoordinationRepository:
         raise TypeError("repo must be an exact RunCoordinationRepository")
     with begin_write(repo._engine) as conn:
@@ -37,7 +39,6 @@ def register_run_leader(
             conn,
             run_id=run_id,
             worker_id=worker_id,
-            now=now,
             window_seconds=window_seconds,
             entry_point=entry_point,
         )

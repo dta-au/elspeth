@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import NotRequired, TypedDict
@@ -11,6 +12,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.secrets import collect_credential_field_violations
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
@@ -29,7 +31,7 @@ from elspeth.web.composer.yaml_importer import (
     composition_state_from_runtime_yaml,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.interpretation_state import parse_interpretation_requirements
+from elspeth.web.interpretation_state import InterpretationReviewSite, parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -762,6 +764,41 @@ async def revert_state(
         return _state_response(new_state, policy_catalog=catalog)
 
 
+_IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL = "Review-debt check did not complete within the configured bound; import aborted."
+_SEED_REVIEW_DEBT_TIMEOUT_DETAIL = "Review-debt check did not complete within the configured bound; seed aborted."
+
+
+async def _review_debt_sites_off_loop(
+    state: CompositionState,
+    *,
+    request: Request,
+    timeout_detail: str,
+) -> tuple[InterpretationReviewSite, ...]:
+    """Run the pure review-debt check off the event loop, bounded (elspeth-e5a38115a6).
+
+    ``unsurfaceable_pending_interpretation_review_sites`` is CPU-bound — it
+    validates the composition several times — and both import routes call it
+    under the session's COMPOSE lease and compose lock. Called inline, it held
+    the loop for its whole duration, so one long import stalled every other
+    request on the deployment and outlived its own lease. It now runs on the
+    shared worker pool like the runtime preflight and under the same bound
+    (``composer_runtime_preflight_timeout_seconds``: one knob for "a static
+    check on the request path took too long"). The refusal is static: the
+    state under check is untrusted input on both routes, so nothing from it
+    reaches the detail. The worker's own exceptions propagate unchanged, so
+    each caller's malformed-metadata arm still sees the classes it handles.
+    """
+    from elspeth.web.composer.service import unsurfaceable_pending_interpretation_review_sites
+
+    try:
+        return await asyncio.wait_for(
+            run_sync_in_worker(unsurfaceable_pending_interpretation_review_sites, state),
+            timeout=request.app.state.settings.composer_runtime_preflight_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=timeout_detail) from exc
+
+
 @router.post(
     "/{session_id}/state/yaml",
     response_model=CompositionStateResponse,
@@ -818,13 +855,14 @@ async def import_state_yaml(
             # the generic Composer surfacer's own pure site-to-writer mapping so a
             # pending site that cannot become a consumable event is rejected before
             # the composition state is saved.
-            from elspeth.web.composer.service import (
-                prepare_pending_interpretation_event_drafts_for_state,
-                unsurfaceable_pending_interpretation_review_sites,
-            )
+            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
 
             try:
-                unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(imported_state)
+                unsurfaceable_sites = await _review_debt_sites_off_loop(
+                    imported_state,
+                    request=request,
+                    timeout_detail=_IMPORT_REVIEW_DEBT_TIMEOUT_DETAIL,
+                )
             except (InvariantError, KeyError, TypeError, ValueError) as exc:
                 # These remain invariant failures for internally persisted state.
                 # At this route the state is untrusted YAML, so reject statically
@@ -968,13 +1006,14 @@ async def seed_state_for_e2e(
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(seeded_state)
-            from elspeth.web.composer.service import (
-                prepare_pending_interpretation_event_drafts_for_state,
-                unsurfaceable_pending_interpretation_review_sites,
-            )
+            from elspeth.web.composer.service import prepare_pending_interpretation_event_drafts_for_state
 
             try:
-                unsurfaceable_sites = unsurfaceable_pending_interpretation_review_sites(seeded_state)
+                unsurfaceable_sites = await _review_debt_sites_off_loop(
+                    seeded_state,
+                    request=request,
+                    timeout_detail=_SEED_REVIEW_DEBT_TIMEOUT_DETAIL,
+                )
             except (InvariantError, KeyError, TypeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
             if unsurfaceable_sites:

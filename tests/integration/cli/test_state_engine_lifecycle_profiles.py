@@ -668,7 +668,6 @@ transforms:
     factory.run_coordination.acquire_run_leadership(
         run_id=run_id,
         worker_id=f"worker:{run_id}:exceptional-leader",
-        now=datetime.now(UTC),
         window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
 

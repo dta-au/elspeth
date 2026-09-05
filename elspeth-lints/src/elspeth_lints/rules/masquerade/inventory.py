@@ -46,6 +46,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from elspeth_lints.core.ast_dump import stable_ast_dump
 from elspeth_lints.core.ast_walker import iter_own_scope
 from elspeth_lints.core.boundary_aliases import (
     argument_names,
@@ -2020,7 +2021,7 @@ def _probe_shape_fingerprint(kind: SiteKind, node: ast.stmt | ast.expr) -> str:
             args=node.args,
             keywords=node.keywords,
         )
-    shape = ast.dump(normalized, annotate_fields=True, include_attributes=False)
+    shape = stable_ast_dump(normalized)
     return hashlib.sha256(f"{kind}|{shape}".encode()).hexdigest()
 
 

@@ -3629,12 +3629,10 @@ def join(
             raise
         finally:
             if not follower_run_entered:
-                from datetime import UTC, datetime
-
                 from elspeth.engine._best_effort import best_effort
 
                 with best_effort("Follower depart after startup failure", run_id=run_id, worker_id=worker_id):
-                    factory.run_coordination.depart_worker(worker_id=worker_id, now=datetime.now(UTC))
+                    factory.run_coordination.depart_worker(worker_id=worker_id)
 
             # Mirror the leader's teardown via the canonical cleanup_plugins:
             # on_complete then close, each hook individually guarded so one

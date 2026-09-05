@@ -329,6 +329,16 @@ revision mode only; facts §2.3), `minReplicas: 2`, `maxReplicas: 4`,
 startup probe `/api/health` 15 s × 10, liveness `/api/health` 30 s × 3,
 readiness `/api/ready` 10 s × 3 and `terminationGracePeriodSeconds: 60`.
 
+Advisory-lock classes are internal to the PostgreSQL connections the replicas
+hold; nothing in the bundle or the schema names them. The blob
+custody lock has its own class (`ELSPETH_BLOB_CUSTODY_LOCK_CLASSID`) so that
+a session-operation lease renew on one replica never waits behind another
+replica's blob write to the NFS share. No operator action attaches to it.
+Replicas running different versions serialise custody on different keys, so
+a rollout that overlaps old and new replicas is outside the contract: the
+proof of rollout above (exactly one active revision carrying the candidate
+digest) is what makes the custody serialisation claim hold.
+
 > **LIVE:** the public-behaviour pass (Playwright tutorial through the
 > ingress, a fork and a guided convert, the two seams Phase 3 trialled) and
 > the WebSocket behaviour at the 240 s request timeout.
@@ -512,6 +522,32 @@ az_capture monitor metrics list --resource "$POSTGRES_RESOURCE_ID" \
 
 ---
 
+## Testcontainer run
+
+The PostgreSQL contention proofs (`pytest tests/ -m testcontainer -n 0
+--junitxml=testcontainer-junit.xml`, the exact selection CI's required
+testcontainer job runs) are recorded as the `testcontainer-run` receipt:
+selection, pytest exit code and the junit id counts, bound to the candidate
+sha. The shared gate (`testcontainer_run_gate`, provider `azure`) REFUSES the
+bundle unless exactly one passing run is on record — absence is
+`testcontainer_run_missing`, a failing run `testcontainer_run_failed`, two
+passing runs `testcontainer_run_ambiguous`; a failed run is kept as evidence
+and superseded by a later passing one, never deleted. The suites provision
+their own PostgreSQL through testcontainers on the acceptance host (no
+external-DSN seam exists in the tree), so Docker must be available there.
+
+```bash
+exit_status=0
+rm -f testcontainer-junit.xml
+uv run --frozen pytest tests/ -m testcontainer -n 0 --junitxml=testcontainer-junit.xml || exit_status=$?
+uv run --frozen python -m elspeth.web._acceptance_common.testcontainer_run \
+  --provider azure --junit testcontainer-junit.xml --exit-code "$exit_status" \
+  --candidate-sha "$CANDIDATE_SHA" --scenario-id A >"$EVIDENCE_DIR/testcontainer-run.json"
+rm -f testcontainer-junit.xml
+```
+
+---
+
 ## Evidence
 
 Log Analytics is the environment's log destination (`log-analytics`,
@@ -581,7 +617,9 @@ The facade validates the bundle of receipts (`verify-doctor-job`,
 `verify-storage-job`, `verify-blob-managed-identity`, `verify-log-analytics`,
 `verify-connection-budget`, `compatibility-record`, `revision-rollout`,
 `replica-fence-conflict`, `replica-run-start`, `replica-lease-takeover`,
-`replica-progress`, `resource-graph-cleanup`) and writes the sanitized
+`replica-progress`, `resource-graph-cleanup`, `testcontainer-run` — the last
+through the shared gate, which refuses the bundle without exactly one passing
+run) and writes the sanitized
 receipt to `docs/operator/evidence/azure-container-apps/0.8.0.json`. That
 receipt, the support-claim flip in
 [Deployment Platforms](../reference/deployment-platforms.md) and the CHANGELOG

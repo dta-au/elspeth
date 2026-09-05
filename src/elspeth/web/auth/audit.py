@@ -88,8 +88,9 @@ class AuthAuditWriter(Protocol):
         identity_id: str | None = None,
     ) -> None: ...
 
-    # The one member with no ``request``: a self-admitting deployment
-    # activates inside the login worker, where there is none to read.
+    # Two members with no ``request``: a self-admitting deployment activates
+    # inside the login worker, where there is none to read, and a credential
+    # deletion retires its identity from whichever surface deleted it.
     def record_identity_admitted(
         self,
         *,
@@ -100,6 +101,16 @@ class AuthAuditWriter(Protocol):
         storage_bytes: int | None,
     ) -> None: ...
 
+    def record_identity_retired(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        retired_subject: str,
+        reason: str,
+    ) -> None: ...
+
 
 class AuthAuditOperation(StrEnum):
     LOGIN_SUCCESS_AND_TOKEN_ISSUED = "login_success_and_token_issued"
@@ -107,6 +118,7 @@ class AuthAuditOperation(StrEnum):
     TOKEN_ISSUED = "token_issued"
     AUTH_FAILURE = "auth_failure"
     LOGIN_FAILURE = "login_failure"
+    IDENTITY_RETIRED = "identity_retired"
 
 
 def _bounded_text(value: str | None, *, max_length: int = MAX_AUTH_AUDIT_TEXT_LENGTH) -> str | None:
@@ -469,5 +481,45 @@ class AuthAuditRecorder:
                     "tokens_per_day": tokens_per_day,
                     "storage_bytes": storage_bytes,
                     "source": "container_defaults",
+                },
+            )
+
+    def record_identity_retired(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        retired_subject: str,
+        reason: str,
+    ) -> None:
+        """Write the ``identity_disabled`` row for a credential-deletion retirement.
+
+        A retirement IS a disable -- the row's ``access_state`` becomes
+        ``disabled`` -- plus a rewrite of the ``(provider, subject)`` binding
+        so no login can reach the row again; the event type is the disable's
+        and the metadata carries what distinguishes it. Not request-bound: the
+        deleting surface (the provider's ``delete_user`` or the ``users
+        remove`` command) is the OPERATOR and has no request to read, so no
+        request fields are invented. Runs inside the authority's transaction,
+        so a retirement this trail cannot hold does not commit.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_RETIRED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_disabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "operator",
+                    "cause": "credential_deleted",
+                    "retired_subject": _bounded_text(retired_subject),
+                    "reason": _bounded_text(reason),
                 },
             )

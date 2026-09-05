@@ -13,7 +13,7 @@ import pytest
 import structlog
 from sqlalchemy import insert, text
 
-from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -163,8 +163,8 @@ def test_shared_sqlite_session_lock_is_reused_by_session_service(service) -> Non
     assert service._sqlite_lock_for_session("shared-session") is sqlite_session_mutex(service._engine, "shared-session")
 
 
-def test_postgres_session_advisory_lock_spans_transactions_and_unlocks() -> None:
-    from elspeth.web.sessions.locking import postgres_session_advisory_lock
+def test_postgres_blob_custody_advisory_lock_spans_transactions_and_unlocks() -> None:
+    from elspeth.web.sessions.locking import postgres_blob_custody_advisory_lock
 
     calls: list[tuple[str, tuple[object, ...]]] = []
 
@@ -184,19 +184,19 @@ def test_postgres_session_advisory_lock_spans_transactions_and_unlocks() -> None
             return False
 
     connection = _Connection()
-    with postgres_session_advisory_lock(connection, "session-across-phases"):
+    with postgres_blob_custody_advisory_lock(connection, "session-across-phases"):
         calls.append(("PHASES", ()))
 
     assert calls == [
         (
             "SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, "session-across-phases"),
+            (ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, "session-across-phases"),
         ),
         ("COMMIT", ()),
         ("PHASES", ()),
         (
             "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, "session-across-phases"),
+            (ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, "session-across-phases"),
         ),
         ("COMMIT", ()),
     ]

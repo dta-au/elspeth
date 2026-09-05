@@ -27,6 +27,7 @@ from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_MIME_BY_FORMAT,
     binary_document_signature_matches,
 )
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 
 ImageFormat = Literal["jpeg", "png"]
@@ -114,7 +115,11 @@ class ChatMessage:
             raise ValueError(f"ChatMessage.role invalid: {self.role!r}")
         if isinstance(self.content, str):
             return
-        if not isinstance(self.content, tuple) or not self.content:
+        # Freeze unconditionally rather than gate on the carrier type: a list
+        # of parts becomes the declared tuple, a tuple of parts is kept by
+        # identity, and anything else is refused by the exact-type check.
+        freeze_fields(self, "content")
+        if type(self.content) is not tuple or not self.content:
             raise ValueError("ChatMessage.content must be str or a non-empty tuple of parts")
         for part in self.content:
             if not isinstance(part, (TextPart, ImagePart)):

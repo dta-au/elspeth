@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._acceptance_common import testcontainer_run
 from elspeth.web._aws_ecs_acceptance import evidence as evidence_owner
 from elspeth.web._aws_ecs_acceptance import gate_ledger as gate_ledger_owner
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
@@ -184,17 +185,60 @@ def _bind_gate_ledger_candidate(ledger_path: Path) -> None:
         )
 
 
-def _fill_gate_ledger_prefix(ledger_path: Path) -> None:
+def _store_testcontainer_run_receipt(manifest_path: Path, *, exit_code: int = 0, junit_salt: bytes = b"") -> str:
+    """Store one testcontainer-run receipt for the fixture candidate; returns its receipt sha256."""
+    outcomes = ["", '<failure message="m"/>'] if exit_code else ["", ""]
+    cases = "".join(f'<testcase classname="t" name="test_{index}">{child}</testcase>' for index, child in enumerate(outcomes))
+    junit = f'<testsuites><testsuite name="pytest">{cases}</testsuite></testsuites>'.encode() + junit_salt
+    record = testcontainer_run.parse_junit_report(junit)
+    receipt = testcontainer_run.build_testcontainer_run_receipt(
+        provider="aws",
+        candidate_sha="c" * 40,
+        scenario_id="A",
+        exit_code=exit_code,
+        record=record,
+        recorded_at=datetime(2026, 7, 14, 1, 1, 45, tzinfo=UTC),
+    )
+    return acceptance.receipt_store(
+        manifest_path,
+        scenario_id="A",
+        kind=testcontainer_run.TESTCONTAINER_RUN_RECEIPT_KIND,
+        subject_id=record.junit_sha256,
+        receipt_bytes=json.dumps(receipt).encode(),
+        now=lambda: datetime(2026, 7, 14, 1, 1, 50, tzinfo=UTC),
+    )
+
+
+def _fill_gate_ledger_prefix(
+    ledger_path: Path,
+    *,
+    tests_receipt_hash: str | None = None,
+    store_testcontainer_run: bool = True,
+) -> None:
+    """Fill the success stages.
+
+    The ``tests`` stage is bound to a testcontainer run: ``tests_receipt_hash``
+    names a receipt already in the sibling ``control.json`` manifest's store;
+    otherwise, when that manifest exists and ``store_testcontainer_run`` holds,
+    one passing run is stored and bound (the shape every export needs). The
+    refusal tests opt out to prove the export demands it.
+    """
     _bind_gate_ledger_candidate(ledger_path)
+    manifest_path = ledger_path.parent / "control.json"
+    if tests_receipt_hash is None and store_testcontainer_run and manifest_path.exists():
+        tests_receipt_hash = _store_testcontainer_run_receipt(manifest_path)
     existing = {record["check_id"] for record in json.loads(ledger_path.read_text())["records"]}
     for check_id in acceptance._SUCCESS_GATE_CHECK_ORDER:
         if check_id in existing:
             continue
+        receipt_hash = hashlib.sha256(check_id.encode()).hexdigest()
+        if check_id == "tests" and tests_receipt_hash is not None:
+            receipt_hash = tests_receipt_hash
         acceptance.gate_ledger_record(
             ledger_path,
             check_id=check_id,
             exit_status=0,
-            receipt_hash=hashlib.sha256(check_id.encode()).hexdigest(),
+            receipt_hash=receipt_hash,
             candidate_sha="c" * 40,
             now=lambda: datetime(2026, 7, 14, 1, 2, tzinfo=UTC),
         )
@@ -302,6 +346,79 @@ def test_create_evidence_export_receipt_derives_current_manifest_and_ledger_hash
         evidence_export_receipt=str(output_path),
         now=lambda: datetime(2026, 7, 14, 1, 2, 31, tzinfo=UTC),
     )
+
+
+def _export(manifest_path: Path, ledger_path: Path, output_path: Path) -> dict[str, object]:
+    return acceptance.create_evidence_export_receipt(
+        manifest_path,
+        ledger_path=ledger_path,
+        output_path=output_path,
+        artifact_count=10,
+        now=lambda: datetime(2026, 7, 14, 1, 2, 30, tzinfo=UTC),
+    )
+
+
+def test_evidence_export_refuses_a_candidate_without_a_testcontainer_run(tmp_path: Path) -> None:
+    """The kind is REQUIRED: absence of the run is a named refusal, never a pass (6b-4 option (b))."""
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    _fill_gate_ledger_prefix(ledger_path, store_testcontainer_run=False)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="testcontainer_run_missing"):
+        _export(manifest_path, ledger_path, tmp_path / "export.json")
+    assert not (tmp_path / "export.json").exists()
+
+
+def test_evidence_export_refuses_a_failed_testcontainer_run(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    failed_hash = _store_testcontainer_run_receipt(manifest_path, exit_code=1)
+    _fill_gate_ledger_prefix(ledger_path, tests_receipt_hash=failed_hash)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="testcontainer_run_failed"):
+        _export(manifest_path, ledger_path, tmp_path / "export.json")
+
+
+def test_evidence_export_refuses_a_tests_stage_not_bound_to_the_passing_run(tmp_path: Path) -> None:
+    """The ledger's ``tests`` stage is the run-level slot: its receipt hash must be the passing run's."""
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    _store_testcontainer_run_receipt(manifest_path)
+    _fill_gate_ledger_prefix(ledger_path, store_testcontainer_run=False)  # tests stage carries sha256("tests"), not the receipt
+    with pytest.raises(acceptance.AcceptanceCheckError, match="testcontainer_run_ledger"):
+        _export(manifest_path, ledger_path, tmp_path / "export.json")
+
+
+def test_evidence_export_refuses_two_passing_testcontainer_runs(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    first = _store_testcontainer_run_receipt(manifest_path)
+    second = _store_testcontainer_run_receipt(manifest_path, junit_salt=b"\n")
+    assert first != second
+    _fill_gate_ledger_prefix(ledger_path, tests_receipt_hash=first)
+    with pytest.raises(acceptance.AcceptanceCheckError, match="testcontainer_run_ambiguous"):
+        _export(manifest_path, ledger_path, tmp_path / "export.json")
+
+
+def test_evidence_export_accepts_a_passing_run_recorded_after_a_failed_one(tmp_path: Path) -> None:
+    """A failed run stays in the store as evidence and is superseded, not erased, by the passing one."""
+    manifest_path = tmp_path / "control.json"
+    manifest = _init_control_manifest(manifest_path)
+    ledger_path = Path(str(manifest["gate_ledger_path"]))
+    _gate_ledger_init(ledger_path)
+    _store_testcontainer_run_receipt(manifest_path, exit_code=1)
+    passing = _store_testcontainer_run_receipt(manifest_path)
+    _fill_gate_ledger_prefix(ledger_path, tests_receipt_hash=passing)
+    receipt = _export(manifest_path, ledger_path, tmp_path / "export.json")
+    assert receipt["verified"] is True
+    kinds = [row["kind"] for row in json.loads(manifest_path.read_text())["evidence"]["receipts"]]
+    assert kinds.count("testcontainer-run") == 2
 
 
 def test_final_evidence_export_refreshes_receipts_created_during_cleanup(tmp_path: Path) -> None:

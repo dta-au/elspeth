@@ -15,9 +15,18 @@
 // Playwright invocation:
 //   cd src/elspeth/web/frontend && npx playwright test tests/e2e/catalog-reshape.spec.ts
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { authedContext, createSession, deleteSession, tokenFromStorageState } from "./helpers/api";
 import { ComposerPage } from "./page-objects/composer-page";
+
+/** The default FilterChipStrip (a0d256676) renders behavioural audit flags,
+ *  not capability tags. "quarantines bad rows" is the flag the CSV source
+ *  declares, so toggling it narrows the Sources tab. */
+function auditChip(page: Page) {
+  return page
+    .getByRole("group", { name: "Catalog filters" })
+    .getByRole("button", { name: /^quarantines bad rows$/i });
+}
 
 test.describe("catalog-reshape — Phase 7 demo path", () => {
   test("1: Open catalog drawer via Ctrl+Shift+P", async ({ page }) => {
@@ -41,10 +50,13 @@ test.describe("catalog-reshape — Phase 7 demo path", () => {
     const composer = new ComposerPage(page);
     await composer.goto();
     await page.keyboard.press("Control+Shift+P");
-    // Wait for plugins to load.
-    await expect(page.getByRole("button", { name: /^csv$/i })).toBeVisible();
+    // Wait for plugins to load, then click a filter chip. Since a0d256676 the
+    // strip shows behavioural (audit) flags by default and capability-tag
+    // chips such as "csv" only with show_advanced, so the demo path narrows
+    // on the audit chip the CSV source carries.
+    await expect(page.getByRole("article", { name: "CSV" })).toBeVisible();
     const initialCount = await page.locator(".plugin-card").count();
-    await page.getByRole("button", { name: /^csv$/i }).click();
+    await auditChip(page).click();
     const filteredCount = await page.locator(".plugin-card").count();
     expect(filteredCount).toBeLessThan(initialCount);
   });
@@ -93,8 +105,8 @@ test.describe("catalog-reshape — Phase 7 demo path", () => {
     const composer = new ComposerPage(page);
     await composer.goto();
     await page.keyboard.press("Control+Shift+P");
-    await expect(page.getByRole("button", { name: /^csv$/i })).toBeVisible();
-    await page.getByRole("button", { name: /^csv$/i }).click();
+    await expect(page.getByRole("article", { name: "CSV" })).toBeVisible();
+    await auditChip(page).click();
     const filteredCount = await page.locator(".plugin-card").count();
     await page.getByRole("button", { name: /clear filters/i }).click();
     const restoredCount = await page.locator(".plugin-card").count();

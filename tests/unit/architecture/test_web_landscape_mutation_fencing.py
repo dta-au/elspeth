@@ -28,6 +28,8 @@ from pathlib import Path
 
 from tests.helpers.tree_gate import iter_gate_files
 
+from elspeth_lints.core.ast_dump import stable_ast_dump
+
 
 @dataclass(frozen=True, slots=True)
 class MutationApi:
@@ -377,7 +379,7 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
 _EXPECTED_DML_COUNT = 139
-_EXPECTED_DML_INVENTORY_SHA256 = "36fe6994523f2119c2da6b76b18337b7ae931da3f1b8b9385d5417dc6cd536cc"
+_EXPECTED_DML_INVENTORY_SHA256 = "ce9dad8ca36031b58d0b7d439837f9e70f293049bcba209fb63864840645a22b"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -1083,7 +1085,7 @@ def _semantic_dml_boundary(node: ast.AST) -> ast.AST:
 
 
 def _fingerprint(node: ast.AST) -> str:
-    normalized = ast.dump(_semantic_dml_boundary(node), annotate_fields=True, include_attributes=False)
+    normalized = stable_ast_dump(_semantic_dml_boundary(node))
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
@@ -1163,7 +1165,7 @@ def _normalized_receiver(node: ast.AST) -> str:
     dotted = _dotted_name(node)
     if dotted is not None:
         return dotted
-    return ast.dump(node, annotate_fields=True, include_attributes=False)
+    return stable_ast_dump(node)
 
 
 _LANDSCAPE_RECEIVER_MARKERS = frozenset(
@@ -1645,11 +1647,7 @@ def _run_id_argument(
 
 
 def _is_exact_token_run_id(run_id: ast.expr, token: ast.expr) -> bool:
-    return (
-        isinstance(run_id, ast.Attribute)
-        and run_id.attr == "run_id"
-        and ast.dump(run_id.value, include_attributes=False) == ast.dump(token, include_attributes=False)
-    )
+    return isinstance(run_id, ast.Attribute) and run_id.attr == "run_id" and stable_ast_dump(run_id.value) == stable_ast_dump(token)
 
 
 def _caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
@@ -1764,11 +1762,7 @@ def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | No
 
 
 def _exact_token_subject(node: ast.expr, token: ast.expr, field: str) -> bool:
-    return (
-        isinstance(node, ast.Attribute)
-        and node.attr == field
-        and ast.dump(node.value, include_attributes=False) == ast.dump(token, include_attributes=False)
-    )
+    return isinstance(node, ast.Attribute) and node.attr == field and stable_ast_dump(node.value) == stable_ast_dump(token)
 
 
 def _coordination_subject_violation(
