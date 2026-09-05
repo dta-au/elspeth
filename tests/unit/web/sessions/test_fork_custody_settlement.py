@@ -34,6 +34,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, GuidedForkSettle
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl, _value_references_parent_blob
+from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
 from tests.unit.web.sessions.test_guided_operation_fork_service import _claim_fork, _service_for
@@ -90,7 +91,10 @@ async def _stage_copy_rewrite(
     # parent authority pair (``routes/sessions.py`` line ~983), not from the
     # session-operation context that rides beside it.
     guided_fence = parent_authority.guided_fence
-    source_blobs = {entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id) for entry in staged.blob_plan}
+    source_blobs = {
+        entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id, session_operation_context=parent_authority.parent_context)
+        for entry in staged.blob_plan
+    }
     blob_map = await blob_service.copy_blobs_for_fork(
         parent_id,
         staged.session.id,
@@ -149,7 +153,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
     service = _service_for(engine)
     blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
+    blob = await create_blob_under_fence(service, blob_service, parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -230,7 +234,7 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
     service = _service_for(engine)
     blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
+    blob = await create_blob_under_fence(service, blob_service, parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -318,7 +322,7 @@ async def test_guided_native_fork_child_serves_no_raw_storage_path(tmp_path: Pat
     _wire_state_projection(app)
     parent = await service.create_session("alice", "Parent", "local")
     root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-    parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+    parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
     stable_id = str(uuid4())
     # Reviewed snapshot RETAINS blob_ref; the committed source does not.
     snapshot_options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
@@ -426,11 +430,11 @@ async def test_unrewritable_parent_custody_refuses_the_fork_before_any_child_row
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
-    ready_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
-    pending_blob = await blob_service.create_blob(parent.id, "late.csv", b"id\n2\n", "text/csv")
+    ready_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    pending_blob = await create_blob_under_fence(service, blob_service, parent.id, "late.csv", b"id\n2\n", "text/csv")
     with service._engine.begin() as conn:
         conn.execute(update(blobs_table).where(blobs_table.c.id == str(pending_blob.id)).values(status="pending"))
-    assert (await blob_service.get_blob(pending_blob.id)).status == "pending"
+    assert (await get_blob_under_fence(service, blob_service, parent.id, pending_blob.id)).status == "pending"
     composer_meta = {
         "unknown_meta_value": {"some_future_subsystem": {"remembered_blob": str(pending_blob.id)}},
         "top_level_meta_key": {str(pending_blob.id): {"note": "x"}},
@@ -526,7 +530,7 @@ async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_reta
     service = _service_for(engine)
     blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
+    blob = await create_blob_under_fence(service, blob_service, parent.id, "cases.csv", b"a,b\n1,2\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -578,7 +582,7 @@ async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_
     service = _service_for(engine)
     blob_service = BlobServiceImpl(engine, tmp_path / "blobs")
     parent = await service.create_session("alice", "Parent", "local")
-    pending_blob = await blob_service.create_blob(parent.id, "late.csv", b"a\n1\n", "text/csv")
+    pending_blob = await create_blob_under_fence(service, blob_service, parent.id, "late.csv", b"a\n1\n", "text/csv")
     with engine.begin() as conn:
         conn.execute(update(blobs_table).where(blobs_table.c.id == str(pending_blob.id)).values(status="pending"))
     state = await service.save_composition_state(
@@ -623,7 +627,7 @@ async def test_forked_child_messages_never_serve_the_parent_blob_plan_row(tmp_pa
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id\n1\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(

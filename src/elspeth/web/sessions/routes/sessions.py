@@ -975,7 +975,13 @@ def register_session_routes(router: APIRouter) -> None:
                         session_operation_context=parent_operation_lease.context,
                     )
 
-                source_blobs = {entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id) for entry in staged.blob_plan}
+                source_blobs = {
+                    entry.source_blob_id: await blob_service.get_blob(
+                        entry.source_blob_id,
+                        session_operation_context=active_parent_lease.context,
+                    )
+                    for entry in staged.blob_plan
+                }
                 blob_map = await blob_service.copy_blobs_for_fork(
                     session_id,
                     staged.session.id,

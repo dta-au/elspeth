@@ -30,6 +30,7 @@ import pytest
 
 from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import source_inspection
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
@@ -42,6 +43,7 @@ from elspeth.web.composer.source_inspection import (
     inspect_csv_source_content,
     inspect_selected_ready_session_blob,
 )
+from tests.helpers.session_fences import make_blob_read_context
 
 
 class TestDeclaredFieldIsRequiredBoundary:
@@ -731,7 +733,8 @@ class _NoListingBlobService:
         self._record = record
         self._content = content
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+        assert type(session_operation_context) is SessionOperationContext
         if blob_id != self._record.id:
             raise BlobNotFoundError(str(blob_id))
         return self._record
@@ -740,7 +743,14 @@ class _NoListingBlobService:
         del session_id, limit, offset
         raise AssertionError("explicit selection must not list session blobs")
 
-    async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        assert type(session_operation_context) is SessionOperationContext
         assert blob_id == self._record.id
         verified_hash = hashlib.sha256(self._content).hexdigest()
         return self._content[:prefix_bytes], verified_hash, len(self._content)
@@ -767,6 +777,7 @@ class TestExplicitSelectionResolvesDirectly:
                 cast(Any, service),
                 session_id,
                 selected_blob_id=record.id,
+                session_operation_context=make_blob_read_context(session_id),
             )
         )
 
@@ -788,6 +799,7 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
+                    session_operation_context=make_blob_read_context(session_id),
                 )
             )
 
@@ -807,6 +819,7 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=record.id,
+                    session_operation_context=make_blob_read_context(session_id),
                 )
             )
 
@@ -821,6 +834,7 @@ class TestExplicitSelectionResolvesDirectly:
                     cast(Any, service),
                     session_id,
                     selected_blob_id=uuid4(),
+                    session_operation_context=make_blob_read_context(session_id),
                 )
             )
 
@@ -846,14 +860,22 @@ class TestExplicitSelectionResolvesDirectly:
         )
 
         class _HugeBlobService:
-            async def get_blob(self, blob_id: UUID) -> BlobRecord:
+            async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+                assert type(session_operation_context) is SessionOperationContext
                 assert blob_id == record.id
                 return record
 
             async def list_blobs(self, *args: object, **kwargs: object) -> list[BlobRecord]:
                 raise AssertionError("explicit selection must not list session blobs")
 
-            async def read_blob_content_prefix_verified(self, blob_id: UUID, *, prefix_bytes: int) -> tuple[bytes, str, int]:
+            async def read_blob_content_prefix_verified(
+                self,
+                blob_id: UUID,
+                *,
+                prefix_bytes: int,
+                session_operation_context: SessionOperationContext,
+            ) -> tuple[bytes, str, int]:
+                assert type(session_operation_context) is SessionOperationContext
                 assert blob_id == record.id
                 # A real streaming store hashes chunk-by-chunk; this fake
                 # need only prove the module is satisfied by a small prefix
@@ -866,6 +888,7 @@ class TestExplicitSelectionResolvesDirectly:
                 cast(Any, _HugeBlobService()),
                 session_id,
                 selected_blob_id=record.id,
+                session_operation_context=make_blob_read_context(session_id),
             )
         )
 
