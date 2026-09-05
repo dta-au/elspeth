@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   OidcEvidenceError,
   buildOidcEvidence,
-  validateAccessToken,
   validateAuthConfig,
+  validateAuthorizationRequest,
+  validateCallbackLanding,
+  validateSessionToken,
   writeOidcBearerHandoff,
   writeOidcEvidence,
 } from "./oidc-evidence";
@@ -31,93 +33,164 @@ function base64Url(value: object): string {
 }
 
 function token(claims: Record<string, unknown>): string {
-  return `${base64Url({ alg: "none", typ: "JWT" })}.${base64Url(claims)}.signature`;
+  return `${base64Url({ alg: "HS256", typ: "JWT" })}.${base64Url(claims)}.signature`;
 }
 
 const expected = {
-  issuer: "https://cognito-idp.ap-southeast-2.amazonaws.com/pool",
   audience: "client-id",
   authorizationOrigin: "https://acceptance.auth.ap-southeast-2.amazoncognito.com",
+  stagingOrigin: "https://elspeth.acceptance.example",
 } as const;
 
-describe("OIDC config and access-token validation", () => {
-  it.each(["aud", "client_id"] as const)("accepts the closed %s audience lane", (audienceClaim) => {
-    const claims = validateAccessToken(
-      token({
-        iss: expected.issuer,
-        sub: "subject-123",
-        exp: 2_000_000_000,
-        token_use: "access",
-        [audienceClaim]: expected.audience,
-      }),
-      { ...expected, audienceClaim },
-      1_900_000_000,
-    );
+const CHALLENGE = "c".repeat(43);
+const HANDOFF = "h".repeat(43);
 
-    expect(claims.subjectSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(JSON.stringify(claims)).not.toContain("subject-123");
-  });
+function sessionClaims(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    iss: "elspeth",
+    aud: expected.stagingOrigin,
+    provider: "oidc",
+    sub: "identity-0001",
+    username: "person",
+    jti: "token-0001",
+    iat: 1_900_000_000,
+    exp: 2_000_000_000,
+    ...overrides,
+  };
+}
 
-  it("requires exact OIDC configuration and same-origin HTTPS endpoints", () => {
+function authorizationUrl(overrides: Record<string, string | null> = {}, origin: string = expected.authorizationOrigin): string {
+  const params: Record<string, string | null> = {
+    response_type: "code",
+    client_id: expected.audience,
+    redirect_uri: `${expected.stagingOrigin}/api/auth/sso/callback`,
+    scope: "openid profile email",
+    state: "s".repeat(43),
+    nonce: "n".repeat(43),
+    code_challenge: CHALLENGE,
+    code_challenge_method: "S256",
+    ...overrides,
+  };
+  const url = new URL(`${origin}/oauth2/authorize`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null) url.searchParams.set(key, value);
+  }
+  return url.toString();
+}
+
+describe("auth config", () => {
+  it("accepts a closed SSO deployment whose start URL is this deployment's own", () => {
     expect(
       validateAuthConfig(
-        {
-          provider: "oidc",
-          oidc_issuer: expected.issuer,
-          oidc_client_id: expected.audience,
-          authorization_endpoint: `${expected.authorizationOrigin}/oauth2/authorize`,
-          token_endpoint: `${expected.authorizationOrigin}/oauth2/token`,
-        },
+        { provider: "oidc", registration_mode: "closed", sso_start_url: `${expected.stagingOrigin}/api/auth/sso/start` },
         expected,
       ),
-    ).toEqual({
-      issuer: expected.issuer,
-      audience: expected.audience,
-      authorizationOrigin: expected.authorizationOrigin,
-      tokenEndpoint: `${expected.authorizationOrigin}/oauth2/token`,
-    });
+    ).toEqual({ ssoStartUrl: `${expected.stagingOrigin}/api/auth/sso/start` });
   });
 
   it.each([
-    ["wrong issuer", { iss: "https://wrong.invalid", sub: "subject", exp: 2_000_000_000, aud: expected.audience }],
-    ["wrong audience", { iss: expected.issuer, sub: "subject", exp: 2_000_000_000, aud: "wrong" }],
-    ["missing subject", { iss: expected.issuer, exp: 2_000_000_000, aud: expected.audience }],
-    ["blank subject", { iss: expected.issuer, sub: "", exp: 2_000_000_000, aud: expected.audience }],
-    ["expired", { iss: expected.issuer, sub: "subject", exp: 1_800_000_000, aud: expected.audience }],
+    ["a local provider", { provider: "local", registration_mode: "closed", sso_start_url: null }],
+    ["open registration", { provider: "oidc", registration_mode: "open", sso_start_url: `${expected.stagingOrigin}/api/auth/sso/start` }],
+    ["an unwired deployment", { provider: "oidc", registration_mode: "closed", sso_start_url: null }],
+    ["a start URL on another origin", { provider: "oidc", registration_mode: "closed", sso_start_url: "https://evil.invalid/api/auth/sso/start" }],
+    [
+      "the old browser-client fields",
+      {
+        provider: "oidc",
+        registration_mode: "closed",
+        sso_start_url: `${expected.stagingOrigin}/api/auth/sso/start`,
+        oidc_client_id: expected.audience,
+        authorization_endpoint: `${expected.authorizationOrigin}/oauth2/authorize`,
+      },
+    ],
+  ])("refuses %s", (_label, config) => {
+    expect(() => validateAuthConfig(config, expected)).toThrow("oidc_auth_config");
+  });
+});
+
+describe("authorization request", () => {
+  it("accepts the backend's confidential-client request with S256, state, nonce and the backend callback", () => {
+    expect(() => validateAuthorizationRequest(authorizationUrl(), expected)).not.toThrow();
+  });
+
+  it.each([
+    ["the wrong origin", authorizationUrl({}, "https://evil.invalid")],
+    ["an implicit flow", authorizationUrl({ response_type: "token" })],
+    ["another client", authorizationUrl({ client_id: "someone-else" })],
+    ["the SPA as redirect target", authorizationUrl({ redirect_uri: `${expected.stagingOrigin}/` })],
+    ["a redirect to another origin", authorizationUrl({ redirect_uri: "https://evil.invalid/api/auth/sso/callback" })],
+    ["plain PKCE", authorizationUrl({ code_challenge_method: "plain" })],
+    ["a malformed challenge", authorizationUrl({ code_challenge: "short" })],
+    ["no state", authorizationUrl({ state: null })],
+    ["no nonce", authorizationUrl({ nonce: null })],
+    ["no openid scope", authorizationUrl({ scope: "profile email" })],
+    ["a client secret on the query", authorizationUrl({ client_secret: "leaked" })],
+    ["a verifier on the query", authorizationUrl({ code_verifier: "leaked" })],
+    ["a duplicated client_id", `${authorizationUrl()}&client_id=${expected.audience}`],
+  ])("refuses %s with a static error", (_label, url) => {
+    expect(() => validateAuthorizationRequest(url, expected)).toThrow("oidc_authorization_request");
+    try {
+      validateAuthorizationRequest(url, expected);
+    } catch (error) {
+      expect(String(error)).not.toMatch(/leaked|someone-else|evil/);
+    }
+  });
+});
+
+describe("callback landing", () => {
+  it("accepts exactly one handoff code in the fragment on this deployment's SPA", () => {
+    expect(() => validateCallbackLanding(`${expected.stagingOrigin}/#/auth/callback?code=${HANDOFF}`, expected)).not.toThrow();
+  });
+
+  it.each([
+    ["a code in the query", `${expected.stagingOrigin}/?code=${HANDOFF}#/auth/callback?code=${HANDOFF}`],
+    ["a token in the fragment", `${expected.stagingOrigin}/#/auth/callback?access_token=leaked`],
+    ["a code and a state", `${expected.stagingOrigin}/#/auth/callback?code=${HANDOFF}&state=x`],
+    ["two codes", `${expected.stagingOrigin}/#/auth/callback?code=${HANDOFF}&code=${HANDOFF}`],
+    ["an error category", `${expected.stagingOrigin}/#/auth/callback?error=sso_idp_error`],
+    ["a code outside the alphabet", `${expected.stagingOrigin}/#/auth/callback?code=${HANDOFF}%2F`],
+    ["a code beyond the bound", `${expected.stagingOrigin}/#/auth/callback?code=${"h".repeat(129)}`],
+    ["another origin", `https://evil.invalid/#/auth/callback?code=${HANDOFF}`],
+    ["another path", `${expected.stagingOrigin}/app#/auth/callback?code=${HANDOFF}`],
+    ["the old query callback", `${expected.stagingOrigin}/?code=${HANDOFF}&state=x`],
+  ])("refuses %s", (_label, url) => {
+    expect(() => validateCallbackLanding(url, expected)).toThrow("oidc_callback_landing");
+  });
+});
+
+describe("session token", () => {
+  it("accepts ELSPETH's session token for this deployment issued to an SSO identity, hashing the subject", () => {
+    const claims = validateSessionToken(token(sessionClaims()), expected, 1_950_000_000);
+    expect(claims.subjectSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(claims)).not.toContain("identity-0001");
+  });
+
+  it.each([
+    ["an IdP-issued token", sessionClaims({ iss: "https://cognito-idp.ap-southeast-2.amazonaws.com/pool" })],
+    ["another deployment's audience", sessionClaims({ aud: "https://other.example" })],
+    ["the local-only audience", sessionClaims({ aud: "elspeth-local" })],
+    ["a local-provider token", sessionClaims({ provider: "local" })],
+    ["no provider", sessionClaims({ provider: undefined })],
+    ["no subject", sessionClaims({ sub: undefined })],
+    ["a blank subject", sessionClaims({ sub: " " })],
+    ["no token id", sessionClaims({ jti: undefined })],
+    ["an expired token", sessionClaims({ exp: 1_800_000_000 })],
   ])("rejects %s with a static error", (_label, claims) => {
     const sentinel = "credential-sentinel";
-    expect(() =>
-      validateAccessToken(token({ ...claims, secret: sentinel }), { ...expected, audienceClaim: "aud" }, 1_900_000_000),
-    ).toThrowError(OidcEvidenceError);
+    expect(() => validateSessionToken(token({ ...claims, secret: sentinel }), expected, 1_950_000_000)).toThrowError(
+      OidcEvidenceError,
+    );
     try {
-      validateAccessToken(token({ ...claims, secret: sentinel }), { ...expected, audienceClaim: "aud" }, 1_900_000_000);
+      validateSessionToken(token({ ...claims, secret: sentinel }), expected, 1_950_000_000);
     } catch (error) {
       expect(String(error)).not.toContain(sentinel);
     }
   });
 
-  it("requires a valid audience mode and access token_use in client_id mode", () => {
-    const valid = token({
-      iss: expected.issuer,
-      sub: "subject",
-      exp: 2_000_000_000,
-      client_id: expected.audience,
-      token_use: "id",
-    });
-    expect(() => validateAccessToken(valid, { ...expected, audienceClaim: "client_id" }, 1_900_000_000)).toThrow(
-      "oidc_token_claims",
-    );
-    expect(() =>
-      validateAccessToken(valid, { ...expected, audienceClaim: "invalid" as "aud" }, 1_900_000_000),
-    ).toThrow("oidc_audience_claim");
-  });
-
   it.each(["not-a-jwt", `${"a".repeat(20_000)}.e30.signature`, "a.!!!!.c"])(
     "rejects malformed or oversized JWT material",
     (rawToken) => {
-      expect(() => validateAccessToken(rawToken, { ...expected, audienceClaim: "aud" }, 1_900_000_000)).toThrowError(
-        OidcEvidenceError,
-      );
+      expect(() => validateSessionToken(rawToken, expected, 1_950_000_000)).toThrowError(OidcEvidenceError);
     },
   );
 });
@@ -128,7 +201,6 @@ describe("OIDC evidence", () => {
       phase: "candidate-initial",
       timestamp: "2026-07-14T01:02:03Z",
       ...expected,
-      audienceClaim: "client_id",
       subjectSha256: "a".repeat(64),
       authMeStatus: 200,
       sessionCreateStatus: 201,
@@ -138,10 +210,8 @@ describe("OIDC evidence", () => {
     expect(Object.keys(evidence).sort()).toEqual(
       [
         "audience",
-        "audience_claim",
         "auth_me_status",
         "authorization_origin",
-        "issuer",
         "phase",
         "session_create_status",
         "session_delete_status",
@@ -149,10 +219,13 @@ describe("OIDC evidence", () => {
         "session_round_trip",
         "subject_sha256",
         "timestamp",
+        "token_audience",
       ].sort(),
     );
     expect(evidence.session_round_trip).toBe(true);
+    expect(evidence.token_audience).toBe(expected.stagingOrigin);
     expect(() => buildOidcEvidence({ ...evidence, phase: "unreviewed" } as never)).toThrow("oidc_evidence_schema");
+    expect(() => buildOidcEvidence({ ...evidence, ...expected, phase: "candidate-initial", subjectSha256: "a".repeat(64), authMeStatus: 200, sessionCreateStatus: 201, sessionReadStatus: 200, sessionDeleteStatus: 204, stagingOrigin: "http://plain.invalid" })).toThrow("oidc_evidence_schema");
   });
 
   it("writes one bounded owner-only file through an owner-only directory", () => {
@@ -164,7 +237,6 @@ describe("OIDC evidence", () => {
       phase: "candidate-initial",
       timestamp: "2026-07-14T01:02:03Z",
       ...expected,
-      audienceClaim: "client_id",
       subjectSha256: "a".repeat(64),
       authMeStatus: 200,
       sessionCreateStatus: 201,
@@ -186,13 +258,7 @@ describe("OIDC evidence", () => {
     directories.push(directory);
     mkdirSync(directory, { mode: 0o700 });
     const destination = join(directory, "access-token");
-    const accessToken = token({
-      iss: expected.issuer,
-      sub: "subject",
-      exp: 2_000_000_000,
-      client_id: expected.audience,
-      token_use: "access",
-    });
+    const accessToken = token(sessionClaims());
 
     writeOidcBearerHandoff(destination, accessToken);
 
@@ -209,7 +275,6 @@ describe("OIDC evidence", () => {
       phase: "candidate-initial",
       timestamp: "2026-07-14T01:02:03Z",
       ...expected,
-      audienceClaim: "client_id",
       subjectSha256: "a".repeat(64),
       authMeStatus: 200,
       sessionCreateStatus: 201,
