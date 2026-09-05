@@ -4582,7 +4582,7 @@ class TestStep2IntraStep:
         failed_calls = [
             envelope["call"]
             for message in audit_messages
-            for envelope in message.tool_calls
+            for envelope in (message.tool_calls or ())
             if envelope.get("_kind") == "llm_call_audit" and envelope.get("call", {}).get("status") == ComposerLLMCallStatus.API_ERROR.value
         ]
         failed_rows = [row for row in operation_rows if row["status"] == "failed"]
