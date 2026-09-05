@@ -356,6 +356,22 @@ class IdentityDisabled:
 
 @final
 @dataclass(frozen=True, slots=True)
+class IdentityRetired:
+    """A credential deletion disabled the identity and retired its binding.
+
+    The actor is the OPERATOR (the surface that deleted the credential), so
+    there is no actor identity to name; ``record.subject`` is the retired form
+    and ``previous_subject`` the binding no login can reach any more.
+    """
+
+    record: IdentityRecord
+    previous_subject: str
+    reason: str
+    retired_at: datetime
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class RoleChanged:
     grant: RoleGrant
     actor_identity_id: str
@@ -1141,7 +1157,14 @@ class RepositoryIdentityAuthority:
                 quota_written=False,
             )
 
-    def retire_identity(self, *, provider: IdentityProviderType, subject: str, reason: str) -> IdentityRecord | None:
+    def retire_identity(
+        self,
+        *,
+        provider: IdentityProviderType,
+        subject: str,
+        reason: str,
+        record: Callable[[IdentityRetired], None],
+    ) -> IdentityRecord | None:
         """Retire the identity behind a credential that has been deleted.
 
         THE ROW IS NOT DELETED, and cannot be: every ownership foreign key to
@@ -1150,7 +1173,11 @@ class RepositoryIdentityAuthority:
         subject)`` binding is retired by rewriting the subject to a form no
         login can produce, so the next holder of a freed username creates a
         FRESH identity instead of binding to a disabled one at the admission
-        wall.  Returns ``None`` when no identity ever existed for the key.
+        wall.  Returns ``None`` when no identity ever existed for the key, in
+        which case nothing is written and ``record`` is not invoked.
+
+        ``record`` runs INSIDE the transaction like every other mutation's
+        callback: a retirement the audit trail cannot hold does not commit.
         """
         _require_provider(provider)
         _require_nonblank(subject, "subject")
@@ -1169,13 +1196,20 @@ class RepositoryIdentityAuthority:
                 .values(subject=retired_subject, access_state="disabled", disabled_at=now, disable_reason=reason)
             )
             bound = _record_from_row(existing, access_state="disabled")
-        return IdentityRecord(
-            identity_id=bound.identity_id,
-            provider=bound.provider,
-            subject=retired_subject,
-            username=bound.username,
-            access_state="disabled",
-        )
+            outcome = IdentityRetired(
+                record=IdentityRecord(
+                    identity_id=bound.identity_id,
+                    provider=bound.provider,
+                    subject=retired_subject,
+                    username=bound.username,
+                    access_state="disabled",
+                ),
+                previous_subject=subject,
+                reason=reason,
+                retired_at=now,
+            )
+            record(outcome)
+            return outcome.record
 
     # -- bootstrap -----------------------------------------------------------
 
@@ -1843,18 +1877,24 @@ class RepositoryIdentityAuthority:
             return outcome
 
 
-def local_identity_retirer(authority: RepositoryIdentityAuthority) -> Callable[[str], None]:
+def local_identity_retirer(
+    authority: RepositoryIdentityAuthority,
+    record: Callable[[IdentityRetired], None],
+) -> Callable[[str], None]:
     """The ONE retirement collaborator for a deleted local credential.
 
     Every surface that deletes a local credential -- the web app's provider
     and the ``elspeth composer users remove`` command -- takes its
     ``retire_identity`` collaborator from here, so the provider, subject and
-    reason are decided in exactly one place (elspeth-9c171c00fa).
+    reason are decided in exactly one place (elspeth-9c171c00fa).  ``record``
+    is the surface's audit sink for the retirement, invoked inside the
+    authority's transaction; a surface that audits nothing passes an explicit
+    no-op and owns that decision.
     """
     if type(authority) is not RepositoryIdentityAuthority:
         raise TypeError("authority must be an exact RepositoryIdentityAuthority")
 
     def retire(username: str) -> None:
-        authority.retire_identity(provider="local", subject=username, reason="local credential deleted")
+        authority.retire_identity(provider="local", subject=username, reason="local credential deleted", record=record)
 
     return retire

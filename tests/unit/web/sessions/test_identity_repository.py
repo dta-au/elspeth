@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.auth.models import IdentityClaims
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import IdentityRowCorruptionError
 from elspeth.web.sessions.models import identities_table, quota_policies_table
@@ -43,6 +43,10 @@ def authority(engine) -> RepositoryIdentityAuthority:
 
 
 def _noop(_identity_id: str, _username: str, _quota_written: bool) -> None:
+    return None
+
+
+def _record_no_retirement(_outcome: IdentityRetired) -> None:
     return None
 
 
@@ -70,7 +74,7 @@ def _ensure(authority: RepositoryIdentityAuthority, *, activate: bool, **claim_o
 
 
 def _retire(authority: RepositoryIdentityAuthority, subject: str = "ada", *, reason: str = "local credential deleted"):
-    return authority.retire_identity(provider="local", subject=subject, reason=reason)
+    return authority.retire_identity(provider="local", subject=subject, reason=reason, record=_record_no_retirement)
 
 
 # --------------------------------------------------------------------------

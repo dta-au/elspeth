@@ -23,7 +23,7 @@ from elspeth.web.auth.session_token import (
     LOCAL_AUDIENCE,
     SessionTokenIssuer,
 )
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -135,6 +135,11 @@ def build_local_auth_provider(
         # authority refuses to guess that a caller audits nothing.
         return None
 
+    def _record_no_retirement(_outcome: IdentityRetired) -> None:
+        # Same decision as ``_record_nothing``: the provider tests do not
+        # exercise the Landscape retirement row that app.py records.
+        return None
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         return authority.ensure_identity(
             claims=claims,
@@ -155,5 +160,5 @@ def build_local_auth_provider(
             principal_is_active=_principal_is_active,
         ),
         admit_identity=_admit_identity,
-        retire_identity=local_identity_retirer(authority),
+        retire_identity=local_identity_retirer(authority, _record_no_retirement),
     )

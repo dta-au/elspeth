@@ -88,7 +88,7 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -1061,6 +1061,18 @@ def _build_local_auth_provider(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_retirement(outcome: IdentityRetired) -> None:
+        # Runs INSIDE retire_identity's transaction: a credential deletion
+        # whose identity event the Landscape cannot hold does not retire the
+        # identity, the same rule the admission pair follows.
+        audit_recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
@@ -1091,7 +1103,7 @@ def _build_local_auth_provider(
         # The same retirement collaborator every surface that deletes a local
         # credential binds, so the provider, subject and reason are decided
         # in exactly one place.
-        retire_identity=local_identity_retirer(identity_authority),
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 

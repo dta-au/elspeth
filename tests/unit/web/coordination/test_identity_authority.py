@@ -39,6 +39,7 @@ from elspeth.web.coordination.identity_authority import (
     IdentityNotDisabled,
     IdentityNotFound,
     IdentityNotPending,
+    IdentityRetired,
     IdentitySummary,
     LastActiveAdminProtected,
     PendingIdentitiesPurged,
@@ -1046,22 +1047,59 @@ def test_the_loser_of_a_first_login_race_binds_to_the_winner(engine, authority, 
 
 def test_retire_disables_and_retires_the_binding(engine, authority) -> None:
     pending = _pending(authority, "ada")
-    retired = authority.retire_identity(provider="local", subject="ada", reason="local credential deleted")
+    retired = authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=_noop)
     assert retired is not None and retired.access_state == "disabled"
     assert retired.subject == f"ada#retired-{pending.identity_id}"
     assert authority.read_identity_by_natural_key(provider="local", subject="ada") is None
-    assert authority.retire_identity(provider="local", subject="ada", reason="again") is None
+    assert authority.retire_identity(provider="local", subject="ada", reason="again", record=_noop) is None
     fresh = _pending(authority, "ada")
     assert fresh.identity_id != pending.identity_id
 
 
-def test_local_identity_retirer_binds_the_local_provider_and_reason(engine, authority) -> None:
+def test_retire_records_one_typed_outcome_and_nothing_for_an_unknown_key(engine, authority) -> None:
+    """The one mutation the pre-review found unaudited: retirement emits its event like the other eleven."""
     pending = _pending(authority, "ada")
-    retire = local_identity_retirer(authority)
+    recorder = _Recorder()
+    retired = authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=recorder)
+    assert retired is not None
+    assert len(recorder.outcomes) == 1
+    outcome = recorder.outcomes[0]
+    assert type(outcome) is IdentityRetired
+    assert outcome.record == retired
+    assert outcome.record.identity_id == pending.identity_id
+    assert outcome.record.subject == f"ada#retired-{pending.identity_id}"
+    assert outcome.previous_subject == "ada"
+    assert outcome.reason == "local credential deleted"
+    # SQLite hands the stored timestamp back naive; the outcome carries the database clock as UTC.
+    assert outcome.retired_at == _identity_row(engine, pending.identity_id).disabled_at.replace(tzinfo=UTC)
+    # No row, no write, no event: an absent identity is not a retirement.
+    assert authority.retire_identity(provider="local", subject="nobody", reason="x", record=recorder) is None
+    assert len(recorder.outcomes) == 1
+
+
+def test_a_failed_retirement_audit_rolls_the_retirement_back(engine, authority) -> None:
+    pending = _pending(authority, "ada")
+    with pytest.raises(_AuditOutage):
+        authority.retire_identity(provider="local", subject="ada", reason="local credential deleted", record=_refuse_audit)
+    row = _identity_row(engine, pending.identity_id)
+    assert row.access_state == "pending"
+    assert row.subject == "ada"
+    assert row.disabled_at is None and row.disable_reason is None
+    # The binding is still live, so a login still reaches this row.
+    assert authority.read_identity_by_natural_key(provider="local", subject="ada") is not None
+
+
+def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(engine, authority) -> None:
+    pending = _pending(authority, "ada")
+    recorder = _Recorder()
+    retire = local_identity_retirer(authority, recorder)
     retire("ada")
     row = _identity_row(engine, pending.identity_id)
     assert row.access_state == "disabled"
     assert row.disable_reason == "local credential deleted"
+    assert [type(outcome) for outcome in recorder.outcomes] == [IdentityRetired]
+    assert recorder.outcomes[0].record.provider == "local"
+    assert recorder.outcomes[0].previous_subject == "ada"
     impostor: Any = object()
     with pytest.raises(TypeError):
-        local_identity_retirer(impostor)
+        local_identity_retirer(impostor, recorder)
