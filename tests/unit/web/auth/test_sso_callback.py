@@ -37,6 +37,7 @@ from elspeth.web.auth.providers import _mechanics
 from elspeth.web.auth.sso import (
     SSO_FAILURE_CATEGORIES,
     CallbackQuery,
+    ConsumedHandoff,
     RedeemedTokens,
     SsoAccessPending,
     SsoClaimCheckFailed,
@@ -92,7 +93,7 @@ class _Handoffs:
         self.issued.append((code_hash, identity_id, request_id))
         self.journal.append(("handoff", code_hash))
 
-    def consume(self, *, code_hash: str) -> str | None:
+    def consume(self, *, code_hash: str) -> ConsumedHandoff | None:
         raise AssertionError("the callback never consumes")
 
 
@@ -678,25 +679,17 @@ class TestLoginCallback:
         assert substrate.journal == []
 
     @pytest.mark.asyncio
-    async def test_a_disabled_identity_is_refused_after_upsert_and_before_the_audit_row(self, idp: FakeIdP) -> None:
-        substrate = _Substrate(access_state="disabled")
-        with pytest.raises(SsoIdentityDisabled):
-            await _walk(idp, _client(idp), substrate)
-        assert [entry for entry, _ in substrate.journal] == ["upsert"], "no login row, no handoff"
-
-    @pytest.mark.asyncio
-    async def test_a_pending_identity_is_refused_the_same_way(self, idp: FakeIdP) -> None:
-        substrate = _Substrate(access_state="pending")
-        with pytest.raises(SsoAccessPending):
-            await _walk(idp, _client(idp), substrate)
-        assert [entry for entry, _ in substrate.journal] == ["upsert"]
-
-    @pytest.mark.asyncio
-    async def test_an_unrecognised_access_state_fails_closed(self, idp: FakeIdP) -> None:
-        substrate = _Substrate(access_state="activeish")
-        with pytest.raises(AuthenticationError, match="unrecognised access_state"):
-            await _walk(idp, _client(idp), substrate)
-        assert [entry for entry, _ in substrate.journal] == ["upsert"]
+    @pytest.mark.parametrize("access_state", ["pending", "disabled"])
+    async def test_a_non_active_identity_still_gets_its_login_row_and_a_handoff(self, idp: FakeIdP, access_state: str) -> None:
+        """R6 (elspeth-61b35227fa comment 9156): the IdP authenticated this person, and the
+        login row records that fact — a first login is how a pending row comes to exist.
+        The refusal belongs to ``complete``, where the token would be minted, and the
+        complete tests pin it. A callback that refused here would leave the trail with no
+        record that a pending person ever tried."""
+        substrate = _Substrate(access_state=access_state)
+        location = await _walk(idp, _client(idp), substrate)
+        assert [entry for entry, _ in substrate.journal] == ["upsert", "login", "handoff"]
+        assert "#/auth/callback?code=" in location
 
     @pytest.mark.asyncio
     async def test_a_jwks_outage_is_a_503_not_a_refusal(self, idp: FakeIdP) -> None:

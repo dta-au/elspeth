@@ -265,6 +265,14 @@ def test_a_pending_identity_is_refused_the_same_way(engine: Engine) -> None:
     assert journal.token_issued == []
 
 
+def test_an_unrecognised_access_state_fails_closed(engine: Engine) -> None:
+    """The column has a CHECK constraint; a fourth value means the store is not ours. Refuse."""
+    journal = _Journal(engine, access_state="activeish")
+    with pytest.raises(AuthenticationError, match="unrecognised access_state"):
+        _complete(journal, _handoff(journal))
+    assert journal.token_issued == []
+
+
 def test_an_identity_that_vanished_after_the_claim_is_refused(engine: Engine) -> None:
     journal = _Journal(engine, identity_present=False)
     with pytest.raises(SsoHandoffInvalid):
