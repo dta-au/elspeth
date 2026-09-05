@@ -46,7 +46,7 @@ from datetime import timedelta
 from sqlalchemy import delete, insert, update
 from sqlalchemy.engine import Engine
 
-from elspeth.web.auth.sso import HANDOFF_TTL_SECONDS
+from elspeth.web.auth.sso import HANDOFF_TTL_SECONDS, ConsumedHandoff
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.models import sso_handoffs_table
 
@@ -96,11 +96,15 @@ class SsoHandoffRepository:
                 )
             )
 
-    def consume(self, *, code_hash: str) -> str | None:
-        """Atomically claim a handoff, returning its ``identity_id`` or ``None``.
+    def consume(self, *, code_hash: str) -> ConsumedHandoff | None:
+        """Atomically claim a handoff, returning what its row says, or ``None``.
 
         ``None`` covers unknown, already-consumed and expired without
         distinction; see the module docstring for why that is deliberate.
+
+        The row's ``request_id`` comes back with the identity: it is the
+        callback's request id, and ``complete`` writes it into the
+        ``token_issued`` audit row so the two halves of one login join.
         """
         with self._engine.begin() as conn:
             now = database_now(conn)
@@ -112,17 +116,18 @@ class SsoHandoffRepository:
                     sso_handoffs_table.c.expires_at > now,
                 )
                 .values(consumed_at=now)
-                .returning(sso_handoffs_table.c.identity_id)
-            ).scalar_one_or_none()
+                .returning(sso_handoffs_table.c.identity_id, sso_handoffs_table.c.request_id)
+            ).one_or_none()
             # Purge AFTER the claim, never before: a delete that ran first
             # would be doing the claim's expiry check in a second statement,
             # which is the race this class exists to avoid.
             conn.execute(delete(sso_handoffs_table).where(sso_handoffs_table.c.expires_at <= now))
             if claimed is None:
                 return None
-            if type(claimed) is not str:
-                # The column is NOT NULL VARCHAR and the FK points at
-                # identities.identity_id, so a non-str here is corruption
-                # rather than an input to coerce.
-                raise RuntimeError("sso_handoffs.identity_id returned a non-string value")
-            return claimed
+            identity_id, request_id = claimed.identity_id, claimed.request_id
+            if type(identity_id) is not str or type(request_id) is not str:
+                # Both columns are NOT NULL VARCHAR and identity_id is an FK,
+                # so a non-str here is corruption rather than an input to
+                # coerce.
+                raise RuntimeError("sso_handoffs returned a non-string identity_id or request_id")
+            return ConsumedHandoff(identity_id=identity_id, login_request_id=request_id)
