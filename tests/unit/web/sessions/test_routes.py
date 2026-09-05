@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import structlog
@@ -9154,7 +9154,8 @@ sinks:
             )
 
         assert resp.status_code == 200, resp.text
-        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
+        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=ANY)
+        assert type(app.state.blob_service.get_blob.await_args.kwargs["session_operation_context"]) is SessionOperationContext
         record = await service.get_current_state(session.id)
         assert record is not None
         source_options = record.sources["source"]["options"]
@@ -9257,7 +9258,8 @@ sinks:
 
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Blob not found"
-        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id)
+        app.state.blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=ANY)
+        assert type(app.state.blob_service.get_blob.await_args.kwargs["session_operation_context"]) is SessionOperationContext
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_rejects_oversized_document(self, tmp_path) -> None:
