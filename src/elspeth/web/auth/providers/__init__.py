@@ -20,11 +20,12 @@ mechanics (``resolve_issuer``, ``expected_origins``, ``claim_checks``,
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, get_args
+from typing import TYPE_CHECKING, Final, get_args
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.providers import _mechanics
 
@@ -84,11 +85,11 @@ class IdPProfile:
     so a single same-origin rule cannot serve every IdP.
     """
 
-    claim_checks: Callable[[Mapping[str, Any], WebSettings], None]
+    claim_checks: Callable[[IdTokenClaims, WebSettings], None]
     """Fail-closed checks beyond standard token validation. Raises or returns."""
 
-    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims]
-    """Tier-3 boundary: raw claims in, one owned ``IdentityClaims`` out."""
+    map_identity: Callable[[IdTokenClaims, UserinfoClaims | None], IdentityClaims]
+    """The verified token's owned claims (and userinfo's, if called) in, one ``IdentityClaims`` out."""
 
     specific_required: tuple[str, ...] = ()
     """Provider-specific settings this profile cannot start without."""

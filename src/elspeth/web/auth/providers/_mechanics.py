@@ -4,17 +4,19 @@ One module of plain functions rather than four subclasses, so each behaviour
 is named, documented with the provider quirk that motivates it, and testable
 without constructing a profile. The registry wires them onto profiles.
 
-Everything here reads data ELSPETH did not produce. ``map_identity`` and
-``claim_checks`` are the Tier-3 boundary: they take whatever shape the IdP
-sent, assert what they need, and construct an owned ``IdentityClaims`` — no
-caller downstream ever sees a raw claim dict.
+``map_identity`` and ``claim_checks`` read the OWNED claims -- the ID
+token's :class:`IdTokenClaims` and, for the one profile that calls it,
+userinfo's :class:`UserinfoClaims`. Both were parsed at their document's
+trust boundary (``auth/id_token.py``, ``auth/sso.py``); nothing here sees a
+raw claim dict, and a profile that needs a claim the closed set lacks adds
+the field there, typed, rather than reaching around the boundary.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.auth.urls import https_url_origin, validate_oidc_issuer
 
@@ -39,56 +41,6 @@ _GOOGLE_ORIGINS = frozenset(
 )
 
 _ENTRA_LOGIN_ORIGIN = "https://login.microsoftonline.com"
-
-
-def _require_claim(payload: Mapping[str, Any], name: str, *, provider: str) -> str:
-    """Read one required string claim, or fail the login.
-
-    A single named accessor for foreign data, per ADR-032: the alternative is
-    ``.get()`` scattered through four mapping functions, each deciding for
-    itself what a missing claim means.
-    """
-    if name not in payload:
-        raise AuthenticationError(f"{provider} ID token is missing the required claim {name!r}")
-    value = payload[name]
-    if type(value) is not str or not value.strip():
-        raise AuthenticationError(f"{provider} claim {name!r} must be a non-blank string")
-    return value
-
-
-def _optional_claim(payload: Mapping[str, Any], name: str) -> str | None:
-    """Read one optional string claim, discarding anything that is not one.
-
-    Deliberately lenient: these feed display fields, and an IdP sending a
-    number where a name belongs should not deny anyone access.
-    """
-    if name not in payload:
-        return None
-    value = payload[name]
-    if type(value) is not str or not value.strip():
-        return None
-    return value
-
-
-def _claim_is_exactly_true(payload: Mapping[str, Any], name: str) -> bool:
-    """True only for the JSON boolean ``true``, never for a truthy value.
-
-    ``"false"`` is a non-empty string and so is ``"0"``; an IdP that sends
-    either — or that omits the claim entirely — must not be read as asserting
-    anything. Read through this rather than ``.get()`` so the absent case is
-    stated once instead of at every call site.
-    """
-    if name not in payload:
-        return False
-    return payload[name] is True
-
-
-def _first_present(payload: Mapping[str, Any], names: tuple[str, ...]) -> str | None:
-    for name in names:
-        value = _optional_claim(payload, name)
-        if value is not None:
-            return value
-    return None
 
 
 # --- issuer resolution -------------------------------------------------
@@ -148,23 +100,25 @@ def google_origins(settings: WebSettings, issuer: str) -> frozenset[str]:
 # --- claim checks beyond standard validation ---------------------------
 
 
-def no_extra_claim_checks(payload: Mapping[str, Any], settings: WebSettings) -> None:
-    del payload, settings
+def no_extra_claim_checks(claims: IdTokenClaims, settings: WebSettings) -> None:
+    del claims, settings
 
 
-def check_entra_tenant(payload: Mapping[str, Any], settings: WebSettings) -> None:
+def check_entra_tenant(claims: IdTokenClaims, settings: WebSettings) -> None:
     """The ``tid`` must be the tenant this container is configured for.
 
     Without it, any Entra tenant that trusts the same multi-tenant app
-    registration authenticates against this deployment.
+    registration authenticates against this deployment. Absent -- which the
+    boundary also reads a non-string ``tid`` as -- is refused, not skipped.
     """
     assert settings.entra_tenant_id is not None, "required_settings guarantees entra_tenant_id"
-    tenant = _require_claim(payload, "tid", provider="entra")
-    if tenant != settings.entra_tenant_id:
+    if claims.tenant_id is None:
+        raise AuthenticationError("Entra ID token is missing the required claim 'tid'")
+    if claims.tenant_id != settings.entra_tenant_id:
         raise AuthenticationError("Entra ID token was issued by a different tenant")
 
 
-def check_google_hosted_domain(payload: Mapping[str, Any], settings: WebSettings) -> None:
+def check_google_hosted_domain(claims: IdTokenClaims, settings: WebSettings) -> None:
     """Verified email plus the configured Workspace domain, both required.
 
     ``hd`` is emitted for Workspace accounts ONLY and is absent from Google's
@@ -174,17 +128,18 @@ def check_google_hosted_domain(payload: Mapping[str, Any], settings: WebSettings
     closed on a missing claim rather than skipping the check.
     """
     assert settings.google_hosted_domain is not None, "required_settings guarantees google_hosted_domain"
-    if not _claim_is_exactly_true(payload, "email_verified"):
+    if not claims.email_verified:
         raise AuthenticationError("Google ID token does not assert a verified email")
-    hosted_domain = _require_claim(payload, "hd", provider="google")
-    if hosted_domain != settings.google_hosted_domain:
+    if claims.hosted_domain is None:
+        raise AuthenticationError("Google ID token is missing the required claim 'hd'")
+    if claims.hosted_domain != settings.google_hosted_domain:
         raise AuthenticationError("Google ID token is from a different hosted domain")
 
 
-# --- identity mapping (Tier 3 -> owned type) ---------------------------
+# --- identity mapping (owned claims -> IdentityClaims) -----------------
 
 
-def map_generic_oidc(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | None) -> IdentityClaims:
+def map_generic_oidc(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> IdentityClaims:
     """Cognito and other generic providers.
 
     ``preferred_username`` then ``cognito:username`` then ``sub``: the first
@@ -192,17 +147,16 @@ def map_generic_oidc(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] |
     subject is the guaranteed fallback because it is the identity key anyway.
     """
     del userinfo
-    subject = _require_claim(id_claims, "sub", provider="oidc")
     return IdentityClaims(
         provider="oidc",
-        subject=subject,
-        username=_first_present(id_claims, ("preferred_username", "cognito:username")) or subject,
-        display_name=_optional_claim(id_claims, "name"),
-        email=_optional_claim(id_claims, "email"),
+        subject=id_claims.subject,
+        username=id_claims.preferred_username or id_claims.cognito_username or id_claims.subject,
+        display_name=id_claims.name,
+        email=id_claims.email,
     )
 
 
-def map_entra(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | None) -> IdentityClaims:
+def map_entra(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> IdentityClaims:
     """Entra. Groups and roles are NOT collected (D17).
 
     IdP groups are organisation facts, not compartment facts: a group name
@@ -210,29 +164,27 @@ def map_entra(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | None) 
     what someone may do here. Authority comes from ``identity_roles``.
     """
     del userinfo
-    subject = _require_claim(id_claims, "sub", provider="entra")
     return IdentityClaims(
         provider="entra",
-        subject=subject,
-        username=_optional_claim(id_claims, "preferred_username") or subject,
-        display_name=_optional_claim(id_claims, "name"),
-        email=_optional_claim(id_claims, "email"),
+        subject=id_claims.subject,
+        username=id_claims.preferred_username or id_claims.subject,
+        display_name=id_claims.name,
+        email=id_claims.email,
     )
 
 
-def map_google(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | None) -> IdentityClaims:
+def map_google(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> IdentityClaims:
     del userinfo
-    subject = _require_claim(id_claims, "sub", provider="google")
     return IdentityClaims(
         provider="google",
-        subject=subject,
-        username=_optional_claim(id_claims, "email") or subject,
-        display_name=_optional_claim(id_claims, "name"),
-        email=_optional_claim(id_claims, "email"),
+        subject=id_claims.subject,
+        username=id_claims.email or id_claims.subject,
+        display_name=id_claims.name,
+        email=id_claims.email,
     )
 
 
-def map_vanguard(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | None) -> IdentityClaims:
+def map_vanguard(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> IdentityClaims:
     """VANguard, the only profile that calls userinfo.
 
     The subject is an email TODAY (measured 2026-09-02); whether it is stable
@@ -244,16 +196,13 @@ def map_vanguard(id_claims: Mapping[str, Any], userinfo: Mapping[str, Any] | Non
     ``abn`` becomes ``organisation_id``. The display name is assembled from
     name parts because VANguard does not send a composed ``name``.
     """
-    subject = _require_claim(id_claims, "sub", provider="vanguard")
-    claims: Mapping[str, Any] = userinfo if userinfo is not None else id_claims
-    given = _optional_claim(claims, "given_name")
-    family = _optional_claim(claims, "family_name")
-    display_name = " ".join(part for part in (given, family) if part) or None
+    source: IdTokenClaims | UserinfoClaims = userinfo if userinfo is not None else id_claims
+    display_name = " ".join(part for part in (source.given_name, source.family_name) if part) or None
     return IdentityClaims(
         provider="vanguard",
-        subject=subject,
-        username=subject,
+        subject=id_claims.subject,
+        username=id_claims.subject,
         display_name=display_name,
-        email=_optional_claim(claims, "email") or subject,
-        organisation_id=_optional_claim(claims, "abn"),
+        email=source.email or id_claims.subject,
+        organisation_id=source.abn,
     )

@@ -271,7 +271,7 @@ class TestHarnessAgainstTheRealValidator:
         token = idp.mint_id_token(idp.codes[code])
         return validator.decode_id_token(
             token,
-            idp.jwks_document(),
+            JWKSTokenValidator._validate_jwks_document(idp.jwks_document()),
             audience=idp.client_id,
             nonce=nonce,
             client_id=idp.client_id,
@@ -280,8 +280,8 @@ class TestHarnessAgainstTheRealValidator:
     def test_the_well_behaved_provider_is_accepted(self, idp: FakeIdP) -> None:
         """THE POSITIVE CONTROL. If this fails, every refusal below is vacuous."""
         claims = self._decode(idp)
-        assert claims["sub"] == "ada"
-        assert claims["iss"] == idp.issuer
+        assert claims.subject == "ada"
+        assert claims.issuer == idp.issuer
 
     def test_an_unsigned_token_is_refused(self, idp: FakeIdP) -> None:
         idp.id_token_algorithm = "none"
@@ -295,8 +295,11 @@ class TestHarnessAgainstTheRealValidator:
             self._decode(idp)
 
     def test_a_non_asymmetric_jwk_is_refused_before_use(self, idp: FakeIdP) -> None:
+        """The fake publishes ONE key, so an ``oct`` entry leaves the document with no usable
+        key and the JWKS boundary refuses it whole; the per-key type gate behind a usable
+        sibling is pinned in ``test_id_token_decode``."""
         idp.jwks_key_type_override = "oct"
-        with pytest.raises(AuthenticationError, match="key type is not permitted"):
+        with pytest.raises(AuthenticationError, match="unusable key entries"):
             self._decode(idp)
 
     def test_a_token_without_a_nonce_is_refused(self, idp: FakeIdP) -> None:
@@ -313,7 +316,7 @@ class TestHarnessAgainstTheRealValidator:
     def test_a_list_audience_with_azp_is_accepted(self, idp: FakeIdP) -> None:
         """The other side of the boundary: a list aud alone is legitimate."""
         idp.audience_override = [idp.client_id, "some-other-client"]
-        assert self._decode(idp)["sub"] == "ada"
+        assert self._decode(idp).subject == "ada"
 
     def test_a_replayed_nonce_from_another_login_is_refused(self, idp: FakeIdP) -> None:
         """The nonce binds the token to THIS browser's login attempt."""
@@ -323,7 +326,7 @@ class TestHarnessAgainstTheRealValidator:
         with pytest.raises(AuthenticationError, match="Invalid token"):
             validator.decode_id_token(
                 token,
-                idp.jwks_document(),
+                JWKSTokenValidator._validate_jwks_document(idp.jwks_document()),
                 audience=idp.client_id,
                 nonce="the-nonce-this-browser-actually-sent",
                 client_id=idp.client_id,
@@ -338,7 +341,7 @@ class TestHarnessAgainstTheRealValidator:
         with pytest.raises(AuthenticationError, match="Invalid token"):
             validator.decode_id_token(
                 token,
-                idp.jwks_document(),  # OUR provider's keys, THEIR token
+                JWKSTokenValidator._validate_jwks_document(idp.jwks_document()),  # OUR provider's keys, THEIR token
                 audience=idp.client_id,
                 nonce="n-1",
                 client_id=idp.client_id,

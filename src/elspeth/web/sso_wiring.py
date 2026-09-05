@@ -28,15 +28,16 @@ path for now (identity sprint step E deletes it); its SSO routes refuse and
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 import httpx
 from sqlalchemy import Engine
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.web.auth.audit import AuthAuditRecorder
+from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.providers import PROFILE_REGISTRY, IdPProfile
@@ -89,8 +90,8 @@ class SsoWiring:
     handoffs: SsoHandoffRepository
     upsert_identity: Callable[[IdentityClaims], AdmittedIdentity]
     read_identity: Callable[[str], AdmittedIdentity | None]
-    claim_checks: Callable[[Mapping[str, Any]], None]
-    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims]
+    claim_checks: Callable[[IdTokenClaims], None]
+    map_identity: Callable[[IdTokenClaims, UserinfoClaims | None], IdentityClaims]
 
 
 def build_sso_wiring(
@@ -153,7 +154,7 @@ def build_sso_wiring(
     def _read_identity(identity_id: str) -> AdmittedIdentity | None:
         return identity_authority.read_identity(identity_id=identity_id)
 
-    def _claim_checks(claims: Mapping[str, Any]) -> None:
+    def _claim_checks(claims: IdTokenClaims) -> None:
         profile.claim_checks(claims, settings)
 
     token_issuer = SessionTokenIssuer(

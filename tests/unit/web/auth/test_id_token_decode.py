@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from elspeth.web.auth.id_token import JWKSTokenValidator
+from elspeth.web.auth.id_token import JwkSet, JWKSTokenValidator, parse_id_token_claims
 from elspeth.web.auth.models import AuthenticationError
 from tests.unit.web.auth.conftest import build_rsa_jwk, make_rsa_token
 
@@ -50,6 +50,21 @@ def _claims(**overrides: Any) -> dict[str, Any]:
 _ABSENT = object()
 
 
+def _jwks(document: dict[str, Any]) -> JwkSet:
+    """Through the ONE JWKS boundary, as production does."""
+    return JWKSTokenValidator._validate_jwks_document(document)
+
+
+def _beside_a_usable_key(jwks: dict[str, Any]) -> dict[str, Any]:
+    """Append a second, unrelated RSA key so the set parses and the FIRST entry is what the token's kid selects."""
+    from cryptography.hazmat.primitives.asymmetric import rsa as rsa_mod
+
+    other = build_rsa_jwk(rsa_mod.generate_private_key(public_exponent=65537, key_size=2048).public_key())["keys"][0]
+    other["kid"] = "an-unrelated-key"
+    jwks["keys"].append(other)
+    return jwks
+
+
 def _decode(validator: JWKSTokenValidator, token: str, jwks: dict[str, Any], **overrides: Any) -> Any:
     kwargs: dict[str, Any] = {
         "audience": AUDIENCE,
@@ -57,7 +72,7 @@ def _decode(validator: JWKSTokenValidator, token: str, jwks: dict[str, Any], **o
         "client_id": AUDIENCE,
     }
     kwargs.update(overrides)
-    return validator.decode_id_token(token, jwks, **kwargs)
+    return validator.decode_id_token(token, _jwks(jwks), **kwargs)
 
 
 class TestTheHappyPathIsActuallyReachable:
@@ -67,7 +82,7 @@ class TestTheHappyPathIsActuallyReachable:
         private_key, public_key = rsa_keypair
         token = make_rsa_token(private_key, _claims())
         payload = _decode(validator, token, build_rsa_jwk(public_key))
-        assert payload["sub"] == "subject-1"
+        assert payload.subject == "subject-1"
 
 
 class TestAlgorithmConfusion:
@@ -93,16 +108,16 @@ class TestAlgorithmConfusion:
         private_key, public_key = rsa_keypair
         token = make_rsa_token(private_key, _claims(), algorithm="PS256")
         payload = _decode(_validator(("PS256",)), token, build_rsa_jwk(public_key, alg="PS256"))
-        assert payload["sub"] == "subject-1"
+        assert payload.subject == "subject-1"
 
     def test_the_bearer_path_is_the_same_pin(self, validator, rsa_keypair) -> None:
         """``decode_token`` used to read ``alg`` from the header. It cannot now."""
         private_key, public_key = rsa_keypair
         token = make_rsa_token(private_key, _claims(), algorithm="PS256")
         with pytest.raises(AuthenticationError, match="Invalid token"):
-            validator.decode_token(token, build_rsa_jwk(public_key, alg="PS256"))
-        accepted = validator.decode_token(make_rsa_token(private_key, _claims()), build_rsa_jwk(public_key))
-        assert accepted["sub"] == "subject-1"
+            validator.decode_token(token, _jwks(build_rsa_jwk(public_key, alg="PS256")))
+        accepted = validator.decode_token(make_rsa_token(private_key, _claims()), _jwks(build_rsa_jwk(public_key)))
+        assert accepted.subject == "subject-1"
 
     @pytest.mark.parametrize("algorithms", [(), ("RS256", "HS256"), ("none",), ("HS256",), ("RS256", "")])
     def test_a_profile_cannot_declare_a_symmetric_or_absent_signature(self, algorithms: tuple[str, ...]) -> None:
@@ -124,7 +139,7 @@ class TestKeyTypeConfusion:
         also having pinned the algorithm list correctly.
         """
         private_key, public_key = rsa_keypair
-        jwks = build_rsa_jwk(public_key)
+        jwks = _beside_a_usable_key(build_rsa_jwk(public_key))
         jwks["keys"][0]["kty"] = "oct"
         token = make_rsa_token(private_key, _claims())
         with pytest.raises(AuthenticationError, match="key type is not permitted"):
@@ -132,11 +147,19 @@ class TestKeyTypeConfusion:
 
     def test_a_key_with_no_type_at_all_is_refused(self, validator, rsa_keypair) -> None:
         private_key, public_key = rsa_keypair
-        jwks = build_rsa_jwk(public_key)
+        jwks = _beside_a_usable_key(build_rsa_jwk(public_key))
         del jwks["keys"][0]["kty"]
         token = make_rsa_token(private_key, _claims())
         with pytest.raises(AuthenticationError, match="key type is not permitted"):
             _decode(validator, token, jwks)
+
+    def test_a_document_with_no_usable_key_is_refused_at_the_boundary(self, validator, rsa_keypair) -> None:
+        """Alone, the same malformed entry fails the DOCUMENT: PyJWT parses the set once, at the boundary."""
+        private_key, public_key = rsa_keypair
+        jwks = build_rsa_jwk(public_key)
+        jwks["keys"][0]["kty"] = "oct"
+        with pytest.raises(AuthenticationError, match="unusable key entries"):
+            _decode(validator, make_rsa_token(private_key, _claims()), jwks)
 
 
 class TestNonceBinding:
@@ -196,11 +219,11 @@ class TestAudienceAndAuthorizedParty:
     def test_a_multi_audience_token_naming_us_passes(self, validator, rsa_keypair) -> None:
         private_key, public_key = rsa_keypair
         token = make_rsa_token(private_key, _claims(aud=[AUDIENCE, "some-other-app"], azp=AUDIENCE))
-        assert _decode(validator, token, build_rsa_jwk(public_key))["sub"] == "subject-1"
+        assert _decode(validator, token, build_rsa_jwk(public_key)).subject == "subject-1"
 
     def test_a_single_audience_token_needs_no_azp(self, validator, rsa_keypair) -> None:
         private_key, public_key = rsa_keypair
-        assert _decode(validator, make_rsa_token(private_key, _claims()), build_rsa_jwk(public_key))["sub"]
+        assert _decode(validator, make_rsa_token(private_key, _claims()), build_rsa_jwk(public_key)).subject
 
 
 class TestRequiredClaimsAndClock:
@@ -233,7 +256,7 @@ class TestRequiredClaimsAndClock:
         private_key, public_key = rsa_keypair
         now = int(time.time())
         token = make_rsa_token(private_key, _claims(exp=now - 30, iat=now - 300))
-        assert _decode(validator, token, build_rsa_jwk(public_key))["sub"] == "subject-1"
+        assert _decode(validator, token, build_rsa_jwk(public_key)).subject == "subject-1"
 
 
 class TestSignature:
@@ -293,3 +316,121 @@ class TestJWKSValidatorBoundaryRaises:
         """A JWKS document without a 'keys' list is rejected at the boundary."""
         with pytest.raises(AuthenticationError, match="missing 'keys' list"):
             JWKSTokenValidator._validate_jwks_document(jwks={"not_keys": []})
+
+
+# --------------------------------------------------------------------------
+# The two boundaries that turn PyJWT's dicts into owned values.
+# --------------------------------------------------------------------------
+
+
+class TestIdTokenClaimsBoundary:
+    """``parse_id_token_claims`` is the ONE place a verified payload becomes owned claims.
+
+    PyJWT has verified the signature, issuer, audience and clock by the time
+    it runs; these tests are about the types of what it verified, and about
+    the profile claims nothing before this point has looked at.
+    """
+
+    def test_a_blank_subject_is_refused(self) -> None:
+        with pytest.raises(AuthenticationError, match="non-blank"):
+            parse_id_token_claims(payload=_claims(sub="   "))
+
+    def test_a_missing_subject_is_refused(self) -> None:
+        with pytest.raises(AuthenticationError, match="missing the required claim 'sub'"):
+            parse_id_token_claims(payload=_claims(sub=_ABSENT))
+
+    def test_a_non_string_issuer_is_refused(self) -> None:
+        with pytest.raises(AuthenticationError, match="'iss'"):
+            parse_id_token_claims(payload=_claims(iss=["https://issuer.example.gov.au"]))
+
+    @pytest.mark.parametrize(
+        "aud",
+        [None, "", 42, [], ["ok", 7], {"aud": "x"}],
+        ids=["absent", "empty", "number", "empty-list", "mixed-list", "object"],
+    )
+    def test_an_audience_that_is_not_a_string_or_a_string_list_is_refused(self, aud: Any) -> None:
+        with pytest.raises(AuthenticationError, match="aud"):
+            parse_id_token_claims(payload=_claims(aud=aud))
+
+    def test_the_audience_keeps_its_wire_shape(self) -> None:
+        """A string stays a string and a list becomes a tuple: the azp rule turns on exactly that."""
+        assert parse_id_token_claims(payload=_claims()).audience == AUDIENCE
+        assert parse_id_token_claims(payload=_claims(aud=[AUDIENCE, "other"])).audience == (AUDIENCE, "other")
+
+    @pytest.mark.parametrize("claim", ["exp", "iat"])
+    @pytest.mark.parametrize("value", ["1700000000", True, None], ids=["string", "boolean", "absent"])
+    def test_a_numeric_date_that_is_not_a_number_is_refused(self, claim: str, value: Any) -> None:
+        with pytest.raises(AuthenticationError, match=claim):
+            parse_id_token_claims(payload=_claims(**{claim: value}))
+
+    def test_a_fractional_numeric_date_keeps_its_whole_seconds(self) -> None:
+        claims = parse_id_token_claims(payload=_claims(iat=1_700_000_000.75))
+        assert claims.issued_at == 1_700_000_000
+
+    @pytest.mark.parametrize(("claim", "attribute"), [("nonce", "nonce"), ("azp", "authorized_party")])
+    def test_a_compared_claim_that_is_not_a_string_reads_as_absent(self, claim: str, attribute: str) -> None:
+        """The comparison is the ONE authority for these two: a non-string cannot match, so it
+        arrives there as absent and is refused there, with that check's message (``TestNonceBinding``)."""
+        assert getattr(parse_id_token_claims(payload=_claims(**{claim: 12345})), attribute) is None
+        assert getattr(parse_id_token_claims(payload=_claims(**{claim: _ABSENT})), attribute) is None
+        assert getattr(parse_id_token_claims(payload=_claims(**{claim: "value"})), attribute) == "value"
+
+    def test_a_non_string_cosmetic_claim_reads_as_absent(self) -> None:
+        """An IdP sending the wrong type must not deny access over a display name."""
+        claims = parse_id_token_claims(payload=_claims(name=42, email=["a@b"], preferred_username="\u200b", tid=7))
+        assert (claims.name, claims.email, claims.preferred_username, claims.tenant_id) == (None, None, None, None)
+
+    @pytest.mark.parametrize("value", ["true", 1, "false", None], ids=["string-true", "one", "string-false", "absent"])
+    def test_email_verified_is_true_only_for_the_json_boolean(self, value: Any) -> None:
+        assert parse_id_token_claims(payload=_claims(email_verified=value)).email_verified is False
+        assert parse_id_token_claims(payload=_claims(email_verified=True)).email_verified is True
+
+    def test_the_closed_set_reads_every_profile_claim(self) -> None:
+        payload = _claims(tid="tenant", hd="example.gov.au", given_name="Ada", family_name="Lovelace", abn="51 824 753 556")
+        payload["cognito:username"] = "cog"
+        claims = parse_id_token_claims(payload=payload)
+        assert (claims.tenant_id, claims.hosted_domain, claims.cognito_username) == ("tenant", "example.gov.au", "cog")
+        assert (claims.given_name, claims.family_name, claims.abn) == ("Ada", "Lovelace", "51 824 753 556")
+
+    def test_legacy_group_claims_keep_the_bearer_paths_shape_rule(self) -> None:
+        """Deleted with the legacy providers (step E); until then the rule they applied lives here."""
+        claims = parse_id_token_claims(payload=_claims(groups=["g1", 2], roles=["admin"]))
+        assert claims.groups == ("g1", "2") and claims.roles == ("admin",)
+        with pytest.raises(AuthenticationError, match="Unexpected type for 'groups' claim"):
+            parse_id_token_claims(payload=_claims(groups="not-a-list"))
+        assert parse_id_token_claims(payload=_claims(hasgroups=True)).groups_overage is True
+        assert parse_id_token_claims(payload=_claims(_claim_names={"groups": "src1"})).groups_overage is True
+        assert parse_id_token_claims(payload=_claims()).groups_overage is False
+
+
+class TestHeaderKeyIdBoundary:
+    """``kid`` is read from the UNVERIFIED header, so its type is asserted before it selects a key."""
+
+    def test_a_non_string_kid_is_refused(self) -> None:
+        with pytest.raises(AuthenticationError, match="key id"):
+            JWKSTokenValidator._header_key_id(header={"alg": "RS256", "kid": 7})
+
+    def test_an_absent_kid_is_none_and_a_string_kid_is_itself(self) -> None:
+        assert JWKSTokenValidator._header_key_id(header={"alg": "RS256"}) is None
+        assert JWKSTokenValidator._header_key_id(header={"alg": "RS256", "kid": "k1"}) == "k1"
+
+
+class TestJwkSetIsAnOwnedType:
+    def test_the_boundary_reads_each_keys_kid_and_kty_once(self, rsa_keypair) -> None:
+        _private_key, public_key = rsa_keypair
+        jwks = _jwks(build_rsa_jwk(public_key))
+        (entry,) = jwks.entries
+        assert entry.key_type == "RSA" and entry.key_id == build_rsa_jwk(public_key)["keys"][0]["kid"]
+
+    def test_equal_documents_give_equal_but_distinct_sets(self, rsa_keypair) -> None:
+        """Value equality for tests; identity for the refresh path, which is why both are pinned."""
+        _private_key, public_key = rsa_keypair
+        first, second = _jwks(build_rsa_jwk(public_key)), _jwks(build_rsa_jwk(public_key))
+        assert first == second and first is not second
+
+    def test_an_entry_with_a_non_string_kid_is_not_carried(self, rsa_keypair) -> None:
+        """No header can name it (RFC 7515: kid is a string), so it can never be selected."""
+        _private_key, public_key = rsa_keypair
+        document = build_rsa_jwk(public_key)
+        document["keys"][0]["kid"] = 7
+        assert _jwks(document).entries == ()

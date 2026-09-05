@@ -482,7 +482,7 @@ class TestOIDCTokenValidation:
         private_key, _ = rsa_keypair
         provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -525,7 +525,7 @@ class TestOIDCBearerRequiredClaims:
         token = make_rs256_token(private_key, claims)
         validator = JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",))
         with pytest.raises(AuthenticationError, match="MissingRequiredClaimError"):
-            validator.decode_token(token, jwks_response)
+            validator.decode_token(token, JWKSTokenValidator._validate_jwks_document(jwks_response))
 
     def test_a_cognito_access_token_is_a_wrong_audience_token_here(self, rsa_keypair, jwks_response) -> None:
         """The client_id/token_use mode is deleted; ``aud`` is the only audience claim."""
@@ -536,7 +536,9 @@ class TestOIDCBearerRequiredClaims:
             _valid_claims({"aud": "wrong-generic-audience", "client_id": AUDIENCE, "token_use": "access", "iat": now}),
         )
         with pytest.raises(AuthenticationError, match="InvalidAudienceError"):
-            JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",)).decode_token(cognito_shaped, jwks_response)
+            JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",)).decode_token(
+                cognito_shaped, JWKSTokenValidator._validate_jwks_document(jwks_response)
+            )
 
     def test_jwks_discovery_requires_exact_issuer(self) -> None:
         validator = JWKSTokenValidator(ISSUER, AUDIENCE, algorithms=("RS256",))
@@ -672,7 +674,7 @@ class TestOIDCGetUserInfo:
         private_key, _ = rsa_keypair
         provider = OIDCAuthProvider(issuer=ISSUER, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.get_user_info(token)
 
     @pytest.mark.asyncio
