@@ -38,6 +38,7 @@ from elspeth.core.schema_shape import (
     collect_metadata_shape_issues,
 )
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import _RELATIONSHIP_TYPE_CHECK, identity_relationships_table
 from elspeth.web.sessions.models import metadata as session_metadata
 
 
@@ -533,6 +534,14 @@ def test_postgresql_literal_case_drift_is_not_normalized_away() -> None:
             "status NOT IN ('live', 'bundled')",
             "status::text <> ALL (ARRAY['live'::text, 'bundled'::text]::text[])",
         ),
+        # A ONE-element IN loses its array entirely: with a single value there
+        # is nothing to scan, so PostgreSQL stores a plain comparison. Distinct
+        # enough from the ANY(ARRAY[...]) forms above to need its own reverse,
+        # and its absence failed every fresh PostgreSQL boot (elspeth-d0e62aea41).
+        ("status IN ('live')", "(status)::text = 'live'::text"),
+        ("status NOT IN ('live')", "(status)::text <> 'live'::text"),
+        # The same rewrite on a column that takes no cast at all.
+        ("id IN (1)", "id = 1"),
         ("path LIKE 'source.options.%'", "path::text ~~ 'source.options.%'::text"),
         (
             "length(btrim(path, chr(9) || chr(10) || chr(32))) > 0",
@@ -599,6 +608,67 @@ def test_collector_pins_postgresql_check_reflection_forms(declared_sql: str, ref
     )
 
     assert issues == ()
+
+
+def test_the_constraint_that_failed_every_fresh_postgresql_boot_is_pinned_verbatim() -> None:
+    """The exact two strings from the epoch-52 failure (elspeth-d0e62aea41).
+
+    ``ck_identity_relationships_type`` is the schema's only one-element ``IN``.
+    The reflected side below is not paraphrased: it is what a PostgreSQL 16
+    server returned from ``pg_get_constraintdef`` after creating the real
+    table, parentheses and casts as stored. Pinning the bytes is the point —
+    a reverse written against a tidied-up approximation of the stored form
+    would pass its own tests and still fail the server.
+    """
+    declared = _RELATIONSHIP_TYPE_CHECK
+    reflected = "((relationship_type)::text = 'approver'::text)"
+
+    metadata = MetaData()
+    # The shared ``_StaticInspector`` answers for one table name only; the
+    # constraint text under test is unqualified, so the name is immaterial.
+    Table(
+        "pg_demo",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("relationship_type", String(32), nullable=False),
+        CheckConstraint(declared, name="ck_identity_relationships_type"),
+    )
+    inspector = _StaticInspector(
+        columns=[
+            {"name": "id", "type": Integer(), "nullable": False, "default": None},
+            {"name": "relationship_type", "type": String(32), "nullable": False, "default": None},
+        ],
+        primary_key=["id"],
+        foreign_keys=[],
+        checks=[{"name": "ck_identity_relationships_type", "sqltext": reflected}],
+        unique_constraints=[],
+        indexes=[],
+    )
+
+    issues = collect_metadata_shape_issues(
+        inspector,  # type: ignore[arg-type]
+        metadata,
+        dialect=postgresql.dialect(),
+        present_tables=frozenset({"pg_demo"}),
+    )
+
+    assert issues == ()
+
+
+def test_the_pinned_constraint_text_is_still_the_models_own() -> None:
+    """Guards the test above against the model drifting out from under it.
+
+    The pin is only evidence while ``_RELATIONSHIP_TYPE_CHECK`` is what the
+    table is actually built with — a constant imported and then not used by
+    the real table would leave the test green and meaningless.
+    """
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in identity_relationships_table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert constraints["ck_identity_relationships_type"] == _RELATIONSHIP_TYPE_CHECK
 
 
 def test_postgresql_integer_default_reflection_matches_quoted_declared_scalar() -> None:
@@ -867,6 +937,16 @@ def _static_check_issues(
         ("trusted.pg_demo.amount > 0", "attacker.pg_demo.amount > 0"),
         ("__elspeth_literal_0__ = 'safe'", "'safe' = 'safe'"),
         ("json_typeof(a) = 'array'", "json_typeof(a) = 'array'::text"),
+        # The one-element IN reverse re-labels a node; it must decide nothing.
+        # Each row below differs from an accepted one by exactly the thing the
+        # ordinary rules judge — polarity, literal, column, cast domain — so a
+        # reverse that stripped or assumed anything would show up here.
+        ("value_text IN ('live')", "value_text::text <> 'live'::text"),
+        ("value_text NOT IN ('live')", "value_text::text = 'live'::text"),
+        ("value_text IN ('live')", "value_text::text = 'bundled'::text"),
+        ("value_text IN ('live')", "code::text = 'live'::text"),
+        ("amount IN (1)", "amount::integer = 1"),
+        ("value_text IN ('1')", "value_text::integer = 1"),
     ],
 )
 def test_collector_rejects_unproven_expression_equivalences(declared_sql: str, reflected_sql: str) -> None:
@@ -895,6 +975,26 @@ def test_collector_preserves_citext_equality_semantics() -> None:
 
 def test_collector_preserves_native_enum_ordering_semantics() -> None:
     issues = _static_check_issues("priority < 'high'", "priority::text < 'high'::text")
+
+    assert any(issue.subject.endswith("CHECK constraint SQL mismatch") for issue in issues)
+
+
+def test_one_element_in_does_not_reopen_citext_equality_semantics() -> None:
+    """The same hole as the equality case above, reached through the IN spelling.
+
+    ``email = 'Admin'`` vs ``email::text = 'Admin'::text`` is already refused:
+    citext compares case-insensitively and the cast makes it case-SENSITIVE, a
+    different predicate. Writing it ``email IN ('Admin')`` must not be a way
+    around that.
+    """
+    issues = _static_check_issues("email IN ('Admin')", "email::text = 'Admin'::text")
+
+    assert any(issue.subject.endswith("CHECK constraint SQL mismatch") for issue in issues)
+
+
+def test_one_element_in_does_not_reopen_native_enum_semantics() -> None:
+    """Likewise for a native enum, where the cast changes the comparison domain."""
+    issues = _static_check_issues("priority IN ('high')", "priority::text = 'high'::text")
 
     assert any(issue.subject.endswith("CHECK constraint SQL mismatch") for issue in issues)
 

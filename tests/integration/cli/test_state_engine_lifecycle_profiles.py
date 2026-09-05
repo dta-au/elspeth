@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import threading
@@ -56,6 +57,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_real_follower_ready_item,
     _work_item,
 )
+from tests.helpers.session_fences import execute_lease
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -340,17 +342,30 @@ payload_store:
 
     monkeypatch.setattr(service._executor, "submit", capture_submit)
 
-    launched_run_id = await service.execute(
-        session_id,
-        user_id="task10-web-user",
-        auth_provider_type="local",
-    )
-    run_id = str(launched_run_id)
-    assert launched_run_id == run_uuid
-    assert len(submitted) == 1
-    assert await asyncio.to_thread(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
+    # ``execute`` takes an exact EXECUTE lease and the run keeps reproving it
+    # from its worker threads until the leader's future resolves, so the lease
+    # is held on an exit stack and released with the service in the cleanup
+    # block below. The helper acquires through ``SessionOperationLease.acquire``
+    # over a recording authority; the session service here is an autospec and
+    # mints no authority of its own.
+    lease_stack = contextlib.AsyncExitStack()
+    session_operation_lease = await lease_stack.enter_async_context(execute_lease(session_id, lease_seconds=120))
+    try:
+        launched_run_id = await service.execute(
+            session_id,
+            session_operation_lease=session_operation_lease,
+            user_id="task10-web-user",
+            auth_provider_type="local",
+        )
+        run_id = str(launched_run_id)
+        assert launched_run_id == run_uuid
+        assert len(submitted) == 1
+        assert await asyncio.to_thread(leader_blocked.wait, 10), "ExecutionService leader never paused before a fork-branch claim"
 
-    db = LandscapeDB.from_url(settings.landscape.url)
+        db = LandscapeDB.from_url(settings.landscape.url)
+    except BaseException:
+        await lease_stack.aclose()
+        raise
 
     try:
         with db.engine.connect() as conn:
@@ -572,6 +587,9 @@ payload_store:
 
         status_calls = [call.kwargs for call in session_service.update_run_status.await_args_list]
         assert [call["status"] for call in status_calls] == ["running", "completed"]
+        # Every status write is fenced by the exact context the EXECUTE lease
+        # minted at launch, so a run can never report completion under
+        # someone else's authority.
         assert status_calls[-1] == {
             "status": "completed",
             "error": None,
@@ -581,6 +599,7 @@ payload_store:
             "rows_routed_success": 0,
             "rows_routed_failure": 0,
             "rows_quarantined": 0,
+            "session_operation_context": session_operation_lease.context,
         }
 
         if request.config.pluginmanager.hasplugin("scripts.state_engine_profile_reporter"):
@@ -601,6 +620,7 @@ payload_store:
         leader_release.set()
         await service.shutdown()
         db.close()
+        await lease_stack.aclose()
 
 
 @pytest.mark.timeout(120)

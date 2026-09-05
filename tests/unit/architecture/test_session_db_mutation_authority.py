@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from tests.helpers.tree_gate import iter_gate_files
+
 from elspeth.web.sessions.models import metadata as sessions_metadata
 
 Scope = Literal["session", "global"]
@@ -279,7 +281,7 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
     ),
     AuthoritySymbol(
         "src/elspeth/web/coordination/run_diagnostics_authority.py",
-        "RepositoryRunDiagnosticsAuditAuthority.append_audit_message",
+        "RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         "RunDiagnosticsAuditMutationAuthority",
     ),
     AuthoritySymbol(
@@ -610,7 +612,7 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
     ),
     AuthoritySymbol(
         "src/elspeth/web/coordination/run_diagnostics_authority.py",
-        "RepositoryRunDiagnosticsAuditAuthority.append_audit_message",
+        "RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         "RunDiagnosticsAuditMutationAuthority",
     ),
     AuthoritySymbol(
@@ -644,25 +646,27 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
 # This manifest grows only after routing a site through its table-specific
 # typed authority.
 _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+    # append_audit_message -> append_audit_messages (7e1f1f86e): one locked
+    # transaction inserts the whole audit cohort and bumps the session once.
     WriterIdentity(
         "src/elspeth/web/coordination/run_diagnostics_authority.py",
-        "RepositoryRunDiagnosticsAuditAuthority.append_audit_message",
+        "RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         "chat_messages",
         "insert",
-        "783b11cdc2d17f21",
+        "d0ef6a582e1fc2a3",
         1,
         "RunDiagnosticsAuditMutationAuthority",
-        line=84,
+        line=121,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/run_diagnostics_authority.py",
-        "RepositoryRunDiagnosticsAuditAuthority.append_audit_message",
+        "RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         "sessions",
         "update",
-        "783b11cdc2d17f21",
+        "d0ef6a582e1fc2a3",
         1,
         "RunDiagnosticsAuditMutationAuthority",
-        line=100,
+        line=137,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -814,6 +818,9 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SkillMarkdownHistoryAuthority",
         line=57,
     ),
+    # upsert_encrypted_secret builds one prebuilt upsert per dialect arm
+    # (sqlite :170, postgresql :178, mysql :186) and executes it once at :190;
+    # each arm is its own writer identity.
     WriterIdentity(
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
@@ -829,20 +836,20 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "user_secrets",
         "insert",
-        "96893964262bac72",
+        "8b0fd0f595fe372f",
         1,
         "UserSecretAuthority",
-        line=170,
+        line=178,
     ),
     WriterIdentity(
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "user_secrets",
         "insert",
-        "96893964262bac72",
+        "3ac0a3fe10d1d8c0",
         1,
         "UserSecretAuthority",
-        line=170,
+        line=186,
     ),
     WriterIdentity(
         "src/elspeth/web/secrets/user_store.py",
@@ -974,15 +981,20 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionInterpretationAuthority",
         line=1199,
     ),
+    # create_or_reconcile_pending: the stale-site update writes SUPERSEDED, not
+    # ABANDONED (elspeth-dbc39dd367, carried by the multi-replica merge); the
+    # opt-out marker insert (:1025) and the event insert (:1052) are distinct
+    # statements; the appended head insert now sits under the guided-custody
+    # assertion and the dead-site retirement in the same transaction.
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
         "_RepositoryInterpretationMutations.create_or_reconcile_pending",
         "interpretation_events",
         "update",
-        "c6d9062a934ad7cc",
+        "b62dec99662793d2",
         1,
         "SessionInterpretationAuthority",
-        line=884,
+        line=948,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -999,20 +1011,20 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "_RepositoryInterpretationMutations.create_or_reconcile_pending",
         "interpretation_events",
         "insert",
-        "83a9e49f7b465443",
+        "c969a753999273dd",
         1,
         "SessionInterpretationAuthority",
-        line=1025,
+        line=1052,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
         "_RepositoryInterpretationMutations.create_or_reconcile_pending",
         "composition_states",
         "insert",
-        "ea19de4d8e554014",
+        "e2f9c8046ec5b809",
         1,
         "SessionInterpretationAuthority",
-        line=1026,
+        line=1102,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -1385,6 +1397,9 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "GuidedSessionMutationAuthority",
         line=3861,
     ),
+    # claim_confirmation: the first UPDATE (:3891) releases an expired owner's
+    # binding and shares its shape with require_no_active_confirmation; the
+    # second (:3915) binds the proposal under the caller's own lease fence.
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
         "_GuidedSessionMutations.claim_confirmation",
@@ -1400,10 +1415,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "_GuidedSessionMutations.claim_confirmation",
         "guided_operations",
         "update",
-        "d2fd5f53fcc3d7de",
+        "95efdd37e97b888e",
         1,
         "GuidedSessionMutationAuthority",
-        line=3891,
+        line=3915,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1500,7 +1515,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4536b6d6104a3575",
         1,
         None,
-        line=3138,
+        line=3174,
     ),
     WriterIdentity(
         "src/elspeth/web/preferences/service.py",
@@ -1565,7 +1580,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "38007d0f0ea7c327",
         1,
         None,
-        line=120,
+        line=121,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1575,7 +1590,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2006ebd10a466428",
         1,
         None,
-        line=254,
+        line=269,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1586,7 +1601,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=796,
+        line=817,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1596,7 +1611,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=821,
+        line=842,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1607,7 +1622,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=919,
+        line=940,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1617,7 +1632,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1138,
+        line=1159,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1627,7 +1642,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1258,
+        line=1279,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1638,7 +1653,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1279,
+        line=1300,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1649,7 +1664,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1319,
+        line=1340,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1659,7 +1674,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "026fc33c365235c4",
         1,
         None,
-        line=1578,
+        line=1599,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -1669,7 +1684,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2038,
+        line=2059,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1683,15 +1698,17 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=466,
         connection_escape=True,
     ),
+    # open_export_read_transaction acquires twice: engine.connect() at :466
+    # (yielded, so an escape) and the REPEATABLE READ rebinding at :471.
     WriterIdentity(
         "src/elspeth/core/landscape/export_read_model.py",
         "open_export_read_transaction",
         "<sessions-write-connection>",
         "write_connection",
-        "ffdb0616b1c68213",
+        "9d39978e72854dca",
         1,
         None,
-        line=466,
+        line=471,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/leases.py",
@@ -1722,7 +1739,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=425,
+        line=426,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1733,7 +1750,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=838,
+        line=839,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1744,7 +1761,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "a1ed0f32c96a6da4",
         1,
         None,
-        line=858,
+        line=859,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1755,7 +1772,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "df00dc245a757212",
         1,
         None,
-        line=1027,
+        line=1053,
     ),
     WriterIdentity(
         "src/elspeth/web/auth/local.py",
@@ -4085,7 +4102,7 @@ def test_run_diagnostics_writer_is_exactly_bound_to_its_handle_free_authority() 
     root = _repo_root()
     repository_path = "src/elspeth/web/coordination/run_diagnostics_authority.py"
     service_path = "src/elspeth/web/sessions/service.py"
-    authority_symbol = "RepositoryRunDiagnosticsAuditAuthority.append_audit_message"
+    authority_symbol = "RepositoryRunDiagnosticsAuditAuthority.append_audit_messages"
     assert _authority_for(repository_path, authority_symbol) == "RunDiagnosticsAuditMutationAuthority"
     assert _contained_connection_authority_for(repository_path, authority_symbol) == "RunDiagnosticsAuditMutationAuthority"
     assert _authority_for(repository_path, f"{authority_symbol}_replacement") is None
@@ -7487,39 +7504,45 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "0564af7982a64ad9",
             1,
             None,
-            line=705,
+            line=707,
         ),
+        # Exhaustive Engine|Connection|None dispatch with assert_never
+        # (fbb2c8392): the acquisition moved under the try and the
+        # connection is still forwarded to the catalog-proof helper.
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
             "_proven_pg_catalog_text_builtin_calls",
             "<sessions-write-connection>",
             "write_connection",
-            "4b4ece909dbd2d9a",
+            "9d26eba31115d8ff",
             1,
             None,
-            line=722,
+            line=728,
+            connection_escape=True,
+        ),
+        # _inspect_database / _initialize_database became the explicit-return
+        # _inspect_via_engine / _initialize_via_engine (9e5f5c2fb, 0041948b9);
+        # both still hand the connection to the probe callable.
+        WriterIdentity(
+            "src/elspeth/web/doctor.py",
+            "_inspect_via_engine",
+            "<sessions-write-connection>",
+            "write_connection",
+            "0d13e49af38d8ee4",
+            1,
+            None,
+            line=381,
             connection_escape=True,
         ),
         WriterIdentity(
             "src/elspeth/web/doctor.py",
-            "_inspect_database",
+            "_initialize_via_engine",
             "<sessions-write-connection>",
             "write_connection",
-            "678f5f038fbf6e2f",
+            "b87b8f33fcdb54e2",
             1,
             None,
-            line=376,
-            connection_escape=True,
-        ),
-        WriterIdentity(
-            "src/elspeth/web/doctor.py",
-            "_initialize_database",
-            "<sessions-write-connection>",
-            "write_connection",
-            "5156e2c4978a3a8f",
-            1,
-            None,
-            line=442,
+            line=476,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -7541,7 +7564,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "65d5d82276d99f4d",
             1,
             None,
-            line=132,
+            line=146,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -7552,7 +7575,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "4312f607f547b35b",
             1,
             None,
-            line=222,
+            line=248,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -7574,7 +7597,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "afc7d978d541eadc",
             1,
             None,
-            line=207,
+            line=217,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -7585,7 +7608,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "883e79c104c66d8f",
             1,
             None,
-            line=253,
+            line=263,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -7596,7 +7619,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "bbce7dbcfc31f6ec",
             1,
             None,
-            line=453,
+            line=469,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable
@@ -7676,7 +7699,7 @@ def test_writer_authority_must_match_the_table_policy() -> None:
 def test_all_production_sessions_writers_are_reviewed_typed_authorities() -> None:
     root = _repo_root()
     production_root = root / "src" / "elspeth"
-    scanned = scan_production_writers(production_root.rglob("*.py"), anchor=root)
+    scanned = scan_production_writers(iter_gate_files(production_root), anchor=root)
     reviewed_read_policy_violations = reviewed_read_connection_policy_violations(_REVIEWED_READ_CONNECTIONS)
     sessions_domain, stale_non_session_connections = subtract_reviewed_identities(
         scanned,

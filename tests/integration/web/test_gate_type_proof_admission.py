@@ -19,6 +19,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.session_fences import acquire_compose_context
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -181,19 +182,24 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
             topology=topology,
         )
         state_dict = state.to_dict()
-        await app.state.session_service.save_composition_state(
-            session_id,
-            CompositionStateData(
-                sources=state_dict["sources"],
-                nodes=state_dict["nodes"],
-                edges=state_dict["edges"],
-                outputs=state_dict["outputs"],
-                metadata_=state_dict["metadata"],
-                is_valid=True,
-                validation_errors=None,
-            ),
-            provenance="session_seed",
-        )
+        # Seed the state under a real COMPOSE lease minted by the production
+        # authority: the fenced writer requires the exact context, and the
+        # session created above already carries its retained fence.
+        async with acquire_compose_context(app.state.session_service, session_id) as compose_context:
+            await app.state.session_service.save_composition_state(
+                session_id,
+                CompositionStateData(
+                    sources=state_dict["sources"],
+                    nodes=state_dict["nodes"],
+                    edges=state_dict["edges"],
+                    outputs=state_dict["outputs"],
+                    metadata_=state_dict["metadata"],
+                    is_valid=True,
+                    validation_errors=None,
+                ),
+                provenance="session_seed",
+                session_operation_context=compose_context,
+            )
 
         validation_response = await client.post(
             f"/api/sessions/{session_id}/validate",
