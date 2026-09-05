@@ -371,7 +371,8 @@ class TestDeleteBlob:
         session_id = _create_session(client)
         blob = _upload_blob(client, session_id)
 
-        async def reject_pending_proposal(blob_id) -> None:
+        async def reject_pending_proposal(blob_id, *, session_operation_context) -> None:
+            del session_operation_context
             raise BlobPendingProposalError(str(blob_id), proposal_id="proposal-pending")
 
         monkeypatch.setattr(blob_service, "delete_blob", reject_pending_proposal)
@@ -455,8 +456,15 @@ class TestIDORProtection:
         resp = bob.get(f"/api/sessions/{bob_session}/blobs/{blob['id']}")
         assert resp.status_code == 404
 
-    def test_blob_delete_from_wrong_session_returns_404(self, tmp_path) -> None:
-        """DELETE another user's blob returns 404 and leaves the blob intact."""
+    def test_blob_delete_from_wrong_session_is_a_no_op_204(self, tmp_path) -> None:
+        """DELETE another user's blob is indistinguishable from deleting a missing one.
+
+        The service reads as the caller's session fence, so a foreign blob is
+        a ``BlobNotFoundError`` there, and the fenced route's delete is
+        idempotent (a missing blob is 204, the cleanup-capable shape the
+        contract gate mandates). The same 204 for "missing" and "not yours"
+        leaks nothing; the blob itself is untouched.
+        """
         alice, bob = self._make_two_session_app(tmp_path)
 
         alice_session = _create_session(alice, "Alice Session")
@@ -464,7 +472,9 @@ class TestIDORProtection:
         blob = _upload_blob(alice, alice_session)
 
         resp = bob.delete(f"/api/sessions/{bob_session}/blobs/{blob['id']}")
-        assert resp.status_code == 404
+        assert resp.status_code == 204
+        missing = bob.delete(f"/api/sessions/{bob_session}/blobs/{uuid4()}")
+        assert missing.status_code == 204
         assert alice.get(f"/api/sessions/{alice_session}/blobs/{blob['id']}/content").content
 
     def test_blob_download_from_wrong_session_returns_404(self, tmp_path) -> None:

@@ -127,6 +127,32 @@ def test_state_engine_validation_job_pins_actions_and_frozen_install() -> None:
     assert "uv sync --frozen --all-extras" in _run_lines(job)
 
 
+def test_suites_run_while_static_analysis_is_red_and_ci_success_still_requires_it() -> None:
+    """The test suites report on every run; the merge still waits on static analysis.
+
+    Operator ruling 2026-09-05 (elspeth-d8749aeaa3): the trust-tier step keeps
+    ``static-analysis`` red by design until Phase 5 signs the allowlists, and
+    while ``test`` and ``testcontainer`` carried ``needs: [static-analysis]``
+    every Python job was ``skipped`` on every push, so no run could score a
+    merge. Those two jobs (and ``integration``, which follows ``test``) now run
+    regardless; ``ci-success`` still lists ``static-analysis`` in its ``needs``
+    and still demands its ``result == success``, so the red blocks the merge
+    without hiding the test verdict. Exactly these two jobs were authorised;
+    the other static-analysis dependants keep theirs.
+    """
+    assert "needs" not in _job("test")
+    assert "needs" not in _job("testcontainer")
+    assert _job("integration")["needs"] == ["test"]
+    for dependant in ("state-engine-validation", "azure-container-apps-bicep", "supply-chain-audit"):
+        assert _job(dependant)["needs"] == ["static-analysis"], dependant
+    ci_success = _job("ci-success")
+    assert "static-analysis" in ci_success["needs"]
+    assert ci_success["if"] == "always()"
+    assert 'if [[ "${{ needs.static-analysis.result }}" != "success" ]]' in _run_lines(ci_success)
+    trust_tier = next(step for step in _job("static-analysis")["steps"] if step["name"] == "Run trust-tier elspeth-lints rule")
+    assert "continue-on-error" not in trust_tier
+
+
 def test_ci_success_requires_state_engine_validation() -> None:
     job = _job("ci-success")
     assert "state-engine-validation" in job["needs"]

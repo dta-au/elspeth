@@ -19,14 +19,13 @@ from elspeth.contracts.blobs import (
 )
 from elspeth.contracts.blobs_inline import BlobContentResolutionError, BlobInlineRef, BlobInlineValidationViolation, ResolvedBlobContent
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.blobs_inline import (
     _discover_blob_content_refs,
     _enforce_blob_content_ref_metadata,
     _evaluate_blob_content_ref_metadata,
-    _fetch_blob_contents,
+    _resolve_blob_content_results,
     _substitute_blob_content_refs,
-    _validate_blob_content_refs,
+    _unique_blob_ids,
     _validate_blob_content_refs_sync,
 )
 
@@ -35,41 +34,6 @@ BLOB1 = "5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b"
 BLOB2 = "7c3a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3aaa"
 BLOB3 = "9d4a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3bbb"
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
-OTHER_SESSION_ID = UUID("22222222-2222-4222-8222-222222222222")
-SESSION_OPERATION_CONTEXT = SessionOperationContext(
-    fence=SessionOperationFence(
-        session_id=str(SESSION_ID),
-        operation_id="33333333-3333-4333-8333-333333333333",
-        lease_token="inline-blob-test-lease-token",
-        operation_epoch=1,
-    ),
-    operation_kind=SessionOperationKind.BLOB_READ,
-)
-
-
-class _AsyncCallRecorder:
-    def __init__(self) -> None:
-        self.return_value: object = None
-        self.side_effect: BaseException | None = None
-        self.call_args_list: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    async def __call__(self, *args: object, **kwargs: object) -> object:
-        self.call_args_list.append((args, kwargs))
-        if self.side_effect is not None:
-            raise self.side_effect
-        return self.return_value
-
-    def assert_awaited_once_with(self, *args: object, **kwargs: object) -> None:
-        assert self.call_args_list == [(args, kwargs)]
-
-    def assert_not_called(self) -> None:
-        assert self.call_args_list == []
-
-
-class _BlobServiceDouble:
-    def __init__(self) -> None:
-        self.read_blob_content = _AsyncCallRecorder()
-        self.get_blob = _AsyncCallRecorder()
 
 
 def _marker(blob_id: str = BLOB1, sha256: str = VALID_HASH) -> dict[str, str]:
@@ -275,115 +239,67 @@ class TestDiscoverBlobContentRefs:
         assert exc_info.value.malformed == (("source.options.prompts", "inline blob refs inside lists are not supported"),)
 
 
-class TestFetchBlobContents:
-    @pytest.mark.asyncio
-    async def test_returns_bytes_by_ref(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.return_value = b"content"
+class TestResolveBlobContentResults:
+    """The production read batch: ``_unique_blob_ids`` dedupes the reads and
+    ``_resolve_blob_content_results`` classifies one gathered batch of
+    ``read_blob_content`` outcomes (``ExecutionService._read_inline_blob_contents``).
+
+    These cover what the deleted async ``_fetch_blob_contents`` pair covered
+    (P4-Q5): the pair had no production caller, so its behaviour is pinned at
+    the helpers the production loop actually calls.
+    """
+
+    def test_returns_bytes_by_ref(self) -> None:
         ref = _ref()
+        unique = _unique_blob_ids([ref])
 
-        fetched = await _fetch_blob_contents(
-            blob_service,
-            [ref],
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+        assert unique == [UUID(BLOB1)]
+        assert _resolve_blob_content_results([ref], unique, [b"content"]) == {ref: b"content"}
 
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-        assert fetched == {ref: b"content"}
-
-    @pytest.mark.asyncio
-    async def test_dedupes_reads_by_blob_id(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.return_value = b"content"
+    def test_dedupes_reads_by_blob_id(self) -> None:
         refs = [
             _ref(BLOB1, "source.options.a"),
             _ref(BLOB1, "source.options.b"),
         ]
+        unique = _unique_blob_ids(refs)
 
-        fetched = await _fetch_blob_contents(
-            blob_service,
-            refs,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+        # One read per blob id, fanned back out to every ref that named it.
+        assert unique == [UUID(BLOB1)]
+        assert _resolve_blob_content_results(refs, unique, [b"content"]) == {refs[0]: b"content", refs[1]: b"content"}
 
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-        assert fetched == {refs[0]: b"content", refs[1]: b"content"}
+    def test_propagates_integrity_errors(self) -> None:
+        ref = _ref()
+        failure = BlobIntegrityError(BLOB1, expected="a" * 64, actual="b" * 64)
 
-    @pytest.mark.asyncio
-    async def test_propagates_integrity_errors(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.side_effect = BlobIntegrityError(BLOB1, expected="a" * 64, actual="b" * 64)
+        with pytest.raises(BlobIntegrityError) as exc_info:
+            _resolve_blob_content_results([ref], [UUID(BLOB1)], [failure])
 
-        with pytest.raises(BlobIntegrityError):
-            await _fetch_blob_contents(
-                blob_service,
-                [_ref()],
-                session_operation_context=SESSION_OPERATION_CONTEXT,
-            )
+        assert exc_info.value is failure
 
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+    def test_propagates_content_missing_errors(self) -> None:
+        ref = _ref()
+        failure = BlobContentMissingError(BLOB1, storage_path="/tmp/blob.csv")
 
-    @pytest.mark.asyncio
-    async def test_propagates_content_missing_errors(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.side_effect = BlobContentMissingError(BLOB1, storage_path="/tmp/blob.csv")
+        with pytest.raises(BlobContentMissingError) as exc_info:
+            _resolve_blob_content_results([ref], [UUID(BLOB1)], [failure])
 
-        with pytest.raises(BlobContentMissingError):
-            await _fetch_blob_contents(
-                blob_service,
-                [_ref()],
-                session_operation_context=SESSION_OPERATION_CONTEXT,
-            )
+        assert exc_info.value is failure
 
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-
-    @pytest.mark.asyncio
-    async def test_collects_not_found_by_field_path(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.side_effect = BlobNotFoundError(BLOB1)
+    def test_collects_not_found_by_field_path(self) -> None:
+        ref = _ref()
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            await _fetch_blob_contents(
-                blob_service,
-                [_ref()],
-                session_operation_context=SESSION_OPERATION_CONTEXT,
-            )
+            _resolve_blob_content_results([ref], [UUID(BLOB1)], [BlobNotFoundError(BLOB1)])
 
         assert exc_info.value.missing == ("source.options.x",)
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
 
-    @pytest.mark.asyncio
-    async def test_collects_not_ready_by_field_path(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.read_blob_content.side_effect = BlobStateError(BLOB1, message="Blob is pending")
+    def test_collects_not_ready_by_field_path(self) -> None:
+        ref = _ref()
 
         with pytest.raises(BlobContentResolutionError) as exc_info:
-            await _fetch_blob_contents(
-                blob_service,
-                [_ref()],
-                session_operation_context=SESSION_OPERATION_CONTEXT,
-            )
+            _resolve_blob_content_results([ref], [UUID(BLOB1)], [BlobStateError(BLOB1, message="Blob is pending")])
 
         assert exc_info.value.not_ready == (("source.options.x", "Blob is pending"),)
-        blob_service.read_blob_content.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
 
 
 class TestSubstituteBlobContentRefs:
@@ -604,72 +520,16 @@ class TestValidateBlobContentRefs:
             ("(aggregate)", 128, 64),
         )
 
-    @pytest.mark.asyncio
-    async def test_async_returns_missing_violation_without_raising(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.get_blob.side_effect = BlobNotFoundError(BLOB1)
-        config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
+    def test_sync_returns_malformed_violation_without_lookup(self) -> None:
+        looked_up: list[UUID] = []
 
-        violations = await _validate_blob_content_refs(
-            blob_service,
-            config,
-            session_id=SESSION_ID,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+        def get_metadata(blob_id: UUID) -> BlobRecord | None:
+            looked_up.append(blob_id)
+            return None
 
-        assert violations == [
-            BlobInlineValidationViolation(
-                category="missing",
-                field_path="source.options.x",
-                detail=f"blob {UUID(BLOB1)} not found",
-            )
-        ]
-        blob_service.get_blob.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-
-    @pytest.mark.asyncio
-    async def test_async_treats_cross_session_blob_as_missing_before_metadata_checks(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.get_blob.return_value = _blob_record(
-            session_id=OTHER_SESSION_ID,
-            status="ready",
-            content_hash="b" * 64,
-            size_bytes=128,
-        )
-        config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
-
-        violations = await _validate_blob_content_refs(
-            blob_service,
-            config,
-            session_id=SESSION_ID,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-
-        assert violations == [
-            BlobInlineValidationViolation(
-                category="missing",
-                field_path="source.options.x",
-                detail=f"blob {UUID(BLOB1)} not found",
-            )
-        ]
-        blob_service.get_blob.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
-
-    @pytest.mark.asyncio
-    async def test_async_returns_malformed_violation_without_lookup(self) -> None:
-        blob_service = _BlobServiceDouble()
         config = {"source": {"options": {"x": {"blob_ref": BLOB1}}}}
 
-        violations = await _validate_blob_content_refs(
-            blob_service,
-            config,
-            session_id=SESSION_ID,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+        violations = _validate_blob_content_refs_sync(blob_get_metadata=get_metadata, config=config)
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -678,19 +538,18 @@ class TestValidateBlobContentRefs:
                 detail="missing mode",
             )
         ]
-        blob_service.get_blob.assert_not_called()
+        assert looked_up == []
 
-    @pytest.mark.asyncio
-    async def test_async_returns_malformed_violation_for_non_string_marker_fields(self) -> None:
-        blob_service = _BlobServiceDouble()
+    def test_sync_returns_malformed_violation_for_non_string_marker_fields(self) -> None:
+        looked_up: list[UUID] = []
+
+        def get_metadata(blob_id: UUID) -> BlobRecord | None:
+            looked_up.append(blob_id)
+            return None
+
         config = {"source": {"options": {"x": {"blob_ref": BLOB1, "mode": []}}}}
 
-        violations = await _validate_blob_content_refs(
-            blob_service,
-            config,
-            session_id=SESSION_ID,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
+        violations = _validate_blob_content_refs_sync(blob_get_metadata=get_metadata, config=config)
 
         assert violations == [
             BlobInlineValidationViolation(
@@ -699,28 +558,23 @@ class TestValidateBlobContentRefs:
                 detail="mode must be string",
             )
         ]
-        blob_service.get_blob.assert_not_called()
+        assert looked_up == []
 
-    @pytest.mark.asyncio
-    async def test_async_returns_hash_and_size_violations(self) -> None:
-        blob_service = _BlobServiceDouble()
-        blob_service.get_blob.return_value = _blob_record(content_hash="b" * 64, size_bytes=128)
+    def test_sync_reports_hash_mismatch_before_size(self) -> None:
+        # A hash mismatch is the only violation reported for that ref even
+        # when the record is also over the per-ref cap: the size comparison
+        # is meaningless against bytes that are not the declared bytes.
+        record = _blob_record(content_hash="b" * 64, size_bytes=128)
         config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
 
-        violations = await _validate_blob_content_refs(
-            blob_service,
-            config,
-            session_id=SESSION_ID,
+        violations = _validate_blob_content_refs_sync(
+            blob_get_metadata=lambda blob_id: record if blob_id == UUID(BLOB1) else None,
+            config=config,
             per_ref_byte_cap=64,
-            session_operation_context=SESSION_OPERATION_CONTEXT,
         )
 
         assert [violation.category for violation in violations] == ["hash_mismatch"]
         assert violations[0].field_path == "source.options.x"
-        blob_service.get_blob.assert_awaited_once_with(
-            UUID(BLOB1),
-            session_operation_context=SESSION_OPERATION_CONTEXT,
-        )
 
     def test_sync_returns_missing_violation_without_raising(self) -> None:
         config = {"source": {"options": {"x": _marker(BLOB1, VALID_HASH)}}}
