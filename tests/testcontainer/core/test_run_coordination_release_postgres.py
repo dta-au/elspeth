@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, insert, select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -29,8 +29,8 @@ RUN_ID = "release-seat-vs-takeover"
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _seed_run(db: LandscapeDB, *, run_id: str, now: datetime, status: str = "running") -> None:

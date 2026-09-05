@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from sqlalchemy import Engine, select, update
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.session_fences import acquire_compose_context
 
 from elspeth.contracts.composer_llm_audit import (
@@ -48,8 +48,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_engine() -> Iterator[Engine]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        engine = create_session_engine(postgres.get_connection_url())
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
         try:
             yield engine

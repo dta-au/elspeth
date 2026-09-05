@@ -8,8 +8,8 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import register_test_node
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.audit import TokenRef
@@ -26,8 +26,8 @@ _CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.mark.timeout(120)

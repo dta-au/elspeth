@@ -31,7 +31,7 @@ from typing import Any, cast
 import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import event, insert, select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.state_engine import capture_state_engine_image
 
 from elspeth.contracts import TerminalOutcome, TerminalPath
@@ -64,8 +64,8 @@ GRACE = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _seed(

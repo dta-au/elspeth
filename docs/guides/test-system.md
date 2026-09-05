@@ -32,7 +32,15 @@ Default behavior:
   integration files under `tests/integration/web/` carry per-test
   `testcontainer` marks. The run is serial because
   `tests/testcontainer/web/conftest.py` shares one TLS PostgreSQL container
-  across the deployment-acceptance files and rejects xdist workers.
+  across the deployment-acceptance files and rejects xdist workers. Every
+  PostgreSQL-backed suite obtains its server through one seam,
+  `tests/helpers/postgres_target.py` (a gate refuses any other
+  `PostgresContainer` construction): unset, it provisions a container per
+  suite; with `ELSPETH_TEST_POSTGRES_URL` set to an admin-capable PostgreSQL
+  URL (`sslmode=verify-full` + `sslrootcert=<file>` required by the
+  deployment-acceptance files) the same selection runs against that server
+  in a fresh database per suite, which is how the acceptance drivers record
+  a `testcontainer-run` receipt against the PostgreSQL they provisioned.
 - `.env` is loaded for integration-style tests that need local operator
   settings.
 

@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.exc import DataError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.engine.test_processor import _make_factory, _make_processor, _persist_token_for_scheduler
 
 from elspeth.contracts import NodeType, TokenInfo, TransformResult
@@ -68,8 +68,8 @@ BATTERY_REASON = {
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture

@@ -345,7 +345,20 @@ def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None
     assert "`testcontainer_run_gate`" in section
     for reason in sorted(TESTCONTAINER_RUN_GATE_REASONS - {"testcontainer_run_invalid"}):
         assert f"`{reason}`" in section, reason
-    assert "no external-DSN seam exists in the tree" in " ".join(section.split())
+    flat = " ".join(section.split())
+    assert "no external-DSN seam" not in flat
+    assert "`tests/helpers/postgres_target.py`" in flat and "`ELSPETH_TEST_POSTGRES_URL`" in flat
+    assert "`database`, `database_identity_sha256`" in flat
+    assert (
+        'export ELSPETH_TEST_POSTGRES_URL="postgresql+psycopg://${PG_ADMIN_USER}:${PGPASSWORD}@${PGHOST}:5432/postgres?sslmode=verify-full&sslrootcert=${AZURE_PG_ROOTS_PEM}"'
+        in section
+    )
+    assert ': "${AZURE_PG_ROOTS_PEM:?' in section and "unset ELSPETH_TEST_POSTGRES_URL" in section
+    assert (
+        section.index("export ELSPETH_TEST_POSTGRES_URL=")
+        < section.index("uv run --frozen pytest ")
+        < section.index("unset ELSPETH_TEST_POSTGRES_URL")
+    )
     assert text.index("## Connection budget") < text.index("## Testcontainer run") < text.index("## Evidence")
 
 
