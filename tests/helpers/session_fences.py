@@ -16,8 +16,9 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, insert
 
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.models import session_operation_fences_table
+from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
 def seed_session_operation_fence(
@@ -463,3 +464,31 @@ async def read_blob_content_under_fence(sessions_service, blob_service, session_
     """Read one blob's bytes under a real BLOB_READ context held only for the call."""
     async with acquire_operation_context(sessions_service, session_id, SessionOperationKind.BLOB_READ) as context:
         return await blob_service.read_blob_content(blob_id, session_operation_context=context)
+
+
+class FencedComposeTurnHarness(DualFencedSessionServiceHarness):
+    """Supply the sync ``persist_compose_turn`` primitive its COMPOSE authority.
+
+    The harness's other adapters are async and cannot cover this primitive:
+    it refuses to run inside an event loop. A call that names no context
+    receives the one LIVE COMPOSE context seeded for its session -- minted
+    through ``seed_live_compose_context`` on first use and reused for that
+    session's later turns -- so the writer's database authority check runs
+    for real against a durable fence row. No optional-context arm reaches
+    production and no signature is relaxed; an explicit context is forwarded
+    untouched.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._live_compose_contexts: dict[str, SessionOperationContext] = {}
+
+    def persist_compose_turn(self, **kwargs):
+        if "session_operation_context" not in kwargs:
+            sid = str(kwargs["session_id"])
+            context = self._live_compose_contexts.get(sid)
+            if context is None:
+                context = seed_live_compose_context(self._engine, sid, owner_instance_id=self.session_operation_owner_instance_id)
+                self._live_compose_contexts[sid] = context
+            kwargs["session_operation_context"] = context
+        return super().persist_compose_turn(**kwargs)

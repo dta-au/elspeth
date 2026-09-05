@@ -14,7 +14,7 @@ import hashlib
 import re
 import textwrap
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -1733,7 +1733,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1094,
+        line=1110,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1743,7 +1743,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1126,
+        line=1142,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1753,7 +1753,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1107,
+        line=1123,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1763,7 +1763,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1410,
+        line=1444,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1773,7 +1773,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1425,
+        line=1459,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1783,7 +1783,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1435,
+        line=1469,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1793,7 +1793,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "0307059e6046fc43",
         1,
         "IdentityAuthority",
-        line=1739,
+        line=1773,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1803,7 +1803,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c1b8a0cd93a6004f",
         1,
         "IdentityAuthority",
-        line=1212,
+        line=1246,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1813,7 +1813,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c1b8a0cd93a6004f",
         1,
         "IdentityAuthority",
-        line=1229,
+        line=1263,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1823,7 +1823,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c1b8a0cd93a6004f",
         1,
         "IdentityAuthority",
-        line=1245,
+        line=1279,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1833,7 +1833,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c1b8a0cd93a6004f",
         1,
         "IdentityAuthority",
-        line=1255,
+        line=1289,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1843,7 +1843,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "fcf79433f30c6fe9",
         1,
         "IdentityAuthority",
-        line=1523,
+        line=1557,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1853,7 +1853,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "fcf79433f30c6fe9",
         1,
         "IdentityAuthority",
-        line=1537,
+        line=1571,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1863,7 +1863,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d008133458a53f2c",
         1,
         "IdentityAuthority",
-        line=1472,
+        line=1506,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1873,7 +1873,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b7b28d84981c21fd",
         1,
         "IdentityAuthority",
-        line=1055,
+        line=1071,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1883,22 +1883,12 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c642d9839b59a5cd",
         1,
         "IdentityAuthority",
-        line=1601,
+        line=1635,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.pre_provision_identity",
         "identities",
-        "insert",
-        "79f23eb2f41856c8",
-        1,
-        "IdentityAuthority",
-        line=1310,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/coordination/identity_authority.py",
-        "RepositoryIdentityAuthority.pre_provision_identity",
-        "identity_roles",
         "insert",
         "79f23eb2f41856c8",
         1,
@@ -1908,12 +1898,22 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.pre_provision_identity",
+        "identity_roles",
+        "insert",
+        "79f23eb2f41856c8",
+        1,
+        "IdentityAuthority",
+        line=1378,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/identity_authority.py",
+        "RepositoryIdentityAuthority.pre_provision_identity",
         "quota_policies",
         "insert",
         "79f23eb2f41856c8",
         1,
         "IdentityAuthority",
-        line=1354,
+        line=1388,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1923,17 +1923,17 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "bc14f7647a324dad",
         1,
         "IdentityAuthority",
-        line=1831,
+        line=1865,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.retire_identity",
         "identities",
         "update",
-        "82a4fff894c91980",
+        "d5fe93b4219a69e3",
         1,
         "IdentityAuthority",
-        line=1167,
+        line=1194,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1943,7 +1943,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "98fac662dd803471",
         1,
         "IdentityAuthority",
-        line=1788,
+        line=1822,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1953,7 +1953,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "cc56170150988321",
         1,
         "IdentityAuthority",
-        line=1645,
+        line=1679,
     ),
     # ── identity substrate acquisitions: one write_connection per mutation,
     # contained (never escapes) and admitted by identity like a writer ────
@@ -1965,7 +1965,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b0000ee0e0238955",
         1,
         "IdentityAuthority",
-        line=1085,
+        line=1101,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1975,7 +1975,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "eb0301044ea54b03",
         1,
         "IdentityAuthority",
-        line=1395,
+        line=1429,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1985,7 +1985,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "70a1e8d7cce5c882",
         1,
         "IdentityAuthority",
-        line=1690,
+        line=1724,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1995,7 +1995,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "04825a9aeb9beb2b",
         1,
         "IdentityAuthority",
-        line=1203,
+        line=1237,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2005,7 +2005,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "58ea9c9a681d0e12",
         1,
         "IdentityAuthority",
-        line=1506,
+        line=1540,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2015,7 +2015,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "0f9c7191f5bcc87e",
         1,
         "IdentityAuthority",
-        line=1461,
+        line=1495,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2025,7 +2025,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "8065904e364a3496",
         1,
         "IdentityAuthority",
-        line=1052,
+        line=1068,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2035,7 +2035,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "24bac4354f78de56",
         1,
         "IdentityAuthority",
-        line=1575,
+        line=1609,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2045,7 +2045,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "875c1d10bd111a07",
         1,
         "IdentityAuthority",
-        line=1300,
+        line=1334,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2055,17 +2055,17 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ad900de7af568547",
         1,
         "IdentityAuthority",
-        line=1821,
+        line=1855,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.retire_identity",
         "<sessions-write-connection>",
         "write_connection",
-        "80bf10701f196a1f",
+        "c2e6e76316a133b3",
         1,
         "IdentityAuthority",
-        line=1158,
+        line=1185,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2075,7 +2075,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "526bc10b49fc5319",
         1,
         "IdentityAuthority",
-        line=1775,
+        line=1809,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2085,7 +2085,386 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "3e77bce9825d9c6f",
         1,
         "IdentityAuthority",
-        line=1625,
+        line=1659,
+    ),
+    # ── P4-D6 steps 4-5 admissions (elspeth-e483fe7f85): writers and contained
+    # acquisitions the scanner attributes to a named authority, admitted
+    # method-exact from live scanner output -- the step-4 facets, then the
+    # acquisitions the step-5 forwarding proof contained (mutate_fork_creation's
+    # probe; blobs/service.py's phase helpers once the proof followed their
+    # advisory-lock import) and the writer inside them.
+    #
+    # Two SessionOperationAuthority acquisitions remain ESCAPES by design and are
+    # deliberately NOT admitted (hub ruling 2 on elspeth-e483fe7f85); they stay
+    # in the drift counters as honest rows until their seams are restructured:
+    #   _SessionOperationAuthorityRepository._locked_transaction (:3998): nine of
+    #     its ten callers prove contained; ``mutate`` hands the connection to the
+    #     _RepositoryMutationTransaction constructor, the typed seam through
+    #     which the mutation facets execute -- a store by construction.
+    #   __build_locked_fork_pair_controls.locked_pair_transaction (:3952): a
+    #     nested factory def, not a class method; it keeps ``(conn, pair)`` in the
+    #     pair-lock registry that require_active_locked_fork_pair checks by
+    #     connection identity, and forwards to transaction_session_lock.
+    # ─────────────────────────────────────────────────────────────────────────
+    # src/elspeth/web/coordination/membership_authority.py :: WebInstanceMembershipAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.begin_drain",
+        "<sessions-write-connection>",
+        "write_connection",
+        "98fd14f12508e73a",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=296,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.heartbeat",
+        "<sessions-write-connection>",
+        "write_connection",
+        "71b4334a0f438add",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=274,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.register",
+        "<sessions-write-connection>",
+        "write_connection",
+        "4152160f19e026da",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=229,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.stop",
+        "<sessions-write-connection>",
+        "write_connection",
+        "476bbd10507b185c",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=318,
+    ),
+    # src/elspeth/web/coordination/repository.py :: SessionBlobMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.abort_blob_deletion",
+        "blob_deletion_cleanups",
+        "delete",
+        "4f9e61b1cf7247b0",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2954,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.commit_blob_deletion",
+        "blob_deletion_cleanups",
+        "update",
+        "32bd4fca1428b085",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2895,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.commit_blob_deletion",
+        "blobs",
+        "delete",
+        "87f41b9adb5c8772",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2902,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.discard_pending_blob",
+        "blobs",
+        "delete",
+        "0e357be387ddc260",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2436,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.finalize_pending_output_blob",
+        "blobs",
+        "update",
+        "d2eb84d546dbcdd2",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2211,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.insert_blob_inline_resolutions",
+        "blob_inline_resolutions",
+        "insert",
+        "bce659afe8519aae",
+        1,
+        "SessionBlobMutationAuthority",
+        line=3233,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.insert_blob_run_link",
+        "blob_run_links",
+        "insert",
+        "05fd90838bf9a030",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2979,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.mark_blob_deletion_staged",
+        "blob_deletion_cleanups",
+        "update",
+        "afe03ed89b5a16c7",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2854,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.mark_blob_ready",
+        "blobs",
+        "update",
+        "3fd8ace829dbb08b",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2405,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.mark_run_output_blob_error",
+        "blobs",
+        "update",
+        "f7b3307ef1e90c89",
+        1,
+        "SessionBlobMutationAuthority",
+        line=3168,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.mark_run_output_blob_ready",
+        "blobs",
+        "update",
+        "a2e525368ada9268",
+        1,
+        "SessionBlobMutationAuthority",
+        line=3140,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.prepare_blob_deletion",
+        "blob_deletion_cleanups",
+        "insert",
+        "850298970c19565f",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2799,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.reserve_blob",
+        "blobs",
+        "update",
+        "d4eba14bc84728e8",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2283,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.reserve_blob",
+        "blobs",
+        "insert",
+        "d112eae374c9b904",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2325,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.reserve_pending_output_blob",
+        "blobs",
+        "insert",
+        "c997a216a1a51351",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2129,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.retire_abandoned_blob_reservation",
+        "blobs",
+        "delete",
+        "d22b3792b721f8ac",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2497,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryBlobMutations.retire_blob_deletion",
+        "blob_deletion_cleanups",
+        "delete",
+        "4f9e61b1cf7247b0",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2936,
+    ),
+    # src/elspeth/web/coordination/repository.py :: SessionMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositorySessionMutations.decide_and_soft_archive",
+        "sessions",
+        "update",
+        "2aec308084effcf4",
+        1,
+        "SessionMutationAuthority",
+        line=649,
+    ),
+    # src/elspeth/web/coordination/repository.py :: SessionOperationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_SessionOperationAuthorityRepository._session_exists",
+        "<sessions-write-connection>",
+        "write_connection",
+        "f98bc6d74193a045",
+        1,
+        "SessionOperationAuthority",
+        line=4113,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_SessionOperationAuthorityRepository.renew_fork_child_lease",
+        "session_operation_fences",
+        "update",
+        "b268c9591db479c5",
+        1,
+        "SessionOperationAuthority",
+        line=4409,
+    ),
+    # src/elspeth/web/coordination/repository.py :: SessionRunMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_RepositoryRunMutations.append_run_event",
+        "run_events",
+        "insert",
+        "5009526a773c2d16",
+        1,
+        "SessionRunMutationAuthority",
+        line=1481,
+    ),
+    # src/elspeth/web/coordination/run_recovery_authority.py :: GlobalRunRecoveryAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/run_recovery_authority.py",
+        "RepositoryGlobalRunRecoveryAuthority.cancel_orphaned_run_records",
+        "<sessions-write-connection>",
+        "write_connection",
+        "39fa7162805bc149",
+        1,
+        "GlobalRunRecoveryAuthority",
+        line=185,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/run_recovery_authority.py",
+        "RepositoryGlobalRunRecoveryAuthority.mark_landscape_reconciliation_outcomes",
+        "<sessions-write-connection>",
+        "write_connection",
+        "ad4dba99faef80aa",
+        1,
+        "GlobalRunRecoveryAuthority",
+        line=222,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/run_recovery_authority.py",
+        "RepositoryGlobalRunRecoveryAuthority.mark_landscape_reconciliation_outcomes",
+        "<sessions-write-connection>",
+        "write_connection",
+        "22158e810234d589",
+        1,
+        "GlobalRunRecoveryAuthority",
+        line=229,
+    ),
+    # src/elspeth/web/secrets/user_store.py :: UserSecretAuthority
+    WriterIdentity(
+        "src/elspeth/web/secrets/user_store.py",
+        "RepositoryUserSecretAuthority.delete_secret",
+        "<sessions-write-connection>",
+        "write_connection",
+        "bc9adb13d7ec6188",
+        1,
+        "UserSecretAuthority",
+        line=194,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/secrets/user_store.py",
+        "RepositoryUserSecretAuthority.upsert_encrypted_secret",
+        "<sessions-write-connection>",
+        "write_connection",
+        "1eefe7b199768760",
+        1,
+        "UserSecretAuthority",
+        line=189,
+    ),
+    # src/elspeth/web/sessions/skill_markdown_history.py :: SkillMarkdownHistoryAuthority
+    WriterIdentity(
+        "src/elspeth/web/sessions/skill_markdown_history.py",
+        "RepositorySkillMarkdownHistoryAuthority.upsert_exact",
+        "<sessions-write-connection>",
+        "write_connection",
+        "7b8f2374db24e42b",
+        1,
+        "SkillMarkdownHistoryAuthority",
+        line=62,
+    ),
+    # src/elspeth/web/coordination/repository.py :: SessionOperationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_SessionOperationAuthorityRepository.mutate_fork_creation",
+        "<sessions-write-connection>",
+        "write_connection",
+        "2a24f2fb856584b3",
+        1,
+        "SessionOperationAuthority",
+        line=4746,
+    ),
+    # src/elspeth/web/blobs/service.py :: SessionBlobMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_finalize_reserved_blob",
+        "<sessions-write-connection>",
+        "write_connection",
+        "5fcbd10db9a8bb6a",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1291,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_finalize_reserved_blob",
+        "blobs",
+        "update",
+        "38de196d17740a2c",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1302,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_reserve_pending_blob",
+        "<sessions-write-connection>",
+        "write_connection",
+        "ed8bc9f6e94ae399",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1218,
     ),
 )
 
@@ -2174,7 +2553,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9de9c0b30666147c",
         1,
         None,
-        line=933,
+        line=949,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2184,7 +2563,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b9d11eb72686f0c0",
         1,
         None,
-        line=948,
+        line=964,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2194,7 +2573,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e0a739c1de8e182",
         1,
         None,
-        line=942,
+        line=958,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2204,7 +2583,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "aacf64b0b472d7a0",
         1,
         None,
-        line=920,
+        line=936,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2214,7 +2593,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "da5ad711342dec32",
         1,
         None,
-        line=990,
+        line=1006,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2224,7 +2603,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d27c1be3c6032030",
         1,
         None,
-        line=964,
+        line=980,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2234,7 +2613,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "447e2ca011fe13a9",
         1,
         None,
-        line=898,
+        line=914,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2244,7 +2623,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "785026bfc68cad16",
         1,
         None,
-        line=905,
+        line=921,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2254,7 +2633,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2be09707110fb626",
         1,
         None,
-        line=913,
+        line=929,
     ),
 )
 
@@ -2281,6 +2660,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=817,
     ),
+    # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
+    # to ``read_schema_identities`` behind a plain import, whose body executes
+    # only a SELECT on it; same acquisition, same fingerprint, no escape.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "_landscape_identity_issue",
@@ -2290,7 +2672,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=842,
-        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2323,6 +2704,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=1279,
         connection_escape=True,
     ),
+    # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
+    # ``_landscape_identity_issue`` above -- the forward is inspected, not assumed.
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._sync_schema_identity",
@@ -2332,7 +2715,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=1300,
-        connection_escape=True,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -2531,6 +2913,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=234,
     ),
+    # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
+    # same-module private callee that executes on it, which the forwarding
+    # proof now inspects; same acquisition, same fingerprint, no escape.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_group_satisfiability_resumable",
@@ -2540,7 +2925,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=430,
-        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -3016,10 +3400,39 @@ def _contained_connection_authority_for(path: str, symbol: str) -> str | None:
     return None
 
 
+# P4-D6 step 5 (hub ruling on elspeth-e483fe7f85): a connection forwarded to a
+# callable the scanner can INSPECT is contained when every use inside the callee
+# is one of these receivers, a dialect read, an anonymous nested transaction, or
+# a further resolvable forward within the depth bound. Everything else escapes.
+_EXECUTE_RECEIVER_METHODS = frozenset({"execute", "executemany", "exec_driver_sql", "scalar", "scalars"})
+_FORWARDING_MAX_DEPTH = 3
+_NESTED_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
 class _ProductionWriterCollector(ast.NodeVisitor):
-    def __init__(self, path: str, tree: ast.AST) -> None:
+    def __init__(self, path: str, tree: ast.AST, *, anchor: Path | None = None) -> None:
         self.path = path
         self.tree = tree
+        # Parallel to ``sites``: the node each site was emitted from, so a
+        # tree-wide post-pass can reason about a site's enclosing function.
+        self.site_nodes: list[ast.AST] = []
+        # A forwarded connection's callee behind a plain ``from x import f``
+        # is inspected in ITS module (P4-D6 step 5, cross-module ruling): the
+        # scanned collectors register here by path, and a module the scan did
+        # not include is parsed from disk under ``anchor`` on demand, so the
+        # verdict for a site never depends on which files a caller passed.
+        # No anchor and no peer: an imported callee is unresolvable.
+        self.anchor = anchor
+        self.peers: dict[str, _ProductionWriterCollector] = {}
         self.import_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.assignment_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.definition_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
@@ -4566,6 +4979,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         connection_escape: bool = False,
     ) -> None:
         symbol = _symbol(node)
+        self.site_nodes.append(node)
         self.sites.append(
             WriterIdentity(
                 path=self.path,
@@ -5323,6 +5737,237 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return any(_ProductionWriterCollector._target_stores_connection_externally(child) for child in target.elts)
         return False
 
+    # -- P4-D6 step 5: forwarding proof (hub ruling, six conditions) ----------
+
+    def _resolvable_private_callee(self, call: ast.Call) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """The callee when it is exactly one same-class method (``self.m(...)``) or one same-module
+        private function (``_f(...)``); ``None`` for anything dispatched through another object,
+        imported, public at module level, or ambiguous (condition 1)."""
+
+        definition = self._local_callable_definition(call)
+        if definition is None:
+            return None
+        if isinstance(call.func, ast.Attribute):
+            return definition if id(definition) in self.method_owners else None
+        parent = getattr(definition, "_inventory_parent", None)
+        if not isinstance(parent, ast.Module) or not definition.name.startswith("_"):
+            return None
+        return definition
+
+    def _resolvable_imported_callee(
+        self,
+        call: ast.Call,
+    ) -> tuple[_ProductionWriterCollector, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+        """The callee behind a plain ``from elspeth.<module> import f`` binding, located in the peer
+        collector that scanned that module: every reaching binding of the name must be that one
+        import (no alias, no reassignment), the module must be under ``src/elspeth`` and among the
+        scanned peers, and it must define exactly one module-level function of that name."""
+
+        func = call.func
+        if not isinstance(func, ast.Name):
+            return None
+        qualified = self._imported_qualified_name(func)
+        if qualified is None or not qualified.startswith("elspeth."):
+            return None
+        module, _, name = qualified.rpartition(".")
+        if name != func.id:
+            return None
+        reaching, complete, _ = self._visible_reaching_bindings(call, func.id)
+        if not complete or not reaching or any(binding.imported != qualified or binding.value is not None for binding in reaching):
+            return None
+        peer = self._peer_collector(f"src/{module.replace('.', '/')}.py")
+        if peer is None:
+            return None
+        definitions = [
+            node
+            for node in ast.iter_child_nodes(peer.tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ]
+        if len(definitions) != 1 or any(isinstance(node, ast.ClassDef) and node.name == name for node in ast.iter_child_nodes(peer.tree)):
+            return None
+        return peer, definitions[0]
+
+    def _peer_collector(self, path: str) -> _ProductionWriterCollector | None:
+        """The collector for ``path``: a scanned peer, else the module parsed from disk under the anchor."""
+
+        peer = self.peers.get(path)
+        if peer is not None:
+            return peer
+        if self.anchor is None:
+            return None
+        source_file = self.anchor / path
+        if not source_file.is_file():
+            return None
+        try:
+            tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=str(source_file))
+        except (SyntaxError, UnicodeDecodeError):
+            return None
+        _attach_parents(tree)
+        peer = _ProductionWriterCollector(path, tree, anchor=self.anchor)
+        peer.peers = self.peers
+        self.peers[path] = peer
+        return peer
+
+    def _is_static_method(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return any(
+            (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
+            or self._imported_qualified_name(decorator) == "builtins.staticmethod"
+            for decorator in definition.decorator_list
+        )
+
+    def _forwarded_parameter(
+        self,
+        call: ast.Call,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        argument: ast.expr,
+    ) -> str | None:
+        """The callee parameter that receives ``argument`` at ``call``, or ``None`` unless exactly knowable."""
+
+        if any(isinstance(item, ast.Starred) for item in call.args) or any(keyword.arg is None for keyword in call.keywords):
+            return None
+        positional = [*definition.args.posonlyargs, *definition.args.args]
+        if id(definition) in self.method_owners:
+            if not isinstance(call.func, ast.Attribute):
+                return None
+            if not self._is_static_method(definition):
+                if not positional:
+                    return None
+                positional = positional[1:]
+        for index, item in enumerate(call.args):
+            if item is argument:
+                return positional[index].arg if index < len(positional) else None
+        for keyword in call.keywords:
+            if keyword.value is argument:
+                names = {parameter.arg for parameter in (*positional, *definition.args.kwonlyargs)}
+                return keyword.arg if keyword.arg in names else None
+        return None
+
+    @classmethod
+    def _scope_nodes(cls, scope: ast.AST) -> Iterator[ast.AST]:
+        """Every node of ``scope`` without descending into a nested scope (the nested scope itself is yielded)."""
+
+        for child in ast.iter_child_nodes(scope):
+            yield child
+            if isinstance(child, _NESTED_SCOPES):
+                continue
+            yield from cls._scope_nodes(child)
+
+    def _connection_uses_are_contained(
+        self,
+        scope: ast.FunctionDef | ast.AsyncFunctionDef,
+        name: str,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        allow_yield: bool = False,
+        strict: bool = False,
+    ) -> bool:
+        """Every use of connection ``name`` inside ``scope`` keeps the capability there.
+
+        Permitted: the name is executed on (``_EXECUTE_RECEIVER_METHODS``), its
+        ``dialect`` is read, it opens an anonymous ``with name.begin_nested():``,
+        is ``del``-ed, or is forwarded to a resolvable callee whose own uses are
+        contained (recursively, ``_FORWARDING_MAX_DEPTH``, cycle-refusing) -- a
+        same-class method, a same-module private function, or a module-level
+        function behind a plain ``from elspeth.<module> import f`` inspected in
+        its own module. Past a module boundary the walk is ``strict``: every
+        execution on the forwarded connection must be a provably read-only or
+        advisory-lock statement, so an imported callee can never carry table
+        DML. ``allow_yield`` admits the one ``yield name`` a contextmanager
+        wrapper is. Anything else -- a store, return, comparison, closure or
+        comprehension capture, star-argument, reassignment, raw DBAPI access, a
+        bound nested transaction, an aliased import, a callee outside
+        ``src/elspeth`` or an unresolvable forward -- refuses.
+        """
+
+        if depth > _FORWARDING_MAX_DEPTH or self._name_reassigned_in(scope, name):
+            return False
+        for node in self._scope_nodes(scope):
+            if isinstance(node, _NESTED_SCOPES):
+                if any(isinstance(inner, ast.Name) and inner.id == name for inner in ast.walk(node)):
+                    return False
+                continue
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if not self._connection_use_is_contained(node, depth=depth, active=active, allow_yield=allow_yield, strict=strict):
+                return False
+        return True
+
+    def _connection_use_is_contained(
+        self,
+        use: ast.Name,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        allow_yield: bool,
+        strict: bool,
+    ) -> bool:
+        parent = getattr(use, "_inventory_parent", None)
+        if isinstance(use.ctx, ast.Del):
+            # ``del conn`` unbinds the local name; nothing receives the capability.
+            return True
+        if not isinstance(use.ctx, ast.Load):
+            # The with-binding that introduces the name is the one permitted store.
+            return isinstance(parent, ast.withitem) and parent.optional_vars is use
+        if isinstance(parent, ast.Attribute) and parent.value is use:
+            grandparent = getattr(parent, "_inventory_parent", None)
+            if parent.attr == "dialect":
+                return True
+            if isinstance(grandparent, ast.Call) and grandparent.func is parent:
+                if parent.attr in _EXECUTE_RECEIVER_METHODS:
+                    if not strict:
+                        return True
+                    # Past a module boundary only a provably read-only /
+                    # advisory-lock statement may run on the forwarded connection.
+                    statement = grandparent.args[0] if grandparent.args else None
+                    return statement is not None and self._is_obviously_read_only_statement(statement, use=grandparent)
+                if parent.attr in {"begin", "begin_nested"}:
+                    item = getattr(grandparent, "_inventory_parent", None)
+                    return isinstance(item, ast.withitem) and item.context_expr is grandparent and item.optional_vars is None
+            return False
+        if allow_yield and isinstance(parent, ast.Yield) and parent.value is use:
+            return isinstance(getattr(parent, "_inventory_parent", None), ast.Expr)
+        call = getattr(parent, "_inventory_parent", None) if isinstance(parent, ast.keyword) else parent
+        if not isinstance(call, ast.Call) or call.func is use:
+            return False
+        if use not in call.args and not any(keyword.value is use for keyword in call.keywords):
+            return False
+        return self._forward_is_contained(call, use, depth=depth + 1, active=active, strict=strict)
+
+    def _forward_is_contained(
+        self,
+        call: ast.Call,
+        argument: ast.Name,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        strict: bool,
+    ) -> bool:
+        """``callee(conn)`` keeps the connection contained iff the callee is inspectable and proves it.
+
+        A same-file callee is inspected here; an imported one in its own module's
+        collector, and from there on the walk is strict.
+        """
+
+        owner: _ProductionWriterCollector = self
+        callee = self._resolvable_private_callee(call)
+        if callee is None:
+            imported = self._resolvable_imported_callee(call)
+            if imported is None:
+                return False
+            owner, callee = imported
+            strict = True
+        parameter = owner._forwarded_parameter(call, callee, argument)
+        if parameter is None:
+            return False
+        key = (id(callee), parameter)
+        if key in active:
+            return False
+        return owner._connection_uses_are_contained(callee, parameter, depth=depth, active=active | {key}, strict=strict)
+
+    def _forwarding_is_contained(self, call: ast.Call, argument: ast.Name) -> bool:
+        return self._forward_is_contained(call, argument, depth=1, active=frozenset(), strict=False)
+
     def _collect_unresolved_connection_flows(self) -> None:
         """Fail closed when an acquired connection reaches an unknown write-capable sink."""
 
@@ -5443,10 +6088,16 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             # ``with engine.begin() as conn: imported_or_local_helper(conn)``.
             # A helper can hide a prebuilt or dynamically generated write, so
             # forwarding a raw connection is write-capable until a typed
-            # authority removes that path.
+            # authority removes that path -- unless the callee can be INSPECTED
+            # and every use inside it is proven contained (P4-D6 step 5); a
+            # callee the scanner cannot resolve keeps the escape.
             for argument in (*call.args, *(keyword.value for keyword in call.keywords)):
-                for acquisition in self._connection_acquisitions_for_expression(call, argument):
-                    self._record_connection(acquisition, escapes=True)
+                acquisitions = self._connection_acquisitions_for_expression(call, argument)
+                if not acquisitions:
+                    continue
+                contained = isinstance(argument, ast.Name) and self._forwarding_is_contained(call, argument)
+                for acquisition in acquisitions:
+                    self._record_connection(acquisition, escapes=not contained)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
@@ -5538,14 +6189,120 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
             raise InventoryScanError(f"cannot parse production source {source_file}: {error}") from error
         _attach_parents(tree)
         relative = relative_path.as_posix()
-        collector = _ProductionWriterCollector(relative, tree)
-        collected.append((collector, collector.collect()))
+        collected.append((_ProductionWriterCollector(relative, tree, anchor=anchor.resolve()), []))
+    # Two phases: every collector exists before any collects, so a forwarded
+    # connection's imported callee can be inspected in its own module (one it
+    # was not scanned with is parsed from disk under the anchor on demand).
+    peers = {collector.path: collector for collector, _ in collected}
+    for collector, _ in collected:
+        collector.peers = peers
+    collected = [(collector, collector.collect()) for collector, _ in collected]
     proven = _CallerSideProof(collected).proven_site_indexes()
+    contained = _WrapperContainmentProof(collected).contained_site_indexes()
     sites: list[WriterIdentity] = []
     for collector, collector_sites in collected:
         dropped = proven.get(id(collector), set())
-        sites.extend(site for index, site in enumerate(collector_sites) if index not in dropped)
+        flipped = contained.get(id(collector), set())
+        for index, site in enumerate(collector_sites):
+            if index in dropped:
+                continue
+            sites.append(replace(site, connection_escape=False) if index in flipped else site)
     return sites
+
+
+class _WrapperContainmentProof:
+    """Same-class, state-fed ``@contextmanager`` wrappers (P4-D6 step 5, condition 2).
+
+    A wrapper that acquires from the enclosing instance's own state
+    (``with self._engine.begin() as conn: yield conn``) reports its acquisition
+    as an escape because it yields the connection. It is CONTAINED only when,
+    tree-wide, every reference to the wrapper's name is a ``with self.<wrapper>(...)
+    as target:`` from an instance method of the same class, the wrapper's own
+    uses of the connection are contained (the yield being the one permitted),
+    and the with-target never escapes in ANY caller by the forwarding rule --
+    all call sites, never any; one unproven caller or one foreign reference
+    keeps the wrapper row escaped.
+    """
+
+    def __init__(self, collected: Sequence[tuple[_ProductionWriterCollector, list[WriterIdentity]]]) -> None:
+        self._collected = collected
+
+    def contained_site_indexes(self) -> dict[int, set[int]]:
+        contained: dict[int, set[int]] = {}
+        for collector, sites in self._collected:
+            for index, site in enumerate(sites):
+                if site.operation != "write_connection" or not site.connection_escape:
+                    continue
+                if self._wrapper_is_contained(collector, collector.site_nodes[index]):
+                    contained.setdefault(id(collector), set()).add(index)
+        return contained
+
+    @staticmethod
+    def _self_parameter(definition: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+        positional = (*definition.args.posonlyargs, *definition.args.args)
+        return positional[0].arg if positional else None
+
+    def _acquisition_rooted_in_self(self, wrapper: ast.FunctionDef | ast.AsyncFunctionDef, acquisition: ast.AST) -> bool:
+        if not (isinstance(acquisition, ast.Call) and isinstance(acquisition.func, ast.Attribute)):
+            return False
+        if acquisition.func.attr not in {"begin", "connect"}:
+            return False
+        receiver: ast.expr = acquisition.func.value
+        while isinstance(receiver, ast.Attribute):
+            receiver = receiver.value
+        return isinstance(receiver, ast.Name) and receiver.id == self._self_parameter(wrapper)
+
+    def _wrapper_is_contained(self, collector: _ProductionWriterCollector, acquisition: ast.AST) -> bool:
+        wrapper = collector._enclosing_function(acquisition)
+        if wrapper is None or id(wrapper) not in collector.method_owners or not collector._is_instance_method(wrapper):
+            return False
+        item = getattr(acquisition, "_inventory_parent", None)
+        if not (isinstance(item, ast.withitem) and item.context_expr is acquisition and isinstance(item.optional_vars, ast.Name)):
+            return False
+        if collector._enclosing_function(getattr(item, "_inventory_parent", None)) is not wrapper:
+            return False
+        if not self._acquisition_rooted_in_self(wrapper, acquisition):
+            return False
+        name = item.optional_vars.id
+        yields = collector._direct_yields(wrapper)
+        if not yields or any(
+            not (isinstance(yielded, ast.Yield) and isinstance(yielded.value, ast.Name) and yielded.value.id == name) for yielded in yields
+        ):
+            return False
+        if not collector._connection_uses_are_contained(wrapper, name, depth=0, active=frozenset(), allow_yield=True):
+            return False
+        owner_class = collector.method_owners[id(wrapper)]
+        callers: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+        for other, _ in self._collected:
+            for node in ast.walk(other.tree):
+                if isinstance(node, ast.Name) and node.id == wrapper.name:
+                    return False
+                if not (isinstance(node, ast.Attribute) and node.attr == wrapper.name):
+                    continue
+                if other is not collector:
+                    return False
+                call = getattr(node, "_inventory_parent", None)
+                if not (isinstance(call, ast.Call) and call.func is node):
+                    return False
+                with_item = getattr(call, "_inventory_parent", None)
+                if not (
+                    isinstance(with_item, ast.withitem) and with_item.context_expr is call and isinstance(with_item.optional_vars, ast.Name)
+                ):
+                    return False
+                caller = collector._enclosing_function(call)
+                if (
+                    caller is None
+                    or collector.method_owners.get(id(caller)) is not owner_class
+                    or not collector._is_instance_method(caller)
+                ):
+                    return False
+                if not (isinstance(node.value, ast.Name) and node.value.id == self._self_parameter(caller)):
+                    return False
+                callers.append((caller, with_item.optional_vars.id))
+        if not callers:
+            return False
+        # The caller's own body is depth 0: its forwards count against the bound.
+        return all(collector._connection_uses_are_contained(caller, target, depth=0, active=frozenset()) for caller, target in callers)
 
 
 class _CallerSideProof:
@@ -6142,11 +6899,19 @@ def test_global_run_recovery_writer_is_exact_contained_and_replaces_direct_servi
     ]
     authority_live = [site for site in scanned if site.symbol in symbols]
     run_writes = [site for site in authority_live if site.table == "runs"]
-    reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in symbols]
+    reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in symbols and site.table == "runs"]
     assert len(run_writes) == len(reviewed) == 2
     assert inventory_drift(run_writes, reviewed) == ([], [])
     assert authority_policy_violations(run_writes, _TABLE_POLICIES) == ([], [])
     assert connection_authority_violations(authority_live) == []
+    # The authority's own acquisitions are admitted like writers (P4-D6 step 4):
+    # every live contained acquisition is reviewed, and nothing reviewed has
+    # drifted or escaped.
+    acquisitions = [site for site in authority_live if site.operation == "write_connection"]
+    reviewed_acquisitions = [site for site in _REVIEWED_WRITERS if site.symbol in symbols and site.operation == "write_connection"]
+    assert len(acquisitions) == len(reviewed_acquisitions) == 3
+    assert not any(site.connection_escape for site in acquisitions)
+    assert inventory_drift(acquisitions, reviewed_acquisitions) == ([], [])
 
 
 def test_web_instance_membership_writer_is_exact_contained_and_operation_exact() -> None:
@@ -8223,7 +8988,15 @@ def test_parameter_fed_contextmanager_wrapper_acquisitions_are_attributed_to_cal
 
 
 def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path: Path) -> None:
-    """A wrapper that acquires from its own state is the boundary; callers resolve through it, not around it."""
+    """A wrapper that acquires from its own state is the boundary; callers resolve through it, not around it.
+
+    The acquisition is reported ONCE, in the wrapper's name, never re-homed to a
+    caller. Whether it is an escape is the callers' doing (P4-D6 step 5, hub
+    ruling condition 2): here the one caller is a same-class method that only
+    executes on the with-target, so the wrapper is contained; a caller that
+    leaks it, a foreign caller, or an escape inside the wrapper keeps the
+    flag (``test_wrapper_containment_is_all_callers_and_same_class_only``).
+    """
 
     source = tmp_path / "self_fed_wrapper.py"
     source.write_text(
@@ -8248,7 +9021,7 @@ def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path:
     )
     sites = scan_production_writers([source], anchor=tmp_path)
     assert [(site.symbol, site.table, site.operation, site.connection_escape) for site in sites] == [
-        ("Store._begin", "<sessions-write-connection>", "write_connection", True),
+        ("Store._begin", "<sessions-write-connection>", "write_connection", False),
     ]
 
 
@@ -8555,6 +9328,487 @@ def test_package_premise_is_revoked_by_a_session_shaped_import(tmp_path: Path) -
                 ("parameter_received", "<unresolved-session-write>", "unknown_execute"): 1,
             }
         ), imports
+
+
+_CALLER_SIDE_PROOF_MODULE = textwrap.dedent(
+    """\
+    class Repo:
+        def __init__(self, db):
+            self._db = db
+
+        def caller(self, stmt):
+            with self._db.write_connection() as conn:
+                helper(conn, stmt)
+
+        def chained_caller(self, stmt):
+            with self._db.write_connection() as conn:
+                outer(conn, stmt)
+
+    def helper(conn, stmt):
+        conn.execute(stmt)
+
+    def outer(conn, stmt):
+        inner(conn, stmt)
+
+    def inner(conn, stmt):
+        conn.execute(stmt)
+    """
+)
+
+
+def _caller_side_findings(tmp_path: Path, extra: dict[str, str] | None = None) -> Counter[tuple[str, str, str]]:
+    """Scan the declared Landscape module plus any extra modules, keyed (path, symbol, table)."""
+
+    declared = tmp_path / "src/elspeth/core/landscape/repo.py"
+    declared.parent.mkdir(parents=True, exist_ok=True)
+    declared.write_text(_CALLER_SIDE_PROOF_MODULE)
+    files = [declared]
+    for relative, body in (extra or {}).items():
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(textwrap.dedent(body))
+        files.append(source)
+    return Counter(
+        (site.path, site.symbol, site.table)
+        for site in scan_production_writers(files, anchor=tmp_path)
+        if site.table == "<unresolved-session-write>"
+    )
+
+
+def test_caller_side_proof_clears_a_helper_every_caller_binds_to_a_module_bound_connection(tmp_path: Path) -> None:
+    """Option (b) acceptance: ``helper`` executes on a parameter, and its only caller binds that parameter
+    from the declared module's own handle, so the execution is proven non-Sessions tree-wide. The chain
+    ``chained_caller -> outer -> inner`` proves ``inner`` through ``outer``'s own parameter."""
+
+    assert _caller_side_findings(tmp_path) == Counter()
+
+
+def test_caller_side_proof_refuses_when_one_caller_hands_a_sessions_connection(tmp_path: Path) -> None:
+    """Adversarial: a web module imports the same helper and passes an engine-bound connection.
+    One contrary call site keeps the parameter-received execution unresolved -- the proof is
+    all-call-sites, never any-call-site."""
+
+    web = """\
+        from elspeth.core.landscape.repo import helper
+
+        def web_caller(engine, stmt):
+            with engine.begin() as conn:
+                helper(conn, stmt)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/web/escape.py": web})
+    assert findings[("src/elspeth/core/landscape/repo.py", "helper", "<unresolved-session-write>")] == 1
+    # The chain has no contrary caller and stays proven.
+    assert findings[("src/elspeth/core/landscape/repo.py", "inner", "<unresolved-session-write>")] == 0
+
+
+def test_caller_side_proof_refuses_a_call_whose_argument_cannot_be_known(tmp_path: Path) -> None:
+    """Adversarial: a star-argument call site cannot bind the parameter to any expression, so it refuses."""
+
+    starred = """\
+        from elspeth.core.landscape.repo import inner
+
+        def relay(*args):
+            inner(*args)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/relay.py": starred})
+    assert findings[("src/elspeth/core/landscape/repo.py", "inner", "<unresolved-session-write>")] == 1
+    assert findings[("src/elspeth/core/landscape/repo.py", "helper", "<unresolved-session-write>")] == 0
+
+
+def test_caller_side_proof_refuses_a_cycle_and_a_helper_nobody_calls(tmp_path: Path) -> None:
+    """Adversarial: two helpers that only hand the connection to each other prove nothing (a cycle is
+    refused, not assumed), and a parameter-received helper with no call site at all stays unresolved."""
+
+    cyclic = """\
+        def ping(conn, stmt):
+            pong(conn, stmt)
+
+        def pong(conn, stmt):
+            ping(conn, stmt)
+            conn.execute(stmt)
+
+        def orphan(conn, stmt):
+            conn.execute(stmt)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/cycle.py": cyclic})
+    assert findings[("src/elspeth/core/landscape/cycle.py", "pong", "<unresolved-session-write>")] == 1
+    assert findings[("src/elspeth/core/landscape/cycle.py", "orphan", "<unresolved-session-write>")] == 1
+
+
+_CONTAINED_FORWARDING_MODULE = """\
+    from contextlib import contextmanager
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        @contextmanager
+        def _tx(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def direct(self, stmt):
+            with self._tx() as conn:
+                conn.execute(stmt)
+
+        def forwarded(self, stmt):
+            with self._tx() as conn:
+                self._apply(conn, stmt)
+
+        def _apply(self, conn, stmt):
+            if conn.dialect.name == "postgresql":
+                conn.exec_driver_sql(stmt)
+            with conn.begin_nested():
+                self._deeper(conn, stmt=stmt)
+
+        def _deeper(self, conn, *, stmt):
+            conn.execute(stmt)
+            _module_helper(conn, stmt)
+            del conn
+
+        def own_acquisition(self, stmt):
+            with self._engine.begin() as conn:
+                _module_helper(conn, stmt)
+
+    def _module_helper(conn, stmt):
+        conn.execute(stmt)
+    """
+
+_ESCAPING_FORWARDING_MODULE = """\
+    from elspeth.web.other import imported_helper
+
+    def helper(conn, stmt):
+        conn.execute(stmt)
+
+    class Repo:
+        def __init__(self, engine, handler):
+            self._engine = engine
+            self._handler = handler
+
+        def stores(self, stmt):
+            with self._engine.begin() as conn:
+                self._keep(conn)
+
+        def _keep(self, conn):
+            self._held = conn
+
+        def returns(self, stmt):
+            with self._engine.begin() as conn:
+                self._give(conn)
+
+        def _give(self, conn):
+            return conn
+
+        def yields(self, stmt):
+            with self._engine.begin() as conn:
+                self._gen(conn)
+
+        def _gen(self, conn):
+            yield conn
+
+        def closure(self, stmt):
+            with self._engine.begin() as conn:
+                self._defer(conn, stmt)
+
+        def _defer(self, conn, stmt):
+            return lambda: conn.execute(stmt)
+
+        def starred(self, stmt, *rest):
+            with self._engine.begin() as conn:
+                self._exec(conn, *rest)
+
+        def _exec(self, conn, *rest):
+            conn.execute(rest[0])
+
+        def cross_module(self, stmt):
+            with self._engine.begin() as conn:
+                imported_helper(conn, stmt)
+
+        def dispatched(self, stmt):
+            with self._engine.begin() as conn:
+                self._handler.run(conn, stmt)
+
+        def public_helper(self, stmt):
+            with self._engine.begin() as conn:
+                helper(conn, stmt)
+
+        def too_deep(self, stmt):
+            with self._engine.begin() as conn:
+                self._d1(conn, stmt)
+
+        def _d1(self, conn, stmt):
+            self._d2(conn, stmt)
+
+        def _d2(self, conn, stmt):
+            self._d3(conn, stmt)
+
+        def _d3(self, conn, stmt):
+            self._d4(conn, stmt)
+
+        def _d4(self, conn, stmt):
+            conn.execute(stmt)
+
+        def raw_dbapi(self, stmt):
+            with self._engine.begin() as conn:
+                self._raw(conn, stmt)
+
+        def _raw(self, conn, stmt):
+            return conn.connection.cursor().execute(stmt)
+
+        def bound_nested(self, stmt):
+            with self._engine.begin() as conn:
+                self._savepoint(conn, stmt)
+
+        def _savepoint(self, conn, stmt):
+            savepoint = conn.begin_nested()
+            conn.execute(stmt)
+            savepoint.rollback()
+
+        def compared(self, stmt):
+            with self._engine.begin() as conn:
+                self._identity(conn)
+
+        def _identity(self, conn):
+            return id(conn)
+    """
+
+_WRAPPER_MODULE = """\
+    from contextlib import contextmanager
+    from elspeth.web.sessions.locking import transaction_lock
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        @contextmanager
+        def _one_bad_caller(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def fine(self, stmt):
+            with self._one_bad_caller() as conn:
+                conn.execute(stmt)
+
+        def leaks(self, stmt):
+            with self._one_bad_caller() as conn:
+                self._held = conn
+
+        @contextmanager
+        def _foreign_reference(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def uses_foreign(self, stmt):
+            with self._foreign_reference() as conn:
+                conn.execute(stmt)
+
+        @contextmanager
+        def _escapes_inside(self, session_id):
+            with self._engine.begin() as conn:
+                transaction_lock(conn, session_id)
+                yield conn
+
+        def uses_escaping(self, stmt):
+            with self._escapes_inside("s") as conn:
+                conn.execute(stmt)
+
+        @contextmanager
+        def _passed_not_entered(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def hands_out(self):
+            return self._passed_not_entered
+    """
+
+_WRAPPER_FOREIGN_MODULE = """\
+    def borrow(repo, stmt):
+        with repo._foreign_reference() as conn:
+            conn.execute(stmt)
+    """
+
+
+def _acquisition_escapes(tmp_path: Path, modules: dict[str, str]) -> dict[str, bool]:
+    """``symbol -> connection_escape`` for every write_connection row the scan of ``modules`` reports."""
+
+    files = []
+    for relative, body in modules.items():
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(textwrap.dedent(body))
+        files.append(source)
+    escapes: dict[str, bool] = {}
+    for site in scan_production_writers(files, anchor=tmp_path):
+        if site.operation == "write_connection":
+            escapes[site.symbol] = escapes.get(site.symbol, False) or site.connection_escape
+    return escapes
+
+
+def test_forwarding_proof_contains_a_connection_handed_only_to_inspectable_callees(tmp_path: Path) -> None:
+    """Step-5 acceptance: a same-class method chain and a same-module private helper that only
+    execute on the connection (a dialect read, an anonymous nested transaction and a ``del`` of the
+    local name included) keep it contained, three forwards deep; the state-fed wrapper whose every
+    caller is such a method is contained too."""
+
+    assert _acquisition_escapes(tmp_path, {"src/elspeth/web/contained.py": _CONTAINED_FORWARDING_MODULE}) == {
+        "Repo._tx": False,
+        "Repo.own_acquisition": False,
+    }
+
+
+def test_forwarding_proof_refuses_every_escape_form(tmp_path: Path) -> None:
+    """Adversarial: each callee leaks the connection one way -- attribute store, return, yield,
+    closure capture, star-argument call, cross-module callee, attribute-dispatched callee, a PUBLIC
+    module function, depth beyond the bound, raw DBAPI access, a bound nested transaction, a
+    comparison through a builtin -- and each acquisition stays an escape."""
+
+    escapes = _acquisition_escapes(tmp_path, {"src/elspeth/web/escapes.py": _ESCAPING_FORWARDING_MODULE})
+    expected = {
+        "Repo.stores",
+        "Repo.returns",
+        "Repo.yields",
+        "Repo.closure",
+        "Repo.starred",
+        "Repo.cross_module",
+        "Repo.dispatched",
+        "Repo.public_helper",
+        "Repo.too_deep",
+        "Repo.raw_dbapi",
+        "Repo.bound_nested",
+        "Repo.compared",
+    }
+    assert {symbol for symbol, escaped in escapes.items() if escaped} == expected
+
+
+def test_wrapper_containment_is_all_callers_and_same_class_only(tmp_path: Path) -> None:
+    """Adversarial: one caller that stores the with-target, one foreign-module caller, an escape
+    inside the wrapper's own body, and a wrapper handed out uncalled each keep the wrapper's
+    acquisition escaped."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {"src/elspeth/web/wrappers.py": _WRAPPER_MODULE, "src/elspeth/web/elsewhere.py": _WRAPPER_FOREIGN_MODULE},
+    )
+    assert escapes == {
+        "Repo._one_bad_caller": True,
+        "Repo._foreign_reference": True,
+        "Repo._escapes_inside": True,
+        "Repo._passed_not_entered": True,
+    }
+
+
+_CROSS_MODULE_LOCKING = """\
+    def acquire_lock(conn, key):
+        conn.exec_driver_sql("SELECT pg_catalog.pg_advisory_xact_lock(%s)", (key,))
+
+    def custody_lock(conn, key):
+        _advisory(conn, key)
+
+    def _advisory(conn, key):
+        conn.exec_driver_sql("SELECT pg_catalog.pg_advisory_xact_lock(%s)", (key,))
+
+    def poison(conn, key):
+        conn.exec_driver_sql("UPDATE sessions SET status = 'x'")
+
+    def hop1(conn, key):
+        _hop2(conn, key)
+
+    def _hop2(conn, key):
+        _hop3(conn, key)
+
+    def _hop3(conn, key):
+        _hop4(conn, key)
+
+    def _hop4(conn, key):
+        conn.exec_driver_sql("SELECT 1")
+    """
+
+_CROSS_MODULE_CALLERS = """\
+    from elspeth.web.sessions.locking import acquire_lock, custody_lock, hop1, poison
+    from elspeth.web.sessions.locking import acquire_lock as grab
+    from lib.outside import outside_lock
+    from elspeth.web.missing import ghost_lock
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        def phase(self, key):
+            with self._engine.begin() as conn:
+                _lock(conn, key)
+
+        def two_hops(self, key):
+            with self._engine.begin() as conn:
+                custody_lock(conn, key)
+
+        def dml_behind_import(self, key):
+            with self._engine.begin() as conn:
+                poison(conn, key)
+
+        def aliased(self, key):
+            with self._engine.begin() as conn:
+                grab(conn, key)
+
+        def outside(self, key):
+            with self._engine.begin() as conn:
+                outside_lock(conn, key)
+
+        def unscanned(self, key):
+            with self._engine.begin() as conn:
+                ghost_lock(conn, key)
+
+        def too_deep(self, key):
+            with self._engine.begin() as conn:
+                hop1(conn, key)
+
+    def _lock(conn, key):
+        acquire_lock(conn, key)
+    """
+
+_OUTSIDE_LOCKING = """\
+    def outside_lock(conn, key):
+        conn.exec_driver_sql("SELECT 1")
+    """
+
+
+def test_forwarding_proof_inspects_an_imported_callee_in_its_own_module(tmp_path: Path) -> None:
+    """Cross-module ruling: behind a plain ``from elspeth.<module> import f`` the callee is inspected
+    in its own module; one hop (through a same-module private helper) and two hops (the imported
+    function forwarding to its module's private helper) prove contained when every execution on the
+    connection is an advisory-lock SELECT."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {
+            "src/elspeth/web/phase.py": _CROSS_MODULE_CALLERS,
+            "src/elspeth/web/sessions/locking.py": _CROSS_MODULE_LOCKING,
+            "lib/outside.py": _OUTSIDE_LOCKING,
+        },
+    )
+    assert escapes["Repo.phase"] is False
+    assert escapes["Repo.two_hops"] is False
+
+
+def test_forwarding_proof_refuses_imports_it_cannot_inspect_or_that_carry_dml(tmp_path: Path) -> None:
+    """Adversarial, cross-module: table DML on the forwarded connection behind the import, an aliased
+    import, a callee outside ``src/elspeth``, a module with no source file under the anchor, and a
+    chain beyond the depth bound each keep the acquisition escaped."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {
+            "src/elspeth/web/phase.py": _CROSS_MODULE_CALLERS,
+            "src/elspeth/web/sessions/locking.py": _CROSS_MODULE_LOCKING,
+            "lib/outside.py": _OUTSIDE_LOCKING,
+        },
+    )
+    assert {symbol for symbol, escaped in escapes.items() if escaped} == {
+        "Repo.dml_behind_import",
+        "Repo.aliased",
+        "Repo.outside",
+        "Repo.unscanned",
+        "Repo.too_deep",
+    }
 
 
 def test_declared_factory_handle_verbs_are_acquisitions_only_on_a_plain_name(tmp_path: Path) -> None:

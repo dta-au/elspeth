@@ -89,9 +89,8 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
-from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
@@ -136,6 +135,7 @@ from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import RepositoryUserSecretAuthority, UserSecretStore
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
@@ -1066,6 +1066,18 @@ def _build_local_auth_provider(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_retirement(outcome: IdentityRetired) -> None:
+        # Runs INSIDE retire_identity's transaction: a credential deletion
+        # whose identity event the Landscape cannot hold does not retire the
+        # identity, the same rule the admission pair follows.
+        audit_recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
@@ -1096,7 +1108,7 @@ def _build_local_auth_provider(
         # The same retirement collaborator every surface that deletes a local
         # credential binds, so the provider, subject and reason are decided
         # in exactly one place.
-        retire_identity=local_identity_retirer(identity_authority),
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 
@@ -1167,14 +1179,7 @@ def _create_app(
     app.state.operator_telemetry = operator_runtime
     app.state.deployment_state_mode = resolved_state_mode
 
-    @app.exception_handler(SessionOperationFenceLost)
-    async def _session_operation_fence_lost_handler(_request: Request, _exc: SessionOperationFenceLost) -> JSONResponse:
-        """Map ownership races to the same nonleaking absence response."""
-        return JSONResponse(status_code=404, content={"detail": "Session not found"})
-
-    @app.exception_handler(SessionOperationConflictError)
-    async def _session_operation_conflict_handler(_request: Request, _exc: SessionOperationConflictError) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
+    register_session_operation_exception_handlers(app)
 
     @app.exception_handler(AuditIntegrityError)
     async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
