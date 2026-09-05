@@ -17,9 +17,10 @@ construction contract:
    exit path.
 
 Heartbeat is driven synchronously via ``_StubHeartbeat`` (no real threads).
-All sleeps are suppressed via injected ``wait_fn``.  Injected ``now_fn``
-fixes the clock.  ``live_leader`` and ``_run_is_terminal`` are controlled
-via the stub coordination repo and stub factory.
+All sleeps are suppressed via injected ``wait_fn``.  The follower carries no
+clock (ADR-047: seat liveness is the Landscape database's verdict).
+``live_leader`` and ``_run_is_terminal`` are controlled via the stub
+coordination repo and stub factory.
 
 Disposition arm note
 --------------------
@@ -247,8 +248,8 @@ class _StubRunCoordRepo:
         # Override per-call via a list (pops first element each call)
         self.live_leader_results: list[LeaderInfo | None] = []
 
-    def live_leader(self, *, run_id: str, now: datetime) -> LeaderInfo | None:
-        self.live_leader_calls.append({"run_id": run_id, "now": now})
+    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+        self.live_leader_calls.append({"run_id": run_id})
         if self.live_leader_results:
             return self.live_leader_results.pop(0)
         if not self._seat_present:
@@ -257,19 +258,19 @@ class _StubRunCoordRepo:
             run_id=run_id,
             leader_worker_id=f"worker:{run_id}:leader",
             leader_epoch=1,
-            leader_heartbeat_expires_at=now + timedelta(seconds=LIVENESS_WINDOW),
+            leader_heartbeat_expires_at=NOW + timedelta(seconds=LIVENESS_WINDOW),
             seat_live=self._seat_live,
         )
 
-    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-        self.depart_calls.append({"worker_id": worker_id, "now": now})
+    def depart_worker(self, *, worker_id: str) -> None:
+        self.depart_calls.append({"worker_id": worker_id})
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("worker_depart")
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> Any:
+    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> Any:
         from elspeth.contracts.coordination import CoordinationSnapshot
 
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "now": now})
+        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
         return CoordinationSnapshot(
             leader_worker_id=f"worker:{RUN_ID}:leader",
             leader_epoch=1,
@@ -372,7 +373,6 @@ def _make_follower(
         token=token,
         run_coordination=coord_repo,  # type: ignore[arg-type]
         factory=factory,  # type: ignore[arg-type]
-        now_fn=lambda: NOW,
         wait_fn=_wait,
     )
 
@@ -436,7 +436,6 @@ class TestFollowerTerminalRun:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -481,7 +480,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -510,7 +508,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -535,7 +532,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -575,7 +571,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -634,7 +629,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -691,7 +685,6 @@ class TestFollowerSeatDead:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -728,7 +721,6 @@ class TestFollowerEvicted:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -760,7 +752,6 @@ class TestFollowerEvicted:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -832,7 +823,6 @@ class TestFollowerEvictionFinalizeDepartureRace:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -877,7 +867,6 @@ class TestFollowerEvictionFinalizeDepartureRace:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -919,7 +908,6 @@ class TestFollowerSIGINT:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
 
@@ -951,7 +939,6 @@ class TestFollowerSIGINT:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -991,7 +978,6 @@ class TestFollowerIdleBehavior:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
             idle_poll_seconds=idle_seconds,
         )
@@ -1030,7 +1016,6 @@ class TestFollowerIdleBehavior:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1074,7 +1059,6 @@ class TestFollowerDrainedBehavior:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1111,7 +1095,6 @@ class TestFollowerDrainedBehavior:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_wait,
         )
 
@@ -1157,7 +1140,6 @@ class TestFollowerDepartHygiene:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1184,7 +1166,6 @@ class TestFollowerDepartHygiene:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
 
@@ -1203,7 +1184,7 @@ class TestFollowerDepartHygiene:
         factory = _StubFactory(running=False)
 
         class _ExplodingCoordRepo(_StubRunCoordRepo):
-            def depart_worker(self, *, worker_id: str, now: datetime) -> None:
+            def depart_worker(self, *, worker_id: str) -> None:
                 raise SQLAOperationalError("stmt", None, Exception("DB unavailable"))
 
         coord_repo = _ExplodingCoordRepo()
@@ -1214,7 +1195,6 @@ class TestFollowerDepartHygiene:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1265,7 +1245,6 @@ class TestFollowerHeartbeatLifecycle:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
         with (
@@ -1290,7 +1269,6 @@ class TestFollowerHeartbeatLifecycle:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=_raising_wait,
         )
         with (
@@ -1316,7 +1294,6 @@ class TestFollowerHeartbeatLifecycle:
             token=CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0),
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=_StubFactory(running=True),  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1365,7 +1342,6 @@ class TestFollowerFinalizeFlipCleanExit:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1391,7 +1367,6 @@ class TestFollowerFinalizeFlipCleanExit:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1419,7 +1394,6 @@ class TestFollowerFinalizeFlipCleanExit:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1443,7 +1417,6 @@ class TestFollowerFinalizeFlipCleanExit:
             token=token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
-            now_fn=lambda: NOW,
             wait_fn=lambda _: None,
         )
 
@@ -1698,8 +1671,8 @@ class _RaisingDepartRepo(_StubRunCoordRepo):
         super().__init__(**kwargs)
         self._depart_exc = exc
 
-    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
-        self.depart_calls.append({"worker_id": worker_id, "now": now})
+    def depart_worker(self, *, worker_id: str) -> None:
+        self.depart_calls.append({"worker_id": worker_id})
         raise self._depart_exc
 
 

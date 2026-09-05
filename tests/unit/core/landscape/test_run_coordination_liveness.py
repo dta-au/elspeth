@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import pytest
-from sqlalchemy import create_engine, insert, select
+from sqlalchemy import create_engine, insert, select, update
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.coordination import (
@@ -47,6 +48,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     metadata,
@@ -56,6 +58,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 from tests.helpers.run_coordination import register_run_leader
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,20 @@ def _coordination_events(engine: Tier1Engine, event_type: str, run_id: str = RUN
     return [dict(r) for r in rows]
 
 
+def _age_deadlines(engine: Tier1Engine, leader_id: str, *, remaining: timedelta, run_id: str = RUN_ID) -> None:
+    """Rewrite the seat's and the leader row's deadlines to database time + ``remaining``.
+
+    Stands in for wall clock elapsing inside the liveness window: the next
+    beat must move both deadlines back out to database time + WINDOW.
+    """
+    with engine.begin() as conn:
+        aged = read_landscape_transaction_time(conn) + remaining
+        conn.execute(
+            update(run_coordination_table).where(run_coordination_table.c.run_id == run_id).values(leader_heartbeat_expires_at=aged)
+        )
+        conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == leader_id).values(heartbeat_expires_at=aged))
+
+
 def _make_thread(
     repo: RunCoordinationRepository,
     *,
@@ -154,8 +171,8 @@ class _StubRepo:
         self.degraded_calls: list[dict[str, object]] = []
         self.degraded_raise: Exception | None = None
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> CoordinationSnapshot:
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "now": now, "window_seconds": window_seconds})
+    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
+        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
         if not self.side_effects:
             raise AssertionError("_StubRepo: no more side_effects configured")
         result = self.side_effects.pop(0)
@@ -190,16 +207,19 @@ class TestLeaderHeartbeatBeatsBothRows:
         _seed_run(engine)
 
         leader_id = mint_worker_id(RUN_ID)
-        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, window_seconds=WINDOW)
+        # The registration stamped database time + WINDOW; age both deadlines
+        # (as 15 s of wall clock would) so the beat's refresh is observable.
+        _age_deadlines(engine, leader_id, remaining=timedelta(seconds=WINDOW - 15))
 
         seat_before = _seat_row(engine)
         worker_before = _worker_row(engine, leader_id)
 
-        # Simulate the heartbeat thread's next tick: 15 s later.
-        beat_at = NOW + timedelta(seconds=15)
-        snapshot = repo.worker_heartbeat(worker_id=leader_id, now=beat_at, window_seconds=WINDOW)
-
-        expected_expiry = beat_at + timedelta(seconds=WINDOW)
+        # The heartbeat thread's next tick: the beat carries no clock, the
+        # deadline is the Landscape database clock + WINDOW (ADR-047).
+        before = landscape_database_now(engine)
+        snapshot = repo.worker_heartbeat(worker_id=leader_id, window_seconds=WINDOW)
+        after = landscape_database_now(engine)
 
         # Snapshot fields.
         assert snapshot.worker_active is True
@@ -211,14 +231,14 @@ class TestLeaderHeartbeatBeatsBothRows:
         seat_after = _seat_row(engine)
         worker_after = _worker_row(engine, leader_id)
 
-        # Strip timezone for comparison (stored as naive UTC).
-        expected_naive = expected_expiry.replace(tzinfo=None)
-        assert seat_after["leader_heartbeat_expires_at"] == expected_naive, "seat expiry must advance on a leader beat"
-        assert worker_after["heartbeat_expires_at"] == expected_naive, "worker row expiry must advance on a leader beat"
-        # Both advanced by the same amount — worker-fresher-than-seat is impossible.
-        assert seat_after["leader_heartbeat_expires_at"] == worker_after["heartbeat_expires_at"], (
-            "seat and worker expiries are identical: no skew possible"
-        )
+        seat_expiry = cast(datetime, seat_after["leader_heartbeat_expires_at"])
+        worker_expiry = cast(datetime, worker_after["heartbeat_expires_at"])
+        window = timedelta(seconds=WINDOW)
+        assert_stamped_between(seat_expiry, start=before, end=after, offset=window)  # seat expiry advances on a leader beat
+        assert_stamped_between(worker_expiry, start=before, end=after, offset=window)  # worker row expiry advances on a leader beat
+        # Both advanced from the ONE database-time read of the beat's
+        # transaction — worker-fresher-than-seat is impossible.
+        assert seat_expiry == worker_expiry, "seat and worker expiries are identical: no skew possible"
         # Sanity: both actually moved from before values.
         assert seat_after["leader_heartbeat_expires_at"] != seat_before["leader_heartbeat_expires_at"]
         assert worker_after["heartbeat_expires_at"] != worker_before["heartbeat_expires_at"]
@@ -234,10 +254,11 @@ class TestLeaderHeartbeatBeatsBothRows:
         _seed_run(engine, status="running")
 
         leader_id = mint_worker_id(RUN_ID)
-        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, window_seconds=WINDOW)
 
         follower_id = mint_worker_id(RUN_ID)
-        # Seed follower via raw INSERT (no admit_follower — that needs a live seat).
+        # Seed follower via raw INSERT (no admit_follower — that needs a live
+        # seat) with a deadline 15 s of wall clock into its window.
         with engine.begin() as conn:
             conn.execute(
                 insert(run_workers_table).values(
@@ -246,13 +267,15 @@ class TestLeaderHeartbeatBeatsBothRows:
                     role="follower",
                     status="active",
                     registered_at=NOW,
-                    heartbeat_expires_at=NOW + timedelta(seconds=WINDOW),
+                    heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=WINDOW - 15),
                 )
             )
 
         seat_before = _seat_row(engine)
-        beat_at = NOW + timedelta(seconds=15)
-        snapshot = repo.worker_heartbeat(worker_id=follower_id, now=beat_at, window_seconds=WINDOW)
+        follower_before = _worker_row(engine, follower_id)
+        before = landscape_database_now(engine)
+        snapshot = repo.worker_heartbeat(worker_id=follower_id, window_seconds=WINDOW)
+        after = landscape_database_now(engine)
 
         # Snapshot reports the seat as viewed — leader_worker_id matches but
         # it's not this worker.
@@ -264,10 +287,12 @@ class TestLeaderHeartbeatBeatsBothRows:
             "follower beat must not advance the seat expiry"
         )
 
-        # The follower's own row advanced.
+        # The follower's own row advanced to database time + WINDOW.
         follower_row = _worker_row(engine, follower_id)
-        expected_naive = (beat_at + timedelta(seconds=WINDOW)).replace(tzinfo=None)
-        assert follower_row["heartbeat_expires_at"] == expected_naive
+        assert_stamped_between(
+            cast(datetime, follower_row["heartbeat_expires_at"]), start=before, end=after, offset=timedelta(seconds=WINDOW)
+        )
+        assert follower_row["heartbeat_expires_at"] != follower_before["heartbeat_expires_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -353,12 +378,12 @@ class TestHeartbeatDegradedEvent:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         leader_id = mint_worker_id(RUN_ID)
-        token = register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, window_seconds=WINDOW)
 
         # Replace the repo's worker_heartbeat with a stubbed busy side-effect
         # while letting record_heartbeat_degraded write to the real DB.
         class _BusyStubRepo:
-            def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> CoordinationSnapshot:
+            def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
                 raise OperationalError("stmt", {}, Exception("database is locked"))
 
             def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:

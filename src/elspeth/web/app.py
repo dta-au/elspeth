@@ -88,6 +88,7 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -136,12 +137,7 @@ from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import (
-    EnsureIdentityOutcome,
-    ensure_identity,
-    read_identity,
-    retire_identity,
-)
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -1019,7 +1015,7 @@ def _session_token_audience(settings: WebSettings) -> str:
 
 def _build_local_auth_provider(
     settings: WebSettings,
-    session_engine: Engine,
+    identity_authority: RepositoryIdentityAuthority,
     *,
     resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
 ) -> LocalAuthProvider:
@@ -1028,7 +1024,10 @@ def _build_local_auth_provider(
     ``auth.db`` holds credentials, the identities substrate holds admission,
     and the issuer holds the token. This function is the only place that knows
     all three, which is what keeps ``LocalAuthProvider`` from needing an
-    engine and the issuer from needing settings.
+    engine and the issuer from needing settings. The substrate arrives as the
+    ``RepositoryIdentityAuthority`` -- the one writer of the identity tables --
+    never as the engine, so nothing built here can reach those tables around
+    it (P4-D6).
     """
     # The SAME resolved mode the app-state recorder gets. Letting this one
     # re-resolve would be two recorders that can disagree about which
@@ -1037,7 +1036,7 @@ def _build_local_auth_provider(
     audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
 
     def _principal_is_active(identity_id: str) -> bool:
-        record = read_identity(session_engine, identity_id)
+        record = identity_authority.read_identity(identity_id=identity_id)
         # An absent row is never an implicit grant.
         return record is not None and record.is_active
 
@@ -1062,14 +1061,25 @@ def _build_local_auth_provider(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_retirement(outcome: IdentityRetired) -> None:
+        # Runs INSIDE retire_identity's transaction: a credential deletion
+        # whose identity event the Landscape cannot hold does not retire the
+        # identity, the same rule the admission pair follows.
+        audit_recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
         # may admit themselves, so it would be incoherent to hold back the
         # people who did so before this table existed while admitting every
         # newcomer instantly.
-        return ensure_identity(
-            session_engine,
+        return identity_authority.ensure_identity(
             claims=claims,
             activate=settings.registration_mode == "open",
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
@@ -1086,19 +1096,14 @@ def _build_local_auth_provider(
         principal_is_active=_principal_is_active,
     )
 
-    def _retire_identity(username: str) -> None:
-        retire_identity(
-            session_engine,
-            provider="local",
-            subject=username,
-            reason="local credential deleted",
-        )
-
     return LocalAuthProvider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
-        retire_identity=_retire_identity,
+        # The same retirement collaborator every surface that deletes a local
+        # credential binds, so the provider, subject and reason are decided
+        # in exactly one place.
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 
@@ -1468,6 +1473,13 @@ def _create_app(
     app.state.sessions_telemetry = sessions_telemetry
 
     app.state.session_engine = session_engine  # available to guided step handlers
+    # --- Identity authority ---
+    # The ONE writer of identities / identity_roles / identity_relationships
+    # (and the quota row an admission grants). Built before the auth provider
+    # because a local provider admits and retires through it, and published
+    # on app.state for the identity routes.
+    identity_authority = RepositoryIdentityAuthority(session_engine)
+    app.state.identity_authority = identity_authority
 
     # --- Auth provider setup ---
     #
@@ -1476,7 +1488,7 @@ def _create_app(
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
     if settings.auth_provider == "local":
-        local_provider = _build_local_auth_provider(settings, session_engine, resolved_state_mode=resolved_state_mode)
+        local_provider = _build_local_auth_provider(settings, identity_authority, resolved_state_mode=resolved_state_mode)
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
     elif settings.auth_provider == "oidc":

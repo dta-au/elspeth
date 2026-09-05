@@ -51,7 +51,6 @@ def fenced_write(
     return fenced_leader_transaction(
         engine,
         token=coordination_token,
-        now=now,
         window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         verb=verb,
     )

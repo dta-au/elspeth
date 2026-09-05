@@ -21,6 +21,7 @@ import pytest
 
 import elspeth.core.checkpoint.recovery as recovery_module
 import elspeth.engine.orchestrator.resume as resume_module
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, BarrierIntakePassOutcome
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.processor import RowProcessor
@@ -165,10 +166,11 @@ class _MaintenanceRunCoordination:
         *,
         run_id: str,
         leader_worker_id: str,
-        now: datetime,
         grace_seconds: float,
     ) -> tuple[str, ...]:
-        self._trace.append(("dead", run_id, leader_worker_id, now, grace_seconds))
+        # The sweep carries no caller clock: liveness is judged against the
+        # Landscape database clock inside the verb (ADR-047).
+        self._trace.append(("dead", run_id, leader_worker_id, grace_seconds))
         return ("dead-z", "dead-a")
 
     def evict_worker(
@@ -176,11 +178,10 @@ class _MaintenanceRunCoordination:
         *,
         token: object,
         target_worker_id: str,
-        now: datetime,
         grace_seconds: float,
         window_seconds: float,
     ) -> bool:
-        self._trace.append(("evict", token, target_worker_id, now, grace_seconds, window_seconds))
+        self._trace.append(("evict", token, target_worker_id, grace_seconds, window_seconds))
         return True
 
 
@@ -207,7 +208,7 @@ def test_rm08_maintenance_evicts_exact_dead_worker_listing_in_order() -> None:
     assert drain.run_maintenance(NOW) == 4
     assert trace[0] == "require-token"
     dead_call = cast(tuple[object, ...], trace[1])
-    assert dead_call[0:4] == ("dead", RUN_ID, "leader-worker", NOW)
+    assert dead_call == ("dead", RUN_ID, "leader-worker", DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
     evicted_worker_ids = []
     for entry in trace:
         if isinstance(entry, tuple) and entry[0] == "evict":
@@ -351,7 +352,7 @@ def _function_node(contract: _ArchitectureContract) -> ast.FunctionDef:
                 "FollowerProcessor",
                 "_drain_loop",
                 (
-                    "seat = self._run_coordination.live_leader(run_id=run_id, now=now)",
+                    "seat = self._run_coordination.live_leader(run_id=run_id)",
                     "seat is None or not seat.seat_live",
                     "raise _SeatDeadError(worker_id, run_id)",
                 ),

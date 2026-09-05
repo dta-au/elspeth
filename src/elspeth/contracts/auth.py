@@ -61,3 +61,22 @@ The org tree carries one job: who oversees whom, for the approver's audit
 view.  Approver eligibility and leave cover are role questions, not tree
 questions, so no second edge type exists.
 """
+
+ActivationRole = Literal["user", "approver", "reviewer", "none"]
+"""What an activation may grant (spec D20).
+
+The three workload roles an administrator may hand out with the "tick of
+approval", plus ``none``: a request argument that writes no ``identity_roles``
+row, and the only value an identity that already holds ``admin`` may be
+activated with (R8).  ``none`` is deliberately not a member of
+:data:`IdentityRole` -- nothing stores it.
+"""
+
+IdentityAccessState = Literal["pending", "active", "disabled"]
+"""Closed vocabulary of ``identities.access_state`` (D12).
+
+``pending`` is where every first sight lands and is not escapable by logging
+in again; ``active`` is the only state a token is issued to; ``disabled`` is
+where an administrator or a credential deletion leaves a row, which is never
+deleted because it anchors that person's audit history.
+"""

@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 import structlog
 from jinja2 import TemplateSyntaxError
 from opentelemetry import metrics
-from sqlalchemy import Engine, update
+from sqlalchemy import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
@@ -209,6 +209,7 @@ from elspeth.web.composer.tools import (
     get_tool_definitions,
     normalize_tool_result_validation,
 )
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import advisor_signoff_check_failed
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
@@ -250,7 +251,6 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.validation import _redact_sensitive_content
 
 slog = structlog.get_logger()
@@ -3774,22 +3774,36 @@ class ComposerServiceImpl:
             #
             # Here we only add the session-row audit breadcrumb (updated_at
             # bump — richer crash-marker columns tracked as a follow-up
-            # migration: elspeth-23b0987938).
-            if self._session_engine is not None and session_id is not None:
+            # migration: elspeth-23b0987938). A compose with no session
+            # (trained-operator and MCP paths) has no row to mark, so the
+            # skip is explicit (elspeth-906bc8f75d).
+            if session_id is not None:
+                if session_operation_context is None or self._sessions_service is None:
+                    # A session-bound compose reached the crash path without
+                    # its COMPOSE lease. The breadcrumb is a sessions-table
+                    # write and every such write goes through the fenced
+                    # authority; writing it on a raw engine here would be the
+                    # one unfenced sessions writer in the tree. Refusing is
+                    # the fail-closed shape: this is a caller defect, so it
+                    # deliberately escapes the audit-failure catch below with
+                    # the plugin crash chained as its cause.
+                    raise RuntimeError("plugin crash breadcrumb requires the COMPOSE session operation context") from crash
+                authority = self._sessions_service.session_operation_authority
                 try:
-                    # Offload to a worker — _persist_crashed_session
-                    # executes a synchronous SQLAlchemy ``Engine.begin()``
-                    # + UPDATE, which would otherwise block the event
-                    # loop for the duration of the DB round-trip,
-                    # stalling websocket heartbeats, rate-limit checks,
-                    # and concurrent progress broadcasts. Symmetric with
-                    # the execute_tool offload at the top of
-                    # _compose_loop: every other sync DB path in this
-                    # file runs through run_sync_in_worker, and this
-                    # crash-path call was missed when it was hoisted
-                    # out of the main loop.
-                    await run_sync_in_worker(self._persist_crashed_session, session_id)
-                except (SQLAlchemyError, OSError) as audit_failure:
+                    # Offload to a worker — the fenced mutation executes a
+                    # synchronous transaction + UPDATE, which would otherwise
+                    # block the event loop for the duration of the DB
+                    # round-trip, stalling websocket heartbeats, rate-limit
+                    # checks, and concurrent progress broadcasts. Symmetric
+                    # with the execute_tool offload at the top of
+                    # _compose_loop: every other sync DB path in this file
+                    # runs through run_sync_in_worker.
+                    await run_sync_in_worker(
+                        authority.mutate,
+                        session_operation_context,
+                        lambda transaction: transaction.session.record_plugin_crash_breadcrumb(),
+                    )
+                except (SQLAlchemyError, OSError, SessionOperationFenceLost) as audit_failure:
                     # Audit-persistence is best-effort on the crash path —
                     # failure to persist MUST NOT mask the original plugin
                     # bug. Log via slog.error (audit system itself is failing
@@ -6962,43 +6976,6 @@ class ComposerServiceImpl:
                     )
                 return classify.result
             continue
-
-    def _persist_crashed_session(self, session_id: str) -> None:
-        """Best-effort timestamp bump to mark that a compose session crashed.
-
-        NOTE: The sessions-table schema does not yet have a dedicated crash
-        marker column. Bumping updated_at is the minimum viable breadcrumb
-        until a migration adds (e.g.) a ``status`` or ``crashed_at`` column.
-        The schema addition is tracked separately as elspeth-23b0987938;
-        when that lands, this method expands to populate the new columns
-        and its signature gains ``exc_class``.
-
-        The crash's exc_class is NOT written to the session row — no column
-        exists to hold it. The operator correlates the updated_at bump with
-        the crash via the slog.error emission at the call site, which
-        includes session_id and exc_class in structured fields.
-
-        Signature intentionally minimal — only the data that actually gets
-        persisted is accepted. When the schema migration lands, this
-        method's signature expands to take last_state and exc_class, and
-        callers are updated at that point. Today, the caller passes
-        session_id and logs the rest via slog.
-
-        The caller's outer try/except absorbs any failure — this method
-        MUST NOT mask the original plugin-bug exception if persistence
-        itself fails.
-        """
-        # Offensive guard (explicit raise, not assert): ``python -O`` strips
-        # assert statements, so a caller that somehow reaches this method
-        # with ``_session_engine is None`` would silently no-op under the
-        # optimised interpreter — turning a recoverable audit failure into
-        # a missed ``updated_at`` write with no trace.  A typed
-        # ``RuntimeError`` always fires.
-        if self._session_engine is None:
-            raise RuntimeError("_persist_crashed_session must only be called when session_engine is set")
-        now = datetime.now(UTC)
-        with self._session_engine.begin() as conn:
-            conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(updated_at=now))
 
     def _schemas_loaded_for_session(self, session_id: str | None) -> frozenset[tuple[str, str]]:
         """Return the immutable view of plugins whose schema has loaded.

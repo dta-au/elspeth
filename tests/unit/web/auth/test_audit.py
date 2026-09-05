@@ -352,6 +352,103 @@ def test_every_writer_propagates_and_redacts_expected_database_failures(
         assert sentinel not in rendered
 
 
+def test_identity_retirement_is_recorded_as_an_operator_disable_with_its_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retirement event: one ``identity_disabled`` row, not request-bound, cause in the metadata.
+
+    ``identity_disabled`` is the closed vocabulary's word for what a retirement
+    does to the row; the metadata is what tells an administrator this one came
+    from a credential deletion and not from an admin's disable.
+    """
+    db_sentinel = object()
+
+    class _DBContext:
+        def __enter__(self) -> object:
+            return db_sentinel
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    class _FakeLandscapeDB:
+        @classmethod
+        def from_url(cls, url: str, **kwargs: object) -> _DBContext:
+            return _DBContext()
+
+    auth_repository = create_autospec(AuthAuditRepository, instance=True)
+    factory = SimpleNamespace(auth_audit=auth_repository)
+    monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
+    monkeypatch.setattr(audit_module, "RecorderFactory", create_autospec(audit_module.RecorderFactory, return_value=factory))
+    recorder = AuthAuditRecorder(landscape_url="sqlite:///auth-audit.db", landscape_passphrase=None, create_tables=False)
+
+    recorder.record_identity_retired(
+        provider="local",
+        identity_id="identity-1",
+        username="ada",
+        retired_subject="ada#retired-identity-1",
+        reason="local credential deleted",
+    )
+
+    auth_repository.record_auth_event.assert_called_once_with(
+        event_type="identity_disabled",
+        outcome="success",
+        provider="local",
+        identity_id="identity-1",
+        user_id="ada",
+        username="ada",
+        failure_category=None,
+        request_id=None,
+        client_host=None,
+        user_agent=None,
+        metadata={
+            "actor": "operator",
+            "cause": "credential_deleted",
+            "retired_subject": "ada#retired-identity-1",
+            "reason": "local credential deleted",
+        },
+    )
+
+
+def test_identity_retirement_audit_failure_propagates_and_is_logged_by_operation(monkeypatch: pytest.MonkeyPatch) -> None:
+    failure = LandscapeRecordError("RAW_SQL_MARKER CREDENTIAL_MARKER")
+
+    class _DBContext:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    class _FakeLandscapeDB:
+        @classmethod
+        def from_url(cls, url: str, **kwargs: object) -> _DBContext:
+            return _DBContext()
+
+    auth_repository = create_autospec(AuthAuditRepository, instance=True)
+    auth_repository.record_auth_event.side_effect = failure
+    monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
+    monkeypatch.setattr(
+        audit_module,
+        "RecorderFactory",
+        create_autospec(audit_module.RecorderFactory, return_value=SimpleNamespace(auth_audit=auth_repository)),
+    )
+    recorder = AuthAuditRecorder(landscape_url="sqlite:///auth-audit.db", landscape_passphrase=None, create_tables=False)
+
+    with capture_logs() as logs, pytest.raises(LandscapeRecordError) as exc_info:
+        recorder.record_identity_retired(
+            provider="local",
+            identity_id="identity-1",
+            username="ada",
+            retired_subject="ada#retired-identity-1",
+            reason="local credential deleted",
+        )
+
+    assert exc_info.value is failure
+    assert len(logs) == 1
+    operation = logs[0]["operation"]
+    operation_value = operation.value if isinstance(operation, audit_module.AuthAuditOperation) else operation
+    assert operation_value == "identity_retired"
+    assert "RAW_SQL_MARKER" not in repr(logs)
+
+
 class TestAdmissionFailureCategories:
     """A correct password refused at the D12 wall is not a bad credential.
 

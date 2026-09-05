@@ -126,7 +126,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                     registered_at=NOW,
                 )
             )
-    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 def _bump_epoch(db: LandscapeDB) -> None:
