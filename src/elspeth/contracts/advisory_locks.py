@@ -72,3 +72,16 @@ ELSPETH_ROUTING_GROUP_LOCK_CLASSID: int = 0x524F5554
 # collisions only over-serialize unrelated lineages and cannot weaken
 # the registry's insert-once guarantee.
 ELSPETH_AUDIT_EXPORT_LOCK_CLASSID: int = 0x41455850
+
+# 0x424C4F42 = ASCII "BLOB". Used by the blob custody lock
+# (_blob_custody_session_lock in src/elspeth/web/blobs/service.py): a
+# SESSION-level lock held on one dedicated connection across a blob's
+# reservation, file write and finalize, so concurrent writers of one
+# session's blobs serialise. It deliberately does NOT share
+# ELSPETH_SESSIONS_LOCK_CLASSID: session-operation fence operations
+# (acquire, renew, release) take transaction-scoped locks on the same
+# session key, and one shared classid made every fence operation on a
+# session wait behind that session's filesystem persistence. The second
+# int4 key is hashtext(session_id); collisions only over-serialize
+# unrelated sessions' blob writes.
+ELSPETH_BLOB_CUSTODY_LOCK_CLASSID: int = 0x424C4F42
