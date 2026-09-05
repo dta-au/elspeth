@@ -949,6 +949,7 @@ class ExecutionServiceImpl:
         state: CompositionState,
         *,
         session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
     ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
         from elspeth.web.composer.guided_blob_refs import validate_guided_reviewed_blob_binding
@@ -1014,7 +1015,7 @@ class ExecutionServiceImpl:
                 resolved_by_blob_id[blob_id] = _unresolved(blob_id)
                 return resolved_by_blob_id[blob_id]
             try:
-                record = self._call_async(self._blob_service.get_blob(parsed_blob_id))
+                record = self._call_async(self._blob_service.get_blob(parsed_blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
                 resolved_by_blob_id[blob_id] = _unresolved(blob_id)
                 return resolved_by_blob_id[blob_id]
@@ -1054,6 +1055,7 @@ class ExecutionServiceImpl:
                 self._blob_service.read_blob_content_prefix_verified(
                     parsed_blob_id,
                     prefix_bytes=8 * 1024,
+                    session_operation_context=session_operation_context,
                 )
             )
             resolved = ResolvedProofBlob(
@@ -1074,6 +1076,7 @@ class ExecutionServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         user_id: str | None,
         session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
     ) -> ValidationResult:
         """Run the canonical 24 checks and bounded source proof in one worker."""
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
@@ -1084,7 +1087,7 @@ class ExecutionServiceImpl:
             if self._blob_service is None:
                 return None
             try:
-                record = self._call_async(self._blob_service.get_blob(blob_id))
+                record = self._call_async(self._blob_service.get_blob(blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
                 return None
             if type(record) is not BlobRecord:
@@ -1123,6 +1126,7 @@ class ExecutionServiceImpl:
             blob_resolver=self._authoritative_proof_blob_resolver(
                 proof_state,
                 session_id=session_id,
+                session_operation_context=session_operation_context,
             ),
         )
         return _merge_authoritative_proof_diagnostics(result, diagnostics)
@@ -1134,6 +1138,7 @@ class ExecutionServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot,
         user_id: str | None,
         session_id: UUID | None,
+        session_operation_context: SessionOperationContext,
         completion_gates: CompletionGateFacts | None,
         completion_gate_state: CompositionState | None = None,
     ) -> ValidationResult:
@@ -1147,6 +1152,7 @@ class ExecutionServiceImpl:
                     plugin_snapshot=plugin_snapshot,
                     user_id=user_id,
                     session_id=session_id,
+                    session_operation_context=session_operation_context,
                 )
             ),
         )
@@ -1567,6 +1573,7 @@ class ExecutionServiceImpl:
             plugin_snapshot=plugin_snapshot,
             user_id=user_id,
             session_id=session_id,
+            session_operation_context=session_operation_lease.context,
             completion_gates=completion_gates,
             completion_gate_state=authored_state,
         )
@@ -1710,7 +1717,10 @@ class ExecutionServiceImpl:
                 # ``BlobNotFoundError`` was uncaught), a two-channel
                 # oracle strictly worse than the state_id surface.
                 await run_sync_in_worker(session_operation_lease.guard_external_effect)
-                blob_record = await self._blob_service.get_blob(parsed_blob_id)
+                blob_record = await self._blob_service.get_blob(
+                    parsed_blob_id,
+                    session_operation_context=session_operation_lease.context,
+                )
                 if blob_record.session_id != session_id:
                     raise BlobNotFoundError(blob_ref)
 
@@ -1809,6 +1819,7 @@ class ExecutionServiceImpl:
                         blob_id=parsed_blob_id,
                         run_id=run_id,
                         direction="input",
+                        session_operation_context=session_operation_lease.context,
                     )
         except BaseException as exc:
             await self._handle_pipeline_submission_failure(
@@ -1986,6 +1997,7 @@ class ExecutionServiceImpl:
             plugin_snapshot=plugin_snapshot,
             user_id=user_id,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             completion_gates=completion_gates,
         )
 
@@ -2243,6 +2255,7 @@ class ExecutionServiceImpl:
                                 blob_id=blob_id,
                                 run_id=run_uuid,
                                 direction="input",
+                                session_operation_context=session_operation_context,
                             )
 
                         await asyncio.gather(*(_link_one(blob_id) for blob_id in unique_blob_ids))
@@ -2266,7 +2279,7 @@ class ExecutionServiceImpl:
 
                         async def _get_blob_scoped(blob_id: UUID) -> BlobRecord:
                             await run_sync_in_worker(session_operation_lease.guard_external_effect)
-                            record = await blob_service.get_blob(blob_id)
+                            record = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
                             if record.session_id != owning_session_id:
                                 raise BlobNotFoundError(str(blob_id))
                             return record
@@ -2289,7 +2302,7 @@ class ExecutionServiceImpl:
                         async def _read_inline_blob_contents() -> dict[Any, bytes]:
                             async def _read_one(blob_id: UUID) -> bytes:
                                 await run_sync_in_worker(session_operation_lease.guard_external_effect)
-                                return await blob_service.read_blob_content(blob_id)
+                                return await blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
 
                             results = await asyncio.gather(
                                 *(_read_one(blob_id) for blob_id in unique_blob_ids),
@@ -2355,7 +2368,7 @@ class ExecutionServiceImpl:
                     rows_session_id = self._call_async(self._session_service.get_run(run_uuid)).session_id
 
                     async def _get_blob_rows_scoped(blob_id: UUID) -> BlobRecord:
-                        record = await rows_blob_service.get_blob(blob_id)
+                        record = await rows_blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
                         if record.session_id != rows_session_id:
                             raise BlobNotFoundError(str(blob_id))
                         return record
@@ -2426,6 +2439,7 @@ class ExecutionServiceImpl:
                                     blob_id=blob_id,
                                     run_id=run_uuid,
                                     direction="input",
+                                    session_operation_context=session_operation_context,
                                 )
                                 for blob_id in unique_rows_blob_ids
                             )
@@ -2548,7 +2562,9 @@ class ExecutionServiceImpl:
                 if staging_blob_service is None:
                     raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
                 for staged_blob_id, expected_ref in admitted_blob_rows:
-                    staged_content = self._call_async(staging_blob_service.read_blob_content(staged_blob_id))
+                    staged_content = self._call_async(
+                        staging_blob_service.read_blob_content(staged_blob_id, session_operation_context=session_operation_context)
+                    )
                     stored_ref = payload_store.store(staged_content)
                     if stored_ref != expected_ref:
                         raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
@@ -3456,6 +3472,7 @@ class ExecutionServiceImpl:
                 blob_service.finalize_run_output_blobs(
                     UUID(run_id),
                     success=success,
+                    session_operation_context=session_operation_lease.context,
                 )
             )
         except self._FINALIZE_SUPPRESSED as blob_err:
