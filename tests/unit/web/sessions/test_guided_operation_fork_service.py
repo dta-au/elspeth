@@ -26,7 +26,7 @@ from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.web.blobs.protocol import BlobForkWriteFence, BlobInProgressForkError, fork_blob_id
+from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.repository import SessionOperationConflictError
@@ -135,6 +135,7 @@ async def _create_test_blob(
             filename,
             content,
             mime_type,
+            session_operation_context=context,
         )
     finally:
         await session_service._run_sync(session_service.session_operation_authority.release, context)
@@ -155,7 +156,7 @@ async def _delete_test_blob(
         )
     )
     try:
-        await blob_service.delete_blob(blob_id)
+        await blob_service.delete_blob(blob_id, session_operation_context=context)
     finally:
         await session_service._run_sync(session_service.session_operation_authority.release, context)
 
@@ -354,18 +355,26 @@ async def _fork_first_blob_contention(
     fork_first: Callable[[], Awaitable[Any]],
     delete_second: Callable[[], Awaitable[Any]],
 ) -> tuple[Any, Any]:
-    """Hold fork staging's custody transaction while blob deletion contends on it."""
+    """Hold fork staging's custody transaction while blob deletion contends on it.
+
+    The delete is observed asking for the same-session mutex — where its
+    context acquire (the operation authority) or its custody lock first
+    contends — and must not hold either before the staging transaction ends.
+    """
 
     from elspeth.web.blobs import service as blob_service_module
     from elspeth.web.coordination import repository as coordination_repository
+    from elspeth.web.sessions import locking as session_locking
 
     original_blob_lock = blob_service_module._blob_custody_session_lock
     original_transaction_lock = coordination_repository.transaction_session_lock
+    original_mutex = session_locking.sqlite_session_mutex
     held = threading.Barrier(2)
     release = threading.Barrier(2)
     delete_waiting = threading.Event()
     delete_acquired = threading.Event()
     paused = False
+    fork_thread: list[threading.Thread] = []
 
     @contextlib.contextmanager
     def controlled_transaction_lock(conn: Any, engine: Any, locked_session_id: str):
@@ -373,8 +382,19 @@ async def _fork_first_blob_contention(
         with original_transaction_lock(conn, engine, locked_session_id):
             if locked_session_id == str(session_id) and not paused:
                 paused = True
+                fork_thread.append(threading.current_thread())
                 held.wait(timeout=5)
                 release.wait(timeout=5)
+            yield
+
+    @contextlib.contextmanager
+    def observed_mutex(engine: Any, locked_session_id: str):
+        contender = locked_session_id == str(session_id) and fork_thread and threading.current_thread() is not fork_thread[0]
+        if contender:
+            delete_waiting.set()
+        with original_mutex(engine, locked_session_id):
+            if contender:
+                delete_acquired.set()
             yield
 
     @contextlib.contextmanager
@@ -388,6 +408,7 @@ async def _fork_first_blob_contention(
 
     with (
         patch.object(coordination_repository, "transaction_session_lock", new=controlled_transaction_lock),
+        patch.object(session_locking, "sqlite_session_mutex", new=observed_mutex),
         patch.object(blob_service_module, "_blob_custody_session_lock", new=observed_blob_lock),
     ):
         fork_task = asyncio.create_task(fork_first())
@@ -1524,7 +1545,7 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
     blob_service = BlobServiceImpl(durable_engine, tmp_path / f"blob-race-{uuid4()}")
     user_id = f"fork-blob-race-{uuid4()}"
     parent = await race_service.create_session(user_id, "Parent", "local")
-    source_blob = await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
+    source_blob = await _create_test_blob(race_service, blob_service, parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
     state = await _save_composition_state(
         race_service,
         parent.id,
@@ -1575,15 +1596,31 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
 
     try:
         if winner == "delete":
-            deleted, staged_result = await _blob_delete_first_contention(
-                race_service,
-                parent.id,
-                lambda: blob_service.delete_blob(source_blob.id),
-                lambda: reserve_stage_copy(race_service),
+            # The delete runs under its own live COMPOSE operation. The fork
+            # claim that queues behind the delete's custody mutex is refused by
+            # the session-operation authority the moment it holds that mutex
+            # (one live operation per session), before it reads a blob row;
+            # the plan freezes only once the delete's operation has ended.
+            delete_context = await race_service._run_sync(
+                lambda: race_service.session_operation_authority.acquire(
+                    session_id=parent.id,
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=race_service.session_operation_owner_instance_id,
+                    lease_seconds=race_service.session_operation_lease_seconds,
+                )
             )
+            try:
+                deleted, refused_claim = await _blob_delete_first_contention(
+                    race_service,
+                    parent.id,
+                    lambda: blob_service.delete_blob(source_blob.id, session_operation_context=delete_context),
+                    lambda: reserve_stage_copy(race_service),
+                )
+            finally:
+                await race_service._run_sync(race_service.session_operation_authority.release, delete_context)
             assert deleted is None
-            assert not isinstance(staged_result, BaseException)
-            staged, copied, fence = staged_result
+            assert isinstance(refused_claim, SessionOperationConflictError)
+            staged, copied, fence = await reserve_stage_copy(race_service)
             assert staged.blob_plan == ()
             assert copied == {}
             with pytest.raises(AuditIntegrityError, match="absent from the frozen fork plan"):
@@ -1612,9 +1649,15 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
                 race_service,
                 parent.id,
                 lambda: reserve_stage_copy(race_service),
-                lambda: blob_service.delete_blob(source_blob.id),
+                lambda: _delete_test_blob(race_service, blob_service, parent.id, source_blob.id),
             )
-            assert isinstance(delete_error, BlobInProgressForkError)
+            # The delete queued behind the fork's staging transaction on the
+            # custody mutex and, once through, was refused by the session-
+            # operation authority: the parent's SESSION_FORK operation is live,
+            # so no COMPOSE context exists to delete under. (A delete that does
+            # hold a context while the plan is frozen meets
+            # BlobInProgressForkError; tests/unit/web/blobs/test_service.py.)
+            assert isinstance(delete_error, SessionOperationConflictError)
             assert len(staged.blob_plan) == len(copied) == 1
             rewritten = _rewrite_fork_state_blob_custody(
                 staged.state,
@@ -1638,7 +1681,8 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
                 )
             )
             assert settled.archived_at is None
-            await blob_service.delete_blob(source_blob.id)
+            _release_fork_authority(race_service, staged.authority)
+            await _delete_test_blob(race_service, blob_service, parent.id, source_blob.id)
             assert await blob_service.list_blobs(parent.id, limit=None) == []
     finally:
         _cleanup_race_user(durable_engine, user_id)
@@ -2316,7 +2360,7 @@ async def test_fork_route_records_the_offending_composer_meta_key_when_custody_d
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    blob = await _create_test_blob(service, blob_service, parent.id, "orders.csv", b"id\n1\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -2482,8 +2526,8 @@ async def test_fork_route_settles_a_blob_rows_source_with_two_parent_blobs(tmp_p
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
-    blob_a = await blob_service.create_blob(parent.id, "orders-a.csv", b"id\n1\n", "text/csv")
-    blob_b = await blob_service.create_blob(parent.id, "orders-b.csv", b"id\n2\n", "text/csv")
+    blob_a = await _create_test_blob(service, blob_service, parent.id, "orders-a.csv", b"id\n1\n", "text/csv")
+    blob_b = await _create_test_blob(service, blob_service, parent.id, "orders-b.csv", b"id\n2\n", "text/csv")
     entries = [_blob_rows_entry(blob_a), _blob_rows_entry(blob_b)]
     state = await service.save_composition_state(
         parent.id,
@@ -2607,7 +2651,7 @@ async def test_fork_route_refuses_a_path_only_residue_in_an_unknown_key_by_name(
     """
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
-    blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    blob = await _create_test_blob(service, blob_service, parent.id, "orders.csv", b"id\n1\n", "text/csv")
     state = await service.save_composition_state(
         parent.id,
         CompositionStateData(
@@ -2658,8 +2702,8 @@ async def test_fork_route_backstop_needles_span_more_parent_blobs_than_one_list_
     app, service, blob_service = _make_fork_app(tmp_path)
     parent = await service.create_session("alice", "Parent", "local")
     root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-    ready_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id\n1\n", "text/csv")
-    oldest_pending_blob = await blob_service.create_blob(parent.id, "oldest.csv", b"id\n2\n", "text/csv")
+    ready_blob = await _create_test_blob(service, blob_service, parent.id, "orders.csv", b"id\n1\n", "text/csv")
+    oldest_pending_blob = await _create_test_blob(service, blob_service, parent.id, "oldest.csv", b"id\n2\n", "text/csv")
     with service._engine.begin() as conn:
         conn.execute(
             update(blobs_table)

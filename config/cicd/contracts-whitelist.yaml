@@ -285,7 +285,6 @@ allowed_dict_patterns:
   # surrounding config dict remains dynamic because source/node/output plugin
   # options are open-ended YAML.
   - "src/elspeth/core/blobs_inline.py:_discover_blob_content_refs:config"
-  - "src/elspeth/core/blobs_inline.py:_validate_blob_content_refs:config"
   - "src/elspeth/core/blobs_inline.py:_validate_blob_content_refs_sync:config"
   - "src/elspeth/core/blobs_inline.py:_substitute_blob_content_refs:config"
   - "src/elspeth/core/blobs_inline.py:_substitute_blob_content_refs_for_validation:config"

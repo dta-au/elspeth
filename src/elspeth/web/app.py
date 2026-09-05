@@ -1542,10 +1542,13 @@ def _create_app(
     app.state.skill_markdown_history_authority = skill_markdown_history_authority
 
     # --- Blob service ---
+    # Shares the session-operation authority built above so blob effects
+    # compare-and-swap the same fences the session service issues.
     app.state.blob_service = BlobServiceImpl(
         session_engine,
         settings.data_dir,
         settings.max_blob_storage_per_session_bytes,
+        session_operation_authority=session_operation_authority,
     )
 
     # --- Secret service ---

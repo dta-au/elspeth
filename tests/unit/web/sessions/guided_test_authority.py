@@ -13,6 +13,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFenceLost, SessionOperationKind
+from elspeth.web.sessions.protocol import GuidedOperationActive
 from elspeth.web.sessions.service import SessionServiceImpl
 
 _UNSET = object()
@@ -67,9 +68,14 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
                 session_id=kwargs["session_id"],
                 operation_id=kwargs["operation_id"],
             )
-            if observed is not None and not getattr(observed, "expired", False):
+            if observed is None:
+                observed_attempt = None
+            elif isinstance(observed, GuidedOperationActive) and observed.expired:
+                observed_attempt = observed.attempt
+            else:
+                # An unexpired active attempt, or a terminal Completed/Failed
+                # descriptor (neither carries ``expired``/``attempt``): replay it.
                 return observed
-            observed_attempt = getattr(observed, "attempt", None)
         context = session_operation_context or await self._guided_test_context(kwargs["session_id"], "guided_start")
         return await super().reconcile_guided_start_operation(
             session_operation_context=context,
