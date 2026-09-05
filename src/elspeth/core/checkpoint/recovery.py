@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, or_, select
@@ -171,7 +170,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         # Lives in the SHARED implementation so the advisory can_resume() and
         # the enforcing resume() entry guard produce the SAME verdict
         # (the elspeth-2f23292372 parity contract).
-        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id, now=datetime.now(UTC))
+        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
         if leader is not None and leader.seat_live:
             reason = (
                 f"Run is in progress under live leader {leader.leader_worker_id!r} "

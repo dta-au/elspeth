@@ -93,6 +93,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-rc6-lease-races"
@@ -637,11 +638,12 @@ def test_ts05_and_aux07_strict_transform_recovery_rotates_identity_under_exact_e
         coordination,
         run_id=RUN_ID,
         worker_id="leader",
-        now=BASE,
         window_seconds=80,
     )
 
+    database_before = landscape_database_now(engine)
     recovered = scheduler.recover_expired_leases(now=SWEEP_AT, coordination_token=token)
+    database_after = landscape_database_now(engine)
 
     assert recovered == 1
     row = _work_item_row(engine, "token-0")
@@ -664,7 +666,8 @@ def test_ts05_and_aux07_strict_transform_recovery_rotates_identity_under_exact_e
         seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID)).mappings().one()
     assert seat["leader_worker_id"] == "leader"
     assert seat["leader_epoch"] == token.leader_epoch
-    assert seat["leader_heartbeat_expires_at"] == (SWEEP_AT + timedelta(seconds=80)).replace(tzinfo=None)
+    # The sweep's leader fence refreshed the seat from the DATABASE clock (ADR-047).
+    assert_stamped_between(seat["leader_heartbeat_expires_at"], start=database_before, end=database_after, offset=timedelta(seconds=80))
 
 
 def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subtype(
@@ -717,7 +720,7 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
     scheduler = TokenSchedulerRepository(engine)
     coordination = RunCoordinationRepository(engine)
     _seed_run_rows_tokens(engine, ("token-0",))
-    token = register_run_leader(coordination, run_id=RUN_ID, worker_id="leader", now=BASE, window_seconds=80)
+    token = register_run_leader(coordination, run_id=RUN_ID, worker_id="leader", window_seconds=80)
     _insert_worker(engine, worker_id="live-owner")
     original = _enqueue_tokens(scheduler, ("token-0",))["token-0"]
     claimed = scheduler.claim_ready(run_id=RUN_ID, lease_owner="live-owner", lease_seconds=30, now=BASE)

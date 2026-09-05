@@ -976,7 +976,6 @@ class BarrierJournalRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_blocked_barrier_item",
         ) as conn:

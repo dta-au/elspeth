@@ -166,7 +166,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -272,7 +271,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -345,7 +343,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -579,7 +576,6 @@ class TestFollowerChaos:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=lambda _: None,
         )
 
@@ -711,7 +707,6 @@ class TestFollowerChaos:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=_wait,
             idle_poll_seconds=0.001,
         )

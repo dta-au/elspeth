@@ -14,7 +14,6 @@ previously patched ``…orchestrator.core.resolve_config`` / ``.stable_hash`` /
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -97,7 +96,6 @@ class JoinAdmissionService:
         run_id: str,
         settings: ElspethSettings,
         *,
-        now: datetime | None = None,
         window_seconds: float | None = None,
     ) -> str:
         """§B.1: atomic follower admission — new public entry point (ADR-030).
@@ -124,9 +122,9 @@ class JoinAdmissionService:
            - joiner's resolved settings hash must equal ``config_hash``,
              else refused (different pipeline ⇒ different graph + barrier
              keys);
-           - ``run_coordination`` seat must be live
-             (``leader_heartbeat_expires_at > now``), else refused
-             ("no live leader — use ``elspeth resume``");
+           - ``run_coordination`` seat must be live against the Landscape
+             database clock (``leader_heartbeat_expires_at >= database_now``,
+             ADR-047), else refused ("no live leader — use ``elspeth resume``");
            - ``INSERT run_workers`` (role='follower', status='active') +
              ``worker_register`` event.  COMMIT.
 
@@ -135,7 +133,6 @@ class JoinAdmissionService:
             settings: The joining process's resolved ``ElspethSettings``.
                 Its ``stable_hash(resolve_config(settings))`` is compared
                 to ``runs.config_hash``; they must be equal.
-            now: Clock injection for tests (defaults to ``datetime.now(UTC)``).
             window_seconds: Heartbeat liveness window (defaults to
                 :data:`~elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS`).
 
@@ -149,7 +146,6 @@ class JoinAdmissionService:
                 config hash mismatch, or no live leader seat.
         """
 
-        _now = now if now is not None else datetime.now(UTC)
         _window = window_seconds if window_seconds is not None else DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 
         # Step 0: filesystem preflight BEFORE touching the registry.
@@ -170,7 +166,6 @@ class JoinAdmissionService:
             run_id=run_id,
             worker_id=worker_id,
             config_hash=joiner_config_hash,
-            now=_now,
             window_seconds=_window,
         )
 

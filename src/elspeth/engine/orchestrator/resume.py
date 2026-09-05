@@ -30,7 +30,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import OperationalError
@@ -791,7 +790,6 @@ class ResumeCoordinator:
         return snapshot.factory.run_coordination.acquire_run_leadership(
             run_id=snapshot.run_id,
             worker_id=snapshot.worker_id,
-            now=datetime.now(UTC),
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             entry_point="resume",
         )
@@ -846,7 +844,7 @@ class ResumeCoordinator:
         # Seat hygiene (ADR-030 §D): release the seat AFTER the terminal
         # finalize succeeded. Best-effort.
         with best_effort("Seat release after resume finalize", run_id=run_id):
-            factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+            factory.run_coordination.release_seat(token=coordination_token)
 
         self._ceremony.emit_run_finished(
             run_id=run_id,
@@ -1199,7 +1197,7 @@ class ResumeCoordinator:
                 # (same best_effort block); without this a failed resume's
                 # seat wedges retries for the liveness window.
                 if coordination_token is not None:
-                    factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                    factory.run_coordination.release_seat(token=coordination_token)
             raise  # Propagate to CLI
         except _RunFailedWithPartialResultError as failed_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
@@ -1219,7 +1217,7 @@ class ResumeCoordinator:
                 )
                 # Seat hygiene: after the FAILED finalize succeeded.
                 if coordination_token is not None:
-                    factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                    factory.run_coordination.release_seat(token=coordination_token)
             raise failed_exc.original_error.with_traceback(failed_exc.original_traceback) from None
         except Exception:
             # Finalize as FAILED to prevent the run from being stuck in RUNNING
@@ -1231,7 +1229,7 @@ class ResumeCoordinator:
                 self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, token=coordination_token)
                 # Seat hygiene: after the FAILED finalize succeeded.
                 if coordination_token is not None:
-                    factory.run_coordination.release_seat(token=coordination_token, now=datetime.now(UTC))
+                    factory.run_coordination.release_seat(token=coordination_token)
             raise
         finally:
             # ADR-030 §A.3: safety-net stop (idempotent) — covers any exit

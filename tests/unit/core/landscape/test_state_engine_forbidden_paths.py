@@ -32,6 +32,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape import database as database_module
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -394,6 +395,23 @@ def _register_peer(harness: _Harness, peer: str, *, status: str = "active") -> N
         )
 
 
+def _age_leader_seat(harness: _Harness) -> None:
+    """Pull the seat's deadline and stamp back inside the window so the fence refresh is observable.
+
+    The seat is minted on Landscape database time (ADR-047) and the leader
+    fence re-stamps it from the same clock, so a fenced verb that runs inside
+    the seat's minting second would rewrite identical values and the
+    "exactly the fence delta" proof below would see no delta at all.
+    """
+    with harness.db.engine.begin() as conn:
+        database_now = read_landscape_transaction_time(conn)
+        conn.execute(
+            update(run_coordination_table)
+            .where(run_coordination_table.c.run_id == RUN_ID)
+            .values(leader_heartbeat_expires_at=database_now + timedelta(seconds=40), updated_at=database_now - timedelta(seconds=5))
+        )
+
+
 def _assert_only_leader_heartbeat_delta(before: StateEngineImage, after: StateEngineImage) -> None:
     delta = before.diff(after)
     assert delta.changed_tables == {"run_coordination"}
@@ -427,6 +445,7 @@ def test_f07_ineligible_lease_is_not_recovered(
                 .where(run_workers_table.c.run_id == RUN_ID)
                 .values(status="departed", departed_at=NOW)
             )
+    _age_leader_seat(harness)
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
 
     recovered = harness.repo.recover_expired_leases(

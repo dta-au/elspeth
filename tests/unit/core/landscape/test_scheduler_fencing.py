@@ -211,7 +211,6 @@ def _seed_leader() -> tuple[LandscapeDB, CoordinationToken]:
         RunCoordinationRepository(db.engine),
         run_id=RUN_ID,
         worker_id=WORKER_ID,
-        now=NOW,
         window_seconds=80.0,
     )
     return db, token

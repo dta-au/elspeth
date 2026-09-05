@@ -355,7 +355,6 @@ def test_can_resume_rejects_running_run_with_live_seat(db: LandscapeDB, recovery
         RunCoordinationRepository(db.engine),
         run_id="run-running",
         worker_id=leader_id,
-        now=datetime.now(UTC),
         window_seconds=80.0,
     )
 

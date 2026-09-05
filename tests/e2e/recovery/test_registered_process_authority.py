@@ -250,7 +250,6 @@ def _release_leader_process(
 ) -> None:
     RunCoordinationRepository(db.engine).release_seat(
         token=CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=leader_epoch),
-        now=datetime.fromisoformat(now_iso),
     )
 
 
@@ -264,7 +263,6 @@ def _acquire_leader_process(
     token = RunCoordinationRepository(db.engine).acquire_run_leadership(
         run_id=run_id,
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
         window_seconds=10**9,
     )
     assert token == CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=expected_epoch)
@@ -282,7 +280,6 @@ def _refuse_live_seat_process(
         RunCoordinationRepository(db.engine).acquire_run_leadership(
             run_id=run_id,
             worker_id=worker_id,
-            now=datetime.fromisoformat(now_iso),
             window_seconds=10**9,
         )
 
@@ -302,7 +299,6 @@ def _join_follower_process(
         worker_id = Orchestrator(db).join_run(
             run_id=run_id,
             settings=types.SimpleNamespace(),  # type: ignore[arg-type]  # resolved settings are patched at this process boundary
-            now=datetime.fromisoformat(now_iso),
             window_seconds=10**9,
         )
     Path(worker_id_path).write_text(worker_id, encoding="utf-8")
@@ -311,7 +307,6 @@ def _join_follower_process(
 def _depart_follower_process(db: LandscapeDB, worker_id: str, now_iso: str) -> None:
     RunCoordinationRepository(db.engine).depart_worker(
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
     )
 
 
@@ -326,7 +321,6 @@ def _evict_follower_process(
     evicted = RunCoordinationRepository(db.engine).evict_worker(
         token=CoordinationToken(run_id=run_id, worker_id=leader_id, leader_epoch=leader_epoch),
         target_worker_id=target_worker_id,
-        now=datetime.fromisoformat(now_iso),
         grace_seconds=0,
         window_seconds=10**9,
     )
@@ -361,7 +355,6 @@ def _worker_heartbeat_process(
     """RC-03: heartbeat an active registered worker through production."""
     snapshot = RunCoordinationRepository(db.engine).worker_heartbeat(
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
         window_seconds=10**9,
     )
     assert snapshot.worker_active is True
@@ -481,7 +474,6 @@ def _refuse_evict_process(
         RunCoordinationRepository(db.engine).evict_worker(
             token=CoordinationToken(run_id=run_id, worker_id=leader_id, leader_epoch=leader_epoch),
             target_worker_id=target_worker_id,
-            now=datetime.fromisoformat(now_iso),
             grace_seconds=0,
             window_seconds=10**9,
         )
@@ -1333,7 +1325,11 @@ def test_registered_process_coordination_release_takeover_join_depart_and_evict(
         ) as refusal:
             refusal.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             _release_and_assert_clean(refusal)
-    assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == before_ineligible_evictions
+    # Each refused eviction still ran under the leader fence, which re-stamps
+    # the seat from the Landscape database clock (ADR-047); nothing else moves.
+    before_ineligible_evictions.diff(capture_state_engine_image(crashed.factory, run_id=crashed.run_id)).assert_only(
+        {"run_coordination": {"leader_heartbeat_expires_at", "updated_at"}}
+    )
     assert capture_state_engine_image(crashed.factory, run_id=foreign_run_id) == before_foreign_run
 
     with crashed.db.engine.connect() as conn:
