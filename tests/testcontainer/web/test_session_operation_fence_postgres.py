@@ -824,3 +824,76 @@ def test_postgres_waiter_cannot_act_after_expiry(
             )
             == before_fence
         )
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): concurrent BLOB_READ admissions share a session on PostgreSQL ---
+
+
+def test_postgres_two_blob_read_claimants_both_win_and_leave_the_row_untouched(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    with postgres_engine.connect() as conn:
+        before = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id))
+        ).one()
+
+    def claim(owner: str):
+        contender = PostgresSessionOperationRepository(postgres_engine)
+        try:
+            return contender.acquire(
+                session_id=created.id,
+                operation_kind=SessionOperationKind.BLOB_READ,
+                owner_instance_id=owner,
+                lease_seconds=30,
+            )
+        except SessionOperationConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(claim, (f"reader-{uuid4()}", f"reader-{uuid4()}")))
+
+    assert all(isinstance(outcome, SessionOperationContext) for outcome in outcomes), outcomes
+    assert outcomes[0].fence != outcomes[1].fence
+    with postgres_engine.connect() as conn:
+        after = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(created.id))
+        ).one()
+    assert (after.operation_id, after.lease_token, after.operation_epoch, after.operation_kind) == (
+        before.operation_id,
+        before.lease_token,
+        before.operation_epoch,
+        before.operation_kind,
+    )
+    for reader in outcomes:
+        repository.compare_and_swap(reader)
+        repository.release(reader)
+
+
+def test_postgres_open_blob_reads_do_not_block_an_exclusive_claimant(postgres_engine: Engine) -> None:
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(repository, owner=f"creator-{uuid4()}")
+    reader = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    proposal = repository.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.PROPOSAL,
+        owner_instance_id=f"claimant-{uuid4()}",
+        lease_seconds=30,
+    )
+    assert proposal.operation_kind is SessionOperationKind.PROPOSAL
+    # Exclusive semantics are untouched: a second exclusive claimant still loses.
+    with pytest.raises(SessionOperationConflictError):
+        repository.acquire(
+            session_id=created.id,
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=f"claimant-{uuid4()}",
+            lease_seconds=30,
+        )
+    # The reader stays live under the writer and releases cleanly.
+    repository.compare_and_swap(reader)
+    repository.release(proposal)
+    repository.release(reader)

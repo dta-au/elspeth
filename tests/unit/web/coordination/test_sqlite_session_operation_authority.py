@@ -2172,3 +2172,105 @@ def test_sqlite_creation_does_not_offer_a_session_id_parameter(engine) -> None:
     assert "session_id" not in parameters
     assert "operation_id" not in parameters
     assert "lease_token" not in parameters
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): BLOB_READ is a shareable admission, not the fence row ---
+
+
+def _fence_identity(engine, session_id: UUID) -> tuple[str, str, int, str]:
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session_id))
+        ).one()
+    return (row.operation_id, row.lease_token, row.operation_epoch, row.operation_kind)
+
+
+def test_sqlite_concurrent_blob_reads_share_the_session_and_leave_the_row_untouched(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    before = _fence_identity(engine, created.id)
+
+    first = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-a", lease_seconds=30
+    )
+    second = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-b", lease_seconds=30
+    )
+
+    assert first.operation_kind is SessionOperationKind.BLOB_READ
+    assert second.operation_kind is SessionOperationKind.BLOB_READ
+    assert first.fence != second.fence
+    assert first.fence.session_id == second.fence.session_id == str(created.id)
+    assert _fence_identity(engine, created.id) == before
+    # Both readers prove custody and release without touching the row.
+    authority.compare_and_swap(first)
+    assert authority.renew(second, lease_seconds=30) == second
+    assert authority.mutate(first, lambda transaction: transaction.database_now is not None)
+    authority.release(first)
+    authority.release(second)
+    assert _fence_identity(engine, created.id) == before
+
+
+def test_sqlite_open_blob_reads_do_not_block_compose_or_archive(engine) -> None:
+    """The page's read leases never make a writer, or the DELETE teardown, a 409."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+
+    compose = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="writer", lease_seconds=30
+    )
+    assert compose.fence.operation_epoch == reader.fence.operation_epoch + 1
+    # The reader stays live under the writer, and a further reader is admitted.
+    authority.compare_and_swap(reader)
+    authority.acquire(session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-2", lease_seconds=30)
+    authority.release(compose)
+
+    archive = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.ARCHIVE, owner_instance_id="archiver", lease_seconds=30
+    )
+    assert archive.operation_kind is SessionOperationKind.ARCHIVE
+    authority.release(archive)
+    authority.release(reader)
+
+
+def test_sqlite_exclusive_kinds_still_conflict_while_a_read_is_admitted(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    authority.acquire(session_id=created.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="writer", lease_seconds=30)
+    authority.acquire(session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30)
+    with pytest.raises(SessionOperationConflictError):
+        authority.acquire(session_id=created.id, operation_kind=SessionOperationKind.EXECUTE, owner_instance_id="other", lease_seconds=30)
+
+
+def test_sqlite_blob_read_custody_is_the_session_not_the_row(engine) -> None:
+    """Archived session: every read proof is OWNER_INACTIVE; release stays terminal-tolerant; a fresh read is refused."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(created.id)).values(archived_at=datetime.now(UTC)))
+
+    for proof in (
+        lambda: authority.compare_and_swap(reader),
+        lambda: authority.renew(reader, lease_seconds=30),
+        lambda: authority.mutate(reader, lambda _transaction: None),
+    ):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.OWNER_INACTIVE
+    authority.release(reader)
+    with pytest.raises(SessionOperationFenceLost) as later:
+        authority.acquire(session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="later", lease_seconds=30)
+    assert later.value.reason is FenceLossReason.OWNER_INACTIVE
+
+
+def test_sqlite_blob_read_on_a_missing_session_is_missing(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        authority.acquire(session_id=uuid4(), operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30)
+    assert lost.value.reason is FenceLossReason.MISSING

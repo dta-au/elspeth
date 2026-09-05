@@ -1156,10 +1156,13 @@ async def get_state_yaml(
     """
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
+    # The export records a composer-completion event, so this is a writer:
+    # it takes COMPOSE authority and answers 409 while another compose is
+    # live (elspeth-bf52d495a2, option A).
     lease = await SessionOperationLease.acquire(
         service.session_operation_authority,
         session_id=session.id,
-        operation_kind=SessionOperationKind.BLOB_READ,
+        operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
@@ -1201,7 +1204,7 @@ async def get_state_yaml(
         # bytes (see its docstring).
         yaml_str = public_export_redaction_header(export_state) + generate_public_yaml(export_state)
 
-        # Audit-first and fence-first: a failed or stale BLOB_READ authority
+        # Audit-first and fence-first: a failed or stale COMPOSE authority
         # returns no YAML and emits no completion telemetry.
         service.session_operation_authority.mutate(
             lease.context,

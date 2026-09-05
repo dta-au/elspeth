@@ -298,6 +298,10 @@ _BLOB_DELETION_RECOVERY_OPERATION_KINDS = frozenset(
         SessionOperationKind.SESSION_FORK,
     }
 )
+# Recovery ledgers are READ by every custodian kind, but retiring or aborting a
+# plan is a write: a shareable BLOB_READ admission (no fence row) must never
+# hold it, so the writer set is the recovery set minus the read kind.
+_BLOB_RECOVERY_WRITE_OPERATION_KINDS = _BLOB_DELETION_RECOVERY_OPERATION_KINDS - {SessionOperationKind.BLOB_READ}
 _GUIDED_INLINE_CUSTODY_OPERATION_KINDS = frozenset({"guided_plan", "guided_respond"})
 
 _ACTIVE_RUN_COMPOSITION_COLUMNS = (
@@ -2058,7 +2062,7 @@ class _RepositoryBlobMutations:
     def retire_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool:
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_replacement_plan(plan)
         deletion = self._read_blob_deletion_locked(blob_id=plan.blob_id)
         if deletion is not None:
@@ -2078,7 +2082,7 @@ class _RepositoryBlobMutations:
     def abort_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool:
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_replacement_plan(plan)
         deletion = self._read_blob_deletion_locked(blob_id=plan.blob_id)
         if deletion is not None:
@@ -2905,7 +2909,7 @@ class _RepositoryBlobMutations:
         """Retire exact cleanup evidence after the caller settles filesystem state."""
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_deletion_plan(plan)
         if self._read_blob_deletion_locked(blob_id=plan.blob_id) is None:
             return False
@@ -2925,7 +2929,7 @@ class _RepositoryBlobMutations:
         """Abort an exact uncommitted plan after the caller restores live bytes."""
         state = self.__state
         state._require_active()
-        self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
         self._validate_blob_deletion_plan(plan)
         if self._read_blob_deletion_locked(blob_id=plan.blob_id) is None:
             return False
@@ -4105,13 +4109,22 @@ class _SessionOperationAuthorityRepository:
         owner_instance_id: str,
         lease_seconds: int,
     ) -> SessionOperationContext:
-        """Advance one retained row and return its immutable authority context."""
+        """Advance one retained row and return its immutable authority context.
+
+        ``BLOB_READ`` is the one shareable kind: it is admitted against session
+        custody without taking or advancing the row (:meth:`_admit_blob_read`),
+        so readers coexist with each other and with one live writer. Every
+        other kind is exclusive and advances the row by epoch.
+        """
         if type(session_id) is not UUID:
             raise ValueError("session_id must be a UUID")
         _validate_kind(operation_kind)
         _validate_owner(owner_instance_id)
         _validate_lease_seconds(lease_seconds)
         session_id_text = str(session_id)
+
+        if operation_kind is SessionOperationKind.BLOB_READ:
+            return self._admit_blob_read(session_id=session_id_text, owner_instance_id=owner_instance_id)
 
         with self._locked_transaction(session_id_text) as conn:
             session_row = conn.execute(
@@ -4173,6 +4186,43 @@ class _SessionOperationAuthorityRepository:
             operation_kind=operation_kind,
         )
 
+    def _admit_blob_read(self, *, session_id: str, owner_instance_id: str) -> SessionOperationContext:
+        """Admit one shareable read against session custody; the fence row is untouched.
+
+        A read admission holds no fence row, so nothing it does can conflict
+        with another reader or with the one live writer, and an exclusive
+        acquire (compose, execute, archive) proceeds over open readers. Its
+        authority is the session's custody — the session row exists and is not
+        archived, the fence row exists — proven under the session lock here
+        and re-proven on every renew, compare-and-swap and mutation through
+        :meth:`_lock_fence_and_read_database_time`. The minted fence carries a
+        fresh operation id and lease token and the row's CURRENT epoch as the
+        custody generation it was admitted under; it never matches the row's
+        exact-active predicates, so no row-bound arm can mistake it for a
+        writer.
+        """
+        with self._locked_transaction(session_id) as conn:
+            session_row = conn.execute(
+                select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id).with_for_update()
+            ).one_or_none()
+            if session_row is None:
+                raise SessionOperationFenceLost(FenceLossReason.MISSING)
+            if session_row.archived_at is not None:
+                raise SessionOperationFenceLost(FenceLossReason.OWNER_INACTIVE)
+            row = self._select_fence(conn, session_id=session_id)
+            if row is None:
+                raise SessionOperationFenceLost(FenceLossReason.MISSING)
+            custody_epoch = row.operation_epoch
+        return SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=session_id,
+                operation_id=_new_operation_id(),
+                lease_token=_new_lease_token(owner_instance_id=owner_instance_id),
+                operation_epoch=custody_epoch,
+            ),
+            operation_kind=SessionOperationKind.BLOB_READ,
+        )
+
     @staticmethod
     def _exact_active_predicates(
         context: SessionOperationContext,
@@ -4225,6 +4275,12 @@ class _SessionOperationAuthorityRepository:
         *,
         database_now: datetime,
     ) -> None:
+        if context.operation_kind is SessionOperationKind.BLOB_READ:
+            # A read admission holds no fence row: its authority is the session
+            # custody that _lock_fence_and_read_database_time has just proven
+            # under this connection (session present, not archived, fence row
+            # present). There is nothing to swap; a lost custody already raised.
+            return
         result = conn.execute(
             update(session_operation_fences_table)
             .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4285,6 +4341,10 @@ class _SessionOperationAuthorityRepository:
         fence = context.fence
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_and_read_database_time(conn, context)
+            if context.operation_kind is SessionOperationKind.BLOB_READ:
+                # Renewal of a read admission is its custody proof (just made
+                # above); no row carries its expiry.
+                return context
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4814,6 +4874,11 @@ class _SessionOperationAuthorityRepository:
         fence = context.fence
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_for_release_and_read_database_time(conn, context)
+            if context.operation_kind is SessionOperationKind.BLOB_READ:
+                # A read admission owns no row to release; the terminal
+                # tolerance above (archived session still releasable, missing
+                # session still refused) is exactly the writers' contract.
+                return
             result = conn.execute(
                 update(session_operation_fences_table)
                 .where(and_(*self._exact_active_predicates(context, database_now)))
@@ -4973,7 +5038,10 @@ class _RepositoryComposerCompletionMutations:
         state = self.__state
         state._require_active()
         context = state._operation_context
-        if context is None or context.operation_kind is not SessionOperationKind.BLOB_READ:
+        # A completion event is a write on the composition, so it takes
+        # writer authority. The shareable BLOB_READ admission holds no fence
+        # row and can never carry one (elspeth-bf52d495a2, option A).
+        if context is None or context.operation_kind is not SessionOperationKind.COMPOSE:
             raise AuditIntegrityError("composer completion mutation is not authorized for this operation kind")
         state._validate_uuid(composition_state_id, field_name="composition_state_id")
         connection = _resolve_mutation_connection(state._connection_token)

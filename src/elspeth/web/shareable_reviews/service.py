@@ -507,9 +507,10 @@ class ShareableReviewService:
         lifetime = timedelta(seconds=self._settings.shareable_link_lifetime_seconds)
         expires_at = snapshot.created_at + lifetime
 
-        # AUDIT FIRST under the exact BLOB_READ authority already spanning
-        # validation and readiness. The facet re-proves that this is still
-        # the current state in the same transaction as the insert.
+        # AUDIT FIRST under the exact COMPOSE authority already spanning
+        # validation and readiness (a completion event is a write, so the
+        # route holds writer authority). The facet re-proves that this is
+        # still the current state in the same transaction as the insert.
         try:
             self._session_operation_authority.mutate(
                 session_operation_context,
