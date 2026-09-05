@@ -51,6 +51,7 @@ from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatPr
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import acquire_compose_context
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -87,6 +88,32 @@ def _create_session(client: TestClient) -> str:
     )
     assert start.status_code == 200, start.json()
     return session_id
+
+
+def _source_from_upload_under_compose_fence(client: TestClient, session_id: str, *, plugin_hint: str = "csv"):
+    """Call the step-1 upload helper the way the chat route does: under a live COMPOSE context.
+
+    The context is minted through the production authority
+    (``acquire_compose_context``), never synthesised, so the helper receives
+    the same exact, database-backed context the route threads from its
+    reserved lease. Today the helper accepts the context but does not yet
+    forward it to the blob read (P4-B9 threads it through); minting a real one
+    here means that forwarding, when it lands, is verified honestly rather
+    than against a synthetic fence.
+    """
+
+    async def _call():
+        service = client.app.state.session_service
+        async with acquire_compose_context(service, UUID(session_id)) as compose_context:
+            return await guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                plugin_hint=plugin_hint,
+                blob_service=client.app.state.blob_service,
+                session_id=UUID(session_id),
+                session_operation_context=compose_context,
+            )
+
+    return asyncio.run(_call())
 
 
 def _chat_body(turn: dict, *, operation_id: str | None = None, message: str = "Use CSV") -> dict[str, str]:
@@ -623,14 +650,7 @@ def test_matching_uploaded_source_missing_required_failure_policy_raises(
     monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_policy_prefill)
 
     with pytest.raises(InvariantError, match="source prefill is missing required on_validation_failure"):
-        asyncio.run(
-            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
-                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
-                plugin_hint="csv",
-                blob_service=composer_test_client.app.state.blob_service,
-                session_id=UUID(session_id),
-            )
-        )
+        _source_from_upload_under_compose_fence(composer_test_client, session_id)
 
 
 def test_matching_uploaded_source_missing_required_path_raises(
@@ -658,14 +678,7 @@ def test_matching_uploaded_source_missing_required_path_raises(
     monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_path_prefill)
 
     with pytest.raises(InvariantError, match="matching source prefill is missing required path"):
-        asyncio.run(
-            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
-                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
-                plugin_hint="csv",
-                blob_service=composer_test_client.app.state.blob_service,
-                session_id=UUID(session_id),
-            )
-        )
+        _source_from_upload_under_compose_fence(composer_test_client, session_id)
 
 
 @pytest.mark.parametrize("malformed_policy", [None, 0, ""])
@@ -696,14 +709,7 @@ def test_matching_uploaded_source_malformed_failure_policy_raises(
     monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_policy_prefill)
 
     with pytest.raises(InvariantError, match="source prefill on_validation_failure must be a non-empty exact str"):
-        asyncio.run(
-            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
-                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
-                plugin_hint="csv",
-                blob_service=composer_test_client.app.state.blob_service,
-                session_id=UUID(session_id),
-            )
-        )
+        _source_from_upload_under_compose_fence(composer_test_client, session_id)
 
 
 @pytest.mark.parametrize(
@@ -774,14 +780,7 @@ def test_matching_uploaded_source_malformed_prefill_contract_raises(
     monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_prefill)
 
     with pytest.raises(InvariantError, match=expected_field):
-        asyncio.run(
-            guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
-                message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
-                plugin_hint="csv",
-                blob_service=composer_test_client.app.state.blob_service,
-                session_id=UUID(session_id),
-            )
-        )
+        _source_from_upload_under_compose_fence(composer_test_client, session_id)
 
 
 def test_schema_form_source_plugin_reselection_rebuilds_form_and_preserves_ready_upload(

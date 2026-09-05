@@ -727,6 +727,14 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
 ) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / "revision-status-drift")
     predecessor, successor, session_id = asyncio.run(_successor_command(service, payload_store))
+    # The successor's guided reservation holds the session's live COMPOSE
+    # authority, so nothing else can mint a PROPOSAL lease on this session
+    # until it is released (the multi-replica session fence refuses it). The
+    # drift is therefore modelled the way the platform allows it to happen:
+    # the predecessor is rejected under that same live authority, which the
+    # pipeline rejection writer accepts alongside PROPOSAL.
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    guided_context = asyncio.run(service._guided_test_context(session_id, "guided"))
     asyncio.run(
         service.reject_pipeline_composition_proposal(
             session_id=session_id,
@@ -736,6 +744,7 @@ def test_revision_old_status_drift_rolls_back_successor_cohort(
             reason="operator_rejected",
             dispatch=None,
             actor="concurrent-operator",
+            session_operation_context=guided_context,
         )
     )
 

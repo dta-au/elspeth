@@ -65,7 +65,10 @@ from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.routes.composer import guided_chat_atomic
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
 from tests.integration.web.composer.guided.test_respond import (
-    TestStep2IntraStep,
+    TestStep2IntraStep as _Step2Journey,
+)
+from tests.integration.web.composer.guided.test_respond import (
+    _assert_compose_context_for,
     _post_current_response,
     _respond,
     _review_wiring,
@@ -462,7 +465,7 @@ def _stage_schema8_topology_intent_proposal(
     )
     assert retained_response.status_code == 200, retained_response.json()
     (retained,) = _guided(client, session_id).deferred_intents
-    staged = TestStep2IntraStep()._stage_proposal(client, session_id, filename="schema8-rewind.jsonl")
+    staged = _Step2Journey()._stage_proposal(client, session_id, filename="schema8-rewind.jsonl")
     assert staged["guided_session"]["step"] == "step_3_transforms"
     return session_id, retained, staged
 
@@ -511,7 +514,7 @@ def test_initial_topology_planner_receives_verified_deferred_user_instruction(
         return await real_plan(**kwargs)
 
     monkeypatch.setattr(planner, "plan_guided_pipeline", capture_plan)
-    TestStep2IntraStep()._drive_to_step_2_single_select(client, session_id)
+    _Step2Journey()._drive_to_step_2_single_select(client, session_id)
     _respond(client, session_id, chosen=["json"])
     _respond(
         client,
@@ -1077,7 +1080,7 @@ def test_active_proposal_future_wire_management_always_invalidates_and_rewinds_w
         return replace(plan, proposal=rebound), catalog_plugin_ids
 
     monkeypatch.setattr(planner, "plan_guided_pipeline", plan_with_exact_coverage)
-    staged = TestStep2IntraStep()._stage_proposal(client, session_id, filename=f"wire-{covered}-{management_kind}.jsonl")
+    staged = _Step2Journey()._stage_proposal(client, session_id, filename=f"wire-{covered}-{management_kind}.jsonl")
     proposal_id = staged["next_turn"]["payload"]["proposal_id"]
     assert staged["guided_session"]["step"] == "step_3_transforms"
 
@@ -1336,7 +1339,7 @@ def test_schema8_passed_output_edit_preserves_stable_id_and_rewinds_reviewed_pen
         return replace(plan, proposal=unclaimed), catalog_plugin_ids
 
     monkeypatch.setattr(planner, "plan_guided_pipeline", plan_without_claiming_intent)
-    staged = TestStep2IntraStep()._stage_proposal(client, session_id, filename="schema8-passed-output.jsonl")
+    staged = _Step2Journey()._stage_proposal(client, session_id, filename="schema8-passed-output.jsonl")
     proposal = staged["next_turn"]["payload"]
     reviewed = client.post(
         f"/api/sessions/{session_id}/guided/respond",
@@ -2885,7 +2888,7 @@ def test_corrupt_origin_custody_is_an_integrity_failure_and_rolls_back_atomicall
     service = client.app.state.session_service
     real_settle = service.settle_guided_state_operation
 
-    async def corrupt_command(command, *, payload_store=None):
+    async def corrupt_command(command, *, payload_store=None, session_operation_context):
         metadata = deep_thaw(command.state.composer_meta)
         guided = GuidedSession.from_dict(metadata["guided_session"])
         (intent,) = guided.deferred_intents
@@ -2904,6 +2907,7 @@ def test_corrupt_origin_custody_is_an_integrity_failure_and_rolls_back_atomicall
         return await real_settle(
             replace(command, state=corrupted_state, originating_message=originating),
             payload_store=payload_store,
+            session_operation_context=_assert_compose_context_for(session_operation_context, target_session_id),
         )
 
     monkeypatch.setattr(service, "settle_guided_state_operation", corrupt_command)
