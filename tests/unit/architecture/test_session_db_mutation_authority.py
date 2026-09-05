@@ -1946,7 +1946,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9e291dca4a439605",
         1,
         None,
-        line=415,
+        line=430,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1957,7 +1957,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "758fe32047daee73",
         1,
         None,
-        line=894,
+        line=909,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1967,7 +1967,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ccdaa74d89308bbb",
         1,
         None,
-        line=955,
+        line=970,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1977,7 +1977,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "63aa60b938d94231",
         1,
         None,
-        line=1022,
+        line=1037,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1987,7 +1987,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "18b91cab2434c597",
         1,
         None,
-        line=1117,
+        line=1132,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1997,7 +1997,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "697320a36b78fae3",
         1,
         None,
-        line=1159,
+        line=1174,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
