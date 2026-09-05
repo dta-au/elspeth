@@ -21,7 +21,7 @@ from uuid import UUID, uuid5
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 
 AllowedMimeType = Literal[
     "text/csv",
@@ -462,11 +462,16 @@ class BlobServiceProtocol(Protocol):
         mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Create a blob from content bytes.
 
         Writes content to storage, computes its hash, and persists
-        metadata.
+        metadata. ``session_operation_context`` is the caller's exact
+        session-operation fence (a CREATE or COMPOSE operation on
+        ``session_id``); the write is refused when the fence is stale or the
+        context does not own the session.
         """
         ...
 
@@ -504,8 +509,18 @@ class BlobServiceProtocol(Protocol):
         """Update a pending blob to ready or error after execution."""
         ...
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
-        """Get blob metadata. Raises ``BlobNotFoundError`` if missing."""
+    async def get_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Get blob metadata under the caller's session-operation fence.
+
+        Raises ``BlobNotFoundError`` if missing — or if the blob is not in
+        the custody of the fence's session, so a foreign blob is
+        indistinguishable from a missing one.
+        """
         ...
 
     async def list_blobs(
@@ -517,22 +532,34 @@ class BlobServiceProtocol(Protocol):
         """List blobs for a session, newest first."""
         ...
 
-    async def delete_blob(self, blob_id: UUID) -> None:
-        """Delete blob metadata and backing file.
+    async def delete_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Delete blob metadata and backing file under an ARCHIVE/COMPOSE fence.
 
         Raises ``BlobActiveRunError`` if linked to an active run,
         ``BlobPendingProposalError`` if a pending proposal retains the blob,
-        and ``BlobNotFoundError`` if the blob does not exist.
+        and ``BlobNotFoundError`` if the blob does not exist or is not in the
+        custody of the fence's session.
         """
         ...
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
-        """Read the raw content of a ready blob.
+    async def read_blob_content(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
+        """Read the raw content of a ready blob under a read-capable fence.
 
         Only ready blobs are readable. The stored hash is verified before
         bytes are returned. Operational misses raise ``BlobNotFoundError``
         or ``BlobStateError``; integrity anomalies raise
-        ``BlobContentMissingError`` or ``BlobIntegrityError``.
+        ``BlobContentMissingError`` or ``BlobIntegrityError``. A stale fence
+        raises before any byte is read.
         """
         ...
 
@@ -541,6 +568,7 @@ class BlobServiceProtocol(Protocol):
         blob_id: UUID,
         *,
         prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[bytes, str, int]:
         """Stream a ready blob, verifying its full content hash incrementally.
 
@@ -560,13 +588,31 @@ class BlobServiceProtocol(Protocol):
         """
         ...
 
+    async def read_blob_preview(
+        self,
+        blob_id: UUID,
+        *,
+        limit_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, bool]:
+        """Read at most ``limit_bytes`` of a ready blob for an inline preview.
+
+        Returns ``(prefix, truncated)``. Shares ``read_blob_content``'s
+        lifecycle, missing-file, and fence guards but does not verify the
+        full content hash, because that would require reading the whole
+        blob and defeat the preview's resource cap.
+        """
+        ...
+
     async def link_blob_to_run(
         self,
         blob_id: UUID,
         run_id: UUID,
         direction: BlobRunLinkDirection,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
-        """Record a blob-to-run linkage.
+        """Record a blob-to-run linkage under the run's EXECUTE fence.
 
         Raises ``RuntimeError`` if direction is outside the declared
         closed set or the blob and run belong to different sessions.
@@ -617,11 +663,14 @@ class BlobServiceProtocol(Protocol):
         self,
         run_id: UUID,
         success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobFinalizationResult:
         """Finalize pending output blobs for a completed or failed run.
 
         Processes each blob independently and returns both successful
-        finalizations and per-blob error records.
+        finalizations and per-blob error records. Runs under the run's
+        EXECUTE fence; the run must be in the custody of the fence's session.
         """
         ...
 
@@ -817,3 +866,20 @@ def blob_record_snapshot_hash(record: BlobRecord) -> str:
         "creating_arguments_hash": record.creating_arguments_hash,
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def names_same_blob(value: str, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance — ``is_widened_blob_ref``
+    matches a ``blob_ref`` against the hyphenated UUID form with ``[0-9a-fA-F]``
+    digits and the runtime binds it through ``UUID(...)`` — so an upper-case
+    marker the LLM authored is the SAME bound blob as the lower-case id the
+    store records. A retention guard that compared spellings read such a
+    bound blob as unbound (elspeth-f123a7b3d2). Two hyphenated UUID texts
+    denote one UUID iff they are equal ignoring case, so that is the whole
+    comparison; a braced or unhyphenated spelling is rejected by the contract,
+    never bound, and therefore a non-match here — as is any non-UUID string,
+    which cannot name a blob at all. No parse, no exception path.
+    """
+    return value.lower() == blob_id.lower()

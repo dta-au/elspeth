@@ -665,7 +665,11 @@ jobs:
       image: python:${{ matrix.python-version }}-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
-    needs: [static-analysis]
+    # No `needs: [static-analysis]` (operator ruling 2026-09-05, elspeth-d8749aeaa3):
+    # the trust-tier step keeps static-analysis red by design until Phase 5
+    # signs, and behind that `needs:` the suites never ran, so a merge could not
+    # be scored at all. `ci-success` still requires static-analysis, so the red
+    # still blocks the merge; it just no longer hides the test verdict.
     strategy:
       fail-fast: false
       matrix:
@@ -858,7 +862,9 @@ jobs:
     # neither the self-hosted container jobs nor the python:*-bookworm images
     # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
     runs-on: ubuntu-24.04
-    needs: [static-analysis]
+    # No `needs: [static-analysis]`: same ruling as the `test` job above — the
+    # PostgreSQL proofs must report even while trust-tier keeps static-analysis
+    # red; `ci-success` still requires both.
     # 276 ids ran serially in 8 min on the maintainer's box (2026-09-05,
     # elspeth-d8749aeaa3); hosted runners are slower, so allow ~3x.
     timeout-minutes: 30

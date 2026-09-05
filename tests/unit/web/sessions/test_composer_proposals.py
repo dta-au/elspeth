@@ -114,13 +114,14 @@ async def _create_test_blob(
     filename: str,
     content: bytes,
 ) -> BlobRecord:
-    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE):
+    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE) as context:
         return await blob_service.create_blob(
             session_id=session_id,
             filename=filename,
             content=content,
             mime_type="text/csv",
             created_by="assistant",
+            session_operation_context=context,
         )
 
 
@@ -144,8 +145,8 @@ async def _delete_test_blob(
     session_id: UUID,
     blob_id: UUID,
 ) -> None:
-    del service, session_id
-    await blob_service.delete_blob(blob_id)
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        await blob_service.delete_blob(blob_id, session_operation_context=context)
 
 
 async def _get_test_blob(
@@ -154,8 +155,8 @@ async def _get_test_blob(
     session_id: UUID,
     blob_id: UUID,
 ) -> BlobRecord:
-    del service, session_id
-    return await blob_service.get_blob(blob_id)
+    async with _session_operation_context(service, session_id, SessionOperationKind.BLOB_READ) as context:
+        return await blob_service.get_blob(blob_id, session_operation_context=context)
 
 
 def _pipeline_plan_result(
@@ -824,19 +825,26 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
     session_id = uuid4()
     with engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    blob = await blob_service.create_blob(
-        session_id=session_id,
-        filename="race.csv",
-        content=b"value\n1\n",
-        mime_type="text/csv",
-        created_by="assistant",
-    )
+    async with _session_operation_context(session_service, session_id, SessionOperationKind.CREATE) as create_context:
+        blob = await blob_service.create_blob(
+            session_id=session_id,
+            filename="race.csv",
+            content=b"value\n1\n",
+            mime_type="text/csv",
+            created_by="assistant",
+            session_operation_context=create_context,
+        )
 
     entered = threading.Event()
     release = threading.Event()
 
-    async def create_proposal():
-        async with _session_operation_context(session_service, session_id, SessionOperationKind.COMPOSE) as context:
+    # A session holds one live operation, so both effects run under the same
+    # COMPOSE context — one composer turn proposing a blob-backed source while
+    # deleting the blob. The context does not order the effects; the custody
+    # lock under test does.
+    async with _session_operation_context(session_service, session_id, SessionOperationKind.COMPOSE) as context:
+
+        async def create_proposal():
             return await session_service.create_composition_proposal(
                 session_operation_context=context,
                 session_id=session_id,
@@ -851,54 +859,54 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                 actor="composer-web:user-alice",
             )
 
-    if winner == "proposal":
-        from elspeth.web.sessions import service as service_module
+        if winner == "proposal":
+            from elspeth.web.sessions import service as service_module
 
-        original_validate = service_module.validate_proposal_blob_references
+            original_validate = service_module.validate_proposal_blob_references
 
-        def blocked_validate(*args, **kwargs):
+            def blocked_validate(*args, **kwargs):
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("proposal race barrier timed out")
+                return original_validate(*args, **kwargs)
+
+            monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
+            proposal_task = asyncio.create_task(create_proposal())
+            assert await asyncio.to_thread(entered.wait, 5)
+            delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
+            await asyncio.sleep(0)
+            release.set()
+
+            proposal = await proposal_task
+            with pytest.raises(BlobPendingProposalError):
+                await delete_task
+            assert proposal.status == "pending"
+            assert await blob_service.get_blob(blob.id, session_operation_context=context) == blob
+            return
+
+        from elspeth.web.blobs import service as blob_service_module
+
+        original_pending = blob_service_module.pending_proposal_reference_id
+
+        def blocked_pending(*args, **kwargs):
             entered.set()
             if not release.wait(timeout=5):
-                raise AssertionError("proposal race barrier timed out")
-            return original_validate(*args, **kwargs)
+                raise AssertionError("delete race barrier timed out")
+            return original_pending(*args, **kwargs)
 
-        monkeypatch.setattr(service_module, "validate_proposal_blob_references", blocked_validate)
-        proposal_task = asyncio.create_task(create_proposal())
+        monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
+        delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
         assert await asyncio.to_thread(entered.wait, 5)
-        delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
+        proposal_task = asyncio.create_task(create_proposal())
         await asyncio.sleep(0)
         release.set()
 
-        proposal = await proposal_task
-        with pytest.raises(BlobPendingProposalError):
-            await delete_task
-        assert proposal.status == "pending"
-        assert await blob_service.get_blob(blob.id) == blob
-        return
-
-    from elspeth.web.blobs import service as blob_service_module
-
-    original_pending = blob_service_module.pending_proposal_reference_id
-
-    def blocked_pending(*args, **kwargs):
-        entered.set()
-        if not release.wait(timeout=5):
-            raise AssertionError("delete race barrier timed out")
-        return original_pending(*args, **kwargs)
-
-    monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
-    delete_task = asyncio.create_task(blob_service.delete_blob(blob.id))
-    assert await asyncio.to_thread(entered.wait, 5)
-    proposal_task = asyncio.create_task(create_proposal())
-    await asyncio.sleep(0)
-    release.set()
-
-    await delete_task
-    with pytest.raises(ValueError, match="does not exist"):
-        await proposal_task
-    with pytest.raises(BlobNotFoundError):
-        await blob_service.get_blob(blob.id)
-    assert await session_service.list_composition_proposals(session_id) == []
+        await delete_task
+        with pytest.raises(ValueError, match="does not exist"):
+            await proposal_task
+        with pytest.raises(BlobNotFoundError):
+            await blob_service.get_blob(blob.id, session_operation_context=context)
+        assert await session_service.list_composition_proposals(session_id) == []
 
 
 @pytest.mark.asyncio

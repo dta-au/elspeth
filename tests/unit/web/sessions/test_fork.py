@@ -20,7 +20,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.blobs.protocol import fork_blob_id
+from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
@@ -50,6 +50,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -2037,7 +2038,8 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2173,7 +2175,7 @@ class TestForkEndpoint:
 
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
-        await blob_service.create_blob(parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
+        await create_blob_under_fence(service, blob_service, parent.id, "source.csv", b"a,b\n1,2\n", "text/csv")
         message = await service.add_message(
             parent.id,
             "user",
@@ -2239,7 +2241,8 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         source_blobs = [
-            await blob_service.create_blob(parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv") for index in range(2)
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+            for index in range(2)
         ]
         message = await service.add_message(
             parent.id,
@@ -2346,6 +2349,9 @@ class TestForkEndpoint:
             "fork",
             writer_principal="route_user_message",
         )
+        # The staged child's only blobs are the fork's own copies: its fence
+        # is held by the fork operation, so nothing else can create there.
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "staged.csv", b"private staged bytes", "text/csv")
         parent_context = await service._run_sync(
             lambda: service.session_operation_authority.acquire(
                 session_id=parent.id,
@@ -2369,12 +2375,25 @@ class TestForkEndpoint:
             fork_message_id=fork_message.id,
             new_message_content="edited",
         )
-        staged_blob = await blob_service.create_blob(
+
+        async def checkpoint() -> None:
+            return None
+
+        copied = await blob_service.copy_blobs_for_fork(
+            parent.id,
             staged.session.id,
-            "staged.csv",
-            b"private staged bytes",
-            "text/csv",
+            staged.blob_plan,
+            BlobForkWriteFence(
+                source_session_id=parent.id,
+                target_session_id=staged.session.id,
+                operation_id=claimed.fence.operation_id,
+                lease_token=claimed.fence.lease_token,
+                attempt=claimed.fence.attempt,
+            ),
+            checkpoint=checkpoint,
         )
+        staged_blob = copied[parent_blob.id]
+        assert staged_blob.session_id == staged.session.id
         client = TestClient(app)
 
         listed = client.get("/api/sessions?include_archived=true")
@@ -2408,7 +2427,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
         parent = await service.create_session("alice", "Parent", "local")
         root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
         stable_id = str(uuid.uuid4())
         guided = GuidedSession(
             step=GuidedStep.STEP_1_SOURCE,
@@ -2499,9 +2518,9 @@ class TestForkEndpoint:
         assert child_intent.options["blob_ref"] == child_blob_id
         assert child_intent.options["path"] == f"blob:{child_blob_id}"
         assert child_intent.sample_rows == ({"id": 1, "name": "Ada"},)
-        child_blob = await blob_service.get_blob(uuid.UUID(child_blob_id))
+        child_blob = await get_blob_under_fence(service, blob_service, child_id, uuid.UUID(child_blob_id))
         assert child_blob.session_id == child_id
-        assert await blob_service.read_blob_content(child_blob.id) == b"id,name\n1,Ada\n"
+        assert await read_blob_content_under_fence(service, blob_service, child_id, child_blob.id) == b"id,name\n1,Ada\n"
 
         committed = transition_source_inspection_review(
             child_guided,
@@ -2546,7 +2565,7 @@ class TestForkEndpoint:
         app.state.plugin_snapshot_factory = lambda _user: PluginAvailabilitySnapshot.for_trained_operator(catalog)
         parent = await service.create_session("alice", "Parent", "local")
         root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
-        parent_blob = await blob_service.create_blob(parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
+        parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
         stable_id = str(uuid.uuid4())
         options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
         guided = GuidedSession(
@@ -2661,7 +2680,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        blob = await blob_service.create_blob(
+        blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -2778,7 +2799,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2805,7 +2828,7 @@ class TestForkEndpoint:
         assert new_blobs[0].session_id == new_session_id
 
         # Verify content matches
-        content = await blob_service.read_blob_content(new_blobs[0].id)
+        content = await read_blob_content_under_fence(service, blob_service, new_session_id, new_blobs[0].id)
         assert content == b"a,b,c\n1,2,3"
 
     @pytest.mark.asyncio
@@ -2824,7 +2847,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b,c\n1,2,3",
@@ -2881,7 +2906,9 @@ class TestForkEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Original", "local")
-        original_blob = await blob_service.create_blob(
+        original_blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "prompt.txt",
             b"Classify this row.",
@@ -3106,7 +3133,9 @@ class TestForkEndpoint:
 
         # Create source session with blobs using the generous-quota service
         session = await session_service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            session_service,
+            blob_service,
             session.id,
             "big.csv",
             b"x" * 200,
@@ -3198,7 +3227,9 @@ class TestForkEndpoint:
         )
 
         # Create a blob so blob_map is non-empty (triggers the rewrite path).
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3250,7 +3281,9 @@ class TestForkEndpoint:
             writer_principal="route_user_message",
         )
 
-        await blob_service.create_blob(
+        await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3283,7 +3316,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await create_blob_under_fence(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         # Use raise_server_exceptions=False so the 500 is returned as an
@@ -3326,7 +3359,9 @@ class TestForkEndpoint:
         session = await service.create_session("alice", "Original", "local")
 
         # Save a state with a blob_ref so the rewrite path is triggered
-        blob = await blob_service.create_blob(
+        blob = await create_blob_under_fence(
+            service,
+            blob_service,
             session.id,
             "data.csv",
             b"a,b\n1,2",
@@ -3397,7 +3432,7 @@ class TestForkEndpoint:
         app, service, blob_service = _make_fork_app(tmp_path)
 
         session = await service.create_session("alice", "Original", "local")
-        await blob_service.create_blob(session.id, "data.csv", b"a,b\n1,2", "text/csv")
+        await create_blob_under_fence(service, blob_service, session.id, "data.csv", b"a,b\n1,2", "text/csv")
         msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
 
         primary = RuntimeError("disk I/O error during blob copy")

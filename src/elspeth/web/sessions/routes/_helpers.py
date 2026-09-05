@@ -3377,6 +3377,7 @@ async def _inspect_latest_ready_session_blob(
     blob_service: BlobServiceProtocol,
     session_id: UUID,
     *,
+    session_operation_context: SessionOperationContext,
     filename: str | None = None,
     source_plugin: str | None = None,
 ) -> SourceInspectionFacts | None:
@@ -3396,7 +3397,7 @@ async def _inspect_latest_ready_session_blob(
             continue
         if filename is not None and record.filename != filename:
             continue
-        content = await blob_service.read_blob_content(record.id)
+        content = await blob_service.read_blob_content(record.id, session_operation_context=session_operation_context)
         facts = inspect_blob_content(
             content=content,
             filename=record.filename,

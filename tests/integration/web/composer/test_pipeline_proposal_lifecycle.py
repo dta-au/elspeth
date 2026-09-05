@@ -18,6 +18,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
@@ -62,6 +63,7 @@ from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -1795,12 +1797,14 @@ async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blockin
 
     session_id = uuid4()
     _insert_session(service, session_id)
-    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
-        session_id,
-        "reviewed.csv",
-        b"value\nreviewed\n",
-        "text/csv",
-    )
+    with fenced_operation_context(service._engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "reviewed.csv",
+            b"value\nreviewed\n",
+            "text/csv",
+            session_operation_context=create_context,
+        )
     source_options = {
         "schema": {"fields": ["value: str"], "mode": "flexible"},
         "path": f"blob:{blob.id}",
@@ -2080,12 +2084,14 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
 
     session_id = uuid4()
     _insert_session(service, session_id)
-    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
-        session_id,
-        "project_urls.csv",
-        b"url\nhttps://example.gov.au/project-1.html\n",
-        "text/csv",
-    )
+    with fenced_operation_context(service._engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "project_urls.csv",
+            b"url\nhttps://example.gov.au/project-1.html\n",
+            "text/csv",
+            session_operation_context=create_context,
+        )
     source_options = {
         "schema": {"fields": ["url: str"], "mode": "flexible"},
         "path": f"blob:{blob.id}",
