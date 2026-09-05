@@ -239,6 +239,16 @@ class FakeIdP:
         """
         return httpx.MockTransport(self._handle)
 
+    def respond(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request as this provider would.
+
+        For a test that mounts its OWN transport to intercept some requests
+        (a redirect at one endpoint, a recorded header) and wants the fake
+        to answer the rest. ``MockTransport.handler`` is typed as possibly
+        async; this is the sync answer, without the indirection.
+        """
+        return self._handle(request)
+
     def _handle(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == self.discovery_url:

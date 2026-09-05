@@ -255,8 +255,12 @@ def test_the_challenge_is_s256_and_not_the_verifier() -> None:
 
 
 def test_every_failure_category_is_distinct() -> None:
-    """Two categories collapsing would merge two different diagnoses."""
-    assert len(SSO_FAILURE_CATEGORIES) == 9
+    """Two categories collapsing would merge two different diagnoses.
+
+    Twelve is the spec's count (§Failure categories [rev2]): eleven ``sso_*``
+    refusals plus ``provider_unavailable``.
+    """
+    assert len(SSO_FAILURE_CATEGORIES) == 12
 
 
 def test_categories_are_carried_by_TYPE_not_message_prefix() -> None:
@@ -275,5 +279,11 @@ def test_every_sso_failure_is_an_authentication_error() -> None:
 
 
 def test_no_category_leaks_idp_supplied_text() -> None:
-    """error_description is attacker-influenced and must never be a category."""
-    assert all(category.startswith("sso_") for category in SSO_FAILURE_CATEGORIES)
+    """error_description is attacker-influenced and must never be a category.
+
+    Every refusal is ``sso_``-prefixed. The single admitted exception is the
+    spec-named ``provider_unavailable``, which is not a refusal at all — it is
+    the 503 path — and is a literal in this module, not anything an IdP sent.
+    """
+    assert SSO_FAILURE_CATEGORIES - {"provider_unavailable"} == {c for c in SSO_FAILURE_CATEGORIES if c.startswith("sso_")}
+    assert "provider_unavailable" in SSO_FAILURE_CATEGORIES

@@ -32,11 +32,9 @@ def idp() -> FakeIdP:
 
 
 def _recording_transport(idp: FakeIdP, seen: list[str]) -> httpx.MockTransport:
-    inner = idp.transport()
-
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(str(request.url))
-        return inner.handler(request)
+        return idp.respond(request)
 
     return httpx.MockTransport(handler)
 
