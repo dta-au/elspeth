@@ -1733,7 +1733,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1110,
+        line=1121,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1743,7 +1743,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1142,
+        line=1153,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1753,7 +1753,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "52821c0918d19708",
         1,
         "IdentityAuthority",
-        line=1123,
+        line=1134,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1763,7 +1763,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1444,
+        line=1472,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1773,7 +1773,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1459,
+        line=1487,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1783,7 +1783,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "956fdc2fb8be5585",
         1,
         "IdentityAuthority",
-        line=1469,
+        line=1497,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1793,67 +1793,67 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "0307059e6046fc43",
         1,
         "IdentityAuthority",
-        line=1773,
+        line=1805,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.bootstrap_admin",
         "identities",
         "insert",
-        "c1b8a0cd93a6004f",
+        "91cb45004637e097",
         1,
         "IdentityAuthority",
-        line=1246,
+        line=1274,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.bootstrap_admin",
         "identities",
         "update",
-        "c1b8a0cd93a6004f",
+        "91cb45004637e097",
         1,
         "IdentityAuthority",
-        line=1263,
+        line=1291,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.bootstrap_admin",
         "identity_roles",
         "insert",
-        "c1b8a0cd93a6004f",
+        "91cb45004637e097",
         1,
         "IdentityAuthority",
-        line=1279,
+        line=1307,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.bootstrap_admin",
         "quota_policies",
         "insert",
-        "c1b8a0cd93a6004f",
+        "91cb45004637e097",
         1,
         "IdentityAuthority",
-        line=1289,
+        line=1317,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.disable_identity",
         "identities",
         "update",
-        "fcf79433f30c6fe9",
+        "bd9ace6eb929d1ec",
         1,
         "IdentityAuthority",
-        line=1557,
+        line=1587,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.disable_identity",
         "identity_relationships",
         "update",
-        "fcf79433f30c6fe9",
+        "bd9ace6eb929d1ec",
         1,
         "IdentityAuthority",
-        line=1571,
+        line=1601,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1863,7 +1863,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d008133458a53f2c",
         1,
         "IdentityAuthority",
-        line=1506,
+        line=1534,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1873,7 +1873,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b7b28d84981c21fd",
         1,
         "IdentityAuthority",
-        line=1071,
+        line=1082,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1883,7 +1883,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c642d9839b59a5cd",
         1,
         "IdentityAuthority",
-        line=1635,
+        line=1665,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1893,7 +1893,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "79f23eb2f41856c8",
         1,
         "IdentityAuthority",
-        line=1344,
+        line=1372,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1903,7 +1903,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "79f23eb2f41856c8",
         1,
         "IdentityAuthority",
-        line=1378,
+        line=1406,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1913,7 +1913,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "79f23eb2f41856c8",
         1,
         "IdentityAuthority",
-        line=1388,
+        line=1416,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1923,7 +1923,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "bc14f7647a324dad",
         1,
         "IdentityAuthority",
-        line=1865,
+        line=1897,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1933,7 +1933,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d5fe93b4219a69e3",
         1,
         "IdentityAuthority",
-        line=1194,
+        line=1205,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1943,17 +1943,17 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "98fac662dd803471",
         1,
         "IdentityAuthority",
-        line=1822,
+        line=1854,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.revoke_role",
         "identity_roles",
         "update",
-        "cc56170150988321",
+        "79b8bbdb5bdf12c6",
         1,
         "IdentityAuthority",
-        line=1679,
+        line=1711,
     ),
     # ── identity substrate acquisitions: one write_connection per mutation,
     # contained (never escapes) and admitted by identity like a writer ────
@@ -1965,7 +1965,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "b0000ee0e0238955",
         1,
         "IdentityAuthority",
-        line=1101,
+        line=1112,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1975,7 +1975,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "eb0301044ea54b03",
         1,
         "IdentityAuthority",
-        line=1429,
+        line=1457,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -1985,27 +1985,27 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "70a1e8d7cce5c882",
         1,
         "IdentityAuthority",
-        line=1724,
+        line=1756,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.bootstrap_admin",
         "<sessions-write-connection>",
         "write_connection",
-        "04825a9aeb9beb2b",
+        "41998549732172fa",
         1,
         "IdentityAuthority",
-        line=1237,
+        line=1253,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.disable_identity",
         "<sessions-write-connection>",
         "write_connection",
-        "58ea9c9a681d0e12",
+        "43ccf54f9119e8be",
         1,
         "IdentityAuthority",
-        line=1540,
+        line=1568,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2015,7 +2015,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "0f9c7191f5bcc87e",
         1,
         "IdentityAuthority",
-        line=1495,
+        line=1523,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2025,7 +2025,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "8065904e364a3496",
         1,
         "IdentityAuthority",
-        line=1068,
+        line=1079,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2035,7 +2035,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "24bac4354f78de56",
         1,
         "IdentityAuthority",
-        line=1609,
+        line=1639,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2045,7 +2045,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "875c1d10bd111a07",
         1,
         "IdentityAuthority",
-        line=1334,
+        line=1362,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2055,7 +2055,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ad900de7af568547",
         1,
         "IdentityAuthority",
-        line=1855,
+        line=1887,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2065,7 +2065,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c2e6e76316a133b3",
         1,
         "IdentityAuthority",
-        line=1185,
+        line=1196,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2075,17 +2075,17 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "526bc10b49fc5319",
         1,
         "IdentityAuthority",
-        line=1809,
+        line=1841,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.revoke_role",
         "<sessions-write-connection>",
         "write_connection",
-        "3e77bce9825d9c6f",
+        "1e13dc0fec869d43",
         1,
         "IdentityAuthority",
-        line=1659,
+        line=1689,
     ),
     # ── P4-D6 steps 4-5 admissions (elspeth-e483fe7f85): writers and contained
     # acquisitions the scanner attributes to a named authority, admitted
@@ -2553,7 +2553,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9de9c0b30666147c",
         1,
         None,
-        line=949,
+        line=960,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2563,7 +2563,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b9d11eb72686f0c0",
         1,
         None,
-        line=964,
+        line=975,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2573,7 +2573,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e0a739c1de8e182",
         1,
         None,
-        line=958,
+        line=969,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2583,7 +2583,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "aacf64b0b472d7a0",
         1,
         None,
-        line=936,
+        line=947,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2593,7 +2593,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "da5ad711342dec32",
         1,
         None,
-        line=1006,
+        line=1017,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2603,7 +2603,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d27c1be3c6032030",
         1,
         None,
-        line=980,
+        line=991,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2613,7 +2613,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "447e2ca011fe13a9",
         1,
         None,
-        line=914,
+        line=925,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2623,7 +2623,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "785026bfc68cad16",
         1,
         None,
-        line=921,
+        line=932,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/identity_authority.py",
@@ -2633,7 +2633,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2be09707110fb626",
         1,
         None,
-        line=929,
+        line=940,
     ),
 )
 
@@ -3331,12 +3331,36 @@ _PRAGMA_STATEMENT = re.compile(
     rf"(?P<name>{_PRAGMA_IDENTIFIER})"
     rf"(?:\s*\((?P<argument>{_PRAGMA_ARGUMENT})\))?\s*;?"
 )
+# PostgreSQL's explicit table lock, in its explicit form ONLY: ``LOCK TABLE``,
+# one or more bare table names, ``IN <one of the eight modes> MODE``, at most
+# one trailing semicolon.  No ``ONLY``, no ``NOWAIT``, no schema qualifier,
+# no second statement.  A lock writes no row; it is the row-set analogue of
+# the advisory-lock SELECTs the forwarding proof already admits, and the
+# bootstrap authority takes one before it counts an EMPTY population (P4-D6,
+# hub ruling on the D20 bootstrap race).
+_LOCK_TABLE_MODES = (
+    "ACCESS SHARE",
+    "ROW SHARE",
+    "ROW EXCLUSIVE",
+    "SHARE UPDATE EXCLUSIVE",
+    "SHARE",
+    "SHARE ROW EXCLUSIVE",
+    "EXCLUSIVE",
+    "ACCESS EXCLUSIVE",
+)
+_LOCK_TABLE_STATEMENT = re.compile(
+    r"LOCK\s+TABLE\s+[A-Z_][A-Z0-9_]*(?:\s*,\s*[A-Z_][A-Z0-9_]*)*\s+IN\s+(?:"
+    + "|".join(mode.replace(" ", r"\s+") for mode in _LOCK_TABLE_MODES)
+    + r")\s+MODE\s*;?"
+)
 
 
 def _raw_sql_is_obviously_read_only(sql: str) -> bool:
-    normalized = sql.lstrip().upper()
+    normalized = sql.strip().upper()
     if normalized.startswith(("SELECT", "WITH RECURSIVE", "EXPLAIN")):
         return True
+    if normalized.startswith("LOCK"):
+        return _LOCK_TABLE_STATEMENT.fullmatch(normalized) is not None
     if not normalized.startswith("PRAGMA"):
         return False
 
@@ -5552,7 +5576,132 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 return self._is_obviously_read_only_statement(func.value, use=use, visited=visited)
         if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
             return _raw_sql_is_obviously_read_only(expression.value)
+        if isinstance(expression, ast.Attribute):
+            texts = self._self_attribute_module_constant_texts(expression, use=use)
+            return texts is not None and all(_raw_sql_is_obviously_read_only(text) for text in texts)
         return False
+
+    def _unrecognised_literal_statement(self, expression: ast.expr | None, *, use: ast.AST) -> bool:
+        """True when every text ``expression`` can hold is readable here and none is a recognised read, lock or raw DML.
+
+        Raw DML literals are already emitted by ``visit_Constant`` as their
+        own writer rows and are not counted twice.
+        """
+
+        texts = self._literal_statement_texts(expression, use=use)
+        if texts is None:
+            return False
+        if all(_raw_sql_is_obviously_read_only(text) for text in texts):
+            return False
+        if isinstance(expression, ast.Attribute):
+            # A text held in a module dict behind ``self.<attr>`` never passes
+            # through ``visit_Constant``: a DML there has no row of its own,
+            # so it is unresolved here rather than trusted to another pass.
+            return True
+        return not all(_raw_sql_is_obviously_read_only(text) or _RAW_WRITE.search(text) for text in texts)
+
+    def _literal_statement_texts(
+        self,
+        expression: ast.expr | None,
+        *,
+        use: ast.AST,
+        visited: frozenset[tuple[int, str, int]] = frozenset(),
+    ) -> list[str] | None:
+        """Every string a statement expression can evaluate to, or ``None`` when any path is unreadable."""
+
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            return [expression.value]
+        if isinstance(expression, ast.Call):
+            qualified = self._imported_qualified_name(expression.func)
+            if qualified and qualified.startswith("sqlalchemy.") and qualified.endswith(".text") and len(expression.args) == 1:
+                return self._literal_statement_texts(expression.args[0], use=use, visited=visited)
+            return None
+        if isinstance(expression, ast.Attribute):
+            return self._self_attribute_module_constant_texts(expression, use=use)
+        if isinstance(expression, ast.Name):
+            key = (id(self._lexical_scope(use)), expression.id, id(use))
+            if key in visited:
+                return None
+            reaching, complete, _ = self._potentially_reaching_bindings(use, expression.id)
+            if not complete or not reaching or any(binding.value is None for binding in reaching):
+                return None
+            texts: list[str] = []
+            for binding in reaching:
+                bound = self._literal_statement_texts(binding.value, use=binding.node, visited=visited | {key})
+                if bound is None:
+                    return None
+                texts.extend(bound)
+            return texts
+        return None
+
+    def _self_attribute_module_constant_texts(self, attribute: ast.Attribute, *, use: ast.AST) -> list[str] | None:
+        """The string constants ``self.<attr>`` can hold, when that is provable from this module alone.
+
+        Admitted shape, and nothing wider: ``use`` sits in an instance method;
+        the enclosing class assigns the attribute EXACTLY once anywhere in its
+        body, as ``self.<attr> = NAME[...]``; ``NAME`` is bound exactly once at
+        module level to a dict display whose every value is a string literal.
+        The dialect-keyed clock SQL of the Sessions authorities is this shape.
+        Anything else -- an import, a second assignment, a ``.get``, a computed
+        value, a non-literal entry -- returns ``None`` and the statement stays
+        unresolved.  This is the only way an attribute-held statement becomes
+        visible to the manifest; before it, a DELETE behind ``self._clock_sql``
+        was invisible (P4-D6, measured 2026-09-05).
+        """
+
+        owner = self._enclosing_function(use)
+        if owner is None or not self._is_instance_method(owner):
+            return None
+        positional = (*owner.args.posonlyargs, *owner.args.args)
+        if not positional or not (isinstance(attribute.value, ast.Name) and attribute.value.id == positional[0].arg):
+            return None
+        owner_class = self.method_owners[id(owner)]
+        assignments: list[ast.expr | None] = []
+        for method in owner_class.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            method_positional = (*method.args.posonlyargs, *method.args.args)
+            self_name = method_positional[0].arg if method_positional and self._is_instance_method(method) else None
+            for node in ast.walk(method):
+                targets: list[ast.expr]
+                if isinstance(node, ast.Assign):
+                    targets = list(node.targets)
+                    value: ast.expr | None = node.value
+                elif isinstance(node, ast.AnnAssign):
+                    targets = [node.target]
+                    value = node.value
+                elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+                    targets = [node.target]
+                    value = None
+                else:
+                    continue
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and target.attr == attribute.attr
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == self_name
+                    ):
+                        assignments.append(value)
+        if len(assignments) != 1 or assignments[0] is None:
+            return None
+        bound = assignments[0]
+        if not (isinstance(bound, ast.Subscript) and isinstance(bound.value, ast.Name)):
+            return None
+        module_bindings = [
+            node.value
+            for node in self.tree.body
+            if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == bound.value.id for t in node.targets))
+            or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == bound.value.id)
+        ]
+        if len(module_bindings) != 1 or not isinstance(module_bindings[0], ast.Dict):
+            return None
+        texts: list[str] = []
+        for value in module_bindings[0].values:
+            if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+                return None
+            texts.append(value.value)
+        return texts if texts else None
 
     def _statement_database_evidence(
         self,
@@ -6065,8 +6214,22 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 mixed_wrapper = any(
                     id(acquisition) in self.wrapper_calls and self._wrapper_arms_disagree(acquisition) for acquisition in acquisitions
                 )
+                # A statement whose TEXT the scanner can read but no recogniser
+                # admits is an unresolved write whether or not the connection
+                # was acquired in scope.  Until P4-D6 an acquisition in scope
+                # swallowed it: only the acquisition row was recorded, so a
+                # TRUNCATE, an unknown PRAGMA or a loosened LOCK inside an
+                # admitted authority's block moved the acquisition's
+                # fingerprint and nothing else, and a mechanical re-pin
+                # admitted it unread.  A statement with no readable text (a
+                # helper's return, a parameter) still rides on its acquisition
+                # row; widening that is a measured ruling, not a default.
+                literal_unknown = self._unrecognised_literal_statement(statement, use=call)
                 if statement_domain == "unknown" and (
-                    force_unresolved or mixed_wrapper or (not acquisitions and id(call) not in self.classified_execution_calls)
+                    force_unresolved
+                    or mixed_wrapper
+                    or literal_unknown
+                    or (not acquisitions and id(call) not in self.classified_execution_calls)
                 ):
                     self._append_site(
                         call,
@@ -7664,7 +7827,10 @@ def test_mutating_pragma_is_not_classified_as_an_obvious_read(tmp_path: Path) ->
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
+    # Not a read, so an unresolved write of its own -- since P4-D6 even
+    # inside the acquired block, not only the acquisition row.
     assert [(site.symbol, site.table, site.operation) for site in sites] == [
+        ("writer", "<unresolved-session-write>", "unknown_exec_driver_sql"),
         ("writer", "<sessions-write-connection>", "write_connection"),
     ]
 
@@ -7707,6 +7873,241 @@ def test_pragma_reads_use_a_closed_allowlist_and_unknown_or_mutating_forms_fail_
             ("unrecognized", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
             ("malformed_argument", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
         }
+    )
+
+
+def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed(tmp_path: Path) -> None:
+    """P4-D6: an acquisition in scope used to swallow every literal the scanner could not classify.
+
+    A TRUNCATE, an unknown PRAGMA, a session setting inside an authority's own
+    ``with engine.begin()`` block moved the acquisition's fingerprint and
+    nothing else, so a mechanical re-pin admitted it unread.  Every literal
+    the scanner can read and no recogniser admits is an unresolved write now,
+    exactly as it is on a bare connection.  A statement with no readable
+    text (a helper's return) still rides on its acquisition row -- measured
+    at 29 live rows on 2026-09-05 and left for a ruling, not widened here.
+    """
+    source = tmp_path / "acquired_unknowns.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import text
+            from sqlalchemy.engine import Engine
+
+            class Authority:
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def truncate(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql("TRUNCATE identity_roles")
+
+                def unknown_pragma(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql("PRAGMA future_read_maybe")
+
+                def session_setting(self):
+                    with self._engine.begin() as conn:
+                        conn.execute(text("SET LOCAL statement_timeout = '1000ms'"))
+
+                def bound_name(self):
+                    statement = "SHOW max_connections"
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql(statement).scalar_one()
+
+                def visible_read(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql("SELECT 1").scalar_one()
+
+                def raw_write_is_its_own_row(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql("DELETE FROM identity_roles")
+
+                def bound_raw_write_is_its_own_row(self):
+                    statement = "DELETE FROM identity_roles"
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql(statement)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites if site.operation != "write_connection") == Counter(
+        {
+            ("Authority.truncate", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("Authority.unknown_pragma", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("Authority.session_setting", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("Authority.bound_name", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("Authority.raw_write_is_its_own_row", "identity_roles", "raw_delete_from"): 1,
+            ("Authority.bound_raw_write_is_its_own_row", "identity_roles", "raw_delete_from"): 1,
+        }
+    )
+    assert Counter(site.symbol for site in sites if site.operation == "write_connection") == Counter(
+        {
+            "Authority.truncate": 1,
+            "Authority.unknown_pragma": 1,
+            "Authority.session_setting": 1,
+            "Authority.bound_name": 1,
+            "Authority.visible_read": 1,
+            "Authority.raw_write_is_its_own_row": 1,
+            "Authority.bound_raw_write_is_its_own_row": 1,
+        }
+    )
+
+
+def test_explicit_lock_table_is_a_lock_acquisition_and_every_loosened_form_is_unresolved(tmp_path: Path) -> None:
+    source = tmp_path / "lock_table.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def two_tables(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles, identities IN SHARE ROW EXCLUSIVE MODE")
+
+            def one_table_lower_semicolon(conn):
+                conn.exec_driver_sql("lock table identity_roles in access share mode;")
+
+            def guarded(conn):
+                if conn.dialect.name == "postgresql":
+                    conn.exec_driver_sql("LOCK TABLE identity_roles IN EXCLUSIVE MODE")
+
+            def no_mode(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles")
+
+            def nowait(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+
+            def no_table_keyword(conn):
+                conn.exec_driver_sql("LOCK identity_roles IN ACCESS SHARE MODE")
+
+            def only_keyword(conn):
+                conn.exec_driver_sql("LOCK TABLE ONLY identity_roles IN SHARE MODE")
+
+            def schema_qualified(conn):
+                conn.exec_driver_sql("LOCK TABLE public.identity_roles IN SHARE MODE")
+
+            def second_statement(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles IN SHARE MODE; DELETE FROM identity_roles")
+
+            def unknown_mode(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles IN FROB MODE")
+
+            def extra_semicolons(conn):
+                conn.exec_driver_sql("LOCK TABLE identity_roles IN SHARE MODE;;")
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    unresolved = Counter(site.symbol for site in sites if site.operation == "unknown_exec_driver_sql")
+    assert unresolved == Counter(
+        {
+            "no_mode": 1,
+            "nowait": 1,
+            "no_table_keyword": 1,
+            "only_keyword": 1,
+            "schema_qualified": 1,
+            "unknown_mode": 1,
+            "extra_semicolons": 1,
+        }
+    )
+    # The two-statement text carries a raw DELETE: that is its row, once.
+    assert Counter((site.symbol, site.table, site.operation) for site in sites if site.operation == "raw_delete_from") == Counter(
+        {("second_statement", "identity_roles", "raw_delete_from"): 1}
+    )
+
+
+def test_self_attribute_bound_once_from_a_module_dict_of_literals_is_classified_by_its_texts(tmp_path: Path) -> None:
+    """The dialect-keyed clock SQL shape, and every way it can be loosened.
+
+    Before P4-D6 a statement held in ``self.<attr>`` was invisible: a DELETE
+    behind ``self._clock_sql`` produced no row.  Now the attribute is
+    classified by the literals it can hold, and only under the one shape a
+    reader can verify from the module alone.  The refusals are exercised on
+    a parameter-received connection, where an unclassified statement has
+    always been reported; the acquired-block case proves a DML in the dict
+    is reported there too, where it used to ride silently on the acquisition.
+    """
+    source = tmp_path / "attribute_statements.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy.engine import Engine
+            from elsewhere import IMPORTED
+
+            _CLOCK: dict[str, str] = {"postgresql": "SELECT clock_timestamp()", "sqlite": "SELECT CURRENT_TIMESTAMP"}
+            _MIXED: dict[str, str] = {"postgresql": "SELECT 1", "sqlite": "DELETE FROM identity_roles"}
+            _COMPUTED = {"postgresql": "SELECT 1", "sqlite": IMPORTED}
+            _TWICE = {"postgresql": "SELECT 1"}
+            _TWICE = {"postgresql": "SELECT 1"}
+            _NOT_A_DICT = ("SELECT 1",)
+
+            class Authority:
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+                    self._clock_sql = _CLOCK[engine.dialect.name]
+                    self._mixed_sql = _MIXED[engine.dialect.name]
+                    self._computed_sql = _COMPUTED[engine.dialect.name]
+                    self._twice_sql = _TWICE[engine.dialect.name]
+                    self._tuple_sql = _NOT_A_DICT[0]
+                    self._imported_sql = IMPORTED[engine.dialect.name]
+                    self._got_sql = _CLOCK.get(engine.dialect.name)
+                    self._reassigned_sql = _CLOCK[engine.dialect.name]
+
+                def rebind(self, text):
+                    self._reassigned_sql = text
+
+                def clock(self, conn):
+                    conn.exec_driver_sql(self._clock_sql).scalar_one()
+
+                def clock_acquired(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql(self._clock_sql).scalar_one()
+
+                def mixed(self, conn):
+                    conn.exec_driver_sql(self._mixed_sql).scalar_one()
+
+                def mixed_acquired(self):
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql(self._mixed_sql).scalar_one()
+
+                def computed(self, conn):
+                    conn.exec_driver_sql(self._computed_sql).scalar_one()
+
+                def twice(self, conn):
+                    conn.exec_driver_sql(self._twice_sql).scalar_one()
+
+                def tuple_bound(self, conn):
+                    conn.exec_driver_sql(self._tuple_sql).scalar_one()
+
+                def imported(self, conn):
+                    conn.exec_driver_sql(self._imported_sql).scalar_one()
+
+                def got(self, conn):
+                    conn.exec_driver_sql(self._got_sql).scalar_one()
+
+                def reassigned(self, conn):
+                    conn.exec_driver_sql(self._reassigned_sql).scalar_one()
+
+            def not_a_method(self, conn):
+                conn.exec_driver_sql(self._clock_sql).scalar_one()
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    unresolved = Counter(site.symbol for site in sites if site.operation == "unknown_exec_driver_sql")
+    assert unresolved == Counter(
+        {
+            "Authority.mixed": 1,
+            "Authority.mixed_acquired": 1,
+            "Authority.computed": 1,
+            "Authority.twice": 1,
+            "Authority.tuple_bound": 1,
+            "Authority.imported": 1,
+            "Authority.got": 1,
+            "Authority.reassigned": 1,
+            "not_a_method": 1,
+        }
+    )
+    assert Counter(site.symbol for site in sites if site.operation == "write_connection") == Counter(
+        {"Authority.clock_acquired": 1, "Authority.mixed_acquired": 1}
     )
 
 

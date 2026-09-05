@@ -656,6 +656,17 @@ _ADMIN_HOLDER_ROWS: Final = (
         identities_table.c.access_state == "active",
     )
 )
+# The same population, LOCKED.  A mutation that can lower R5's count takes
+# this FIRST in its transaction -- before its own target row -- so two such
+# mutations serialise on the admin row set instead of each locking a
+# different target, each reading count 2 and both committing to zero admins
+# (PostgreSQL READ COMMITTED; the loser re-reads the rows as the winner
+# committed them and refuses).  Taking it first is also what keeps the two
+# from deadlocking on each other's target row.  The inner join locks the
+# identities AND identity_roles rows of every holder.  SQLite's dialect
+# drops FOR UPDATE; there ``engine.begin()`` is BEGIN IMMEDIATE, so the whole
+# read-count-then-write already runs under the single writer lock.
+_ADMIN_HOLDER_ROWS_FOR_UPDATE: Final = _ADMIN_HOLDER_ROWS.with_for_update()
 _PENDING_ROWS: Final = (
     select(identities_table.c.identity_id, identities_table.c.first_seen_at)
     .where(identities_table.c.access_state == "pending")
@@ -1231,10 +1242,27 @@ class RepositoryIdentityAuthority:
         self-granted, because there is by definition no other admin to name.
         Inert once an active human admin exists, so a listed subject never
         becomes a standing grant and a config edit cannot recover a lockout.
+
+        Two replicas bootstrapping at once serialise on a PostgreSQL table
+        lock taken before the count, so the loser counts the winner and is
+        refused; on SQLite the transaction is already a BEGIN IMMEDIATE and no
+        lock statement is issued.
         """
         claims = _require_claims(claims)
         _require_nonblank(note, "note")
         with self._engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                # D20's population lock.  The population this method counts
+                # is EMPTY on the run that matters, and a row lock over an
+                # empty set locks nothing: two replicas bootstrapping at once
+                # would each count zero and both self-grant.  SHARE ROW
+                # EXCLUSIVE conflicts with itself and with the ROW EXCLUSIVE
+                # every INSERT and UPDATE takes, and does not block reads.
+                # SQLite issues nothing: create_session_engine makes this
+                # transaction a BEGIN IMMEDIATE, already the single writer.
+                # A literal, not an attribute: the writer manifest classifies
+                # only the statement text it can see at the call.
+                conn.exec_driver_sql("LOCK TABLE identity_roles, identities IN SHARE ROW EXCLUSIVE MODE")
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             if _active_human_admin_count(conn.execute(_ADMIN_HOLDER_ROWS).all(), now) > 0:
                 raise AdminAlreadyBootstrapped()
@@ -1539,6 +1567,8 @@ class RepositoryIdentityAuthority:
         _require_nonblank(reason, "reason")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # R5's population, locked before anything else (see the constant).
+            admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             actor_row = conn.execute(_IDENTITY_BY_ID, {"identity_id": actor.identity_id}).one_or_none()
             actor_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": actor.identity_id}).all(), now)
             verified = _verified_actor(actor, actor_row, actor_grants)
@@ -1551,7 +1581,7 @@ class RepositoryIdentityAuthority:
                 raise IdentityAlreadyDisabled()
             if row.kind == "human" and row.access_state == "active":
                 target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all(), now)
-                if _holds_deployment_admin(target_grants) and _active_human_admin_count(conn.execute(_ADMIN_HOLDER_ROWS).all(), now) <= 1:
+                if _holds_deployment_admin(target_grants) and _active_human_admin_count(admin_holders, now) <= 1:
                     raise LastActiveAdminProtected()
             conn.execute(
                 update(identities_table)
@@ -1658,6 +1688,8 @@ class RepositoryIdentityAuthority:
         _require_optional_text(note, "note")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # R5's population, locked before anything else (see the constant).
+            admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             actor_row = conn.execute(_IDENTITY_BY_ID, {"identity_id": actor.identity_id}).one_or_none()
             actor_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": actor.identity_id}).all(), now)
             verified = _verified_actor(actor, actor_row, actor_grants)
@@ -1673,7 +1705,7 @@ class RepositoryIdentityAuthority:
                     holder is not None
                     and holder.kind == "human"
                     and holder.access_state == "active"
-                    and _active_human_admin_count(conn.execute(_ADMIN_HOLDER_ROWS).all(), now) <= 1
+                    and _active_human_admin_count(admin_holders, now) <= 1
                 ):
                     raise LastActiveAdminProtected()
             conn.execute(update(identity_roles_table).where(identity_roles_table.c.role_id == role_id).values(revoked_at=now))
