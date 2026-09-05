@@ -1,16 +1,17 @@
 # Test System Guide
 
-Current as of 2026-05-20.
+Runner selection current as of 2026-09-05; suite layout last reviewed
+2026-05-20.
 
 ELSPETH's test system is a pytest suite with strict marker/config validation,
 Hypothesis profiles, shared fixture factories, and directory-based test tiers.
 The active source of truth for runner behavior is
 [`pyproject.toml`](../../pyproject.toml), not this guide.
 
-On 2026-05-20, `python -m pytest --collect-only -q` collected 19,163 pytest
-items in this checkout. The default marker expression deselected 115 slow,
-stress, performance, or testcontainer items, leaving 19,048 default-selected
-items. Treat these numbers as a freshness check, not a permanent contract.
+On 2026-09-05, `python -m pytest --collect-only -q` collected 47,462 pytest
+items in this checkout, of which 276 carry the `testcontainer` marker and are
+deselected by the default expression. Treat these numbers as a freshness
+check, not a permanent contract.
 
 ## Runner Configuration
 
@@ -21,8 +22,17 @@ Default behavior:
 - Test discovery starts at `tests/`.
 - `src` and `elspeth-lints/src` are on `pythonpath`.
 - Strict marker and strict config checks are enabled.
-- The default run excludes `slow`, `stress`, `performance`, and
-  `testcontainer` tests.
+- The default run excludes `slow`, `stress`, `performance`, `testcontainer`,
+  and `live_provider` tests. It is the selection CI's `Test` job runs.
+- The `testcontainer` tests (real PostgreSQL 16 via testcontainers-python,
+  Docker required) run in CI in their own required job,
+  `Testcontainer (PostgreSQL contention proofs)` in
+  `.github/workflows/ci.yaml`, as `pytest tests/ -m testcontainer -n 0`. The
+  selection is the whole tree, not only `tests/testcontainer/`: four
+  integration files under `tests/integration/web/` carry per-test
+  `testcontainer` marks. The run is serial because
+  `tests/testcontainer/web/conftest.py` shares one TLS PostgreSQL container
+  across the deployment-acceptance files and rejects xdist workers.
 - `.env` is loaded for integration-style tests that need local operator
   settings.
 
@@ -35,7 +45,7 @@ python -m pytest tests/integration
 python -m pytest tests/property
 python -m pytest tests/e2e -m e2e
 python -m pytest -m "performance or stress"
-python -m pytest -m testcontainer
+python -m pytest tests/ -m testcontainer -n 0
 python -m pytest --collect-only -q
 ```
 

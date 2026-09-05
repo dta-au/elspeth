@@ -68,10 +68,12 @@ on:
   pull_request:
     branches: [main, master, "RC*", "release/**"]
 
-# Cancel in-progress judge-gate runs when a new commit updates the same ref.
+# Cancel in-progress judge-gate runs when a new commit updates the same ref —
+# except on release/** refs, mirroring ci.yaml (elspeth-d8749aeaa3);
+# tests/unit/cicd pins the three workflows identical.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
   contents: read

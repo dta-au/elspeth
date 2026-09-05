@@ -40,7 +40,7 @@ from elspeth.contracts.emitted_option import (
     emitted_option_fields,
     env_placeholders_in,
 )
-from elspeth.contracts.enums import OutputMode, RunMode
+from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode, RunMode
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.security import SecretFingerprintError as SecretFingerprintError
 from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT
@@ -2312,11 +2312,7 @@ class ElspethSettings(BaseModel):
         seen: dict[str, str] = {}
         for name, node_type in all_names:
             if name in seen:
-                raise ValueError(
-                    f"Node name '{name}' is used by both {seen[name]} and {node_type}. "
-                    f"All node names must be unique across transforms, gates, "
-                    f"aggregations, coalesce nodes, row_union nodes, collectors, sources, queues, and sinks."
-                )
+                raise ValueError(f"Node name '{name}' is used by both {seen[name]} and {node_type}. {UNIQUE_NODE_NAMES_RULE}")
             seen[name] = node_type
         return self
 

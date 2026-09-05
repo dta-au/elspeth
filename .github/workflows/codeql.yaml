@@ -15,9 +15,11 @@ on:
   schedule:
     - cron: "23 4 * * 1"
 
+# Mirrors ci.yaml: never cancel an in-progress run on a release/** ref
+# (elspeth-d8749aeaa3); tests/unit/cicd pins the three workflows identical.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
 
 permissions:
   actions: read

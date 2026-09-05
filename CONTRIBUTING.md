@@ -108,9 +108,15 @@ the hash of a plugin's source. A change can be locally green, fully typed, and
 lint-clean and still fail one of these for everyone on the branch, because the
 gate that catches it lives in a test file you did not run.
 
-- Run the full `pytest tests/` (the CI-equivalent selection) before you
-  consider a commit done. At an absolute minimum run every gate listed below
-  whose tree you touched.
+- Run the full `pytest tests/` (the selection CI's `Test` job runs) before
+  you consider a commit done. At an absolute minimum run every gate listed
+  below whose tree you touched.
+- The default selection deselects the `testcontainer` marker. If you touched
+  schema, SQL, session or Landscape persistence, or a lock, also run
+  `pytest tests/ -m testcontainer -n 0` (Docker required; serial because the
+  web acceptance fixture shares one PostgreSQL container). CI runs that
+  selection in the required `Testcontainer (PostgreSQL contention proofs)`
+  job; a PostgreSQL-only defect is invisible to everything else.
 - Several gates run **only in CI** (`trust_boundary.tests`, the plugin
   `source_file_hash` check): a green local suite and a green pre-commit hook
   prove nothing about them. Run the CI command yourself; the commands are

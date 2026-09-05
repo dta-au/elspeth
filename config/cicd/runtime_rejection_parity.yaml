@@ -627,25 +627,22 @@ sites:
   ordinal: 0
   disposition: not_authorable
   note: Same landscape.export.enabled guard (config.py:2045) that composer YAML can never turn on (yaml_generator.py:352-353).
-- key: e73658612a1f25df
+- key: 6992bbbcb20bb248
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_globally_unique_node_names
   exception: ValueError
-  message: Node name '{}' is used by both {} and {}. All node names must be unique across transforms,
-    gates, aggregations, coalesce nodes, row_union nodes, collectors, sou
+  message: Node name '{}' is used by both {} and {}. {}
   ordinal: 0
   disposition: mirrored
   counterpart:
   - node_id_collides_with_source_or_sink
   - queue_name_collision
   - duplicate_node_id
-  note: Carried from 0f959991339a963c (re-keyed by the WS2 Task 2 message reword adding "collectors" to
-    the enumerated node kinds). Mirrored disposition holds for every node kind the composer can author
-    today. The new collector branch itself is not yet reachable from the composer - collectors and scopes
-    are not_authorable per the sibling entries this task seeded (Task 12 re-adjudicates). Review round
-    1 note - duplicate_node_id was dropped from this list during the carry-forward and is restored here;
-    it is a live Stage-1 code (state.py:5969) and a genuine mirror of the same predicate for same-name
-    collisions.
+  note: Carried from e73658612a1f25df (re-keyed by elspeth-1768ad240c, which derives the trailing rule
+    sentence from contracts.enums.UNIQUE_NODE_NAMES_RULE instead of hand-listing the node kinds; the predicate
+    is unchanged). Mirrored disposition holds for every node kind the composer can author today. Earlier
+    carry (0f959991339a963c) restored duplicate_node_id after a review round dropped it - it is a live
+    Stage-1 code (state.py) and a genuine mirror of the same predicate for same-name collisions.
 - key: e7d99b1fec819603
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_queue_names
@@ -2601,6 +2598,31 @@ sites:
     at builder.py:783, so a key exists only once it holds at least one edge; ''if not upstream_edges''
     at builder.py:938 can never be true. (Stage 1 does cover the real predicate anyway: a queue''s input
     is its own id, so a producerless queue trips node_input_not_reachable — see state.py:5788-5790.)'
+- key: ca0dda9f7b36bba1
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: 'Scope ''{}'' opener ''{}'' does not name a transforms: entry. A scope opener is a multi-row
+    transform declared in transforms:.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - scope_opener_unknown
+  note: Builder twin of ScopeSettings' name-membership check, reached with plugin instances in hand; Stage-1
+    already refuses an opener that names no transform node (state.py scope_opener_unknown).
+- key: 90913c9e624a399f
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: GraphValidationError
+  message: Scope '{}' opener '{}' is not a multi-row transform (creates_tokens=False), so it expands no
+    rows into the group collector '{}' would close. A scope opener must
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - scope_opener_not_multi_row
+  note: The check core/config.py _validate_scope_bindings defers to the builder (elspeth-9783949ed4).
+    Stage-1 mirror in _collector_intrinsic_errors derives multi-row-ness from the same plugin attribute
+    (creates_tokens) via the shared plugin manager, as the is_batch_aware mirror does.
 - key: 6e3e011c4d6699d3
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
