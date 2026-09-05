@@ -57,6 +57,7 @@ from elspeth.web.sessions.models import schema_identity_table as session_schema_
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedCompositionStateResult,
+    GuidedOperationActive,
     GuidedOperationClaimed,
     GuidedOperationCompleted,
     GuidedOperationFenceLostError,
@@ -400,6 +401,18 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
 
 @pytest.mark.asyncio
 async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postgres_engine: Engine) -> None:
+    """The guided table arbitrates two concurrent reserves admitted by ONE session lease.
+
+    Dual fencing makes the session COMPOSE lease exclusive per session, so two
+    DISTINCT lease holders never reach ``reserve_guided_operation`` at the same
+    time (that race is decided at the session fence; see the next test). The
+    guided-table arbitration is still reachable: the session fence is a plain
+    lease-row read with no per-use consumption, so one live context presented
+    by two concurrent dispatches passes both fence checks and the two reserves
+    contend under the per-session PostgreSQL advisory lock. Exactly one takes
+    the expired operation over (attempt 2); the other observes the fresh lease
+    as active. The audited event chain records one takeover.
+    """
     init_session_schema(postgres_engine)
     services = [
         SessionServiceImpl(
@@ -412,14 +425,100 @@ async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postg
     session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
     operation_id = "postgres-contended-takeover"
     request_hash = "c" * 64
-    # Dual fencing: a contender must hold the session COMPOSE lease before
-    # it can take over the expired guided operation, so the race is decided
-    # at the session fence. Worker-a claims under its own lease and lets it
-    # go; its guided lease is forced to expire; two contenders then race for
-    # the session lease at a barrier. Exactly one acquires it and takes the
-    # operation over; the other is refused at the session fence. The winner
-    # holds its lease until the loser has been refused (second barrier), so
-    # the outcome pair is the same on every run.
+    context = await services[0]._run_sync(
+        lambda: services[0].session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=services[0].session_operation_owner_instance_id,
+            lease_seconds=services[0].session_operation_lease_seconds,
+        )
+    )
+    try:
+        first = await services[0].reserve_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="guided_start",
+            request_hash=request_hash,
+            actor="worker-a",
+            lease_seconds=30,
+            session_operation_context=context,
+        )
+        assert isinstance(first, GuidedOperationClaimed)
+        with postgres_engine.begin() as conn:
+            conn.execute(
+                update(guided_operations_table)
+                .where(
+                    guided_operations_table.c.session_id == str(session_id),
+                    guided_operations_table.c.operation_id == operation_id,
+                )
+                .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
+            )
+
+        barrier = threading.Barrier(2)
+
+        def contend(service: SessionServiceImpl, actor: str):
+            barrier.wait()
+            return asyncio.run(
+                service.reserve_guided_operation(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    kind="guided_start",
+                    request_hash=request_hash,
+                    actor=actor,
+                    lease_seconds=30,
+                    session_operation_context=context,
+                )
+            )
+
+        outcomes = await asyncio.gather(
+            asyncio.to_thread(contend, services[1], "worker-b"),
+            asyncio.to_thread(contend, services[2], "worker-c"),
+        )
+    finally:
+        await services[0]._run_sync(services[0].session_operation_authority.release, context)
+    assert sum(isinstance(outcome, GuidedOperationTakenOver) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, GuidedOperationActive) for outcome in outcomes) == 1
+    (active,) = [outcome for outcome in outcomes if isinstance(outcome, GuidedOperationActive)]
+    assert active.attempt == 2
+    assert active.expired is False
+    with postgres_engine.connect() as conn:
+        events = conn.execute(
+            select(guided_operation_events_table)
+            .where(
+                guided_operation_events_table.c.session_id == str(session_id),
+                guided_operation_events_table.c.operation_id == operation_id,
+            )
+            .order_by(guided_operation_events_table.c.sequence)
+        ).all()
+    assert [event.event_kind for event in events] == ["claimed", "taken_over"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_concurrent_takeover_contenders_are_decided_at_the_session_fence(postgres_engine: Engine) -> None:
+    """Two DISTINCT contenders for an expired guided operation are decided at the session fence.
+
+    Under dual fencing a contender must hold the session COMPOSE lease before
+    it can reach the guided table, and that lease is exclusive per session, so
+    the guided table's own arbitration (previous test) is never the deciding
+    layer between two holders. Worker-a claims under its own lease and lets it
+    go; its guided lease is forced to expire; two contenders then race for the
+    session lease at a barrier. Exactly one acquires it and takes the operation
+    over; the other is refused at the session fence and never issues a reserve.
+    The winner holds its lease until the loser has been refused (second
+    barrier), so the outcome pair is the same on every run.
+    """
+    init_session_schema(postgres_engine)
+    services = [
+        SessionServiceImpl(
+            postgres_engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger(f"test.guided-operation-contender-{index}"),
+        )
+        for index in range(3)
+    ]
+    session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
+    operation_id = "postgres-contended-takeover"
+    request_hash = "c" * 64
     context_a = await services[0]._run_sync(
         lambda: services[0].session_operation_authority.acquire(
             session_id=session_id,
