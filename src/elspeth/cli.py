@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
     from elspeth.telemetry import TelemetryManager
     from elspeth.web.auth.local import LocalAuthProvider, RetireIdentity
+    from elspeth.web.coordination.identity_authority import IdentityRetired
 __all__ = [
     "app",
     "load_settings",  # Re-exported from config for convenience
@@ -1951,6 +1952,63 @@ def _resolve_composer_session_db_url(*, data_dir: Path, session_db_url: str | No
     return resolve_session_db_url(data_dir=data_dir.expanduser().resolve(), session_db_url=configured)
 
 
+def _resolve_composer_landscape_url(*, data_dir: Path, landscape_url: str | None) -> str:
+    """The Landscape the retirement audit row goes to, by the web app's rule.
+
+    Explicit URL, then the ``ELSPETH_WEB__LANDSCAPE_URL`` the container
+    exports, then ``data_dir/runs/audit.db`` -- the same resolution as
+    ``WebSettings.get_landscape_url``, read through the same module-level
+    function rather than a copy of it.
+    """
+    from elspeth.web.config import resolve_landscape_url
+
+    configured = landscape_url if landscape_url is not None else os.environ.get("ELSPETH_WEB__LANDSCAPE_URL")
+    return resolve_landscape_url(data_dir=data_dir.expanduser().resolve(), landscape_url=configured)
+
+
+def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
+    """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
+
+    A credential deletion disables the identity and retires its binding, and
+    the authority invokes this INSIDE that transaction -- a retirement the
+    Landscape cannot hold does not commit, the rule every identity mutation
+    follows. The CLI is a surface whose audit trail matters (it deletes
+    accounts), so it does not take the "audits nothing" no-op the authority
+    allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
+    through the same recorder, resolved from the same URL rule.
+    """
+    from sqlalchemy.engine.url import make_url
+
+    from elspeth.web.auth.audit import AuthAuditRecorder
+
+    parsed = make_url(landscape_url)
+    sqlite_landscape = parsed.drivername.split("+", 1)[0] == "sqlite"
+    sqlite_file = parsed.database if sqlite_landscape else None
+    if sqlite_file is not None and sqlite_file != ":memory:":
+        # The web app creates data_dir/runs at boot; a CLI that writes the
+        # first audit row of a fresh data dir must do the same, or SQLite
+        # refuses to create the file.
+        Path(sqlite_file).parent.mkdir(parents=True, exist_ok=True)
+    recorder = AuthAuditRecorder(
+        landscape_url=landscape_url,
+        landscape_passphrase=os.environ.get("ELSPETH_WEB__LANDSCAPE_PASSPHRASE"),
+        # Mirrors AuthAuditRecorder.from_settings: only a SQLite Landscape is
+        # created on first write; an external store is provisioned by doctor.
+        create_tables=sqlite_landscape,
+    )
+
+    def record(outcome: IdentityRetired) -> None:
+        recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
+    return record
+
+
 def _composer_session_engine(session_db_url: str) -> Engine:
     """Open the sessions store the way the web app opens it (PRAGMAs, pool)."""
     from elspeth.web.schema_probe import postgres_engine_kwargs
@@ -1959,22 +2017,23 @@ def _composer_session_engine(session_db_url: str) -> Engine:
     return create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
 
 
-def _deferred_identity_retirer(session_db_url: str) -> RetireIdentity:
-    """A retirer that opens the sessions store only if it is ever asked to retire.
+def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> RetireIdentity:
+    """A retirer that opens the stores only if it is ever asked to retire.
 
     ``add`` never deletes, but the provider's retirer is required -- a
     provider that cannot retire is the inheritance defect, not a smaller
-    provider -- and opening the store eagerly is not free: the engine
+    provider -- and opening the stores eagerly is not free: the engine
     probes its PRAGMAs on construction, which creates an empty
     ``sessions.db`` beside an ``auth.db`` the operator only meant to add a
-    user to. So ``add`` binds the real authority behind a first-call open.
+    user to. So ``add`` binds the real authority, with the real audit sink,
+    behind a first-call open.
     """
     from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
     def retire(username: str) -> None:
         engine = _composer_session_engine(session_db_url)
         try:
-            local_identity_retirer(RepositoryIdentityAuthority(engine))(username)
+            local_identity_retirer(RepositoryIdentityAuthority(engine), _composer_retirement_recorder(landscape_url))(username)
         finally:
             engine.dispose()
 
@@ -2035,7 +2094,10 @@ def composer_users_add(
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
     provider = _composer_auth_provider(
         db_path,
-        retire_identity=_deferred_identity_retirer(_resolve_composer_session_db_url(data_dir=data_dir, session_db_url=None)),
+        retire_identity=_deferred_identity_retirer(
+            _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=None),
+            _resolve_composer_landscape_url(data_dir=data_dir, landscape_url=None),
+        ),
     )
     try:
         provider.create_user(
@@ -2069,6 +2131,11 @@ def composer_users_remove(
         "--session-db-url",
         help="Sessions store URL; defaults to ELSPETH_WEB__SESSION_DB_URL, then <data-dir>/sessions.db.",
     ),
+    landscape_url: str | None = typer.Option(
+        None,
+        "--landscape-url",
+        help="Landscape URL for the retirement audit row; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -2089,7 +2156,13 @@ def composer_users_remove(
         raise typer.Exit(1)
     resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
     session_engine = _composer_session_engine(resolved_session_db_url)
-    provider = _composer_auth_provider(db_path, retire_identity=local_identity_retirer(RepositoryIdentityAuthority(session_engine)))
+    provider = _composer_auth_provider(
+        db_path,
+        retire_identity=local_identity_retirer(
+            RepositoryIdentityAuthority(session_engine),
+            _composer_retirement_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url)),
+        ),
+    )
     # The store must carry the current schema BEFORE the credential goes:
     # a deletion whose retirement then fails is the inheritance defect with
     # extra steps. Same create-or-validate rule the web app applies to this

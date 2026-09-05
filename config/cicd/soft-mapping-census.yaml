@@ -663,18 +663,21 @@ files:
     dict[str, object]: 4
   src/elspeth/web/auth/entra.py:
     dict[str, Any]: 2
+  src/elspeth/web/auth/id_token.py:
+    Mapping[str, Any]: 10
+    dict[str, Any]: 7
   src/elspeth/web/auth/local.py:
     Mapping[str, object]: 2
   src/elspeth/web/auth/oidc.py:
-    Mapping[str, Any]: 8
-    boundary: 3
-    dict[str, Any]: 9
+    dict[str, Any]: 2
   src/elspeth/web/auth/providers/__init__.py:
     Mapping[str, Any]: 3
   src/elspeth/web/auth/providers/_mechanics.py:
     Mapping[str, Any]: 16
   src/elspeth/web/auth/session_token.py:
     dict[str, object]: 3
+  src/elspeth/web/auth/sso.py:
+    Mapping[str, Any]: 11
   src/elspeth/web/blobs/service.py:
     dict[str, Any]: 2
   src/elspeth/web/catalog/knob_schema.py:
@@ -1016,11 +1019,13 @@ files:
     Mapping[str, Any]: 34
     dict[str, Any]: 3
     dict[str, object]: 2
+  src/elspeth/web/sso_wiring.py:
+    Mapping[str, Any]: 4
 totals:
-  Mapping[str, Any]: 898
+  Mapping[str, Any]: 915
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
-  boundary: 63
+  boundary: 60
   dict[str, Any]: 1154
   dict[str, object]: 389
-  soft: 2739
+  soft: 2756
