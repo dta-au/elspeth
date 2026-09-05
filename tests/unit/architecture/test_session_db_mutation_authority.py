@@ -9372,7 +9372,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "afc7d978d541eadc",
             1,
             None,
-            line=217,
+            line=218,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -9383,7 +9383,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "883e79c104c66d8f",
             1,
             None,
-            line=263,
+            line=264,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -9394,7 +9394,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "bbce7dbcfc31f6ec",
             1,
             None,
-            line=469,
+            line=471,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable
