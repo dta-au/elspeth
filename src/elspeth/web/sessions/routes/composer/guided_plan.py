@@ -390,7 +390,11 @@ async def post_guided_plan(
         request_id=body.operation_id,
         user_id=user.user_id,
     )
-    joined_after_fence_loss = False
+    # Set the moment this worker observes that its guided authority is gone
+    # (a takeover or lapse). From then on the lease's own close reporting the
+    # same loss is expected and must never replace the outcome the route
+    # already settled on -- a joined winner or the preserved primary.
+    fence_loss_observed = False
     try:
         catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
@@ -563,6 +567,7 @@ async def post_guided_plan(
         await progress(_guided_full_complete_progress_event())
         return proposal_response
     except (GuidedOperationFenceLostError, BlobGuidedOperationFenceLostError) as exc:
+        fence_loss_observed = True
         failure_code = _guided_full_failure_code(exc)
         lookup_failed = False
         try:
@@ -676,6 +681,7 @@ async def post_guided_plan(
                 )
             )
         except GuidedOperationFenceLostError as fence_lost:
+            fence_loss_observed = True
             try:
                 (joined, _cancelled_during_winner_lookup) = await _await_with_deferred_cancellation(
                     reserve_or_replay_guided_operation(
@@ -768,6 +774,7 @@ async def post_guided_plan(
                 session_operation_context=reserved.session_operation_context,
             )
         except GuidedOperationFenceLostError as fence_lost:
+            fence_loss_observed = True
             try:
                 joined = await reserve_or_replay_guided_operation(
                     service=service,
@@ -822,7 +829,7 @@ async def post_guided_plan(
         try:
             await reserved.close()
         except SessionOperationFenceLost:
-            if not joined_after_fence_loss:
+            if not fence_loss_observed:
                 raise
 
 

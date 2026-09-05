@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event, insert, select
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.state_engine import capture_state_engine_image
 
 from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
@@ -171,12 +172,12 @@ def test_postgresql_initial_leader_registration_is_atomic(postgres_url: str) -> 
     event.listen(db.engine, "before_cursor_execute", fail_first_evidence)
     try:
         with pytest.raises(RuntimeError, match="forced PostgreSQL coordination evidence failure"):
-            repo.register_run_leader(run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
+            register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
     finally:
         event.remove(db.engine, "before_cursor_execute", fail_first_evidence)
 
     assert capture_state_engine_image(db, run_id=run_id) == before
-    token = repo.register_run_leader(run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
+    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
     try:
         assert token == CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
         with db.read_only_connection() as conn:
@@ -210,7 +211,7 @@ def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(po
     db = LandscapeDB.from_url(postgres_url)
     repo = RunCoordinationRepository(db.engine)
     _seed_run(db, run_id=run_id, now=now, status="failed")
-    repo.register_run_leader(run_id=run_id, worker_id=incumbent_id, now=now, window_seconds=1)
+    register_run_leader(repo, run_id=run_id, worker_id=incumbent_id, now=now, window_seconds=1)
     before_equality = capture_state_engine_image(db, run_id=run_id)
     equality_contender = mint_worker_id(run_id)
 
@@ -265,7 +266,8 @@ def test_postgresql_concurrent_takeover_conditional_update_has_one_winner(postgr
         second_db = LandscapeDB.from_url(postgres_url)
         resources.callback(second_db.close)
         _seed_run(first_db, run_id=run_id, now=now, status="failed")
-        RunCoordinationRepository(first_db.engine).register_run_leader(
+        register_run_leader(
+            RunCoordinationRepository(first_db.engine),
             run_id=run_id,
             worker_id=incumbent_id,
             now=now,
@@ -318,7 +320,7 @@ def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(post
     db = LandscapeDB.from_url(postgres_url)
     repo = RunCoordinationRepository(db.engine)
     _seed_run(db, run_id=run_id, now=now, status="failed")
-    repo.register_run_leader(run_id=run_id, worker_id=worker_id, now=now, window_seconds=5)
+    register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=5)
     events_before = _coordination_events(db, run_id=run_id)
 
     heartbeat_at = now + timedelta(seconds=5)
@@ -364,7 +366,7 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
     try:
         repo = RunCoordinationRepository(db.engine)
         _seed_run(db, run_id=run_id, now=now)
-        repo.register_run_leader(run_id=run_id, worker_id=leader_id, now=now, window_seconds=30)
+        register_run_leader(repo, run_id=run_id, worker_id=leader_id, now=now, window_seconds=30)
         repo.admit_follower(
             run_id=run_id,
             worker_id=follower_id,
@@ -434,7 +436,7 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
             )
         )
     incumbent_id = mint_worker_id(RUN_ID)
-    token = repo.register_run_leader(run_id=RUN_ID, worker_id=incumbent_id, now=NOW, window_seconds=1)
+    token = register_run_leader(repo, run_id=RUN_ID, worker_id=incumbent_id, now=NOW, window_seconds=1)
     successor_id = mint_worker_id(RUN_ID)
 
     release_has_first_lock = threading.Event()
