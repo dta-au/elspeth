@@ -53,7 +53,7 @@ Outputs:
 ```bash
 ./build-control-pack.sh --list             # show the document keys
 ./build-control-pack.sh --pdf              # build every document
-./build-control-pack.sh --pdf programme    # build one
+./build-control-pack.sh --pdf program      # build one
 ```
 
 One PDF per document rather than a bound volume: each document carries its own

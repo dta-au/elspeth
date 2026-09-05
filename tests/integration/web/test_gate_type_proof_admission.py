@@ -9,6 +9,7 @@ import pytest
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.app import create_app
 from elspeth.web.composer.state import (
     CompositionState,
@@ -19,7 +20,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.helpers.session_fences import acquire_compose_context
+from tests.helpers.session_fences import acquire_compose_context, acquire_operation_context
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -167,13 +168,15 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
         )
         assert created.status_code == 201, created.text
         session_id = UUID(created.json()["id"])
-        blob = await app.state.blob_service.create_blob(
-            session_id,
-            "amounts.csv",
-            b"amount\n250.00\n750.00\n",
-            "text/csv",
-            created_by="user",
-        )
+        async with acquire_operation_context(app.state.session_service, session_id, SessionOperationKind.CREATE) as create_context:
+            blob = await app.state.blob_service.create_blob(
+                session_id,
+                "amounts.csv",
+                b"amount\n250.00\n750.00\n",
+                "text/csv",
+                created_by="user",
+                session_operation_context=create_context,
+            )
         output_dir = tmp_path / "outputs" / str(session_id)
         state = _state(
             blob_id=blob.id,

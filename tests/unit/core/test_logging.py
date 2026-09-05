@@ -276,3 +276,81 @@ class TestBoundContextvarsInJsonOutput:
 
         payload = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert "request_id" not in payload
+
+
+class TestRouteElspethLogsToStderr:
+    """``route_elspeth_logs_to_stderr`` — the log channel for stdout-owning CLI modes."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_root_logger(self) -> Iterator[None]:
+        from elspeth.core.logging import _elspeth_handler_ids
+
+        root = logging.getLogger()
+        saved_handlers = list(root.handlers)
+        saved_level = root.level
+        saved_ids = set(_elspeth_handler_ids)
+        yield
+        root.handlers = saved_handlers
+        root.level = saved_level
+        _elspeth_handler_ids.clear()
+        _elspeth_handler_ids.update(saved_ids)
+
+    def test_route_elspeth_logs_to_stderr_moves_only_owned_handlers(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A machine-readable CLI mode owns stdout; ELSPETH log lines move to stderr.
+
+        elspeth-4b27604bb7: the deployment doctor's ``--json`` report was
+        corrupted by a structlog WARNING emitted on the shared stdout handler.
+        Re-targeting must touch ONLY the handlers configure_logging installed —
+        a foreign handler (pytest caplog, an operator's own sink) keeps its stream.
+        """
+        import io as _io
+
+        import structlog
+
+        from elspeth.core.logging import _elspeth_handler_ids, configure_logging, route_elspeth_logs_to_stderr
+
+        root = logging.getLogger()
+        foreign_sink = _io.StringIO()
+        foreign_handler = logging.StreamHandler(foreign_sink)
+        foreign_handler.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(foreign_handler)
+        try:
+            configure_logging(json_output=True)
+            route_elspeth_logs_to_stderr()
+
+            structlog.get_logger("probe").warning("routed_probe_event")
+
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "routed_probe_event" in captured.err
+            assert "routed_probe_event" in foreign_sink.getvalue()
+            assert foreign_handler.stream is foreign_sink
+            assert len([h for h in root.handlers if id(h) in _elspeth_handler_ids]) == 1
+        finally:
+            root.removeHandler(foreign_handler)
+
+    def test_route_elspeth_logs_to_stderr_resolves_the_live_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The re-targeted stream must resolve sys.stderr at write time, like the stdout one does."""
+        import structlog
+
+        from elspeth.core.logging import configure_logging, route_elspeth_logs_to_stderr
+
+        configure_logging(json_output=False, color_output=False)
+        route_elspeth_logs_to_stderr()
+        # A swap of sys.stderr AFTER routing (what CliRunner / pytest capture do)
+        # must still receive the record.
+        structlog.get_logger("probe").warning("late_swap_probe")
+        first = capsys.readouterr()
+        assert "late_swap_probe" in first.err
+        assert first.out == ""
+
+    def test_route_elspeth_logs_to_stderr_requires_a_configured_handler(self) -> None:
+        """Fail closed: with no ELSPETH handler installed there is nothing governing the log channel."""
+        from elspeth.core.logging import _elspeth_handler_ids, route_elspeth_logs_to_stderr
+
+        root = logging.getLogger()
+        root.handlers = [h for h in root.handlers if id(h) not in _elspeth_handler_ids]
+        _elspeth_handler_ids.clear()
+
+        with pytest.raises(RuntimeError, match="configure_logging"):
+            route_elspeth_logs_to_stderr()

@@ -4,7 +4,7 @@
 # Companion to build-arch-pack.sh.  Where the arch pack concatenates many
 # chapters into one volume, the control set is deliberately one PDF per
 # document: the RAID register carries its own review cycle and is reissued
-# independently of the programme document.
+# independently of the program document.
 #
 # Pipeline (per document): source markdown -> preprocess.py (hrule strip,
 # relative-link rewrite) -> pandoc (typst output) -> postprocess.py ->
@@ -16,7 +16,7 @@
 # Usage:
 #   ./build-control-pack.sh                    # .typ intermediates only, all docs
 #   ./build-control-pack.sh --pdf              # compile every document to PDF
-#   ./build-control-pack.sh --pdf programme    # compile one document
+#   ./build-control-pack.sh --pdf program      # compile one document
 #   ./build-control-pack.sh --list             # show the document keys
 #
 # Environment:
@@ -54,9 +54,9 @@ METADATA_DIR="$SCRIPT_DIR/control-pack"
 # add a line here and a matching metadata YAML under control-pack/.
 # ─────────────────────────────────────────────────────────────
 DOCUMENTS=(
-    "programme|2026-09-03-work-packages.md|programme.yaml"
-    "raid-register|2026-09-03-implementation-raid-register.md|raid-register.yaml"
-    "prd|elspeth-prd.md|prd.yaml"
+    "program|2026-09-05-work-packages.md|program.yaml"
+    "raid-register|2026-09-05-implementation-raid-register.md|raid-register.yaml"
+    "prd|2026-09-05-elspeth-prd.md|prd.yaml"
 )
 
 doc_key()      { echo "${1%%|*}"; }

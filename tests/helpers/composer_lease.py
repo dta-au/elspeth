@@ -16,20 +16,27 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
     session-operation context acquire an exact, short-lived COMPOSE lease on
     the composer's sessions service for the duration of the call (mirrors
     DualFencedSessionServiceHarness for the session writers)."""
+    from uuid import UUID
+
     from elspeth.contracts.session_operation import SessionOperationKind
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.contracts import SessionOperationFenceLost
     from elspeth.web.coordination.lifecycle import SessionOperationLease
 
     async def _with_lease(self, session_id, kwargs, call):
-        sessions = getattr(self, "_sessions_service", None)
-        authority = getattr(sessions, "session_operation_authority", None)
-        if session_id is None or kwargs.get("session_operation_context") is not None or authority is None:
+        # ``self`` is always a ComposerServiceImpl (the adapter is installed on
+        # that class) and its sessions service is a SessionServiceImpl, so the
+        # authority and engine are read directly: a double lacking them fails
+        # the calling test loudly instead of silently running unfenced.
+        sessions = self._sessions_service
+        if session_id is None or kwargs.get("session_operation_context") is not None or sessions is None:
             return await call(**kwargs)
+        authority = sessions.session_operation_authority
+        session_uuid = session_id if not isinstance(session_id, str) else UUID(session_id)
         try:
             lease = await SessionOperationLease.acquire(
                 authority,
-                session_id=session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id),
+                session_id=session_uuid,
                 operation_kind=SessionOperationKind.COMPOSE,
                 owner_instance_id=sessions.session_operation_owner_instance_id,
                 lease_seconds=sessions.session_operation_lease_seconds,
@@ -37,10 +44,8 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         except SessionOperationFenceLost:
             from tests.helpers.session_fences import ensure_session_fence
 
-            session_uuid = session_id if not isinstance(session_id, str) else __import__("uuid").UUID(session_id)
-            engine = getattr(sessions, "_engine", None)
-            seeded = engine is not None and ensure_session_fence(
-                engine,
+            seeded = ensure_session_fence(
+                sessions._engine,
                 session_uuid,
                 owner_instance_id=sessions.session_operation_owner_instance_id,
             )

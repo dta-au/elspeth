@@ -18,7 +18,7 @@ any in-region node that originates outside the region.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
 from elspeth.contracts.types import NodeID
@@ -29,6 +29,22 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
 
     from elspeth.core.dag.graph import ExecutionGraph
+
+# The rule-4 exit guarantee, stated ONCE and scoped honestly. Rule 4's walks
+# run over SUCCESS-PATH edges only (module docstring above), so the guarantee
+# they enforce is scoped the same way: a DIVERT leg (on_error) CAN leave a
+# bound region, by construction, and the loss ledger accounts for the escaped
+# member against its own group (reason='error_routed'; verified by 12 engine
+# runs 2026-08-26, elspeth-494491978d comment 7984). The unqualified form
+# "no token may leave a bound region except through its closer" was shipped
+# in the operator-facing message for 10 days after the engine had refuted it
+# (elspeth-46825d0055); the composer Stage-1 mirror imports this sentence
+# rather than restating it, so the two surfaces cannot drift apart again.
+BOUND_REGION_EXIT_RULE: Final[str] = (
+    "No token may leave a bound region on a success path except through its closer "
+    "— sinks inside a bound region are rejected flat (spec §7 rule 4); only an on_error "
+    "DIVERT leg may leave, and the loss ledger records that member against its group."
+)
 
 ESCALATION_ITERATIONS_PER_LEVEL = 8
 _BASE_FLUSH_ITERATIONS = 1_000
@@ -289,8 +305,7 @@ def validate_sese_regions(graph: ExecutionGraph, regions: tuple[BoundRegion, ...
             if info.node_type is NodeType.SINK:
                 raise GraphValidationError(
                     f"Bound region '{binding.closer_name}' (opener '{binding.opener_name}') reaches sink "
-                    f"'{member}' before the region's closer. No token may leave a bound region except "
-                    f"through its closer — sinks inside a bound region are rejected flat (spec §7 rule 4). "
+                    f"'{member}' before the region's closer. {BOUND_REGION_EXIT_RULE} "
                     f"Move the sink after the closer, or unbind the group.",
                     component_id=binding.closer_name,
                     component_type=binding.closer_kind,

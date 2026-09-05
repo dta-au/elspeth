@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.web.composer.guided._display import plugin_display_label
@@ -1157,6 +1158,7 @@ async def _step_1_inline_source_inspection_facts(
     session_id: UUID,
     resolution: Step1SourceChatResolution,
     source_description: str,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Materialize inline resolve_source content as an upload-equivalent blob.
 
@@ -1179,6 +1181,7 @@ async def _step_1_inline_source_inspection_facts(
     facts = await _inspect_latest_ready_session_blob(
         blob_service,
         session_id,
+        session_operation_context=session_operation_context,
     )
     if facts is None:
         content = resolution.content.encode("utf-8")
@@ -1189,6 +1192,7 @@ async def _step_1_inline_source_inspection_facts(
             resolution.mime_type,
             created_by="assistant",
             source_description=source_description,
+            session_operation_context=session_operation_context,
         )
         facts = inspect_blob_content(
             content=content,
@@ -1800,6 +1804,7 @@ async def post_guided_chat_schema8(
                             source_inspection_facts = await _step_1_inline_source_inspection_facts(
                                 blob_service=request.app.state.blob_service,
                                 session_id=session_id,
+                                session_operation_context=reserved.session_operation_context,
                                 resolution=source_resolution,
                                 source_description=(
                                     "Guided Step-1 chat resolve_source inline content "
@@ -1841,6 +1846,7 @@ async def post_guided_chat_schema8(
                         source_reselection_facts = await _inspect_latest_ready_session_blob(
                             request.app.state.blob_service,
                             session_id,
+                            session_operation_context=reserved.session_operation_context,
                             source_plugin=source_plugin_reselection,
                         )
                     sink_prefill_options: dict[str, Any] | None = None

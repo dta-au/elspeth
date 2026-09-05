@@ -10,6 +10,7 @@ same small builders repeated file-locally throughout that suite.
 
 from __future__ import annotations
 
+from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -325,6 +326,11 @@ class TestBoundRegionSinkInsideStage1Mirror:
         assert "bound_region_sink_inside" in codes, summary.errors
         offending = next(e for e in summary.errors if e.error_code == "bound_region_sink_inside")
         assert "leak" in offending.message
+        # elspeth-46825d0055: the Stage-1 mirror states the SAME rule sentence
+        # as the builder (imported, not restated), scoped to success paths;
+        # the refuted unqualified universal must not reappear here either.
+        assert BOUND_REGION_EXIT_RULE in offending.message
+        assert "No token may leave a bound region except" not in offending.message
 
     def test_fully_in_region_chain_validates_green(self) -> None:
         # Positive control: same shape, but the inner gate's other route

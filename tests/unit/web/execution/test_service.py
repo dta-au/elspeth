@@ -42,7 +42,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.run_result import RunResult
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
@@ -723,8 +723,10 @@ def _install_ready_proof_blobs(
         verified[blob_id] = (content[: 8 * 1024], content_digest, len(content))
 
     blob_service = create_autospec(BlobServiceProtocol, instance=True)
-    blob_service.get_blob.side_effect = records.__getitem__
-    blob_service.read_blob_content_prefix_verified.side_effect = lambda blob_id, *, prefix_bytes: verified[blob_id]
+    blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: records[blob_id]
+    blob_service.read_blob_content_prefix_verified.side_effect = lambda blob_id, *, prefix_bytes, session_operation_context: verified[
+        blob_id
+    ]
     service._blob_service = blob_service
     return blob_service
 
@@ -1572,9 +1574,8 @@ class TestExecutionFlow:
         with patch("elspeth.web.execution.service.run_sync_in_worker", new_callable=AsyncMock) as run_worker:
             run_worker.return_value = expected
             session_id = uuid4()
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result is expected
         run_worker.assert_awaited_once()
@@ -1718,18 +1719,18 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
         assert result.checks[24].passed is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
             blob_id,
             prefix_bytes=8 * 1024,
+            session_operation_context=context,
         )
 
     @pytest.mark.asyncio
@@ -1781,18 +1782,18 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
         assert result.checks[24].passed is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
             blob_id,
             prefix_bytes=8 * 1024,
+            session_operation_context=context,
         )
 
     @pytest.mark.asyncio
@@ -1835,9 +1836,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -1884,15 +1884,14 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
         assert result.checks[24].passed is False
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1943,9 +1942,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -1982,9 +1980,8 @@ class TestAuthoritativeProofDiagnostics:
             return_value=_successful_core_validation_result(),
         ):
             session_id = uuid4()
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
@@ -2035,9 +2032,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -2088,9 +2084,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
@@ -2133,15 +2128,15 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert [error.component_id for error in result.errors] == ["order_gate", "refund_gate"]
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
             blob_id,
             prefix_bytes=8 * 1024,
+            session_operation_context=context,
         )
 
     @pytest.mark.asyncio
@@ -2166,9 +2161,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert [check.name for check in result.checks[:24]] == [check.name for check in _successful_core_validation_result().checks]
         assert result.checks[24].name == "proof_diagnostics"
@@ -2204,14 +2198,14 @@ class TestAuthoritativeProofDiagnostics:
             ),
             patch.object(Path, "read_bytes", side_effect=AssertionError("proof must use verified prefix API")),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
             blob_id,
             prefix_bytes=8 * 1024,
+            session_operation_context=context,
         )
 
     @pytest.mark.asyncio
@@ -2315,14 +2309,13 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
         assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
-        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("schema_mode", ["fixed", "flexible"])
@@ -2352,9 +2345,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2387,9 +2379,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2414,9 +2405,8 @@ class TestAuthoritativeProofDiagnostics:
             return_value=_successful_core_validation_result(),
         ):
             session_id = uuid4()
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -2470,9 +2460,8 @@ class TestAuthoritativeProofDiagnostics:
             return_value=_successful_core_validation_result(),
         ):
             session_id = uuid4()
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is False
         assert result.checks[24].name == "proof_diagnostics"
@@ -2516,9 +2505,8 @@ class TestAuthoritativeProofDiagnostics:
             "elspeth.web.execution.validation.validate_pipeline",
             return_value=_successful_core_validation_result(),
         ):
-            result = await service.validate_state(
-                state, session_operation_context=make_blob_read_context(session_id), user_id="alice", session_id=session_id
-            )
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
         assert result.is_valid is True
         assert result.checks[24].name == "proof_diagnostics"
@@ -4126,11 +4114,11 @@ class TestInlineBlobRuntimePreflight:
         async def link_blob_to_run(*_args: Any, **_kwargs: Any) -> None:
             order.append("link")
 
-        async def read_blob_content(_blob_id: UUID) -> bytes:
+        async def read_blob_content(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
             order.append("read")
             return content
 
-        async def get_blob(_blob_id: UUID) -> Any:
+        async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
             order.append("metadata")
             return blob_record
 
@@ -4200,8 +4188,10 @@ sinks:
 
         assert order.index("link") < order.index("read")
         assert order.index("metadata") < order.index("record") < order.index("load")
-        blob_service.link_blob_to_run.assert_awaited_once_with(blob_id=blob_id, run_id=run_id, direction="input")
-        blob_service.read_blob_content.assert_awaited_once_with(blob_id)
+        blob_service.link_blob_to_run.assert_awaited_once_with(
+            blob_id=blob_id, run_id=run_id, direction="input", session_operation_context=_execute_lease().context
+        )
+        blob_service.read_blob_content.assert_awaited_once_with(blob_id, session_operation_context=_execute_lease().context)
         mock_session_service.record_blob_inline_resolutions.assert_awaited_once()
         resolutions = mock_session_service.record_blob_inline_resolutions.await_args.kwargs["resolutions"]
         assert len(resolutions) == 1
@@ -4372,7 +4362,7 @@ sinks:
                 size_bytes=220 * 1024,
             )
 
-        async def get_blob(blob_id: UUID) -> Any:
+        async def get_blob(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
             if blob_id in records_by_id:
                 return records_by_id[blob_id]
             raise AssertionError(f"unexpected blob_id {blob_id}")
@@ -4540,7 +4530,7 @@ sinks:
 
         if case == "missing":
             # get_blob raises for a genuinely-missing blob (the control surface).
-            async def get_blob(_blob_id: UUID) -> Any:
+            async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> Any:
                 raise BlobNotFoundError(str(_blob_id))
 
             blob_service = _blob_service_stub()
@@ -4737,14 +4727,14 @@ class TestBlobRowsRuntimeAdmission:
 
         mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
 
-        async def get_blob(blob_id: UUID) -> BlobRecord:
+        async def get_blob(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
             order.append("metadata")
             return records_by_id[blob_id]
 
         async def link_blob_to_run(**_kwargs: Any) -> None:
             order.append("link")
 
-        async def read_blob_content(blob_id: UUID) -> bytes:
+        async def read_blob_content(blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
             order.append("read")
             return content_by_id[blob_id]
 
@@ -4827,7 +4817,7 @@ class TestBlobRowsRuntimeAdmission:
         blob_service = _blob_service_stub()
         if case == "missing":
 
-            async def get_blob(_blob_id: UUID) -> BlobRecord:
+            async def get_blob(_blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
                 raise BlobNotFoundError(str(_blob_id))
 
             blob_service.get_blob.side_effect = get_blob
@@ -4980,7 +4970,9 @@ class TestBlobRowsRuntimeAdmission:
                 str(run_id), _blob_rows_pipeline_yaml([entry], singular=True), threading.Event(), session_operation_lease=_execute_lease()
             )
 
-        blob_service.link_blob_to_run.assert_awaited_once_with(blob_id=blob_id, run_id=run_id, direction="input")
+        blob_service.link_blob_to_run.assert_awaited_once_with(
+            blob_id=blob_id, run_id=run_id, direction="input", session_operation_context=_execute_lease().context
+        )
         mock_payload_cls.return_value.store.assert_called_once_with(content)
 
     @patch("elspeth.web.execution.service.Orchestrator")
@@ -6674,8 +6666,10 @@ class TestCompletionPathExternalCancellation:
         blob_state = {"status": "pending"}
         blob_calls: list[bool] = []
 
-        async def finalize_run_output_blobs(run_id: UUID, success: bool) -> BlobFinalizationResult:
-            del run_id
+        async def finalize_run_output_blobs(
+            run_id: UUID, success: bool, *, session_operation_context: SessionOperationContext
+        ) -> BlobFinalizationResult:
+            del run_id, session_operation_context
             blob_calls.append(success)
             if blob_state["status"] == "pending":
                 blob_state["status"] = "ready" if success else "error"
@@ -7533,13 +7527,15 @@ class TestBlobRefPreValidation:
             "on_validation_failure": "quarantine",
         }
 
+        authority = RecordingSessionOperationAuthority()
         with patch.object(service, "_run_pipeline"):
-            await _execute(service, session_id=session_id)
+            await _execute(service, session_id=session_id, authority=authority)
 
         blob_service.link_blob_to_run.assert_called_once_with(
             blob_id=UUID(blob_ref),
             run_id=run_id,
             direction="input",
+            session_operation_context=authority.calls[0][1],
         )
 
     @pytest.mark.asyncio
@@ -7594,7 +7590,7 @@ class TestBlobRefPreValidation:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
             blob_ref=str(blob_id),
             session_id=session_id,
             storage_path={orders_blob: orders_path, refunds_blob: refunds_path}[str(blob_id)],
@@ -7702,7 +7698,7 @@ class TestBlobOwnership:
         refunds_path = f"/tmp/data/blobs/{executing_session_id}/{refunds_blob}_refunds.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
             blob_ref=str(blob_id),
             session_id=executing_session_id if str(blob_id) == orders_blob else other_session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_path,
@@ -7949,7 +7945,7 @@ class TestBlobSourcePathReadGuard:
         refunds_diverging_path = f"/tmp/data/blobs/{session_id}/{refunds_blob}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+        blob_service.get_blob.side_effect = lambda blob_id, *, session_operation_context: _ready_csv_blob_for_execution(
             blob_ref=str(blob_id),
             session_id=session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_canonical_path,

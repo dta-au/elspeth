@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import os
 import threading
+import traceback
 import uuid
 from datetime import UTC, datetime
 
@@ -256,7 +259,7 @@ class TestSessionCRUD:
         blob_file.write_text("col1\nval1")
 
         def fail_rmtree(_path: object) -> None:
-            raise OSError("permission denied removing staged blob directory")
+            raise OSError(errno.EACCES, "permission denied removing staged blob directory", str(blob_dir))
 
         class _FailingRmtreeShutil:
             """Stand-in for the ``shutil`` name as seen from inside
@@ -277,10 +280,55 @@ class TestSessionCRUD:
 
         monkeypatch.setattr("elspeth.web.sessions.archive_quarantine.shutil", _FailingRmtreeShutil())
 
-        with pytest.raises(QuarantineCleanupError, match=r"archive committed.*quarantine cleanup remains pending") as exc_info:
+        from structlog.testing import capture_logs
+
+        with (
+            capture_logs() as records,
+            pytest.raises(QuarantineCleanupError, match=r"archive committed.*quarantine cleanup remains pending") as exc_info,
+        ):
             await service_with_dir.archive_session(session.id)
-        assert isinstance(exc_info.value.__cause__, OSError)
-        assert "permission denied removing staged blob directory" in str(exc_info.value.__cause__)
+
+        # Ratified redaction contract (platform fec6a4f32; testcontainer twin
+        # test_postgres_postcommit_purge_failure_remains_discoverable): the
+        # exception, however it is rendered — message, notes, the full chained
+        # traceback — never carries the filesystem detail. The 2026-08-31 sweep
+        # (7b402f716) transplanted ``from cleanup_exc`` back over ``from None``
+        # citing a runbook that does not exist in the tree (elspeth-ada35955b6).
+        rendered = "\n".join((str(exc_info.value), "".join(traceback.format_exception(exc_info.value))))
+        assert "permission denied removing staged blob directory" not in rendered
+        assert str(data_dir) not in rendered
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+        # The causal fact is discoverable on the SERVICE LOG, as structured
+        # fields the operator can act on — never the exception's own text and
+        # never a path (the quarantine obligation is located from the identity).
+        cleanup_records = [r for r in records if r["event"] == "session_archive_quarantine_cleanup_failed"]
+        assert len(cleanup_records) == 1
+        (record,) = cleanup_records
+        assert record["log_level"] == "error"
+        assert record["session_id"] == str(session.id)
+        assert isinstance(record["operation_id"], str) and uuid.UUID(record["operation_id"])
+        assert isinstance(record["operation_epoch"], int)
+        # errno.EACCES materialises as the PermissionError subclass — the type
+        # name is a safe operator fact; the message and filename are not logged.
+        assert record["error_type"] == "PermissionError"
+        assert record["errno"] == errno.EACCES
+        assert record["strerror"] == os.strerror(errno.EACCES)
+        assert set(record) == {
+            "event",
+            "log_level",
+            "session_id",
+            "operation_id",
+            "operation_epoch",
+            "error_type",
+            "errno",
+            "strerror",
+        }
+        for emitted in records:
+            flattened = repr(emitted)
+            assert "permission denied removing staged blob directory" not in flattened
+            assert str(data_dir) not in flattened
 
         with pytest.raises(ValueError):
             await service_with_dir.get_session(session.id)

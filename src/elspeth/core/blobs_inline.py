@@ -9,7 +9,6 @@ substitution phases. This first slice implements pure discovery only.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 from collections.abc import Callable, Mapping
@@ -23,7 +22,6 @@ from elspeth.contracts.blobs import (
     BlobIntegrityError,
     BlobNotFoundError,
     BlobRecord,
-    BlobServiceProtocol,
     BlobStateError,
 )
 from elspeth.contracts.blobs_inline import (
@@ -34,7 +32,6 @@ from elspeth.contracts.blobs_inline import (
     WidenedBlobRefShape,
     is_widened_blob_ref,
 )
-from elspeth.contracts.session_operation import SessionOperationContext
 
 # Node-collection keys in the runtime pipeline dict whose entries can carry an
 # ``options`` mapping a blob reference could hide in.
@@ -95,46 +92,6 @@ def _discover_blob_content_refs(config: dict[str, Any]) -> list[BlobInlineRef]:
     if malformed:
         raise BlobContentResolutionError(malformed=malformed)
     return refs
-
-
-async def _validate_blob_content_refs(
-    blob_service: BlobServiceProtocol,
-    config: dict[str, Any],
-    *,
-    session_id: UUID,
-    per_ref_byte_cap: int | None = None,
-    aggregate_byte_cap: int | None = None,
-    session_operation_context: SessionOperationContext,
-) -> list[BlobInlineValidationViolation]:
-    """Return validate-path violations without raising recoverable errors."""
-    try:
-        refs = _discover_blob_content_refs(config)
-    except BlobContentResolutionError as exc:
-        return _malformed_validation_violations(exc)
-
-    records_by_blob_id: dict[UUID, BlobRecord] = {}
-    not_ready_by_blob_id: dict[UUID, str] = {}
-    for ref in refs:
-        try:
-            record = await blob_service.get_blob(ref.blob_id)
-        except BlobNotFoundError:
-            continue
-        except BlobStateError as exc:
-            not_ready_by_blob_id[ref.blob_id] = str(exc)
-            continue
-        if record.session_id != session_id:
-            continue
-        not_ready_by_blob_id.pop(ref.blob_id, None)
-        records_by_blob_id[ref.blob_id] = record
-
-    evaluation = _evaluate_blob_content_ref_metadata(
-        refs,
-        records_by_blob_id,
-        not_ready_by_blob_id=not_ready_by_blob_id,
-        per_ref_byte_cap=per_ref_byte_cap,
-        aggregate_byte_cap=aggregate_byte_cap,
-    )
-    return _metadata_evaluation_validation_violations(refs, evaluation)
 
 
 def _validate_blob_content_refs_sync(
@@ -329,21 +286,6 @@ def _short_hash(value: str | None) -> str:
     if value is None:
         return "<missing>"
     return f"{value[:16]}..."
-
-
-async def _fetch_blob_contents(
-    blob_service: BlobServiceProtocol,
-    refs: list[BlobInlineRef],
-    *,
-    session_operation_context: SessionOperationContext,
-) -> dict[BlobInlineRef, bytes]:
-    """Fetch content bytes for discovered refs, deduped by blob id."""
-    unique_blob_ids = _unique_blob_ids(refs)
-    results = await asyncio.gather(
-        *(blob_service.read_blob_content(blob_id) for blob_id in unique_blob_ids),
-        return_exceptions=True,
-    )
-    return _resolve_blob_content_results(refs, unique_blob_ids, results)
 
 
 def _resolve_blob_content_results(

@@ -57,9 +57,8 @@ def test_write_bundle_rejects_absolute_bundle_id(tmp_path: Path) -> None:
 
 def test_resolve_staged_bundle_path_returns_local_json_path(tmp_path: Path) -> None:
     staged_dir = tmp_path / "staged"
-    resolver = getattr(review_bundle, "resolve_staged_bundle_path", None)
+    resolver = review_bundle.resolve_staged_bundle_path
 
-    assert resolver is not None
     assert resolver(staged_dir=staged_dir, bundle_id="release-072") == staged_dir / "release-072.json"
 
 

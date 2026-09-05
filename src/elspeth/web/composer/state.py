@@ -55,6 +55,7 @@ from elspeth.core.config import (
     _validate_node_name_chars,
     validate_sink_name,
 )
+from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
@@ -7770,8 +7771,7 @@ class CompositionState:
                             _err(
                                 f"node:{closer_id}",
                                 f"A path inside bound group '{closer_id}' (fork branches {roster}) reaches sink "
-                                f"'{sink_hit}' before the group's closer. No token may leave a bound region except "
-                                f"through its closer — sinks inside a bound region are rejected flat (spec §7 rule 4). "
+                                f"'{sink_hit}' before the group's closer. {BOUND_REGION_EXIT_RULE} "
                                 f"Route the in-region chain to '{closer_id}' and move the sink after it.",
                                 "high",
                                 "bound_region_sink_inside",

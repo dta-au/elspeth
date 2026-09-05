@@ -13,11 +13,15 @@ ADR-024 defines four living artefacts, each one to two pages. One is written:
 | Milestone and forecast register — commitments, forecasts, and change | Not written |
 
 The folder also holds working documents that are **not** part of the ADR-024
-control set and do not substitute for the artefacts above: a programme
-work-package inventory, a product requirements document, and PDF renderings of
-the RAID register and the inventory for briefing. Where an artefact is not
+control set and do not substitute for the artefacts above: a program
+work-package inventory and a product requirements document, with PDF
+renderings of all three documents for briefing. Where an artefact is not
 written, ADR-024's requirement for it stands unmet; no other document in this
 folder satisfies it.
+
+The current version of each document is the file with the latest date prefix.
+A document may carry a delimited section listing work in flight at its
+as-at date, which is deleted when the work lands. The PDFs are built by `tools/pdf/build-control-pack.sh --pdf`.
 
 What is here is maintained in full and unsanitised, but it is not published in
 the repository: `.gitignore` excludes everything in this folder except this

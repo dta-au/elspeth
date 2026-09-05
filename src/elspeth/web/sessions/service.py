@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import threading
 import uuid
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
@@ -7026,6 +7027,26 @@ class SessionServiceImpl:
                 identity,
             )
 
+        def record_cleanup_failure(cleanup_exc: BaseException, error_number: int | None) -> None:
+            # The archive is committed; only the staged-directory purge
+            # stalled. The exception that reaches the route (and any traceback
+            # rendered from it) must not carry the cleanup error's text: on the
+            # shared mount that text is a filesystem path (elspeth-ada35955b6;
+            # platform pin fec6a4f32 restored over the 7b402f716 transplant of
+            # ``from cleanup_exc``). The causal fact is recorded here as
+            # structured, non-textual fields: the quarantine obligation is
+            # located from the identity, and the OS reason from the errno —
+            # never from the exception's own strings.
+            self._log.error(
+                "session_archive_quarantine_cleanup_failed",
+                session_id=sid,
+                operation_id=str(identity.operation_id),
+                operation_epoch=identity.operation_epoch,
+                error_type=type(cleanup_exc).__name__,
+                errno=error_number,
+                strerror=None if error_number is None else os.strerror(error_number),
+            )
+
         async def finalize_consumed() -> None:
             assert data_dir is not None
             assert canonical is not None
@@ -7041,11 +7062,12 @@ class SessionServiceImpl:
                     data_dir,
                     identity,
                 )
+            except OSError as cleanup_exc:
+                record_cleanup_failure(cleanup_exc, cleanup_exc.errno)
+                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from None
             except BaseException as cleanup_exc:
-                # Keep the operator-facing message stable and redacted, but
-                # carry the causal exception: the recovery runbook needs the
-                # OSError (permissions, missing mount) that stalled cleanup.
-                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from cleanup_exc
+                record_cleanup_failure(cleanup_exc, None)
+                raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from None
 
         async def compensate_precommit() -> None:
             """Restore only while exact authority remains provably current."""

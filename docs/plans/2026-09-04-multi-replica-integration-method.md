@@ -263,7 +263,7 @@ Both belong to **M3**, which keeps M3 the cohort where the resolution rule
 earns its keep.
 
 **9099 also rules the target out of one of these:** *"interim-merge-target is a
-BUG-FIX-ONLY interim branch and this multi-replica platform programme must not
+BUG-FIX-ONLY interim branch and this multi-replica platform program must not
 land on it"* — John's scoping. So `interim-merge-target`'s 24 is the cheapest and
 the **forbidden** option. §8 D1.
 
@@ -408,7 +408,7 @@ The pass is complete when **all six** hold:
    the new run's own terms. Flaky-set discipline: re-run any red in
    `tests/e2e/recovery`, `tests/integration/pipeline`, `tests/unit/engine/orchestrator`
    with `-n 0` before attributing it to the integration (`elspeth-0077cb7789`, open;
-   H10 notes the flaky set overlaps this programme's subject matter exactly).
+   H10 notes the flaky set overlaps this program's subject matter exactly).
 
 3. **No hang and no leaked lease.** The §3.1 signature is absent: no suite hang, no
    `TypeError: missing … session_operation_context`, no guided row left
@@ -448,7 +448,7 @@ not a substitute for it.
 | **D5** | **`state_envelope.py` cherry-pick to mainline: now, with the merge, or not at all.** | 9075 required re-verifying the defect reproduces before cherry-picking (`61e561061`, `7f7a2ec75` touched `composition_states`); 9099 records it **not re-verified**. H7 warns the naive fix (`_unwrap_envelope` alone) downgrades a fail-**closed** prong to a fail-**open** one — a blob referenced only from a source's options would read as unreferenced. `elspeth-3db5745ba7` is open P1; **do not file a duplicate**. | `src/elspeth/web/sessions/state_envelope.py`: **PRESENT** on `a2176dfe2`; **ABSENT** on `release/0.8.0`, `feature/unified-lineage`, `interim-merge-target`. The writer/reader asymmetry is live on mainline today. |
 | **D6** | **What Phase-0 cohort E was.** | 8966 claims "part of C/E" complete; **E is defined nowhere in the nine comments.** Either the operator knows, or it is re-derived from the remaining 8949/8966 open items and re-named. | Cohorts A (stage 1–3 merge), B (ruling-5 PG proofs), C (contention + characterization leasing), D (architecture repin) are all defined. E is not. |
 | **D7** | **Whether the 3 mainline context-free call sites get a lease wrapper or a written exemption.** | §4 step 7. Mainline's `save_composition_state_with_interpretations` (`370e3bdf0`) has no fencing concept at all; wrapping it is a semantic change to mainline behaviour, and exempting it puts an unfenced audit-primary writer inside a fenced tree. | See §9. |
-| **D8** | **Correcting the record.** Ruling 5 is closed with evidence (§0) but the brief (H9) and `elspeth-obs-a346487a1f` still read as open; the platform-branch `AGENTS.md` is 107 lines shorter than mainline's (H10) and a resumer reading it gets no `-n 12` guidance, no xdist flaky-set gotcha and no whole-tree-gates STOP block. | Both are tracker/doc writes with programme-wide reach. | — |
+| **D8** | **Correcting the record.** Ruling 5 is closed with evidence (§0) but the brief (H9) and `elspeth-obs-a346487a1f` still read as open; the platform-branch `AGENTS.md` is 107 lines shorter than mainline's (H10) and a resumer reading it gets no `-n 12` guidance, no xdist flaky-set gotcha and no whole-tree-gates STOP block. | Both are tracker/doc writes with program-wide reach. | — |
 
 ---
 

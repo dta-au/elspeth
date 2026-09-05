@@ -584,6 +584,7 @@ async def _step_1_unambiguous_compatible_blob_inspection(
     session_id: UUID,
     *,
     plugin: str,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Inspect the session's ONE ready upload that can prefill ``plugin``.
 
@@ -614,6 +615,7 @@ async def _step_1_unambiguous_compatible_blob_inspection(
             blob_service,
             session_id,
             selected_blob_id=record.id,
+            session_operation_context=session_operation_context,
         )
         if facts is None:
             raise AuditIntegrityError("explicit ready blob inspection unexpectedly declined")
@@ -661,6 +663,7 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
     inspection_facts = await _inspect_latest_ready_session_blob(
         blob_service,
         session_id,
+        session_operation_context=session_operation_context,
         filename=uploaded_filename,
     )
     if inspection_facts is None:
@@ -2462,16 +2465,18 @@ async def _schema8_active_source_edit_inspection(
     blob_service: BlobServiceProtocol,
     session_id: UUID,
     guided: GuidedSession,
+    *,
+    session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
     """Re-inspect the exact blob owned by the active source edit target."""
 
     blob_id = _schema8_active_source_edit_blob_id(guided)
     if blob_id is None:
         return None
-    record = await blob_service.get_blob(blob_id)
+    record = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
     if record.session_id != session_id or record.status != "ready":
         raise InvariantError("active source edit blob is not a ready blob owned by this session")
-    content = await blob_service.read_blob_content(blob_id)
+    content = await blob_service.read_blob_content(blob_id, session_operation_context=session_operation_context)
     return inspect_blob_content(
         content=content,
         filename=record.filename,
@@ -3537,53 +3542,37 @@ async def post_guided_respond(
                 status_code=400,
                 detail="source_blob_id is only valid for a Step 1 source selection.",
             )
+        # The preflight projection runs with no inspection facts: every blob
+        # byte read (the explicit selection, the compatible-upload fallback,
+        # the schema-form active-edit re-inspection) is a fenced effect and no
+        # session-operation fence exists before the operation is reserved
+        # below. They run once, under ``reserved.session_operation_context``,
+        # at settlement; ``None`` here is exactly what the projection sees
+        # whenever a selection resolves no blob.
         inspection_facts: SourceInspectionFacts | None = None
         fallback_blob_inspection: SourceInspectionFacts | None = None
-        if observed_guided.step is GuidedStep.STEP_1_SOURCE:
-            if current_turn["type"] == TurnType.SINGLE_SELECT.value:
-                selected_source_plugin = body.chosen[0] if body.chosen is not None and len(body.chosen) == 1 else None
-                accepts_blob_inspection = source_plugin_accepts_blob_inspection(selected_source_plugin)
-                if body.source_blob_id is not None and not accepts_blob_inspection:
+        if observed_guided.step is GuidedStep.STEP_1_SOURCE and current_turn["type"] == TurnType.SINGLE_SELECT.value:
+            selected_source_plugin = body.chosen[0] if body.chosen is not None and len(body.chosen) == 1 else None
+            accepts_blob_inspection = source_plugin_accepts_blob_inspection(selected_source_plugin)
+            if body.source_blob_id is not None and not accepts_blob_inspection:
+                raise HTTPException(
+                    status_code=400,
+                    detail="source_blob_id is not valid for the selected source plugin.",
+                )
+            # Selection membership is cheap metadata validation and may
+            # reject before reservation.
+            if accepts_blob_inspection:
+                records = await request.app.state.blob_service.list_blobs(session_id, limit=None)
+                try:
+                    resolve_source_inspection_blob_id(
+                        selected_blob_id=body.source_blob_id,
+                        ready_blob_ids=tuple(record.id for record in records if record.status == "ready"),
+                    )
+                except ValueError as exc:
                     raise HTTPException(
                         status_code=400,
-                        detail="source_blob_id is not valid for the selected source plugin.",
-                    )
-                # Selection membership is cheap metadata validation and may
-                # reject before reservation. Reading Tier-3 bytes is a fenced
-                # effect and is deliberately deferred until the exact guided
-                # operation lease exists below.
-                if accepts_blob_inspection:
-                    records = await request.app.state.blob_service.list_blobs(session_id, limit=None)
-                    try:
-                        resolve_source_inspection_blob_id(
-                            selected_blob_id=body.source_blob_id,
-                            ready_blob_ids=tuple(record.id for record in records if record.status == "ready"),
-                        )
-                    except ValueError as exc:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Selected source blob is not a ready upload for this session.",
-                        ) from exc
-                    if inspection_facts is None and selected_source_plugin is not None:
-                        # A plural raw ready set resolves no blob identity, so
-                        # the intent captures no inspection custody and the
-                        # projected schema form would render an empty ``path``
-                        # whose only practically legal web value is a
-                        # ``blob:<id>`` sentinel the user cannot type. Prefill
-                        # the form only when exactly ONE ready upload could
-                        # prefill the selected plugin: staying recency-blind
-                        # keeps the no-silent-latest-blob rule intact.
-                        fallback_blob_inspection = await _step_1_unambiguous_compatible_blob_inspection(
-                            request.app.state.blob_service,
-                            session_id,
-                            plugin=selected_source_plugin,
-                        )
-            elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
-                inspection_facts = await _schema8_active_source_edit_inspection(
-                    request.app.state.blob_service,
-                    session_id,
-                    observed_guided,
-                )
+                        detail="Selected source blob is not a ready upload for this session.",
+                    ) from exc
         try:
             # Deployment sink admission now runs inside
             # _schema8_answer_and_project_next (elspeth-ef92db3e16), so this
@@ -5210,6 +5199,7 @@ async def post_guided_respond(
                                             request.app.state.blob_service,
                                             session_id,
                                             selected_blob_id=body.source_blob_id,
+                                            session_operation_context=reserved.session_operation_context,
                                         )
                                     except (SourceInspectionBlobLifecycleError, ValueError) as exc:
                                         raise GuidedOperationSettlementConflictError() from exc
@@ -5218,12 +5208,14 @@ async def post_guided_respond(
                                             request.app.state.blob_service,
                                             session_id,
                                             plugin=selected_source_plugin,
+                                            session_operation_context=reserved.session_operation_context,
                                         )
                             elif current_turn["type"] == TurnType.SCHEMA_FORM.value:
                                 attempt_inspection_facts = await _schema8_active_source_edit_inspection(
                                     request.app.state.blob_service,
                                     session_id,
                                     guided,
+                                    session_operation_context=reserved.session_operation_context,
                                 )
                         try:
                             new_state, planned_response, next_turn, prepared_next = _schema8_answer_and_project_next(

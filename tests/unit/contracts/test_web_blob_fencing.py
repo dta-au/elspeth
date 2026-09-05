@@ -222,7 +222,7 @@ _TRUSTED_IMPORTS = {
 }
 _TRUSTED_HELPER_AST_SHA256 = {
     "_verify_session_and_get_blob_service": "b0fc32d53168fc347386727a7210e9249d6476184b3f3b96dc1c451136dc7c66",
-    "_get_owned_blob": "167629725c2b540cacf24bf04737f14938b5f6d57948c76f4de04df591357cee",
+    "_get_owned_blob": "58fa61b145438691702b9589e7fd8b86e4334828e62c9b2948012825e71aa083",
 }
 _STATE_GUARD_AST_SHA256 = {
     "download_blob_content": "b8987e464a69eca9bd0811864d91569473f09c071d40fd1c13b07b54d285d235",
@@ -237,6 +237,8 @@ _ENDPOINT_DECORATOR_AST_SHA256 = {
     "delete_blob": "38b47f8d4e607636275395970fd5db2094c5f38b30ea2d7f97bf5bf053bbeb69",
 }
 _CALLABLE_IMPORTS = {
+    "binary_document_signature_matches": "elspeth.contracts.binary_documents",
+    "detect_binary_document_signature": "elspeth.contracts.binary_documents",
     "cast": "typing",
     "quote": "urllib.parse",
     "APIRouter": "fastapi",
@@ -296,14 +298,19 @@ _PRODUCTION_ENDPOINT_RETURN_AST_SHA256 = {
     "delete_blob": "8f2cda988d9ca73053c7f508ff6d429ab1df0a26a6352507088f780e596b398c",
 }
 _PRODUCTION_ENDPOINT_PREAMBLE_AST_SHA256 = {
-    "create_blob_upload": "b47600b6894fbdb7d97a5e711cacfe6926c235db647fe56b4f49889f4c5bf18c",
-    "create_blob_inline": "a21323e26b760d8f59134e38fee22a6a87c508644507103b86b0e5c16e99a6f5",
+    # create_blob_upload: mainline's binary-document admission
+    # (elspeth-0c6a343921) folded into ONE if/else arm so both admission
+    # paths converge on the single fenced create (P4-C2).
+    "create_blob_upload": "7104d3c91b30171b7f42bf79074f99712ac240a38faf0f83d8c0d997a92085e3",
+    # create_blob_inline: the text-only smuggle rejection precedes the lease.
+    "create_blob_inline": "508bad641c3f5641b0843f41e81c17d6434b5f40310660fb0bf5bc2054761db4",
     "get_blob_metadata": "4f13d38282606a8945c2055a26b04e48816c1817f3de0f6480c55e703f3c454e",
     "download_blob_content": "7b362d54bb6b80f200f7dc8fa891f31ad124eb4eacc9658120850e6bfff7969f",
     "preview_blob_content": "62e2eb91414beff38eb50d5a5ae452771a343c985eb0fa5667d2ac0d3de5a189",
-    "delete_blob": "d171169edec8a72426c9b94be633c4a49800070df6529a4fdec6dbefb41a58e9",
+    # delete_blob: the docstring names the idempotent, cleanup-capable contract.
+    "delete_blob": "24bded45619a8b1ff30e436119136e59b1a8e8427fd205cac69cd09d3a96a04e",
 }
-_PRODUCTION_IMPORTS_AST_SHA256 = "756c02a95bcad96e45baa4848b141b8a826426b0013bbad17ee381f646c7af86"
+_PRODUCTION_IMPORTS_AST_SHA256 = "ddba86cd52908d2d48352875cce8e6391dd9e343bc362998ac6059461cb177d8"
 _SYNTHETIC_IMPORTS_AST_SHA256 = "94033e0618e2844484fe405c1390874e190827ea0928d790784c88ca22422c20"
 _SYNTHETIC_DELETE_IMPORTS_AST_SHA256 = "495d568047a365b64f2ea5b19dc4f628b0a881f9580b622a6b524913ed180b99"
 _ROUTER_FACTORY_SIGNATURE_AST_SHA256 = "6662cca5c620abce45dd4871654fd02fea18f10e2ebfcb15db05f466dd165115"
@@ -337,6 +344,8 @@ _ALLOWED_ROUTE_CALLABLES = {
             "HTTPException",
             "chunks.append",
             "b''.join",
+            "binary_document_signature_matches",
+            "detect_binary_document_signature",
             "detect_mime_type",
             "cast",
             "SessionOperationLease.acquire",
@@ -351,6 +360,7 @@ _ALLOWED_ROUTE_CALLABLES = {
             "body.content.encode",
             "len",
             "HTTPException",
+            "detect_binary_document_signature",
             "SessionOperationLease.acquire",
             "blob_service.create_blob",
             "str",
@@ -3243,7 +3253,7 @@ async def test_stale_blob_read_context_changes_neither_row_nor_canonical_bytes(t
 
     service = BlobServiceImpl(engine, tmp_path)
     with pytest.raises(SessionOperationFenceLost):
-        await service.read_blob_content(blob_id, session_operation_context=stale)  # type: ignore[call-arg]
+        await service.read_blob_content(blob_id, session_operation_context=stale)
 
     with engine.connect() as conn:
         after = dict(conn.execute(select(blobs_table).where(blobs_table.c.id == str(blob_id))).mappings().one())

@@ -282,20 +282,36 @@ def close_adopted_lease(loop, lease) -> None:
     loop.run_until_complete(lease.close())
 
 
-def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "test-live-owner", lease_seconds: int = 300):
-    """Upsert one LIVE COMPOSE fence row for ``session_id`` and return its exact context.
+def seed_live_operation_context(
+    engine,
+    session_id,
+    *,
+    operation_kind: SessionOperationKind,
+    owner_instance_id: str = "test-live-owner",
+    lease_seconds: int = 300,
+):
+    """Upsert one LIVE fence row of ``operation_kind`` for ``session_id`` and return its exact context.
 
-    For sync direct calls on fenced writers whose session ids are not UUIDs
-    (legacy fixture ids), where the production acquire path cannot be used.
-    The DTO matches the durable row exactly, so writer-side database
-    verification passes honestly; nothing in production is bypassed.
+    The per-kind real-fence seeder for direct calls on the fenced blob
+    service and other writers that compare-and-swap the context against the
+    ``session_operation_fences`` row through the real
+    ``SQLiteLocalSessionOperationAuthority``: the DTO matches the durable
+    row exactly, so the authority's database-side verification passes
+    honestly and nothing in production is bypassed. A session holds ONE
+    fence row, so seeding again for the same session (any kind) replaces
+    the previous fence and makes its context stale — exactly what the
+    production authority does when a new operation is acquired. Sequence
+    calls accordingly (create under COMPOSE, then seed EXECUTE before
+    linking or finalizing).
     """
     from datetime import timedelta
 
     from sqlalchemy import delete
 
-    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
 
+    if type(operation_kind) is not SessionOperationKind:
+        raise TypeError("operation_kind must be an exact SessionOperationKind")
     sid = str(session_id)
     operation_id = str(uuid4())
     lease_token = uuid4().hex
@@ -307,7 +323,7 @@ def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "t
                 session_id=sid,
                 operation_id=operation_id,
                 lease_token=lease_token,
-                operation_kind=SessionOperationKind.COMPOSE.value,
+                operation_kind=operation_kind.value,
                 owner_instance_id=owner_instance_id,
                 operation_epoch=2,
                 lease_expires_at=now + timedelta(seconds=lease_seconds),
@@ -321,8 +337,133 @@ def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "t
             lease_token=lease_token,
             operation_epoch=2,
         ),
-        operation_kind=SessionOperationKind.COMPOSE,
+        operation_kind=operation_kind,
     )
+
+
+def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "test-live-owner", lease_seconds: int = 300):
+    """Upsert one LIVE COMPOSE fence row for ``session_id`` and return its exact context.
+
+    For sync direct calls on fenced writers whose session ids are not UUIDs
+    (legacy fixture ids), where the production acquire path cannot be used.
+    COMPOSE is admitted to the blob create, read, and delete effects, so one
+    seeded COMPOSE context drives a whole blob-service scenario; the EXECUTE
+    effects (run linkage, output finalization) need
+    :func:`seed_live_operation_context` with ``SessionOperationKind.EXECUTE``.
+    """
+    return seed_live_operation_context(
+        engine,
+        session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=owner_instance_id,
+        lease_seconds=lease_seconds,
+    )
+
+
+@__import__("contextlib").contextmanager
+def fenced_operation_context(
+    engine,
+    session_id,
+    *,
+    operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+    owner_instance_id: str = "test-fenced-owner",
+    lease_seconds: int = 300,
+):
+    """Acquire a real context of ``operation_kind`` through the production authority, then release it.
+
+    For direct calls on the fenced blob service from tests that hold only an
+    engine (hand-inserted sessions included: the released epoch-1 fence a
+    real session carries is seeded first when absent). Acquire and release
+    are the production authority's own verbs, so the context is exact, the
+    lease is live only inside the ``with``, and nothing is left behind to
+    conflict with the next operation on the session — unlike
+    :func:`seed_live_operation_context`, which upserts a live fence and keeps
+    it.
+    """
+    from contextlib import suppress
+    from uuid import UUID as _UUID
+
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+
+    sid = session_id if isinstance(session_id, _UUID) else _UUID(str(session_id))
+    ensure_session_fence(engine, sid, owner_instance_id=owner_instance_id)
+    if engine.dialect.name == "sqlite":
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+
+        authority = SQLiteLocalSessionOperationAuthority(engine)
+    else:
+        from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+
+        authority = PostgresSessionOperationRepository(engine)
+    context = authority.acquire(
+        session_id=sid,
+        operation_kind=operation_kind,
+        owner_instance_id=owner_instance_id,
+        lease_seconds=lease_seconds,
+    )
+    try:
+        yield context
+    finally:
+        with suppress(SessionOperationFenceLost):
+            authority.release(context)
+
+
+@__import__("contextlib").asynccontextmanager
+async def acquire_operation_context(sessions_service, session_id, operation_kind: SessionOperationKind):
+    """Acquire a real context of ``operation_kind`` through a session service's authority and release it.
+
+    The per-kind form of :func:`acquire_compose_context`, for async tests
+    that hold a real ``SessionServiceImpl`` (or harness) and need a CREATE,
+    BLOB_READ, ARCHIVE or EXECUTE fence around one blob-service call.
+    """
+    from contextlib import suppress
+    from uuid import UUID as _UUID
+
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+
+    sid = session_id if not isinstance(session_id, str) else _UUID(session_id)
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=sid,
+            operation_kind=operation_kind,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        with suppress(SessionOperationFenceLost):
+            await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
+
+
+async def create_blob_under_fence(
+    sessions_service, blob_service, session_id, filename: str, content: bytes, mime_type: str = "text/csv", **fields
+):
+    """Create one blob the way the upload routes do: under a real CREATE context held only for the call.
+
+    ``fields`` are forwarded to ``create_blob`` (``created_by``,
+    ``source_description``). The context is acquired through the session
+    service's production authority and released afterwards, so the session
+    is free for the next operation.
+    """
+    from uuid import UUID as _UUID
+
+    sid = session_id if isinstance(session_id, _UUID) else _UUID(str(session_id))
+    async with acquire_operation_context(sessions_service, sid, SessionOperationKind.CREATE) as context:
+        return await blob_service.create_blob(sid, filename, content, mime_type, session_operation_context=context, **fields)
+
+
+async def get_blob_under_fence(sessions_service, blob_service, session_id, blob_id):
+    """Read one blob record under a real BLOB_READ context held only for the call."""
+    async with acquire_operation_context(sessions_service, session_id, SessionOperationKind.BLOB_READ) as context:
+        return await blob_service.get_blob(blob_id, session_operation_context=context)
+
+
+async def read_blob_content_under_fence(sessions_service, blob_service, session_id, blob_id) -> bytes:
+    """Read one blob's bytes under a real BLOB_READ context held only for the call."""
+    async with acquire_operation_context(sessions_service, session_id, SessionOperationKind.BLOB_READ) as context:
+        return await blob_service.read_blob_content(blob_id, session_operation_context=context)
 
 
 class FencedComposeTurnHarness(DualFencedSessionServiceHarness):

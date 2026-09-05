@@ -61,6 +61,7 @@ from elspeth.engine.orchestrator.export import (
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 from elspeth.engine.orchestrator.run_state import _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.run_status import (
+    assert_bound_groups_settled_from_audit,
     assert_terminal_counter_parity,
     cli_completion_for,
     derive_terminal_status_from_audit,
@@ -508,6 +509,11 @@ class RunLifecycleCoordinator:
             # the two documented rows_coalesce_failed divergences are
             # tolerated — see assert_terminal_counter_parity).
             _check_combined_coordination_latch()
+            # Durable post-condition beside the deferred-invariant sweep: no
+            # bound group converged unsettled (elspeth-76e936568e). Same
+            # contract — the run is still RUNNING, a refusal propagates to the
+            # except arms below and finalizes FAILED.
+            assert_bound_groups_settled_from_audit(self._db, run.run_id, graph)
             terminal_status, audit_counters = derive_terminal_status_from_audit(factory, run.run_id)
             assert_terminal_counter_parity(live=result, audit=audit_counters, run_id=run.run_id)
 

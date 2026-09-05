@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from tests.helpers.session_fences import get_blob_under_fence
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -374,8 +375,14 @@ class TestGetGuidedAfterStepAdvance:
         )
         assert resp.status_code == 201, resp.json()
         blob_id = resp.json()["id"]
-        blob_service = client.app.state.blob_service
-        record = asyncio.run(blob_service.get_blob(UUID(blob_id)))
+        record = asyncio.run(
+            get_blob_under_fence(
+                client.app.state.session_service,
+                client.app.state.blob_service,
+                UUID(session_id),
+                UUID(blob_id),
+            )
+        )
         return blob_id, record.storage_path
 
     def _outputs_path(self, client: TestClient, filename: str) -> str:
