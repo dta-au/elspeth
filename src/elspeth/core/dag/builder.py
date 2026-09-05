@@ -691,6 +691,11 @@ def build_execution_graph(
     collector_transforms: dict[CollectorName, TransformProtocol] = {}
     scopes_by_closer: dict[str, ScopeSettings] = {s.closer: s for s in (scope_settings or ())}
     if collectors:
+        # The opener check core/config.py's _validate_scope_bindings defers
+        # here ("opener multi-row-ness is only visible with plugin instances
+        # in hand"). Derived from the same plugin attribute the rule-5
+        # census reads (creates_tokens), never from the opener's name.
+        transform_plugins_by_name: dict[str, TransformProtocol] = {wired.settings.name: wired.plugin for wired in transforms}
         for collector_name, (transform, collector_config) in collectors.items():
             if not transform.is_batch_aware:
                 raise GraphValidationError(
@@ -707,6 +712,27 @@ def build_execution_graph(
                     component_type="collector",
                 )
             scope = scopes_by_closer[collector_config.name]
+            opener_plugin = transform_plugins_by_name.get(scope.opener)
+            if opener_plugin is None:
+                raise GraphValidationError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' does not name a transforms: entry. "
+                    f"A scope opener is a multi-row transform declared in transforms:.",
+                    component_id=scope.opener,
+                    component_type="transform",
+                )
+            if not opener_plugin.creates_tokens:
+                # A non-expanding opener yields a bound region no token can
+                # enter: the first row cannot route onto the collector's
+                # input without an EXPAND group frame, and the run dies with
+                # an internal error naming a phantom sink (elspeth-9783949ed4).
+                raise GraphValidationError(
+                    f"Scope '{scope.name}' opener '{scope.opener}' is not a multi-row transform "
+                    f"(creates_tokens=False), so it expands no rows into the group collector "
+                    f"'{collector_name}' would close. A scope opener must be an expanding transform "
+                    f"(spec §3, §7 rule 5).",
+                    component_id=scope.opener,
+                    component_type="transform",
+                )
             transform_config = transform.config
             collector_node_config: NodeConfig = {
                 "options": dict(collector_config.options),

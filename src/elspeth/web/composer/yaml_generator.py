@@ -31,7 +31,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, TypedDict, cast
+from types import MappingProxyType
+from typing import Any, Final, Protocol, TypedDict, cast
 
 import yaml
 
@@ -59,7 +60,6 @@ _WEB_ONLY_OPTION_KEYS = frozenset({"blob_ref"}) | AUTHORING_METADATA_OPTION_KEYS
 _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS = _WEB_ONLY_OPTION_KEYS | frozenset(NESTED_LOCAL_PATH_OPTION_KEYS) | frozenset({"blob_id"})
 _PUBLIC_STORAGE_OPTION_KEYS = frozenset(SOURCE_LOCAL_PATH_OPTION_KEYS) | frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
 _PUBLIC_CUSTODY_SUBTREE_KEYS = frozenset({"custody", "provider_config"})
-_YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"})
 
 
 class PublicCompositionDict(TypedDict):
@@ -162,49 +162,28 @@ def _source_entry(source: dict[str, Any], *, omit_source_paths: bool) -> dict[st
     }
 
 
-def _generate_pipeline_dict(
-    state: CompositionState,
-    *,
-    omit_source_paths: bool,
-    state_dict: PublicCompositionDict | None = None,
-) -> dict[str, Any]:
-    """Convert a CompositionState to ELSPETH's canonical pipeline dict.
+class LoweredPipelineDocument(TypedDict, total=False):
+    """The runtime settings document the composer lowers to — the closed set
+    of top-level sections, in the order the generator emits them. Each entry
+    is a plugin-shaped mapping whose keys the per-kind lowering owns."""
 
-    Maps CompositionState fields to the YAML structure expected by
-    ELSPETH's load_settings() parser. This is the canonical analysis form
-    for code that needs to walk a composition state using runtime/YAML
-    section names without serializing to text first.
+    sources: dict[str, dict[str, Any]]
+    queues: dict[str, dict[str, Any]]
+    transforms: list[dict[str, Any]]
+    gates: list[dict[str, Any]]
+    row_unions: list[dict[str, Any]]
+    aggregations: list[dict[str, Any]]
+    coalesce: list[dict[str, Any]]
+    collectors: list[dict[str, Any]]
+    scopes: list[dict[str, Any]]
+    sinks: dict[str, dict[str, Any]]
 
-    Calls state.to_dict() to unwrap all frozen containers
-    (MappingProxyType -> dict, tuple -> list) before building the dict.
 
-    Args:
-        state: The pipeline composition state to convert.
+class _NodeKindLowering(Protocol):
+    def __call__(self, doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None: ...
 
-    Returns:
-        Plain dict representing the pipeline configuration.
-    """
-    # Unwrap frozen containers to plain Python types (R4).
-    # to_dict() recursively converts MappingProxyType -> dict,
-    # tuple -> list. Without this, yaml.dump() raises RepresenterError.
-    state_dict = cast(PublicCompositionDict, state.to_dict()) if state_dict is None else state_dict
 
-    if COMPOSER_NODE_TYPES != _YAML_LOWERED_NODE_TYPES:
-        missing = sorted(COMPOSER_NODE_TYPES - _YAML_LOWERED_NODE_TYPES)
-        obsolete = sorted(_YAML_LOWERED_NODE_TYPES - COMPOSER_NODE_TYPES)
-        raise RuntimeError(f"Composer node type lowering drift: missing YAML lowering for {missing}; obsolete YAML lowering for {obsolete}")
-
-    doc: dict[str, Any] = {}
-
-    for node in state_dict["nodes"]:
-        node_type = node["node_type"]
-        if node_type not in COMPOSER_NODE_TYPES:
-            raise PipelineLoweringError(f"Unknown node_type '{node_type}' for node '{node['id']}'.")
-
-    sources = state_dict["sources"]
-    if sources:
-        doc["sources"] = {name: _source_entry(source, omit_source_paths=omit_source_paths) for name, source in sources.items()}
-
+def _lower_queue_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Queues — structural pass-through fan-in points (elspeth-a5b86149d4).
     # Emitted after sources and before executable node lists so the YAML reads
     # source -> queues -> transforms -> ... Queue nodes are in COMPOSER_NODE_TYPES
@@ -226,6 +205,8 @@ def _generate_pipeline_dict(
             queues_doc[queue.id] = queue_entry
         doc["queues"] = queues_doc
 
+
+def _lower_transform_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Transforms — filter nodes by type, access always-present fields directly.
     transforms = [n for n in state_dict["nodes"] if n["node_type"] == "transform"]
     if transforms:
@@ -248,6 +229,8 @@ def _generate_pipeline_dict(
                 entry["options"] = _strip_profile_lowering_provenance(t["plugin"], _strip_web_metadata(dict(t["options"])))
             doc["transforms"].append(entry)
 
+
+def _lower_gate_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Gates — condition and routes are conditionally present (only on gates).
     # to_dict() emits them when not None, so a Stage-1-invalid state can reach
     # here with either absent; the guarded accessor refuses to lower it.
@@ -268,6 +251,8 @@ def _generate_pipeline_dict(
                 entry["fork_to"] = g["fork_to"]
             doc["gates"].append(entry)
 
+
+def _lower_row_union_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Row unions — structural N-to-N barriers. ``input`` is a Composer-only
     # placeholder derived from the first branch connection; runtime consumes
     # only the ordered branches mapping.
@@ -284,6 +269,8 @@ def _generate_pipeline_dict(
                 entry["timeout_seconds"] = row_union["timeout_seconds"]
             doc["row_unions"].append(entry)
 
+
+def _lower_aggregation_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Aggregations
     aggregations = [n for n in state_dict["nodes"] if n["node_type"] == "aggregation"]
     if aggregations:
@@ -316,6 +303,8 @@ def _generate_pipeline_dict(
                 entry["options"] = _strip_web_metadata(dict(a["options"]))
             doc["aggregations"].append(entry)
 
+
+def _lower_coalesce_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Coalesce — branches, policy, merge are conditionally present. Where the
     # runtime has a default, NodeSpec.__post_init__ already records it, so an
     # absence here proves a state_dict that never crossed that boundary. Raise
@@ -339,6 +328,8 @@ def _generate_pipeline_dict(
                 entry["timeout_seconds"] = c["timeout_seconds"]
             doc["coalesce"].append(entry)
 
+
+def _lower_collector_nodes(doc: LoweredPipelineDocument, *, state: CompositionState, state_dict: PublicCompositionDict) -> None:
     # Collectors — EXPAND-group closers (barrier-scopes spec §3). Each
     # collector NodeSpec lowers to ONE collectors: entry plus ONE scopes:
     # entry derived from its scope binding fields; the scope's closer is the
@@ -382,6 +373,87 @@ def _generate_pipeline_dict(
                 }
             )
 
+
+# THE lowering table: one entry per composer node kind, in YAML section order
+# (queues → transforms → gates → row_unions → aggregations → coalesce →
+# collectors + scopes). Its KEYS are what the lowering drift guard in
+# ``_generate_pipeline_dict`` checks against ``COMPOSER_NODE_TYPES`` (derived
+# from the ``NodeType`` Literal). This operand is derived from the lowering
+# CODE — a kind is "lowered" exactly when it has an entry here — never from
+# ``NodeType``: a guard with both operands derived from the same authority is
+# ``x != x`` (elspeth-b3117ec3ac comment 7980). So the guard now compares what
+# the vocabulary declares against what lowering implements, in both
+# directions: a kind added to the Literal without a lowering is refused
+# (missing), and a lowering left behind by a removed kind is refused
+# (obsolete) — the silent direction elspeth-11d8cb0908 recorded is closed.
+_NODE_KIND_LOWERINGS: Final[Mapping[str, _NodeKindLowering]] = MappingProxyType(
+    {
+        "queue": _lower_queue_nodes,
+        "transform": _lower_transform_nodes,
+        "gate": _lower_gate_nodes,
+        "row_union": _lower_row_union_nodes,
+        "aggregation": _lower_aggregation_nodes,
+        "coalesce": _lower_coalesce_nodes,
+        "collector": _lower_collector_nodes,
+    }
+)
+
+
+def _lowered_node_types() -> frozenset[str]:
+    """The node kinds the lowering table implements — read at call time so a
+    mutated table is what the guard sees."""
+
+    return frozenset(_NODE_KIND_LOWERINGS)
+
+
+def _generate_pipeline_dict(
+    state: CompositionState,
+    *,
+    omit_source_paths: bool,
+    state_dict: PublicCompositionDict | None = None,
+) -> LoweredPipelineDocument:
+    """Convert a CompositionState to ELSPETH's canonical pipeline dict.
+
+    Maps CompositionState fields to the YAML structure expected by
+    ELSPETH's load_settings() parser. This is the canonical analysis form
+    for code that needs to walk a composition state using runtime/YAML
+    section names without serializing to text first.
+
+    Calls state.to_dict() to unwrap all frozen containers
+    (MappingProxyType -> dict, tuple -> list) before building the dict.
+
+    Args:
+        state: The pipeline composition state to convert.
+
+    Returns:
+        Plain dict representing the pipeline configuration.
+    """
+    # Unwrap frozen containers to plain Python types (R4).
+    # to_dict() recursively converts MappingProxyType -> dict,
+    # tuple -> list. Without this, yaml.dump() raises RepresenterError.
+    state_dict = cast(PublicCompositionDict, state.to_dict()) if state_dict is None else state_dict
+
+    lowered = _lowered_node_types()
+    if lowered != COMPOSER_NODE_TYPES:
+        missing = sorted(COMPOSER_NODE_TYPES - lowered)
+        obsolete = sorted(lowered - COMPOSER_NODE_TYPES)
+        raise RuntimeError(f"Composer node type lowering drift: missing YAML lowering for {missing}; obsolete YAML lowering for {obsolete}")
+
+    doc: LoweredPipelineDocument = {}
+
+    for node in state_dict["nodes"]:
+        node_type = node["node_type"]
+        if node_type not in COMPOSER_NODE_TYPES:
+            raise PipelineLoweringError(f"Unknown node_type '{node_type}' for node '{node['id']}'.")
+
+    sources = state_dict["sources"]
+    if sources:
+        doc["sources"] = {name: _source_entry(source, omit_source_paths=omit_source_paths) for name, source in sources.items()}
+
+    # Every composer node kind lowers through the table, in its order.
+    for lowering in _NODE_KIND_LOWERINGS.values():
+        lowering(doc, state=state, state_dict=state_dict)
+
     # Sinks — always-present fields, direct access.
     if state_dict["outputs"]:
         doc["sinks"] = {}
@@ -399,7 +471,7 @@ def _generate_pipeline_dict(
     return doc
 
 
-def generate_pipeline_dict(state: CompositionState) -> dict[str, Any]:
+def generate_pipeline_dict(state: CompositionState) -> LoweredPipelineDocument:
     """Convert a CompositionState to the runtime pipeline dict."""
     return _generate_pipeline_dict(state, omit_source_paths=False)
 
@@ -642,7 +714,7 @@ def generate_public_composition_dict(state: CompositionState) -> PublicCompositi
     return projected
 
 
-def generate_public_pipeline_dict(state: CompositionState) -> dict[str, Any]:
+def generate_public_pipeline_dict(state: CompositionState) -> LoweredPipelineDocument:
     """Convert a CompositionState to public export/share/MCP pipeline dict."""
     public_state = generate_public_composition_dict(state)
     return _generate_pipeline_dict(

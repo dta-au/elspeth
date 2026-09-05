@@ -1477,13 +1477,28 @@ row_unions:
     def test_generator_fails_closed_when_supported_node_lowering_drifts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.web.composer import yaml_generator
 
+        # The lowering table is the guard's derived-from-CODE operand; a
+        # lowering left behind by a removed kind is "obsolete".
         monkeypatch.setattr(
             yaml_generator,
-            "_YAML_LOWERED_NODE_TYPES",
-            yaml_generator._YAML_LOWERED_NODE_TYPES | {"future_structural_node"},
+            "_NODE_KIND_LOWERINGS",
+            {**yaml_generator._NODE_KIND_LOWERINGS, "future_structural_node": lambda doc, *, state, state_dict: None},
         )
 
-        with pytest.raises(RuntimeError, match="Composer node type lowering drift"):
+        with pytest.raises(RuntimeError, match=r"obsolete YAML lowering for \['future_structural_node'\]"):
+            generate_pipeline_dict(_make_linear_pipeline())
+
+    def test_a_kind_without_a_lowering_block_is_refused_not_silently_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-11d8cb0908 direction B: before the registry, adding a kind to
+        the hand-written set and forgetting its block left the guard passing
+        and the kind silently not lowered. The set is now the table's keys,
+        so a kind with no lowering entry cannot claim to be lowered."""
+        from elspeth.web.composer import yaml_generator
+
+        without_collector = {kind: fn for kind, fn in yaml_generator._NODE_KIND_LOWERINGS.items() if kind != "collector"}
+        monkeypatch.setattr(yaml_generator, "_NODE_KIND_LOWERINGS", without_collector)
+
+        with pytest.raises(RuntimeError, match=r"missing YAML lowering for \['collector'\]"):
             generate_pipeline_dict(_make_linear_pipeline())
 
 

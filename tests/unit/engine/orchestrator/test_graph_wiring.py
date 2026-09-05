@@ -154,3 +154,17 @@ class TestStructuralNodeClassification:
                 config=config,
                 config_gate_id_map=graph.get_config_gate_id_map(),
             )
+
+
+def test_unaccounted_node_message_names_every_traversal_inert_kind() -> None:
+    """elspeth-1768ad240c drift 1: the message named three of the five kinds
+    the membership test accepts, so an operator reading it would conclude a
+    row_union or collector is NOT an accepted role — the opposite of the
+    code. The text now derives from the set it reports on."""
+    from elspeth.engine.orchestrator.graph_wiring import _TRAVERSAL_INERT_NODE_TYPES, _unaccounted_traversal_nodes_message
+
+    message = _unaccounted_traversal_nodes_message(["orphan"])
+    assert "['orphan']" in message
+    for kind in _TRAVERSAL_INERT_NODE_TYPES:
+        assert kind.value in message, kind
+    assert "structural (source/queue/coalesce)" not in message
