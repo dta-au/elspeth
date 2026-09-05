@@ -5932,11 +5932,13 @@ class TestStep2IntraStep:
             raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
 
         monkeypatch.setattr(composer_service_module, "surface_pending_interpretation_reviews_for_state", _lose_repair_lease)
-        # The leak-safe fence error escapes the route (a 500 to the client,
-        # never a fabricated success): the client retries, exactly as after
-        # the crash above.
-        with pytest.raises(SessionOperationFenceLost):
-            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        # The leak-safe fence error is answered by the production handler
+        # (``create_app`` and this fixture register the same one): the
+        # nonleaking 404 absence, never a fabricated success. The client
+        # retries, exactly as after the crash above.
+        lost = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert lost.status_code == 404, lost.json()
+        assert lost.json() == {"detail": "Session not found"}
         assert _pending_prompt_events() == []
         assert _state_versions() == versions_after_settlement
 
