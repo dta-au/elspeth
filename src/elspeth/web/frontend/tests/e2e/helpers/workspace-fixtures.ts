@@ -88,6 +88,12 @@ const INSTALLED_SCENARIOS = new WeakMap<Page, InstalledScenario>();
 const SOURCE_FILENAME = "workspace-geometry.csv";
 const FIXED_TIME = "2026-08-11T08:00:00.000Z";
 const TALL_DIALOG_NODE_COUNT = 80;
+const TALL_DIALOG_PROMPT_TEMPLATE =
+  "Review category {{ row.category }} and return a concise classification.";
+// elspeth.core.canonical.stable_hash(TALL_DIALOG_PROMPT_TEMPLATE), 2026-09-05,
+// release/0.8.0 @ b00674f5d. Re-derive if the prompt text above changes.
+const TALL_DIALOG_PROMPT_TEMPLATE_HASH =
+  "be07c8ba62144f98ae93e15a63d3e745393e8a388053db74e4bd3491267ad2b6";
 
 function deferredSignal(): DeferredSignal {
   let release: (() => void) | undefined;
@@ -142,11 +148,33 @@ async function seedCanonicalComposition(
         // playwright.config.ts. Authoring provider/model alongside a profile
         // is correctly rejected by live preflight.
         profile: "e2e-bedrock",
-        prompt_template:
-          "Review category {{ row.category }} and return a concise classification.",
+        prompt_template: TALL_DIALOG_PROMPT_TEMPLATE,
         required_input_fields: ["category"],
         response_field: "review",
         schema: { mode: "observed" },
+        // Since b3ca8d7fb (2026-09-01, "surface YAML source review debt") a
+        // seeded llm node with a prompt_template must carry its
+        // prompt-template review requirement or the seed is rejected as
+        // review debt the backend cannot surface. The fixture's intent is a
+        // validated pipeline, so the review is RESOLVED against the prompt's
+        // own hash rather than left pending (which would gate Run behind 80
+        // interpretation cards). The hash is stable_hash(prompt_template) —
+        // interpretation_state._validate_prompt_template_review — computed
+        // in the worktree venv for the exact prompt above; change both or
+        // neither.
+        interpretation_requirements: [
+          {
+            id: `prompt-template-review-${String(index + 1).padStart(3, "0")}`,
+            kind: "llm_prompt_template",
+            user_term: `llm_prompt_template:${id}`,
+            status: "resolved",
+            draft: TALL_DIALOG_PROMPT_TEMPLATE,
+            accepted_value: TALL_DIALOG_PROMPT_TEMPLATE,
+            accepted_artifact_hash: null,
+            resolved_prompt_template_hash: TALL_DIALOG_PROMPT_TEMPLATE_HASH,
+            event_id: null,
+          },
+        ],
       },
     }));
     return await seedCompositionState(

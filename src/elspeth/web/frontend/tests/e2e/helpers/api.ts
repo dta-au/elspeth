@@ -77,6 +77,38 @@ export async function setShowAdvanced(
   }
 }
 
+/** The account's persisted composer mode. A fresh session opens in the
+ *  account's default_mode, and a guided build hides the plugin catalog
+ *  (App.tsx catalogAvailable = !guidedBuildActive), so specs that drive the
+ *  catalog on a real session state their mode instead of inheriting whatever
+ *  an earlier live spec left on the shared E2E account. */
+export async function getDefaultMode(
+  ctx: APIRequestContext,
+): Promise<"guided" | "freeform"> {
+  const resp = await ctx.get("/api/composer-preferences");
+  if (!resp.ok()) {
+    throw new Error(
+      `GET /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+  const body = (await resp.json()) as { default_mode: "guided" | "freeform" };
+  return body.default_mode;
+}
+
+export async function setDefaultMode(
+  ctx: APIRequestContext,
+  mode: "guided" | "freeform",
+): Promise<void> {
+  const resp = await ctx.patch("/api/composer-preferences", {
+    data: { default_mode: mode },
+  });
+  if (!resp.ok()) {
+    throw new Error(
+      `PATCH /api/composer-preferences failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+    );
+  }
+}
+
 const DELETE_SESSION_CONFLICT_RETRIES = 20;
 const DELETE_SESSION_CONFLICT_BACKOFF_MS = 250;
 
