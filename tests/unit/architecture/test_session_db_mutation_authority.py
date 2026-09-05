@@ -8557,6 +8557,111 @@ def test_package_premise_is_revoked_by_a_session_shaped_import(tmp_path: Path) -
         ), imports
 
 
+_CALLER_SIDE_PROOF_MODULE = textwrap.dedent(
+    """\
+    class Repo:
+        def __init__(self, db):
+            self._db = db
+
+        def caller(self, stmt):
+            with self._db.write_connection() as conn:
+                helper(conn, stmt)
+
+        def chained_caller(self, stmt):
+            with self._db.write_connection() as conn:
+                outer(conn, stmt)
+
+    def helper(conn, stmt):
+        conn.execute(stmt)
+
+    def outer(conn, stmt):
+        inner(conn, stmt)
+
+    def inner(conn, stmt):
+        conn.execute(stmt)
+    """
+)
+
+
+def _caller_side_findings(tmp_path: Path, extra: dict[str, str] | None = None) -> Counter[tuple[str, str, str]]:
+    """Scan the declared Landscape module plus any extra modules, keyed (path, symbol, table)."""
+
+    declared = tmp_path / "src/elspeth/core/landscape/repo.py"
+    declared.parent.mkdir(parents=True, exist_ok=True)
+    declared.write_text(_CALLER_SIDE_PROOF_MODULE)
+    files = [declared]
+    for relative, body in (extra or {}).items():
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(textwrap.dedent(body))
+        files.append(source)
+    return Counter(
+        (site.path, site.symbol, site.table)
+        for site in scan_production_writers(files, anchor=tmp_path)
+        if site.table == "<unresolved-session-write>"
+    )
+
+
+def test_caller_side_proof_clears_a_helper_every_caller_binds_to_a_module_bound_connection(tmp_path: Path) -> None:
+    """Option (b) acceptance: ``helper`` executes on a parameter, and its only caller binds that parameter
+    from the declared module's own handle, so the execution is proven non-Sessions tree-wide. The chain
+    ``chained_caller -> outer -> inner`` proves ``inner`` through ``outer``'s own parameter."""
+
+    assert _caller_side_findings(tmp_path) == Counter()
+
+
+def test_caller_side_proof_refuses_when_one_caller_hands_a_sessions_connection(tmp_path: Path) -> None:
+    """Adversarial: a web module imports the same helper and passes an engine-bound connection.
+    One contrary call site keeps the parameter-received execution unresolved -- the proof is
+    all-call-sites, never any-call-site."""
+
+    web = """\
+        from elspeth.core.landscape.repo import helper
+
+        def web_caller(engine, stmt):
+            with engine.begin() as conn:
+                helper(conn, stmt)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/web/escape.py": web})
+    assert findings[("src/elspeth/core/landscape/repo.py", "helper", "<unresolved-session-write>")] == 1
+    # The chain has no contrary caller and stays proven.
+    assert findings[("src/elspeth/core/landscape/repo.py", "inner", "<unresolved-session-write>")] == 0
+
+
+def test_caller_side_proof_refuses_a_call_whose_argument_cannot_be_known(tmp_path: Path) -> None:
+    """Adversarial: a star-argument call site cannot bind the parameter to any expression, so it refuses."""
+
+    starred = """\
+        from elspeth.core.landscape.repo import inner
+
+        def relay(*args):
+            inner(*args)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/relay.py": starred})
+    assert findings[("src/elspeth/core/landscape/repo.py", "inner", "<unresolved-session-write>")] == 1
+    assert findings[("src/elspeth/core/landscape/repo.py", "helper", "<unresolved-session-write>")] == 0
+
+
+def test_caller_side_proof_refuses_a_cycle_and_a_helper_nobody_calls(tmp_path: Path) -> None:
+    """Adversarial: two helpers that only hand the connection to each other prove nothing (a cycle is
+    refused, not assumed), and a parameter-received helper with no call site at all stays unresolved."""
+
+    cyclic = """\
+        def ping(conn, stmt):
+            pong(conn, stmt)
+
+        def pong(conn, stmt):
+            ping(conn, stmt)
+            conn.execute(stmt)
+
+        def orphan(conn, stmt):
+            conn.execute(stmt)
+        """
+    findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/cycle.py": cyclic})
+    assert findings[("src/elspeth/core/landscape/cycle.py", "pong", "<unresolved-session-write>")] == 1
+    assert findings[("src/elspeth/core/landscape/cycle.py", "orphan", "<unresolved-session-write>")] == 1
+
+
 def test_declared_factory_handle_verbs_are_acquisitions_only_on_a_plain_name(tmp_path: Path) -> None:
     """``with open_landscape_db(...) as db, db.write_connection() as conn`` is a Landscape acquisition; ``self._db.write_connection()`` is not one."""
 
