@@ -1877,3 +1877,22 @@ export async function verifyEmail(token: string): Promise<AuthTokenResponse> {
   });
   return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
 }
+
+/**
+ * Exchange the single-use SSO handoff code (read from the `#/auth/callback`
+ * fragment) for the session token. The code is spent by this call whether
+ * or not the login is admitted, so a refusal here is final for that code.
+ *
+ * `logoutOnUnauthorized: false` for the same reason as `verifyEmail`: a 401
+ * is the backend refusing THIS handoff (pending, disabled, already spent) and
+ * must not evict a session that may already be signed in.
+ */
+export async function completeSsoLogin(code: string): Promise<AuthTokenResponse> {
+  const response = await fetch("/api/auth/sso/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+    cache: "no-store",
+  });
+  return parseResponse<AuthTokenResponse>(response, { logoutOnUnauthorized: false });
+}
