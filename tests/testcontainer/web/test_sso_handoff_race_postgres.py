@@ -27,7 +27,7 @@ from sqlalchemy import Engine, create_engine, insert, select
 from sqlalchemy.engine import make_url
 from testcontainers.postgres import PostgresContainer
 
-from elspeth.web.auth.sso import handoff_code_hash, new_handoff_code
+from elspeth.web.auth.sso import ConsumedHandoff, handoff_code_hash, new_handoff_code
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.schema_probe import init_session_schema
 from elspeth.web.sessions.models import identities_table, sso_handoffs_table
@@ -73,7 +73,7 @@ def postgres_engine(postgres_url: str) -> Iterator[Engine]:
         admin.dispose()
 
 
-def _race(postgres_engine: Engine, *, code_hash: str, contenders: int) -> list[str | None]:
+def _race(postgres_engine: Engine, *, code_hash: str, contenders: int) -> list[ConsumedHandoff | None]:
     """Release ``contenders`` independent stores onto one code simultaneously.
 
     Each gets its OWN engine, so no two share a connection or a transaction —
@@ -83,7 +83,7 @@ def _race(postgres_engine: Engine, *, code_hash: str, contenders: int) -> list[s
     engines = [create_engine(postgres_engine.url) for _ in range(contenders)]
     barrier = threading.Barrier(contenders)
 
-    def consume(engine: Engine) -> str | None:
+    def consume(engine: Engine) -> ConsumedHandoff | None:
         store = SsoHandoffRepository(engine)
         barrier.wait()
         return store.consume(code_hash=code_hash)
@@ -103,7 +103,7 @@ def test_exactly_one_of_two_racing_consumers_wins(postgres_engine: Engine) -> No
 
     results = _race(postgres_engine, code_hash=handoff_code_hash(code), contenders=2)
 
-    assert sorted(results, key=lambda value: value is None) == [_IDENTITY, None]
+    assert sorted(results, key=lambda value: value is None) == [ConsumedHandoff(_IDENTITY, "req-1"), None]
 
 
 def test_exactly_one_of_many_racing_consumers_wins(postgres_engine: Engine) -> None:
@@ -114,7 +114,7 @@ def test_exactly_one_of_many_racing_consumers_wins(postgres_engine: Engine) -> N
 
     results = _race(postgres_engine, code_hash=handoff_code_hash(code), contenders=_CONTENDERS)
 
-    assert results.count(_IDENTITY) == 1, results
+    assert results.count(ConsumedHandoff(_IDENTITY, "req-1")) == 1, results
     assert results.count(None) == _CONTENDERS - 1, results
 
 
@@ -149,7 +149,7 @@ def test_racing_distinct_codes_all_succeed(postgres_engine: Engine) -> None:
     engines = [create_engine(postgres_engine.url) for _ in codes]
     barrier = threading.Barrier(len(codes))
 
-    def consume(engine: Engine, code: str) -> str | None:
+    def consume(engine: Engine, code: str) -> ConsumedHandoff | None:
         barrier.wait()
         return SsoHandoffRepository(engine).consume(code_hash=handoff_code_hash(code))
 
@@ -160,4 +160,4 @@ def test_racing_distinct_codes_all_succeed(postgres_engine: Engine) -> None:
         for engine in engines:
             engine.dispose()
 
-    assert results == [_IDENTITY] * len(codes)
+    assert results == [ConsumedHandoff(_IDENTITY, f"req-{index}") for index in range(len(codes))]

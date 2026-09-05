@@ -43,7 +43,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Final, Literal, Protocol, TypedDict, cast
+from typing import Any, ClassVar, Final, Literal, NamedTuple, Protocol, TypedDict, cast
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -54,6 +54,7 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims
+from elspeth.web.auth.session_token import SessionTokenIssuer
 from elspeth.web.auth.urls import DiscoveredEndpoints, validate_discovered_endpoints
 
 # ── failure taxonomy ─────────────────────────────────────────────────────
@@ -479,6 +480,21 @@ def handoff_code_hash(code: str) -> str:
     return hashlib.sha256(code.encode("ascii")).hexdigest()
 
 
+class ConsumedHandoff(NamedTuple):
+    """What a claimed handoff row says: who, and which login it came from.
+
+    ``login_request_id`` is the request id of the CALLBACK that issued the
+    handoff. The ``token_issued`` row written at ``complete`` carries it so
+    the two audit rows of one login — ``login`` at callback, ``token_issued``
+    at complete, on different requests and possibly different replicas — are
+    joinable (spec §2 complete: "joined to the login row by request_id").
+    Returning only the identity would leave the join to a timestamp guess.
+    """
+
+    identity_id: str
+    login_request_id: str
+
+
 class HandoffStore(Protocol):
     """Where handoffs live. Injected, not imported.
 
@@ -494,8 +510,8 @@ class HandoffStore(Protocol):
         """Record a handoff. Called after the identity is verified."""
         ...
 
-    def consume(self, *, code_hash: str) -> str | None:
-        """Atomically claim a handoff, returning its identity_id or None.
+    def consume(self, *, code_hash: str) -> ConsumedHandoff | None:
+        """Atomically claim a handoff, returning what its row says, or None.
 
         The CLAIM must be one conditional UPDATE: the row is claimed by the
         same statement that decides it may be claimed. Two ``complete`` calls
@@ -1200,3 +1216,75 @@ async def login_callback(
     handoff = new_handoff_code()
     handoffs.issue(code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
     return handoff_location(client.public_base_url, handoff)
+
+
+# ── complete ─────────────────────────────────────────────────────────────
+#
+# The browser is back with the handoff code from the fragment. This is the
+# only step that mints a session token, and it does so only after the code
+# has been consumed — so a token never exists before someone has proven they
+# hold the code, and the code cannot be used again once one does.
+
+# token_urlsafe(32) is 43 characters. The bound is generous, but it is a
+# bound: the code is hashed as-is, and a hash of a megabyte is work an
+# unauthenticated caller should not be able to demand.
+_MAX_HANDOFF_CODE_LENGTH: Final = 128
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedSession:
+    """What ``complete`` returns to the SPA: the token, and what kind it is."""
+
+    access_token: str = field(repr=False)
+    token_type: Literal["Bearer"] = "Bearer"
+
+
+def complete_login(
+    code: str,
+    *,
+    handoffs: HandoffStore,
+    read_identity: Callable[[str], AdmittedIdentity | None],
+    issuer: SessionTokenIssuer,
+    record_token_issued: Callable[[AdmittedIdentity, str, str], None],
+) -> IssuedSession:
+    """Trade a handoff code for a session token, or refuse.
+
+    CONSUME FIRST, READ SECOND. The code is claimed by one conditional
+    UPDATE before anything else is looked at. Two things follow from that
+    order, and both are the point:
+
+    * a code that does not claim never touches the identity table, so the
+      response time of an invalid code carries no fact about any identity —
+      an attacker guessing codes learns only that the guess failed;
+    * a code that DOES claim is spent even if the login is then refused —
+      an identity disabled between callback and complete gets
+      ``sso_identity_disabled``, and its handoff is gone, not left live for
+      a retry after the administrator's decision.
+
+    The admission check runs again here, not only at callback. The spec
+    calls this "re-check disabled_at" (§Disable reach [rev2]): the window
+    between the two steps is short, but a disable that lands inside it must
+    hold, and the only way it holds is to read the row now.
+
+    ``record_token_issued`` runs BEFORE the token is returned, and it is
+    given the login's request id from the handoff row. A token whose audit
+    row failed to write is a token nobody gets: the handoff is spent, the
+    caller sees the failure, and the person logs in again.
+    """
+    if not code or len(code) > _MAX_HANDOFF_CODE_LENGTH or not code.isprintable():
+        raise SsoHandoffInvalid
+    consumed = handoffs.consume(code_hash=handoff_code_hash(code))
+    if consumed is None:
+        raise SsoHandoffInvalid
+
+    identity = read_identity(consumed.identity_id)
+    if identity is None:
+        # The row is a foreign key of the handoff's, so this is a delete that
+        # landed between the claim and this read. The handoff is spent; the
+        # caller sees the same refusal as for an unknown code.
+        raise SsoHandoffInvalid(detail="This sign-in could not be completed — start the login again")
+    admit(identity)
+
+    token = issuer.mint(identity_id=identity.identity_id, username=identity.username)
+    record_token_issued(identity, token, consumed.login_request_id)
+    return IssuedSession(access_token=token)
