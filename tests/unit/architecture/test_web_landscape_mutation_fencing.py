@@ -864,30 +864,44 @@ def _resolver_for_unit(unit: SourceUnit) -> _Resolver:
     return _Resolver(unit)
 
 
-def _table_name(node: ast.AST, resolver: _Resolver, *, use: ast.AST) -> str | None:
+def _table_identity(node: ast.AST, resolver: _Resolver, *, use: ast.AST) -> tuple[str, str] | None:
+    """Return the defining module and table name of a SQLAlchemy table reference.
+
+    A table NAME is not an identity.  Sessions (``elspeth.web.sessions.models``)
+    and Landscape (``elspeth.core.landscape.schema``) both define a ``runs``
+    table, so every cross-database decision keys on the module the table object
+    is bound from, never on the trailing spelling.
+    """
+
     dotted = resolver.qualified_name(node, use=use)
     if dotted is None:
         return None
-    terminal = dotted.rsplit(".", maxsplit=1)[-1]
+    module, _, terminal = dotted.rpartition(".")
     if not terminal.endswith("_table"):
         return None
-    return terminal.removesuffix("_table")
+    return module, terminal.removesuffix("_table")
 
 
-def _dml_shape(call: ast.Call, resolver: _Resolver) -> tuple[str, str] | None:
-    """Return a SQLAlchemy DML construction's exact table and operation."""
+def _table_name(node: ast.AST, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    identity = _table_identity(node, resolver, use=use)
+    return None if identity is None else identity[1]
+
+
+def _dml_construction(call: ast.Call, resolver: _Resolver) -> tuple[ast.expr, str, ast.AST] | None:
+    """Return a SQLAlchemy DML construction's table expression, operation and use site."""
 
     callable_node = resolver.resolve_callable(call.func, use=call)
     if isinstance(callable_node, ast.Call) and _call_name(callable_node) == "getattr" and len(callable_node.args) >= 2:
         operation_node = callable_node.args[1]
         if isinstance(operation_node, ast.Constant) and operation_node.value in {"insert", "update", "delete"}:
-            table = _table_name(callable_node.args[0], resolver, use=callable_node)
-            return None if table is None else (table, str(operation_node.value))
+            return callable_node.args[0], str(operation_node.value), callable_node
 
-    if isinstance(callable_node, ast.Attribute) and callable_node.attr in {"insert", "update", "delete"}:
-        table = _table_name(callable_node.value, resolver, use=callable_node)
-        if table is not None:
-            return table, callable_node.attr
+    if (
+        isinstance(callable_node, ast.Attribute)
+        and callable_node.attr in {"insert", "update", "delete"}
+        and _table_name(callable_node.value, resolver, use=callable_node) is not None
+    ):
+        return callable_node.value, callable_node.attr, callable_node
 
     qualified = resolver.qualified_name(callable_node, use=call)
     name = None if qualified is None else qualified.rsplit(".", maxsplit=1)[-1]
@@ -902,7 +916,17 @@ def _dml_shape(call: ast.Call, resolver: _Resolver) -> tuple[str, str] | None:
         operation = "insert"
     if operation is None:
         return None
-    table = _table_name(call.args[0], resolver, use=call)
+    return call.args[0], operation, call
+
+
+def _dml_shape(call: ast.Call, resolver: _Resolver) -> tuple[str, str] | None:
+    """Return a SQLAlchemy DML construction's exact table and operation."""
+
+    construction = _dml_construction(call, resolver)
+    if construction is None:
+        return None
+    table_node, operation, use = construction
+    table = _table_name(table_node, resolver, use=use)
     return None if table is None else (table, operation)
 
 
@@ -2388,6 +2412,34 @@ def _targets_landscape_schema(expression: ast.expr, resolver: _Resolver, *, use:
     return False
 
 
+# A table NAME is not an identity.  The Sessions database owns its own ``runs``
+# table, so ``update(runs_table)`` in ``src/elspeth/web/`` means the Landscape
+# runs table or the Sessions one depending only on which module defines the
+# ``Table`` object the statement binds to.  These are the non-Landscape schema
+# modules whose tables are proven to belong to another engine; anything the
+# scanner cannot bind to one of them keeps failing closed on the name.
+_NON_LANDSCAPE_SCHEMA_MODULES = ("elspeth.web.sessions.",)
+
+
+def _dml_table_metadata_module(statement: ast.expr | None, resolver: _Resolver) -> str | None:
+    """Return the module defining the ``Table`` a DML construction binds to.
+
+    ``None`` when the statement is not a DML construction, or when its table
+    expression cannot be resolved to a ``*_table`` object with a defining
+    module — an unresolved binding is never treated as proof of another
+    database, so the caller keeps failing closed on the table name.
+    """
+
+    if not isinstance(statement, ast.Call):
+        return None
+    construction = _dml_construction(statement, resolver)
+    if construction is None:
+        return None
+    table_node, _operation, use = construction
+    identity = _table_identity(table_node, resolver, use=use)
+    return None if identity is None or not identity[0] else identity[0]
+
+
 def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     violations: list[str] = []
     implementation_prefixes = (
@@ -2449,6 +2501,11 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
             statement = resolver.resolve_statement(node.args[0], use=node)
             if shape is None and isinstance(statement, ast.Call):
                 shape = _dml_shape(statement, resolver) or _raw_dml_shape(statement, resolver)
+            metadata_module = _dml_table_metadata_module(statement, resolver)
+            if metadata_module is not None and metadata_module.startswith(_NON_LANDSCAPE_SCHEMA_MODULES):
+                # Proven other-engine metadata: the statement binds to a Table
+                # this repository defines outside the Landscape schema.
+                continue
             landscape_schema_target = _targets_landscape_schema(node.args[0], resolver, use=node)
             raw_outside_sessions = (
                 shape is not None
@@ -4578,6 +4635,48 @@ def test_dml_scanner_respects_parameter_and_local_shadowing() -> None:
         ),
     )
     assert scan_dml_identities([shadowed]) == ()
+
+
+def test_outside_landscape_dml_keys_on_the_table_metadata_module_not_the_table_name() -> None:
+    """P4-D8 defect 1: Sessions and Landscape both own a ``runs`` table."""
+
+    sessions_runs = _parse_source(
+        "src/elspeth/web/coordination/repository.py",
+        "from sqlalchemy import insert, update\n"
+        "from elspeth.web.sessions.models import runs_table\n"
+        "def write(conn):\n"
+        "    conn.execute(insert(runs_table).values(id='r'))\n"
+        "    conn.execute(update(runs_table).values(status='failed'))\n",
+    )
+    assert _raw_write_surface_violations([sessions_runs]) == ()
+
+    landscape_runs = _parse_source(
+        "src/elspeth/web/composer/tutorial_service.py",
+        "from sqlalchemy import update\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def write(conn):\n"
+        "    conn.execute(update(runs_table).values(status='failed'))\n",
+    )
+    assert any("outside Landscape DML update runs" in item for item in _raw_write_surface_violations([landscape_runs]))
+
+    # An unproven origin is NOT proof of another database: the table-name test
+    # remains the fail-closed default for anything the scanner cannot bind.
+    unproven_origin = _parse_source(
+        "src/elspeth/web/reexported_table.py",
+        "from sqlalchemy import update\n"
+        "from elspeth.web.schema_reexport import runs_table\n"
+        "def write(conn):\n"
+        "    conn.execute(update(runs_table).values(status='failed'))\n",
+    )
+    assert any("outside Landscape DML update runs" in item for item in _raw_write_surface_violations([unproven_origin]))
+
+    bound_method_form = _parse_source(
+        "src/elspeth/web/coordination/bound_method.py",
+        "from elspeth.web.sessions.models import runs_table\n"
+        "def write(conn):\n"
+        "    conn.execute(runs_table.update().values(status='failed'))\n",
+    )
+    assert _raw_write_surface_violations([bound_method_form]) == ()
 
 
 def test_dml_fingerprint_is_stable_when_the_required_fence_wraps_the_same_statement() -> None:
