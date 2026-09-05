@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     interpretation_events_table,
     session_operation_fences_table,
+    session_read_admissions_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
@@ -2274,3 +2276,248 @@ def test_sqlite_blob_read_on_a_missing_session_is_missing(engine) -> None:
     with pytest.raises(SessionOperationFenceLost) as lost:
         authority.acquire(session_id=uuid4(), operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30)
     assert lost.value.reason is FenceLossReason.MISSING
+
+
+# --- elspeth-f98e0ae8b2 (under A-3): every BLOB_READ admission is recorded and proven against its row ---
+
+
+def _read_rows(engine, *, session_id: str) -> dict[str, tuple[str, datetime]]:
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                session_read_admissions_table.c.operation_id,
+                session_read_admissions_table.c.lease_token,
+                session_read_admissions_table.c.expires_at,
+            ).where(session_read_admissions_table.c.session_id == session_id)
+        ).all()
+    # SQLite hands DateTime(timezone=True) columns back naive; normalise the
+    # way the authority itself does before comparing against aware times.
+    return {row.operation_id: (row.lease_token, coordination_repository._ensure_utc(row.expires_at)) for row in rows}
+
+
+_EXPIRED_ADMITTED_AT = datetime(2000, 1, 1, tzinfo=UTC)
+_EXPIRED_EXPIRES_AT = datetime(2000, 1, 1, 0, 0, 1, tzinfo=UTC)
+
+
+def _expire_read_admission(engine, *, session_id: str, operation_id: str) -> None:
+    # Both stamps move: the schema's ck_session_read_admissions_expiry_after_admission
+    # refuses an expiry at or before the admission time.
+    with engine.begin() as conn:
+        conn.execute(
+            update(session_read_admissions_table)
+            .where(
+                session_read_admissions_table.c.session_id == session_id,
+                session_read_admissions_table.c.operation_id == operation_id,
+            )
+            .values(admitted_at=_EXPIRED_ADMITTED_AT, expires_at=_EXPIRED_EXPIRES_AT)
+        )
+
+
+class _SkewedClockAuthority(SQLiteLocalSessionOperationAuthority):
+    """Read the database clock one hour AHEAD of the real database clock.
+
+    A read admission recorded by the plain authority is live by the real
+    clock and expired by this one. A proof through this authority that is
+    refused as LEASE_EXPIRED therefore proves the comparison uses the
+    authority's database clock; a comparison against process time would
+    still see the row as live and let the proof through.
+    """
+
+    @staticmethod
+    def _database_now(conn: Connection) -> datetime:
+        return SQLiteLocalSessionOperationAuthority._database_now(conn) + timedelta(hours=1)
+
+
+def _read_proofs(
+    authority: SQLiteLocalSessionOperationAuthority,
+    context: SessionOperationContext,
+) -> tuple[Callable[[], object], ...]:
+    return (
+        lambda: authority.compare_and_swap(context),
+        lambda: authority.mutate(context, lambda _transaction: None),
+        lambda: authority.renew(context, lease_seconds=30),
+        lambda: authority.release(context),
+    )
+
+
+def test_sqlite_blob_read_admission_is_recorded_with_a_database_time_expiry(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=45
+    )
+    rows = _read_rows(engine, session_id=str(created.id))
+    assert set(rows) == {reader.fence.operation_id}
+    token, expires_at = rows[reader.fence.operation_id]
+    assert token == reader.fence.lease_token
+    with engine.connect() as conn:
+        database_now = authority._database_now(conn)
+    assert timedelta(seconds=40) < expires_at - database_now <= timedelta(seconds=45)
+    with engine.connect() as conn:
+        recorded_epoch = conn.execute(
+            select(session_read_admissions_table.c.operation_epoch).where(
+                session_read_admissions_table.c.operation_id == reader.fence.operation_id
+            )
+        ).scalar_one()
+    assert recorded_epoch == reader.fence.operation_epoch
+
+
+def test_sqlite_released_read_context_is_refused_on_every_proof(engine) -> None:
+    """Release deletes the admission row; the context is RELEASED everywhere afterwards."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    stale = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    authority.release(stale)
+    assert _read_rows(engine, session_id=str(created.id)) == {}
+    # A later admission advances nothing and must not resurrect the stale one.
+    live = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-2", lease_seconds=30
+    )
+    for proof in _read_proofs(authority, stale):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.RELEASED
+    authority.compare_and_swap(live)
+    assert set(_read_rows(engine, session_id=str(created.id))) == {live.fence.operation_id}
+
+
+def test_sqlite_expired_read_context_is_refused_on_every_proof(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    _expire_read_admission(engine, session_id=str(created.id), operation_id=reader.fence.operation_id)
+    for proof in _read_proofs(authority, reader):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.LEASE_EXPIRED
+    # An expired admission cannot renew itself back to life: the row is unchanged.
+    assert _read_rows(engine, session_id=str(created.id))[reader.fence.operation_id][1] == _EXPIRED_EXPIRES_AT
+
+
+def test_sqlite_read_expiry_is_measured_against_the_database_clock(engine) -> None:
+    """A row live by the real clock is expired one hour ahead of it — and only there."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    skewed = _SkewedClockAuthority(engine)
+    for proof in _read_proofs(skewed, reader):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.LEASE_EXPIRED
+    # The same row, the real clock: still live.
+    authority.compare_and_swap(reader)
+    authority.release(reader)
+
+
+def test_sqlite_forged_read_token_is_a_token_mismatch(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    forged = SessionOperationContext(
+        fence=replace(reader.fence, lease_token=f"forged-{uuid4()}"),
+        operation_kind=SessionOperationKind.BLOB_READ,
+    )
+    for proof in _read_proofs(authority, forged):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.TOKEN_MISMATCH
+    # The genuine holder is untouched by the forgery attempts.
+    authority.compare_and_swap(reader)
+    authority.release(reader)
+
+
+def test_sqlite_two_live_read_admissions_are_independent(engine) -> None:
+    """Reads stay shareable: many rows per session; releasing one leaves the other live."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    first = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-1", lease_seconds=30
+    )
+    second = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-2", lease_seconds=30
+    )
+    assert set(_read_rows(engine, session_id=str(created.id))) == {first.fence.operation_id, second.fence.operation_id}
+    authority.compare_and_swap(first)
+    authority.compare_and_swap(second)
+    authority.release(first)
+    assert set(_read_rows(engine, session_id=str(created.id))) == {second.fence.operation_id}
+    authority.compare_and_swap(second)
+    authority.mutate(second, lambda _transaction: None)
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        authority.compare_and_swap(first)
+    assert lost.value.reason is FenceLossReason.RELEASED
+    authority.release(second)
+    assert _read_rows(engine, session_id=str(created.id)) == {}
+
+
+def test_sqlite_read_renew_is_the_only_per_proof_write(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    admitted = _read_rows(engine, session_id=str(created.id))
+    authority.compare_and_swap(reader)
+    authority.mutate(reader, lambda _transaction: None)
+    assert _read_rows(engine, session_id=str(created.id)) == admitted
+    assert authority.renew(reader, lease_seconds=3600) == reader
+    renewed = _read_rows(engine, session_id=str(created.id))
+    assert set(renewed) == set(admitted)
+    assert renewed[reader.fence.operation_id][0] == admitted[reader.fence.operation_id][0]
+    assert renewed[reader.fence.operation_id][1] - admitted[reader.fence.operation_id][1] > timedelta(minutes=55)
+    authority.release(reader)
+
+
+def test_sqlite_read_admission_sweeps_the_sessions_expired_rows(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    other = _created(authority)
+    expired = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-1", lease_seconds=30
+    )
+    live = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-2", lease_seconds=30
+    )
+    foreign = authority.acquire(
+        session_id=other.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-3", lease_seconds=30
+    )
+    _expire_read_admission(engine, session_id=str(created.id), operation_id=expired.fence.operation_id)
+    _expire_read_admission(engine, session_id=str(other.id), operation_id=foreign.fence.operation_id)
+    # A proof does not sweep (reads are not writers) ...
+    authority.compare_and_swap(live)
+    assert set(_read_rows(engine, session_id=str(created.id))) == {expired.fence.operation_id, live.fence.operation_id}
+    # ... the next admission on THIS session does, and only this session's rows.
+    newest = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader-4", lease_seconds=30
+    )
+    assert set(_read_rows(engine, session_id=str(created.id))) == {live.fence.operation_id, newest.fence.operation_id}
+    assert set(_read_rows(engine, session_id=str(other.id))) == {foreign.fence.operation_id}
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        authority.compare_and_swap(expired)
+    assert lost.value.reason is FenceLossReason.RELEASED
+
+
+def test_sqlite_archive_delete_cascades_the_read_admissions(engine) -> None:
+    """The session's ON DELETE CASCADE removes its read rows; the reader then reads MISSING (custody first)."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    reader = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.BLOB_READ, owner_instance_id="reader", lease_seconds=30
+    )
+    archive = authority.acquire(
+        session_id=created.id, operation_kind=SessionOperationKind.ARCHIVE, owner_instance_id="archiver", lease_seconds=30
+    )
+    authority.archive_delete(archive)
+    assert _read_rows(engine, session_id=str(created.id)) == {}
+    for proof in _read_proofs(authority, reader):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.MISSING

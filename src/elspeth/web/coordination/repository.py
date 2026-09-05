@@ -88,6 +88,7 @@ from elspeth.web.sessions.models import (
     run_events_table,
     runs_table,
     session_operation_fences_table,
+    session_read_admissions_table,
     sessions_table,
     web_instances_table,
 )
@@ -4124,7 +4125,11 @@ class _SessionOperationAuthorityRepository:
         session_id_text = str(session_id)
 
         if operation_kind is SessionOperationKind.BLOB_READ:
-            return self._admit_blob_read(session_id=session_id_text, owner_instance_id=owner_instance_id)
+            return self._admit_blob_read(
+                session_id=session_id_text,
+                owner_instance_id=owner_instance_id,
+                lease_seconds=lease_seconds,
+            )
 
         with self._locked_transaction(session_id_text) as conn:
             session_row = conn.execute(
@@ -4186,8 +4191,14 @@ class _SessionOperationAuthorityRepository:
             operation_kind=operation_kind,
         )
 
-    def _admit_blob_read(self, *, session_id: str, owner_instance_id: str) -> SessionOperationContext:
-        """Admit one shareable read against session custody; the fence row is untouched.
+    def _admit_blob_read(
+        self,
+        *,
+        session_id: str,
+        owner_instance_id: str,
+        lease_seconds: int,
+    ) -> SessionOperationContext:
+        """Admit one shareable read against session custody and record it.
 
         A read admission holds no fence row, so nothing it does can conflict
         with another reader or with the one live writer, and an exclusive
@@ -4200,6 +4211,19 @@ class _SessionOperationAuthorityRepository:
         custody generation it was admitted under; it never matches the row's
         exact-active predicates, so no row-bound arm can mistake it for a
         writer.
+
+        The admission is RECORDED as one ``session_read_admissions`` row
+        (epoch 53, elspeth-f98e0ae8b2) keyed by the minted operation id, with
+        a database-time expiry ``lease_seconds`` ahead. That row is what every
+        later proof compares the context against (:meth:`_prove_read_admission`):
+        without it a released or expired read context was indistinguishable
+        from a live one. Many rows per session coexist — reads stay shareable.
+
+        Admission also sweeps this session's expired read rows under the
+        session lock it already holds. Two admissions sweeping the same rows
+        is harmless: each deletes only rows whose expiry has passed at the
+        database clock it read, and a row deleted by one sweep is simply
+        absent for the other, so no live admission can be lost to the race.
         """
         with self._locked_transaction(session_id) as conn:
             session_row = conn.execute(
@@ -4213,15 +4237,68 @@ class _SessionOperationAuthorityRepository:
             if row is None:
                 raise SessionOperationFenceLost(FenceLossReason.MISSING)
             custody_epoch = row.operation_epoch
+            database_now = self._database_now(conn)
+            conn.execute(
+                delete(session_read_admissions_table).where(
+                    session_read_admissions_table.c.session_id == session_id,
+                    session_read_admissions_table.c.expires_at <= database_now,
+                )
+            )
+            operation_id = _new_operation_id()
+            lease_token = _new_lease_token(owner_instance_id=owner_instance_id)
+            conn.execute(
+                insert(session_read_admissions_table).values(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    lease_token=lease_token,
+                    owner_instance_id=owner_instance_id,
+                    operation_epoch=custody_epoch,
+                    admitted_at=database_now,
+                    expires_at=database_now + timedelta(seconds=lease_seconds),
+                )
+            )
         return SessionOperationContext(
             fence=SessionOperationFence(
                 session_id=session_id,
-                operation_id=_new_operation_id(),
-                lease_token=_new_lease_token(owner_instance_id=owner_instance_id),
+                operation_id=operation_id,
+                lease_token=lease_token,
                 operation_epoch=custody_epoch,
             ),
             operation_kind=SessionOperationKind.BLOB_READ,
         )
+
+    @staticmethod
+    def _prove_read_admission(
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        database_now: datetime,
+    ) -> None:
+        """Refuse a read context whose admission row is gone, foreign, or expired.
+
+        Runs AFTER the custody proof (session present, not archived, fence
+        row present), so a deleted session still reads MISSING. The row is
+        selected by ``(session_id, operation_id)``: absent means the admission
+        was RELEASED (release deletes its row); a lease token that does not
+        match is TOKEN_MISMATCH; an expiry at or before the database clock is
+        LEASE_EXPIRED. The recorded ``operation_epoch`` is informational and
+        deliberately NOT compared: a writer's epoch advance must not
+        invalidate a shareable read (the validate route holds a read while
+        its repair pass takes its own COMPOSE inside it).
+        """
+        fence = context.fence
+        row = conn.execute(
+            select(session_read_admissions_table.c.lease_token, session_read_admissions_table.c.expires_at).where(
+                session_read_admissions_table.c.session_id == fence.session_id,
+                session_read_admissions_table.c.operation_id == fence.operation_id,
+            )
+        ).one_or_none()
+        if row is None:
+            raise SessionOperationFenceLost(FenceLossReason.RELEASED)
+        if row.lease_token != fence.lease_token:
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        if _ensure_utc(row.expires_at) <= database_now:
+            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
 
     @staticmethod
     def _exact_active_predicates(
@@ -4279,7 +4356,10 @@ class _SessionOperationAuthorityRepository:
             # A read admission holds no fence row: its authority is the session
             # custody that _lock_fence_and_read_database_time has just proven
             # under this connection (session present, not archived, fence row
-            # present). There is nothing to swap; a lost custody already raised.
+            # present) PLUS its own admission row, which must still be live.
+            # Nothing is swapped and nothing is written: an ordinary read
+            # proof leaves the row untouched.
+            self._prove_read_admission(conn, context, database_now=database_now)
             return
         result = conn.execute(
             update(session_operation_fences_table)
@@ -4342,8 +4422,23 @@ class _SessionOperationAuthorityRepository:
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_and_read_database_time(conn, context)
             if context.operation_kind is SessionOperationKind.BLOB_READ:
-                # Renewal of a read admission is its custody proof (just made
-                # above); no row carries its expiry.
+                # Renewal of a read admission: custody proof (just made above),
+                # then its own row must be live, then the expiry is extended
+                # from the database clock. This is the ONLY per-proof write a
+                # read admission ever makes.
+                self._prove_read_admission(conn, context, database_now=database_now)
+                renewed = conn.execute(
+                    update(session_read_admissions_table)
+                    .where(
+                        session_read_admissions_table.c.session_id == fence.session_id,
+                        session_read_admissions_table.c.operation_id == fence.operation_id,
+                        session_read_admissions_table.c.lease_token == fence.lease_token,
+                        session_read_admissions_table.c.expires_at > database_now,
+                    )
+                    .values(expires_at=database_now + timedelta(seconds=lease_seconds))
+                )
+                if renewed.rowcount != 1:
+                    raise SessionOperationFenceLost(FenceLossReason.RELEASED)
                 return context
             result = conn.execute(
                 update(session_operation_fences_table)
@@ -4875,9 +4970,21 @@ class _SessionOperationAuthorityRepository:
         with self._locked_transaction(fence.session_id) as conn:
             database_now = self._lock_fence_for_release_and_read_database_time(conn, context)
             if context.operation_kind is SessionOperationKind.BLOB_READ:
-                # A read admission owns no row to release; the terminal
-                # tolerance above (archived session still releasable, missing
-                # session still refused) is exactly the writers' contract.
+                # A read admission releases by DELETING its own row after the
+                # terminal-tolerant custody proof above (archived session still
+                # releasable, missing session still refused — the writers'
+                # contract) and its own liveness proof: a released, foreign or
+                # expired read context cannot release twice.
+                self._prove_read_admission(conn, context, database_now=database_now)
+                released = conn.execute(
+                    delete(session_read_admissions_table).where(
+                        session_read_admissions_table.c.session_id == fence.session_id,
+                        session_read_admissions_table.c.operation_id == fence.operation_id,
+                        session_read_admissions_table.c.lease_token == fence.lease_token,
+                    )
+                )
+                if released.rowcount != 1:
+                    raise SessionOperationFenceLost(FenceLossReason.RELEASED)
                 return
             result = conn.execute(
                 update(session_operation_fences_table)
