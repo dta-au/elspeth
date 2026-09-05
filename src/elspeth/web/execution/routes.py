@@ -932,8 +932,19 @@ def create_execution_router() -> APIRouter:
                 raise HTTPException(status_code=404, detail="State not found") from exc
             if state_record.session_id != session_id:
                 raise HTTPException(status_code=404, detail="State not found")
+            # The web UI always validates by explicit state_id (executionStore
+            # passes the loaded head), so the requested snapshot gets the same
+            # repair pass as the None arm above, under the same BLOB_READ lease.
+            composition_state = state_from_record(state_record)
+            await composer.surface_pending_interpretation_reviews(
+                composition_state,
+                session_id=str(session_id),
+                current_state_id=str(state_record.id),
+                only_missing_evidence=True,
+                session_operation_context=lease.context,
+            )
             return await service.validate_state(
-                state_from_record(state_record),
+                composition_state,
                 session_operation_context=lease.context,
                 user_id=user.user_id,
                 session_id=session_id,
