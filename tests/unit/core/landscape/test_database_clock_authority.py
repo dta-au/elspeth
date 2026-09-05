@@ -38,7 +38,7 @@ _ROOT = Path(__file__).resolve().parents[4]
 _CLOCK_AUTHORITY_VERBS = frozenset(
     {
         "_acquire_run_leadership_on",
-        "_recover_expired_leases",
+        "_rotate_expired_leases",
         "acquire_lease",
         "acquire_run_leadership",
         "admit_follower",
@@ -122,7 +122,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/engine/orchestrator/",
 )
-_CLOCK_BOUNDARY_DIGEST = "6e256864b43ab502abee6032acd80b880f1acfff40af3ff98db89eca96000497"
+_CLOCK_BOUNDARY_DIGEST = "8ee57c08a577512c4a821bafff79dc6509ebb3cc026e70620fc813ba12076b00"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -246,7 +246,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.adopt_group_losses"),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.stage_escalation_loss"),
-        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._recover_expired_leases"),
+        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._rotate_expired_leases"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_ready"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_ready_row"),

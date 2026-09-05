@@ -42,7 +42,6 @@ class _StrictFencedWrite(Protocol):
         engine: Tier1Engine,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         verb: str,
     ) -> AbstractContextManager[Connection]: ...
 
@@ -234,7 +233,6 @@ def test_strict_helper_rejects_runtime_none_before_transaction() -> None:
             helper(
                 db.engine,
                 coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
-                now=NOW,
                 verb="strict_probe",
             )
     finally:
@@ -340,7 +338,6 @@ def test_strict_helper_accepts_current_token_and_commits() -> None:
     with helper(
         db.engine,
         coordination_token=token,
-        now=NOW,
         verb="strict_probe",
     ) as conn:
         conn.execute(
@@ -375,7 +372,6 @@ def test_strict_helper_refuses_stale_token_without_payload_mutation() -> None:
         helper(
             db.engine,
             coordination_token=token,
-            now=NOW,
             verb="strict_probe",
         ) as conn,
     ):
