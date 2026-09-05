@@ -339,12 +339,38 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
     )
 
 
+def _names_blob(value: Any, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance: the contract's
+    ``is_widened_blob_ref`` matches a marker against the hyphenated UUID form
+    with ``[0-9a-fA-F]`` digits and the runtime binds it through ``UUID(...)``,
+    so an upper-case marker the LLM authored is the SAME bound blob as the
+    lower-case id the store records. Comparing spellings read such a bound
+    blob as unbound on this delete path (elspeth-f123a7b3d2, the twin of the
+    composer-side finding on elspeth-4f3cd4155b). Two hyphenated UUID texts
+    denote one UUID iff they are equal ignoring case; a braced or unhyphenated
+    spelling is rejected by the contract, never bound, and therefore a
+    non-match here, as is any non-string.
+    """
+    return type(value) is str and value.lower() == blob_id.lower()
+
+
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
-    """Recursively inspect one plugin option value for exact blob markers."""
+    """Recursively inspect one plugin option value for blob identity markers.
+
+    The vocabulary is the union the blob store's own walker recognises: an
+    inline ``blob_ref`` marker, the ``blob_id`` custody key ``blob_rows``
+    persists (elspeth-0c6a343921), and the legacy ``path``/``file`` storage
+    path. This is the PostgreSQL multi-replica delete path's copy of that
+    walker; it must never recognise less than its twin.
+    """
     if type(value) is dict:
-        if value.get("blob_ref") == blob_id:
+        if "blob_ref" in value and _names_blob(value["blob_ref"], blob_id):
             return True
-        if any(value.get(key) == storage_path for key in ("path", "file")):
+        if "blob_id" in value and _names_blob(value["blob_id"], blob_id):
+            return True
+        if any(key in value and value[key] == storage_path for key in ("path", "file")):
             return True
         return any(_option_value_references_blob(child, blob_id, storage_path) for child in value.values())
     if type(value) is list:
