@@ -1584,17 +1584,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
-        "begin_write",
-        "<sessions-write-connection>",
-        "write_connection",
-        "2006ebd10a466428",
-        1,
-        None,
-        line=269,
-        connection_escape=True,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/landscape/database.py",
         "_sqlite_epoch_is_incompatible",
         "<sessions-write-connection>",
         "write_connection",
@@ -1648,7 +1637,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._sync_schema_identity",
-        "<sessions-write-connection>",
+        "<non-session-write-connection>",
         "write_connection",
         "b92e2e573b8362dd",
         1,
@@ -1656,10 +1645,24 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=1300,
         connection_escape=True,
     ),
+    # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
+    # in-file wrapper hop is transparent and ``self`` carries the declared
+    # engine type, so the caller is the proven acquisition.
+    WriterIdentity(
+        "src/elspeth/core/landscape/database.py",
+        "LandscapeDB._sync_schema_identity",
+        "<non-session-write-connection>",
+        "write_connection",
+        "91a7ddcfb7d2279c",
+        1,
+        None,
+        line=1313,
+        connection_escape=True,
+    ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._get_sqlite_schema_epoch",
-        "<sessions-write-connection>",
+        "<non-session-write-connection>",
         "write_connection",
         "4644a6cc893b4d09",
         1,
@@ -1669,7 +1672,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB._validate_schema",
-        "<sessions-write-connection>",
+        "<non-session-write-connection>",
         "write_connection",
         "026fc33c365235c4",
         1,
@@ -1679,12 +1682,23 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
         "LandscapeDB.read_only_connection",
-        "<sessions-write-connection>",
+        "<non-session-write-connection>",
         "write_connection",
         "44c4543542ceeb85",
         1,
         None,
         line=2059,
+        connection_escape=True,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/database.py",
+        "LandscapeDB.write_connection",
+        "<non-session-write-connection>",
+        "write_connection",
+        "222b5f4b0d258dbe",
+        1,
+        None,
+        line=2041,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1956,14 +1970,326 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         self.write_connection_calls: dict[int, tuple[ast.Call, bool]] = {}
         self.classified_execution_calls: set[int] = set()
         self._dependent_write_context_cache: dict[int, tuple[list[ast.stmt], list[ast.Call]]] = {}
+        # ``with wrapper(...) as conn`` where ``wrapper`` is a same-scope
+        # ``@contextmanager`` whose yield resolves to an acquisition: the
+        # caller's call is the acquisition site, keyed here to the wrapper
+        # definition and its resolved yields (an unresolved yield is kept as
+        # an empty list so the merged domain stays unknown).
+        self.wrapper_calls: dict[
+            int,
+            tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[tuple[ast.Yield | ast.YieldFrom, list[ast.Call]]]],
+        ] = {}
+        # ``conn = opener()`` where ``opener`` is a same-scope non-generator
+        # whose EVERY return is a qualified-factory acquisition
+        # (``_NON_SESSION_ENGINE_FACTORIES``): the call carries the factory's
+        # domain for one hop. A return that is not such an acquisition, or a
+        # generator callee, is never followed.
+        self.factory_return_calls: dict[int, tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.Call]]] = {}
+        self.wrapper_call_nodes: dict[int, ast.Call] = {}
+        self.method_owners: dict[int, ast.ClassDef] = {}
+        self.class_methods: dict[tuple[int, str], ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
         self._collect_aliases()
+        self._collect_class_methods()
 
     def _record_connection(self, acquisition: ast.Call, *, escapes: bool) -> None:
+        # A transparent hop (a factory-return call, or a wrapper that acquires
+        # from its own state) carries domain only; the engine or factory it
+        # reaches is the reported acquisition. A parameter-fed wrapper call is
+        # the caller's own acquisition and is recorded here.
+        if id(acquisition) in self.factory_return_calls:
+            return
+        if id(acquisition) in self.wrapper_calls and not self._wrapper_call_is_parameter_fed(acquisition):
+            return
         existing = self.write_connection_calls.get(id(acquisition))
         self.write_connection_calls[id(acquisition)] = (
             acquisition,
             escapes or (existing[1] if existing is not None else False),
         )
+
+    def _collect_class_methods(self) -> None:
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for child in node.body:
+                if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                self.method_owners[id(child)] = node
+                key = (id(node), child.name)
+                self.class_methods[key] = None if key in self.class_methods else child
+
+    def _local_callable_definition(self, call: ast.Call) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """Resolve ``name(...)`` or ``self.name(...)`` to exactly one same-file definition, else ``None``."""
+
+        func = call.func
+        if isinstance(func, ast.Name):
+            reaching, complete, _ = self._visible_reaching_bindings(call, func.id)
+            if not complete or not reaching or any(binding.value is not None for binding in reaching):
+                return None
+            definitions = {id(binding.node): binding.node for binding in reaching}
+            if len(definitions) != 1:
+                return None
+            definition = next(iter(definitions.values()))
+            if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return None
+            return definition
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            owner = self._enclosing_function(call)
+            if owner is None:
+                return None
+            owner_class = self.method_owners.get(id(owner))
+            positional = (*owner.args.posonlyargs, *owner.args.args)
+            if owner_class is None or not positional or positional[0].arg != func.value.id:
+                return None
+            if self._name_reassigned_in(owner, func.value.id) or not self._is_instance_method(owner):
+                return None
+            return self.class_methods.get((id(owner_class), func.attr))
+        return None
+
+    def _name_reassigned_in(self, scope: ast.AST, name: str) -> bool:
+        """True when ``name`` is bound to a value inside ``scope`` (a bare parameter binding has no value)."""
+
+        return any(binding.value is not None for binding in self.assignment_bindings.get((id(scope), name), ()))
+
+    def _is_instance_method(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        if id(definition) not in self.method_owners:
+            return False
+        return not any(
+            (isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"})
+            or self._imported_qualified_name(decorator) in {"builtins.staticmethod", "builtins.classmethod"}
+            for decorator in definition.decorator_list
+        )
+
+    def _module_qualified_name(self) -> str:
+        parts = list(Path(self.path).with_suffix("").parts)
+        if parts and parts[0] == "src":
+            parts = parts[1:]
+        return ".".join(parts)
+
+    def _declared_engine_type_self_domain(self, definition: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> DatabaseDomain | None:
+        """``self`` inside a method of a declared non-Sessions engine type carries that type's domain."""
+
+        if not self._is_instance_method(definition):
+            return None
+        positional = (*definition.args.posonlyargs, *definition.args.args)
+        if not positional or positional[0].arg != name or self._name_reassigned_in(definition, name):
+            return None
+        owner_class = self.method_owners[id(definition)]
+        if f"{self._module_qualified_name()}.{owner_class.name}" in _NON_SESSION_ENGINE_TYPES:
+            return "non_sessions"
+        return None
+
+    def _is_contextmanager_definition(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return any(
+            self._imported_qualified_name(decorator) in {"contextlib.contextmanager", "contextlib.asynccontextmanager"}
+            for decorator in definition.decorator_list
+        )
+
+    @classmethod
+    def _direct_yields(cls, node: ast.AST) -> list[ast.Yield | ast.YieldFrom]:
+        found: list[ast.Yield | ast.YieldFrom] = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                found.append(child)
+            found.extend(cls._direct_yields(child))
+        return found
+
+    @classmethod
+    def _direct_returns(cls, node: ast.AST) -> list[ast.Return]:
+        found: list[ast.Return] = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Return):
+                found.append(child)
+            found.extend(cls._direct_returns(child))
+        return found
+
+    def _wrapper_yield_acquisitions(
+        self,
+        wrapper: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        visited: frozenset[str],
+    ) -> list[tuple[ast.Yield | ast.YieldFrom, list[ast.Call]]] | None:
+        marker = f"<wrapper:{id(wrapper)}>"
+        if marker in visited:
+            return None
+        # Plain names in ``visited`` belong to the caller's scope; only the
+        # definition markers guard recursion across the hop.
+        next_visited = self._scope_markers(visited) | {marker}
+        yields = self._direct_yields(wrapper)
+        if not yields:
+            return None
+        resolved: list[tuple[ast.Yield | ast.YieldFrom, list[ast.Call]]] = []
+        for yielded in yields:
+            if isinstance(yielded, ast.YieldFrom) or yielded.value is None:
+                resolved.append((yielded, []))
+                continue
+            resolved.append((yielded, self._connection_acquisitions_for_expression(yielded, yielded.value, visited=next_visited)))
+        if not any(acquisitions for _, acquisitions in resolved):
+            return None
+        return resolved
+
+    def _factory_returned_acquisitions(
+        self,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        visited: frozenset[str],
+    ) -> list[ast.Call] | None:
+        marker = f"<factory:{id(callee)}>"
+        if marker in visited:
+            return None
+        next_visited = self._scope_markers(visited) | {marker}
+        returns = self._direct_returns(callee)
+        if not returns:
+            return None
+        acquisitions: list[ast.Call] = []
+        for returned in returns:
+            if returned.value is None:
+                return None
+            resolved = self._connection_acquisitions_for_expression(returned, returned.value, visited=next_visited)
+            if not resolved:
+                return None
+            for acquisition in resolved:
+                if self._qualified_database_domain(self._imported_qualified_name(acquisition.func)) is None:
+                    return None
+            acquisitions.extend(resolved)
+        return acquisitions
+
+    def _wrapper_argument_for(
+        self,
+        call: ast.Call,
+        wrapper: ast.FunctionDef | ast.AsyncFunctionDef,
+        name: str,
+    ) -> ast.expr | None:
+        """The caller's expression bound to wrapper parameter ``name``, or ``None`` when it cannot be known exactly."""
+
+        if self._name_reassigned_in(wrapper, name):
+            return None
+        positional = [*wrapper.args.posonlyargs, *wrapper.args.args]
+        if id(wrapper) in self.method_owners and isinstance(call.func, ast.Attribute) and positional:
+            positional = positional[1:]
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                return None
+            if keyword.arg == name:
+                return keyword.value
+        names = [parameter.arg for parameter in positional]
+        if name not in names:
+            return None
+        index = names.index(name)
+        if index >= len(call.args) or any(isinstance(argument, ast.Starred) for argument in call.args[: index + 1]):
+            return None
+        return call.args[index]
+
+    def _inner_is_parameter_fed(self, wrapper: ast.FunctionDef | ast.AsyncFunctionDef, inner: ast.Call) -> bool:
+        """True when the wrapper's yielded acquisition is built on one of the wrapper's own parameters."""
+
+        if id(inner) in self.wrapper_calls or id(inner) in self.factory_return_calls:
+            return False
+        if self._qualified_database_domain(self._imported_qualified_name(inner.func)) is not None:
+            return False
+        receiver = inner.func.value if isinstance(inner.func, ast.Attribute) else inner
+        while isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Attribute):
+            receiver = receiver.func.value
+        if not isinstance(receiver, ast.Name):
+            return False
+        parameters = {parameter.arg for parameter in (*wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs)}
+        if id(wrapper) in self.method_owners:
+            positional = (*wrapper.args.posonlyargs, *wrapper.args.args)
+            if positional and positional[0].arg == receiver.id:
+                return False
+        return receiver.id in parameters and not self._name_reassigned_in(wrapper, receiver.id)
+
+    def _wrapper_call_is_parameter_fed(self, call: ast.Call) -> bool:
+        wrapper, yields = self.wrapper_calls[id(call)]
+        return any(self._inner_is_parameter_fed(wrapper, inner) for _, inner_acquisitions in yields for inner in inner_acquisitions)
+
+    def _wrapper_arms_disagree(self, call: ast.Call) -> bool:
+        """True unless EVERY yield arm resolves and every arm proves the same domain (Q7 ruling, per yield)."""
+
+        wrapper, yields = self.wrapper_calls[id(call)]
+        arm_domains: set[DatabaseDomain] = set()
+        for _, inner_acquisitions in yields:
+            if not inner_acquisitions:
+                return True
+            arm_domains.add(
+                self._merge_database_domains(self._wrapper_inner_origin_domain(call, wrapper, inner) for inner in inner_acquisitions)
+            )
+        return len(arm_domains) > 1
+
+    @staticmethod
+    def _scope_markers(visited: frozenset[str]) -> frozenset[str]:
+        return frozenset(marker for marker in visited if marker.startswith("<"))
+
+    def _absorbed_wrapper_acquisitions(self) -> set[int]:
+        """Parameter-fed acquisitions inside wrappers that at least one caller now carries."""
+
+        fed_wrappers: dict[int, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        for call_id, (wrapper, _) in self.wrapper_calls.items():
+            if self._wrapper_call_is_parameter_fed(self.wrapper_call_nodes[call_id]):
+                fed_wrappers[id(wrapper)] = wrapper
+        absorbed: set[int] = set()
+        for call_id, (acquisition, _) in self.write_connection_calls.items():
+            owner = self._enclosing_function(acquisition)
+            if owner is None or id(owner) not in fed_wrappers:
+                continue
+            if self._inner_is_parameter_fed(owner, acquisition):
+                absorbed.add(call_id)
+        return absorbed
+
+    def _wrapper_inner_origin_domain(
+        self,
+        call: ast.Call,
+        wrapper: ast.FunctionDef | ast.AsyncFunctionDef,
+        inner: ast.Call,
+    ) -> DatabaseDomain:
+        if id(inner) in self.wrapper_calls or id(inner) in self.factory_return_calls:
+            return self._connection_origin_database_domain(inner)
+        qualified_domain = self._qualified_database_domain(self._imported_qualified_name(inner.func))
+        if qualified_domain is not None:
+            return qualified_domain
+        receiver = inner.func.value if isinstance(inner.func, ast.Attribute) else inner
+        if isinstance(receiver, ast.Name):
+            argument = self._wrapper_argument_for(call, wrapper, receiver.id)
+            if argument is not None:
+                return self._expression_database_domain(argument, use=call)
+        return self._connection_origin_database_domain(inner)
+
+    def _wrapper_call_origin_domain(
+        self,
+        call: ast.Call,
+        wrapper: ast.FunctionDef | ast.AsyncFunctionDef,
+        yields: list[tuple[ast.Yield | ast.YieldFrom, list[ast.Call]]],
+    ) -> DatabaseDomain:
+        domains: list[DatabaseDomain | None] = []
+        for _, inner_acquisitions in yields:
+            if not inner_acquisitions:
+                domains.append("unknown")
+                continue
+            domains.extend(self._wrapper_inner_origin_domain(call, wrapper, inner) for inner in inner_acquisitions)
+        return self._merge_database_domains(domains)
+
+    def _raw_sql_names_no_sessions_table(self, expression: ast.expr | None, *, use: ast.AST) -> bool:
+        """True only for raw SQL text whose every identifier is provably outside the Sessions schema."""
+
+        if isinstance(expression, ast.Name):
+            reaching, complete, _ = self._potentially_reaching_bindings(use, expression.id)
+            if not complete or not reaching:
+                return False
+            return all(
+                binding.value is not None and self._raw_sql_names_no_sessions_table(binding.value, use=binding.node) for binding in reaching
+            )
+        if isinstance(expression, ast.Call):
+            qualified = self._imported_qualified_name(expression.func)
+            if qualified and qualified.startswith("sqlalchemy.") and qualified.endswith(".text") and len(expression.args) == 1:
+                return self._raw_sql_names_no_sessions_table(expression.args[0], use=use)
+            return False
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            identifiers = {token.strip('"`[]').lower() for token in re.findall(_SQL_IDENTIFIER, expression.value)}
+            return not (identifiers & _TABLE_NAMES)
+        return False
 
     @classmethod
     def _assignment_target_values(
@@ -2532,6 +2858,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 if argument is not None:
                     if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         return None
+                    self_domain = self._declared_engine_type_self_domain(scope, name)
+                    if self_domain is not None:
+                        return self_domain
                     parent = getattr(scope, "_inventory_parent", None)
                     if parent is None:
                         return None
@@ -3140,6 +3469,22 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 expression.func.value,
                 visited=visited,
             )
+        callee = self._local_callable_definition(expression)
+        if callee is not None:
+            if self._is_contextmanager_definition(callee):
+                yields = self._wrapper_yield_acquisitions(callee, visited=visited)
+                if yields is None:
+                    return []
+                self.wrapper_calls[id(expression)] = (callee, yields)
+                self.wrapper_call_nodes[id(expression)] = expression
+                return [expression]
+            if not self._direct_yields(callee):
+                returned = self._factory_returned_acquisitions(callee, visited=visited)
+                if returned is None:
+                    return []
+                self.factory_return_calls[id(expression)] = (callee, returned)
+                return [expression]
+            return []
         if isinstance(expression.func, ast.Name) and self._is_connection_callable_alias(
             expression,
             expression.func.id,
@@ -3557,6 +3902,12 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         return self._statement_database_evidence(expression)[0]
 
     def _connection_origin_database_domain(self, acquisition: ast.Call) -> DatabaseDomain:
+        wrapped = self.wrapper_calls.get(id(acquisition))
+        if wrapped is not None:
+            return self._wrapper_call_origin_domain(acquisition, *wrapped)
+        factory = self.factory_return_calls.get(id(acquisition))
+        if factory is not None:
+            return self._merge_database_domains(self._connection_origin_database_domain(inner) for inner in factory[1])
         # The generic SQLAlchemy factory inside the canonical Sessions engine
         # factory mints a Sessions engine.  Outside that exact lexical scope,
         # endpoint-agnostic factories remain unknown.
@@ -3600,6 +3951,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 statement = candidate.args[0] if candidate.args else None
                 statement_domain = self._statement_database_domain(statement)
                 if statement_domain == "unknown" and self._is_obviously_read_only_statement(statement, use=candidate):
+                    continue
+                # Raw SQL that names no Sessions table cannot contradict a
+                # proven non-Sessions origin; raw SQL naming one still does.
+                if (
+                    statement_domain == "unknown"
+                    and origin == "non_sessions"
+                    and self._raw_sql_names_no_sessions_table(statement, use=candidate)
+                ):
                     continue
                 statement_domains.append(statement_domain)
         statement_domain = self._merge_database_domains(statement_domains) if statement_domains else None
@@ -3664,7 +4023,8 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 stored_callable = isinstance(acquisition.func, (ast.Attribute, ast.Subscript)) and not (
                     isinstance(acquisition.func, ast.Attribute) and acquisition.func.attr in {"begin", "connect"}
                 )
-                self._record_connection(acquisition, escapes=stored_callable)
+                transparent = id(acquisition) in self.wrapper_calls or id(acquisition) in self.factory_return_calls
+                self._record_connection(acquisition, escapes=stored_callable and not transparent)
             if isinstance(func, ast.Attribute) and func.attr in {"execute", "executemany", "exec_driver_sql"}:
                 acquisitions = self._connection_acquisitions_for(call)
                 statement = call.args[0] if call.args else None
@@ -3687,8 +4047,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                     for acquisition in acquisitions:
                         self._record_connection(acquisition, escapes=False)
                     continue
+                # A wrapper whose yield arms do not all prove one domain gives
+                # its callers nothing to inherit: an unknown statement on it is
+                # unresolved, never silently classified (Q7 ruling, per yield).
+                mixed_wrapper = any(
+                    id(acquisition) in self.wrapper_calls and self._wrapper_arms_disagree(acquisition) for acquisition in acquisitions
+                )
                 if statement_domain == "unknown" and (
-                    force_unresolved or (not acquisitions and id(call) not in self.classified_execution_calls)
+                    force_unresolved or mixed_wrapper or (not acquisitions and id(call) not in self.classified_execution_calls)
                 ):
                     self._append_site(
                         call,
@@ -3758,7 +4124,10 @@ class _ProductionWriterCollector(ast.NodeVisitor):
     def collect(self) -> list[WriterIdentity]:
         self.visit(self.tree)
         self._collect_unresolved_connection_flows()
+        absorbed = self._absorbed_wrapper_acquisitions()
         for call, escapes in self.write_connection_calls.values():
+            if id(call) in absorbed:
+                continue
             table = "<sessions-write-connection>"
             if self._connection_database_domain(call) == "non_sessions":
                 table = "<non-session-write-connection>"
@@ -6219,6 +6588,313 @@ def test_production_scanner_flags_wrapper_escapes_and_keyword_forwarding(tmp_pat
     ]
 
 
+def test_parameter_fed_contextmanager_wrapper_acquisitions_are_attributed_to_callers(tmp_path: Path) -> None:
+    """A wrapper that acquires from its own parameter is transparent: the caller is the boundary.
+
+    The domain comes from the caller's argument, so one wrapper serves a
+    Landscape engine, a Sessions engine and an unknown engine differently, and
+    the wrapper itself no longer reports the acquisition it hands out.
+    """
+
+    source = tmp_path / "wrapper_callers.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from contextlib import contextmanager
+            from sqlalchemy import update
+            from elspeth.core.landscape.database import Tier1Engine
+            from elspeth.core.landscape.schema import runs_table
+            from elspeth.web.sessions.engine import create_session_engine
+
+            @contextmanager
+            def phase(engine):
+                with engine.begin() as conn:
+                    yield conn
+
+            def landscape_caller(engine: Tier1Engine):
+                with phase(engine) as conn:
+                    conn.execute(update(runs_table).values(status="failed"))
+
+            def sessions_caller(url, dynamic):
+                engine = create_session_engine(url)
+                with phase(engine) as conn:
+                    conn.execute(dynamic)
+
+            def unknown_caller(engine, dynamic):
+                with phase(engine) as conn:
+                    conn.execute(dynamic)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation, site.connection_escape) for site in sites) == Counter(
+        {
+            ("landscape_caller", "<non-session-write-connection>", "write_connection", False): 1,
+            ("sessions_caller", "<sessions-write-connection>", "write_connection", False): 1,
+            ("unknown_caller", "<sessions-write-connection>", "write_connection", False): 1,
+        }
+    )
+
+
+def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path: Path) -> None:
+    """A wrapper that acquires from its own state is the boundary; callers resolve through it, not around it."""
+
+    source = tmp_path / "self_fed_wrapper.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from contextlib import contextmanager
+
+            class Store:
+                def __init__(self, engine):
+                    self._engine = engine
+
+                @contextmanager
+                def _begin(self):
+                    with self._engine.begin() as conn:
+                        yield conn
+
+                def write(self, dynamic):
+                    with self._begin() as conn:
+                        conn.execute(dynamic)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert [(site.symbol, site.table, site.operation, site.connection_escape) for site in sites] == [
+        ("Store._begin", "<sessions-write-connection>", "write_connection", True),
+    ]
+
+
+def test_wrapper_with_disagreeing_yield_arms_stays_unresolved(tmp_path: Path) -> None:
+    """Q7 ruling, case 1: one arm yields the sqlite3 store, the other a Sessions engine connection.
+
+    The caller's raw auth-table write is UNRESOLVED, not non-session: a later
+    branch yielding a Sessions connection must never reclassify the store's
+    writes from a change nowhere near them.
+    """
+
+    source = tmp_path / "disagreeing_arms.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            import sqlite3
+            from contextlib import contextmanager
+            from elspeth.web.sessions.engine import create_session_engine
+
+            class Store:
+                def _get_conn(self):
+                    return sqlite3.connect(":memory:")
+
+                @contextmanager
+                def _connect(self, *, shared: bool):
+                    if not shared:
+                        yield self._get_conn()
+                        return
+                    engine = create_session_engine("sqlite://")
+                    with engine.begin() as conn:
+                        yield conn
+
+                def write(self):
+                    with self._connect(shared=False) as conn:
+                        conn.execute("INSERT INTO users (id) VALUES (1)")
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation, site.connection_escape) for site in sites) == Counter(
+        {
+            ("Store._get_conn", "<non-session-write-connection>", "write_connection", True): 1,
+            ("Store._connect", "<sessions-write-connection>", "write_connection", True): 1,
+            ("Store.write", "<unresolved-session-write>", "unknown_execute", False): 1,
+        }
+    )
+
+
+def test_wrapper_with_an_unprovable_second_arm_stays_unresolved(tmp_path: Path) -> None:
+    """Q7 ruling, case 2: a yield the scanner cannot resolve gives the caller nothing to inherit."""
+
+    source = tmp_path / "unresolved_wrapper_yield.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from contextlib import contextmanager
+            from elspeth.core.landscape.database import Tier1Engine
+
+            @contextmanager
+            def opaque(provider):
+                conn = provider.open()
+                yield conn
+
+            def opaque_caller(provider, dynamic):
+                with opaque(provider) as conn:
+                    conn.execute(dynamic)
+
+            @contextmanager
+            def mixed(engine, held):
+                if held is None:
+                    with engine.begin() as conn:
+                        yield conn
+                    return
+                with held.begin():
+                    yield held
+
+            def mixed_caller(engine: Tier1Engine, held, dynamic):
+                with mixed(engine, held) as conn:
+                    conn.execute(dynamic)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("opaque_caller", "<unresolved-session-write>", "unknown_execute"): 1,
+            # The proven arm is attributed to the caller (fail-closed as a
+            # Sessions acquisition); the unproven arm keeps the dynamic
+            # statement unresolved rather than classified.
+            ("mixed_caller", "<sessions-write-connection>", "write_connection"): 1,
+            ("mixed_caller", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
+def test_stored_wrapper_connection_is_still_an_escape(tmp_path: Path) -> None:
+    source = tmp_path / "stored_wrapper_connection.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from contextlib import contextmanager
+
+            @contextmanager
+            def phase(engine):
+                with engine.begin() as conn:
+                    yield conn
+
+            class Holder:
+                def stash(self, engine):
+                    with phase(engine) as conn:
+                        self._conn = conn
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert [(site.symbol, site.operation, site.connection_escape) for site in sites] == [
+        ("Holder.stash", "write_connection", True),
+    ]
+
+
+def test_non_generator_callee_is_never_followed_as_a_wrapper(tmp_path: Path) -> None:
+    source = tmp_path / "plain_callee.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def plain(engine):
+                return engine.begin()
+
+            def caller(engine, dynamic):
+                with plain(engine) as conn:
+                    conn.execute(dynamic)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation, site.connection_escape) for site in sites) == Counter(
+        {
+            ("plain", "<sessions-write-connection>", "write_connection", True): 1,
+            ("caller", "<unresolved-session-write>", "unknown_execute", False): 1,
+        }
+    )
+
+
+def test_qualified_factory_return_hop_carries_the_factory_domain_one_hop(tmp_path: Path) -> None:
+    """``conn = self._open()`` where every return of ``_open`` is ``sqlite3.connect`` is that factory's connection.
+
+    The factory's own return stays the reported acquisition; the hop only
+    carries domain, and raw SQL naming a Sessions table still poisons it.
+    """
+
+    source = tmp_path / "factory_return_hop.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            import sqlite3
+            from contextlib import contextmanager
+
+            class Store:
+                def _open(self):
+                    return sqlite3.connect(":memory:")
+
+                @contextmanager
+                def _connect(self):
+                    conn = self._open()
+                    try:
+                        yield conn
+                    finally:
+                        conn.close()
+
+                def write(self):
+                    with self._connect() as conn:
+                        conn.execute("INSERT INTO users (id) VALUES (1)")
+
+                def forbidden(self):
+                    with self._connect() as conn:
+                        conn.execute("UPDATE sessions SET status = 'x'")
+
+                def _wrapped(self):
+                    return self._open()
+
+                def two_hops(self):
+                    conn = self._wrapped()
+                    conn.execute("INSERT INTO users (id) VALUES (2)")
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation, site.connection_escape) for site in sites) == Counter(
+        {
+            ("Store._open", "<non-session-write-connection>", "write_connection", True): 1,
+            ("Store.forbidden", "sessions", "raw_update", False): 1,
+            ("Store.two_hops", "<unresolved-session-write>", "unknown_execute", False): 1,
+        }
+    )
+
+
+def test_self_inside_a_declared_engine_type_carries_its_domain(tmp_path: Path) -> None:
+    landscape = tmp_path / "src/elspeth/core/landscape/database.py"
+    landscape.parent.mkdir(parents=True)
+    body = textwrap.dedent(
+        """\
+        from sqlalchemy import update
+        from elspeth.core.landscape.schema import runs_table
+
+        class {name}:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def write(self):
+                with self._engine.begin() as conn:
+                    conn.execute(update(runs_table).values(status="failed"))
+
+            @staticmethod
+            def detached(self):
+                with self._engine.begin() as conn:
+                    conn.execute(update(runs_table).values(status="failed"))
+        """
+    )
+    landscape.write_text(body.format(name="LandscapeDB"))
+    other = tmp_path / "src/elspeth/other.py"
+    other.write_text(body.format(name="LandscapeDB"))
+    sites = scan_production_writers([landscape, other], anchor=tmp_path)
+    assert Counter((site.path, site.symbol, site.table) for site in sites if site.operation == "write_connection") == Counter(
+        {
+            ("src/elspeth/core/landscape/database.py", "LandscapeDB.write", "<non-session-write-connection>"): 1,
+            ("src/elspeth/core/landscape/database.py", "LandscapeDB.detached", "<sessions-write-connection>"): 1,
+            ("src/elspeth/other.py", "LandscapeDB.write", "<sessions-write-connection>"): 1,
+            ("src/elspeth/other.py", "LandscapeDB.detached", "<sessions-write-connection>"): 1,
+        }
+    )
+
+
 def test_production_scanner_flags_connection_flows_without_session_model_imports(tmp_path: Path) -> None:
     source = tmp_path / "model_free_connection_flows.py"
     source.write_text(
@@ -7493,9 +8169,23 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=466,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 20
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 21
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
+        # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
+        # so it poisons the otherwise-proven Landscape origin of this
+        # ``begin_write`` acquisition; it stays session-reachable until the
+        # Landscape package premise classifies the statement.
+        WriterIdentity(
+            "src/elspeth/core/landscape/database.py",
+            "LandscapeDB._set_sqlite_schema_epoch",
+            "<sessions-write-connection>",
+            "write_connection",
+            "145b5590f940eae3",
+            1,
+            None,
+            line=1352,
+        ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
             "_collect_sqlite_table_option_issues",
