@@ -18,14 +18,16 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
+from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 
@@ -228,3 +230,31 @@ class TestRacedDeletionReadSeam:
             await blob_service.read_blob_preview(record.id, limit_bytes=4, session_operation_context=compose_context)
         with pytest.raises(OSError, match="Permission denied"):
             await blob_service.read_blob_content_prefix_verified(record.id, prefix_bytes=4, session_operation_context=compose_context)
+
+
+class TestStorageMimeGuard:
+    """The fenced read's Tier-1 row guard admits the STORAGE union and refuses anything outside it.
+
+    Every fenced read goes through ``_RepositoryBlobMutations.read_blob`` →
+    ``_blob_record``; until e1d6d9ce4 that guard named the text/data set
+    only, so a stored binary document (elspeth-0c6a343921) could be created
+    but never read back through the fence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_binary_document_reads_back_through_the_fence(self, blob_service, session_id, compose_context) -> None:
+        pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
+        record = await blob_service.create_blob(session_id, "doc.pdf", pdf, "application/pdf", session_operation_context=compose_context)
+        assert record.mime_type == "application/pdf"
+        assert await blob_service.get_blob(record.id, session_operation_context=compose_context) == record
+        assert await blob_service.read_blob_content(record.id, session_operation_context=compose_context) == pdf
+
+    @pytest.mark.asyncio
+    async def test_row_outside_the_storage_union_is_refused_on_read(self, blob_service, db_engine, session_id, compose_context) -> None:
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        with db_engine.begin() as conn:
+            conn.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(mime_type="application/x-msdownload"))
+        with pytest.raises(AuditIntegrityError, match="not in the storage MIME set"):
+            await blob_service.get_blob(record.id, session_operation_context=compose_context)
+        with pytest.raises(AuditIntegrityError, match="not in the storage MIME set"):
+            await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
