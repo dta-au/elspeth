@@ -284,7 +284,6 @@ class GroupLossRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_group_losses",
         ) as conn:
@@ -323,7 +322,6 @@ class GroupLossRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="stage_escalation_loss",
         ) as conn:

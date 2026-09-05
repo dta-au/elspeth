@@ -28,12 +28,16 @@ suffix on the existing happy-path. Prose pattern matching here is
 content-grounding, not gate routing. The augmentation contract
 (``augmented.startswith(content)``) is preserved.
 
-Scope: v1 targets operator-trust-relevant scalar fields where
-misclaims are demo-blockers — source-level ``on_validation_failure``,
-``plugin``, ``on_success``; output-level ``on_write_failure``,
-``plugin``. Node-level fields (``policy``, ``merge``, ``condition``)
-are deferred because disambiguating "which node id?" from natural
-language has unacceptable false-positive cost without more structure.
+Scope: the enforced fields are exactly the keys of ``_FIELD_READERS`` —
+source-level ``on_validation_failure`` and output-level
+``on_write_failure``, the two closed-enum routing fields whose
+misclaims are demo-blockers. ``plugin`` and ``on_success`` are
+deliberately NOT extracted (see the field catalogue below for why), and
+node-level fields (``policy``, ``merge``, ``condition``) are deferred
+because disambiguating "which node id?" from natural language has
+unacceptable false-positive cost without more structure. A pattern
+whose (scope, field) has no reader is an import-time error, so this
+list cannot drift from what the verifier can actually check.
 
 Action-claim detection uses four conservative pattern categories,
 each with its own anchoring beyond a bare verb to bound the
@@ -63,6 +67,7 @@ the prose pattern that matched.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
@@ -468,34 +473,60 @@ def extract_action_claims(prose: str) -> tuple[ActionClaim, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _lookup_source_field_values(state: CompositionState, field_name: str) -> tuple[str, ...]:
-    """Read a scalar field off every source. Returns distinct values."""
-    values: list[str] = []
-    for source in state.sources.values():
-        if field_name == "on_validation_failure":
-            values.append(source.on_validation_failure)
-        elif field_name == "plugin":
-            values.append(source.plugin)
-        elif field_name == "on_success":
-            values.append(source.on_success)
-    return tuple(dict.fromkeys(values))
+@dataclass(frozen=True, slots=True)
+class _FieldReader:
+    """How the verifier reads one (scope, field) off persisted state.
 
-
-def _lookup_output_field_values(state: CompositionState, field_name: str) -> tuple[str, ...]:
-    """Read a scalar field off every output. Returns the set of distinct values.
-
-    A claim about an output-level field is satisfied if the claimed value
-    appears in *any* output's actual value (multi-output pipelines may have
-    different routing per sink). Returns the distinct actual values across
-    outputs for verifier inspection.
+    ``read`` returns the field's value from every in-scope component
+    (every source, or every output) in declaration order; the verifier
+    de-duplicates. ``subject`` and ``collective`` are the nouns the
+    violation explanation uses for that scope.
     """
-    values: list[str] = []
-    for output in state.outputs:
-        if field_name == "on_write_failure":
-            values.append(output.on_write_failure)
-        elif field_name == "plugin":
-            values.append(output.plugin)
-    return tuple(dict.fromkeys(values))
+
+    subject: str
+    collective: str
+    read: Callable[[CompositionState], tuple[str, ...]]
+
+
+# The verifier's authority for which claims it can ground. A pattern in
+# ``_FIELD_PATTERNS`` whose (scope, field) is absent here is refused at
+# import (below), and a claim whose (scope, field) is absent here fails
+# loudly at verify time — neither is silently skipped.
+_FIELD_READERS: Final[Mapping[tuple[str, str], _FieldReader]] = {
+    ("source", "on_validation_failure"): _FieldReader(
+        subject="a source's",
+        collective="configured sources",
+        read=lambda state: tuple(source.on_validation_failure for source in state.sources.values()),
+    ),
+    ("outputs", "on_write_failure"): _FieldReader(
+        subject="an output's",
+        collective="configured outputs",
+        read=lambda state: tuple(output.on_write_failure for output in state.outputs),
+    ),
+}
+
+
+def unreadable_pattern_fields(
+    patterns: tuple[tuple[str, str, re.Pattern[str], int], ...],
+    readers: Mapping[tuple[str, str], _FieldReader],
+) -> frozenset[tuple[str, str]]:
+    """Return every (scope, field) that ``patterns`` extract but ``readers`` cannot ground."""
+    return frozenset((scope, field_name) for field_name, scope, _pattern, _group in patterns) - frozenset(readers)
+
+
+_UNREADABLE: Final[frozenset[tuple[str, str]]] = unreadable_pattern_fields(_FIELD_PATTERNS, _FIELD_READERS)
+if _UNREADABLE:
+    raise RuntimeError(
+        f"state_claim_grounding extracts claims for {sorted(_UNREADABLE)} but registers no reader for them; "
+        "add a _FieldReader or drop the pattern"
+    )
+
+
+def _reader_for(claim: StateClaim) -> _FieldReader:
+    key = (claim.scope, claim.field_name)
+    if key not in _FIELD_READERS:
+        raise LookupError(f"no state reader registered for {claim.scope}.{claim.field_name}; the claim cannot be grounded")
+    return _FIELD_READERS[key]
 
 
 def verify_state_claims(
@@ -507,54 +538,38 @@ def verify_state_claims(
     A violation is emitted when the claimed value cannot be found in any
     in-scope state field. For source-scoped claims, the source's actual
     value must match. For output-scoped claims, the claimed value must
-    appear in at least one output's actual value.
+    appear in at least one output's actual value (multi-output pipelines
+    may have different routing per sink).
 
     When state has no source (source-scoped claim) or no outputs
     (output-scoped claim), no violation is emitted — the model is
     discussing a hypothetical configuration, not contradicting state.
     The empty-state finalize paths in ``service.py`` cover this case
-    via a different exit shape.
+    via a different exit shape. That is the ONLY silent path: a claim
+    for a (scope, field) with no registered reader raises.
     """
     violations: list[GroundingViolation] = []
     for claim in claims:
-        if claim.scope == "source":
-            actuals = _lookup_source_field_values(state, claim.field_name)
-            if not actuals:
-                continue
-            if not any(claim.claimed_value.lower() == actual.lower() for actual in actuals):
-                actual_repr = ", ".join(sorted(actuals)) if len(actuals) > 1 else actuals[0]
-                violations.append(
-                    GroundingViolation(
-                        kind="state_claim",
-                        field_name=claim.field_name,
-                        scope=claim.scope,
-                        claimed_value=claim.claimed_value,
-                        actual_value=actual_repr,
-                        explanation=(
-                            f"Prose claims a source's {claim.field_name} is "
-                            f"{claim.claimed_value!r}, but configured sources use {actual_repr!r}."
-                        ),
-                    )
-                )
-        elif claim.scope == "outputs":
-            actuals = _lookup_output_field_values(state, claim.field_name)
-            if not actuals:
-                continue
-            if not any(claim.claimed_value.lower() == a.lower() for a in actuals):
-                actual_repr = ", ".join(sorted(actuals)) if len(actuals) > 1 else actuals[0]
-                violations.append(
-                    GroundingViolation(
-                        kind="state_claim",
-                        field_name=claim.field_name,
-                        scope=claim.scope,
-                        claimed_value=claim.claimed_value,
-                        actual_value=actual_repr,
-                        explanation=(
-                            f"Prose claims an output's {claim.field_name} is "
-                            f"{claim.claimed_value!r}, but configured outputs use {actual_repr!r}."
-                        ),
-                    )
-                )
+        reader = _reader_for(claim)
+        actuals = tuple(dict.fromkeys(reader.read(state)))
+        if not actuals:
+            continue
+        if any(claim.claimed_value.lower() == actual.lower() for actual in actuals):
+            continue
+        actual_repr = ", ".join(sorted(actuals)) if len(actuals) > 1 else actuals[0]
+        violations.append(
+            GroundingViolation(
+                kind="state_claim",
+                field_name=claim.field_name,
+                scope=claim.scope,
+                claimed_value=claim.claimed_value,
+                actual_value=actual_repr,
+                explanation=(
+                    f"Prose claims {reader.subject} {claim.field_name} is "
+                    f"{claim.claimed_value!r}, but {reader.collective} use {actual_repr!r}."
+                ),
+            )
+        )
     return tuple(violations)
 
 

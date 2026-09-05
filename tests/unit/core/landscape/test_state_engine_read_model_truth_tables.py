@@ -21,6 +21,7 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -30,7 +31,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
 )
 from elspeth.web.execution.accounting import load_run_accounting_map_from_db
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node, within_one_database_second
 
 NOW = datetime(2026, 8, 11, 20, 0, 0, tzinfo=UTC)
 RUN_ID = "rm-truth-run"
@@ -112,6 +113,9 @@ def _seed_scheduler_image() -> tuple[Any, TokenSchedulerRepository, dict[str, st
     foreign_id = _enqueue(factory, OTHER_RUN_ID, "foreign-ready", 100)
 
     with db.engine.begin() as conn:
+        # Peers are LIVE members: worker liveness is judged against the
+        # Landscape database clock (ADR-047), so their deadline is minted from it.
+        live_until = read_landscape_transaction_time(conn) + timedelta(minutes=5)
         for owner in (PEER_A, PEER_B):
             conn.execute(
                 insert(run_workers_table).values(
@@ -120,7 +124,7 @@ def _seed_scheduler_image() -> tuple[Any, TokenSchedulerRepository, dict[str, st
                     role="follower",
                     status="active",
                     registered_at=NOW,
-                    heartbeat_expires_at=NOW + timedelta(minutes=5),
+                    heartbeat_expires_at=live_until,
                 )
             )
 
@@ -362,19 +366,27 @@ def test_rm07_occupied_leader_seat_truth_table() -> None:
     factory, _repository, _ids = _seed_scheduler_image()
     coordination = RunCoordinationRepository(factory._db.engine)
 
-    occupied = coordination.live_leader(run_id=RUN_ID, now=NOW)
+    occupied = coordination.live_leader(run_id=RUN_ID)
     assert occupied is not None
     assert occupied.leader_worker_id == LEADER
     assert occupied.leader_epoch == 1
     assert occupied.seat_live is True
 
-    equality = coordination.live_leader(
-        run_id=RUN_ID,
-        now=occupied.leader_heartbeat_expires_at,
-    )
-    assert equality is not None
-    assert equality.seat_live is True
-    assert coordination.live_leader(run_id="missing-run", now=NOW) is None
+    # A seat deadline EQUAL to database time is still live (``>=``); pinned
+    # by stamping the seat and reading it inside one database second.
+    def equality_arm(database_now: datetime) -> bool:
+        with factory._db.engine.begin() as conn:
+            conn.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == RUN_ID)
+                .values(leader_heartbeat_expires_at=database_now)
+            )
+        equality = coordination.live_leader(run_id=RUN_ID)
+        assert equality is not None
+        return equality.seat_live
+
+    assert within_one_database_second(factory._db.engine, equality_arm) is True
+    assert coordination.live_leader(run_id="missing-run") is None
 
     with factory._db.engine.begin() as conn:
         conn.execute(
@@ -382,18 +394,19 @@ def test_rm07_occupied_leader_seat_truth_table() -> None:
             .where(run_coordination_table.c.run_id == RUN_ID)
             .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=NOW)
         )
-    assert coordination.live_leader(run_id=RUN_ID, now=NOW) is None
+    assert coordination.live_leader(run_id=RUN_ID) is None
 
 
 def test_rm08_dead_non_leader_worker_truth_table_and_ordering() -> None:
     factory, _repository, _ids = _seed_scheduler_image()
     coordination = RunCoordinationRepository(factory._db.engine)
-    threshold = NOW - timedelta(seconds=10)
+    # Deadlines are judged against the Landscape database clock (ADR-047):
+    # NOW lies in its past, so these three are all beyond the grace threshold.
     workers = (
-        ("dead-first", "follower", "active", threshold - timedelta(seconds=2), NOW - timedelta(seconds=4)),
-        ("dead-second", "follower", "active", threshold - timedelta(seconds=1), NOW - timedelta(seconds=3)),
-        ("equality", "follower", "active", threshold, NOW - timedelta(seconds=2)),
-        ("departed", "follower", "departed", threshold - timedelta(seconds=3), NOW - timedelta(seconds=1)),
+        ("dead-first", "follower", "active", NOW - timedelta(seconds=12), NOW - timedelta(seconds=4)),
+        ("dead-second", "follower", "active", NOW - timedelta(seconds=11), NOW - timedelta(seconds=3)),
+        ("equality", "follower", "active", NOW - timedelta(seconds=10), NOW - timedelta(seconds=2)),
+        ("departed", "follower", "departed", NOW - timedelta(seconds=13), NOW - timedelta(seconds=1)),
     )
     with factory._db.engine.begin() as conn:
         for worker_id, role, status, expires_at, registered_at in workers:
@@ -408,12 +421,19 @@ def test_rm08_dead_non_leader_worker_truth_table_and_ordering() -> None:
                     departed_at=NOW if status == "departed" else None,
                 )
             )
-    assert coordination.dead_non_leader_workers(
-        run_id=RUN_ID,
-        leader_worker_id=LEADER,
-        now=NOW,
-        grace_seconds=10,
-    ) == ("dead-first", "dead-second")
+
+    # The equality boundary (deadline == database_now - grace is NOT dead) is
+    # pinned by stamping the row and sweeping inside one database second.
+    def sweep_with_equality_at_threshold(database_now: datetime) -> tuple[str, ...]:
+        with factory._db.engine.begin() as conn:
+            conn.execute(
+                update(run_workers_table)
+                .where(run_workers_table.c.worker_id == "equality")
+                .values(heartbeat_expires_at=database_now - timedelta(seconds=10))
+            )
+        return coordination.dead_non_leader_workers(run_id=RUN_ID, leader_worker_id=LEADER, grace_seconds=10)
+
+    assert within_one_database_second(factory._db.engine, sweep_with_equality_at_threshold) == ("dead-first", "dead-second")
 
 
 def test_rm08_equal_registration_times_order_by_worker_identity() -> None:
@@ -437,7 +457,6 @@ def test_rm08_equal_registration_times_order_by_worker_identity() -> None:
     assert coordination.dead_non_leader_workers(
         run_id=RUN_ID,
         leader_worker_id=LEADER,
-        now=NOW,
         grace_seconds=10,
     ) == ("dead-a", "dead-z")
 

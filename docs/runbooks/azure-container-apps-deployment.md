@@ -329,6 +329,16 @@ revision mode only; facts §2.3), `minReplicas: 2`, `maxReplicas: 4`,
 startup probe `/api/health` 15 s × 10, liveness `/api/health` 30 s × 3,
 readiness `/api/ready` 10 s × 3 and `terminationGracePeriodSeconds: 60`.
 
+Advisory-lock classes are internal to the PostgreSQL connections the replicas
+hold; nothing in the bundle or the schema names them. The blob
+custody lock has its own class (`ELSPETH_BLOB_CUSTODY_LOCK_CLASSID`) so that
+a session-operation lease renew on one replica never waits behind another
+replica's blob write to the NFS share. No operator action attaches to it.
+Replicas running different versions serialise custody on different keys, so
+a rollout that overlaps old and new replicas is outside the contract: the
+proof of rollout above (exactly one active revision carrying the candidate
+digest) is what makes the custody serialisation claim hold.
+
 > **LIVE:** the public-behaviour pass (Playwright tutorial through the
 > ingress, a fork and a guided convert, the two seams Phase 3 trialled) and
 > the WebSocket behaviour at the 240 s request timeout.

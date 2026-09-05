@@ -22,6 +22,7 @@ from typing import Literal
 from tests.helpers.tree_gate import iter_gate_files
 
 from elspeth.web.sessions.models import metadata as sessions_metadata
+from elspeth_lints.core.ast_dump import stable_ast_dump
 
 Scope = Literal["session", "global"]
 DatabaseDomain = Literal["sessions", "non_sessions", "unknown"]
@@ -1906,7 +1907,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3ff2ad66f23de4bc",
         1,
         None,
-        line=220,
+        line=219,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/manager.py",
@@ -1916,7 +1917,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c3ee61782a940776",
         1,
         None,
-        line=242,
+        line=241,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1926,7 +1927,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "288170ec1722ebc2",
         1,
         None,
-        line=127,
+        line=126,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1936,7 +1937,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4b552d15f53e6c40",
         1,
         None,
-        line=234,
+        line=233,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1946,7 +1947,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9e291dca4a439605",
         1,
         None,
-        line=430,
+        line=429,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -1957,7 +1958,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "758fe32047daee73",
         1,
         None,
-        line=909,
+        line=908,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1967,7 +1968,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ccdaa74d89308bbb",
         1,
         None,
-        line=970,
+        line=969,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1977,7 +1978,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "63aa60b938d94231",
         1,
         None,
-        line=1037,
+        line=1036,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1987,7 +1988,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "18b91cab2434c597",
         1,
         None,
-        line=1132,
+        line=1131,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -1997,27 +1998,29 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "697320a36b78fae3",
         1,
         None,
-        line=1174,
+        line=1173,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository.live_leader",
         "<non-session-write-connection>",
         "write_connection",
-        "ad6d71c0a227bcf6",
+        "2b52f58624e1e33d",
         1,
         None,
-        line=637,
+        line=653,
+        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository.dead_non_leader_workers",
         "<non-session-write-connection>",
         "write_connection",
-        "1d14464e4e5644d1",
+        "ee5e921beae1a1a7",
         1,
         None,
-        line=1010,
+        line=1041,
+        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
@@ -2027,14 +2030,14 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1034,
+        line=1066,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
         "RunLifecycleRepository.complete_run",
         "<non-session-write-connection>",
         "write_connection",
-        "02a32c802141b6f0",
+        "cccd76061f31fbc7",
         1,
         None,
         line=627,
@@ -2047,7 +2050,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "77752b22fc520b7b",
         1,
         None,
-        line=1084,
+        line=1083,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -2057,7 +2060,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "89c87457b3d6b1a9",
         1,
         None,
-        line=1103,
+        line=1102,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -2067,7 +2070,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c5310a65c3619209",
         1,
         None,
-        line=1117,
+        line=1116,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -2077,7 +2080,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3053f6e3f97a64b7",
         1,
         None,
-        line=1141,
+        line=1140,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/group_losses.py",
@@ -2405,7 +2408,7 @@ def _statement_fingerprint(node: ast.AST) -> str:
         if parent is None or isinstance(parent, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             break
         current = parent
-    normalized = ast.dump(current, annotate_fields=True, include_attributes=False)
+    normalized = stable_ast_dump(current)
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
@@ -3759,7 +3762,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             )
             if base_domain != "unknown":
                 return base_domain
-            attribute_key = ast.dump(expression, include_attributes=False)
+            attribute_key = stable_ast_dump(expression)
             if attribute_key in visited_attributes:
                 return "unknown"
             values = self._attribute_assignment_values(expression)
@@ -3930,7 +3933,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         normalized = "\0".join(
             (
                 _statement_fingerprint(node),
-                ast.dump(context, annotate_fields=True, include_attributes=False),
+                stable_ast_dump(context),
             )
         )
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
@@ -4213,7 +4216,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             }
         if isinstance(expression, ast.Subscript):
             return {
-                ("subscript", base, ast.dump(expression.slice, include_attributes=False))
+                ("subscript", base, stable_ast_dump(expression.slice))
                 for base in self._storage_target_keys(
                     expression.value,
                     use=use,
@@ -4371,7 +4374,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         ordered = sorted(contexts.values(), key=self._position)
         if len(ordered) == 1:
             return _statement_fingerprint(node)
-        normalized = "\0".join(ast.dump(statement, annotate_fields=True, include_attributes=False) for statement in ordered)
+        normalized = "\0".join(stable_ast_dump(statement) for statement in ordered)
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
     def _write_executions_for(self, node: ast.AST) -> list[ast.Call]:
@@ -4780,9 +4783,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             domain = self._table_database_domain(node.args[0])
         if domain == "sessions" and table and operation:
             statements, _ = self._dependent_write_context(node)
-            if operation == "insert" and any(
-                "on_conflict_do_" in ast.dump(statement, include_attributes=False) for statement in statements
-            ):
+            if operation == "insert" and any("on_conflict_do_" in stable_ast_dump(statement) for statement in statements):
                 operation = "upsert"
             self._emit(node, table, operation)
         elif domain == "non_sessions" and operation:

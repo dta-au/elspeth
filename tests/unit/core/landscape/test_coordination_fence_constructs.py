@@ -33,6 +33,7 @@ from elspeth.contracts.errors import RunLeadershipLostError, RunWorkerEvictedErr
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import (
     RunCoordinationRepository,
     verify_and_extend_leader_fence,
@@ -52,7 +53,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import assert_deadline_within, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
@@ -741,7 +742,6 @@ class TestVerifyAndExtendLeaderFence:
             RunCoordinationRepository(db.engine),
             run_id=RUN_1,
             worker_id="worker-leader",
-            now=NOW,
             window_seconds=80.0,
         )
 
@@ -754,22 +754,24 @@ class TestVerifyAndExtendLeaderFence:
 
     def test_match_extends_expiry_and_stamps_updated_at(self, db: LandscapeDB) -> None:
         token = self._seat(db)
-        later = NOW + timedelta(seconds=30)
         with begin_write(db.engine) as conn:
-            verify_and_extend_leader_fence(conn, token=token, now=later, window_seconds=120.0, verb="unit-test")
-        assert self._expiry(db) == later + timedelta(seconds=120)
+            database_now = read_landscape_transaction_time(conn)
+            verify_and_extend_leader_fence(conn, token=token, window_seconds=120.0, verb="unit-test")
+        # Both stamps come from the database clock, never from a caller's
+        # ``now`` (ADR-047); SQLite stamps whole seconds.
+        assert_deadline_within(self._expiry(db), database_now + timedelta(seconds=120))
         with db.engine.connect() as conn:
             updated_at = conn.execute(
                 select(run_coordination_table.c.updated_at).where(run_coordination_table.c.run_id == RUN_1)
             ).scalar_one()
-        assert (updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=UTC)) == later
+        assert_deadline_within(updated_at, database_now)
 
     def test_stale_epoch_raises_and_does_not_move_expiry(self, db: LandscapeDB) -> None:
         token = self._seat(db)
         before = self._expiry(db)
         stale = CoordinationToken(run_id=RUN_1, worker_id=token.worker_id, leader_epoch=token.leader_epoch + 1)
         with pytest.raises(RunLeadershipLostError) as exc_info, begin_write(db.engine) as conn:
-            verify_and_extend_leader_fence(conn, token=stale, now=NOW + timedelta(seconds=30), window_seconds=120.0, verb="unit-test")
+            verify_and_extend_leader_fence(conn, token=stale, window_seconds=120.0, verb="unit-test")
         assert exc_info.value.verb == "unit-test"
         assert self._expiry(db) == before
 
@@ -778,7 +780,7 @@ class TestVerifyAndExtendLeaderFence:
         before = self._expiry(db)
         foreign = CoordinationToken(run_id=RUN_1, worker_id="worker-imposter", leader_epoch=token.leader_epoch)
         with pytest.raises(RunLeadershipLostError), begin_write(db.engine) as conn:
-            verify_and_extend_leader_fence(conn, token=foreign, now=NOW + timedelta(seconds=30), window_seconds=120.0, verb="unit-test")
+            verify_and_extend_leader_fence(conn, token=foreign, window_seconds=120.0, verb="unit-test")
         assert self._expiry(db) == before
 
     def test_verify_rides_the_payload_transaction_no_autonomous_commit(self, db: LandscapeDB) -> None:
@@ -793,7 +795,7 @@ class TestVerifyAndExtendLeaderFence:
             pass
 
         with pytest.raises(_Boom), begin_write(db.engine) as conn:
-            verify_and_extend_leader_fence(conn, token=token, now=NOW + timedelta(seconds=30), window_seconds=120.0, verb="unit-test")
+            verify_and_extend_leader_fence(conn, token=token, window_seconds=120.0, verb="unit-test")
             raise _Boom
 
         assert self._expiry(db) == before, "the successful verify rolled back with the payload"

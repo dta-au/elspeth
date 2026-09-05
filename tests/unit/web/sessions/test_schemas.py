@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+import elspeth.web.sessions.schemas as schemas
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -517,3 +519,55 @@ def test_workflow_profile_response_wire_subset_and_strict() -> None:
             coaching="yes",
             bookends=True,
         )
+
+
+class TestResponseStrictnessTripwire:
+    """Every response model is strict and closed; no model admits extras.
+
+    elspeth-d03d706141 reported five interpretation response models that
+    had drifted off the strict base. The property is re-derived from the
+    module here so it cannot regress silently again: the inventory comes
+    from the live module namespace, never from a hand-kept list.
+    """
+
+    @staticmethod
+    def _module_models() -> dict[str, type[BaseModel]]:
+        return {
+            name: cls
+            for name, cls in vars(schemas).items()
+            if inspect.isclass(cls) and issubclass(cls, BaseModel) and cls.__module__ == schemas.__name__
+        }
+
+    def test_every_response_model_is_strict_and_closed(self) -> None:
+        responses = {name: cls for name, cls in self._module_models().items() if name.endswith("Response")}
+        assert responses, "positive control: the module defines response models"
+        off_base = sorted(name for name, cls in responses.items() if not issubclass(cls, schemas._StrictResponse))
+        assert off_base == []
+        lax = sorted(
+            name
+            for name, cls in responses.items()
+            if cls.model_config.get("strict") is not True or cls.model_config.get("extra") != "forbid"
+        )
+        assert lax == []
+
+    def test_no_model_admits_extra_keys(self) -> None:
+        models = self._module_models()
+        assert models, "positive control: the module defines models"
+        open_models = sorted(name for name, cls in models.items() if cls.model_config.get("extra") != "forbid")
+        assert open_models == []
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "InterpretationEventResponse",
+            "InterpretationResolveResponse",
+            "InterpretationOptOutResponse",
+            "ListInterpretationEventsResponse",
+            "OptOutSummaryResponse",
+        ],
+    )
+    def test_interpretation_responses_reject_coercion_and_extras(self, name: str) -> None:
+        cls = self._module_models()[name]
+        assert issubclass(cls, schemas._StrictResponse)
+        with pytest.raises(ValidationError):
+            cls.model_validate({"__never_a_field__": 1})

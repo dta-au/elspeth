@@ -32,7 +32,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now, make_recorder_with_run, register_test_node
 
 if TYPE_CHECKING:
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -1610,24 +1610,36 @@ def test_ts14_outcome_repair_without_witness_only_refreshes_the_leader_fence() -
     before = _scheduler_terminalization_state_snapshot(engine)
 
     repair_now = now + timedelta(seconds=3)
+    database_before = landscape_database_now(engine)
     terminalized = repo.terminalize_pending_sinks_with_terminal_outcomes(
         run_id="run-1",
         now=repair_now,
         caller_owner="resume-repair",
         coordination_token=_COORD_TOKEN,
     )
+    database_after = landscape_database_now(engine)
 
     after = _scheduler_terminalization_state_snapshot(engine)
     assert terminalized == 0
     assert after["work_items"] == before["work_items"]
     assert after["outcomes"] == before["outcomes"]
     assert after["events"] == before["events"]
-    expected_coordination = dict(before["coordination"][0])
-    expected_coordination["leader_heartbeat_expires_at"] = _stored_datetime(
-        repair_now + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
+    # The leader fence refreshed the seat from the DATABASE clock (ADR-047):
+    # the two stamps are bracketed by the reads around the verb, and nothing
+    # else on the seat moved.
+    [refreshed] = after["coordination"]
+    refreshed = dict(refreshed)
+    assert_stamped_between(
+        refreshed.pop("leader_heartbeat_expires_at"),
+        start=database_before,
+        end=database_after,
+        offset=timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS),
     )
-    expected_coordination["updated_at"] = _stored_datetime(repair_now)
-    assert after["coordination"] == [expected_coordination]
+    assert_stamped_between(refreshed.pop("updated_at"), start=database_before, end=database_after)
+    expected_coordination = dict(before["coordination"][0])
+    expected_coordination.pop("leader_heartbeat_expires_at")
+    expected_coordination.pop("updated_at")
+    assert refreshed == expected_coordination
 
 
 def test_blocked_barrier_terminalization_records_transition_event() -> None:

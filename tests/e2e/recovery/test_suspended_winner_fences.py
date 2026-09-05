@@ -89,6 +89,7 @@ from tests.e2e.recovery.harness import (
     _run_workers,
     _usurp_seat,
 )
+from tests.fixtures.landscape import expire_leader_seat
 from tests.helpers.checkpoint import create_checkpoint
 
 WORKER_OLD = "worker-old"
@@ -108,7 +109,6 @@ def _takeover_image(tmp_path: Path) -> tuple[_CrashedRun, CoordinationToken]:
     token_old = _coord(crashed).acquire_run_leadership(
         run_id=crashed.run_id,
         worker_id=WORKER_OLD,
-        now=clock.now_utc(),
         window_seconds=80.0,
     )
     return crashed, token_old
@@ -685,7 +685,6 @@ class TestSuspendedWinnerFences:
         token_old = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=WORKER_OLD,
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
         current = _usurp(crashed)
@@ -845,7 +844,6 @@ class TestSuspendedWinnerFences:
         token_new = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id="worker-new",
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
         assert token_new.leader_epoch == token_old.leader_epoch + 1, "epoch monotonic bump E -> E+1"
@@ -977,13 +975,14 @@ class TestSuspendedWinnerFences:
         crashed2, _token_old = _takeover_image(tmp_path)
         # Seed the PENDING_SINK row while WORKER_OLD is still ACTIVE.
         token_id = _parked_pending_sink(crashed2, ingest_sequence=6, claim_back=False)
-        # Now run a real takeover CAS: evicts WORKER_OLD in run_workers.
+        # Now run a real takeover CAS: evicts WORKER_OLD in run_workers. The
+        # CAS judges the seat against the Landscape database clock (ADR-047),
+        # so the seat is lapsed through the database, not the MockClock.
         clock2 = crashed2.clock
-        clock2.advance(_DEFAULT_LEASE_SECONDS + 10)  # seat is expired for the takeover
+        expire_leader_seat(crashed2.db, crashed2.run_id)
         _coord(crashed2).acquire_run_leadership(
             run_id=crashed2.run_id,
             worker_id=USURPER,
-            now=clock2.now_utc(),
             window_seconds=80.0,
         )
         workers = {w["worker_id"]: w for w in _run_workers(crashed2.db, crashed2.run_id)}

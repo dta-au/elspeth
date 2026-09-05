@@ -37,10 +37,12 @@ Design invariants enforced here:
   verb) updates ``run_workers`` and, for the leader, ``run_coordination`` in a
   single BEGIN IMMEDIATE transaction; the two liveness clocks cannot skew in
   the worker-fresher-than-seat direction.
-- **Deterministic testability** — inject ``now_fn`` (defaults to
-  ``datetime.now(UTC)``) and ``wait_fn`` (defaults to ``stop_event.wait``);
-  unit tests step the beat with ``_step_beat()`` and an injected
-  ``wait_fn=lambda _: False`` to drive ticks without sleeping.
+- **Deterministic testability** — inject ``wait_fn`` (defaults to
+  ``stop_event.wait``); unit tests step the beat with ``_step_beat()`` and an
+  injected ``wait_fn=lambda _: False`` to drive ticks without sleeping. The
+  beat itself carries no clock: its deadline is the Landscape database's own
+  time (ADR-047). ``now_fn`` (defaults to ``datetime.now(UTC)``) stamps only
+  the forensic ``heartbeat_degraded`` record.
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ class _HeartbeatSnapshot(Protocol):
 class _HeartbeatRepository(Protocol):
     """Repository operations required by ``RunHeartbeatThread``."""
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> _HeartbeatSnapshot: ...
+    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> _HeartbeatSnapshot: ...
 
     def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None: ...
 
@@ -127,8 +129,9 @@ class RunHeartbeatThread:
         :data:`~elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS`
         (80 s).
     now_fn:
-        Callable returning the current UTC datetime.  Inject a fixed-clock
-        callable in unit tests.
+        Callable returning the current UTC datetime, used only for the
+        forensic ``recorded_at`` of the ``heartbeat_degraded`` event; the
+        beat's deadline is database time (ADR-047).
     wait_fn:
         Called as ``wait_fn(interval_seconds) -> bool`` (same signature as
         :meth:`threading.Event.wait`); returns ``True`` when the stop event
@@ -287,7 +290,6 @@ class RunHeartbeatThread:
         try:
             snapshot = self._repo.worker_heartbeat(
                 worker_id=self._token.worker_id,
-                now=self._now_fn(),
                 window_seconds=self._window_seconds,
             )
             # Reset busy counter on any successful DB round-trip.

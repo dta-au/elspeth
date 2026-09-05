@@ -60,6 +60,7 @@ from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.schema import (
     node_states_table,
@@ -96,6 +97,7 @@ from tests.e2e.recovery.harness import (
     _run_workers,
     _work_items_by_token,
 )
+from tests.fixtures.landscape import expire_leader_seat
 
 # The resume() entry guard and can_resume() evaluate seat liveness with the
 # WALL clock (datetime.now(UTC)), while the harness MockClock lives at the
@@ -119,7 +121,6 @@ class TestMidClaimCrashResume:
         old_token = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=old_leader,
-            now=clock.now_utc(),
             window_seconds=_DEFAULT_LEASE_SECONDS,
         )
 
@@ -213,6 +214,9 @@ class TestMidClaimCrashResume:
         ]
 
         clock.advance(_DEFAULT_LEASE_SECONDS + 60)
+        # The crashed leader's seat lapses in the Landscape database clock's
+        # domain (ADR-047) — the resume guard judges it there, not by MockClock.
+        expire_leader_seat(crashed.db, crashed.run_id)
         repair_point = _resume_point(crashed)
         assert repair_point is not None
 
@@ -269,6 +273,7 @@ class TestMidClaimCrashResume:
         ]
 
         clock.advance(_DEFAULT_LEASE_SECONDS + 60)
+        expire_leader_seat(crashed.db, crashed.run_id)  # the killed repair process never released its seat
         winner_point = _resume_point(crashed)
         loser_point = _resume_point(crashed)
         assert winner_point is not None and loser_point is not None
@@ -614,7 +619,6 @@ class TestTwoResumesSameRunId:
         winner_token = coord.acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=winner_id,
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
         assert winner_token.leader_epoch == 2, "takeover of the begin_run epoch-1 seat"
@@ -632,7 +636,6 @@ class TestTwoResumesSameRunId:
             coord.acquire_run_leadership(
                 run_id=crashed.run_id,
                 worker_id=loser_id,
-                now=clock.now_utc(),
                 window_seconds=80.0,
             )
         assert winner_id in str(exc_info.value), "the refusal names the incumbent"
@@ -674,7 +677,7 @@ class TestTwoResumesSameRunId:
         assert claimed is not None and claimed.token_id == crashed_token and claimed.attempt == 2
         crashed.repo.mark_terminal(work_item_id=claimed.work_item_id, now=clock.now_utc(), expected_lease_owner=winner_id)
         crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=winner_token)
-        coord.release_seat(token=winner_token, now=clock.now_utc())
+        coord.release_seat(token=winner_token)
 
         with crashed.db.engine.connect() as conn:
             final_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == crashed.run_id)).scalar_one()
@@ -731,7 +734,6 @@ class TestTwoResumesSameRunId:
         _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=winner_id,
-            now=clock.now_utc(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
         )
 
@@ -978,7 +980,6 @@ class TestTwoResumesSameRunId:
         _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=winner_id,
-            now=clock.now_utc(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
         )
 
@@ -1083,7 +1084,6 @@ class TestTwoResumesSameRunId:
         _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=winner_id,
-            now=clock.now_utc(),
             window_seconds=80.0,
         )
 
@@ -1102,7 +1102,10 @@ class TestTwoResumesSameRunId:
         epoch_before = int(seat_before["leader_epoch"])  # == 2
         assert epoch_before == 2, "precondition: incumbent acquired epoch 2"
 
-        # Seed an active follower to assert no bulk-eviction at takeover.
+        # Seed an ACTIVE follower to assert no bulk-eviction at takeover. Its
+        # heartbeat is live against the Landscape database clock (ADR-047) —
+        # the resumed leader's liveness sweep judges members against that
+        # clock, and a MockClock-relative deadline lies in its past.
         follower_id = "worker-follower-slice4"
         with crashed.db.engine.begin() as conn:
             conn.execute(
@@ -1112,7 +1115,7 @@ class TestTwoResumesSameRunId:
                     role="follower",
                     status="active",
                     registered_at=clock.now_utc().replace(tzinfo=None),
-                    heartbeat_expires_at=(clock.now_utc() + timedelta(hours=1)).replace(tzinfo=None),
+                    heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
                     entry_point="join",
                 )
             )
@@ -1254,7 +1257,6 @@ class TestTwoResumesSameRunId:
         leader_token = _coord(crashed).acquire_run_leadership(
             run_id=crashed.run_id,
             worker_id=leader_id,
-            now=clock.now_utc(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
         )
         assert leader_token.leader_epoch == 2, "takeover of begin_run epoch-1 seat"
@@ -1302,7 +1304,6 @@ class TestTwoResumesSameRunId:
             follower_id = orch.join_run(
                 run_id=crashed.run_id,
                 settings=fake_settings,
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -1411,7 +1412,6 @@ class TestTwoResumesSameRunId:
         # Depart the follower first (simulating follower clean exit via depart_worker).
         crashed.factory.run_coordination.depart_worker(
             worker_id=follower_id,
-            now=clock.now_utc(),
         )
         follower_row_departed = next(w for w in _run_workers(crashed.db, crashed.run_id) if w["worker_id"] == follower_id)
         assert follower_row_departed["status"] == "departed"
