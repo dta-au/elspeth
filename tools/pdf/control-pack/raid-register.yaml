@@ -2,7 +2,7 @@ title: "ELSPETH — Implementation RAID Register"
 subtitle: "Risks, assumptions, issues and dependencies for delivery"
 author: "John Morrissey"
 date: "5 September 2026"
-version: "2.0.0"
+version: "1.0.0"
 status: "DRAFT"
 
 # Template variables
@@ -34,9 +34,6 @@ org-tagline: "Auditable LLM and Data Pipelines"
 
 # Revision history (newest first)
 revisions:
-  - version: "2.0.0"
-    date: "5 September 2026"
-    changes: "Second issue."
   - version: "1.0.0"
-    date: "3 September 2026"
+    date: "5 September 2026"
     changes: "Initial issue."
