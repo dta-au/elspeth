@@ -1585,8 +1585,6 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError(f"Tier 1: blobs.status is {row.status!r}, expected one of {sorted(BLOB_STATUSES)}")
         if row.created_by not in BLOB_CREATORS:
             raise AuditIntegrityError(f"Tier 1: blobs.created_by is {row.created_by!r}, expected one of {sorted(BLOB_CREATORS)}")
-        # The STORAGE union: binary documents (elspeth-0c6a343921) are stored
-        # blobs too, and every fenced read comes through here.
         if row.mime_type not in STORAGE_MIME_TYPES:
             raise AuditIntegrityError(f"Tier 1: blobs.mime_type is {row.mime_type!r}, not in the storage MIME set")
         if row.creation_modality not in {modality.value for modality in CreationModality}:
