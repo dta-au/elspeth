@@ -14,30 +14,39 @@ Architecture:
 import io
 import logging
 import sys
-from typing import Any
+from typing import Any, Literal, TextIO
 
 import structlog
 from structlog.stdlib import ProcessorFormatter
 
 
-class _LazyStdoutStream(io.TextIOBase):
-    """Stream wrapper that delegates to the current sys.stdout at write time.
+class _LazyStdStream(io.TextIOBase):
+    """Stream wrapper that delegates to the current ``sys.stdout``/``sys.stderr`` at write time.
 
-    StreamHandler(sys.stdout) captures a reference to stdout at construction.
-    Under pytest (or any tool that swaps stdout), the captured reference goes
-    stale after the swap's scope ends. This wrapper resolves sys.stdout lazily
-    on every write, so it always targets the live stdout.
+    ``StreamHandler(sys.stdout)`` captures a reference to the stream at
+    construction. Under pytest, typer's ``CliRunner``, or any tool that swaps
+    the standard streams, the captured reference goes stale after the swap's
+    scope ends. This wrapper resolves the named stream lazily on every write,
+    so it always targets the live one.
     """
 
+    def __init__(self, name: Literal["stdout", "stderr"]) -> None:
+        super().__init__()
+        self._name = name
+
+    @property
+    def _target(self) -> TextIO:
+        return sys.stdout if self._name == "stdout" else sys.stderr
+
     def write(self, s: str) -> int:
-        return sys.stdout.write(s)
+        return self._target.write(s)
 
     def flush(self) -> None:
-        sys.stdout.flush()
+        self._target.flush()
 
     @property
     def closed(self) -> bool:
-        return sys.stdout.closed
+        return self._target.closed
 
 
 # Third-party loggers that are excessively verbose at DEBUG level.
@@ -68,6 +77,11 @@ _NOISY_LOGGERS: tuple[str, ...] = (
 # Track ELSPETH-owned handler ids for selective removal on reconfiguration.
 # Using id-set instead of getattr() to comply with the defensive programming ban.
 _elspeth_handler_ids: set[int] = set()
+
+# The stream handler the most recent configure_logging() installed (exactly
+# one per configuration). Held as the typed object so a stdout-owning CLI mode
+# can re-target its stream without discovering it by type among root.handlers.
+_elspeth_stream_handler: logging.StreamHandler[Any] | None = None
 
 
 def _remove_internal_fields(
@@ -108,6 +122,7 @@ def configure_logging(
         color_output: If True, force ANSI colors in console output. If False,
             disable them. If None, auto-detect from stdout interactivity.
     """
+    global _elspeth_stream_handler
     normalized_level = level.upper()
     if normalized_level == "DEBUG":
         log_level = logging.DEBUG
@@ -160,7 +175,7 @@ def configure_logging(
 
     # Configure stdlib logging with ProcessorFormatter
     # This ensures stdlib loggers go through structlog's processor chain
-    handler = logging.StreamHandler(_LazyStdoutStream())
+    handler = logging.StreamHandler(_LazyStdStream("stdout"))
     handler.setFormatter(
         ProcessorFormatter(
             processors=final_processors,
@@ -178,6 +193,7 @@ def configure_logging(
 
     # Track our handler by id so we can find it later
     _elspeth_handler_ids.add(id(handler))
+    _elspeth_stream_handler = handler
     root.addHandler(handler)
     root.setLevel(log_level)
 
@@ -187,6 +203,29 @@ def configure_logging(
     noisy_level = max(log_level, logging.WARNING)
     for logger_name in _NOISY_LOGGERS:
         logging.getLogger(logger_name).setLevel(noisy_level)
+
+
+def route_elspeth_logs_to_stderr() -> None:
+    """Move the ELSPETH-owned log handler(s) from stdout to stderr.
+
+    For CLI modes whose stdout IS a machine-readable document (the deployment
+    doctor's ``--json`` report, parsed by the ECS/ACA acceptance drivers and
+    the PostgreSQL doctor proofs — elspeth-4b27604bb7). ``configure_logging``
+    deliberately targets stdout so container logs are captured; a mode that
+    owns stdout must take the log lines off it BEFORE anything that can log
+    runs (``WebSettings`` validation emits a WARNING during settings load).
+
+    Only the handler installed by :func:`configure_logging` is re-targeted —
+    a foreign handler (pytest's caplog, an operator's own sink) keeps its
+    stream. Fails closed when no ELSPETH handler is installed: an ungoverned
+    log channel would fall through to structlog's default stdout printer and
+    corrupt the document again.
+    """
+    handler = _elspeth_stream_handler
+    root = logging.getLogger()
+    if handler is None or id(handler) not in _elspeth_handler_ids or handler not in root.handlers:
+        raise RuntimeError("route_elspeth_logs_to_stderr() requires the handler installed by configure_logging(); none is present")
+    handler.setStream(_LazyStdStream("stderr"))
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

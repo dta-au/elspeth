@@ -850,15 +850,35 @@ def _blob_creation_provenance(content: str, context: ToolContext) -> _BlobCreati
     )
 
 
+def _names_blob(value: str, blob_id: str) -> bool:
+    """Whether ``value`` names the blob ``blob_id`` — the same UUID, in either hex case.
+
+    The binding path admits exactly one spelling variance: the contract's
+    ``is_widened_blob_ref`` matches a ``blob_ref`` against the hyphenated
+    UUID form with ``[0-9a-fA-F]`` digits and the runtime binds it through
+    ``UUID(...)``, so an upper-case marker the LLM authored is the SAME
+    bound blob as the lower-case id the store records. Comparing spellings
+    here read such a bound blob as unbound (review finding A1 on
+    elspeth-4f3cd4155b). Two hyphenated UUID texts denote one UUID iff they
+    are equal ignoring case, so that is the whole comparison; a braced or
+    unhyphenated spelling is rejected by the contract, never bound, and
+    therefore a non-match here — as is any non-UUID string, which cannot
+    name a blob at all.
+    """
+    return value.lower() == blob_id.lower()
+
+
 @trust_boundary(
     tier=3,
     source="one component's frozen options tree (web/LLM-authored content retained through CompositionState freezing)",
     source_param="options",
     suppresses=("R5",),
     invariant=(
-        "returns True only on an exact blob_ref/path/file match found by structural traversal; raises "
-        "AuditIntegrityError on a present-but-non-str blob_ref (audited-state corruption) rather than "
-        "treating the blob as unbound"
+        "returns True only on a blob_ref / blob_id / *_blob_id value, or a blob:<uuid> path / file "
+        "sentinel, that is UUID-identical to blob_id (any hex case), or a path / file value equal to "
+        "storage_path, found by full structural traversal (mappings and list/tuple at any depth); raises "
+        "AuditIntegrityError on a present-but-non-str blob_ref / blob_id / *_blob_id (audited-state "
+        "corruption) rather than treating the blob as unbound"
     ),
     test_ref="tests/unit/web/composer/test_blob_inline_tools.py::test_state_options_reference_blob_crashes_on_non_str_blob_ref",
     test_fingerprint="cc4ab30745da588422649670128e04e05a2b19ad065a5750801cfc3a86e56a3b",
@@ -872,37 +892,66 @@ def _state_options_reference_blob(
 ) -> bool:
     """Recursively inspect one component's options for references to a blob.
 
-    Recognizes every composer-authored blob vocabulary: ``blob_ref`` values
-    (top-level source bindings and nested inline-content markers), and
-    ``path``/``file`` values equal to either the blob's canonical
-    ``storage_path`` or its ``blob:<uuid>`` sentinel.  Frozen state options
-    are Mapping/tuple shaped, hence the structural checks here rather than
-    the exact ``dict``/``list`` checks the DB-side walker uses.
+    Recognizes the UNION of the vocabularies the other blob walkers use
+    (``guided/stage_transitions._option_blob_ids``,
+    ``web/blobs/service._option_value_references_blob``,
+    ``web/coordination/repository._option_value_references_blob``,
+    ``yaml_generator``'s public-YAML strip list) — no single one of them
+    knows the whole set: ``blob_ref`` values (top-level source bindings and
+    nested inline-content markers), ``blob_id`` and any ``*_blob_id``
+    custody key, and ``path``/``file`` values equal to either the blob's
+    canonical ``storage_path`` or its ``blob:<uuid>`` sentinel.  Id values
+    are compared by UUID identity (``_names_blob``), because the binding
+    path accepts either hex case.  Traversal is full: every nested mapping
+    and every list/tuple element at any depth is inspected, so a binding
+    inside a list of lists is seen.  Frozen state options are Mapping/tuple
+    shaped, hence the structural checks here rather than the exact
+    ``dict``/``list`` checks the DB-side walker uses.
 
-    A present-but-non-str ``blob_ref`` cannot arise from any valid authoring
-    path (the canonical writers always record ``blob["id"]``); it is a
-    corruption of the audited CompositionState.  Silently treating it as
-    "not bound" would let update/delete mutate a blob that is in fact bound,
-    defeating the guard — so escalate rather than suppress.
+    Before elspeth-4f3cd4155b this walker knew only ``blob_ref``/``path``/
+    ``file`` and descended one level into sequences, and only into mapping
+    elements — while its docstring claimed the coverage above. A blob bound
+    through ``blob_id`` vocabulary, or through a mapping two sequence levels
+    down, read as UNBOUND and became updatable/deletable under an accepted
+    composition. This function is the SOLE retention guard over the live
+    authored state on both update and delete; the adjacent
+    ``_composition_references_blob`` only runs when an active run exists.
+
+    A present-but-non-str ``blob_ref`` / ``blob_id`` / ``*_blob_id`` cannot
+    arise from any valid authoring path (the canonical writers always record
+    ``blob["id"]`` as a string); it is a corruption of the audited
+    CompositionState.  Silently treating it as "not bound" would let
+    update/delete mutate a blob that is in fact bound, defeating the guard —
+    so escalate rather than suppress.
     """
     for key, value in options.items():
-        if key == "blob_ref":
+        if isinstance(key, str) and (key == "blob_ref" or key == "blob_id" or key.endswith("_blob_id")):
             if value is None:
                 continue
             if not isinstance(value, str):
-                raise AuditIntegrityError(f"{owner} has a non-str blob_ref ({type(value).__name__}); CompositionState integrity anomaly")
-            if value == blob_id:
+                raise AuditIntegrityError(f"{owner} has a non-str {key} ({type(value).__name__}); CompositionState integrity anomaly")
+            if _names_blob(value, blob_id):
                 return True
         elif key in ("path", "file") and isinstance(value, str):
-            if value == storage_path or value == f"blob:{blob_id}":
+            if value == storage_path:
                 return True
-        elif isinstance(value, Mapping):
-            if _state_options_reference_blob(value, blob_id, storage_path, owner=owner):
+            if value.startswith("blob:") and _names_blob(value.removeprefix("blob:"), blob_id):
                 return True
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                if isinstance(item, Mapping) and _state_options_reference_blob(item, blob_id, storage_path, owner=owner):
-                    return True
+        else:
+            # Descend into the value whatever its shape. Mappings recurse so
+            # key vocabulary applies at every depth; list/tuple elements are
+            # each pushed in turn, so ``[[{"blob_ref": ...}]]`` is seen.
+            # Scalars never reference a blob on their own: a bare string equal
+            # to the storage path is only a binding under a ``path``/``file``
+            # key, which is the DB-side walker's rule too.
+            pending: list[object] = [value]
+            while pending:
+                item = pending.pop()
+                if isinstance(item, Mapping):
+                    if _state_options_reference_blob(item, blob_id, storage_path, owner=owner):
+                        return True
+                elif isinstance(item, (list, tuple)):
+                    pending.extend(item)
     return False
 
 

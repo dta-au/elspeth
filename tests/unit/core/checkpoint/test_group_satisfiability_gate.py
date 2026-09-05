@@ -2,8 +2,8 @@
 
 Every minted member of every bound group must be lost (group_losses row,
 adopted or not), live (a frame-bearing token without a completed terminal),
-or arrived (a journal row at the group's closer). A member with none of the
-three can never settle, so the roster can never close: refuse resume naming
+or arrived (a journal row addressed to the group's closer AND held there —
+``barrier_blocked_at`` set). A member with none of the three can never settle, so the roster can never close: refuse resume naming
 closer, group, and member. Unbound groups are inert provenance and never
 refuse (ADR-020 batch posture, made structural).
 """
@@ -69,13 +69,16 @@ def _enqueue_journal_row(db: LandscapeDB, *, token_id: str, node_id: str) -> Non
 
 
 def _seed_arrival(db: LandscapeDB, *, token_id: str) -> None:
-    """Journal evidence that the member's token reached the coalesce closer."""
+    """Journal evidence that the member's token reached the coalesce closer:
+    addressed to it AND held there (``barrier_blocked_at``, the stamp only
+    ``mark_blocked`` writes). The address alone is the member's binding,
+    present from creation; the hold stamp is what proves arrival."""
     _enqueue_journal_row(db, token_id=token_id, node_id=COALESCE_NODE_ID)
     with db.engine.begin() as conn:
         conn.execute(
             update(token_work_items_table)
             .where(token_work_items_table.c.token_id == token_id)
-            .values(coalesce_name="merger", barrier_key="merger")
+            .values(coalesce_name="merger", barrier_key="merger", barrier_blocked_at=NOW)
         )
 
 
@@ -204,7 +207,7 @@ class TestExpandGroups:
             conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.token_id == members[0])
-                .values(collector_name="page_stitcher", barrier_key=None)
+                .values(collector_name="page_stitcher", barrier_key=None, barrier_blocked_at=NOW)
             )
         terminalize(db, members[0])
         gate = check_group_satisfiability_resumable(db, RUN_ID, _SCOPE_BINDINGS)
@@ -223,11 +226,57 @@ class TestExpandGroups:
             conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.token_id == members[0])
-                .values(collector_name=None, barrier_key=collector_barrier_key("page_stitcher", EXPAND_GROUP))
+                .values(
+                    collector_name=None,
+                    barrier_key=collector_barrier_key("page_stitcher", EXPAND_GROUP),
+                    barrier_blocked_at=NOW,
+                )
             )
         terminalize(db, members[0])
         gate = check_group_satisfiability_resumable(db, RUN_ID, _SCOPE_BINDINGS)
         assert gate.check.can_resume, f"compound barrier_key disjunct missing: {gate.check.reason}"
+
+    def test_bound_but_never_held_member_is_unsatisfiable(self) -> None:
+        """elspeth-76e936568e — the hole the gate had. A member that died
+        INSIDE the region before reaching its collector: its only journal
+        row sits at the in-region node, stamped with the collector's full
+        binding address (collector_name AND the compound barrier_key, exactly
+        as the engine stamps every in-region work item at creation), but
+        ``barrier_blocked_at`` is NULL because it was never held at the
+        barrier; terminal; no group_losses row. The old arrived limb matched
+        the address and called this settled, so a run — or a resume — over
+        it converged with the group never closed. It is unsatisfiable on the
+        gate's own definition and must be named as such.
+
+        Mutation oracle for the limb: drop the ``barrier_blocked_at`` condition
+        and this goes green for the wrong reason. Measured against real runs
+        2026-09-05: a released member and a diverted member carry IDENTICAL
+        address columns; only the hold stamp differs."""
+        db = make_landscape_db()
+        seed_run(db)
+        members = seed_expand_group(db, member_count=1)
+        _enqueue_journal_row(db, token_id=members[0], node_id=OPENER_NODE_ID)
+        with db.engine.begin() as conn:
+            conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.token_id == members[0])
+                .values(
+                    collector_name="page_stitcher",
+                    barrier_key=collector_barrier_key("page_stitcher", EXPAND_GROUP),
+                    barrier_blocked_at=None,
+                )
+            )
+        terminalize(db, members[0])
+        gate = check_group_satisfiability_resumable(db, RUN_ID, _SCOPE_BINDINGS)
+        assert not gate.check.can_resume
+        assert len(gate.unsatisfiable_members) == 1
+        member = gate.unsatisfiable_members[0]
+        assert (member.closer_name, member.group_id, member.member_key, member.kind) == (
+            "page_stitcher",
+            EXPAND_GROUP,
+            members[0],
+            FrameKind.EXPAND,
+        )
 
     def test_empty_expand_group_is_vacuously_satisfiable(self) -> None:
         db = make_landscape_db()
