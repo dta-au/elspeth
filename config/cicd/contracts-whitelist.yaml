@@ -764,7 +764,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/guided/state_machine.py:GuidedSession.from_dict:d"
   # YAML generator — strips web-specific metadata from plugin options dicts
   # Options are dynamic (vary by plugin) so dict[str, Any] is the correct type
-  - "src/elspeth/web/composer/yaml_generator.py:generate_pipeline_dict:return"
   - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:options"
   - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:return"
   - "src/elspeth/web/composer/yaml_generator.py:_strip_profile_lowering_provenance:options"
@@ -1082,8 +1081,6 @@ allowed_dict_patterns:
   # These helpers bridge SQL composition rows to the existing YAML/runtime
   # serializer surface, whose canonical representation is intentionally a
   # dynamic pipeline dict keyed by plugin graph sections.
-  - "src/elspeth/web/blobs/service.py:_active_run_pipeline_dict:return"
-  - "src/elspeth/web/sessions/converters.py:pipeline_dict_from_record:return"
 
   # Contract checker import-indexing reconciliation (elspeth-b05961e6c2).
   # Editing scripts/check_contracts.py triggers the full contracts gate. The
@@ -1096,8 +1093,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/audit.py:_public_llm_call_audit_payload:return"
   - "src/elspeth/web/composer/yaml_generator.py:_has_blob_binding:options"
   - "src/elspeth/web/composer/yaml_generator.py:_has_bind_source_mode:options"
-  - "src/elspeth/web/composer/yaml_generator.py:_generate_pipeline_dict:return"
-  - "src/elspeth/web/composer/yaml_generator.py:generate_public_pipeline_dict:return"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._evaluate_terminal_no_tool_advisor_gate:llm_messages (list)"
   - "src/elspeth/web/composer/discovery_cache.py:make_cache_key:arguments"
   - "src/elspeth/web/sessions/service.py:_strip_guided_profile_in_meta:return"

@@ -38,6 +38,11 @@ PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
 PLANNER_TERMINAL_TOOL_NAME: Final[str] = "emit_pipeline_proposal"
 PLANNER_IMPLEMENTATION_ID: Final[str] = "elspeth.web.composer.pipeline_planner.plan_pipeline"
 
+# HAND-WRITTEN ON PURPOSE — the keys are the operand the capability-skill
+# identity pin CHECKS against ``COMPOSER_NODE_TYPES`` (derived from the
+# ``NodeType`` Literal); the values are guidance prose that cannot be derived
+# without inventing it. Derive the keys and the pin is ``x == x``
+# (elspeth-b3117ec3ac, comment 7980).
 CAPABILITY_CORE_NODE_GUIDANCE: Final[Mapping[str, str]] = MappingProxyType(
     {
         "aggregation": "[capability-node:aggregation]",

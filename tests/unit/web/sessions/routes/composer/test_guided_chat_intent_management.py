@@ -161,7 +161,7 @@ def test_unmentioned_unavailable_model_catalog_identity_precedes_weaker_routing_
 def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes() -> None:
     """A message naming only a collector gets the frame PLUS the collector clause.
 
-    Collector is deliberately absent from `_STRUCTURAL_NODE_TYPES` — that
+    Collector is deliberately absent from `PLUGIN_FREE_NODE_TYPES` — that
     tuple's copy asserts "not a transform plugin", which is false for a
     plugin-bearing collector — so the teaching composes into the frame instead
     (filigree elspeth-270e81443d).
@@ -185,7 +185,7 @@ def test_unmentioned_unavailable_model_catalog_identity_teaches_collector_scopes
     # the first two pass on every ancestor too, so they witness no change —
     # they are standing bans on a shape the reviewed draft had, kept because
     # the shape is tempting, not because this commit removed it. The third is
-    # NOT vacuous: adding `collector` to `_STRUCTURAL_NODE_TYPES` — the fix
+    # NOT vacuous: adding `collector` to `PLUGIN_FREE_NODE_TYPES` — the fix
     # this ticket originally specified and later overruled — makes it fire.
     assert "proposed for the collector" not in result.chat.assistant_message
     assert "batch-transform plugin I proposed" not in result.chat.assistant_message
@@ -323,7 +323,7 @@ def test_both_plugin_bearing_clauses_compose_in_one_frame() -> None:
 
     Same additive property as the collector/gate pair, extended to the kind
     added last. Named precisely: this message contains NO member of
-    `_STRUCTURAL_NODE_TYPES`, so it exercises collector + aggregation only, and
+    `PLUGIN_FREE_NODE_TYPES`, so it exercises collector + aggregation only, and
     those are the only two plugin-bearing clauses that exist (transform is
     deliberately excluded). The structural-before-aggregation half of the
     stated ordering is pinned by the test below, not by this one.
