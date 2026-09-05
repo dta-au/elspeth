@@ -16,6 +16,7 @@ import httpx
 import pytest
 from pydantic import SecretBytes
 
+from elspeth.web.auth.claims import IdTokenClaims
 from elspeth.web.auth.sso import SsoRuntime
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
@@ -153,7 +154,9 @@ async def test_a_wired_deployments_first_login_lands_pending(tmp_path: Path, sub
         _oidc_wired(tmp_path, idp), session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single"
     )
     assert wiring is not None
-    claims = wiring.map_identity({"sub": "ada", "iss": idp.issuer, "aud": idp.client_id}, None)
+    claims = wiring.map_identity(
+        IdTokenClaims(issuer=idp.issuer, subject="ada", audience=idp.client_id, issued_at=1_700_000_000, expires_at=1_700_000_300), None
+    )
     admitted = wiring.upsert_identity(claims)
     assert admitted.access_state == "pending"
     assert wiring.read_identity(admitted.identity_id) is not None

@@ -51,7 +51,7 @@ async def test_a_resolved_jwks_uri_is_fetched_directly_and_discovery_is_never_re
     jwks = await validator.ensure_jwks()
 
     assert seen == [idp.jwks_uri], "exactly one fetch, of exactly the resolved URL; discovery is not re-read"
-    assert jwks == idp.jwks_document()
+    assert [entry.key_id for entry in jwks.entries] == [key["kid"] for key in idp.jwks_document()["keys"]]
 
 
 @pytest.mark.asyncio
@@ -63,7 +63,23 @@ async def test_the_full_decode_with_refresh_accepts_the_well_behaved_provider(id
 
     claims = await validator.decode_id_token_with_refresh(token, audience=idp.client_id, nonce="n-1", client_id=idp.client_id)
 
-    assert claims["sub"] == "ada"
+    assert claims.subject == "ada"
+
+
+@pytest.mark.asyncio
+async def test_a_forced_refresh_of_an_unchanged_document_is_a_new_instance(idp: FakeIdP) -> None:
+    """The refresh path tells "someone already replaced the cache" from "still the set I
+    found insufficient" by IDENTITY, not by value: a re-fetch of the same document is a
+    new ``JwkSet``, equal to the old one and observably not it."""
+    validator = _validator(idp, idp.transport())
+    first = await validator.ensure_jwks()
+
+    second = await validator.ensure_jwks(refresh_if_unchanged=first)
+
+    assert second == first, "same document, so equal as a value"
+    assert second is not first, "but the refresh produced a new instance"
+    third = await validator.ensure_jwks(refresh_if_unchanged=first)
+    assert third is second, "a caller still holding the OLD set gets the replacement, without another fetch"
 
 
 @pytest.mark.asyncio
@@ -104,5 +120,5 @@ async def test_a_key_miss_refreshes_from_the_same_resolved_uri(idp: FakeIdP) -> 
 
     claims = await validator.decode_id_token_with_refresh(token, audience=idp.client_id, nonce="n-1", client_id=idp.client_id)
 
-    assert claims["sub"] == "ada"
+    assert claims.subject == "ada"
     assert seen == [idp.jwks_uri, idp.jwks_uri], "one initial fetch, one key-miss refresh, both to the resolved URL"

@@ -43,7 +43,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Final, Literal, NamedTuple, Protocol, TypedDict, cast
+from typing import ClassVar, Final, Literal, NamedTuple, Protocol, TypedDict, cast
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -53,6 +53,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims, optional_string_claim
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims, UserIdentity, UserProfile
 from elspeth.web.auth.session_token import SessionTokenIssuer
@@ -567,23 +568,25 @@ class SsoDiscoveryFailed(SsoLoginError):
     category: ClassVar[str] = PROVIDER_UNAVAILABLE_CATEGORY
 
 
-def _discovery_string(document: Mapping[str, Any], key: str, *, required: bool) -> str | None:
-    """Read one endpoint URL out of a Tier-3 discovery document.
+def _required_discovery_url(value: object, key: str) -> str:
+    """Read one required endpoint URL out of a Tier-3 discovery document.
 
-    Membership-then-subscript rather than ``.get()``: absence is a decision
-    this function makes explicitly, and for a required endpoint it is fatal.
-    A present-but-wrong-type value is fatal in both cases — a document that
-    puts an object where a URL belongs is not one to take the rest of on
-    trust.
+    Absence is fatal, and so is a present-but-wrong-type value — a document
+    that puts an object where a URL belongs is not one to take the rest of
+    on trust.
     """
-    value = document[key] if key in document else None
     if value is None:
-        if required:
-            raise SsoDiscoveryFailed(f"discovery document is missing a usable {key!r}")
-        return None
-    if not isinstance(value, str) or not value.strip():
+        raise SsoDiscoveryFailed(f"discovery document is missing a usable {key!r}")
+    if type(value) is not str or not value.strip():
         raise SsoDiscoveryFailed(f"discovery document {key!r} is not a non-empty string")
     return value
+
+
+def _optional_discovery_url(value: object, key: str) -> str | None:
+    """An endpoint the document may omit; when present it is held to the same rule."""
+    if value is None:
+        return None
+    return _required_discovery_url(value, key)
 
 
 def discovery_endpoints(document: object, *, issuer: str, expected_origins: frozenset[str]) -> DiscoveredEndpoints:
@@ -602,10 +605,14 @@ def discovery_endpoints(document: object, *, issuer: str, expected_origins: froz
     """
     if not isinstance(document, dict):
         raise SsoDiscoveryFailed(f"discovery document is not a JSON object (got {type(document).__name__})")
-    mapping = cast("Mapping[str, Any]", document)
 
-    document_issuer = mapping["issuer"] if "issuer" in mapping else None
-    if not isinstance(document_issuer, str) or document_issuer != issuer:
+    # Membership-then-subscript rather than ``.get()``: absence is a decision
+    # the readers below make explicitly, and this is foreign data.
+    def field_value(key: str) -> object:
+        return document[key] if key in document else None
+
+    document_issuer = field_value("issuer")
+    if type(document_issuer) is not str or document_issuer != issuer:
         # Neither value is echoed: one is remote-supplied and the other names
         # the deployment's IdP.
         raise SsoDiscoveryFailed("discovery document failed the exact issuer check")
@@ -613,10 +620,10 @@ def discovery_endpoints(document: object, *, issuer: str, expected_origins: froz
     try:
         return validate_discovered_endpoints(
             DiscoveredEndpoints(
-                authorization_endpoint=cast("str", _discovery_string(mapping, "authorization_endpoint", required=True)),
-                token_endpoint=cast("str", _discovery_string(mapping, "token_endpoint", required=True)),
-                jwks_uri=cast("str", _discovery_string(mapping, "jwks_uri", required=True)),
-                userinfo_endpoint=_discovery_string(mapping, "userinfo_endpoint", required=False),
+                authorization_endpoint=_required_discovery_url(field_value("authorization_endpoint"), "authorization_endpoint"),
+                token_endpoint=_required_discovery_url(field_value("token_endpoint"), "token_endpoint"),
+                jwks_uri=_required_discovery_url(field_value("jwks_uri"), "jwks_uri"),
+                userinfo_endpoint=_optional_discovery_url(field_value("userinfo_endpoint"), "userinfo_endpoint"),
             ),
             expected_origins=expected_origins,
         )
@@ -861,8 +868,7 @@ class RedeemedTokens:
     access_token: str = field(repr=False)
 
 
-def _token_string(document: Mapping[str, Any], key: str) -> str:
-    value = document[key] if key in document else None
+def _token_string(value: object, key: str) -> str:
     if type(value) is not str or not value:
         raise SsoTokenExchangeFailed(f"token response {key!r} is not a non-empty string")
     return value
@@ -887,10 +893,16 @@ def parse_token_response(document: object) -> RedeemedTokens:
     """
     if not isinstance(document, dict):
         raise SsoTokenExchangeFailed(f"token response is not a JSON object (got {type(document).__name__})")
-    mapping = cast("Mapping[str, Any]", document)
-    if _token_string(mapping, "token_type").lower() != "bearer":
+
+    def field_value(key: str) -> object:
+        return document[key] if key in document else None
+
+    if _token_string(field_value("token_type"), "token_type").lower() != "bearer":
         raise SsoTokenExchangeFailed("token response token_type is not Bearer")
-    return RedeemedTokens(id_token=_token_string(mapping, "id_token"), access_token=_token_string(mapping, "access_token"))
+    return RedeemedTokens(
+        id_token=_token_string(field_value("id_token"), "id_token"),
+        access_token=_token_string(field_value("access_token"), "access_token"),
+    )
 
 
 def _client_secret_basic(client_id: str, client_secret: str) -> str:
@@ -972,7 +984,7 @@ def _media_type(content_type: str) -> str:
     test_ref="tests/unit/web/auth/test_sso_callback.py::TestUserinfoBoundary::test_parse_userinfo_non_dict_raises",
     test_fingerprint="ede8a61e1355122e70018faa82b2941179b4e5e3427298d79a4502ea9b223bc5",
 )
-def parse_userinfo(document: object, *, expected_subject: str) -> Mapping[str, Any]:
+def parse_userinfo(document: object, *, expected_subject: str) -> UserinfoClaims:
     """Bind a userinfo body to the ID token it was fetched for.
 
     The ONE check that is this function's own: userinfo ``sub`` must equal
@@ -980,18 +992,27 @@ def parse_userinfo(document: object, *, expected_subject: str) -> Mapping[str, A
     proxy in front of one) that answers userinfo with a different person's
     claims would have those claims attached to the verified identity.
 
-    The remaining claims are not read here. The profile's ``map_identity``
-    reads exactly the keys it declares and constructs the owned
-    ``IdentityClaims``; this function's job is to establish that the body is
-    an object about the right subject, and to hand over nothing else.
+    This is the userinfo document's one boundary: the profile fields the
+    VANguard mapping reads come out as the owned :class:`UserinfoClaims`,
+    each a visible string or ``None``, and nothing else in the body is
+    carried past this line.
     """
     if not isinstance(document, dict):
         raise SsoUserinfoInvalid(f"userinfo response is not a JSON object (got {type(document).__name__})")
-    mapping = cast("Mapping[str, Any]", document)
-    subject = mapping["sub"] if "sub" in mapping else None
+
+    def field_value(key: str) -> object:
+        return document[key] if key in document else None
+
+    subject = field_value("sub")
     if type(subject) is not str or not hmac.compare_digest(subject.encode("utf-8"), expected_subject.encode("utf-8")):
         raise SsoUserinfoInvalid("userinfo sub does not match the ID token")
-    return mapping
+    return UserinfoClaims(
+        subject=subject,
+        email=optional_string_claim(field_value("email")),
+        given_name=optional_string_claim(field_value("given_name")),
+        family_name=optional_string_claim(field_value("family_name")),
+        abn=optional_string_claim(field_value("abn")),
+    )
 
 
 async def fetch_userinfo(
@@ -1000,7 +1021,7 @@ async def fetch_userinfo(
     access_token: str,
     expected_subject: str,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> Mapping[str, Any]:
+) -> UserinfoClaims:
     """Fetch userinfo for the subject just verified, or refuse.
 
     Spec §Userinfo: 200, ``application/json``, at most 64 KiB, an object
@@ -1129,8 +1150,8 @@ async def login_callback(
     *,
     client: SsoClient,
     validator: JWKSTokenValidator,
-    claim_checks: Callable[[Mapping[str, Any]], None],
-    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims],
+    claim_checks: Callable[[IdTokenClaims], None],
+    map_identity: Callable[[IdTokenClaims, UserinfoClaims | None], IdentityClaims],
     upsert_identity: Callable[[IdentityClaims], AdmittedIdentity],
     record_login: Callable[[AdmittedIdentity], None],
     handoffs: HandoffStore,
@@ -1151,7 +1172,7 @@ async def login_callback(
     3. ID-token verification, with the nonce from the cookie;
     4. the profile's own claim checks;
     5. userinfo, only if the profile needs it, bound to the ID token's sub;
-    6. ``map_identity`` — the Tier-3 boundary that yields the owned claims;
+    6. ``map_identity`` — the profile's reading of the owned claims into ``IdentityClaims``;
     7. the IdP's tokens are dropped: nothing after this line can see them;
     8. upsert, audit ``login``, THEN issue the handoff.
 
@@ -1201,19 +1222,13 @@ async def login_callback(
     except AuthenticationError as exc:
         raise SsoClaimCheckFailed from exc
 
-    userinfo: Mapping[str, Any] | None = None
+    userinfo: UserinfoClaims | None = None
     if client.userinfo:
-        # ``sub`` is in the decoder's required-claims list, so it is present
-        # and a string here; the membership form is kept because this is
-        # still foreign data and the accessor should look like one.
-        subject = id_claims["sub"] if "sub" in id_claims else None
-        if type(subject) is not str:
-            raise SsoIdTokenInvalid
         userinfo = await fetch_userinfo(
             # ``__post_init__`` made this non-None whenever ``client.userinfo``.
             userinfo_endpoint=cast("str", client.endpoints.userinfo_endpoint),
             access_token=tokens.access_token,
-            expected_subject=subject,
+            expected_subject=id_claims.subject,
             transport=transport,
         )
 
@@ -1373,8 +1388,8 @@ class SsoRuntime:
 
     client: SsoClient
     validator: JWKSTokenValidator
-    claim_checks: Callable[[Mapping[str, Any]], None]
-    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims]
+    claim_checks: Callable[[IdTokenClaims], None]
+    map_identity: Callable[[IdTokenClaims, UserinfoClaims | None], IdentityClaims]
     handoffs: HandoffStore
     upsert_identity: Callable[[IdentityClaims], AdmittedIdentity]
     read_identity: Callable[[str], AdmittedIdentity | None]

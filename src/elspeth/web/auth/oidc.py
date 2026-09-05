@@ -12,34 +12,17 @@ importing from here until both go together.
 
 from __future__ import annotations
 
-from typing import Any, cast
-
 import httpx
 import structlog
 
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.auth.id_token import JWKSTokenValidator
-from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+from elspeth.web.auth.models import UserIdentity, UserProfile
 from elspeth.web.auth.providers import get_profile
-from elspeth.web.validation import has_visible_content
 
-__all__ = ["JWKSTokenValidator", "OIDCAuthProvider", "optional_profile_claim"]
+__all__ = ["JWKSTokenValidator", "OIDCAuthProvider"]
 
 slog = structlog.get_logger()
-
-
-def optional_profile_claim(payload: dict[str, Any], claim_name: str) -> str | None:
-    """Return optional cosmetic IdP claims as visible strings or None."""
-    # Tier-3 token claims: an optional claim may simply be absent. Read it
-    # explicitly (membership-then-subscript) so the "absent -> None" step is
-    # visible decision-making rather than a `.get()` that hides it.
-    value = payload[claim_name] if claim_name in payload else None
-    if value is None or not isinstance(value, str):
-        return None
-    claim_value = cast(str, value)
-    if not has_visible_content(claim_value):
-        return None
-    return claim_value
 
 
 class OIDCAuthProvider:
@@ -75,28 +58,15 @@ class OIDCAuthProvider:
 
     async def authenticate(self, token: str) -> UserIdentity:
         """Validate an OIDC token and return the authenticated identity."""
-        payload = dict(await self._validator.decode_token_with_refresh(token))
+        claims = await self._validator.decode_token_with_refresh(token)
 
-        try:
-            sub = payload["sub"]
-        except KeyError as exc:
-            raise AuthenticationError("Missing required 'sub' claim in token") from exc
-
-        # preferred_username is an optional cosmetic claim. Decide the username
-        # explicitly: use the IdP-supplied visible value when present, otherwise
-        # fall back to the canonical `sub` identifier (always a valid principal).
-        preferred_username = self._optional_profile_claim(payload, "preferred_username")
-        username = preferred_username if preferred_username is not None else sub
-
+        # preferred_username is an optional cosmetic claim, read as None by
+        # the token boundary when absent or not a visible string; fall back
+        # to the canonical `sub` identifier (always a valid principal).
         return UserIdentity(
-            user_id=sub,
-            username=username,
+            user_id=claims.subject,
+            username=claims.preferred_username if claims.preferred_username is not None else claims.subject,
         )
-
-    @staticmethod
-    def _optional_profile_claim(payload: dict[str, Any], claim_name: str) -> str | None:
-        """Return optional cosmetic claims as visible strings or None."""
-        return optional_profile_claim(payload, claim_name)
 
     @trust_boundary(
         tier=3,
@@ -108,40 +78,21 @@ class OIDCAuthProvider:
         test_fingerprint="cefa7844868a4e9b7662d3966a910dc1698332f477a06c5b9050ddb699657898",
     )
     async def get_user_info(self, token: str) -> UserProfile:
-        """Decode the OIDC token and extract profile claims."""
-        payload = dict(await self._validator.decode_token_with_refresh(token))
+        """Decode the OIDC token and extract profile claims.
 
-        try:
-            sub = payload["sub"]
-        except KeyError as exc:
-            raise AuthenticationError("Missing required 'sub' claim in token") from exc
+        The ``groups`` shape rule (absent is none, a list is coerced to
+        strings, anything else is refused) is applied by the token boundary
+        in ``auth/id_token.py``; this reads the owned result.
+        """
+        claims = await self._validator.decode_token_with_refresh(token)
 
-        raw_groups = payload.get("groups")
-        if raw_groups is None:
-            groups: list[str] = []
-        elif isinstance(raw_groups, list):
-            # Coerce group IDs to str — IdPs may send integers (e.g. Entra
-            # group object IDs). This is intentional Tier 3 coercion.
-            groups = [str(g) for g in raw_groups]
-        else:
-            raise AuthenticationError(
-                f"Unexpected type for 'groups' claim: {type(raw_groups).__name__} (expected list) — check IdP token configuration"
-            )
-
-        display_name = self._optional_profile_claim(payload, "name")
-        if display_name is None:
-            display_name = self._optional_profile_claim(payload, "preferred_username")
-
-        # preferred_username is an optional cosmetic claim. Decide the username
-        # explicitly: use the IdP-supplied visible value when present, otherwise
-        # fall back to the canonical `sub` identifier (always a valid principal).
-        preferred_username = self._optional_profile_claim(payload, "preferred_username")
-        username = preferred_username if preferred_username is not None else sub
+        display_name = claims.name if claims.name is not None else claims.preferred_username
+        username = claims.preferred_username if claims.preferred_username is not None else claims.subject
 
         return UserProfile(
-            user_id=sub,
+            user_id=claims.subject,
             username=username,
             display_name=display_name,
-            email=self._optional_profile_claim(payload, "email"),
-            groups=tuple(groups),
+            email=claims.email,
+            groups=claims.groups,
         )

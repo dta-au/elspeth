@@ -179,7 +179,7 @@ class TestEntraTenantValidation:
         private_key, _ = rsa_keypair
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_entra_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -473,7 +473,7 @@ class TestEntraGetUserInfoTenantValidation:
         private_key, _ = rsa_keypair
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_entra_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.get_user_info(token)
 
     @pytest.mark.asyncio
