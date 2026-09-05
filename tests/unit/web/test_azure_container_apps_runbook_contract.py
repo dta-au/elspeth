@@ -57,6 +57,7 @@ CHECK_KINDS = (
     "replica-lease-takeover",
     "replica-progress",
     "resource-graph-cleanup",
+    "testcontainer-run",
 )
 
 
@@ -330,6 +331,22 @@ def test_receipt_vocabulary_is_closed_and_named() -> None:
         assert f"`{kind}`" in receipt, kind
     assert "in **one commit**" in receipt
     assert "the bar is a second clean run end to end" in receipt
+
+
+def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None:
+    """6b-4 option (b): the ACA driver records CI's exact testcontainer selection and the shared gate requires it."""
+    from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_RUN_GATE_REASONS, TESTCONTAINER_SELECTION
+
+    text = _text(ACCEPTANCE_RUNBOOK)
+    section = text[text.index("## Testcontainer run") : text.index("## Evidence")]
+    assert "uv run --frozen pytest " + " ".join(TESTCONTAINER_SELECTION) in section
+    assert "python -m elspeth.web._acceptance_common.testcontainer_run" in section
+    assert "--provider azure" in section
+    assert "`testcontainer_run_gate`" in section
+    for reason in sorted(TESTCONTAINER_RUN_GATE_REASONS - {"testcontainer_run_invalid"}):
+        assert f"`{reason}`" in section, reason
+    assert "no external-DSN seam exists in the tree" in " ".join(section.split())
+    assert text.index("## Connection budget") < text.index("## Testcontainer run") < text.index("## Evidence")
 
 
 def test_skill_mirrors_the_ecs_layout_and_worktree_guidance() -> None:

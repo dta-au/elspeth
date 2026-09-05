@@ -281,3 +281,85 @@ def test_module_is_executable_with_the_running_interpreter(tmp_path: Path) -> No
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["schema"] == tr.TESTCONTAINER_RUN_SCHEMAS["azure"]
+
+
+# --- the ONE gate predicate -------------------------------------------------
+
+
+def _index_and_reader(*receipts: dict[str, object]) -> tuple[list[dict[str, object]], dict[str, object]]:
+    index: list[dict[str, object]] = []
+    store: dict[str, object] = {}
+    for receipt in receipts:
+        sha = _sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode())
+        index.append(
+            {
+                "scenario_id": receipt["scenario_id"],
+                "kind": receipt["kind"],
+                "subject_sha256": _sha256(str(receipt["junit_sha256"]).encode()),
+                "receipt_sha256": sha,
+                "stored_at": "2026-09-05T06:00:00Z",
+            }
+        )
+        store[sha] = receipt
+    return index, store
+
+
+def _gate(index: list[dict[str, object]], store: dict[str, object], *, provider: tr.Provider = "aws") -> tr.TestcontainerRunGateVerdict:
+    return tr.testcontainer_run_gate(index, provider=provider, candidate_sha=CANDIDATE, read_receipt=lambda sha: store[sha])
+
+
+@pytest.mark.parametrize("provider", ["aws", "azure"])
+def test_gate_passes_only_with_exactly_one_passing_run(provider: tr.Provider) -> None:
+    clean = tr.parse_junit_report(_junit([None, None]))
+    passing = _receipt(provider, exit_code=0, record=clean)
+    index, store = _index_and_reader(passing)
+    verdict = _gate(index, store, provider=provider)
+    assert verdict.passed and verdict.reason is None
+    assert verdict.receipt_sha256 == index[0]["receipt_sha256"]
+    # Under the other provider the same store is invalid, never silently passing.
+    other: tr.Provider = "azure" if provider == "aws" else "aws"
+    assert _gate(index, store, provider=other) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_invalid", None)
+
+
+def test_gate_refuses_absence_failure_ambiguity_and_tampering() -> None:
+    clean = tr.parse_junit_report(_junit([None, None]))
+    passing = _receipt(exit_code=0, record=clean)
+    failed = _receipt(exit_code=1)
+    other_passing = _receipt(exit_code=0, record=tr.parse_junit_report(_junit([None, None, None])))
+    verify_s3 = {"kind": "verify-s3", "scenario_id": "A", "junit_sha256": "0" * 64}
+
+    assert _gate(*_index_and_reader()) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_missing", None)
+    assert _gate(*_index_and_reader(verify_s3)) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_missing", None)
+    assert _gate(*_index_and_reader(failed)) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_failed", None)
+    assert _gate(*_index_and_reader(passing, other_passing)) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_ambiguous", None)
+    # A failed run superseded by a passing one passes on the passing receipt.
+    index, store = _index_and_reader(failed, passing)
+    assert _gate(index, store) == tr.TestcontainerRunGateVerdict(True, None, index[1]["receipt_sha256"])
+    # Tampered document: the index row no longer hashes the stored bytes.
+    index, store = _index_and_reader(passing)
+    store[str(index[0]["receipt_sha256"])] = {**passing, "recorded_at": "2026-09-05T07:00:00Z"}
+    assert _gate(index, store) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_invalid", None)
+    # Wrong candidate on the receipt.
+    index, store = _index_and_reader(passing)
+    assert tr.testcontainer_run_gate(
+        index, provider="aws", candidate_sha="d" * 40, read_receipt=lambda sha: store[sha]
+    ) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_invalid", None)
+    # Non-string receipt hash in the index.
+    assert _gate([{**index[0], "receipt_sha256": 1}], store) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_invalid", None)
+    with pytest.raises(AcceptanceInputError):
+        _gate(index, store, provider="gcp")  # type: ignore[arg-type]
+
+
+def test_gate_verdict_is_internally_consistent() -> None:
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunGateVerdict(passed=True, reason="testcontainer_run_failed", receipt_sha256="a" * 64)
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunGateVerdict(passed=False, reason=None, receipt_sha256=None)
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunGateVerdict(passed=False, reason="nope", receipt_sha256=None)  # type: ignore[arg-type]
+    assert set(tr.TESTCONTAINER_RUN_GATE_REASONS) == {
+        "testcontainer_run_missing",
+        "testcontainer_run_ambiguous",
+        "testcontainer_run_invalid",
+        "testcontainer_run_failed",
+    }

@@ -11,7 +11,8 @@ the run wrote. The receipt is a record of what ran, not a verdict: a failing
 run is recorded with its exit code, and whether that blocks the gate is the
 evidence ledger's decision (its ``tests`` stage), never this module's.
 
-One validator serves both providers; each binds its own schema id
+One validator and ONE gate predicate (:func:`testcontainer_run_gate`) serve both
+providers; each binds its own schema id
 (:data:`TESTCONTAINER_RUN_SCHEMAS`). The kind is NEW in 0.8.0 — no existing
 receipt gains a field, so every receipt produced before its introduction
 validates byte-for-byte as before, and every field of a ``testcontainer-run``
@@ -28,7 +29,7 @@ import argparse
 import json
 import stat
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -297,6 +298,93 @@ def validate_testcontainer_run_receipt(
     ):
         raise AcceptanceCheckError("receipt_store_binding")
     return payload
+
+
+GateReason = Literal[
+    "testcontainer_run_missing",
+    "testcontainer_run_ambiguous",
+    "testcontainer_run_invalid",
+    "testcontainer_run_failed",
+]
+TESTCONTAINER_RUN_GATE_REASONS: Final[frozenset[str]] = frozenset(
+    {"testcontainer_run_missing", "testcontainer_run_ambiguous", "testcontainer_run_invalid", "testcontainer_run_failed"}
+)
+"""The closed set of reasons the gate refuses with; each names exactly what the store lacked."""
+
+
+@dataclass(frozen=True)
+class TestcontainerRunGateVerdict:
+    """Whether the candidate has exactly one passing testcontainer run on record, and which receipt proves it."""
+
+    passed: bool
+    reason: GateReason | None
+    receipt_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if self.passed != (self.reason is None) or self.passed != (self.receipt_sha256 is not None):
+            raise ValueError("a passing verdict names its receipt and no reason; a refusal names its reason and no receipt")
+        if self.reason is not None and self.reason not in TESTCONTAINER_RUN_GATE_REASONS:
+            raise ValueError("gate reason must be one of the closed set")
+
+
+def _canonical_sha256(document: Mapping[str, object]) -> str:
+    return _sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def testcontainer_run_gate(
+    receipt_index: Sequence[Mapping[str, object]],
+    *,
+    provider: Provider,
+    candidate_sha: str,
+    read_receipt: Callable[[str], object],
+) -> TestcontainerRunGateVerdict:
+    """The ONE gate predicate: refuse unless exactly one passing testcontainer run is on record.
+
+    ``receipt_index`` is the provider's already-validated receipt index (the
+    ECS control manifest's ``evidence.receipts`` rows: ``scenario_id``,
+    ``kind``, ``subject_sha256``, ``receipt_sha256``, ``stored_at``);
+    ``read_receipt`` loads the stored document for one ``receipt_sha256``.
+    Every ``testcontainer-run`` row is validated for ``provider`` and
+    ``candidate_sha`` through :func:`validate_testcontainer_run_receipt`, and
+    the document must hash to the row that indexes it. A candidate passes iff
+    exactly one such receipt validates AND records exit code 0: no receipt is
+    ``testcontainer_run_missing``; a receipt that no longer validates (or hashes
+    elsewhere) is ``testcontainer_run_invalid``; only failing runs on record is
+    ``testcontainer_run_failed`` (a failed run stays in the store as evidence
+    and is superseded, not erased, by a later passing one); more than one
+    passing run is ``testcontainer_run_ambiguous``. Absence is a refusal, never
+    a pass: a candidate whose driver skipped the run cannot export evidence.
+    """
+
+    if provider not in TESTCONTAINER_RUN_SCHEMAS:
+        raise AcceptanceInputError("provider must be aws or azure")
+    rows = [row for row in receipt_index if row["kind"] == TESTCONTAINER_RUN_RECEIPT_KIND]
+    if not rows:
+        return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_missing", receipt_sha256=None)
+    passing: list[str] = []
+    for row in rows:
+        receipt_sha256 = row["receipt_sha256"]
+        if type(receipt_sha256) is not str:
+            return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)
+        try:
+            document = validate_testcontainer_run_receipt(
+                read_receipt(receipt_sha256),
+                provider=provider,
+                candidate_sha=candidate_sha,
+                scenario_id=str(row["scenario_id"]),
+                subject_sha256=str(row["subject_sha256"]),
+            )
+        except AcceptanceCheckError:
+            return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)
+        if _canonical_sha256(document) != receipt_sha256:
+            return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)
+        if document["exit_code"] == 0:
+            passing.append(receipt_sha256)
+    if not passing:
+        return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_failed", receipt_sha256=None)
+    if len(passing) > 1:
+        return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_ambiguous", receipt_sha256=None)
+    return TestcontainerRunGateVerdict(passed=True, reason=None, receipt_sha256=passing[0])
 
 
 def build_parser() -> argparse.ArgumentParser:
