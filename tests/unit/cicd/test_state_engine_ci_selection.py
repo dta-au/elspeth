@@ -165,6 +165,27 @@ def test_always_on_test_job_runs_the_ci_equivalent_selection() -> None:
     assert "pytest tests/" in commands
 
 
+def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
+    """The Test job's marker selection is pyproject addopts', never a copy.
+
+    A ``-m`` on the pytest command line replaces the one in addopts, so a
+    copy in ci.yaml can drift. It did: the CI expression omitted
+    ``not live_provider``, 56 live-provider nodes were selected, and
+    tests/conftest.py refused them with a UsageError inside every xdist
+    worker — which xdist surfaces only as an anonymous crashed first item,
+    so both Test matrix entries died before any result on every push
+    (elspeth-6128fc7f95, elspeth-515183ac5a). The selection is pinned once,
+    in ``test_default_selection_excludes_protected_live_lanes``; here we pin
+    that no ``pytest`` invocation in the Test job re-states it.
+    """
+    pytest_steps = [step for step in _job("test")["steps"] if "pytest" in str(step.get("run", ""))]
+    assert len(pytest_steps) == 2, [step.get("name") for step in pytest_steps]
+    for step in pytest_steps:
+        tokens = step["run"].replace("\\\n", " ").split()
+        assert "-m" not in tokens, step.get("name")
+        assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), step.get("name")
+
+
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
     """The testcontainer job is the ONLY run of the ``testcontainer`` ids.
 
