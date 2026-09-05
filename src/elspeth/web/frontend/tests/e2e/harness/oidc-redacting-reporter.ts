@@ -18,8 +18,8 @@ const CREDENTIAL_ENV_NAMES = [
 ] as const;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\b/g;
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/gi;
-const KEYED_SECRET_PATTERN = /\b(code|state|code_verifier|access_token|refresh_token|id_token|token|password|username)=([^\s&;]+)/gi;
-const STRUCTURED_SECRET_PATTERN = /((?:["'](?:code|state|code_verifier|access_token|refresh_token|id_token|token)["']|\b(?:code|state|code_verifier|access_token|refresh_token|id_token|token)\b)\s*:\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,}\r\n]+)/gi;
+const KEYED_SECRET_PATTERN = /\b(code|state|nonce|code_challenge|code_verifier|client_secret|access_token|refresh_token|id_token|token|password|username)=([^\s&;]+)/gi;
+const STRUCTURED_SECRET_PATTERN = /((?:["'](?:code|state|nonce|code_challenge|code_verifier|client_secret|access_token|refresh_token|id_token|token)["']|\b(?:code|state|nonce|code_challenge|code_verifier|client_secret|access_token|refresh_token|id_token|token)\b)\s*:\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,}\r\n]+)/gi;
 const HEADER_PATTERN = /^(authorization|cookie|set-cookie|proxy-authorization|x-api-key)\s*:\s*.*$/gim;
 const STRUCTURED_HEADER_PATTERN = /(["'](?:authorization|cookie|set-cookie|proxy-authorization|x-api-key)["']\s*:\s*)(["'][^"'\r\n]*["']|[^,}\r\n]+)/gi;
 const MAX_REPORTED_CHARS = 16 * 1024;

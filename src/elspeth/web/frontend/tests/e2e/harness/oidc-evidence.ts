@@ -14,8 +14,29 @@ import { basename, dirname, join } from "node:path";
 const MAX_JWT_BYTES = 16 * 1024;
 const MAX_JWT_PAYLOAD_BYTES = 8 * 1024;
 const MAX_EVIDENCE_BYTES = 64 * 1024;
+const MAX_URL_BYTES = 16 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
+/** S256 code challenge: base64url of a 32-byte digest, unpadded. */
+const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+/** The handoff code the backend puts in the fragment: token_urlsafe, bounded like SsoCompleteRequest. */
+const HANDOFF_CODE = /^[A-Za-z0-9_-]{1,128}$/;
+/** The session token's `iss`: web/auth/session_token.py `_ISSUER`. */
+const SESSION_TOKEN_ISSUER = "elspeth";
+
+/**
+ * What this harness proves, and what it deliberately does not.
+ *
+ * The backend is the confidential client (spec D2). The browser therefore
+ * never sees the IdP's token endpoint, the client secret, or an IdP-minted
+ * token; it sees the authorization REQUEST the backend redirects it to, the
+ * callback LANDING (`#/auth/callback?code=<handoff>` in the fragment), and
+ * the ELSPETH session token that POST /api/auth/sso/complete returns. Every
+ * validator here checks one of those three observable things. The IdP
+ * issuer is NOT observable from the browser and is not recorded as if it
+ * had been verified: the backend pins it, and the backend's own tests prove
+ * that pin.
+ */
 
 export const OIDC_EVIDENCE_PHASES = [
   "previous-before-candidate",
@@ -25,7 +46,6 @@ export const OIDC_EVIDENCE_PHASES = [
 ] as const;
 
 export type OidcEvidencePhase = (typeof OIDC_EVIDENCE_PHASES)[number];
-export type OidcAudienceClaim = "aud" | "client_id";
 
 export class OidcEvidenceError extends Error {
   constructor(readonly check: string) {
@@ -35,41 +55,34 @@ export class OidcEvidenceError extends Error {
 }
 
 interface ExpectedOidc {
-  issuer: string;
+  /** The IdP client id, observed on the authorization request. */
   audience: string;
+  /** The exact HTTPS origin the authorization request must go to. */
   authorizationOrigin: string;
-}
-
-interface TokenExpectations extends ExpectedOidc {
-  audienceClaim: OidcAudienceClaim;
+  /** The deployment under test: the SPA's origin, the callback's origin, and the session token's `aud`. */
+  stagingOrigin: string;
 }
 
 interface AuthConfigDocument {
   provider?: unknown;
-  oidc_issuer?: unknown;
-  oidc_client_id?: unknown;
-  authorization_endpoint?: unknown;
-  token_endpoint?: unknown;
+  registration_mode?: unknown;
+  sso_start_url?: unknown;
 }
 
 export interface ValidatedAuthConfig {
-  issuer: string;
-  audience: string;
-  authorizationOrigin: string;
-  tokenEndpoint: string;
+  ssoStartUrl: string;
 }
 
-export interface ValidatedAccessToken {
+export interface ValidatedSessionToken {
   subjectSha256: string;
 }
 
 export interface OidcEvidence {
   phase: OidcEvidencePhase;
   timestamp: string;
-  issuer: string;
-  authorization_origin: string;
-  audience_claim: OidcAudienceClaim;
   audience: string;
+  authorization_origin: string;
+  token_audience: string;
   subject_sha256: string;
   auth_me_status: 200;
   session_create_status: 201;
@@ -81,7 +94,6 @@ export interface OidcEvidence {
 interface BuildOidcEvidenceInput extends ExpectedOidc {
   phase: OidcEvidencePhase;
   timestamp: string;
-  audienceClaim: OidcAudienceClaim;
   subjectSha256: string;
   authMeStatus: number;
   sessionCreateStatus: number;
@@ -115,48 +127,103 @@ function exactHttpsOrigin(value: unknown, check: string): string {
   return canonical;
 }
 
-function exactHttpsUrl(value: unknown, expectedOrigin: string, check: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 4096) {
+function parseBoundedUrl(value: unknown, check: string): URL {
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > MAX_URL_BYTES) {
     throw new OidcEvidenceError(check);
   }
-  let parsed: URL;
   try {
-    parsed = new URL(value);
+    return new URL(value);
   } catch {
     throw new OidcEvidenceError(check);
   }
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.origin !== expectedOrigin ||
-    parsed.search !== "" ||
-    parsed.hash !== ""
-  ) {
-    throw new OidcEvidenceError(check);
-  }
-  return value;
 }
 
-export function validateAuthConfig(config: AuthConfigDocument, expected: ExpectedOidc): ValidatedAuthConfig {
-  const authorizationOrigin = exactHttpsOrigin(expected.authorizationOrigin, "oidc_expected_origin");
+/**
+ * GET /api/auth/config must say: SSO deployment, closed registration, and a
+ * start URL that is THIS deployment's /api/auth/sso/start — not an IdP URL,
+ * not another origin. A config that still published IdP endpoints would be
+ * the old browser-client path, which is exactly what this harness must not
+ * accept as evidence.
+ */
+export function validateAuthConfig(config: AuthConfigDocument, expected: Pick<ExpectedOidc, "stagingOrigin">): ValidatedAuthConfig {
+  const stagingOrigin = exactHttpsOrigin(expected.stagingOrigin, "oidc_staging_origin");
   if (
     config.provider !== "oidc" ||
-    typeof expected.issuer !== "string" ||
-    !expected.issuer ||
-    typeof expected.audience !== "string" ||
-    !expected.audience ||
-    config.oidc_issuer !== expected.issuer ||
-    config.oidc_client_id !== expected.audience
+    config.registration_mode !== "closed" ||
+    Object.keys(config).sort().join(",") !== "provider,registration_mode,sso_start_url" ||
+    config.sso_start_url !== `${stagingOrigin}/api/auth/sso/start`
   ) {
     throw new OidcEvidenceError("oidc_auth_config");
   }
-  const authorizationEndpoint = exactHttpsUrl(config.authorization_endpoint, authorizationOrigin, "oidc_auth_config");
-  const tokenEndpoint = exactHttpsUrl(config.token_endpoint, authorizationOrigin, "oidc_auth_config");
-  if (authorizationEndpoint === tokenEndpoint) {
-    throw new OidcEvidenceError("oidc_auth_config");
+  return { ssoStartUrl: config.sso_start_url };
+}
+
+/**
+ * The authorization request the backend redirected the browser to. It must
+ * carry the confidential client's id, name the BACKEND callback as the
+ * redirect target, use S256 PKCE, bind a state and a nonce, and carry no
+ * secret or verifier. The values of state, nonce and challenge are not
+ * returned: the harness has no use for them and must not leak them.
+ */
+export function validateAuthorizationRequest(url: unknown, expected: ExpectedOidc): void {
+  const authorizationOrigin = exactHttpsOrigin(expected.authorizationOrigin, "oidc_expected_origin");
+  const stagingOrigin = exactHttpsOrigin(expected.stagingOrigin, "oidc_staging_origin");
+  if (typeof expected.audience !== "string" || !expected.audience) {
+    throw new OidcEvidenceError("oidc_expected_audience");
   }
-  return { issuer: expected.issuer, audience: expected.audience, authorizationOrigin, tokenEndpoint };
+  const parsed = parseBoundedUrl(url, "oidc_authorization_request");
+  const params = parsed.searchParams;
+  const single = (name: string): string | null => {
+    const values = params.getAll(name);
+    return values.length === 1 ? values[0] : null;
+  };
+  if (
+    parsed.origin !== authorizationOrigin ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.hash !== "" ||
+    single("response_type") !== "code" ||
+    single("client_id") !== expected.audience ||
+    single("redirect_uri") !== `${stagingOrigin}/api/auth/sso/callback` ||
+    single("code_challenge_method") !== "S256" ||
+    !PKCE_CHALLENGE.test(single("code_challenge") ?? "") ||
+    !(single("state") ?? "") ||
+    !(single("nonce") ?? "") ||
+    !(single("scope") ?? "").split(" ").includes("openid") ||
+    params.has("client_secret") ||
+    params.has("code_verifier") ||
+    params.has("token") ||
+    params.has("access_token") ||
+    params.has("id_token")
+  ) {
+    throw new OidcEvidenceError("oidc_authorization_request");
+  }
+}
+
+/**
+ * Where the backend's callback sends the browser: this deployment's SPA,
+ * with exactly one handoff code in the FRAGMENT and nothing in the query.
+ * A token anywhere in the URL, a code in the query, or a second parameter
+ * is a different (older, or broken) flow and is refused as evidence.
+ */
+export function validateCallbackLanding(url: unknown, expected: Pick<ExpectedOidc, "stagingOrigin">): void {
+  const stagingOrigin = exactHttpsOrigin(expected.stagingOrigin, "oidc_staging_origin");
+  const parsed = parseBoundedUrl(url, "oidc_callback_landing");
+  const prefix = "#/auth/callback?";
+  if (
+    parsed.origin !== stagingOrigin ||
+    parsed.pathname !== "/" ||
+    parsed.search !== "" ||
+    !parsed.hash.startsWith(prefix)
+  ) {
+    throw new OidcEvidenceError("oidc_callback_landing");
+  }
+  const fragment = new URLSearchParams(parsed.hash.slice(prefix.length));
+  const keys = [...fragment.keys()];
+  const codes = fragment.getAll("code");
+  if (keys.length !== 1 || codes.length !== 1 || !HANDOFF_CODE.test(codes[0])) {
+    throw new OidcEvidenceError("oidc_callback_landing");
+  }
 }
 
 function decodeClaims(rawToken: string): Record<string, unknown> {
@@ -188,28 +255,37 @@ function decodeClaims(rawToken: string): Record<string, unknown> {
   return claims as Record<string, unknown>;
 }
 
-export function validateAccessToken(
+/**
+ * The token that lands in localStorage is ELSPETH's session token, minted by
+ * POST /api/auth/sso/complete — never the IdP's. Its envelope is
+ * web/auth/session_token.py's: iss "elspeth", aud = this deployment's
+ * public_base_url, provider "oidc", sub = the identity id, plus jti and exp.
+ * The signature is not checked here (the key is the backend's); what the
+ * harness proves is that the browser holds an ELSPETH token for THIS
+ * deployment, issued to an SSO identity, and that the API honours it.
+ */
+export function validateSessionToken(
   rawToken: string,
-  expected: TokenExpectations,
+  expected: Pick<ExpectedOidc, "stagingOrigin">,
   nowEpochSeconds = Math.floor(Date.now() / 1000),
-): ValidatedAccessToken {
-  if (expected.audienceClaim !== "aud" && expected.audienceClaim !== "client_id") {
-    throw new OidcEvidenceError("oidc_audience_claim");
-  }
-  exactHttpsOrigin(expected.authorizationOrigin, "oidc_expected_origin");
+): ValidatedSessionToken {
+  const stagingOrigin = exactHttpsOrigin(expected.stagingOrigin, "oidc_staging_origin");
   const claims = decodeClaims(rawToken);
   const subject = claims.sub;
   const expiration = claims.exp;
+  const tokenId = claims.jti;
   if (
-    claims.iss !== expected.issuer ||
-    claims[expected.audienceClaim] !== expected.audience ||
+    claims.iss !== SESSION_TOKEN_ISSUER ||
+    claims.aud !== stagingOrigin ||
+    claims.provider !== "oidc" ||
     typeof subject !== "string" ||
     subject.trim() === "" ||
     Buffer.byteLength(subject, "utf8") > 1024 ||
+    typeof tokenId !== "string" ||
+    tokenId === "" ||
     typeof expiration !== "number" ||
     !Number.isSafeInteger(expiration) ||
-    expiration <= nowEpochSeconds ||
-    (expected.audienceClaim === "client_id" && claims.token_use !== "access")
+    expiration <= nowEpochSeconds
   ) {
     throw new OidcEvidenceError("oidc_token_claims");
   }
@@ -224,9 +300,6 @@ export function buildOidcEvidence(input: BuildOidcEvidenceInput): OidcEvidence {
   if (
     !OIDC_EVIDENCE_PHASES.includes(input.phase) ||
     !isIsoUtc(input.timestamp) ||
-    input.audienceClaim !== "client_id" && input.audienceClaim !== "aud" ||
-    typeof input.issuer !== "string" ||
-    !input.issuer ||
     typeof input.audience !== "string" ||
     !input.audience ||
     !SHA256.test(input.subjectSha256) ||
@@ -238,13 +311,13 @@ export function buildOidcEvidence(input: BuildOidcEvidenceInput): OidcEvidence {
     throw new OidcEvidenceError("oidc_evidence_schema");
   }
   const authorizationOrigin = exactHttpsOrigin(input.authorizationOrigin, "oidc_evidence_schema");
+  const tokenAudience = exactHttpsOrigin(input.stagingOrigin, "oidc_evidence_schema");
   return {
     phase: input.phase,
     timestamp: input.timestamp,
-    issuer: input.issuer,
-    authorization_origin: authorizationOrigin,
-    audience_claim: input.audienceClaim,
     audience: input.audience,
+    authorization_origin: authorizationOrigin,
+    token_audience: tokenAudience,
     subject_sha256: input.subjectSha256,
     auth_me_status: 200,
     session_create_status: 201,
@@ -265,9 +338,8 @@ export function writeOidcEvidence(destination: string, evidence: OidcEvidence): 
   const validated = buildOidcEvidence({
     phase: evidence.phase,
     timestamp: evidence.timestamp,
-    issuer: evidence.issuer,
     authorizationOrigin: evidence.authorization_origin,
-    audienceClaim: evidence.audience_claim,
+    stagingOrigin: evidence.token_audience,
     audience: evidence.audience,
     subjectSha256: evidence.subject_sha256,
     authMeStatus: evidence.auth_me_status,
