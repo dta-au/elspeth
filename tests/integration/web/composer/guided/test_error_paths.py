@@ -23,6 +23,7 @@ from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMet
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import _initial_composition_state_with_guided_session
+from tests.helpers.session_fences import get_blob_under_fence
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -137,7 +138,14 @@ def _seed_completed_pipeline(client: TestClient, session_id: str) -> None:
         json={"filename": "rows.csv", "content": "price\n1.99\n", "mime_type": "text/csv"},
     )
     assert upload.status_code == 201, upload.json()
-    blob = asyncio.run(client.app.state.blob_service.get_blob(UUID(upload.json()["id"])))
+    blob = asyncio.run(
+        get_blob_under_fence(
+            client.app.state.session_service,
+            client.app.state.blob_service,
+            UUID(session_id),
+            UUID(upload.json()["id"]),
+        )
+    )
     output_dir = Path(client.app.state.settings.data_dir) / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     record = TurnRecord(

@@ -43,3 +43,4 @@ from elspeth.contracts.blobs import FinalizeBlobStatus as FinalizeBlobStatus
 from elspeth.contracts.blobs import InlineCustodyRequest as InlineCustodyRequest
 from elspeth.contracts.blobs import StorageMimeType as StorageMimeType
 from elspeth.contracts.blobs import fork_blob_id as fork_blob_id
+from elspeth.contracts.blobs import names_same_blob as names_same_blob

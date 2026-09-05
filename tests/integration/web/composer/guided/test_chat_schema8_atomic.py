@@ -52,7 +52,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.guided_leases import abandon_guided_worker_leases
-from tests.helpers.session_fences import acquire_compose_context
+from tests.helpers.session_fences import acquire_compose_context, create_blob_under_fence, read_blob_content_under_fence
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
@@ -115,6 +115,21 @@ def _source_from_upload_under_compose_fence(client: TestClient, session_id: str,
             )
 
     return asyncio.run(_call())
+
+
+def _upload_blob(client: TestClient, session_id: str, filename: str, content: bytes, mime_type: str):
+    """Seed one user upload the way the upload route does: under a real CREATE context."""
+    return asyncio.run(
+        create_blob_under_fence(
+            client.app.state.session_service,
+            client.app.state.blob_service,
+            UUID(session_id),
+            filename,
+            content,
+            mime_type,
+            created_by="user",
+        )
+    )
 
 
 def _chat_body(turn: dict, *, operation_id: str | None = None, message: str = "Use CSV") -> dict[str, str]:
@@ -587,15 +602,7 @@ def test_schema_form_uploaded_source_type_mismatch_is_acknowledged_without_provi
     session_id = _create_session(composer_test_client)
     initial_turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
     schema_turn = _choose_source(composer_test_client, session_id, initial_turn, plugin="text")["next_turn"]
-    uploaded = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "MOCK_DATA.json",
-            b'[{"name":"alice","value":1}]\n',
-            "application/json",
-            created_by="user",
-        )
-    )
+    uploaded = _upload_blob(composer_test_client, session_id, "MOCK_DATA.json", b'[{"name":"alice","value":1}]\n', "application/json")
 
     async def provider_must_not_run(**_kwargs: object) -> GuidedChatProviderOutcome:
         raise AssertionError("uploaded source mismatch called provider")
@@ -631,15 +638,7 @@ def test_matching_uploaded_source_missing_required_failure_policy_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_id = _create_session(composer_test_client)
-    uploaded = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "orders.csv",
-            b"order_id,total\n1,10\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    uploaded = _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
 
     def missing_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
         assert inspection_facts is not None
@@ -659,15 +658,7 @@ def test_matching_uploaded_source_missing_required_path_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_id = _create_session(composer_test_client)
-    asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "orders.csv",
-            b"order_id,total\n1,10\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
 
     def missing_path_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
         assert inspection_facts is not None
@@ -689,15 +680,7 @@ def test_matching_uploaded_source_malformed_failure_policy_raises(
     malformed_policy: object,
 ) -> None:
     session_id = _create_session(composer_test_client)
-    uploaded = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "orders.csv",
-            b"order_id,total\n1,10\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    uploaded = _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
 
     def malformed_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
         assert inspection_facts is not None
@@ -764,15 +747,7 @@ def test_matching_uploaded_source_malformed_prefill_contract_raises(
     expected_field: str,
 ) -> None:
     session_id = _create_session(composer_test_client)
-    asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "orders.csv",
-            b"order_id,total\n1,10\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    _upload_blob(composer_test_client, session_id, "orders.csv", b"order_id,total\n1,10\n", "text/csv")
 
     def malformed_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
         assert inspection_facts is not None
@@ -797,24 +772,8 @@ def test_schema_form_source_plugin_reselection_rebuilds_form_and_preserves_ready
     pending_before = record_before.composer_meta["guided_session"]["pending_source_intents"]
     assert len(pending_before) == 1
     stable_id = next(iter(pending_before))
-    uploaded = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "MOCK_DATA.json",
-            b'[{"name":"alice","value":1}]\n',
-            "application/json",
-            created_by="user",
-        )
-    )
-    newer_mismatched_upload = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "NEWER_DATA.csv",
-            b"name,value\nbob,2\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    uploaded = _upload_blob(composer_test_client, session_id, "MOCK_DATA.json", b'[{"name":"alice","value":1}]\n', "application/json")
+    newer_mismatched_upload = _upload_blob(composer_test_client, session_id, "NEWER_DATA.csv", b"name,value\nbob,2\n", "text/csv")
     provider_calls = 0
 
     async def provider(**kwargs: object) -> GuidedChatProviderOutcome:
@@ -1253,7 +1212,14 @@ def test_single_select_inline_source_resolution_materializes_blob_and_prefills_s
     assert blob.mime_type == "text/csv"
     assert blob.created_by == "assistant"
     assert blob.status == "ready"
-    content = asyncio.run(composer_test_client.app.state.blob_service.read_blob_content(blob.id))
+    content = asyncio.run(
+        read_blob_content_under_fence(
+            composer_test_client.app.state.session_service,
+            composer_test_client.app.state.blob_service,
+            UUID(session_id),
+            blob.id,
+        )
+    )
     assert content == b"name,value\nalice,1\n"
 
     next_turn = first_json["next_turn"]
@@ -1839,15 +1805,7 @@ def test_inline_source_defers_to_existing_ready_uploaded_blob(
 ) -> None:
     """An uploaded blob stays authoritative; inline content is not stored."""
     session_id = _create_session(composer_test_client)
-    uploaded = asyncio.run(
-        composer_test_client.app.state.blob_service.create_blob(
-            UUID(session_id),
-            "uploaded.csv",
-            b"name,value\nuploaded,9\n",
-            "text/csv",
-            created_by="user",
-        )
-    )
+    uploaded = _upload_blob(composer_test_client, session_id, "uploaded.csv", b"name,value\nuploaded,9\n", "text/csv")
     initial_turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _resolved_source_provider, raising=False)
 

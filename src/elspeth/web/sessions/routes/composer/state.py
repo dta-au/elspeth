@@ -459,7 +459,7 @@ async def _state_with_imported_source_blobs(
 
     for source_name, blob_id in requested_blobs:
         try:
-            blob = await blob_service.get_blob(blob_id)
+            blob = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
         except BlobNotFoundError:
             raise HTTPException(status_code=404, detail="Blob not found") from None
         if blob.session_id != session_id:
@@ -1113,7 +1113,7 @@ async def _verified_yaml_export_blob_ids(
     blob_service: BlobServiceProtocol = request.app.state.blob_service
     for source, blob_id in parsed_blob_ids:
         try:
-            blob = await blob_service.get_blob(blob_id)
+            blob = await blob_service.get_blob(blob_id, session_operation_context=session_operation_context)
         except BlobNotFoundError:
             raise AuditIntegrityError("YAML export blob custody verification failed") from None
         # ``BlobServiceProtocol`` is structural, so an implementation could

@@ -384,8 +384,7 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
 def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> None:
     from elspeth.web.sessions import models as session_models
 
-    session_operation_fences_table = getattr(session_models, "session_operation_fences_table", None)
-    assert session_operation_fences_table is not None
+    session_operation_fences_table = session_models.session_operation_fences_table
     columns = {column.name: column for column in session_operation_fences_table.columns}
 
     assert tuple(columns) == (

@@ -140,6 +140,7 @@ async def _create_test_blob(
             content=content,
             mime_type="text/plain",
             created_by="user",
+            session_operation_context=context,
         )
     finally:
         await service._run_sync(service.session_operation_authority.release, context)

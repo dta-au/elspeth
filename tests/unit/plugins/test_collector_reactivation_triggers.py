@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import cast
 
+from pydantic import BaseModel
+
 from elspeth.contracts.enums import Determinism
 from elspeth.core.secrets import SECRET_FIELD_NAMES, SECRET_FIELD_SUFFIXES
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -47,11 +49,11 @@ def input_semantic_requirement_overriders(transforms: Iterable[type[BaseTransfor
     )
 
 
-def credential_shaped_fields(model: type) -> tuple[str, ...]:
+def credential_shaped_fields(model: type[BaseModel]) -> tuple[str, ...]:
     """Config-model field names the secret redactor would treat as credentials
     — the SAME vocabulary ``core/secrets.py`` redacts by, not a restatement."""
 
-    names = tuple(getattr(model, "model_fields", {}))
+    names = tuple(model.model_fields)
     return tuple(name for name in names if name in SECRET_FIELD_NAMES or name.endswith(SECRET_FIELD_SUFFIXES))
 
 
@@ -139,8 +141,6 @@ def test_no_batch_aware_config_model_carries_a_credential_shaped_field() -> None
 def test_the_credential_field_detector_uses_the_redactors_vocabulary() -> None:
     """Prove the detector fires on both the exact-name and the suffix forms
     the redactor recognises, and not on an ordinary field."""
-
-    from pydantic import BaseModel
 
     class _Probe(BaseModel):
         text_field: str

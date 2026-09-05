@@ -42,6 +42,7 @@ from elspeth.contracts.blobs import BlobActiveRunError, BlobNotFoundError, BlobR
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.tools.blobs import _execute_update_blob
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.protocol import CompositionStateData
@@ -134,7 +135,8 @@ async def _seed_session_with_blob(
 ) -> tuple[Any, Any, BlobRecord]:
     """One session, one blob, and one saved state that does or does not reference it."""
     session = await service.create_session(f"alice-{uuid.uuid4().hex[:8]}", "Lock domain", "local")
-    blob = await blob_service.create_blob(session.id, "tickets.csv", _BLOB_CONTENT, "text/csv")
+    async with _operation(service, session.id, SessionOperationKind.CREATE) as create:
+        blob = await blob_service.create_blob(session.id, "tickets.csv", _BLOB_CONTENT, "text/csv", session_operation_context=create)
     sources = {
         "tickets": {
             "plugin": "csv",
@@ -159,6 +161,18 @@ def _admit_run(service: SessionServiceImpl, session_id: uuid.UUID, state_id: uui
             return await service.create_run(session_id, state_id, session_operation_context=execute)
 
     return asyncio.run(_go())
+
+
+async def _delete_blob(service: SessionServiceImpl, blob_service: BlobServiceImpl, session_id: uuid.UUID, blob_id: uuid.UUID) -> None:
+    """Delete one blob the way the route does: under a real COMPOSE context."""
+    async with _operation(service, session_id, SessionOperationKind.COMPOSE) as compose:
+        await blob_service.delete_blob(blob_id, session_operation_context=compose)
+
+
+async def _get_blob(service: SessionServiceImpl, blob_service: BlobServiceImpl, session_id: uuid.UUID, blob_id: uuid.UUID) -> BlobRecord:
+    """Read one blob record under a real BLOB_READ context."""
+    async with _operation(service, session_id, SessionOperationKind.BLOB_READ) as read:
+        return await blob_service.get_blob(blob_id, session_operation_context=read)
 
 
 def _install_advisory_lock_probe(engine: Engine) -> tuple[threading.Event, dict[str, int], Callable[..., None]]:
@@ -290,7 +304,7 @@ def test_delete_blob_past_its_guard_excludes_run_admission_on_another_replica(
 
     def delete_blob() -> None:
         try:
-            asyncio.run(blob_service.delete_blob(blob.id))
+            asyncio.run(_delete_blob(service, blob_service, session.id, blob.id))
         except BaseException as exc:
             delete_error.append(exc)
             parked.set()
@@ -322,11 +336,17 @@ def test_delete_blob_past_its_guard_excludes_run_admission_on_another_replica(
     assert run_created.wait(timeout=15)
     runner.join(timeout=15)
     assert delete_error == []
-    assert failures == []
-    # The run was admitted strictly after the delete committed: it observes a
-    # world in which the blob is already gone, never one mid-mutation.
+    # The run's acquire queued on the advisory lock behind the delete's
+    # transaction and, once through, met the delete's still-live COMPOSE
+    # fence: the session-operation authority refuses a second operation on
+    # the session. Admission succeeds only after the delete's operation has
+    # ended, and it then observes a world in which the blob is already gone,
+    # never one mid-mutation.
+    assert [type(exc) for exc in failures] == [SessionOperationConflictError], failures
+    run = _admit_run(second_service, session.id, state.id)
+    assert run.status == "pending"
     with pytest.raises(BlobNotFoundError):
-        asyncio.run(blob_service.get_blob(blob.id))
+        asyncio.run(_get_blob(second_service, blob_service, session.id, blob.id))
     active = asyncio.run(second_service.get_active_run(session.id))
     assert active is not None
     assert active.status == "pending"
@@ -401,7 +421,7 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
     result = update_outcome[0]
     assert not isinstance(result, BaseException), result
     assert result.success is True, result.to_dict()
-    updated = asyncio.run(blob_service.get_blob(blob.id))
+    updated = asyncio.run(_get_blob(second_service, blob_service, session.id, blob.id))
     assert updated is not None
     assert Path(updated.storage_path).read_bytes() == new_content.encode()
     active = asyncio.run(second_service.get_active_run(session.id))
@@ -422,7 +442,7 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
     assert run.status == "pending"
 
     with pytest.raises(BlobActiveRunError):
-        asyncio.run(blob_service.delete_blob(blob.id))
+        asyncio.run(_delete_blob(service, blob_service, session.id, blob.id))
 
     new_content = "id,value\n1,gamma\n"
     message_content = f"Use this exact content:\n{new_content}"
