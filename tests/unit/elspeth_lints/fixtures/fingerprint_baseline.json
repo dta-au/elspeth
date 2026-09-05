@@ -9,20 +9,7 @@
   "contract_invariants.portable_sqlite_insert": [],
   "contract_invariants.session_engine_factory": [],
   "contract_invariants.validation_theatre": [],
-  "immutability.freeze_guards": [
-    {
-      "file_path": "contracts/chat_parts.py",
-      "fingerprint": "74dfeb87e6e9f90c"
-    },
-    {
-      "file_path": "plugins/transforms/reference_join.py",
-      "fingerprint": "cad59b8e566969b4"
-    },
-    {
-      "file_path": "web/execution/validation.py",
-      "fingerprint": "ec9405f459f11d96"
-    }
-  ],
+  "immutability.freeze_guards": [],
   "immutability.frozen_annotations": [],
   "manifest.contract_manifest": [],
   "manifest.symbol_inventory": [],
