@@ -132,7 +132,7 @@ first; do not proceed to step 5.
 ```bash
 az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --image "$CANDIDATE_IMAGE" --revision-suffix "${CANDIDATE_SHA:0:12}" \
-  --set-env-vars "ELSPETH_WEB__RELEASE_SOURCE_SHA=${CANDIDATE_SHA}"
+  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${CANDIDATE_SHA}"
 ```
 
 ## 6. Prove the rollout
