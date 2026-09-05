@@ -230,7 +230,7 @@ same figure is restated at §4 step 7 and is equally exact there.
 
 ### 3.2 "PostgreSQL membership and epoch-fenced run ownership" — STILL_TRUE
 
-This is the one the brief calls "the programme's core safety property" and tells
+This is the one the brief calls "the program's core safety property" and tells
 you to derive from code. I measured it three ways.
 
 **Schema exists:**
