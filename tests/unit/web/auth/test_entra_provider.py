@@ -68,6 +68,7 @@ def _valid_entra_claims(overrides: dict[str, object] | None = None) -> dict[str,
         "tid": TENANT_ID,
         "iss": ISSUER,
         "aud": AUDIENCE,
+        "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
     }
     if overrides:
@@ -165,7 +166,7 @@ class TestEntraTenantValidation:
         claims = _valid_entra_claims()
         del claims["sub"]
         token = make_rs256_token(private_key, claims)
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Missing required 'sub' claim"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Invalid token: MissingRequiredClaimError"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -457,7 +458,7 @@ class TestEntraGetUserInfoTenantValidation:
             mock_httpx_discovery,
             pytest.raises(
                 AuthenticationError,
-                match="Missing required 'sub' claim",
+                match="Invalid token: MissingRequiredClaimError",
             ),
         ):
             await provider.get_user_info(token)

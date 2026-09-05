@@ -12,13 +12,15 @@ importing from here until both go together.
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Any, cast
 
+import httpx
 import structlog
 
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+from elspeth.web.auth.providers import get_profile
 from elspeth.web.validation import has_visible_content
 
 __all__ = ["JWKSTokenValidator", "OIDCAuthProvider", "optional_profile_claim"]
@@ -41,7 +43,15 @@ def optional_profile_claim(payload: dict[str, Any], claim_name: str) -> str | No
 
 
 class OIDCAuthProvider:
-    """Validates OIDC tokens via JWKS discovery."""
+    """Validates OIDC bearer tokens via JWKS discovery.
+
+    The accepted signature algorithms are the ``oidc`` profile's pinned
+    list, fixed at construction. The Cognito access-token mode that used to
+    live here (``audience_claim="client_id"``) is gone with the branch that
+    served it: Cognito re-registers as a confidential client through the SSO
+    profile (spec D2), and its access tokens are not bearer credentials for
+    this API.
+    """
 
     def __init__(
         self,
@@ -51,7 +61,7 @@ class OIDCAuthProvider:
         jwks_failure_retry_seconds: int = 300,
         jwks_max_stale_seconds: int = 86_400,
         *,
-        audience_claim: Literal["aud", "client_id"] = "aud",
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._validator = JWKSTokenValidator(
             issuer,
@@ -59,7 +69,8 @@ class OIDCAuthProvider:
             jwks_cache_ttl_seconds,
             jwks_failure_retry_seconds,
             jwks_max_stale_seconds,
-            audience_claim=audience_claim,
+            algorithms=get_profile("oidc").id_token_algorithms,
+            transport=transport,
         )
 
     async def authenticate(self, token: str) -> UserIdentity:

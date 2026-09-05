@@ -11,6 +11,7 @@ from typing import Any
 
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
 from elspeth.web.auth.oidc import JWKSTokenValidator, optional_profile_claim
+from elspeth.web.auth.providers import get_profile
 
 
 class EntraAuthProvider:
@@ -37,6 +38,7 @@ class EntraAuthProvider:
             jwks_cache_ttl_seconds=jwks_cache_ttl_seconds,
             jwks_failure_retry_seconds=jwks_failure_retry_seconds,
             jwks_max_stale_seconds=jwks_max_stale_seconds,
+            algorithms=get_profile("entra").id_token_algorithms,
         )
 
     def _validate_tenant(self, payload: dict[str, Any]) -> None:

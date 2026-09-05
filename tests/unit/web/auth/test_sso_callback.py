@@ -136,13 +136,14 @@ def _client(idp: FakeIdP, *, provider: AuthProviderType = "oidc", userinfo: bool
         transaction_secret=SECRET,
         public_base_url=PUBLIC_BASE,
         endpoints=_endpoints(idp),
-        id_token_algorithms=("RS256",),
         userinfo=userinfo,
     )
 
 
 def _validator(idp: FakeIdP) -> JWKSTokenValidator:
-    return JWKSTokenValidator(issuer=idp.issuer, audience=idp.client_id, jwks_uri=idp.jwks_uri, transport=idp.transport())
+    return JWKSTokenValidator(
+        issuer=idp.issuer, audience=idp.client_id, algorithms=("RS256",), jwks_uri=idp.jwks_uri, transport=idp.transport()
+    )
 
 
 @dataclass(frozen=True)
@@ -704,7 +705,11 @@ class TestLoginCallback:
         browser = _start(idp, _client(idp))
         code = idp.authorize(nonce=browser.nonce, subject="ada")
         validator = JWKSTokenValidator(
-            issuer=idp.issuer, audience=idp.client_id, jwks_uri=idp.jwks_uri, transport=httpx.MockTransport(handler)
+            issuer=idp.issuer,
+            audience=idp.client_id,
+            algorithms=("RS256",),
+            jwks_uri=idp.jwks_uri,
+            transport=httpx.MockTransport(handler),
         )
         with pytest.raises(AuthProviderUnavailable):
             await login_callback(
@@ -797,7 +802,6 @@ class TestLoginCallback:
                 transaction_secret=SECRET,
                 public_base_url=PUBLIC_BASE,
                 endpoints=endpoints,
-                id_token_algorithms=("RS256",),
                 userinfo=True,
             )
 
