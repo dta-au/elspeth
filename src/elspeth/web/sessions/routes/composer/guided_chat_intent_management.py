@@ -297,19 +297,6 @@ def _deferred_disposition_chat(
 
 
 _MAX_POLICY_VISIBLE_ALTERNATIVES = 5
-# DERIVED, not restated. This was a hand-written tuple byte-identical to
-# ``chat_solver.PLUGIN_FREE_NODE_TYPES`` — same four members, same order, same
-# feature — and the two agreed only by hand. They answer the identical
-# question: a kind belongs here exactly when "a {x} is a built-in topology
-# node, not a transform plugin" is TRUE of it, which is the plugin-free
-# partition. Importing it means the module-load assert over ``NodeType`` that
-# guards that partition now guards this clause too, so a new or renamed node
-# kind cannot leave this teaching surface quietly incomplete.
-#
-# ORDER is load-bearing and is inherited deliberately: the ``next()`` scan
-# below returns the first member in TUPLE order that the message names, so
-# reordering the authority changes which clause "a queue and a gate" teaches.
-_STRUCTURAL_NODE_TYPES = PLUGIN_FREE_NODE_TYPES
 
 
 def _message_names_identifier(message: str, identifier: str) -> bool:
@@ -426,7 +413,7 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     * Nothing true is lost. A collector arm that WON would have taken the gate
       clause away from "add a collector and a gate", trading one teaching line
       for another; appending buys the collector case at no price.
-    * It deletes the ordering question. `_STRUCTURAL_NODE_TYPES` is scanned with
+    * It deletes the ordering question. `PLUGIN_FREE_NODE_TYPES` is scanned with
       `next()`, which returns the first member in TUPLE order that the message
       names — for "a queue and a gate" that is `gate`, because `gate` precedes
       `queue` in the tuple, NOT because of where the words appear in the
@@ -507,8 +494,8 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     aggregation whose plugin is not batch-aware. The sentence states the
     contract correctly; the composer simply does not check that half of it.
 
-    Collector is also deliberately absent from `_STRUCTURAL_NODE_TYPES`, and
-    that is now enforced rather than merely intended: the tuple IS
+    Collector is also deliberately absent from `PLUGIN_FREE_NODE_TYPES`, and
+    that is enforced rather than merely intended: the scanned tuple IS
     `chat_solver.PLUGIN_FREE_NODE_TYPES`, whose membership rule is exactly "a
     {x} is a built-in topology node, not a transform plugin" is TRUE of x. A
     collector is plugin-BEARING (barrier-scopes spec §3 types it as a
@@ -518,8 +505,17 @@ def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepC
     no longer possible to add it here at all.
     """
     clauses: list[str] = []
+    # ``chat_solver.PLUGIN_FREE_NODE_TYPES`` is read directly, not through a
+    # local alias: the alias this used to carry shared its name with an
+    # engine constant answering a DIFFERENT predicate (traversal-inert;
+    # elspeth-ea38638721). The membership rule is exactly the clause below —
+    # "a {x} is a built-in topology node, not a transform plugin" — which is
+    # the plugin-free partition, guarded at module load against ``NodeType``.
+    # ORDER is load-bearing: ``next()`` returns the first member in TUPLE
+    # order the message names, so "a queue and a gate" teaches ``gate``
+    # because it precedes ``queue`` there.
     structural_node = next(
-        (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
+        (node_type for node_type in PLUGIN_FREE_NODE_TYPES if _message_names_node_kind(user_message, node_type)),
         None,
     )
     if structural_node is not None:

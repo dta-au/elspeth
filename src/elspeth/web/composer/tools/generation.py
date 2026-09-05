@@ -616,6 +616,13 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "collector reassembles, and declare that transform in the pipeline.",
     ),
     (
+        r"scope_opener_not_multi_row|opener '(.+)' is not a multi-row transform",
+        "The collector's scope_opener names a transform that does not expand rows (creates_tokens=False), "
+        "so nothing opens the group this collector would close and no row can reach it.",
+        "Set scope_opener to an expanding transform (for example json_explode or line_explode) — the one "
+        "whose expanded rows this collector reassembles — or remove the collector if no expansion exists.",
+    ),
+    (
         r"collector_has_trigger_invalid|Collector '(.+)' does not accept 'trigger'",
         "A collector flushes on end_of_group only; count/timeout/condition triggers are inexpressible "
         "on a closer (a timeout would silently short the group).",
@@ -1529,6 +1536,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "collector_missing_scope",
     "collector_scope_policy_invalid",
     "scope_opener_unknown",
+    "scope_opener_not_multi_row",
     # Guided-binder referential-integrity twin of scope_opener_unknown (WS6
     # lift fix round): the binder rejects a dangling opener with connectivity
     # facts before the candidate ever reaches validation or projection.
