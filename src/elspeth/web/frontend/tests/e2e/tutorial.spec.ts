@@ -386,12 +386,22 @@ async function installTutorialRoutes(
       return;
     }
 
+    // The account-preferences payload is decoded structurally since
+    // 69c910a56 (preferencesDecoder.ts KEYS): every key must be present or
+    // the store records a preferences error and App.tsx's fail-closed
+    // tutorial gate never shows the welcome turn. Mock the full wire shape.
     if (path === "/api/composer-preferences" && method === "GET") {
       await route.fulfill({
         json: {
           default_mode: "guided",
           banner_dismissed_at: null,
+          freeform_intro_dismissed_at: null,
           tutorial_completed_at: null,
+          tutorial_stage: null,
+          tutorial_session_id: null,
+          tutorial_run_id: null,
+          tutorial_source_data_hash: null,
+          show_advanced: false,
           updated_at: null,
         },
       });
@@ -400,14 +410,19 @@ async function installTutorialRoutes(
 
     if (path === "/api/composer-preferences" && method === "PATCH") {
       const body = request.postDataJSON() as Record<string, unknown>;
+      const echoNullableString = (key: string): string | null =>
+        typeof body[key] === "string" ? (body[key] as string) : null;
       await route.fulfill({
         json: {
           default_mode: body.default_mode ?? "guided",
           banner_dismissed_at: null,
-          tutorial_completed_at:
-            typeof body.tutorial_completed_at === "string"
-              ? body.tutorial_completed_at
-              : null,
+          freeform_intro_dismissed_at: null,
+          tutorial_completed_at: echoNullableString("tutorial_completed_at"),
+          tutorial_stage: echoNullableString("tutorial_stage"),
+          tutorial_session_id: echoNullableString("tutorial_session_id"),
+          tutorial_run_id: echoNullableString("tutorial_run_id"),
+          tutorial_source_data_hash: echoNullableString("tutorial_source_data_hash"),
+          show_advanced: typeof body.show_advanced === "boolean" ? body.show_advanced : false,
           updated_at: "2026-05-19T12:11:00Z",
         },
       });

@@ -3,6 +3,7 @@ every tampered field must raise, not just the happy path pass."""
 
 import base64
 import hashlib
+from typing import Any
 
 import pytest
 
@@ -110,3 +111,29 @@ class TestProjections:
         h2 = parts_hash((t, b, a))
         assert h1 != h2
         assert len(h1) == 64
+
+
+class TestChatMessageContentGuard:
+    """The content guard freezes rather than gates: a list of parts becomes the
+    declared tuple, a tuple is kept by identity, and anything that is not a
+    non-empty tuple of parts is refused with the same ValueError as before."""
+
+    def test_tuple_of_parts_is_kept_by_identity(self) -> None:
+        parts = (TextPart(text="describe"), _part())
+        assert ChatMessage(role="user", content=parts).content is parts
+
+    def test_list_of_parts_is_frozen_to_the_declared_tuple(self) -> None:
+        parts: Any = [TextPart(text="describe"), _part()]
+        msg = ChatMessage(role="user", content=parts)
+        assert type(msg.content) is tuple
+        assert msg.content == tuple(parts)
+
+    @pytest.mark.parametrize("content", [(), [], {"text": "describe"}, 5], ids=["empty-tuple", "empty-list", "mapping", "int"])
+    def test_non_part_sequences_are_refused(self, content: Any) -> None:
+        with pytest.raises(ValueError, match="non-empty tuple of parts"):
+            ChatMessage(role="user", content=content)
+
+    def test_foreign_part_is_refused(self) -> None:
+        parts: Any = ("describe",)
+        with pytest.raises(ValueError, match="TextPart or ImagePart"):
+            ChatMessage(role="user", content=parts)

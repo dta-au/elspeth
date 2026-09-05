@@ -32,6 +32,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
@@ -176,6 +177,14 @@ class ReferenceIndex:
     """
 
     entries: Mapping[str, Mapping[str, Any]]
+
+    def __post_init__(self) -> None:
+        # The table is resolved once at config load and read on every row;
+        # freezing it is what turns that into a guarantee. A nested reference
+        # value (a JSON table's object or array) freezes with it and is emitted
+        # as-is: PipelineRow deep-freezes row data itself and thaws in to_dict,
+        # so the frozen value is already the row's native representation.
+        freeze_fields(self, "entries")
 
 
 def _parse_reference_entries(cfg: ReferenceJoinConfig) -> list[Mapping[str, object]]:
@@ -516,7 +525,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:24109a08dac93c6f"
+    source_file_hash: str | None = "sha256:ca3fb9ffcf8366c2"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
