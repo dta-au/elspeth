@@ -22,6 +22,7 @@ from typing import Literal
 from tests.helpers.tree_gate import iter_gate_files
 
 from elspeth.web.sessions.models import metadata as sessions_metadata
+from elspeth_lints.core.ast_dump import stable_ast_dump
 
 Scope = Literal["session", "global"]
 DatabaseDomain = Literal["sessions", "non_sessions", "unknown"]
@@ -3406,7 +3407,7 @@ def _statement_fingerprint(node: ast.AST) -> str:
         if parent is None or isinstance(parent, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             break
         current = parent
-    normalized = ast.dump(current, annotate_fields=True, include_attributes=False)
+    normalized = stable_ast_dump(current)
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
@@ -4860,7 +4861,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             )
             if base_domain != "unknown":
                 return base_domain
-            attribute_key = ast.dump(expression, include_attributes=False)
+            attribute_key = stable_ast_dump(expression)
             if attribute_key in visited_attributes:
                 return "unknown"
             values = self._attribute_assignment_values(expression)
@@ -5032,7 +5033,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         normalized = "\0".join(
             (
                 _statement_fingerprint(node),
-                ast.dump(context, annotate_fields=True, include_attributes=False),
+                stable_ast_dump(context),
             )
         )
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
@@ -5315,7 +5316,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             }
         if isinstance(expression, ast.Subscript):
             return {
-                ("subscript", base, ast.dump(expression.slice, include_attributes=False))
+                ("subscript", base, stable_ast_dump(expression.slice))
                 for base in self._storage_target_keys(
                     expression.value,
                     use=use,
@@ -5473,7 +5474,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         ordered = sorted(contexts.values(), key=self._position)
         if len(ordered) == 1:
             return _statement_fingerprint(node)
-        normalized = "\0".join(ast.dump(statement, annotate_fields=True, include_attributes=False) for statement in ordered)
+        normalized = "\0".join(stable_ast_dump(statement) for statement in ordered)
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
     def _write_executions_for(self, node: ast.AST) -> list[ast.Call]:
@@ -6275,9 +6276,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             domain = self._table_database_domain(node.args[0])
         if domain == "sessions" and table and operation:
             statements, _ = self._dependent_write_context(node)
-            if operation == "insert" and any(
-                "on_conflict_do_" in ast.dump(statement, include_attributes=False) for statement in statements
-            ):
+            if operation == "insert" and any("on_conflict_do_" in stable_ast_dump(statement) for statement in statements):
                 operation = "upsert"
             self._emit(node, table, operation)
         elif domain == "non_sessions" and operation:

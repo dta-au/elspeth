@@ -22,7 +22,7 @@ import structlog
 from sqlalchemy import Engine, event, func, insert, select, update
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.blobs import BlobForkWriteFence
 from elspeth.web.blobs.protocol import BlobForkFenceLostError
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -985,6 +985,20 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
 async def test_postgres_target_rename_holds_no_connection_and_release_cannot_deadlock(
     deployment,
 ) -> None:
+    """A paused child rename holds only the blob custody connection; a fence release never waits behind it.
+
+    The blob custody lock is a session-level advisory lock in its own
+    classid namespace (``ELSPETH_BLOB_CUSTODY_LOCK_CLASSID``), so the one
+    connection the copy holds on the blob engine during the rename does not
+    block session-operation fence operations, which lock the same session id
+    under ``ELSPETH_SESSIONS_LOCK_CLASSID``: releasing the child context
+    completes while the rename is paused. That release does NOT revoke the
+    copy: its authority is the parent's ``session_fork`` lease
+    (``_require_live_fork_write_fence`` at reserve and finalize), and the
+    child context is bound to that operation (renew's exact-bound-child
+    check), not an authority over it -- so the copy completes. Losing the
+    parent's lease mid-copy is pinned by the next test.
+    """
     first_engine, second_engine, first, second, shared = deployment
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
@@ -1060,7 +1074,9 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
             try:
                 assert await asyncio.to_thread(entered.wait, 10)
                 assert first_engine.pool.checkedout() == 0
-                assert second_engine.pool.checkedout() == 0
+                # The blob engine holds exactly the custody-lock connection
+                # (session-level advisory lock in its own classid namespace).
+                assert second_engine.pool.checkedout() == 1
 
                 # This is a real production contender, not a manually held
                 # lock. It must complete while filesystem persistence pauses.
@@ -1076,8 +1092,10 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
                 if release_task is not None and not release_task.done():
                     await asyncio.wait_for(asyncio.shield(release_task), timeout=10)
 
-            with pytest.raises(BlobForkFenceLostError):
-                await asyncio.wait_for(copy_task, timeout=10)
+            copied = await asyncio.wait_for(copy_task, timeout=10)
+            assert set(copied) == {entry.source_blob_id for entry in staged.blob_plan}
+            assert first_engine.pool.checkedout() == 0
+            assert second_engine.pool.checkedout() == 0
     finally:
         event.remove(second_engine, "before_cursor_execute", capture_phase_sql)
 
@@ -1087,19 +1105,119 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
         if " from sessions " in f" {statement} " and statement.endswith(" for update")
     )
     pre_quota_advisory_locks = tuple(
-        (engine, parameters) for engine, statement, parameters in phase_sql[:quota_lock_index] if "pg_advisory_xact_lock" in statement
+        (engine, statement, parameters) for engine, statement, parameters in phase_sql[:quota_lock_index] if "pg_advisory" in statement
     )
-    assert len(pre_quota_advisory_locks) == 4
-    observed_session_ids: list[str] = []
-    for engine, parameters in pre_quota_advisory_locks:
-        assert engine is second_engine
-        assert type(parameters) is tuple
-        assert parameters[0] == ELSPETH_SESSIONS_LOCK_CLASSID
-        assert type(parameters[1]) is str
-        observed_session_ids.append(parameters[1])
-    expected_pair = tuple(sorted((str(parent.id), str(staged.session.id))))
-    observed_pairs = tuple(tuple(observed_session_ids[offset : offset + 2]) for offset in range(0, len(observed_session_ids), 2))
-    assert observed_pairs == (expected_pair, expected_pair)
+    # Lock order of the copy before the child's quota row lock: plan
+    # verification takes no advisory lock; the persist takes the SESSION-level
+    # custody lock on the child in its own classid namespace, then, inside the
+    # reservation transaction, one transaction-scoped sessions-classid lock on
+    # the child. The copy never advisory-locks the parent -- its authority over
+    # the parent is the session_fork lease row, not a lock -- so no
+    # parent/child pair order exists for a contender to invert.
+    assert len(pre_quota_advisory_locks) == 2
+    (custody_engine, custody_statement, custody_parameters), (phase_engine, phase_statement, phase_parameters) = pre_quota_advisory_locks
+    assert custody_engine is second_engine
+    assert "pg_advisory_lock(" in custody_statement
+    assert custody_parameters == (ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, str(staged.session.id))
+    assert phase_engine is second_engine
+    assert "pg_advisory_xact_lock(" in phase_statement
+    assert phase_parameters == (ELSPETH_SESSIONS_LOCK_CLASSID, str(staged.session.id))
+
+
+@pytest.mark.asyncio
+async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_parent_lease_is_lost(
+    deployment,
+) -> None:
+    """The real contender: the parent's session_fork lease lost while the child rename is paused.
+
+    The copy's authority is that lease; when it lapses (takeover, abandon or
+    expiry -- expiry by database time here) the copy's next authority check,
+    the finalize-phase ``_require_live_fork_write_fence``, refuses with
+    ``BlobForkFenceLostError`` and no pooled connection is left behind.
+    """
+    first_engine, second_engine, first, second, shared = deployment
+    _register_instance(first_engine, first.session_operation_owner_instance_id)
+    _register_instance(first_engine, second.session_operation_owner_instance_id)
+    blobs = BlobServiceImpl(second_engine, shared)
+    parent = await first.create_session(f"pg-pair-{uuid4()}", "Parent", "local")
+    create_lease = await SessionOperationLease.acquire(
+        second.session_operation_authority,
+        session_id=parent.id,
+        operation_kind=SessionOperationKind.CREATE,
+        owner_instance_id=second.session_operation_owner_instance_id,
+        lease_seconds=second.session_operation_lease_seconds,
+    )
+    try:
+        await blobs.create_blob(
+            parent.id,
+            "source.csv",
+            b"x\n1\n",
+            "text/csv",
+            session_operation_context=create_lease.context,
+        )
+    finally:
+        await create_lease.close()
+    message = await first.add_message(
+        parent.id,
+        "user",
+        "fork",
+        writer_principal="route_user_message",
+    )
+    authority = await _claim(first, parent.id, str(uuid4()))
+    staged = await first.fork_session(
+        authority,
+        fork_message_id=message.id,
+        new_message_content="edited",
+    )
+
+    async def checkpoint() -> None:
+        return None
+
+    entered = threading.Event()
+    resume_rename = threading.Event()
+    original_replace = os.replace
+    child_blob_dir = shared / "blobs" / str(staged.session.id)
+
+    def paused_target_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        source_path = Path(source)
+        target_path = Path(target)
+        if target_path.parent == child_blob_dir and source_path.name.endswith(".custody.tmp"):
+            entered.set()
+            assert resume_rename.wait(timeout=10)
+        original_replace(source, target)
+
+    with patch("elspeth.web.blobs.service.os.replace", paused_target_replace):
+        copy_task = asyncio.create_task(
+            blobs.copy_blobs_for_fork(
+                parent.id,
+                staged.session.id,
+                staged.blob_plan,
+                _fork_write_fence(staged.authority, source_session_id=parent.id, target_session_id=staged.session.id),
+                checkpoint=checkpoint,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            guided = staged.authority.parent.guided_fence
+            with first_engine.begin() as conn:
+                now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
+                expired = conn.execute(
+                    update(guided_operations_table)
+                    .where(
+                        guided_operations_table.c.session_id == str(parent.id),
+                        guided_operations_table.c.operation_id == guided.operation_id,
+                        guided_operations_table.c.lease_token == guided.lease_token,
+                        guided_operations_table.c.attempt == guided.attempt,
+                    )
+                    .values(lease_expires_at=now - timedelta(seconds=1))
+                )
+                assert expired.rowcount == 1
+        finally:
+            resume_rename.set()
+        with pytest.raises(BlobForkFenceLostError):
+            await asyncio.wait_for(copy_task, timeout=10)
+    assert first_engine.pool.checkedout() == 0
+    assert second_engine.pool.checkedout() == 0
 
 
 @pytest.mark.asyncio
