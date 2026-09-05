@@ -59,6 +59,15 @@ _WEB_ONLY_OPTION_KEYS = frozenset({"blob_ref"}) | AUTHORING_METADATA_OPTION_KEYS
 _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS = _WEB_ONLY_OPTION_KEYS | frozenset(NESTED_LOCAL_PATH_OPTION_KEYS) | frozenset({"blob_id"})
 _PUBLIC_STORAGE_OPTION_KEYS = frozenset(SOURCE_LOCAL_PATH_OPTION_KEYS) | frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
 _PUBLIC_CUSTODY_SUBTREE_KEYS = frozenset({"custody", "provider_config"})
+# HAND-WRITTEN ON PURPOSE — this is the operand the lowering drift guard in
+# ``_generate_pipeline_dict`` CHECKS against ``COMPOSER_NODE_TYPES`` (which is
+# derived from the ``NodeType`` Literal). A drift guard needs exactly one
+# derived operand; derive this one too and the guard becomes ``x != x``,
+# always False, while still reading as if it cited the authority. It mirrors
+# the seven per-kind lowering blocks below by hand (one in identifier form,
+# six in the ``n["node_type"] == ...`` dict-access form), which is the real
+# backing table — the residual is that the guard checks this CLAIM about
+# lowering rather than lowering itself (elspeth-11d8cb0908).
 _YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"})
 
 

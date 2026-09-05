@@ -19,6 +19,7 @@ from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
@@ -70,7 +71,45 @@ NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", 
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
 CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
-COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "collector", "gate", "queue", "row_union", "transform"))
+# DERIVED from the ``NodeType`` Literal above, never restated: this one
+# constant is an operand of BOTH node-kind drift guards (yaml_generator's
+# lowering guard and the capability-skill guidance pin), so deriving it here
+# re-points both at the authority ``NodeSpec.node_type`` is annotated
+# against. Their OTHER operands stay hand-written on purpose — a guard with
+# both operands derived is ``x != x`` (elspeth-b3117ec3ac, comment 7980).
+COMPOSER_NODE_TYPES: frozenset[str] = frozenset(get_args(NodeType))
+
+# The composer-authorable vocabulary is a PARTITION of the runtime graph
+# vocabulary (``contracts.enums.NodeType``, stored in ``nodes.node_type``):
+# every runtime kind except the two the composer authors as ``sources:`` and
+# ``outputs`` rather than as nodes. The Literal above stays hand-written
+# (it is the type ``NodeSpec.node_type`` carries); the enum is the derived
+# operand, so a kind added on either side without the other fails at import.
+_RUNTIME_KINDS_THE_COMPOSER_DOES_NOT_AUTHOR_AS_NODES: Final[frozenset[str]] = frozenset(
+    {RuntimeNodeType.SOURCE.value, RuntimeNodeType.SINK.value}
+)
+
+
+def check_composer_vocabulary_partitions_runtime(composer_kinds: frozenset[str], runtime_kinds: frozenset[str]) -> None:
+    """Refuse a composer vocabulary that is not runtime minus {source, sink}.
+
+    A function rather than a bare ``assert`` so it survives ``python -O``
+    (a module-load guard that only exists un-optimised is a guard that does
+    not exist in a deployment — elspeth-37941f1731) and so a test can feed
+    it a drifted pair.
+    """
+
+    expected = runtime_kinds - _RUNTIME_KINDS_THE_COMPOSER_DOES_NOT_AUTHOR_AS_NODES
+    if composer_kinds != expected:
+        raise RuntimeError(
+            "Composer node-kind vocabulary drift against contracts.enums.NodeType: "
+            f"composer-only kinds {sorted(composer_kinds - expected)}; "
+            f"runtime kinds the composer does not author {sorted(expected - composer_kinds)}. "
+            "Add the kind to BOTH the composer NodeType Literal and the runtime enum, or to neither."
+        )
+
+
+check_composer_vocabulary_partitions_runtime(COMPOSER_NODE_TYPES, frozenset(member.value for member in RuntimeNodeType))
 
 # Structural marker the bind tools stamp into a composer/LLM-authored source's
 # options (content-hash-bound authoring metadata; ``tools/sources.py`` writes
