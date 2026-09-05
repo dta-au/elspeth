@@ -20,6 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
@@ -163,7 +164,6 @@ class SchedulerQueueRepository:
         available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -196,7 +196,6 @@ class SchedulerQueueRepository:
             available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -223,7 +222,6 @@ class SchedulerQueueRepository:
         available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -252,7 +250,6 @@ class SchedulerQueueRepository:
             available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -279,7 +276,6 @@ class SchedulerQueueRepository:
         available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int,
         queue_key: str | None,
         barrier_key: str | None,
@@ -305,7 +301,6 @@ class SchedulerQueueRepository:
                 available_at=available_at,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 attempt=attempt,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
@@ -334,7 +329,6 @@ class SchedulerQueueRepository:
         available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -417,7 +411,6 @@ class SchedulerQueueRepository:
                 run_id=run_id,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 strict_membership_fenced=worker_id is not None,
             )
             if claimed is not None:
@@ -428,7 +421,6 @@ class SchedulerQueueRepository:
         self,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         insert_row_and_token: Callable[[Connection], tuple[Row, Token]],
         token_id: str,
         row_id: str,
@@ -462,6 +454,12 @@ class SchedulerQueueRepository:
         ``coordination_token`` is REQUIRED — this verb has no legacy callers.
         Raises :class:`~elspeth.contracts.errors.RunLeadershipLostError` on a
         fence miss (``fence_refusal`` evented on a fresh connection).
+
+        Ingested work is available immediately, and "immediately" is Landscape
+        database time read inside the fenced transaction (ADR-047), not the
+        leader's process clock. ``available_at`` is compared against that same
+        clock by ``claim_ready``, so a leader whose clock ran fast can no
+        longer enqueue work that its own next claim refuses as not-yet-due.
         """
         run_id = coordination_token.run_id
         with fenced_leader_transaction(
@@ -487,10 +485,9 @@ class SchedulerQueueRepository:
                 step_index=step_index,
                 ingest_sequence=ingest_sequence,
                 row_payload_json=row_payload_json,
-                available_at=now,
+                available_at=read_landscape_transaction_time(conn),
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
                 on_success_sink=on_success_sink,

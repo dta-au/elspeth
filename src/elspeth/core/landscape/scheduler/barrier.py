@@ -279,7 +279,7 @@ class BarrierJournalRepository:
         if scope_row_id is not None:
             blocked_select = blocked_select.where(token_work_items_table.c.row_id == scope_row_id)
 
-        with fenced_write(self._engine, coordination_token=coordination_token, now=now, verb="complete_barrier") as conn:
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="complete_barrier") as conn:
             if terminal_outcome_token_ids:
                 locked_tokens = conn.execute(
                     select(tokens_table.c.token_id, tokens_table.c.run_id)

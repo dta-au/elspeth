@@ -573,7 +573,7 @@ class SchedulerDispositionRepository:
             .exists()
         )
         with fenced_write(
-            self._engine, coordination_token=coordination_token, now=now, verb="terminalize_pending_sinks_with_terminal_outcomes"
+            self._engine, coordination_token=coordination_token, verb="terminalize_pending_sinks_with_terminal_outcomes"
         ) as conn:
             rows = (
                 conn.execute(

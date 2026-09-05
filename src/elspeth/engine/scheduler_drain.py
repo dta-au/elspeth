@@ -395,7 +395,6 @@ class SchedulerDrainCoordinator:
                 )
 
         recovered = self._scheduler.recover_expired_leases(
-            now=now,
             coordination_token=coordination_token,
         )
         self._scheduler_drains_since_maintenance = 0
@@ -523,7 +522,6 @@ class SchedulerDrainCoordinator:
                     run_id=self._run_id,
                     lease_owner=self._scheduler_lease_owner,
                     lease_seconds=self._scheduler_lease_seconds,
-                    now=now,
                 )
             if claimed is None:
                 if recover_pending_sinks:
@@ -868,7 +866,6 @@ class SchedulerDrainCoordinator:
 
             now = self._clock.now_utc()
             self._scheduler.recover_expired_leases(
-                now=now,
                 coordination_token=coordination_token,
             )
             repaired = self._scheduler.terminalize_pending_sinks_with_terminal_outcomes(
@@ -883,7 +880,6 @@ class SchedulerDrainCoordinator:
                 run_id=self._run_id,
                 lease_owner=self._scheduler_lease_owner,
                 lease_seconds=self._scheduler_lease_seconds,
-                now=now,
             )
             if pending_sink is None:
                 return
@@ -1099,7 +1095,6 @@ class SchedulerDrainCoordinator:
             work_item_id=self._active_claim_work_item_id,
             lease_owner=self._scheduler_lease_owner,
             lease_seconds=self._scheduler_lease_seconds,
-            now=now,
             # Explicit boundary: registered production workers require the
             # strict active-membership EXISTS predicate. Legacy/N=0 processors
             # select the unfenced compatibility arm deliberately; registry
@@ -1178,7 +1173,6 @@ class SchedulerDrainCoordinator:
                 collector_name=fields.collector_name,
                 lease_owner=self._scheduler_lease_owner,
                 lease_seconds=self._scheduler_lease_seconds,
-                now=available_at,
             )
         else:
             scheduled = self._scheduler.enqueue_ready(

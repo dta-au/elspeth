@@ -8,8 +8,6 @@ peer-lease probe. Extracted from ``TokenSchedulerRepository``
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 
 from sqlalchemy import ColumnElement, and_, literal, or_, select, true, update
@@ -23,6 +21,7 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import WRITE_INTENT_OPTION, Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import record_coordination_event
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.fencing import (
@@ -98,16 +97,27 @@ class SchedulerLeaseRepository:
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
     ) -> TokenWorkItem | None:
-        """Claim the next available READY work item for a bounded lease."""
+        """Claim the next available READY work item for a bounded lease.
+
+        Availability and the lease deadline are both decided on Landscape
+        database time (ADR-047). This SELECT and the CAS UPDATE inside
+        ``claim_ready_row`` each read the clock on ``conn``: on PostgreSQL
+        ``CURRENT_TIMESTAMP`` is transaction time, so the two reads are the
+        same instant; on SQLite they can straddle a whole second, and that
+        direction is safe because the second read is never earlier — a row
+        that satisfied ``available_at <= first`` still satisfies
+        ``available_at <= second``, so the UPDATE cannot refuse a row the
+        SELECT admitted.
+        """
         with begin_write(self._engine) as conn:
+            database_now = read_landscape_transaction_time(conn)
             row = (
                 conn.execute(
                     select(token_work_items_table)
                     .where(token_work_items_table.c.run_id == run_id)
                     .where(token_work_items_table.c.status == TokenWorkStatus.READY.value)
-                    .where(token_work_items_table.c.available_at <= now)
+                    .where(token_work_items_table.c.available_at <= database_now)
                     .order_by(
                         token_work_items_table.c.ingest_sequence,
                         token_work_items_table.c.step_index,
@@ -131,7 +141,6 @@ class SchedulerLeaseRepository:
                 run_id=run_id,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 # Membership fence: the public claim_ready verb applies the
                 # claim_verb_fence_clause so an evicted/departed claimant
                 # is refused with RunWorkerEvictedError (ADR-030 §G, slice 4).
@@ -149,11 +158,14 @@ class SchedulerLeaseRepository:
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         membership_fenced: bool = False,
         strict_membership_fenced: bool = False,
     ) -> RowMapping | None:
         """CAS update to claim a READY row under a lease.
+
+        Reads the Landscape database clock on the caller's ``conn`` (ADR-047):
+        availability, the lease deadline and ``updated_at`` are all one
+        in-transaction instant, and no caller can hand this CAS a timestamp.
 
         ``membership_fenced=True`` (set only by the public ``claim_ready``
         verb) adds the ``claim_verb_fence_clause`` to the UPDATE WHERE.
@@ -171,7 +183,8 @@ class SchedulerLeaseRepository:
         as ``False`` because they are explicitly legacy or operate inside a
         broader leader-fenced transaction.
         """
-        lease_expires_at = now + timedelta(seconds=lease_seconds)
+        database_now = read_landscape_transaction_time(conn)
+        lease_expires_at = database_now + timedelta(seconds=lease_seconds)
         if strict_membership_fenced or membership_fenced:
             # Serialize the fence with worker eviction BEFORE the CAS UPDATE:
             # the EXISTS predicate below is an unlocked MVCC read and would
@@ -183,7 +196,7 @@ class SchedulerLeaseRepository:
             token_work_items_table.c.work_item_id == row["work_item_id"],
             token_work_items_table.c.run_id == run_id,
             token_work_items_table.c.status == TokenWorkStatus.READY.value,
-            token_work_items_table.c.available_at <= now,
+            token_work_items_table.c.available_at <= database_now,
         )
         if strict_membership_fenced:
             where_clauses = and_(
@@ -208,7 +221,7 @@ class SchedulerLeaseRepository:
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=lease_owner,
                 lease_expires_at=lease_expires_at,
-                updated_at=now,
+                updated_at=database_now,
             )
         )
         if result.rowcount == 0:
@@ -266,7 +279,7 @@ class SchedulerLeaseRepository:
             to_lease_owner=lease_owner,
             from_attempt=row["attempt"],
             to_attempt=row["attempt"],
-            recorded_at=now,
+            recorded_at=database_now,
             from_lease_expires_at=row["lease_expires_at"],
             to_lease_expires_at=lease_expires_at,
             caller_owner=lease_owner,
@@ -294,12 +307,16 @@ class SchedulerLeaseRepository:
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
     ) -> TokenWorkItem | None:
-        """Claim a sink-bound token whose transform work is already durable."""
-        lease_expires_at = now + timedelta(seconds=lease_seconds)
+        """Claim a sink-bound token whose transform work is already durable.
+
+        The lease deadline is database time + ``lease_seconds``, read once
+        inside this verb's own write transaction (ADR-047).
+        """
         complete_bundle = pending_sink_bundle_clause()
         with begin_write(self._engine) as conn:
+            database_now = read_landscape_transaction_time(conn)
+            lease_expires_at = database_now + timedelta(seconds=lease_seconds)
             row = (
                 conn.execute(
                     select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
@@ -349,7 +366,7 @@ class SchedulerLeaseRepository:
                     status=TokenWorkStatus.LEASED.value,
                     lease_owner=lease_owner,
                     lease_expires_at=lease_expires_at,
-                    updated_at=now,
+                    updated_at=database_now,
                 )
             )
             if result.rowcount == 0:
@@ -396,7 +413,7 @@ class SchedulerLeaseRepository:
                 to_lease_owner=lease_owner,
                 from_attempt=row["attempt"],
                 to_attempt=row["attempt"],
-                recorded_at=now,
+                recorded_at=database_now,
                 from_lease_expires_at=row["lease_expires_at"],
                 to_lease_expires_at=lease_expires_at,
                 caller_owner=lease_owner,
@@ -422,7 +439,6 @@ class SchedulerLeaseRepository:
     def recover_expired_leases(
         self,
         *,
-        now: datetime,
         coordination_token: CoordinationToken,
         grace_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         stall_budget_seconds: float = DEFAULT_ITEM_STALL_BUDGET_SECONDS,
@@ -439,7 +455,8 @@ class SchedulerLeaseRepository:
 
         1. ``owner_registry_dead`` — the ``run_workers`` row for the lease
            owner is ABSENT, has status IN ('evicted','departed'), or has
-           ``status='active'`` AND ``heartbeat_expires_at < now - grace``.
+           ``status='active'`` AND ``heartbeat_expires_at`` older than
+           database time minus ``grace_seconds``.
            All three arms collapse into a single NOT EXISTS predicate so
            absent, non-active, and active-but-stale rows all match (no row
            → no EXISTS match → dead). This is the primary protection: a
@@ -483,58 +500,20 @@ class SchedulerLeaseRepository:
         coordination_token = require_coordination_token(coordination_token, verb="recover_expired_leases")
         run_id = coordination_token.run_id
         caller_owner = coordination_token.worker_id
-        grace_threshold = now - timedelta(seconds=grace_seconds)
-        owner_registry_dead: ColumnElement[bool] = ~(
-            select(run_workers_table.c.worker_id)
-            .where(
-                run_workers_table.c.worker_id == token_work_items_table.c.lease_owner,
-                run_workers_table.c.status == "active",
-                run_workers_table.c.heartbeat_expires_at >= grace_threshold,
-            )
-            .exists()
-        )
-        stall_threshold = now - timedelta(seconds=stall_budget_seconds)
-        lease_stalled: ColumnElement[bool] = token_work_items_table.c.lease_expires_at < stall_threshold
-        reap_eligible: ColumnElement[bool] = or_(owner_registry_dead, lease_stalled)
-
-        def record_worker_stalled_event(conn: Connection, row: RowMapping) -> None:
-            owner_is_dead = bool(row["owner_is_dead"])
-            if owner_is_dead or row["lease_owner"] is None:
-                return
-            record_coordination_event(
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="recover_expired_leases") as conn:
+            return self._rotate_expired_leases(
                 conn,
                 run_id=run_id,
-                event_type="worker_stalled",
-                worker_id=row["lease_owner"],
+                caller_owner=caller_owner,
+                grace_seconds=grace_seconds,
+                stall_budget_seconds=stall_budget_seconds,
                 leader_epoch=coordination_token.leader_epoch,
-                recorded_at=now,
-                context={
-                    "reaped_work_item_id": row["work_item_id"],
-                    "previous_work_item_id": row["work_item_id"],
-                    "reason": "item_stall_budget",
-                },
             )
-
-        return self._recover_expired_leases(
-            run_id=run_id,
-            now=now,
-            caller_owner=caller_owner,
-            owner_registry_dead=owner_registry_dead,
-            reap_eligible=reap_eligible,
-            write_transaction=fenced_write(
-                self._engine,
-                coordination_token=coordination_token,
-                now=now,
-                verb="recover_expired_leases",
-            ),
-            record_worker_stalled_event=record_worker_stalled_event,
-        )
 
     def recover_expired_leases_legacy_unfenced(
         self,
         *,
         run_id: str,
-        now: datetime,
         caller_owner: str,
     ) -> int:
         """Recover direct-harness leases without coordination authority.
@@ -545,34 +524,55 @@ class SchedulerLeaseRepository:
         clock domain that does not match their setup heartbeats.
 
         Liveness thresholds are absent by construction: legacy recovery does
-        not consult the worker registry.
+        not consult the worker registry, which is what the ``None`` liveness
+        durations select. Expiry itself is still decided on Landscape database time
+        (ADR-047): a harness ages a lease by writing an ``lease_expires_at``
+        in the past, never by handing recovery a future clock.
         """
+        with legacy_unfenced_recover_expired_leases_write(self._engine) as conn:
+            return self._rotate_expired_leases(
+                conn,
+                run_id=run_id,
+                caller_owner=caller_owner,
+                grace_seconds=None,
+                stall_budget_seconds=None,
+                leader_epoch=None,
+            )
 
-        def ignore_worker_stalled_event(conn: Connection, row: RowMapping) -> None:
-            del conn, row
-
-        return self._recover_expired_leases(
-            run_id=run_id,
-            now=now,
-            caller_owner=caller_owner,
-            owner_registry_dead=literal(True),
-            reap_eligible=true(),
-            write_transaction=legacy_unfenced_recover_expired_leases_write(self._engine),
-            record_worker_stalled_event=ignore_worker_stalled_event,
-        )
-
-    def _recover_expired_leases(
+    def _rotate_expired_leases(
         self,
+        conn: Connection,
         *,
         run_id: str,
-        now: datetime,
         caller_owner: str,
-        owner_registry_dead: ColumnElement[bool],
-        reap_eligible: ColumnElement[bool],
-        write_transaction: AbstractContextManager[Connection],
-        record_worker_stalled_event: Callable[[Connection, RowMapping], None],
+        grace_seconds: float | None,
+        stall_budget_seconds: float | None,
+        leader_epoch: int | None,
     ) -> int:
-        """Apply the shared lease rotation algorithm under explicit authority."""
+        """Apply the shared lease rotation algorithm under explicit authority.
+
+        Takes the open write connection rather than the transaction that
+        produced it: each public verb opens its own (fenced or named-legacy)
+        transaction and hands the connection down, so the clock this rotation
+        decides on is read on a connection whose authority is already
+        established and is never selected from a caller-supplied object.
+
+        Every threshold this sweep decides on — lease expiry, the owner's
+        heartbeat grace, the item stall budget, the ``updated_at`` stamp and
+        the ``worker_stalled`` event's ``recorded_at`` — is derived from ONE
+        ``read_landscape_transaction_time`` on the sweep's own write
+        connection (ADR-047). Building the liveness predicates inside the
+        transaction rather than accepting them pre-built is what makes that
+        possible: a predicate built by a caller would have had to close over a
+        caller clock.
+
+        The three liveness arguments are all-or-nothing: the fenced sweep
+        supplies every one, and the named legacy adapter supplies ``None`` for
+        each to select its no-registry arm, where every expired lease is
+        reap-eligible and no ``worker_stalled`` event is emitted (that path has
+        no leader epoch to attribute one to). They are durations and an epoch,
+        never timestamps — the sweep's only instant is ``database_now``.
+        """
         # Predicate symmetric across the SELECT and UPDATE to close two
         # multi-worker race classes (filigree elspeth-28aaa36a62, G1 P2):
         #
@@ -583,7 +583,7 @@ class SchedulerLeaseRepository:
         #    the per-row UPDATE, a peer reaper may have already returned the
         #    row to PENDING_SINK and a peer claimant may have leased it
         #    again with a fresh ``lease_expires_at``. Without the
-        #    ``lease_expires_at < now`` predicate on the UPDATE, the caller
+        #    ``lease_expires_at < database_now`` predicate on the UPDATE, the caller
         #    would clobber the peer's live lease. The READY-recovery branch
         #    is incidentally protected by ``work_item_id`` rotation at the
         #    next-attempt bump, but symmetry costs nothing and survives the
@@ -615,121 +615,156 @@ class SchedulerLeaseRepository:
         )
         complete_pending_sink_bundle = pending_sink_bundle_clause()
 
-        with write_transaction as conn:
-            expired_rows = conn.execute(
-                select(
-                    token_work_items_table,
-                    owner_registry_dead.label("owner_is_dead"),
-                    sink_redrive_shaped.label("_sink_redrive_shaped"),
-                    complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+        database_now = read_landscape_transaction_time(conn)
+        if grace_seconds is None or stall_budget_seconds is None or leader_epoch is None:
+            owner_registry_dead: ColumnElement[bool] = literal(True)
+            reap_eligible: ColumnElement[bool] = true()
+        else:
+            grace_threshold = database_now - timedelta(seconds=grace_seconds)
+            owner_registry_dead = ~(
+                select(run_workers_table.c.worker_id)
+                .where(
+                    run_workers_table.c.worker_id == token_work_items_table.c.lease_owner,
+                    run_workers_table.c.status == "active",
+                    run_workers_table.c.heartbeat_expires_at >= grace_threshold,
                 )
+                .exists()
+            )
+            stall_threshold = database_now - timedelta(seconds=stall_budget_seconds)
+            lease_stalled: ColumnElement[bool] = token_work_items_table.c.lease_expires_at < stall_threshold
+            reap_eligible = or_(owner_registry_dead, lease_stalled)
+
+        expired_rows = conn.execute(
+            select(
+                token_work_items_table,
+                owner_registry_dead.label("owner_is_dead"),
+                sink_redrive_shaped.label("_sink_redrive_shaped"),
+                complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+            )
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .where(token_work_items_table.c.lease_expires_at < database_now)
+            .where(lease_owner_not_caller)
+            .where(reap_eligible)
+            .order_by(
+                token_work_items_table.c.ingest_sequence,
+                token_work_items_table.c.step_index,
+                # Stable last-resort tiebreaker for cross-source same-tick
+                # collisions (filigree elspeth-6cb89db535, G3 M1).
+                token_work_items_table.c.work_item_id,
+            )
+        ).mappings()
+        # Materialise into a list: the connection must remain open for the
+        # per-row UPDATEs below, but lazy iteration over the SELECT cursor
+        # would be invalidated by the first write on the same connection
+        # (SQLite WAL mode). Collect all eligible rows first, then update.
+        expired = list(expired_rows)
+
+        recovered = 0
+        for row in expired:
+            is_sink_redrive = bool(row["_sink_redrive_shaped"])
+            if is_sink_redrive and not row["_pending_sink_bundle_complete"]:
+                raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
+            next_attempt = row["attempt"] if is_sink_redrive else row["attempt"] + 1
+            next_work_item_id = (
+                row["work_item_id"] if is_sink_redrive else work_item_id(run_id, row["token_id"], row["node_id"], next_attempt)
+            )
+            recovered_status = TokenWorkStatus.PENDING_SINK.value if is_sink_redrive else TokenWorkStatus.READY.value
+            result = conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == row["work_item_id"])
                 .where(token_work_items_table.c.run_id == run_id)
                 .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-                .where(token_work_items_table.c.lease_expires_at < now)
-                .where(lease_owner_not_caller)
+                .where(token_work_items_table.c.lease_expires_at < database_now)
+                .where(
+                    or_(
+                        token_work_items_table.c.lease_owner.is_(None),
+                        token_work_items_table.c.lease_owner != caller_owner,
+                    )
+                )
                 .where(reap_eligible)
-                .order_by(
-                    token_work_items_table.c.ingest_sequence,
-                    token_work_items_table.c.step_index,
-                    # Stable last-resort tiebreaker for cross-source same-tick
-                    # collisions (filigree elspeth-6cb89db535, G3 M1).
-                    token_work_items_table.c.work_item_id,
+                # The diagnostic SELECT above is not the safety boundary.
+                # Repeat the exact subtype admission inside the conditional
+                # UPDATE so a same-transaction interleaving cannot turn a
+                # transform into sink debt (or lease a malformed bundle).
+                .where(complete_pending_sink_bundle if is_sink_redrive else ~sink_redrive_shaped)
+                .values(
+                    work_item_id=next_work_item_id,
+                    attempt=next_attempt,
+                    status=recovered_status,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=database_now,
                 )
-            ).mappings()
-            # Materialise into a list: the connection must remain open for the
-            # per-row UPDATEs below, but lazy iteration over the SELECT cursor
-            # would be invalidated by the first write on the same connection
-            # (SQLite WAL mode). Collect all eligible rows first, then update.
-            expired = list(expired_rows)
-
-            recovered = 0
-            for row in expired:
-                is_sink_redrive = bool(row["_sink_redrive_shaped"])
-                if is_sink_redrive and not row["_pending_sink_bundle_complete"]:
-                    raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
-                next_attempt = row["attempt"] if is_sink_redrive else row["attempt"] + 1
-                next_work_item_id = (
-                    row["work_item_id"] if is_sink_redrive else work_item_id(run_id, row["token_id"], row["node_id"], next_attempt)
-                )
-                recovered_status = TokenWorkStatus.PENDING_SINK.value if is_sink_redrive else TokenWorkStatus.READY.value
-                result = conn.execute(
-                    update(token_work_items_table)
-                    .where(token_work_items_table.c.work_item_id == row["work_item_id"])
-                    .where(token_work_items_table.c.run_id == run_id)
-                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-                    .where(token_work_items_table.c.lease_expires_at < now)
-                    .where(
-                        or_(
-                            token_work_items_table.c.lease_owner.is_(None),
-                            token_work_items_table.c.lease_owner != caller_owner,
+            )
+            if result.rowcount == 0:
+                current = (
+                    conn.execute(
+                        select(
+                            token_work_items_table.c.status,
+                            sink_redrive_shaped.label("_sink_redrive_shaped"),
+                            complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
                         )
+                        .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                        .where(token_work_items_table.c.run_id == run_id)
                     )
-                    .where(reap_eligible)
-                    # The diagnostic SELECT above is not the safety boundary.
-                    # Repeat the exact subtype admission inside the conditional
-                    # UPDATE so a same-transaction interleaving cannot turn a
-                    # transform into sink debt (or lease a malformed bundle).
-                    .where(complete_pending_sink_bundle if is_sink_redrive else ~sink_redrive_shaped)
-                    .values(
-                        work_item_id=next_work_item_id,
-                        attempt=next_attempt,
-                        status=recovered_status,
-                        lease_owner=None,
-                        lease_expires_at=None,
-                        updated_at=now,
-                    )
+                    .mappings()
+                    .one_or_none()
                 )
-                if result.rowcount == 0:
-                    current = (
-                        conn.execute(
-                            select(
-                                token_work_items_table.c.status,
-                                sink_redrive_shaped.label("_sink_redrive_shaped"),
-                                complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
-                            )
-                            .where(token_work_items_table.c.work_item_id == row["work_item_id"])
-                            .where(token_work_items_table.c.run_id == run_id)
-                        )
-                        .mappings()
-                        .one_or_none()
-                    )
-                    if current is not None and current["status"] == TokenWorkStatus.LEASED.value:
-                        current_sink_redrive = bool(current["_sink_redrive_shaped"])
-                        current_bundle_complete = bool(current["_pending_sink_bundle_complete"])
-                        if (is_sink_redrive and not current_bundle_complete) or (
-                            not is_sink_redrive and current_sink_redrive and not current_bundle_complete
-                        ):
-                            raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
-                if result.rowcount == 1:
-                    self._events.record(
+                if current is not None and current["status"] == TokenWorkStatus.LEASED.value:
+                    current_sink_redrive = bool(current["_sink_redrive_shaped"])
+                    current_bundle_complete = bool(current["_pending_sink_bundle_complete"])
+                    if (is_sink_redrive and not current_bundle_complete) or (
+                        not is_sink_redrive and current_sink_redrive and not current_bundle_complete
+                    ):
+                        raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
+            if result.rowcount == 1:
+                self._events.record(
+                    conn,
+                    event_type=SchedulerEventType.RECOVER_EXPIRED_LEASE,
+                    run_id=run_id,
+                    token_id=row["token_id"],
+                    work_item_id=next_work_item_id,
+                    node_id=row["node_id"],
+                    from_status=TokenWorkStatus.LEASED,
+                    to_status=TokenWorkStatus(recovered_status),
+                    from_lease_owner=row["lease_owner"],
+                    to_lease_owner=None,
+                    from_attempt=row["attempt"],
+                    to_attempt=next_attempt,
+                    recorded_at=database_now,
+                    from_lease_expires_at=row["lease_expires_at"],
+                    to_lease_expires_at=None,
+                    caller_owner=caller_owner,
+                    context=({"previous_work_item_id": row["work_item_id"]} if next_work_item_id != row["work_item_id"] else None),
+                )
+                # §A.5 :145: emit worker_stalled ONLY when the owner is
+                # registry-LIVE but stalled (stall arm, not dead-owner arm).
+                # ``owner_is_dead`` is materialised per-row by the SELECT
+                # (correlated EXISTS evaluated at query time). A dead-owner
+                # reap is already explained by the worker_evict event on
+                # that path; emitting worker_stalled for it is redundant
+                # and violates the invariant (every non-evicted rotation
+                # is explained by stalled, not double-evented).
+                #
+                # The legacy no-registry arm (no liveness durations) never
+                # emits: it has no leader epoch to attribute the event to
+                # and its ``owner_is_dead`` is a constant TRUE.
+                if leader_epoch is not None and not bool(row["owner_is_dead"]) and row["lease_owner"] is not None:
+                    record_coordination_event(
                         conn,
-                        event_type=SchedulerEventType.RECOVER_EXPIRED_LEASE,
                         run_id=run_id,
-                        token_id=row["token_id"],
-                        work_item_id=next_work_item_id,
-                        node_id=row["node_id"],
-                        from_status=TokenWorkStatus.LEASED,
-                        to_status=TokenWorkStatus(recovered_status),
-                        from_lease_owner=row["lease_owner"],
-                        to_lease_owner=None,
-                        from_attempt=row["attempt"],
-                        to_attempt=next_attempt,
-                        recorded_at=now,
-                        from_lease_expires_at=row["lease_expires_at"],
-                        to_lease_expires_at=None,
-                        caller_owner=caller_owner,
-                        context=({"previous_work_item_id": row["work_item_id"]} if next_work_item_id != row["work_item_id"] else None),
+                        event_type="worker_stalled",
+                        worker_id=row["lease_owner"],
+                        leader_epoch=leader_epoch,
+                        recorded_at=database_now,
+                        context={
+                            "reaped_work_item_id": row["work_item_id"],
+                            "previous_work_item_id": row["work_item_id"],
+                            "reason": "item_stall_budget",
+                        },
                     )
-                    # §A.5 :145: emit worker_stalled ONLY when the owner is
-                    # registry-LIVE but stalled (stall arm, not dead-owner arm).
-                    # ``owner_is_dead`` is materialised per-row by the SELECT
-                    # (correlated EXISTS evaluated at query time). A dead-owner
-                    # reap is already explained by the worker_evict event on
-                    # that path; emitting worker_stalled for it is redundant
-                    # and violates the invariant (every non-evicted rotation
-                    # is explained by stalled, not double-evented).
-                    record_worker_stalled_event(conn, row)
-                recovered += result.rowcount
+            recovered += result.rowcount
         return recovered
 
     def heartbeat_lease(
@@ -739,16 +774,21 @@ class SchedulerLeaseRepository:
         work_item_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         membership_fenced: bool,
     ) -> datetime:
-        """Extend a held lease's ``lease_expires_at`` to ``now + lease_seconds``.
+        """Extend a held lease's ``lease_expires_at`` by ``lease_seconds``.
+
+        The new deadline is Landscape database time + ``lease_seconds``, read
+        once inside this heartbeat's own write transaction (ADR-047), so a
+        worker whose process clock has drifted forward cannot buy itself a
+        longer lease than the reaper will honour: the reaper compares against
+        the same database clock.
 
         Single-timestamp heartbeat for ADR-026 RC6 multi-worker (filigree
         elspeth-ddde8144b6). A worker mid-processing calls this periodically
         from inside the slow work loop so a peer's ``recover_expired_leases``
         sweep does NOT reap an alive-but-slow worker. ``peer_active_leases``
-        already filters on ``lease_expires_at > now``, so extending that
+        already filters on ``lease_expires_at`` against database time, so extending that
         timestamp is sufficient — no second clock and no inconsistency window
         between heartbeat-fresh-but-lease-expired vs reaper semantics.
 
@@ -775,7 +815,6 @@ class SchedulerLeaseRepository:
         Returns the new ``lease_expires_at`` so the caller can update its
         local last-heartbeat-attempt clock without re-reading the row.
         """
-        new_expires_at = now + timedelta(seconds=lease_seconds)
         lease_lost = False
         with self._engine.connect() as conn:
             # Write intent must be declared BEFORE conn.begin() — the begin
@@ -783,6 +822,8 @@ class SchedulerLeaseRepository:
             conn.execution_options(**{WRITE_INTENT_OPTION: True})
             transaction = conn.begin()
             try:
+                database_now = read_landscape_transaction_time(conn)
+                new_expires_at = database_now + timedelta(seconds=lease_seconds)
                 where_clauses = and_(
                     token_work_items_table.c.work_item_id == work_item_id,
                     token_work_items_table.c.run_id == run_id,
@@ -808,7 +849,7 @@ class SchedulerLeaseRepository:
                     .where(where_clauses)
                     .values(
                         lease_expires_at=new_expires_at,
-                        updated_at=now,
+                        updated_at=database_now,
                     )
                 )
                 if result.rowcount != 1:
@@ -846,7 +887,7 @@ class SchedulerLeaseRepository:
                             to_lease_owner=current["lease_owner"],
                             from_attempt=current["attempt"],
                             to_attempt=current["attempt"],
-                            recorded_at=now,
+                            recorded_at=database_now,
                             from_lease_expires_at=None,
                             to_lease_expires_at=current["lease_expires_at"],
                             caller_owner=lease_owner,
@@ -872,7 +913,7 @@ class SchedulerLeaseRepository:
                                 to_lease_owner=recovery_event["to_lease_owner"],
                                 from_attempt=recovery_event["from_attempt"],
                                 to_attempt=recovery_event["to_attempt"],
-                                recorded_at=now,
+                                recorded_at=database_now,
                                 from_lease_expires_at=recovery_event["from_lease_expires_at"],
                                 to_lease_expires_at=recovery_event["to_lease_expires_at"],
                                 caller_owner=lease_owner,
@@ -903,14 +944,16 @@ class SchedulerLeaseRepository:
         *,
         run_id: str,
         caller_owner: str,
-        now: datetime,
     ) -> tuple[str, ...]:
         """Return distinct lease_owners of unexpired LEASED rows held by peers.
 
         A "peer" is any ``lease_owner`` other than ``caller_owner``. A lease is
-        "active" if ``lease_expires_at > now``; rows whose lease has expired are
-        recoverable via ``recover_expired_leases`` and do not contribute to the
-        peer set.
+        "active" if ``lease_expires_at`` is later than Landscape database time,
+        read on this probe's own connection (ADR-047) — the same clock
+        ``recover_expired_leases`` reaps against, so this precondition and the
+        sweep can never disagree about which leases are live. Rows whose lease
+        has expired are recoverable via ``recover_expired_leases`` and do not
+        contribute to the peer set.
 
         This is the single-active-resume precondition surface for
         ``drain_scheduled_work``: a resume drain run while a peer holds an
@@ -929,6 +972,7 @@ class SchedulerLeaseRepository:
         duplicate RowResults into the audit trail.
         """
         with self._engine.connect() as conn:
+            database_now = read_landscape_transaction_time(conn)
             owners = (
                 conn.execute(
                     select(token_work_items_table.c.lease_owner)
@@ -936,7 +980,7 @@ class SchedulerLeaseRepository:
                     .where(token_work_items_table.c.run_id == run_id)
                     .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
                     .where(token_work_items_table.c.lease_owner != caller_owner)
-                    .where(token_work_items_table.c.lease_expires_at > now)
+                    .where(token_work_items_table.c.lease_expires_at > database_now)
                     .order_by(token_work_items_table.c.lease_owner)
                 )
                 .scalars()
