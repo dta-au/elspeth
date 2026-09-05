@@ -36,9 +36,24 @@ scope here is that the gap stays visible while that work is outstanding.
 above has a test that asserts the scanner does NOT report it, so widening the
 scanner without updating the record fails loudly.
 
+CHECK 4 — SOFT-MAPPING CENSUS (elspeth-10d605be55). Check 2's whitelist is a
+ratchet over the third it can see, and "whitelist rows retired" credits a
+``dict[str, Any]`` -> ``Mapping[str, Any]`` rewrite exactly like an owned-type
+conversion. The census is the second measure: it counts EVERY soft mapping
+form (``dict``/``Mapping``/``MutableMapping`` with a ``str`` key and an ``Any``
+or ``object`` value) in EVERY annotation position, all of ``src/elspeth``, and
+pins the per-file, per-form counts in ``config/cicd/soft-mapping-census.yaml``.
+Any drift from the pin fails; a rewrite between forms is a swap the re-pin diff
+shows, and only the ``soft`` total falling is progress. A parameter parsed at a
+``@trust_boundary`` (its ``source_param``) scores as a boundary conversion, i.e.
+a removal. The exact counting rule is :data:`CENSUS_METHOD`, emitted verbatim
+into the pin file. Re-pin with ``--write-census`` in the same commit that
+changes a soft site.
+
 Usage:
     python scripts/check_contracts.py
     python scripts/check_contracts.py --no-fail-on-stale  # Skip stale check
+    python scripts/check_contracts.py --write-census      # Re-pin the soft-mapping census
 
 Exit codes:
     0: All contracts properly centralized
@@ -53,6 +68,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from typing import Final
 
 import yaml
 
@@ -1418,6 +1434,368 @@ def check_settings_alignment(config_path: Path) -> list[SettingsViolation]:
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Soft-mapping census (elspeth-10d605be55)
+#
+# Check 2 above counts one SPELLING (``dict[str, Any]``) in two positions and
+# credits every retired whitelist row identically — a ``dict[str, Any]`` ->
+# ``Mapping[str, Any]`` rewrite and a genuine owned-type conversion both retire
+# exactly one row, and the 2026-08-31 campaign that replaced ``Any`` with
+# ``object`` wholesale went green on it while retiring no risk. The census is
+# the second measure: it counts every soft mapping form in every annotation
+# position, pins the counts per file, and refuses ANY drift from the pin. A
+# rewrite between forms therefore shows up as a swap in the re-pin diff (one
+# column down, another up in the same file) instead of scoring; only a site
+# that leaves the soft family altogether lowers the soft total, and that total
+# is the burn-down score.
+# ---------------------------------------------------------------------------
+
+SOFT_MAPPING_FORMS: Final[tuple[str, ...]] = (
+    "dict[str, Any]",
+    "Mapping[str, Any]",
+    "MutableMapping[str, Any]",
+    "dict[str, object]",
+    "Mapping[str, object]",
+)
+"""The five soft mapping forms, keyed on container and value type.
+
+``object``-valued forms are soft here even though check 2 excludes them: they
+force narrowing at every use site instead of at a boundary, which is the shape
+the failed ``Any`` -> ``object`` sweep produced. Counting them is what stops
+that sweep from ever scoring again.
+"""
+
+BOUNDARY_COLUMN: Final = "boundary"
+
+CENSUS_METHOD: Final = (
+    "Every dict/Dict/Mapping/MutableMapping[str, Any|object] subscript occurring anywhere inside an "
+    "annotation (unions, Optional and container wrappers included, each occurrence counted) on any "
+    "function parameter (positional-only, ordinary, *args, keyword-only, **kwargs), any return, and any "
+    "AnnAssign at module, class or function scope, in every parseable .py file under src/elspeth "
+    "including contracts/; module-level dict[str, Any] aliases resolved by import through DictAliasIndex. "
+    "A parameter named as source_param by a @trust_boundary decorator on the same function counts in the "
+    "'boundary' column (a boundary conversion scores as a removal), not in its form column. Measured "
+    "2,739 soft + 63 boundary occurrences across 386 files at release/0.8.0@e8998f20a, six of them "
+    "reached only through alias resolution; the 2,162 quoted by the 2026-09-04 scope statement used a "
+    "narrower rule that could not be recovered and is NOT this census."
+)
+
+_SOFT_CONTAINERS: Final[dict[str, str]] = {
+    "dict": "dict",
+    "Dict": "dict",
+    "Mapping": "Mapping",
+    "MutableMapping": "MutableMapping",
+}
+
+
+@dataclass(frozen=True)
+class CensusSite:
+    """One soft-mapping occurrence: where it is, which form, and whether it is a boundary parse."""
+
+    file: str
+    line: int
+    context: str
+    position: str
+    form: str
+    boundary: bool
+
+
+@dataclass(frozen=True)
+class CensusDrift:
+    """One per-file, per-form disagreement between the pinned census and the live tree."""
+
+    file: str
+    form: str
+    pinned: int
+    live: int
+
+
+@dataclass(frozen=True)
+class CensusReport:
+    """Outcome of :func:`check_soft_mapping_census`: pass/fail, printable lines, and the score."""
+
+    ok: bool
+    lines: tuple[str, ...]
+    totals: dict[str, int]
+    drifts: tuple[CensusDrift, ...]
+
+
+def _annotation_name(expr: ast.expr) -> str | None:
+    """Return the bare or attribute name an annotation node spells, else ``None``."""
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    return None
+
+
+def soft_mapping_form(node: ast.AST, aliases: frozenset[str] = frozenset()) -> str | None:
+    """Classify ONE annotation node as a soft mapping form, or ``None``.
+
+    ``typing.Mapping`` / ``collections.abc.Mapping`` / bare ``Mapping`` all read
+    as the same container; ``typing.Any`` and ``Any`` as the same value. A name
+    in ``aliases`` is a module-level ``dict[str, Any]`` alias resolved by import.
+    """
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return "dict[str, Any]"
+    if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2):
+        return None
+    container = _SOFT_CONTAINERS.get(_annotation_name(node.value) or "")
+    key_type, value_type = node.slice.elts
+    value = _annotation_name(value_type)
+    if container is None or _annotation_name(key_type) != "str" or value not in ("Any", "object"):
+        return None
+    return f"{container}[str, {value}]"
+
+
+def iter_soft_mapping_forms(annotation: ast.expr, aliases: frozenset[str] = frozenset()) -> list[str]:
+    """Every soft form occurring anywhere inside ``annotation``, in source order.
+
+    Walks the whole expression so a union carrying two soft forms yields two
+    and a wrapper such as ``list[dict[str, Any]]`` yields one — per-occurrence
+    counting is what turns a form-to-form rewrite into a visible swap.
+    """
+    forms: list[str] = []
+    for node in ast.walk(annotation):
+        form = soft_mapping_form(node, aliases)
+        if form is not None:
+            forms.append(form)
+    return forms
+
+
+def _trust_boundary_source_param(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The ``source_param`` a ``@trust_boundary(...)`` decorator on ``func`` names, else ``None``."""
+    for decorator in func.decorator_list:
+        if not isinstance(decorator, ast.Call) or _annotation_name(decorator.func) != "trust_boundary":
+            continue
+        for keyword in decorator.keywords:
+            if keyword.arg == "source_param" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                return keyword.value.value
+    return None
+
+
+def _annassign_target(node: ast.AnnAssign) -> str:
+    dotted = _dotted_name(node.target)
+    return dotted if dotted is not None else ast.unparse(node.target)
+
+
+def census_file(file_path: Path, aliases: frozenset[str] = frozenset()) -> list[CensusSite]:
+    """Every soft-mapping occurrence in one file, in source order (see :data:`CENSUS_METHOD`)."""
+    try:
+        tree = ast.parse(file_path.read_text())
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    parent_map: dict[int, ast.AST] = {}
+    for parent_node in ast.walk(tree):
+        for child_node in ast.iter_child_nodes(parent_node):
+            parent_map[id(child_node)] = parent_node
+
+    def context_of(node: ast.AST) -> str:
+        """Dotted enclosing class/function names, ``<module>`` at module scope."""
+        names: list[str] = []
+        ancestor = parent_map.get(id(node))
+        while ancestor is not None:
+            if isinstance(ancestor, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                names.append(ancestor.name)
+            ancestor = parent_map.get(id(ancestor))
+        return ".".join(reversed(names)) if names else "<module>"
+
+    sites: list[CensusSite] = []
+    relative_path = str(file_path)
+
+    def record(line: int, context: str, position: str, annotation: ast.expr, *, boundary: bool) -> None:
+        for form in iter_soft_mapping_forms(annotation, aliases):
+            sites.append(CensusSite(relative_path, line, context, position, form, boundary))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            own_context = context_of(node)
+            context = f"{own_context}.{node.name}" if own_context != "<module>" else node.name
+            source_param = _trust_boundary_source_param(node)
+            args = node.args
+            labelled: list[tuple[str, ast.arg]] = [(arg.arg, arg) for arg in args.posonlyargs + args.args]
+            if args.vararg is not None:
+                labelled.append((f"*{args.vararg.arg}", args.vararg))
+            labelled.extend((arg.arg, arg) for arg in args.kwonlyargs)
+            if args.kwarg is not None:
+                labelled.append((f"**{args.kwarg.arg}", args.kwarg))
+            for label, arg in labelled:
+                if arg.annotation is not None:
+                    record(arg.lineno, context, f"param:{label}", arg.annotation, boundary=arg.arg == source_param)
+            if node.returns is not None:
+                record(node.lineno, context, "return", node.returns, boundary=False)
+        elif isinstance(node, ast.AnnAssign):
+            record(node.lineno, context_of(node), f"annassign:{_annassign_target(node)}", node.annotation, boundary=False)
+    return sites
+
+
+def build_census(src_dir: Path, alias_index: DictAliasIndex | None = None) -> list[CensusSite]:
+    """Every soft-mapping occurrence under ``src_dir`` (contracts/ included), file order sorted."""
+    sites: list[CensusSite] = []
+    for py_file in sorted(src_dir.rglob("*.py")):
+        aliases = alias_index.names_in_scope(py_file, src_dir) if alias_index is not None else frozenset()
+        sites.extend(census_file(py_file, aliases))
+    return sites
+
+
+def tabulate_census(sites: list[CensusSite]) -> dict[str, dict[str, int]]:
+    """Per-file counts: ``{file: {form: n, ..., "boundary": n}}`` with zero columns omitted."""
+    table: dict[str, dict[str, int]] = {}
+    for site in sites:
+        column = BOUNDARY_COLUMN if site.boundary else site.form
+        row = table.setdefault(site.file, {})
+        row[column] = row.get(column, 0) + 1
+    return table
+
+
+def census_totals(table: dict[str, dict[str, int]]) -> dict[str, int]:
+    """The score: ``soft`` (every form column summed), ``boundary``, and one entry per form."""
+    totals = dict.fromkeys(SOFT_MAPPING_FORMS, 0)
+    totals[BOUNDARY_COLUMN] = 0
+    for row in table.values():
+        for column, count in row.items():
+            totals[column] = totals.get(column, 0) + count
+    return {
+        "soft": sum(totals[form] for form in SOFT_MAPPING_FORMS),
+        BOUNDARY_COLUMN: totals[BOUNDARY_COLUMN],
+        **{form: totals[form] for form in SOFT_MAPPING_FORMS},
+    }
+
+
+def compare_census(
+    pinned: dict[str, dict[str, int]],
+    stored_totals: dict[str, int],
+    live: dict[str, dict[str, int]],
+) -> list[CensusDrift]:
+    """Every per-file, per-form disagreement, either direction, plus a forged-totals check.
+
+    Decreases are drifts too: a stale-high pin is slack a later addition could
+    hide in, so the pin must move with every change and the re-pin diff is the
+    record of what moved.
+    """
+    drifts: list[CensusDrift] = []
+    for file in sorted(set(pinned) | set(live)):
+        pinned_row = pinned.get(file, {})
+        live_row = live.get(file, {})
+        for column in sorted(set(pinned_row) | set(live_row)):
+            before, after = pinned_row.get(column, 0), live_row.get(column, 0)
+            if before != after:
+                drifts.append(CensusDrift(file=file, form=column, pinned=before, live=after))
+    recomputed = census_totals(pinned)
+    for column in sorted(set(stored_totals) | set(recomputed)):
+        if stored_totals.get(column, 0) != recomputed.get(column, 0):
+            drifts.append(CensusDrift(file="<totals>", form=column, pinned=stored_totals.get(column, 0), live=recomputed.get(column, 0)))
+    return drifts
+
+
+def write_census(path: Path, table: dict[str, dict[str, int]]) -> None:
+    """Pin ``table`` to ``path`` with the counting rule in the header, keys sorted for stable diffs."""
+    document = {
+        "totals": census_totals(table),
+        "files": {file: dict(sorted(row.items())) for file, row in sorted(table.items())},
+    }
+    header = (
+        "# Soft-mapping census — GENERATED by `python scripts/check_contracts.py --write-census`.\n"
+        "# Do not hand-edit: every per-file, per-form count is compared against the live tree and\n"
+        "# any drift fails the contracts gate. Re-pin in the same commit that changes a soft site;\n"
+        "# the diff of this file is the record of what moved (a dict -> Mapping rewrite is a swap,\n"
+        "# not a retirement — only the `soft` total falling is progress).\n"
+        "# Counting rule: `method` below, verbatim from CENSUS_METHOD in scripts/check_contracts.py.\n"
+    )
+    # The method is emitted as a literal block scalar (``|-``) by hand so it lands
+    # verbatim on one line — safe_dump would fold it at the line width and the
+    # stated rule would no longer be greppable as written.
+    method_block = f"method: |-\n  {CENSUS_METHOD}\n"
+    path.write_text(
+        header + method_block + yaml.safe_dump(document, sort_keys=True, default_flow_style=False, allow_unicode=True, width=120)
+    )
+
+
+def load_census(path: Path) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """Read a pin written by :func:`write_census`: ``(files table, stored totals)``.
+
+    The file is repository-owned config, but its shape is still asserted rather
+    than trusted, so a hand-edit that breaks it fails here instead of reading
+    as "no soft sites".
+    """
+    loaded = yaml.safe_load(path.read_text())
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("files"), dict) or not isinstance(loaded.get("totals"), dict):
+        raise ValueError(f"{path}: expected a mapping with 'files' and 'totals' blocks")
+    table: dict[str, dict[str, int]] = {}
+    for file, row in loaded["files"].items():
+        if not isinstance(file, str) or not isinstance(row, dict):
+            raise ValueError(f"{path}: malformed files row {file!r}")
+        counts: dict[str, int] = {}
+        for column, count in row.items():
+            if column not in SOFT_MAPPING_FORMS and column != BOUNDARY_COLUMN:
+                raise ValueError(f"{path}: {file}: unknown census column {column!r}")
+            if type(count) is not int or count < 0:
+                raise ValueError(f"{path}: {file}: {column} count must be a non-negative int, got {count!r}")
+            counts[column] = count
+        table[file] = counts
+    totals: dict[str, int] = {}
+    for column, count in loaded["totals"].items():
+        if not isinstance(column, str) or type(count) is not int:
+            raise ValueError(f"{path}: malformed totals entry {column!r}")
+        totals[column] = count
+    return table, totals
+
+
+def check_soft_mapping_census(
+    src_dir: Path,
+    census_path: Path,
+    alias_index: DictAliasIndex | None,
+    *,
+    write: bool,
+) -> CensusReport:
+    """Build the live census, pin it when asked, otherwise compare it against the pin."""
+    sites = build_census(src_dir, alias_index)
+    live = tabulate_census(sites)
+    totals = census_totals(live)
+    score = f"{totals['soft']} soft occurrences across {len(live)} files, {totals[BOUNDARY_COLUMN]} boundary-parsed"
+
+    if write:
+        write_census(census_path, live)
+        return CensusReport(True, (f"✅ Soft-mapping census pinned to {census_path}: {score}",), totals, ())
+
+    if not census_path.exists():
+        return CensusReport(
+            False,
+            (
+                f"❌ Soft-mapping census pin missing: {census_path}",
+                f"   Live tree: {score}",
+                "   Fix: python scripts/check_contracts.py --write-census, and commit the file",
+            ),
+            totals,
+            (),
+        )
+
+    pinned, stored_totals = load_census(census_path)
+    drifts = compare_census(pinned, stored_totals, live)
+    if not drifts:
+        return CensusReport(True, (f"✅ Soft-mapping census matches {census_path}: {score}",), totals, ())
+
+    pinned_soft = stored_totals.get("soft", 0)
+    lines = [
+        "❌ Soft-mapping census drift (the live tree disagrees with the pin):\n",
+        f"  soft total pinned {pinned_soft} -> live {totals['soft']} "
+        f"({'progress' if totals['soft'] < pinned_soft else 'REGRESSION' if totals['soft'] > pinned_soft else 'no change — a swap between forms is not a retirement'})\n",
+    ]
+    by_key: dict[tuple[str, str], list[CensusSite]] = {}
+    for site in sites:
+        by_key.setdefault((site.file, BOUNDARY_COLUMN if site.boundary else site.form), []).append(site)
+    for drift in drifts:
+        lines.append(f"  {drift.file}: {drift.form} pinned {drift.pinned} -> live {drift.live}")
+        for site in by_key.get((drift.file, drift.form), [])[:20]:
+            lines.append(f"    line {site.line}: {site.context} {site.position}")
+    lines.append("")
+    lines.append("    Fix: convert the site to an owned type (or parse it at a @trust_boundary), then")
+    lines.append("    re-pin with `python scripts/check_contracts.py --write-census` in the same commit.")
+    lines.append("    Rewriting one soft form as another does not retire it and will not pass.\n")
+    return CensusReport(False, tuple(lines), totals, tuple(drifts))
+
+
 def main() -> int:
     """Run the contracts enforcement check."""
     parser = argparse.ArgumentParser(description="Check that cross-boundary types are in contracts/ and whitelist entries are valid")
@@ -1426,11 +1804,17 @@ def main() -> int:
         action="store_true",
         help="Don't fail on stale whitelist entries (just warn)",
     )
+    parser.add_argument(
+        "--write-census",
+        action="store_true",
+        help="Re-pin config/cicd/soft-mapping-census.yaml from the live tree instead of comparing against it",
+    )
     args = parser.parse_args()
 
     src_dir = Path("src/elspeth")
     contracts_dir = src_dir / "contracts"
     whitelist_path = Path("config/cicd/contracts-whitelist.yaml")
+    census_path = Path("config/cicd/soft-mapping-census.yaml")
 
     whitelist, all_entries = load_whitelist(whitelist_path)
     violations: list[Violation] = []
@@ -1492,6 +1876,9 @@ def main() -> int:
 
     # Check hardcoded literals in from_settings() are documented in INTERNAL_DEFAULTS
     hardcode_violations = check_hardcode_documentation(runtime_path)
+
+    # Soft-mapping census: every form, every position, pinned per file
+    census = check_soft_mapping_census(src_dir, census_path, alias_index, write=args.write_census)
 
     has_violations = False
     has_stale = False
@@ -1558,6 +1945,11 @@ def main() -> int:
             print(f"  [{se.category}] {se.entry}")
             print(f"    Reason: {se.reason}\n")
 
+    if not census.ok:
+        has_violations = True
+        for line in census.lines:
+            print(line)
+
     if has_violations:
         return 1
 
@@ -1576,6 +1968,8 @@ def main() -> int:
     print("✅ All Settings fields are accessed in from_settings() methods")
     print("✅ All field name mappings match FIELD_MAPPINGS")
     print("✅ All hardcoded values are documented in INTERNAL_DEFAULTS")
+    for line in census.lines:
+        print(line)
     return 0
 
 
