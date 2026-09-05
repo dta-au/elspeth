@@ -77,17 +77,37 @@ export async function setShowAdvanced(
   }
 }
 
+const DELETE_SESSION_CONFLICT_RETRIES = 20;
+const DELETE_SESSION_CONFLICT_BACKOFF_MS = 250;
+
 export async function deleteSession(
   ctx: APIRequestContext,
   sessionId: string,
 ): Promise<void> {
-  const resp = await ctx.delete(`/api/sessions/${sessionId}`);
-  // 404 is acceptable — session may have been deleted by the test itself.
-  if (!resp.ok() && resp.status() !== 404) {
-    throw new Error(
-      `DELETE /api/sessions/${sessionId} failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
-    );
+  // Teardown quiescence: the archive takes the session operation fence, and
+  // a page the test has not closed yet may still hold a short read lease on
+  // it (validate / audit-readiness / blob read), which the backend answers
+  // with 409 "Session operation is already active". That contention is a
+  // product concern tracked in elspeth-bf52d495a2; teardown only waits for
+  // the in-flight read to release and tries again, bounded, then fails loud.
+  let lastConflictBody = "";
+  for (let attempt = 0; attempt <= DELETE_SESSION_CONFLICT_RETRIES; attempt += 1) {
+    const resp = await ctx.delete(`/api/sessions/${sessionId}`);
+    // 404 is acceptable — session may have been deleted by the test itself.
+    if (resp.ok() || resp.status() === 404) {
+      return;
+    }
+    if (resp.status() !== 409) {
+      throw new Error(
+        `DELETE /api/sessions/${sessionId} failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
+      );
+    }
+    lastConflictBody = (await resp.text()).slice(0, 500);
+    await new Promise((resolve) => setTimeout(resolve, DELETE_SESSION_CONFLICT_BACKOFF_MS));
   }
+  throw new Error(
+    `DELETE /api/sessions/${sessionId} still 409 after ${DELETE_SESSION_CONFLICT_RETRIES} retries: ${lastConflictBody}`,
+  );
 }
 
 export async function seedCompositionState(
