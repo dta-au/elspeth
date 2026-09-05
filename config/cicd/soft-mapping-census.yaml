@@ -657,6 +657,8 @@ files:
     dict[str, object]: 2
   src/elspeth/web/_aws_ecs_acceptance/textract.py:
     dict[str, object]: 3
+  src/elspeth/web/_azure_container_apps_acceptance/receipt_contracts.py:
+    boundary: 1
   src/elspeth/web/app.py:
     dict[str, object]: 2
   src/elspeth/web/auth/audit.py:
@@ -1020,7 +1022,7 @@ totals:
   Mapping[str, Any]: 898
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
-  boundary: 63
+  boundary: 64
   dict[str, Any]: 1154
   dict[str, object]: 389
   soft: 2739
