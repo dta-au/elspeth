@@ -693,25 +693,15 @@ allowed_dict_patterns:
   - "src/elspeth/core/dependency_config.py:CollectionProbeConfig._serialize_provider_config:return"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # WEB AUTH — OIDC/Entra token validation (Tier 3 boundary)
-  # JWKS and JWT payloads are external IdP data with no typed schema.
+  # WEB AUTH — ID-token validation (Tier 3 boundary)
+  # The two boundaries whose input is PyJWT's own return type (dict[str, Any]
+  # from jwt.decode and jwt.get_unverified_header). Each parses that dict ONCE
+  # into an owned type (IdTokenClaims / the header's kid); everything past
+  # them is nominally typed, and the JWKS document crosses its boundary as
+  # unparsed JSON (typed Any) into the owned JwkSet.
   # ═══════════════════════════════════════════════════════════════════════════
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator.ensure_jwks:return"
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator.decode_token:jwks"
-  # Same foreign JWKS document as decode_token above: PyJWKSet.from_dict
-  # requires a real dict, and this is the SSO ID-token path's copy of it.
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator.decode_id_token:jwks"
-  # The one decode core both entry points delegate to; same document again.
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._decode:jwks"
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._parse_jwk_set:jwks"
-  # Shape validator returns the same external JWKS dict after top-level type
-  # checks; PyJWKSet.from_dict consumes the raw IdP structure so the return
-  # type must stay dict[str, Any].
-  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._validate_jwks_document:return"
-  - "src/elspeth/web/auth/oidc.py:optional_profile_claim:payload"
-  - "src/elspeth/web/auth/oidc.py:OIDCAuthProvider._optional_profile_claim:payload"
-  - "src/elspeth/web/auth/entra.py:EntraAuthProvider._validate_tenant:payload"
-  - "src/elspeth/web/auth/entra.py:EntraAuthProvider._extract_groups:payload"
+  - "src/elspeth/web/auth/id_token.py:parse_id_token_claims:payload"
+  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._header_key_id:header"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEB AUTH — Session service protocol

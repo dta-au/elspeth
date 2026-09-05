@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.web.auth.claims import IdTokenClaims
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims
 from elspeth.web.auth.providers import _mechanics
@@ -281,9 +282,12 @@ class TestUserinfoBoundary:
         with pytest.raises(SsoUserinfoInvalid):
             parse_userinfo(document=["not", "a", "dict"], expected_subject="ada")
 
-    def test_a_matching_subject_returns_the_body_for_the_profile_to_read(self) -> None:
-        body = {"sub": "ada", "given_name": "Ada", "abn": "12 345 678 901"}
-        assert parse_userinfo(body, expected_subject="ada") == body
+    def test_a_matching_subject_yields_the_owned_claims_for_the_profile_to_read(self) -> None:
+        body = {"sub": "ada", "given_name": "Ada", "abn": "12 345 678 901", "family_name": 7, "picture": "https://x/y.png"}
+        parsed = parse_userinfo(body, expected_subject="ada")
+        assert (parsed.subject, parsed.given_name, parsed.abn) == ("ada", "Ada", "12 345 678 901")
+        assert parsed.family_name is None, "a non-string cosmetic claim reads as absent"
+        assert not hasattr(parsed, "picture"), "nothing outside the closed set is carried"
 
     @pytest.mark.parametrize(
         "document",
@@ -298,7 +302,7 @@ class TestUserinfoBoundary:
         """compare_digest on str raises for non-ASCII; the bytes form must not."""
         with pytest.raises(SsoUserinfoInvalid):
             parse_userinfo({"sub": "adà"}, expected_subject="ada")
-        assert parse_userinfo({"sub": "adà"}, expected_subject="adà")["sub"] == "adà"
+        assert parse_userinfo({"sub": "adà"}, expected_subject="adà").subject == "adà"
 
 
 # ==========================================================================
@@ -518,7 +522,7 @@ class TestFetchUserinfo:
     async def test_the_body_for_the_verified_subject_is_returned(self, idp: FakeIdP) -> None:
         idp.userinfo_extra_claims = {"given_name": "Ada", "family_name": "Lovelace", "abn": "12 345 678 901"}
         body = await self._fetch(idp)
-        assert body["sub"] == "ada" and body["abn"] == "12 345 678 901"
+        assert body.subject == "ada" and body.abn == "12 345 678 901"
 
     @pytest.mark.asyncio
     async def test_the_access_token_is_presented_as_a_bearer(self, idp: FakeIdP) -> None:
@@ -546,7 +550,7 @@ class TestFetchUserinfo:
     @pytest.mark.asyncio
     async def test_content_type_parameters_do_not_defeat_the_check(self, idp: FakeIdP) -> None:
         idp.userinfo_content_type = "application/json; charset=utf-8"
-        assert (await self._fetch(idp))["sub"] == "ada"
+        assert (await self._fetch(idp)).subject == "ada"
 
     @pytest.mark.asyncio
     async def test_a_non_200_is_refused(self, idp: FakeIdP) -> None:
@@ -668,15 +672,15 @@ class TestLoginCallback:
     @pytest.mark.asyncio
     async def test_the_profiles_claim_check_runs_after_verification_and_refuses(self, idp: FakeIdP) -> None:
         substrate = _Substrate()
-        seen: list[dict[str, Any]] = []
+        seen: list[IdTokenClaims] = []
 
-        def refuse(claims: Any) -> None:
-            seen.append(dict(claims))
+        def refuse(claims: IdTokenClaims) -> None:
+            seen.append(claims)
             raise AuthenticationError("wrong tenant")
 
         with pytest.raises(SsoClaimCheckFailed):
             await _walk(idp, _client(idp), substrate, claim_checks=refuse, tid="tenant-b")
-        assert seen and seen[0]["tid"] == "tenant-b", "the check saw the VERIFIED claims"
+        assert seen and seen[0].tenant_id == "tenant-b", "the check saw the VERIFIED claims"
         assert substrate.journal == []
 
     @pytest.mark.asyncio

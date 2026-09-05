@@ -23,8 +23,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import time
-from collections.abc import Mapping
-from typing import Any, NoReturn
+from dataclasses import dataclass, field
+from typing import Any, NoReturn, final
 
 import httpx
 import jwt
@@ -32,6 +32,13 @@ import structlog
 from jwt.exceptions import PyJWTError
 
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.auth.claims import (
+    IdTokenClaims,
+    claim_is_exactly_true,
+    optional_string_claim,
+    required_string_claim,
+    string_list_claim,
+)
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
 from elspeth.web.auth.urls import validate_oidc_issuer
 
@@ -65,6 +72,116 @@ def _pinned_algorithms(algorithms: tuple[str, ...]) -> tuple[str, ...]:
 # used. "oct" is the dangerous one: a symmetric key published in a JWKS, paired
 # with an HMAC algorithm, turns a public document into a signing secret.
 _PERMITTED_JWK_KEY_TYPES = frozenset({"RSA", "EC"})
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SigningKeyEntry:
+    """One JWKS entry's identity, read at the boundary before its material is parsed."""
+
+    key_id: str | None
+    key_type: str | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class JwkSet:
+    """The IdP's published key set, parsed ONCE at the JWKS boundary.
+
+    ``entries`` is what the key-type gate reads and what equality means.
+    ``key_set`` is PyJWT's parsed key material and is excluded from
+    equality: two fetches of the same document are equal ``JwkSet`` values
+    but distinct instances, and the refresh path in :meth:`ensure_jwks`
+    deliberately compares by INSTANCE (``is``) -- "the cache is still the
+    one I found insufficient" is a question about identity, not content.
+    """
+
+    entries: tuple[SigningKeyEntry, ...]
+    key_set: jwt.PyJWKSet = field(repr=False, compare=False)
+
+
+def _numeric_date(value: object, *, name: str) -> int:
+    """A NumericDate (RFC 7519 §2): a JSON number, possibly fractional.
+
+    PyJWT compared the whole-second value against the clock; that is what
+    is kept. ``bool`` is a JSON boolean, not a number, and is refused.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise AuthenticationError(f"Invalid token: {name} claim is not a number")
+    return int(value)
+
+
+def _compared_string(value: object) -> str | None:
+    """A claim that is compared, never displayed.
+
+    Anything that is not a string cannot equal the string it is checked
+    against, so it is read as absent and the comparison -- the ONE authority
+    for that refusal -- says so. No message here, no second check.
+    """
+    return value if type(value) is str else None
+
+
+@trust_boundary(
+    tier=3,
+    source="ID-token payload returned by jwt.decode after signature, issuer, audience and clock verification",
+    source_param="payload",
+    suppresses=("R1",),
+    invariant=(
+        "raises AuthenticationError unless iss and sub are non-blank strings, aud is a non-empty string or list of strings, "
+        "exp and iat are numbers, and groups/roles are lists when present; nonce and azp are carried only as strings "
+        "(anything else reads as absent for the comparison that is their one authority); optional profile claims that "
+        "are not visible strings read as None; never coerces a malformed document"
+    ),
+    test_ref="tests/unit/web/auth/test_id_token_decode.py::TestIdTokenClaimsBoundary::test_a_blank_subject_is_refused",
+    test_fingerprint="16f289fa46b57bafff5243d391f56745a817e924b780b616e0aa329cd80e1746",
+)
+def parse_id_token_claims(payload: dict[str, Any]) -> IdTokenClaims:
+    """THE boundary between a verified token and the claims ELSPETH reads.
+
+    PyJWT has verified the signature, issuer, audience and clock by the time
+    this runs, and its result is typed ``dict[str, Any]``: every value is
+    still whatever the IdP put there. This is the one place that turns that
+    into :class:`IdTokenClaims`; nothing downstream sees the dict.
+
+    Membership-then-subscript rather than ``.get()``: this is IdP data, and
+    the absent case is a decision worth seeing.
+    """
+
+    def claim(name: str) -> object:
+        return payload[name] if name in payload else None
+
+    raw_audience = claim("aud")
+    audience: str | tuple[str, ...]
+    if type(raw_audience) is str and raw_audience:
+        audience = raw_audience
+    elif type(raw_audience) is list and raw_audience and all(type(entry) is str for entry in raw_audience):
+        audience = tuple(raw_audience)
+    else:
+        raise AuthenticationError("Invalid token: aud claim is not a string or a list of strings")
+
+    claim_names = claim("_claim_names")
+    return IdTokenClaims(
+        issuer=required_string_claim(claim("iss"), name="iss", document="ID token"),
+        subject=required_string_claim(claim("sub"), name="sub", document="ID token"),
+        audience=audience,
+        issued_at=_numeric_date(claim("iat"), name="iat"),
+        expires_at=_numeric_date(claim("exp"), name="exp"),
+        nonce=_compared_string(claim("nonce")),
+        authorized_party=_compared_string(claim("azp")),
+        preferred_username=optional_string_claim(claim("preferred_username")),
+        name=optional_string_claim(claim("name")),
+        email=optional_string_claim(claim("email")),
+        email_verified=claim_is_exactly_true(claim("email_verified")),
+        tenant_id=optional_string_claim(claim("tid")),
+        hosted_domain=optional_string_claim(claim("hd")),
+        cognito_username=optional_string_claim(claim("cognito:username")),
+        given_name=optional_string_claim(claim("given_name")),
+        family_name=optional_string_claim(claim("family_name")),
+        abn=optional_string_claim(claim("abn")),
+        groups=string_list_claim(claim("groups"), name="groups"),
+        roles=string_list_claim(claim("roles"), name="roles"),
+        groups_overage=claim_is_exactly_true(claim("hasgroups")) or (type(claim_names) is dict and "groups" in claim_names),
+    )
 
 
 class _UnknownSigningKeyError(AuthenticationError):
@@ -121,7 +238,7 @@ class JWKSTokenValidator:
         # ``_next_refresh_at`` but must never renew this lifetime; only a
         # fully validated successful fetch resets ``_jwks_last_success_at``.
         self._jwks_max_stale_seconds = jwks_max_stale_seconds
-        self._jwks: dict[str, Any] | None = None
+        self._jwks: JwkSet | None = None
         self._jwks_last_success_at: float | None = None
         self._jwks_refresh_failed = False
         # Unknown token key IDs may force one refresh before the normal TTL,
@@ -200,37 +317,48 @@ class JWKSTokenValidator:
         source="JWKS document JSON fetched from the IdP's jwks_uri endpoint",
         source_param="jwks",
         suppresses=("R1",),
-        invariant="raises AuthenticationError on non-dict or missing 'keys' list; never coerces a malformed document",
+        invariant=(
+            "raises AuthenticationError on non-dict, missing 'keys' list, or key entries PyJWT cannot parse; "
+            "returns an owned JwkSet whose entries carry each key's kid and kty; never coerces a malformed document"
+        ),
         test_ref="tests/unit/web/auth/test_id_token_decode.py::TestJWKSValidatorBoundaryRaises::test_validate_jwks_document_missing_keys_raises",
         test_fingerprint="c06b1f0b8c04a6b33dd5e1b3bec1da3752bc6081c170ae076aa175f20893e09d",
     )
-    def _validate_jwks_document(jwks: Any) -> dict[str, Any]:
-        """Shape-validate the JWKS document.
+    def _validate_jwks_document(jwks: Any) -> JwkSet:
+        """THE JWKS boundary: the IdP's document in, an owned :class:`JwkSet` out.
 
-        Returns the same dict on success; raises ``AuthenticationError``
-        on shape mismatch. Called BEFORE caching so a malformed response
-        cannot poison ``self._jwks`` for the TTL window.
+        Called BEFORE caching so a malformed response cannot poison
+        ``self._jwks`` for the TTL window. Each entry's ``kid`` and ``kty``
+        are read here, once, so the key-type gate in ``_decode`` reads a
+        typed entry rather than the document. An entry whose ``kid`` is
+        present but not a string can never be named by a token header and
+        is not carried; PyJWT skips it for the same reason.
         """
         if not isinstance(jwks, dict):
             raise AuthenticationError(f"JWKS document is not a JSON object (got {type(jwks).__name__})")
-        keys = jwks.get("keys")
-        if not isinstance(keys, list):
+        keys = jwks["keys"] if "keys" in jwks else None
+        if type(keys) is not list:
             raise AuthenticationError("JWKS document missing 'keys' list")
-        return jwks
-
-    @staticmethod
-    def _parse_jwk_set(jwks: dict[str, Any]) -> jwt.PyJWKSet:
-        """Fully validate JWK usability before decode/caching decisions."""
+        entries: list[SigningKeyEntry] = []
+        for raw_key in keys:
+            if type(raw_key) is not dict:
+                continue
+            raw_kid = raw_key["kid"] if "kid" in raw_key else None
+            if raw_kid is not None and type(raw_kid) is not str:
+                continue
+            raw_kty = raw_key["kty"] if "kty" in raw_key else None
+            entries.append(SigningKeyEntry(key_id=raw_kid, key_type=raw_kty if type(raw_kty) is str else None))
         try:
-            return jwt.PyJWKSet.from_dict(jwks)
+            key_set = jwt.PyJWKSet.from_dict(jwks)
         except (PyJWTError, AttributeError, TypeError, ValueError) as exc:
             raise AuthenticationError(f"JWKS document contains unusable key entries: {type(exc).__name__}") from exc
+        return JwkSet(entries=tuple(entries), key_set=key_set)
 
     async def ensure_jwks(
         self,
         *,
-        refresh_if_unchanged: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        refresh_if_unchanged: JwkSet | None = None,
+    ) -> JwkSet:
         """Fetch and cache JWKS keys from the OIDC discovery endpoint.
 
         Uses double-checked locking to prevent thundering herd at TTL
@@ -359,7 +487,6 @@ class JWKSTokenValidator:
                     # Shape-validate BEFORE assigning to cache: a wrong-shaped
                     # response must not poison self._jwks.
                     validated = self._validate_jwks_document(jwks_resp.json())
-                    self._parse_jwk_set(validated)
                     success_at = time.monotonic()
                     self._jwks = validated
                     self._jwks_last_success_at = success_at
@@ -497,7 +624,7 @@ class JWKSTokenValidator:
 
         return self._jwks
 
-    def decode_token(self, token: str, jwks: dict[str, Any]) -> Mapping[str, Any]:
+    def decode_token(self, token: str, jwks: JwkSet) -> IdTokenClaims:
         """Decode a bearer token presented on an API call (legacy providers).
 
         Same core as :meth:`decode_id_token`; the difference is the caller's
@@ -513,43 +640,63 @@ class JWKSTokenValidator:
         return self._decode(token, jwks, audience=self._audience, nonce=None, client_id=self._audience)
 
     @staticmethod
-    def _assert_supported_key_type(jwks: Mapping[str, Any], *, kid: str | None) -> None:
+    @trust_boundary(
+        tier=3,
+        source="Unverified JWT header decoded from the externally-supplied token (its 'kid' field)",
+        source_param="header",
+        suppresses=("R1",),
+        invariant="returns None when 'kid' is absent and the value when it is a string; raises AuthenticationError on a present non-string 'kid'; never coerces",
+        test_ref="tests/unit/web/auth/test_id_token_decode.py::TestHeaderKeyIdBoundary::test_a_non_string_kid_is_refused",
+        test_fingerprint="94ee285aeb60b09fdb1ba641aee6d0adb046294d8d45147676366cd07e5aa231",
+    )
+    def _header_key_id(header: dict[str, Any]) -> str | None:
+        """The key id the token names, read before anything about it is trusted.
+
+        ``kid`` is optional per RFC 7515 and, when present, a string. Absent
+        matches only a JWK without one. Anything else names no key and is
+        refused here rather than compared against whatever type the JWKS
+        happened to carry in the same field.
+        """
+        kid = header["kid"] if "kid" in header else None
+        if kid is None:
+            return None
+        if type(kid) is not str:
+            raise AuthenticationError("Invalid token: header key id is not a string")
+        return kid
+
+    @staticmethod
+    def _assert_supported_key_type(jwks: JwkSet, *, kid: str | None) -> None:
         """Refuse a matched JWK whose key type is not RSA or EC.
 
-        Checked BEFORE the key material is parsed or used. A JWKS is a public
+        Checked BEFORE the key material is used. A JWKS is a public
         document, so an ``oct`` entry paired with an HMAC algorithm would let
         anyone who can read it forge a token; pinning the algorithm list
         already blocks that, and this closes the same door from the other
         side.
-
-        Membership-then-subscript rather than ``.get()``: this is IdP data,
-        and the absent case is a decision worth seeing.
         """
-        for raw_key in jwks["keys"]:
-            if type(raw_key) is not dict:
+        for entry in jwks.entries:
+            if entry.key_id != kid:
                 continue
-            raw_kid = raw_key["kid"] if "kid" in raw_key else None
-            if raw_kid != kid:
-                continue
-            key_type = raw_key["kty"] if "kty" in raw_key else None
-            if key_type not in _PERMITTED_JWK_KEY_TYPES:
+            if entry.key_type not in _PERMITTED_JWK_KEY_TYPES:
                 raise AuthenticationError("Invalid token: JWKS key type is not permitted")
             return
 
     @staticmethod
-    def _verify_nonce(payload: Mapping[str, Any], *, expected: str) -> None:
+    def _verify_nonce(claims: IdTokenClaims, *, expected: str) -> None:
         """Bind the token to THIS login attempt, in constant time.
 
         The nonce is the only thing tying an ID token to the browser
         transaction that asked for it; without this check a token replayed
-        from another session validates perfectly.
+        from another session validates perfectly. Compared as bytes:
+        ``compare_digest`` on ``str`` raises for non-ASCII, and a token is
+        the wrong place to let an attacker choose between refusal and crash.
         """
-        actual = payload["nonce"] if "nonce" in payload else None
-        if type(actual) is not str or not hmac.compare_digest(actual, expected):
+        actual = claims.nonce
+        if actual is None or not hmac.compare_digest(actual.encode("utf-8"), expected.encode("utf-8")):
             raise AuthenticationError("Invalid token: nonce check failed")
 
     @staticmethod
-    def _verify_authorized_party(payload: Mapping[str, Any], *, client_id: str) -> None:
+    def _verify_authorized_party(claims: IdTokenClaims, *, client_id: str) -> None:
         """When ``aud`` is a list, ``azp`` must name us.
 
         A multi-audience token is addressed to several relying parties at
@@ -558,22 +705,21 @@ class JWKSTokenValidator:
         presented here; ``azp`` is the claim that says which party it was
         actually issued to.
         """
-        audience = payload["aud"] if "aud" in payload else None
-        if type(audience) is str:
+        if type(claims.audience) is str:
             return
-        authorized_party = payload["azp"] if "azp" in payload else None
-        if type(authorized_party) is not str or not hmac.compare_digest(authorized_party, client_id):
+        authorized_party = claims.authorized_party
+        if authorized_party is None or not hmac.compare_digest(authorized_party.encode("utf-8"), client_id.encode("utf-8")):
             raise AuthenticationError("Invalid token: authorized party check failed")
 
     def decode_id_token(
         self,
         token: str,
-        jwks: dict[str, Any],
+        jwks: JwkSet,
         *,
         audience: str,
         nonce: str,
         client_id: str,
-    ) -> Mapping[str, Any]:
+    ) -> IdTokenClaims:
         """Decode an ID token from an SSO login.
 
         The nonce is REQUIRED here and is the transaction's: the sealed
@@ -589,12 +735,12 @@ class JWKSTokenValidator:
     def _decode(
         self,
         token: str,
-        jwks: dict[str, Any],
+        jwks: JwkSet,
         *,
         audience: str,
         nonce: str | None,
         client_id: str,
-    ) -> Mapping[str, Any]:
+    ) -> IdTokenClaims:
         """The one decode. Profile-pinned algorithms; no header-driven branch.
 
         ``exp iat iss sub aud`` are always required -- a token missing any
@@ -612,19 +758,16 @@ class JWKSTokenValidator:
         """
         try:
             header = jwt.get_unverified_header(token)
-            # `kid` is optional per RFC 7515; an absent or unknown one
-            # matches no JWK and raises below.
-            kid = header["kid"] if "kid" in header else None
+            kid = self._header_key_id(header)
             self._assert_supported_key_type(jwks, kid=kid)
-            jwk_set = self._parse_jwk_set(jwks)
             matched_jwk = None
-            for key in jwk_set.keys:
+            for key in jwks.key_set.keys:
                 if key.key_id == kid:
                     matched_jwk = key
                     break
             if matched_jwk is None:
                 raise _UnknownSigningKeyError("Invalid token: signing key check failed")
-            payload: Mapping[str, Any] = jwt.decode(
+            payload = jwt.decode(
                 token,
                 matched_jwk.key,
                 algorithms=list(self._algorithms),
@@ -637,10 +780,11 @@ class JWKSTokenValidator:
             # Class name only: PyJWT messages echo claim values and token
             # segments, which AuthenticationError would surface into a 401 body.
             raise AuthenticationError(f"Invalid token: {type(exc).__name__}") from exc
+        claims = parse_id_token_claims(payload)
         if nonce is not None:
-            self._verify_nonce(payload, expected=nonce)
-        self._verify_authorized_party(payload, client_id=client_id)
-        return payload
+            self._verify_nonce(claims, expected=nonce)
+        self._verify_authorized_party(claims, client_id=client_id)
+        return claims
 
     async def decode_id_token_with_refresh(
         self,
@@ -649,7 +793,7 @@ class JWKSTokenValidator:
         audience: str,
         nonce: str,
         client_id: str,
-    ) -> Mapping[str, Any]:
+    ) -> IdTokenClaims:
         """``decode_id_token``, refreshing JWKS once on an unknown key."""
         jwks = await self.ensure_jwks()
         try:
@@ -658,7 +802,7 @@ class JWKSTokenValidator:
             refreshed_jwks = await self.ensure_jwks(refresh_if_unchanged=jwks)
             return self.decode_id_token(token, refreshed_jwks, audience=audience, nonce=nonce, client_id=client_id)
 
-    async def decode_token_with_refresh(self, token: str) -> Mapping[str, Any]:
+    async def decode_token_with_refresh(self, token: str) -> IdTokenClaims:
         """Decode a token, refreshing JWKS once if its signing key is unknown."""
         jwks = await self.ensure_jwks()
         try:
