@@ -548,6 +548,28 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "BlobServiceImpl._abort_fork_deletion",
         "SessionBlobMutationAuthority",
     ),
+    # ── web_instances membership writer (6b-2, elspeth-66a19780b1): one
+    # authority, four lifecycle methods, method-exact ─────────────────────
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.register",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.heartbeat",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.begin_drain",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.stop",
+        "WebInstanceMembershipAuthority",
+    ),
 )
 
 # Connection acquisition is a separate capability from table mutation.  A
@@ -639,6 +661,28 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
         "src/elspeth/web/coordination/run_recovery_authority.py",
         "RepositoryGlobalRunRecoveryAuthority.mark_landscape_reconciliation_outcomes",
         "GlobalRunRecoveryAuthority",
+    ),
+    # ── web_instances membership writer (6b-2, elspeth-66a19780b1): each
+    # method opens one write_connection and never hands it out ──────────
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.register",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.heartbeat",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.begin_drain",
+        "WebInstanceMembershipAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.stop",
+        "WebInstanceMembershipAuthority",
     ),
 )
 
@@ -1489,6 +1533,58 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         1,
         "SessionForkAuthority",
         line=4836,
+    ),
+    # ── web_instances membership writer (6b-2, elspeth-66a19780b1): the
+    # only production writer of the table; insert + update, never delete ──
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.register",
+        "web_instances",
+        "insert",
+        "9d42ab43e8714140",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=251,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.register",
+        "web_instances",
+        "update",
+        "9d42ab43e8714140",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=257,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.heartbeat",
+        "web_instances",
+        "update",
+        "fd9264070f18566f",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=277,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.begin_drain",
+        "web_instances",
+        "update",
+        "16ca50d5443ff62b",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=299,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/membership_authority.py",
+        "RepositoryWebInstanceMembershipAuthority.stop",
+        "web_instances",
+        "update",
+        "46a0b81f64e195f0",
+        1,
+        "WebInstanceMembershipAuthority",
+        line=321,
     ),
 )
 
@@ -5252,6 +5348,99 @@ def test_global_run_recovery_writer_is_exact_contained_and_replaces_direct_servi
     assert inventory_drift(run_writes, reviewed) == ([], [])
     assert authority_policy_violations(run_writes, _TABLE_POLICIES) == ([], [])
     assert connection_authority_violations(authority_live) == []
+
+
+def test_web_instance_membership_writer_is_exact_contained_and_operation_exact() -> None:
+    """``web_instances`` has one writer: the membership authority's four lifecycle methods.
+
+    A peer joins an expired fence's ``owner_instance_id`` to this table before it
+    may take the fence over (``PostgresSessionOperationRepository._expired_owner_allows_takeover``
+    and ``RepositoryGlobalRunRecoveryAuthority._session_allows_recovery`` both read
+    it and fail closed), so the row's writer set is a takeover-safety property:
+    exactly ``register`` (insert, or update to reclaim a dead incarnation),
+    ``heartbeat``, ``begin_drain`` and ``stop`` (update), never a delete, and
+    every write inside a connection the method opens and never hands out. The
+    readers, the lifecycle wrapper and the app factory never write it.
+    """
+
+    root = _repo_root()
+    authority_relpath = "src/elspeth/web/coordination/membership_authority.py"
+    expected_operations = {
+        "RepositoryWebInstanceMembershipAuthority.register": {"insert", "update"},
+        "RepositoryWebInstanceMembershipAuthority.heartbeat": {"update"},
+        "RepositoryWebInstanceMembershipAuthority.begin_drain": {"update"},
+        "RepositoryWebInstanceMembershipAuthority.stop": {"update"},
+    }
+    for symbol in expected_operations:
+        assert _authority_for(authority_relpath, symbol) == "WebInstanceMembershipAuthority"
+        assert _contained_connection_authority_for(authority_relpath, symbol) == "WebInstanceMembershipAuthority"
+        assert _authority_for(authority_relpath, f"{symbol}_replacement") is None
+    assert _authority_for(authority_relpath, "RepositoryWebInstanceMembershipAuthority.future_method") is None
+    assert _contained_connection_authority_for(authority_relpath, "RepositoryWebInstanceMembershipAuthority") is None
+
+    authority_live = scan_production_writers([root / authority_relpath], anchor=root)
+    writes = [site for site in authority_live if site.table == "web_instances"]
+    reviewed = [site for site in _REVIEWED_WRITERS if site.table == "web_instances"]
+    assert len(writes) == len(reviewed) == 5
+    assert inventory_drift(writes, reviewed) == ([], [])
+    assert {site.authority for site in writes} == {"WebInstanceMembershipAuthority"}
+    live_operations: dict[str, set[str]] = {}
+    for site in writes:
+        live_operations.setdefault(site.symbol, set()).add(site.operation)
+    assert live_operations == expected_operations
+    assert authority_policy_violations(writes, _TABLE_POLICIES) == ([], [])
+    assert not [site for site in authority_live if site.table == "<unresolved-session-write>"]
+
+    connections = sorted((site for site in authority_live if site.operation == "write_connection"), key=lambda site: site.line)
+    assert connections == [
+        WriterIdentity(
+            authority_relpath,
+            "RepositoryWebInstanceMembershipAuthority.register",
+            "<sessions-write-connection>",
+            "write_connection",
+            "4152160f19e026da",
+            1,
+            "WebInstanceMembershipAuthority",
+            line=229,
+        ),
+        WriterIdentity(
+            authority_relpath,
+            "RepositoryWebInstanceMembershipAuthority.heartbeat",
+            "<sessions-write-connection>",
+            "write_connection",
+            "71b4334a0f438add",
+            1,
+            "WebInstanceMembershipAuthority",
+            line=274,
+        ),
+        WriterIdentity(
+            authority_relpath,
+            "RepositoryWebInstanceMembershipAuthority.begin_drain",
+            "<sessions-write-connection>",
+            "write_connection",
+            "98fd14f12508e73a",
+            1,
+            "WebInstanceMembershipAuthority",
+            line=296,
+        ),
+        WriterIdentity(
+            authority_relpath,
+            "RepositoryWebInstanceMembershipAuthority.stop",
+            "<sessions-write-connection>",
+            "write_connection",
+            "476bbd10507b185c",
+            1,
+            "WebInstanceMembershipAuthority",
+            line=318,
+        ),
+    ]
+    assert connection_authority_violations(authority_live) == []
+
+    non_writers = [
+        path for path in iter_gate_files(root / "src/elspeth/web/coordination") if path.resolve() != (root / authority_relpath).resolve()
+    ]
+    non_writers.extend([root / "src/elspeth/web/app.py", root / "src/elspeth/web/sessions/service.py"])
+    assert not [site for site in scan_production_writers(non_writers, anchor=root) if site.table == "web_instances"]
 
 
 def test_removed_unfenced_state_pruner_is_absent() -> None:

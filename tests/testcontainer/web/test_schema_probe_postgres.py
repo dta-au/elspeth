@@ -34,6 +34,7 @@ from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
 from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection
 from elspeth.web import schema_probe as schema_probe_module
 from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.schema_probe import (
@@ -56,7 +57,6 @@ from elspeth.web.sessions.models import schema_identity_table as session_schema_
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     GuidedCompositionStateResult,
-    GuidedOperationActive,
     GuidedOperationClaimed,
     GuidedOperationCompleted,
     GuidedOperationFenceLostError,
@@ -329,6 +329,21 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
 
     operation_id = "postgres-takeover"
     request_hash = "a" * 64
+    # Dual fencing: every guided write proves a live session COMPOSE lease
+    # on the write connection as well as the guided fence. Worker-a claims
+    # the operation under its own session lease, then its session lease is
+    # gone (released: the worker went away) and its guided lease is forced
+    # to expire; worker-b acquires the session lease and takes the operation
+    # over. Worker-a's late writes carry its dead context and stale guided
+    # fence and must be refused at the fence, not written.
+    context_a = await service_a._run_sync(
+        lambda: service_a.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service_a.session_operation_owner_instance_id,
+            lease_seconds=service_a.session_operation_lease_seconds,
+        )
+    )
     first = await service_a.reserve_guided_operation(
         session_id=session_id,
         operation_id=operation_id,
@@ -336,8 +351,10 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
         request_hash=request_hash,
         actor="worker-a",
         lease_seconds=30,
+        session_operation_context=context_a,
     )
     assert isinstance(first, GuidedOperationClaimed)
+    await service_a._run_sync(service_a.session_operation_authority.release, context_a)
     with postgres_engine.begin() as conn:
         conn.execute(
             update(guided_operations_table)
@@ -348,31 +365,45 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
             .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
         )
 
-    takeover = await service_b.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_start",
-        request_hash=request_hash,
-        actor="worker-b",
-        lease_seconds=30,
+    context_b = await service_b._run_sync(
+        lambda: service_b.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service_b.session_operation_owner_instance_id,
+            lease_seconds=service_b.session_operation_lease_seconds,
+        )
     )
-    assert isinstance(takeover, GuidedOperationTakenOver)
-    with pytest.raises(GuidedOperationFenceLostError):
-        await service_a.bind_guided_operation(first.fence, result_state_id=state_id)
-    with pytest.raises(GuidedOperationFenceLostError):
-        await service_a.complete_guided_operation(
-            first.fence,
+    try:
+        takeover = await service_b.reserve_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="guided_start",
+            request_hash=request_hash,
+            actor="worker-b",
+            lease_seconds=30,
+            session_operation_context=context_b,
+        )
+        assert isinstance(takeover, GuidedOperationTakenOver)
+        with pytest.raises(GuidedOperationFenceLostError):
+            await service_a.bind_guided_operation(first.fence, result_state_id=state_id, session_operation_context=context_a)
+        with pytest.raises(GuidedOperationFenceLostError):
+            await service_a.complete_guided_operation(
+                first.fence,
+                result=GuidedCompositionStateResult(state_id=state_id),
+                response_hash="b" * 64,
+                actor="worker-a",
+                session_operation_context=context_a,
+            )
+        await service_b.bind_guided_operation(takeover.fence, result_state_id=state_id, session_operation_context=context_b)
+        completed = await service_b.complete_guided_operation(
+            takeover.fence,
             result=GuidedCompositionStateResult(state_id=state_id),
             response_hash="b" * 64,
-            actor="worker-a",
+            actor="worker-b",
+            session_operation_context=context_b,
         )
-    await service_b.bind_guided_operation(takeover.fence, result_state_id=state_id)
-    completed = await service_b.complete_guided_operation(
-        takeover.fence,
-        result=GuidedCompositionStateResult(state_id=state_id),
-        response_hash="b" * 64,
-        actor="worker-b",
-    )
+    finally:
+        await service_b._run_sync(service_b.session_operation_authority.release, context_b)
     assert completed == GuidedOperationCompleted(
         result=GuidedCompositionStateResult(state_id=state_id),
         response_hash="b" * 64,
@@ -411,6 +442,22 @@ async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postg
     session_id = (await services[0].create_session("alice", "Contended PostgreSQL operation", "local")).id
     operation_id = "postgres-contended-takeover"
     request_hash = "c" * 64
+    # Dual fencing: a contender must hold the session COMPOSE lease before
+    # it can take over the expired guided operation, so the race is decided
+    # at the session fence. Worker-a claims under its own lease and lets it
+    # go; its guided lease is forced to expire; two contenders then race for
+    # the session lease at a barrier. Exactly one acquires it and takes the
+    # operation over; the other is refused at the session fence. The winner
+    # holds its lease until the loser has been refused (second barrier), so
+    # the outcome pair is the same on every run.
+    context_a = await services[0]._run_sync(
+        lambda: services[0].session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=services[0].session_operation_owner_instance_id,
+            lease_seconds=services[0].session_operation_lease_seconds,
+        )
+    )
     first = await services[0].reserve_guided_operation(
         session_id=session_id,
         operation_id=operation_id,
@@ -418,8 +465,10 @@ async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postg
         request_hash=request_hash,
         actor="worker-a",
         lease_seconds=30,
+        session_operation_context=context_a,
     )
     assert isinstance(first, GuidedOperationClaimed)
+    await services[0]._run_sync(services[0].session_operation_authority.release, context_a)
     with postgres_engine.begin() as conn:
         conn.execute(
             update(guided_operations_table)
@@ -430,27 +479,43 @@ async def test_postgres_concurrent_expired_reserve_has_one_takeover_winner(postg
             .values(lease_expires_at=text("clock_timestamp() - interval '1 second'"))
         )
 
-    barrier = threading.Barrier(2)
+    start_barrier = threading.Barrier(2)
+    settled_barrier = threading.Barrier(2)
 
     def contend(service: SessionServiceImpl, actor: str):
-        barrier.wait()
-        return asyncio.run(
-            service.reserve_guided_operation(
+        start_barrier.wait()
+        try:
+            context = service.session_operation_authority.acquire(
                 session_id=session_id,
-                operation_id=operation_id,
-                kind="guided_start",
-                request_hash=request_hash,
-                actor=actor,
-                lease_seconds=30,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
             )
-        )
+        except SessionOperationConflictError as refused:
+            settled_barrier.wait()
+            return refused
+        try:
+            return asyncio.run(
+                service.reserve_guided_operation(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    kind="guided_start",
+                    request_hash=request_hash,
+                    actor=actor,
+                    lease_seconds=30,
+                    session_operation_context=context,
+                )
+            )
+        finally:
+            settled_barrier.wait()
+            service.session_operation_authority.release(context)
 
     outcomes = await asyncio.gather(
         asyncio.to_thread(contend, services[1], "worker-b"),
         asyncio.to_thread(contend, services[2], "worker-c"),
     )
     assert sum(isinstance(outcome, GuidedOperationTakenOver) for outcome in outcomes) == 1
-    assert sum(isinstance(outcome, GuidedOperationActive) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, SessionOperationConflictError) for outcome in outcomes) == 1
     with postgres_engine.connect() as conn:
         events = conn.execute(
             select(guided_operation_events_table)

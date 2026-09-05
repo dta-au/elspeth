@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,6 +22,7 @@ from elspeth.web.coordination.membership_authority import (
     WebInstanceIdentity,
     WebInstanceMembershipLost,
     WebInstanceRegistrationConflict,
+    _database_clock_value,
     current_compatibility_key,
     web_instance_identity_from_settings,
 )
@@ -332,6 +333,48 @@ class TestDrainAndStop:
         authority.register(identity, lease_seconds=300)
 
         assert authority.stop(identity.instance_id).state is InstanceState.STOPPED
+
+
+class TestDatabaseClockAdmission:
+    """``_database_clock_value`` is the admission that keeps leases on the database clock.
+
+    Every lifecycle test above runs on SQLite, whose ``CURRENT_TIMESTAMP`` is the
+    same wall clock as the process, so swapping the admission for
+    ``datetime.now(UTC)`` would leave all of them green. The pin is therefore on
+    the admission itself: the scalar the database returned is what comes back,
+    verbatim and aware, and a scalar that is not a datetime is refused rather
+    than replaced by the process clock (elspeth-66a19780b1, verification seat).
+    """
+
+    def test_returns_the_database_value_verbatim(self) -> None:
+        database_now = datetime(2026, 9, 5, 1, 2, 3, 456789, tzinfo=UTC)
+        assert _database_clock_value(database_now) == database_now
+
+    def test_naive_offset_and_iso_text_values_are_admitted_as_the_same_instant(self) -> None:
+        instant = datetime(2026, 9, 5, 1, 2, 3, tzinfo=UTC)
+        assert _database_clock_value(instant.replace(tzinfo=None)) == instant
+        assert _database_clock_value("2026-09-05 01:02:03") == instant
+        assert _database_clock_value(datetime(2026, 9, 5, 11, 2, 3, tzinfo=timezone(timedelta(hours=10)))) == instant
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, 1757034123, 1757034123.5, b"2026-09-05 01:02:03", date(2026, 9, 5), ("2026-09-05 01:02:03",)],
+        ids=["none", "int", "float", "bytes", "date", "tuple"],
+    )
+    def test_refuses_a_non_datetime_scalar_instead_of_substituting_the_process_clock(self, value: object) -> None:
+        with pytest.raises(RuntimeError, match="non-datetime"):
+            _database_clock_value(value)
+
+    def test_sqlite_lease_timestamps_are_the_database_scalar_not_the_process_clock(self, engine: Engine) -> None:
+        """SQLite's ``CURRENT_TIMESTAMP`` is whole-second UTC text; a process clock carries microseconds."""
+        authority = RepositoryWebInstanceMembershipAuthority(engine)
+        record = authority.register(_identity(), lease_seconds=30)
+        with engine.connect() as conn:
+            database_now = datetime.fromisoformat(conn.exec_driver_sql("SELECT CURRENT_TIMESTAMP").scalar_one()).replace(tzinfo=UTC)
+
+        assert record.last_heartbeat_at.microsecond == 0
+        assert record.lease_expires_at.microsecond == 0
+        assert abs(record.last_heartbeat_at - database_now) <= timedelta(seconds=2)
 
 
 class TestHeartbeatInterval:

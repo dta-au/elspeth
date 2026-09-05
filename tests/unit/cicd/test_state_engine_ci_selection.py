@@ -52,6 +52,36 @@ PUSH_WORKFLOWS = (
     REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml",
 )
 RELEASE_KEEPS_IN_PROGRESS_RUNS = "${{ !startsWith(github.ref, 'refs/heads/release/') }}"
+BASH_ONLY_TOKENS = ("pipefail", "[[")
+
+
+def test_container_job_steps_with_bash_syntax_declare_bash() -> None:
+    """A container job's default shell is dash, so bash-only steps must say so.
+
+    GitHub's shell auto-detection inside ``container:`` jobs falls back to
+    ``sh -e`` (dash), which rejects ``set -o pipefail`` and has no ``[[``.
+    The "Reject touched or broadened permanent multi-rule per-file blankets"
+    step ran that way on every push run and died at its first line, so the
+    ratchet resolver it guards never executed (run 33944365102,
+    elspeth-d8749aeaa3). Every run step in a container job that uses a
+    bash-only token must declare ``shell: bash``; host-runner jobs get bash
+    by default and are not constrained here.
+    """
+    workflow = _workflow()
+    offenders: list[str] = []
+    checked = 0
+    for job_name, job in workflow["jobs"].items():
+        if "container" not in job:
+            continue
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not isinstance(run, str) or not any(token in run for token in BASH_ONLY_TOKENS):
+                continue
+            checked += 1
+            if step.get("shell") != "bash":
+                offenders.append(f"{job_name}: {step.get('name')!r}")
+    assert checked >= 2, "expected the actionlint and blanket-ratchet steps to be checked"
+    assert offenders == []
 
 
 def test_release_refs_never_cancel_an_in_progress_required_run() -> None:

@@ -202,6 +202,12 @@ class WebSettings(BaseModel):
     # are resolved by web/deployment_contract.py.
     deployment_target: DeploymentTarget = "default"
     deployment_state_mode: DeploymentStateMode = "auto"
+    # The identity this process presents on every response (X-Elspeth-Instance),
+    # in /api/system/status, and as the owner of the session-operation fences it
+    # acquires. None (the production setting) mints a fresh ``web-<uuid4>`` at
+    # startup, which is what keeps two replicas distinguishable; an explicit
+    # value pins it for a single-process harness.
+    instance_id: str | None = None
     deployment_aws_region: str | None = None
     # Operator telemetry is deployment policy, not pipeline-authored routing.
     # The AWS destination and headers are intentionally absent from this model:
@@ -756,6 +762,22 @@ class WebSettings(BaseModel):
     def _reject_blank_secret_key(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("must not be blank")
+        return v
+
+    @field_validator("instance_id")
+    @classmethod
+    def _validate_instance_id(cls, v: str | None) -> str | None:
+        # The value is placed verbatim on every response header and in every
+        # fence row, so it is held to a header-safe shape: a leading
+        # alphanumeric, then at most 127 of [A-Za-z0-9._-]; nothing that could
+        # smuggle a header continuation or a control character.
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("instance_id must not be blank (omit the field to mint one at startup)")
+        header_safe = all(char.isascii() and (char.isalnum() or char in "._-") for char in v)
+        if len(v) > 128 or not header_safe or not v[0].isalnum():
+            raise ValueError("instance_id must be 1-128 characters of [A-Za-z0-9._-] with a leading alphanumeric")
         return v
 
     @field_validator("operator_metrics_bearer_token")
