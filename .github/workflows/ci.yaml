@@ -16,10 +16,18 @@ on:
   pull_request:
     branches: [main, master, "RC*", "release/**"]
 
-# Cancel in-progress runs when a new commit is pushed
+# Cancel in-progress runs when a new commit is pushed — except on release/**
+# refs. A release branch is landed in bursts (~12 pushes in 11 h on
+# 2026-09-04/05) and every CI run in that window was cancelled by the next
+# push, so the required check never completed on a single sha
+# (elspeth-d8749aeaa3). On a release ref the in-progress run finishes and
+# only the pending run is replaced, so the tip is always tested eventually
+# and every completed run is a verdict on a real sha. The three push
+# workflows (ci, codeql, enforce-allowlist-judge-gates) keep this expression
+# identical; tests/unit/cicd pins it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
 
 env:
   PYTHON_VERSION: "3.13"
