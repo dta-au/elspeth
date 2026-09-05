@@ -1799,6 +1799,345 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=319,
         connection_escape=True,
     ),
+    # Proven non-Sessions acquisitions (P4-D6 step 1): every origin is a
+    # LandscapeDB / Tier1Engine provider or a declared factory; listed by
+    # identity so a moved or rewritten acquisition re-opens review.
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/manager.py",
+        "CheckpointManager.get_latest_checkpoint",
+        "<non-session-write-connection>",
+        "write_connection",
+        "3ff2ad66f23de4bc",
+        1,
+        None,
+        line=220,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/manager.py",
+        "CheckpointManager.get_checkpoints",
+        "<non-session-write-connection>",
+        "write_connection",
+        "c3ee61782a940776",
+        1,
+        None,
+        line=242,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "_fetch_run",
+        "<non-session-write-connection>",
+        "write_connection",
+        "288170ec1722ebc2",
+        1,
+        None,
+        line=127,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "check_source_lifecycle_resumable",
+        "<non-session-write-connection>",
+        "write_connection",
+        "4b552d15f53e6c40",
+        1,
+        None,
+        line=234,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "check_group_satisfiability_resumable",
+        "<non-session-write-connection>",
+        "write_connection",
+        "9e291dca4a439605",
+        1,
+        None,
+        line=415,
+        connection_escape=True,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "RecoveryManager.get_unprocessed_row_data",
+        "<non-session-write-connection>",
+        "write_connection",
+        "758fe32047daee73",
+        1,
+        None,
+        line=894,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "RecoveryManager.get_unprocessed_row_data_by_source",
+        "<non-session-write-connection>",
+        "write_connection",
+        "ccdaa74d89308bbb",
+        1,
+        None,
+        line=955,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "RecoveryManager._get_incomplete_token_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "63aa60b938d94231",
+        1,
+        None,
+        line=1022,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "RecoveryManager.get_resume_workset",
+        "<non-session-write-connection>",
+        "write_connection",
+        "18b91cab2434c597",
+        1,
+        None,
+        line=1117,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/checkpoint/recovery.py",
+        "RecoveryManager.get_resume_workset",
+        "<non-session-write-connection>",
+        "write_connection",
+        "697320a36b78fae3",
+        1,
+        None,
+        line=1159,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "RunCoordinationRepository.live_leader",
+        "<non-session-write-connection>",
+        "write_connection",
+        "ad6d71c0a227bcf6",
+        1,
+        None,
+        line=637,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "RunCoordinationRepository.dead_non_leader_workers",
+        "<non-session-write-connection>",
+        "write_connection",
+        "1d14464e4e5644d1",
+        1,
+        None,
+        line=1010,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "RunCoordinationRepository._read_registered_workers",
+        "<non-session-write-connection>",
+        "write_connection",
+        "e69348a5794c1998",
+        1,
+        None,
+        line=1034,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/run_lifecycle_repository.py",
+        "RunLifecycleRepository.complete_run",
+        "<non-session-write-connection>",
+        "write_connection",
+        "02a32c802141b6f0",
+        1,
+        None,
+        line=627,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/barrier.py",
+        "BarrierJournalRepository.list_blocked_barrier_items",
+        "<non-session-write-connection>",
+        "write_connection",
+        "77752b22fc520b7b",
+        1,
+        None,
+        line=1084,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/barrier.py",
+        "BarrierJournalRepository.blocked_barrier_token_ids",
+        "<non-session-write-connection>",
+        "write_connection",
+        "89c87457b3d6b1a9",
+        1,
+        None,
+        line=1103,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/barrier.py",
+        "BarrierJournalRepository.count_blocked_barrier_items",
+        "<non-session-write-connection>",
+        "write_connection",
+        "c5310a65c3619209",
+        1,
+        None,
+        line=1117,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/barrier.py",
+        "BarrierJournalRepository.list_pending_blocked_barrier_items",
+        "<non-session-write-connection>",
+        "write_connection",
+        "3053f6e3f97a64b7",
+        1,
+        None,
+        line=1141,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/group_losses.py",
+        "GroupLossRepository.list_unadopted_group_losses",
+        "<non-session-write-connection>",
+        "write_connection",
+        "96de5f8f04d0d42b",
+        1,
+        None,
+        line=226,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/group_losses.py",
+        "GroupLossRepository.list_group_losses",
+        "<non-session-write-connection>",
+        "write_connection",
+        "b1352aa1e42a3d57",
+        1,
+        None,
+        line=261,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.count_ready_in_set",
+        "<non-session-write-connection>",
+        "write_connection",
+        "07606e7bd8e70285",
+        1,
+        None,
+        line=92,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.count_failed_in_set",
+        "<non-session-write-connection>",
+        "write_connection",
+        "507106f1f32a3934",
+        1,
+        None,
+        line=124,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.has_peer_owned_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "9d03e89f3fd122fc",
+        1,
+        None,
+        line=170,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.count_active_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "bed9203e7ba49ea2",
+        1,
+        None,
+        line=195,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.active_row_ids",
+        "<non-session-write-connection>",
+        "write_connection",
+        "e93c01fa22314ccf",
+        1,
+        None,
+        line=212,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.count_unquiesced_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "aabf3002d846cbce",
+        1,
+        None,
+        line=227,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.summarize_unquiesced_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "c511a7a388171ef4",
+        1,
+        None,
+        line=238,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.count_unresolved_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "435e93f0f1cf5fbc",
+        1,
+        None,
+        line=269,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.summarize_unresolved_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "dd23d5e0e835da29",
+        1,
+        None,
+        line=280,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/read_model.py",
+        "SchedulerReadModel.summarize_active_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "0100307f496daf20",
+        1,
+        None,
+        line=317,
+    ),
+    WriterIdentity(
+        "src/elspeth/core/rate_limit/limiter.py",
+        "RateLimiter.__init__",
+        "<non-session-write-connection>",
+        "write_connection",
+        "002b7e991cd4aa65",
+        1,
+        None,
+        line=224,
+        connection_escape=True,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/_aws_ecs_acceptance/capture.py",
+        "verify_local_auth",
+        "<non-session-write-connection>",
+        "write_connection",
+        "7e1168bb961c9d7e",
+        1,
+        None,
+        line=737,
+    ),
+    # ``with open_landscape_db(settings) as db, db.write_connection() as conn``:
+    # the tutorial's live-run projection writes the Landscape ``runs`` row and
+    # hands the connection to two counting helpers (hence the escape).
+    WriterIdentity(
+        "src/elspeth/web/composer/tutorial_service.py",
+        "_project_live_tutorial_output",
+        "<non-session-write-connection>",
+        "write_connection",
+        "aca40e2f0a3f3a63",
+        1,
+        None,
+        line=438,
+        connection_escape=True,
+    ),
 )
 
 _TABLE_NAMES = frozenset(policy.table for policy in _TABLE_POLICIES)
@@ -1810,8 +2149,20 @@ _NON_SESSION_ENGINE_FACTORIES = frozenset(
     {
         "sqlite3.connect",
         "elspeth.core.landscape.database.begin_write",
+        # One leader-fenced begin_write on a Tier1Engine (ADR-030); yields the
+        # Landscape connection it opened.
+        "elspeth.core.landscape.run_coordination_repository.fenced_leader_transaction",
+        # The web tier's accessor for the Landscape store; yields a LandscapeDB.
+        "elspeth.web.landscape_access.open_landscape_db",
     }
 )
+# LandscapeDB's own acquisition verbs. Recognised ONLY on a plain name bound
+# from a declared factory in the same function (``with open_landscape_db(...)
+# as db, db.write_connection() as conn``); an attribute receiver such as
+# ``self._db.write_connection()`` is deliberately not an acquisition here,
+# so the Landscape repositories keep their statement-level classification
+# (package premise) rather than acquiring a manifest row per site.
+_LANDSCAPE_CONNECTION_VERBS = frozenset({"connection", "write_connection", "read_only_connection"})
 _NON_SESSION_ENGINE_TYPES = frozenset(
     {
         "elspeth.core.landscape.database.LandscapeDB",
@@ -1828,6 +2179,7 @@ _NON_SESSION_ENGINE_TYPES = frozenset(
 _DECLARED_NON_SESSION_PACKAGES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/core/checkpoint/",
+    "src/elspeth/core/retention/",
 )
 _SESSION_SHAPED_IMPORT_ROOT = "elspeth.web"
 _SESSION_ENGINE_FACTORY_PATH = "src/elspeth/web/sessions/engine.py"
@@ -1836,6 +2188,9 @@ _PRAGMA_ASSIGNMENT = re.compile(r"PRAGMA\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0
 _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
     {
         "elspeth.web.execution.protocol.ExecutionService",
+        # LLM query strategies: ``execute`` runs the prompt plan, not SQL.
+        "elspeth.plugins.transforms.llm.transform.SingleQueryStrategy",
+        "elspeth.plugins.transforms.llm.transform.MultiQueryStrategy",
     }
 )
 _TRANSPARENT_SQLALCHEMY_STATEMENT_METHODS = frozenset(
@@ -2106,6 +2461,73 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return bool(identifiers & _TABLE_NAMES)
         return False
 
+    def _with_binding_context(self, binding: _NameBinding, name: str) -> ast.expr | None:
+        """The context expression that bound ``name`` in a ``with`` statement, when that is what the binding is."""
+
+        if not isinstance(binding.node, (ast.With, ast.AsyncWith)):
+            return None
+        items = [item for item in binding.node.items if isinstance(item.optional_vars, ast.Name) and item.optional_vars.id == name]
+        return items[0].context_expr if len(items) == 1 else None
+
+    def _name_bound_from_declared_factory(self, use: ast.AST, name: str) -> bool:
+        """Every reaching binding of ``name`` is a with-target or assignment of a declared non-Sessions factory call."""
+
+        reaching, complete, _ = self._visible_reaching_bindings(use, name)
+        if not complete or not reaching:
+            return False
+        for binding in reaching:
+            value = self._with_binding_context(binding, name) if binding.value is None else binding.value
+            if not isinstance(value, ast.Call):
+                return False
+            if self._qualified_database_domain(self._imported_qualified_name(value.func)) != "non_sessions":
+                return False
+        return True
+
+    def _annotation_type_qualified_names(self, annotation: ast.expr | None) -> frozenset[str] | None:
+        """Qualified names of every type in a plain or union annotation; ``None`` when any part is not resolvable."""
+
+        if annotation is None:
+            return None
+        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            left = self._annotation_type_qualified_names(annotation.left)
+            right = self._annotation_type_qualified_names(annotation.right)
+            return None if left is None or right is None else left | right
+        if isinstance(annotation, ast.Constant) and annotation.value is None:
+            return frozenset()
+        if isinstance(annotation, (ast.Name, ast.Attribute)):
+            qualified = self._imported_qualified_name(annotation)
+            if qualified is not None:
+                return frozenset({qualified})
+            if isinstance(annotation, ast.Name):
+                bindings = self.definition_bindings.get((id(self.tree), annotation.id), [])
+                if len(bindings) == 1 and isinstance(bindings[0].node, ast.ClassDef):
+                    return frozenset({f"{self._module_qualified_name()}.{annotation.id}"})
+            return None
+        return None
+
+    def _self_attribute_annotation(self, execution: ast.Call, attribute: ast.Attribute) -> ast.expr | None:
+        """The one ``self.<attr>: T`` annotation in the enclosing class, when exactly one exists."""
+
+        owner = self._enclosing_function(execution)
+        if owner is None or not self._is_instance_method(owner):
+            return None
+        positional = (*owner.args.posonlyargs, *owner.args.args)
+        if not positional or not (isinstance(attribute.value, ast.Name) and attribute.value.id == positional[0].arg):
+            return None
+        owner_class = self.method_owners[id(owner)]
+        annotations = [
+            node.annotation
+            for method in owner_class.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for node in ast.walk(method)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Attribute)
+            and node.target.attr == attribute.attr
+            and isinstance(node.target.value, ast.Name)
+            and node.target.value.id == positional[0].arg
+        ]
+        return annotations[0] if len(annotations) == 1 else None
+
     def _is_session_engine_configuration(self, execution: ast.Call, statement: ast.expr | None) -> bool:
         """PRAGMA assignments and transaction control inside create_session_engine are engine configuration, not table writes."""
 
@@ -2279,6 +2701,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             if returned.value is None:
                 return None
             resolved = self._connection_acquisitions_for_expression(returned, returned.value, visited=next_visited)
+            if (
+                not resolved
+                and isinstance(returned.value, ast.Call)
+                and self._qualified_database_domain(self._imported_qualified_name(returned.value.func)) is not None
+            ):
+                # A direct call to a declared factory (begin_write,
+                # fenced_leader_transaction, ...) is that factory's acquisition.
+                resolved = [returned.value]
             if not resolved:
                 return None
             for acquisition in resolved:
@@ -3021,9 +3451,13 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         return None
 
     def _has_explicit_non_sql_execute_receiver(self, execution: ast.Call) -> bool:
-        if not (
-            isinstance(execution.func, ast.Attribute) and execution.func.attr == "execute" and isinstance(execution.func.value, ast.Name)
-        ):
+        if not (isinstance(execution.func, ast.Attribute) and execution.func.attr == "execute"):
+            return False
+        if isinstance(execution.func.value, ast.Attribute):
+            annotation = self._self_attribute_annotation(execution, execution.func.value)
+            declared = self._annotation_type_qualified_names(annotation)
+            return bool(declared) and declared <= _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES
+        if not isinstance(execution.func.value, ast.Name):
             return False
         receiver = execution.func.value
         reaching, complete, _ = self._visible_reaching_bindings(execution, receiver.id)
@@ -3196,7 +3630,17 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             parameter_domain = self._parameter_database_domain(use, expression.id)
             domains: list[DatabaseDomain | None] = []
             for binding in reaching:
-                if binding.value is None:
+                with_context = self._with_binding_context(binding, expression.id) if binding.value is None else None
+                if with_context is not None:
+                    domains.append(
+                        self._expression_database_domain(
+                            with_context,
+                            use=binding.node,
+                            visited_names=visited_names | {key},
+                            visited_attributes=visited_attributes,
+                        )
+                    )
+                elif binding.value is None:
                     domains.append(parameter_domain)
                 else:
                     domains.append(
@@ -3592,6 +4036,13 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 )
                 if receiver_acquisitions:
                     return []
+            return [expression]
+        if (
+            isinstance(expression.func, ast.Attribute)
+            and expression.func.attr in _LANDSCAPE_CONNECTION_VERBS
+            and isinstance(expression.func.value, ast.Name)
+            and self._name_bound_from_declared_factory(use, expression.func.value.id)
+        ):
             return [expression]
         if isinstance(expression.func, ast.Attribute) and expression.func.attr in {"execution_options"}:
             return self._connection_acquisitions_for_expression(
@@ -7118,6 +7569,143 @@ def test_package_premise_is_revoked_by_a_session_shaped_import(tmp_path: Path) -
         ), imports
 
 
+def test_declared_factory_handle_verbs_are_acquisitions_only_on_a_plain_name(tmp_path: Path) -> None:
+    """``with open_landscape_db(...) as db, db.write_connection() as conn`` is a Landscape acquisition; ``self._db.write_connection()`` is not one."""
+
+    source = tmp_path / "src/elspeth/web/tutorial.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import update
+            from elspeth.core.landscape.schema import runs_table
+            from elspeth.web.landscape_access import open_landscape_db
+
+            def project(settings, run_id):
+                with open_landscape_db(settings) as db, db.write_connection() as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(llm_call_count=1))
+
+            class Holder:
+                def __init__(self, db):
+                    self._db = db
+
+                def project(self, run_id):
+                    with self._db.write_connection() as conn:
+                        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(llm_call_count=1))
+
+            def unknown_handle(db, run_id):
+                with db.write_connection() as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(llm_call_count=1))
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("project", "<non-session-write-connection>", "write_connection"): 1,
+            ("Holder.project", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("unknown_handle", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
+def test_factory_return_hop_follows_a_method_returning_either_declared_landscape_factory(tmp_path: Path) -> None:
+    """checkpoint/manager's shape: a method returning begin_write(...) or fenced_leader_transaction(...) carries the Landscape origin."""
+
+    source = tmp_path / "src/elspeth/core/checkpoint/manager.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import insert
+            from elspeth.core.landscape.database import begin_write
+            from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+            from elspeth.core.landscape.schema import checkpoints_table
+
+            class CheckpointManager:
+                def __init__(self, db):
+                    self._db = db
+
+                def _fenced_or_plain_write(self, *, token, verb):
+                    if token is None:
+                        return begin_write(self._db.engine)
+                    return fenced_leader_transaction(self._db.engine, token=token, verb=verb)
+
+                def create(self, token):
+                    with self._fenced_or_plain_write(token=token, verb="create") as conn:
+                        conn.execute(insert(checkpoints_table).values(run_id="r"))
+
+                def _leaky(self, provider):
+                    if provider is None:
+                        return begin_write(self._db.engine)
+                    return provider.connect()
+
+                def create_leaky(self, provider):
+                    with self._leaky(provider) as conn:
+                        conn.execute(insert(checkpoints_table).values(run_id="r"))
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            # The refused hop: one return is not a declared factory, so the
+            # caller's execute stays unresolved even inside a declared package
+            # (its connection roots in a parameter-fed helper, not the module),
+            # and the returned generic connection is the helper's own escape.
+            ("CheckpointManager._leaky", "<sessions-write-connection>", "write_connection"): 1,
+            ("CheckpointManager.create_leaky", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
+def test_self_attribute_with_a_declared_non_sql_type_is_not_a_database_execute(tmp_path: Path) -> None:
+    source = tmp_path / "src/elspeth/plugins/transforms/llm/transform.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            class SingleQueryStrategy:
+                def execute(self, row):
+                    return row
+
+            class MultiQueryStrategy:
+                def execute(self, row):
+                    return row
+
+            class Other:
+                def execute(self, row):
+                    return row
+
+            class Transform:
+                def __init__(self, single):
+                    if single:
+                        self._strategy: SingleQueryStrategy | MultiQueryStrategy = SingleQueryStrategy()
+                    else:
+                        self._strategy = MultiQueryStrategy()
+                    self._other: Other = Other()
+                    self._untyped = Other()
+
+                def process(self, row):
+                    return self._strategy.execute(row)
+
+                def process_other(self, row):
+                    return self._other.execute(row)
+
+                def process_untyped(self, row):
+                    return self._untyped.execute(row)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("Transform.process_other", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("Transform.process_untyped", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
 def test_session_engine_factory_configuration_is_not_a_table_write(tmp_path: Path) -> None:
     """Rule 3: PRAGMA assignments and BEGIN inside create_session_engine are engine configuration; elsewhere they are not."""
 
@@ -8431,7 +9019,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=466,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 21
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 54
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
