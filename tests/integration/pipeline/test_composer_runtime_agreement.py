@@ -624,6 +624,7 @@ from elspeth.contracts.secrets import (
     SecretInventoryItem,
     SecretUnavailabilityReason,
 )
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.config import (
     AggregationSettings,
     CoalesceSettings,
@@ -3800,18 +3801,35 @@ class _FakeBlobService:
     get_blob_calls: list[UUID] = field(default_factory=list)
     finalize_run_output_blobs_calls: list[tuple[UUID, bool]] = field(default_factory=list)
 
-    async def link_blob_to_run(self, blob_id: UUID, run_id: UUID, direction: str) -> None:
+    async def link_blob_to_run(
+        self,
+        blob_id: UUID,
+        run_id: UUID,
+        direction: str,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        assert type(session_operation_context) is SessionOperationContext
         self.link_blob_to_run_calls.append((blob_id, run_id, direction))
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
+    async def read_blob_content(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> bytes:
+        assert type(session_operation_context) is SessionOperationContext
         self.read_blob_content_calls.append(blob_id)
         return self.content
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
+    async def get_blob(self, blob_id: UUID, *, session_operation_context: SessionOperationContext) -> BlobRecord:
+        assert type(session_operation_context) is SessionOperationContext
         self.get_blob_calls.append(blob_id)
         return self.blob_record
 
-    async def finalize_run_output_blobs(self, run_id: UUID, success: bool) -> BlobFinalizationResult:
+    async def finalize_run_output_blobs(
+        self,
+        run_id: UUID,
+        success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobFinalizationResult:
+        assert type(session_operation_context) is SessionOperationContext
         self.finalize_run_output_blobs_calls.append((run_id, success))
         return BlobFinalizationResult(finalized=(), errors=())
 

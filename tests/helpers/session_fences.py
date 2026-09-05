@@ -281,20 +281,36 @@ def close_adopted_lease(loop, lease) -> None:
     loop.run_until_complete(lease.close())
 
 
-def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "test-live-owner", lease_seconds: int = 300):
-    """Upsert one LIVE COMPOSE fence row for ``session_id`` and return its exact context.
+def seed_live_operation_context(
+    engine,
+    session_id,
+    *,
+    operation_kind: SessionOperationKind,
+    owner_instance_id: str = "test-live-owner",
+    lease_seconds: int = 300,
+):
+    """Upsert one LIVE fence row of ``operation_kind`` for ``session_id`` and return its exact context.
 
-    For sync direct calls on fenced writers whose session ids are not UUIDs
-    (legacy fixture ids), where the production acquire path cannot be used.
-    The DTO matches the durable row exactly, so writer-side database
-    verification passes honestly; nothing in production is bypassed.
+    The per-kind real-fence seeder for direct calls on the fenced blob
+    service and other writers that compare-and-swap the context against the
+    ``session_operation_fences`` row through the real
+    ``SQLiteLocalSessionOperationAuthority``: the DTO matches the durable
+    row exactly, so the authority's database-side verification passes
+    honestly and nothing in production is bypassed. A session holds ONE
+    fence row, so seeding again for the same session (any kind) replaces
+    the previous fence and makes its context stale — exactly what the
+    production authority does when a new operation is acquired. Sequence
+    calls accordingly (create under COMPOSE, then seed EXECUTE before
+    linking or finalizing).
     """
     from datetime import timedelta
 
     from sqlalchemy import delete
 
-    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+    from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
 
+    if type(operation_kind) is not SessionOperationKind:
+        raise TypeError("operation_kind must be an exact SessionOperationKind")
     sid = str(session_id)
     operation_id = str(uuid4())
     lease_token = uuid4().hex
@@ -306,7 +322,7 @@ def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "t
                 session_id=sid,
                 operation_id=operation_id,
                 lease_token=lease_token,
-                operation_kind=SessionOperationKind.COMPOSE.value,
+                operation_kind=operation_kind.value,
                 owner_instance_id=owner_instance_id,
                 operation_epoch=2,
                 lease_expires_at=now + timedelta(seconds=lease_seconds),
@@ -320,5 +336,24 @@ def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "t
             lease_token=lease_token,
             operation_epoch=2,
         ),
+        operation_kind=operation_kind,
+    )
+
+
+def seed_live_compose_context(engine, session_id, *, owner_instance_id: str = "test-live-owner", lease_seconds: int = 300):
+    """Upsert one LIVE COMPOSE fence row for ``session_id`` and return its exact context.
+
+    For sync direct calls on fenced writers whose session ids are not UUIDs
+    (legacy fixture ids), where the production acquire path cannot be used.
+    COMPOSE is admitted to the blob create, read, and delete effects, so one
+    seeded COMPOSE context drives a whole blob-service scenario; the EXECUTE
+    effects (run linkage, output finalization) need
+    :func:`seed_live_operation_context` with ``SessionOperationKind.EXECUTE``.
+    """
+    return seed_live_operation_context(
+        engine,
+        session_id,
         operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=owner_instance_id,
+        lease_seconds=lease_seconds,
     )
