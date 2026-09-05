@@ -2937,7 +2937,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "df6185754d14a63c",
         1,
         None,
-        line=319,
+        line=325,
         connection_escape=True,
     ),
     # Proven non-Sessions acquisitions (P4-D6 step 1): every origin is a
@@ -11854,7 +11854,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "4312f607f547b35b",
             1,
             None,
-            line=248,
+            line=249,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -11876,7 +11876,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "afc7d978d541eadc",
             1,
             None,
-            line=218,
+            line=250,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -11887,7 +11887,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "883e79c104c66d8f",
             1,
             None,
-            line=264,
+            line=307,
             connection_escape=True,
         ),
         WriterIdentity(
@@ -11898,7 +11898,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "bbce7dbcfc31f6ec",
             1,
             None,
-            line=471,
+            line=513,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable
