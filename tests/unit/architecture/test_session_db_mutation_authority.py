@@ -1818,6 +1818,21 @@ _NON_SESSION_ENGINE_TYPES = frozenset(
         "elspeth.core.landscape.database.Tier1Engine",
     }
 )
+# Package premise (P4-D6 rule 1): a module under one of these prefixes that
+# imports nothing from ``elspeth.web`` can neither build a Sessions-model
+# statement nor mint a Sessions engine, so a statement it executes on a
+# connection IT bound (a ``with ... as conn`` or an assignment in the module,
+# never a parameter) is a non-Sessions execution — unless the statement is
+# raw SQL naming a Sessions table. The premise is verified per module, never
+# assumed from the path.
+_DECLARED_NON_SESSION_PACKAGES = (
+    "src/elspeth/core/landscape/",
+    "src/elspeth/core/checkpoint/",
+)
+_SESSION_SHAPED_IMPORT_ROOT = "elspeth.web"
+_SESSION_ENGINE_FACTORY_PATH = "src/elspeth/web/sessions/engine.py"
+_TRANSACTION_CONTROL_SQL = frozenset({"BEGIN", "BEGIN IMMEDIATE", "BEGIN DEFERRED", "BEGIN EXCLUSIVE", "COMMIT", "ROLLBACK"})
+_PRAGMA_ASSIGNMENT = re.compile(r"PRAGMA\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+", flags=re.IGNORECASE)
 _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
     {
         "elspeth.web.execution.protocol.ExecutionService",
@@ -1990,6 +2005,121 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         self.class_methods: dict[tuple[int, str], ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
         self._collect_aliases()
         self._collect_class_methods()
+        self.declared_non_session_module = self._declared_non_session_module()
+
+    def _declared_non_session_module(self) -> bool:
+        """The package premise, verified on this module's own imports (not asserted from its path)."""
+
+        if not self.path.startswith(_DECLARED_NON_SESSION_PACKAGES):
+            return False
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                names = [imported.name for imported in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                module = self._relative_import_module(node)
+                names = [module] if module is not None else [None]
+                names.extend(f"{module}.{imported.name}" for imported in node.names if module is not None)
+            else:
+                continue
+            for name in names:
+                if name is None:
+                    return False
+                if name == _SESSION_SHAPED_IMPORT_ROOT or name.startswith(f"{_SESSION_SHAPED_IMPORT_ROOT}."):
+                    return False
+        return True
+
+    def _execution_receiver_is_module_bound(self, execution: ast.Call) -> bool:
+        """True when the executing connection was bound by this module (with-target or assignment), never a parameter."""
+
+        receiver = execution.func.value if isinstance(execution.func, ast.Attribute) else None
+        if not isinstance(receiver, ast.Name):
+            return False
+        return self._name_is_module_bound(execution, receiver.id, depth=0)
+
+    def _name_is_module_bound(self, use: ast.AST, name: str, *, depth: int) -> bool:
+        """Every reaching binding of ``name`` is a call rooted in this module's own state, never in a parameter."""
+
+        if depth > 3:
+            return False
+        reaching, complete, _ = self._visible_reaching_bindings(use, name)
+        if not complete or not reaching:
+            return False
+        for binding in reaching:
+            node = binding.node
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                items = [item for item in node.items if isinstance(item.optional_vars, ast.Name) and item.optional_vars.id == name]
+                if len(items) != 1 or not isinstance(items[0].context_expr, ast.Call):
+                    return False
+                if not self._call_roots_in_module(items[0].context_expr, use=node, depth=depth):
+                    return False
+                continue
+            if binding.value is None or not isinstance(binding.value, ast.Call):
+                return False
+            if not self._call_roots_in_module(binding.value, use=node, depth=depth):
+                return False
+        return True
+
+    def _call_roots_in_module(self, call: ast.Call, *, use: ast.AST, depth: int) -> bool:
+        """No Name leaf of the call (receiver chain or arguments) is a parameter of the enclosing function except ``self``."""
+
+        owner = self._enclosing_function(use)
+        parameters: set[str] = set()
+        self_name: str | None = None
+        if owner is not None:
+            positional = (*owner.args.posonlyargs, *owner.args.args)
+            parameters = {argument.arg for argument in (*positional, *owner.args.kwonlyargs)}
+            if owner.args.vararg is not None:
+                parameters.add(owner.args.vararg.arg)
+            if owner.args.kwarg is not None:
+                parameters.add(owner.args.kwarg.arg)
+            if positional and self._is_instance_method(owner) and not self._name_reassigned_in(owner, positional[0].arg):
+                self_name = positional[0].arg
+        for leaf in ast.walk(call):
+            if not isinstance(leaf, ast.Name) or not isinstance(leaf.ctx, ast.Load):
+                continue
+            if leaf.id == self_name:
+                continue
+            if leaf.id in parameters:
+                return False
+            scope_key = (id(self._lexical_scope(use)), leaf.id)
+            if scope_key in self.shadowed_names and not self._name_is_module_bound(use, leaf.id, depth=depth + 1):
+                return False
+        return True
+
+    def _raw_sql_names_sessions_table(self, expression: ast.expr | None, *, use: ast.AST) -> bool:
+        """True only for raw SQL text that names a Sessions table (the package-premise veto)."""
+
+        if isinstance(expression, ast.Name):
+            reaching, complete, _ = self._potentially_reaching_bindings(use, expression.id)
+            if not complete or not reaching:
+                return False
+            return any(
+                binding.value is not None and self._raw_sql_names_sessions_table(binding.value, use=binding.node) for binding in reaching
+            )
+        if isinstance(expression, ast.Call):
+            qualified = self._imported_qualified_name(expression.func)
+            if qualified and qualified.startswith("sqlalchemy.") and qualified.endswith(".text") and len(expression.args) == 1:
+                return self._raw_sql_names_sessions_table(expression.args[0], use=use)
+            return False
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            identifiers = {token.strip('"`[]').lower() for token in re.findall(_SQL_IDENTIFIER, expression.value)}
+            return bool(identifiers & _TABLE_NAMES)
+        return False
+
+    def _is_session_engine_configuration(self, execution: ast.Call, statement: ast.expr | None) -> bool:
+        """PRAGMA assignments and transaction control inside create_session_engine are engine configuration, not table writes."""
+
+        if self.path != _SESSION_ENGINE_FACTORY_PATH:
+            return False
+        symbol = _symbol(execution)
+        if not (symbol == "create_session_engine" or symbol.startswith("create_session_engine.")):
+            return False
+        if not (isinstance(statement, ast.Constant) and isinstance(statement.value, str)):
+            return False
+        text = statement.value.strip().rstrip(";").strip()
+        if text.upper() in _TRANSACTION_CONTROL_SQL:
+            return True
+        return _PRAGMA_ASSIGNMENT.fullmatch(text) is not None
 
     def _record_connection(self, acquisition: ast.Call, *, escapes: bool) -> None:
         # A transparent hop (a factory-return call, or a wrapper that acquires
@@ -4033,10 +4163,27 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                     use=call,
                 ):
                     continue
+                if self._is_session_engine_configuration(call, statement):
+                    self.classified_execution_calls.add(id(call))
+                    continue
                 statement_domain, force_unresolved = self._statement_database_evidence(statement)
                 connection_domain = self._execution_connection_database_domain(call)
                 if connection_domain == "non_sessions":
                     self.classified_execution_calls.add(id(call))
+                    continue
+                if (
+                    self.declared_non_session_module
+                    and connection_domain == "unknown"
+                    and statement_domain != "sessions"
+                    and self._execution_receiver_is_module_bound(call)
+                    and not self._raw_sql_names_sessions_table(statement, use=call)
+                ):
+                    # Package premise: this module bound the connection itself
+                    # and can hold no Sessions engine, so the execution is
+                    # non-Sessions by construction (rule 1; see the constant).
+                    self.classified_execution_calls.add(id(call))
+                    for acquisition in acquisitions:
+                        self._record_connection(acquisition, escapes=False)
                     continue
                 if statement_domain == "non_sessions":
                     self._append_site(
@@ -6891,6 +7038,121 @@ def test_self_inside_a_declared_engine_type_carries_its_domain(tmp_path: Path) -
             ("src/elspeth/core/landscape/database.py", "LandscapeDB.detached", "<sessions-write-connection>"): 1,
             ("src/elspeth/other.py", "LandscapeDB.write", "<sessions-write-connection>"): 1,
             ("src/elspeth/other.py", "LandscapeDB.detached", "<sessions-write-connection>"): 1,
+        }
+    )
+
+
+_PACKAGE_PREMISE_MODULE = textwrap.dedent(
+    """\
+    {imports}
+    class Repo:
+        def __init__(self, db):
+            self._db = db
+
+        def module_bound(self, stmt):
+            with self._db.write_connection() as conn:
+                conn.execute(stmt)
+
+        def raw_landscape(self):
+            with self._db.write_connection() as conn:
+                conn.execute("UPDATE token_outcomes SET outcome = 'x'")
+
+        def raw_sessions(self):
+            with self._db.write_connection() as conn:
+                conn.execute("UPDATE sessions SET status = 'x'")
+
+    def parameter_received(conn, stmt):
+        conn.execute(stmt)
+    """
+)
+
+
+def _package_premise_findings(tmp_path: Path, relative: str, *, imports: str = "") -> Counter[tuple[str, str, str]]:
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(_PACKAGE_PREMISE_MODULE.format(imports=imports))
+    return Counter((site.symbol, site.table, site.operation) for site in scan_production_writers([source], anchor=tmp_path))
+
+
+def test_package_premise_classifies_module_bound_executions_in_a_declared_landscape_module(tmp_path: Path) -> None:
+    """Rule 1 acceptance: a declared module with no elspeth.web import executes on the connection it bound."""
+
+    assert _package_premise_findings(tmp_path, "src/elspeth/core/landscape/repo.py") == Counter(
+        {
+            # The parameter-received helper stays fail-closed (merge writer's default).
+            ("parameter_received", "<unresolved-session-write>", "unknown_execute"): 1,
+            # Raw SQL naming a Sessions table is vetoed even here.
+            ("Repo.raw_sessions", "sessions", "raw_update"): 1,
+        }
+    )
+
+
+def test_package_premise_does_not_apply_outside_the_declared_packages(tmp_path: Path) -> None:
+    """Rule 1 refusal: the same module under web/ keeps every finding."""
+
+    assert _package_premise_findings(tmp_path, "src/elspeth/web/repo.py") == Counter(
+        {
+            ("Repo.module_bound", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("Repo.raw_landscape", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("Repo.raw_sessions", "sessions", "raw_update"): 1,
+            ("parameter_received", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
+def test_package_premise_is_revoked_by_a_session_shaped_import(tmp_path: Path) -> None:
+    """Rule 1 tripwire: one elspeth.web import in a declared module re-opens every execution it classified."""
+
+    for imports in (
+        "from elspeth.web.sessions.models import sessions_table\n",
+        "from elspeth.web.sessions.engine import create_session_engine\n",
+        "import elspeth.web.sessions.models\n",
+    ):
+        assert _package_premise_findings(tmp_path, "src/elspeth/core/landscape/repo.py", imports=imports) == Counter(
+            {
+                ("Repo.module_bound", "<unresolved-session-write>", "unknown_execute"): 1,
+                ("Repo.raw_landscape", "<unresolved-session-write>", "unknown_execute"): 1,
+                ("Repo.raw_sessions", "sessions", "raw_update"): 1,
+                ("parameter_received", "<unresolved-session-write>", "unknown_execute"): 1,
+            }
+        ), imports
+
+
+def test_session_engine_factory_configuration_is_not_a_table_write(tmp_path: Path) -> None:
+    """Rule 3: PRAGMA assignments and BEGIN inside create_session_engine are engine configuration; elsewhere they are not."""
+
+    source = tmp_path / "src/elspeth/web/sessions/engine.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def create_session_engine(url):
+                def _configure(dbapi_conn, _record):
+                    cursor = dbapi_conn.cursor()
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                    cursor.execute("PRAGMA journal_mode=WAL")
+
+                def _begin_immediate(conn):
+                    conn.exec_driver_sql("BEGIN IMMEDIATE")
+                    conn.exec_driver_sql("BEGIN")
+
+                def _not_configuration(conn):
+                    conn.exec_driver_sql("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL")
+                    conn.execute("VACUUM")
+
+            def elsewhere(dbapi_conn, conn):
+                dbapi_conn.cursor().execute("PRAGMA foreign_keys=ON")
+                conn.exec_driver_sql("BEGIN IMMEDIATE")
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("create_session_engine._not_configuration", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("create_session_engine._not_configuration", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("elsewhere", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("elsewhere", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
         }
     )
 
