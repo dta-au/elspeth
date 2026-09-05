@@ -32,6 +32,7 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.tree_gate import iter_gate_files
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _PRIVATE = "/srv/elspeth/data/blobs/s1/50f5b3e9-f52f-4c5f-98df-a20ec7b2627b_colours.csv"
@@ -309,7 +310,7 @@ def test_every_composition_states_insert_site_is_preceded_by_the_custody_gate() 
     package_root = _custody_census_package_root()
     def_pattern = re.compile(r"^    (async )?def (\w+)\(")
     sites: dict[str, int] = {}
-    for source_path in sorted(package_root.rglob("*.py")):
+    for source_path in iter_gate_files(package_root):
         source_lines = source_path.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(source_lines):
             if "insert(composition_states_table)" not in line:

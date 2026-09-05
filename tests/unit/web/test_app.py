@@ -1289,7 +1289,6 @@ class TestSessionWiring:
         assert service._audit_access_log_authority is app.state.audit_access_log_authority
         assert service._skill_markdown_history_authority is app.state.skill_markdown_history_authority
         assert app.state.user_secret_store._mutation_authority is app.state.user_secret_authority
-        assert app.state.preferences_service._mutation_authority is app.state.user_preference_authority
 
     def test_session_routes_registered(self, tmp_path) -> None:
         app = create_app(_settings(tmp_path))

@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
+from tests.helpers.tree_gate import iter_gate_files
+
 
 @dataclass(frozen=True, slots=True)
 class MutationApi:
@@ -466,7 +468,7 @@ def _read_source(path: Path, *, anchor: Path) -> SourceUnit:
 @cache
 def _production_units() -> tuple[SourceUnit, ...]:
     root = _repo_root()
-    return tuple(_read_source(path, anchor=root) for path in sorted((root / "src" / "elspeth").rglob("*.py")))
+    return tuple(_read_source(path, anchor=root) for path in iter_gate_files(root / "src" / "elspeth"))
 
 
 def _call_name(call: ast.Call) -> str | None:
