@@ -53,7 +53,6 @@ from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from datetime import datetime
 
     from elspeth.contracts import (
         ResumePoint,
@@ -363,7 +362,6 @@ class Orchestrator:
         run_id: str,
         settings: ElspethSettings,
         *,
-        now: datetime | None = None,
         window_seconds: float | None = None,
     ) -> str:
         """§B.1: atomic follower admission — public entry point (ADR-030).
@@ -376,6 +374,5 @@ class Orchestrator:
         return self._join_admission.join_run(
             run_id,
             settings,
-            now=now,
             window_seconds=window_seconds,
         )

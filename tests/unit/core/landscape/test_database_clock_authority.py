@@ -2139,6 +2139,12 @@ class _ClockScanner(ast.NodeVisitor):
                 sources.add("process")
         elif isinstance(node, ast.Attribute):
             lowered = node.attr.lower()
+            if lowered.endswith("_id") and not _name_has_clock_marker(node.attr):
+                # An identity read (``run.run_id``, ``token.worker_id``) is not
+                # a clock, whatever clock the object it hangs off was built
+                # with (``Run(started_at=now())``); it contributes no source,
+                # so a deadline written from it still reads missing-database-time.
+                return frozenset(sources)
             if lowered in _FORENSIC_NAMES:
                 sources.add("forensic")
             if self._is_process_clock_callable(node, seen=seen, scope=scope):
@@ -3820,6 +3826,49 @@ def rotate_custody(conn):
     ))
 """
     assert _scan_source(safe, path=path) == ()
+
+
+def test_identity_attribute_of_a_clock_built_object_is_not_a_forwarded_clock() -> None:
+    """``run.run_id`` off ``Run(started_at=now())`` names no clock; ``run.started_at`` still does."""
+    authority_path = "src/elspeth/core/landscape/custody_impl.py"
+    caller_path = "src/elspeth/core/landscape/lifecycle_facade.py"
+    authority = """
+from datetime import timedelta
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+def register_run_leader_on(conn, *, run_id, worker_id, window_seconds):
+    database_now = read_landscape_transaction_time(conn)
+    conn.execute(update(run_workers_table).values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds)))
+"""
+    identity_forward = """
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.custody_impl import register_run_leader_on
+
+def begin_run(conn, run_id):
+    timestamp = now()
+    run = Run(run_id=run_id, started_at=timestamp)
+    worker_id = mint_worker_id(run.run_id)
+    register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=80.0)
+"""
+    assert [
+        violation
+        for violation in _scan_sources({authority_path: authority, caller_path: identity_forward})
+        if violation.path == caller_path
+    ] == []
+
+    forensic_forward = identity_forward.replace("run_id=run.run_id, worker_id=worker_id", "run_id=run.run_id, worker_id=run.started_at")
+    forensic_kinds = {
+        violation.kind
+        for violation in _scan_sources({authority_path: authority, caller_path: forensic_forward})
+        if violation.path == caller_path
+    }
+    assert "caller-clock-forwarding" in forensic_kinds
+
+    identity_deadline = """
+def rotate(conn, run):
+    conn.execute(update(run_workers_table).values(heartbeat_expires_at=run.run_id))
+"""
+    assert "missing-database-time" in {violation.kind for violation in _scan_source(identity_deadline, path=authority_path)}
 
 
 def test_structural_inventory_follows_cross_file_authority_wrappers() -> None:

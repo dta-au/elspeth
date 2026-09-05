@@ -199,7 +199,6 @@ class TestFirstFenceDatabaseDeadline:
             RunCoordinationRepository(db.engine),
             run_id=run_id,
             worker_id="worker-leader",
-            now=datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC),
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         )
         return run_id, token

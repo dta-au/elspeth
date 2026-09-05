@@ -742,7 +742,6 @@ class TestVerifyAndExtendLeaderFence:
             RunCoordinationRepository(db.engine),
             run_id=RUN_1,
             worker_id="worker-leader",
-            now=NOW,
             window_seconds=80.0,
         )
 

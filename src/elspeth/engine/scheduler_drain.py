@@ -384,14 +384,12 @@ class SchedulerDrainCoordinator:
             dead_members = self._run_coordination.dead_non_leader_workers(
                 run_id=self._run_id,
                 leader_worker_id=coordination_token.worker_id,
-                now=now,
                 grace_seconds=grace,
             )
             for target_worker_id in dead_members:
                 self._run_coordination.evict_worker(
                     token=coordination_token,
                     target_worker_id=target_worker_id,
-                    now=now,
                     grace_seconds=grace,
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 )

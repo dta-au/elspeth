@@ -73,6 +73,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -352,7 +353,6 @@ class RunCoordinationRepository:
         *,
         run_id: str,
         worker_id: str,
-        now: datetime,
         window_seconds: float,
         entry_point: str = "run",
     ) -> CoordinationToken:
@@ -362,16 +362,18 @@ class RunCoordinationRepository:
         ``run_workers`` row (with the §A.1 pid/hostname/entry_point
         forensics), and the ``leader_acquire`` + ``worker_register`` events —
         all on ``conn``. The ``runs`` row must already exist in this
-        transaction (FK).
+        transaction (FK). The seat's deadline and every stamp come from the
+        Landscape database clock read once on ``conn`` (ADR-047).
         """
-        expires = now + timedelta(seconds=window_seconds)
+        database_now = read_landscape_transaction_time(conn)
+        expires = database_now + timedelta(seconds=window_seconds)
         conn.execute(
             insert(run_coordination_table).values(
                 run_id=run_id,
                 leader_worker_id=worker_id,
                 leader_epoch=1,
                 leader_heartbeat_expires_at=expires,
-                updated_at=now,
+                updated_at=database_now,
             )
         )
         self._insert_worker_row(
@@ -379,8 +381,7 @@ class RunCoordinationRepository:
             run_id=run_id,
             worker_id=worker_id,
             role="leader",
-            now=now,
-            heartbeat_expires_at=expires,
+            window_seconds=window_seconds,
             entry_point=entry_point,
         )
         record_coordination_event(
@@ -389,7 +390,7 @@ class RunCoordinationRepository:
             event_type="worker_register",
             worker_id=worker_id,
             leader_epoch=1,
-            recorded_at=now,
+            recorded_at=database_now,
             context={"role": "leader", "entry_point": entry_point},
         )
         record_coordination_event(
@@ -398,7 +399,7 @@ class RunCoordinationRepository:
             event_type="leader_acquire",
             worker_id=worker_id,
             leader_epoch=1,
-            recorded_at=now,
+            recorded_at=database_now,
             context={"entry_point": entry_point},
         )
         return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
@@ -408,7 +409,6 @@ class RunCoordinationRepository:
         *,
         run_id: str,
         worker_id: str,
-        now: datetime,
         window_seconds: float,
         entry_point: str = "resume",
     ) -> CoordinationToken:
@@ -448,7 +448,6 @@ class RunCoordinationRepository:
                     conn,
                     run_id=run_id,
                     worker_id=worker_id,
-                    now=now,
                     window_seconds=window_seconds,
                     entry_point=entry_point,
                 )
@@ -463,10 +462,13 @@ class RunCoordinationRepository:
         *,
         run_id: str,
         worker_id: str,
-        now: datetime,
         window_seconds: float,
         entry_point: str,
     ) -> CoordinationToken:
+        # The takeover decision compares the seat against the database's own
+        # clock, read once inside the write transaction (ADR-047): a lock-wait
+        # stale reading can only make the incumbent look LESS expired.
+        database_now = read_landscape_transaction_time(conn)
         seat = conn.execute(
             select(
                 run_coordination_table.c.leader_worker_id,
@@ -484,7 +486,7 @@ class RunCoordinationRepository:
                 "or was written by incompatible code."
             )
         prior_worker: str | None = seat.leader_worker_id
-        expires = now + timedelta(seconds=window_seconds)
+        expires = database_now + timedelta(seconds=window_seconds)
 
         # Immutable-success durable backstop (§B.4 closing line). The takeover
         # CAS subsumed the resume path's update_run_status(RUNNING) first
@@ -507,13 +509,14 @@ class RunCoordinationRepository:
             update(run_coordination_table)
             .where(
                 run_coordination_table.c.run_id == run_id,
-                (run_coordination_table.c.leader_worker_id.is_(None)) | (run_coordination_table.c.leader_heartbeat_expires_at < now),
+                (run_coordination_table.c.leader_worker_id.is_(None))
+                | (run_coordination_table.c.leader_heartbeat_expires_at < database_now),
             )
             .values(
                 leader_worker_id=worker_id,
                 leader_epoch=run_coordination_table.c.leader_epoch + 1,
                 leader_heartbeat_expires_at=expires,
-                updated_at=now,
+                updated_at=database_now,
             )
         )
         if cas.rowcount != 1:
@@ -551,7 +554,7 @@ class RunCoordinationRepository:
                     run_workers_table.c.worker_id == prior_worker,
                     run_workers_table.c.status == "active",
                 )
-                .values(status="evicted", evicted_at=now, evicted_by_worker_id=worker_id)
+                .values(status="evicted", evicted_at=database_now, evicted_by_worker_id=worker_id)
             )
             if evicted.rowcount == 1:
                 record_coordination_event(
@@ -560,7 +563,7 @@ class RunCoordinationRepository:
                     event_type="worker_evict",
                     worker_id=prior_worker,
                     leader_epoch=new_epoch,
-                    recorded_at=now,
+                    recorded_at=database_now,
                     context={"evicted_by_worker_id": worker_id, "reason": "deposed_leader_takeover"},
                 )
 
@@ -569,8 +572,7 @@ class RunCoordinationRepository:
             run_id=run_id,
             worker_id=worker_id,
             role="leader",
-            now=now,
-            heartbeat_expires_at=expires,
+            window_seconds=window_seconds,
             entry_point=entry_point,
         )
         record_coordination_event(
@@ -579,7 +581,7 @@ class RunCoordinationRepository:
             event_type="worker_register",
             worker_id=worker_id,
             leader_epoch=new_epoch,
-            recorded_at=now,
+            recorded_at=database_now,
             context={"role": "leader", "entry_point": entry_point},
         )
         record_coordination_event(
@@ -588,12 +590,12 @@ class RunCoordinationRepository:
             event_type="leader_acquire",
             worker_id=worker_id,
             leader_epoch=new_epoch,
-            recorded_at=now,
+            recorded_at=database_now,
             context={"entry_point": entry_point, "deposed_leader_worker_id": prior_worker},
         )
         return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
 
-    def release_seat(self, *, token: CoordinationToken, now: datetime) -> None:
+    def release_seat(self, *, token: CoordinationToken) -> None:
         """Graceful leader shutdown: CAS the seat vacant + depart own row. Idempotent.
 
         Rowcount 0 on the seat CAS (already released, or deposed) is a
@@ -604,6 +606,7 @@ class RunCoordinationRepository:
         """
         try:
             with begin_write(self._engine) as conn:
+                database_now = read_landscape_transaction_time(conn)
                 released = conn.execute(
                     update(run_coordination_table)
                     .where(
@@ -611,7 +614,7 @@ class RunCoordinationRepository:
                         run_coordination_table.c.leader_worker_id == token.worker_id,
                         run_coordination_table.c.leader_epoch == token.leader_epoch,
                     )
-                    .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=now)
+                    .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=database_now)
                 )
                 if released.rowcount != 1:
                     return
@@ -622,7 +625,7 @@ class RunCoordinationRepository:
                         run_workers_table.c.worker_id == token.worker_id,
                         run_workers_table.c.status == "active",
                     )
-                    .values(status="departed", departed_at=now)
+                    .values(status="departed", departed_at=database_now)
                 )
                 if departed.rowcount != 1:
                     raise _ReleaseMembershipMiss
@@ -632,37 +635,42 @@ class RunCoordinationRepository:
                     event_type="leader_release",
                     worker_id=token.worker_id,
                     leader_epoch=token.leader_epoch,
-                    recorded_at=now,
+                    recorded_at=database_now,
                     context={"worker_row_departed": True},
                 )
         except _ReleaseMembershipMiss:
             return
 
-    def live_leader(self, *, run_id: str, now: datetime) -> LeaderInfo | None:
+    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
         """Read-only seat read (§B.3). Implemented now; WIRED into the entry guard in slice 4.
 
         Returns None when the run has no seat row or the seat is vacant;
-        otherwise the incumbent with ``seat_live`` evaluated at ``now``.
+        otherwise the incumbent with ``seat_live`` evaluated against the
+        Landscape database clock read on the same connection (ADR-047).
         Check-then-act at the caller is acceptable because the leadership CAS
         is the arbiter.
         """
         with self._engine.connect() as conn:
+            database_now = read_landscape_transaction_time(conn)
+            # Liveness is decided in SQL against the bound database time — the
+            # same comparison the takeover CAS makes — so the advisory verdict
+            # and the arbiter agree even on the fence's whole-second SQLite text.
             seat = conn.execute(
                 select(
                     run_coordination_table.c.leader_worker_id,
                     run_coordination_table.c.leader_epoch,
                     run_coordination_table.c.leader_heartbeat_expires_at,
+                    (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
                 ).where(run_coordination_table.c.run_id == run_id)
             ).one_or_none()
         if seat is None or seat.leader_worker_id is None:
             return None
-        expires = _utc(seat.leader_heartbeat_expires_at)
         return LeaderInfo(
             run_id=run_id,
             leader_worker_id=seat.leader_worker_id,
             leader_epoch=int(seat.leader_epoch),
-            leader_heartbeat_expires_at=expires,
-            seat_live=expires >= now,
+            leader_heartbeat_expires_at=_utc(seat.leader_heartbeat_expires_at),
+            seat_live=bool(seat.seat_live),
         )
 
     # ── eventing ─────────────────────────────────────────────────────────
@@ -717,7 +725,7 @@ class RunCoordinationRepository:
 
     # ── registry membership (slice-4/5 consumers) ────────────────────────
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> CoordinationSnapshot:
+    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
         """Worker-row liveness CAS + seat snapshot, one transaction (§A.3).
 
         SLICE-4 CONSUMER: the dedicated heartbeat thread. Semantics pinned by
@@ -729,6 +737,7 @@ class RunCoordinationRepository:
         never skew in the dangerous worker-fresher-than-seat direction.
         """
         with begin_write(self._engine) as conn:
+            database_now = read_landscape_transaction_time(conn)
             member = conn.execute(
                 select(run_workers_table.c.run_id, run_workers_table.c.role).where(run_workers_table.c.worker_id == worker_id)
             ).one_or_none()
@@ -743,7 +752,7 @@ class RunCoordinationRepository:
                     run_workers_table.c.worker_id == worker_id,
                     run_workers_table.c.status == "active",
                 )
-                .values(heartbeat_expires_at=now + timedelta(seconds=window_seconds))
+                .values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds))
             )
             worker_active = beat.rowcount == 1
             if worker_active and member.role == "leader":
@@ -753,13 +762,15 @@ class RunCoordinationRepository:
                         run_coordination_table.c.run_id == member.run_id,
                         run_coordination_table.c.leader_worker_id == worker_id,
                     )
-                    .values(leader_heartbeat_expires_at=now + timedelta(seconds=window_seconds), updated_at=now)
+                    .values(leader_heartbeat_expires_at=database_now + timedelta(seconds=window_seconds), updated_at=database_now)
                 )
+            # The seat's liveness is decided in SQL against the transaction's
+            # database time (ADR-047): NULL expiry or vacant seat reads dead.
             seat = conn.execute(
                 select(
                     run_coordination_table.c.leader_worker_id,
                     run_coordination_table.c.leader_epoch,
-                    run_coordination_table.c.leader_heartbeat_expires_at,
+                    (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
                 ).where(run_coordination_table.c.run_id == member.run_id)
             ).one_or_none()
         if seat is None:
@@ -769,8 +780,7 @@ class RunCoordinationRepository:
         else:
             leader_worker_id = seat.leader_worker_id
             leader_epoch = int(seat.leader_epoch)
-            expires = seat.leader_heartbeat_expires_at
-            seat_live = leader_worker_id is not None and expires is not None and _utc(expires) >= now
+            seat_live = leader_worker_id is not None and bool(seat.seat_live)
         return CoordinationSnapshot(
             leader_worker_id=leader_worker_id,
             leader_epoch=leader_epoch,
@@ -785,7 +795,6 @@ class RunCoordinationRepository:
         run_id: str,
         worker_id: str,
         config_hash: str,
-        now: datetime,
         window_seconds: float,
     ) -> None:
         """§B.1 step 2: atomic IMMEDIATE follower admission.
@@ -794,9 +803,12 @@ class RunCoordinationRepository:
         preflight BEFORE calling this). Refuses with
         :class:`JoinRefusedError` when the run is not RUNNING, the joiner's
         config hash disagrees, or the leader seat is not live (a follower
-        must never be the first process on an abandoned run).
+        must never be the first process on an abandoned run). Seat liveness
+        is judged against the Landscape database clock read inside this
+        transaction (ADR-047).
         """
         with begin_write(self._engine) as conn:
+            database_now = read_landscape_transaction_time(conn)
             run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one_or_none()
             if run is None:
                 raise JoinRefusedError(run_id, "run not found")
@@ -815,15 +827,10 @@ class RunCoordinationRepository:
             seat = conn.execute(
                 select(
                     run_coordination_table.c.leader_worker_id,
-                    run_coordination_table.c.leader_heartbeat_expires_at,
+                    (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
                 ).where(run_coordination_table.c.run_id == run_id)
             ).one_or_none()
-            seat_live = (
-                seat is not None
-                and seat.leader_worker_id is not None
-                and seat.leader_heartbeat_expires_at is not None
-                and _utc(seat.leader_heartbeat_expires_at) >= now
-            )
+            seat_live = seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live)
             if not seat_live:
                 raise JoinRefusedError(run_id, "no live leader — use `elspeth resume` to take the seat")
             self._insert_worker_row(
@@ -831,8 +838,7 @@ class RunCoordinationRepository:
                 run_id=run_id,
                 worker_id=worker_id,
                 role="follower",
-                now=now,
-                heartbeat_expires_at=now + timedelta(seconds=window_seconds),
+                window_seconds=window_seconds,
                 entry_point="join",
             )
             record_coordination_event(
@@ -841,11 +847,11 @@ class RunCoordinationRepository:
                 event_type="worker_register",
                 worker_id=worker_id,
                 leader_epoch=None,
-                recorded_at=now,
+                recorded_at=database_now,
                 context={"role": "follower", "entry_point": "join"},
             )
 
-    def depart_worker(self, *, worker_id: str, now: datetime) -> None:
+    def depart_worker(self, *, worker_id: str) -> None:
         """CAS ``active → departed`` + ``worker_depart`` event. Idempotent.
 
         SLICE-5 CONSUMER: follower clean exit (§B.1 step 5). No-op when the
@@ -853,6 +859,7 @@ class RunCoordinationRepository:
         departed it first).
         """
         with begin_write(self._engine) as conn:
+            database_now = read_landscape_transaction_time(conn)
             member = conn.execute(select(run_workers_table.c.run_id).where(run_workers_table.c.worker_id == worker_id)).one_or_none()
             if member is None:
                 return
@@ -862,7 +869,7 @@ class RunCoordinationRepository:
                     run_workers_table.c.worker_id == worker_id,
                     run_workers_table.c.status == "active",
                 )
-                .values(status="departed", departed_at=now)
+                .values(status="departed", departed_at=database_now)
             )
             if departed.rowcount == 1:
                 record_coordination_event(
@@ -871,7 +878,7 @@ class RunCoordinationRepository:
                     event_type="worker_depart",
                     worker_id=worker_id,
                     leader_epoch=None,
-                    recorded_at=now,
+                    recorded_at=database_now,
                     context={},
                 )
 
@@ -880,7 +887,6 @@ class RunCoordinationRepository:
         *,
         token: CoordinationToken,
         target_worker_id: str,
-        now: datetime,
         grace_seconds: float,
         window_seconds: float,
     ) -> bool:
@@ -892,7 +898,7 @@ class RunCoordinationRepository:
         (3) the belt-and-braces no-unexpired-leases precondition (registry
         eviction must never outrun a lease the item layer still considers
         possibly alive); (4) CAS eviction gated on ``heartbeat_expires_at <
-        now - grace``. Rowcount 0 anywhere ⇒ benign skip (the worker
+        database_now - grace`` (ADR-047). Rowcount 0 anywhere ⇒ benign skip (the worker
         heartbeated, is not an eligible follower, or still holds live leases).
         A fence miss raises
         :class:`RunLeadershipLostError` via :func:`fenced_leader_transaction`
@@ -903,6 +909,10 @@ class RunCoordinationRepository:
         from elspeth.core.landscape.schema import token_work_items_table
 
         with fenced_leader_transaction(self._engine, token=token, window_seconds=window_seconds, verb="evict_worker") as conn:
+            # Liveness and the grace threshold are judged against the
+            # Landscape database clock read inside the fenced transaction
+            # (ADR-047); the fence above is the only earlier statement.
+            database_now = read_landscape_transaction_time(conn)
             # Serialize with membership-fenced claim/heartbeat verbs
             # (elspeth-6903f82511): lock the target's registry row BEFORE the
             # no-unexpired-leases precondition read.  Fenced lease verbs take
@@ -935,7 +945,7 @@ class RunCoordinationRepository:
                     token_work_items_table.c.run_id == token.run_id,
                     token_work_items_table.c.status == TokenWorkStatus.LEASED.value,
                     token_work_items_table.c.lease_owner == target_worker_id,
-                    token_work_items_table.c.lease_expires_at >= now,
+                    token_work_items_table.c.lease_expires_at >= database_now,
                 )
                 .limit(1)
             ).one_or_none()
@@ -949,9 +959,9 @@ class RunCoordinationRepository:
                     run_workers_table.c.role == "follower",
                     run_workers_table.c.worker_id != token.worker_id,
                     run_workers_table.c.status == "active",
-                    run_workers_table.c.heartbeat_expires_at < now - timedelta(seconds=grace_seconds),
+                    run_workers_table.c.heartbeat_expires_at < database_now - timedelta(seconds=grace_seconds),
                 )
-                .values(status="evicted", evicted_at=now, evicted_by_worker_id=token.worker_id)
+                .values(status="evicted", evicted_at=database_now, evicted_by_worker_id=token.worker_id)
             )
             if evicted.rowcount != 1:
                 return False
@@ -961,7 +971,7 @@ class RunCoordinationRepository:
                 event_type="worker_evict",
                 worker_id=target_worker_id,
                 leader_epoch=token.leader_epoch,
-                recorded_at=now,
+                recorded_at=database_now,
                 context={"evicted_by_worker_id": token.worker_id, "reason": "liveness_expired"},
             )
             return True
@@ -975,18 +985,29 @@ class RunCoordinationRepository:
         run_id: str,
         worker_id: str,
         role: str,
-        now: datetime,
-        heartbeat_expires_at: datetime,
+        window_seconds: float,
         entry_point: str,
     ) -> None:
+        """Register an ACTIVE member whose first heartbeat deadline is database time + window.
+
+        Reads the Landscape database clock on ``conn`` itself (ADR-047): no
+        caller hands this helper a clock. Inside the caller's transaction the
+        read is the same instant as the caller's own on PostgreSQL
+        (``CURRENT_TIMESTAMP`` is transaction time), so a seat minted in that
+        transaction and this row carry identical deadlines; on SQLite the two
+        statement-time reads can straddle a second boundary, a one-second
+        offset that the leader's first beat (which stamps both rows from one
+        read) erases and that no liveness window (>= 10 s) can observe.
+        """
+        database_now = read_landscape_transaction_time(conn)
         conn.execute(
             insert(run_workers_table).values(
                 worker_id=worker_id,
                 run_id=run_id,
                 role=role,
                 status="active",
-                registered_at=now,
-                heartbeat_expires_at=heartbeat_expires_at,
+                registered_at=database_now,
+                heartbeat_expires_at=database_now + timedelta(seconds=window_seconds),
                 pid=os.getpid(),
                 hostname=socket.gethostname(),
                 entry_point=entry_point,
@@ -998,7 +1019,6 @@ class RunCoordinationRepository:
         *,
         run_id: str,
         leader_worker_id: str,
-        now: datetime,
         grace_seconds: float,
     ) -> tuple[str, ...]:
         """Return worker_ids of ACTIVE non-leader members whose heartbeat has expired.
@@ -1018,8 +1038,8 @@ class RunCoordinationRepository:
         The caller then calls ``evict_worker`` for each, which is idempotent
         (benign skip if the worker heartbeated or holds a live lease).
         """
-        grace_threshold = now - timedelta(seconds=grace_seconds)
         with self._engine.connect() as conn:
+            grace_threshold = read_landscape_transaction_time(conn) - timedelta(seconds=grace_seconds)
             rows = conn.execute(
                 select(run_workers_table.c.worker_id)
                 .where(

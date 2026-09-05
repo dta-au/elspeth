@@ -638,7 +638,6 @@ def test_ts05_and_aux07_strict_transform_recovery_rotates_identity_under_exact_e
         coordination,
         run_id=RUN_ID,
         worker_id="leader",
-        now=BASE,
         window_seconds=80,
     )
 
@@ -721,7 +720,7 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
     scheduler = TokenSchedulerRepository(engine)
     coordination = RunCoordinationRepository(engine)
     _seed_run_rows_tokens(engine, ("token-0",))
-    token = register_run_leader(coordination, run_id=RUN_ID, worker_id="leader", now=BASE, window_seconds=80)
+    token = register_run_leader(coordination, run_id=RUN_ID, worker_id="leader", window_seconds=80)
     _insert_worker(engine, worker_id="live-owner")
     original = _enqueue_tokens(scheduler, ("token-0",))["token-0"]
     claimed = scheduler.claim_ready(run_id=RUN_ID, lease_owner="live-owner", lease_seconds=30, now=BASE)

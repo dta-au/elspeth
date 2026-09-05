@@ -213,7 +213,6 @@ def test_public_resume_refuses_non_resumable_failed_effect_without_reopening_or_
     leader_token = crashed.factory.run_coordination.acquire_run_leadership(
         run_id=crashed.run_id,
         worker_id="worker:task10:non-resumable-resume",
-        now=clock.now_utc(),
         window_seconds=10**9,
     )
     with crashed.db.engine.begin() as conn:

@@ -125,7 +125,7 @@ def seat_token(db: LandscapeDB) -> CoordinationToken:
     _seed_row_and_token(db, row_id="row-a", token_id="tok_a", source_row_index=0)
     _seed_row_and_token(db, row_id="row-b", token_id="tok_b", source_row_index=1)
     _seed_row_and_token(db, row_id="row-impostor", token_id="tok_IMPOSTOR", source_row_index=2)
-    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=_NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 @pytest.fixture
@@ -234,7 +234,7 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
     expire_leader_seat(db, run_id)
     later = datetime.now(UTC)
     new_epoch_token = RunCoordinationRepository(db.engine).acquire_run_leadership(
-        run_id=run_id, worker_id=f"{WORKER}-takeover", now=later, window_seconds=80.0
+        run_id=run_id, worker_id=f"{WORKER}-takeover", window_seconds=80.0
     )
     assert new_epoch_token.leader_epoch != seat_token.leader_epoch
     marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=later, coordination_token=new_epoch_token)
