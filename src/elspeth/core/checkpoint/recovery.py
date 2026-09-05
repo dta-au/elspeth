@@ -328,7 +328,21 @@ def _group_member_is_settled_or_live(
     group_id: str,
     member_key: str,
 ) -> bool:
-    """The three-limb satisfiability check for one minted member (spec §8)."""
+    """The three-limb satisfiability check for one minted member (spec §8).
+
+    Lost: named in ``group_losses``. Live: a frame-bearing token with no
+    completed terminal. Arrived: a journal row for the member that was HELD
+    at this closer's barrier — the address columns name the barrier and
+    ``barrier_blocked_at`` proves the hold. The address alone is not
+    arrival: ``coalesce_name`` / ``row_union_name`` / ``collector_name`` /
+    ``barrier_key`` are the member's barrier BINDING address (schema, spec
+    §4.3), stamped on every in-region work item from the moment it is
+    created, so a member that died inside the region before reaching its
+    closer carries the same address as one the closer consumed. Only
+    ``mark_blocked`` writes ``barrier_blocked_at`` (Task 1.3); a released
+    or failed-group member keeps its stamp after the hold resolves, a
+    diverted or dropped member never gets one (elspeth-76e936568e).
+    """
     lost = conn.execute(
         select(group_losses_table.c.loss_id)
         .where(
@@ -376,6 +390,7 @@ def _group_member_is_settled_or_live(
             token_work_items_table.c.run_id == run_id,
             frames.c.group_id == group_id,
             frames.c.member_key == member_key,
+            token_work_items_table.c.barrier_blocked_at.is_not(None),
             or_(
                 token_work_items_table.c.coalesce_name == closer_name,
                 token_work_items_table.c.row_union_name == closer_name,
