@@ -91,20 +91,6 @@ entries:
   justification: Probes the platform C library for the optional Linux renameat2 capability
     at module initialization. Absence selects the explicit portable fallback; no arbitrary
     attribute name or masquerader-controlled object is used.
-- path: src/elspeth/contracts/blobs.py
-  qualname: BlobReplacementPlan.__post_init__
-  kind: getattr
-  occurrences: 2
-  probe_shapes:
-  - 4789cb72737725a656e126bc35ecf8f9afe0c91626a31b538b4e89f8cca524c7
-  - 4789cb72737725a656e126bc35ecf8f9afe0c91626a31b538b4e89f8cca524c7
-  classification: unadjudicated
-  justification: 'TRACKED, NOT CLEARED: production getattr(self, field_name) loops
-    at BlobReplacementPlan.__post_init__ (:733 and :748) are scheduled for unrolling
-    to direct attribute checks under P4-E7 elspeth-7aab1bec78 once lane C''s C1 (elspeth-f4a4a3d000)
-    blobs landing settles; the E7 commit that fixes the site deletes this entry (stale-baseline-entry
-    otherwise). Seeded 2026-09-05 by P4-E8 elspeth-9b14a7a804 so the ledger tracks
-    the live tree.'
 - path: src/elspeth/contracts/composer_llm_audit.py
   qualname: ComposerChatTurn.to_dict
   kind: getattr
