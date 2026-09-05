@@ -41,6 +41,8 @@ from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_BASELINE_SESSI
 from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_PACKAGE_VERSION as _ROLLBACK_PACKAGE_VERSION
 from elspeth.web._acceptance_common.schema_facts import _SCENARIO_B_STRUCTURAL_CHANGES as _SCENARIO_B_STRUCTURAL_CHANGES
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts as _expected_schema_facts
+from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_RUN_RECEIPT_KIND as TESTCONTAINER_RUN_RECEIPT_KIND
+from elspeth.web._acceptance_common.testcontainer_run import validate_testcontainer_run_receipt as validate_testcontainer_run_receipt
 
 _METRIC_NAME = "operator.acceptance.sentinel"
 
@@ -826,6 +828,10 @@ _RECEIPT_KINDS = frozenset(
         "verify-textract",
         "verify-bedrock-guardrails",
         "verify-operator-telemetry",
+        # 6b-4 option (b): the acceptance driver's testcontainer run, validated
+        # by the shared validator under the aws schema id; NEW in 0.8.0, so no
+        # receipt produced before it gains a field.
+        TESTCONTAINER_RUN_RECEIPT_KIND,
     }
 )
 
@@ -875,6 +881,19 @@ def _validate_stored_receipt(
             kind=kind,
             subject_sha256=subject_sha256,
             subject_id=subject_id,
+        )
+    if kind == TESTCONTAINER_RUN_RECEIPT_KIND:
+        # Subject is the junit report's sha256 (the terraform-plan shape). The
+        # validator returns the owned TestcontainerRunReceipt; this dispatcher's
+        # common return is the plain document every other kind yields.
+        return dict(
+            validate_testcontainer_run_receipt(
+                document,
+                provider="aws",
+                candidate_sha=candidate_sha,
+                scenario_id=scenario_id,
+                subject_sha256=subject_sha256,
+            )
         )
     if kind not in _RECEIPT_KINDS:
         raise AcceptanceCheckError("receipt_store_schema")

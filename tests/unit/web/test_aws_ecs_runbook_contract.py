@@ -632,6 +632,7 @@ def test_runbook_defines_every_packaged_lifecycle_wrapper_before_first_runtime_u
     text = _text()
     for helper in (
         "persist_sanitized_receipt",
+        "record_testcontainer_run",
         "require_signed_tf_plan_approval",
         "require_signed_tf_destroy_approval",
         "load_scenario",
@@ -649,6 +650,25 @@ def test_runbook_defines_every_packaged_lifecycle_wrapper_before_first_runtime_u
         "cleanup-evidence-finalize",
     ):
         assert command in text
+
+
+def test_runbook_records_the_testcontainer_run_before_deploy_and_binds_the_tests_stage() -> None:
+    """6b-4 option (b): the run is recorded with CI's exact selection, stored as a receipt, and bound to the ledger."""
+    from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_SELECTION
+
+    text = _text()
+    helper = text[text.index("record_testcontainer_run() {") : text.index("require_signed_tf_plan_approval() {")]
+    assert "uv run --frozen pytest " + " ".join(TESTCONTAINER_SELECTION) in helper
+    assert "python -m elspeth.web._acceptance_common.testcontainer_run" in helper
+    assert "--provider aws" in helper
+    assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" testcontainer-run' in helper
+    assert "gate-ledger record" in helper and "--check-id tests" in helper and '--receipt-hash "$receipt_hash"' in helper
+    assert 'return "$exit_status"' in helper
+    gate = text[text.index("### 3. Apply the schema compatibility gate") : text.index("### 4. Deploy exactly one candidate task")]
+    assert "\nrecord_testcontainer_run\n" in gate
+    for reason in ("testcontainer_run_missing", "testcontainer_run_failed", "testcontainer_run_ledger"):
+        assert reason in gate, reason
+    assert text.index("record_testcontainer_run() {") < text.index("\nrecord_testcontainer_run\n")
 
 
 def test_load_scenario_clears_every_closed_assignment_before_loading() -> None:

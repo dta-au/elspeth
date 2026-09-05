@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.web._acceptance_common.testcontainer_run import ReceiptIndexRow, testcontainer_run_gate
 
 from .contracts import (
     _EVIDENCE_KINDS,
@@ -384,6 +385,28 @@ def create_evidence_export_receipt(
     evidence_record_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
     if artifact_count < max(1, evidence_record_count):
         raise AcceptanceCheckError("evidence_export_binding")
+    # REQUIRED testcontainer run (6b-4 option (b)): the export refuses unless
+    # the store holds exactly one passing `testcontainer-run` receipt for this
+    # candidate (the shared gate names what is missing) AND the ledger's
+    # `tests` stage — the run-level slot — recorded that receipt's hash.
+    receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
+    verdict = testcontainer_run_gate(
+        cast(list[ReceiptIndexRow], cast(Mapping[str, object], manifest["evidence"])["receipts"]),
+        provider="aws",
+        candidate_sha=cast(str, manifest["candidate_sha"]),
+        read_receipt=lambda receipt_sha256: _read_protected_document(
+            receipt_directory / f"{receipt_sha256}.json", check="testcontainer_run_receipt"
+        ),
+    )
+    if not verdict.passed:
+        assert verdict.reason is not None
+        raise AcceptanceCheckError(verdict.reason)
+    tests_record = next(
+        (record for record in cast(list[Mapping[str, object]], ledger["records"]) if record["check_id"] == "tests"),
+        None,
+    )
+    if tests_record is None or tests_record["receipt_hash"] != verdict.receipt_sha256:
+        raise AcceptanceCheckError("testcontainer_run_ledger")
     receipt = {
         "schema": "elspeth.aws-ecs-evidence-export.v1",
         "acceptance_run_id": manifest["acceptance_run_id"],
