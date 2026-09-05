@@ -411,7 +411,10 @@ class CookieAttributes(TypedDict):
     path: str
     secure: bool
     httponly: bool
-    samesite: str
+    # The Literal Starlette's set_cookie takes, not str: "Lax" with a capital
+    # would type-check as str and be rejected at runtime — or worse, silently
+    # dropped by a browser — which is the drift this shape exists to refuse.
+    samesite: Literal["lax", "strict", "none"]
     max_age: int
 
 
@@ -1049,10 +1052,20 @@ class SsoClient:
     endpoints: DiscoveredEndpoints
     id_token_algorithms: tuple[str, ...]
     userinfo: bool
+    scopes: tuple[str, ...] = ("openid", "profile", "email")
 
     def __post_init__(self) -> None:
         if self.userinfo and self.endpoints.userinfo_endpoint is None:
             raise ValueError(f"the {self.provider!r} profile requires userinfo but the provider published no userinfo_endpoint")
+        if "openid" not in self.scopes:
+            # Without it the authorization server issues no ID token, and
+            # the whole walk is built on verifying one.
+            raise ValueError("SSO scopes must include 'openid'")
+
+    @property
+    def start_url(self) -> str:
+        """Where the SPA sends the browser to begin a login. Absolute, from public_base_url."""
+        return f"{self.public_base_url.rstrip('/')}/api/auth/sso/start"
 
 
 class AdmittedIdentity(Protocol):
@@ -1295,3 +1308,32 @@ def complete_login(
     token = issuer.mint(identity_id=identity.identity_id, username=identity.username)
     record_token_issued(identity, token, consumed.login_request_id)
     return IssuedSession(access_token=token)
+
+
+# ── what the routes are given ────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class SsoRuntime:
+    """Everything the three routes need, bound once at startup onto ``app.state.sso``.
+
+    The routes read THIS and nothing else off the app: one attribute, one
+    owned type, checked by ``isinstance`` (ADR-032). Absent or wrong-typed
+    means the deployment is not wired for SSO, and the routes refuse
+    closed — never an ``AttributeError`` half-way through a login.
+
+    The identity substrate arrives as callables for the reason
+    ``HandoffStore`` gives: ``web.auth`` does not import ``web.sessions``.
+    ``claim_checks`` is the profile's check with the settings already bound,
+    so this module never reads ``WebSettings``.
+    """
+
+    client: SsoClient
+    validator: JWKSTokenValidator
+    claim_checks: Callable[[Mapping[str, Any]], None]
+    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims]
+    handoffs: HandoffStore
+    upsert_identity: Callable[[IdentityClaims], AdmittedIdentity]
+    read_identity: Callable[[str], AdmittedIdentity | None]
+    issuer: SessionTokenIssuer
+    transport: httpx.AsyncBaseTransport | None = None
