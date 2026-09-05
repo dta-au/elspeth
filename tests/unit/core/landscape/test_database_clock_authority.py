@@ -55,7 +55,6 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
         "live_leader",
         "peer_active_leases",
         "recover_expired_leases",
-        "register_run_leader",
         "register_run_leader_on",
         "release_seat",
         "takeover_expired",
@@ -123,7 +122,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/engine/orchestrator/",
 )
-_CLOCK_BOUNDARY_DIGEST = "4cdc01d9e9cc524f9723c137131fbacfbc502a25546d10baaa3976ca581b687d"
+_CLOCK_BOUNDARY_DIGEST = "6e256864b43ab502abee6032acd80b880f1acfff40af3ff98db89eca96000497"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -214,7 +213,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.dead_non_leader_workers"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.evict_worker"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.release_seat"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
@@ -5455,6 +5453,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         token_work_items_table,
     )
     from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+    from tests.helpers.run_coordination import register_run_leader
 
     sessions_database_now = datetime(2040, 1, 1, tzinfo=UTC)
 
@@ -5526,7 +5525,8 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             )
 
         token = call_with_legacy_now(
-            factory.run_coordination.register_run_leader,
+            register_run_leader,
+            factory.run_coordination,
             run_id=run_id,
             worker_id=leader_worker_id,
             window_seconds=80.0,

@@ -51,13 +51,14 @@ from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
-from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
+from elspeth.web.sessions.models import guided_operations_table
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationTakenOver
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedRespondRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -2365,23 +2366,7 @@ def test_route_takeover_uses_live_fence_and_stale_worker_joins_winner(
         async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
             stale = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
             await asyncio.wait_for(first_at_settle.wait(), timeout=3)
-            with engine.begin() as connection:
-                connection.execute(
-                    text(
-                        "UPDATE guided_operations SET lease_expires_at = :expired "
-                        "WHERE session_id = :session_id AND operation_id = :operation_id"
-                    ),
-                    {
-                        "expired": datetime.now(UTC) - timedelta(seconds=1),
-                        "session_id": session_id,
-                        "operation_id": body["operation_id"],
-                    },
-                )
-                connection.execute(
-                    session_operation_fences_table.update()
-                    .where(session_operation_fences_table.c.session_id == session_id)
-                    .values(released_at=datetime.now(UTC))
-                )
+            abandon_guided_worker_leases(engine, session_id=session_id, operation_id=body["operation_id"])
             winner = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/respond", json=body))
             await asyncio.wait_for(takeover_reserved.wait(), timeout=3)
             allow_stale_settle.set()

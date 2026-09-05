@@ -56,6 +56,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
+from tests.helpers.run_coordination import register_run_leader
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -189,7 +190,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         _seed_run(engine)
 
         leader_id = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
 
         seat_before = _seat_row(engine)
         worker_before = _worker_row(engine, leader_id)
@@ -233,7 +234,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         _seed_run(engine, status="running")
 
         leader_id = mint_worker_id(RUN_ID)
-        repo.register_run_leader(run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
 
         follower_id = mint_worker_id(RUN_ID)
         # Seed follower via raw INSERT (no admit_follower — that needs a live seat).
@@ -352,7 +353,7 @@ class TestHeartbeatDegradedEvent:
         repo = RunCoordinationRepository(engine)
         _seed_run(engine)
         leader_id = mint_worker_id(RUN_ID)
-        token = repo.register_run_leader(run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, now=NOW, window_seconds=WINDOW)
 
         # Replace the repo's worker_heartbeat with a stubbed busy side-effect
         # while letting record_heartbeat_degraded write to the real DB.

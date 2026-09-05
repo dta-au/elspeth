@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import event, func, select, text
+from sqlalchemy import event, func, select
 from sqlalchemy.engine.interfaces import ExecutionContext
 from sqlalchemy.sql.dml import Delete, Insert, Update
 from sqlalchemy.sql.expression import FromClause
@@ -32,7 +32,6 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     proposal_events_table,
-    session_operation_fences_table,
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -54,6 +53,7 @@ from elspeth.web.sessions.routes.guided_operations import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.integration.web.composer.guided.test_respond import _assert_compose_context_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
@@ -1914,27 +1914,7 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
         ) as client:
             stale = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.first_started.wait(), timeout=3)
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "UPDATE guided_operations SET lease_expires_at = :expired "
-                        "WHERE session_id = :session_id AND operation_id = :operation_id"
-                    ),
-                    {
-                        "expired": datetime.now(UTC) - timedelta(seconds=1),
-                        "session_id": session["id"],
-                        "operation_id": operation_id,
-                    },
-                )
-                # A takeover owns both authorities. Expiring only the guided
-                # row while the original COMPOSE fence remains live must fail;
-                # release that exact session-operation generation too so the
-                # test models an actually abandoned worker.
-                conn.execute(
-                    session_operation_fences_table.update()
-                    .where(session_operation_fences_table.c.session_id == session["id"])
-                    .values(released_at=datetime.now(UTC))
-                )
+            abandon_guided_worker_leases(engine, session_id=session["id"], operation_id=operation_id)
             winner = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.takeover_started.wait(), timeout=3)
             winner_response = await asyncio.wait_for(winner, timeout=3)

@@ -9,11 +9,16 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import Engine, insert, update
+from sqlalchemy import Engine, update
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
+from elspeth.web.coordination.membership_authority import (
+    RepositoryWebInstanceMembershipAuthority,
+    WebInstanceIdentity,
+    current_compatibility_key,
+)
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, session_operation_fences_table, web_instances_table
+from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
 from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -49,24 +54,18 @@ def deployment(
 
 
 def _register_live_instance(engine: Engine, instance_id: str) -> None:
-    with engine.begin() as conn:
-        now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
-        conn.execute(
-            insert(web_instances_table).values(
-                instance_id=instance_id,
-                deployment_target="testcontainer",
-                deployment_generation="global-run-recovery",
-                session_epoch=SESSION_SCHEMA_EPOCH,
-                landscape_epoch=29,
-                coordination_protocol=1,
-                image_digest="sha256:global-run-recovery",
-                revision_label="global-run-recovery",
-                state="active",
-                started_at=now,
-                last_heartbeat_at=now,
-                lease_expires_at=now + timedelta(minutes=5),
-            )
-        )
+    """Seed membership through the production writer, exactly as a booting replica does."""
+    RepositoryWebInstanceMembershipAuthority(engine).register(
+        WebInstanceIdentity(
+            instance_id=instance_id,
+            deployment_target="testcontainer",
+            deployment_generation="global-run-recovery",
+            compatibility_key=current_compatibility_key(),
+            image_digest="sha256:global-run-recovery",
+            revision_label="global-run-recovery",
+        ),
+        lease_seconds=300,
+    )
 
 
 def _expire_fence(engine: Engine, session_id: UUID) -> None:

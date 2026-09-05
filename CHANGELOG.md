@@ -94,12 +94,20 @@ carries a still-pending proposal across the checkpoint it writes can move the
 proposal's anchor there and record the move, instead of leaving it anchored to
 a superseded checkpoint — which made the session unreadable through the guided
 route and killed the wire-review "edit this component" affordance
-(elspeth-ed67eb9d0d). Epoch 51 adds the multi-replica coordination substrate: a
-persistent session-operation authority, compatible-generation membership and
-run-start coordination, cross-replica ticket, progress and rate state, bounded
-cleanup claims, monotonic user-secret row versions, and durable proposal
-blob-effect receipts. Epoch 50 cannot represent those authorities or receipts
-and is rejected outright; no migration exists. That substrate carried the
+(elspeth-ed67eb9d0d). Epoch 51 adds the multi-replica coordination substrate's
+schema. Three parts of it are written in production: the persistent
+session-operation authority (fenced, database-clock leases), monotonic
+user-secret row versions, and durable proposal blob-effect receipts. The
+`web_instances` membership table gained its writer in 0.8.0
+(elspeth-66a19780b1): every PostgreSQL-backed replica registers itself at
+boot, renews its lease from the database clock, records `draining` as the
+first act of shutdown and `stopped` after its executor drains — the fact a
+peer's fence takeover and orphan-run recovery read before acting on a dead
+owner. The remaining epoch-51 tables — run-start permits, cross-replica
+websocket tickets, rate-limit state and bounded cleanup claims — are schema
+only: no production writer exists yet (follow-ups on elspeth-6f8c1714d5).
+Epoch 50 cannot represent those authorities or receipts and is rejected
+outright; no migration exists. That substrate carried the
 number 44 and then 48 on its original lane and shipped under neither — both of
 those integers already name different schemas on this release line, and the
 epoch sentinel is enforced by exact equality, so one integer must name exactly

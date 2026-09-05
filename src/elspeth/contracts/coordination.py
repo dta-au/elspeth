@@ -75,7 +75,7 @@ def mint_worker_id(run_id: str) -> str:
 class CoordinationToken:
     """Leader fencing token: ``(run_id, worker_id, leader_epoch)``.
 
-    Minted by ``register_run_leader`` (epoch 1, in ``begin_run``'s
+    Minted by ``register_run_leader_on`` (epoch 1, in ``begin_run``'s
     transaction) or ``acquire_run_leadership`` (takeover CAS, epoch+1).
     Threaded by value into every leader-fenced verb; the verify-and-extend
     fence (``verify_and_extend_leader_fence``) CAS-matches all three fields
