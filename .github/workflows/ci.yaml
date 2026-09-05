@@ -118,6 +118,14 @@ jobs:
 
       - name: Reject touched or broadened permanent multi-rule per-file blankets
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # This job runs inside a container, where GitHub's shell auto-detection
+        # falls back to `sh -e` (dash). dash rejects `set -o pipefail` and has
+        # no `[[`, so without an explicit bash this step died at its first
+        # line ("set: Illegal option -o pipefail", exit 2) on every push run
+        # and the ratchet resolver below never executed (run 33944365102,
+        # elspeth-d8749aeaa3). enforce-allowlist-judge-gates.yaml documents
+        # the same fallback in its header and declares bash for that reason.
+        shell: bash
         env:
           CURRENT_RUN_ID: ${{ github.run_id }}
           GH_TOKEN: ${{ github.event_name != 'pull_request' && github.token || '' }}
