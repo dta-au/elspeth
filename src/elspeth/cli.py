@@ -163,6 +163,18 @@ def _run_doctor_command(
     from elspeth.web.deployment_contract import ContractCheck
     from elspeth.web.doctor import sanitize_error
 
+    if json_output:
+        # In --json mode stdout IS the report (parsed by the ECS/ACA acceptance
+        # drivers and the PostgreSQL doctor proofs). configure_logging() targets
+        # stdout for container capture, and settings load below can emit a
+        # WARNING (WebSettings' composer_turn_budget_underfunded disclosure,
+        # elspeth-f159d2394b), so the log channel moves to stderr FIRST. The
+        # disclosure stays a log line by design — it is not a ContractCheck
+        # (a binary check cannot carry a disclosure honestly; elspeth-4b27604bb7).
+        from elspeth.core.logging import route_elspeth_logs_to_stderr
+
+        route_elspeth_logs_to_stderr()
+
     try:
         settings = settings_from_env()
     except Exception as exc:
