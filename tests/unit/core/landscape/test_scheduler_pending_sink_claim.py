@@ -23,6 +23,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-pending-sink-admission"
 NOW = datetime(2026, 7, 16, 9, 0, tzinfo=UTC)
@@ -114,7 +115,7 @@ def test_claim_pending_sink_rejects_incomplete_bundle_without_mutation(
     before = _durable_image(engine, work_item_id)
 
     with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30, now=NOW + timedelta(seconds=3))
+        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
 
     assert _durable_image(engine, work_item_id) == before
 
@@ -169,17 +170,18 @@ def test_claim_pending_sink_accepts_complete_legal_bundle(
     with engine.begin() as conn:
         conn.execute(update(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id).values(**bundle_values))
 
+    before = landscape_database_now(engine)
     claimed = repo.claim_pending_sink(
         run_id=RUN_ID,
         lease_owner="redrive-worker",
         lease_seconds=30,
-        now=NOW + timedelta(seconds=3),
     )
+    after = landscape_database_now(engine)
 
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
     assert claimed.lease_owner == "redrive-worker"
-    assert claimed.lease_expires_at == NOW + timedelta(seconds=33)
+    assert_stamped_between(claimed.lease_expires_at, start=before, end=after, offset=timedelta(seconds=30))
     assert claimed.work_item_id == work_item_id
     assert claimed.attempt == 1
     assert claimed.row_payload_json == payload
@@ -207,7 +209,7 @@ def test_claim_pending_sink_update_rechecks_bundle_atomically(
 
     try:
         with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-            repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30, now=NOW + timedelta(seconds=3))
+            repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redrive-worker", lease_seconds=30)
     finally:
         event.remove(engine, "before_cursor_execute", invalidate_bundle_between_select_and_update)
 
@@ -278,7 +280,7 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         available_at=NOW,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30, now=NOW + timedelta(seconds=1))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30)
     assert claimed is not None
     repo.mark_pending_sink(
         work_item_id=item.work_item_id,

@@ -30,7 +30,7 @@ elspeth-addd3dc41f):
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -52,6 +52,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-pragma"
 SCHEDULER_TABLES = ("token_work_items", "scheduler_events")
@@ -198,7 +199,7 @@ class TestSchedulerConnectionPragmaDiscipline:
         database layer — bypassing the repository's reference validation to
         prove the constraint itself is live on a scheduler-bearing connection.
         """
-        now = datetime.now(UTC)
+        now = landscape_database_now(landscape_db.engine)
         _insert_run_node_row_token(landscape_db, now=now)
         with pytest.raises(IntegrityError), landscape_db.engine.begin() as conn:
             conn.execute(
@@ -238,11 +239,9 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
         *,
         events: SchedulerEventStore,
         rival: TokenSchedulerRepository,
-        now: datetime,
     ) -> None:
         super().__init__(engine, events=events)  # type: ignore[arg-type]  # branded engine forwarded verbatim
         self._rival = rival
-        self._now = now
         self.rival_outcome: TokenWorkItem | OperationalError | None = None
 
     def claim_ready_row(
@@ -253,7 +252,6 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         membership_fenced: bool = False,
         strict_membership_fenced: bool = False,
     ) -> RowMapping | None:
@@ -262,7 +260,6 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
                 run_id=run_id,
                 lease_owner="owner-rival",
                 lease_seconds=300,
-                now=self._now,
             )
         except OperationalError as exc:
             self.rival_outcome = exc
@@ -272,7 +269,6 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
             run_id=run_id,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             membership_fenced=membership_fenced,
             strict_membership_fenced=strict_membership_fenced,
         )
@@ -286,9 +282,9 @@ class _RivalInterposingRepository(TokenSchedulerRepository):
     re-wired too because it composes the same lease CAS.
     """
 
-    def __init__(self, engine: object, rival: TokenSchedulerRepository, *, now: datetime) -> None:
+    def __init__(self, engine: object, rival: TokenSchedulerRepository) -> None:
         super().__init__(engine)  # type: ignore[arg-type]  # branded engine forwarded verbatim
-        self.leases = _RivalInterposingLeases(engine, events=self.events, rival=rival, now=now)  # type: ignore[arg-type]
+        self.leases = _RivalInterposingLeases(engine, events=self.events, rival=rival)  # type: ignore[arg-type]
         self.queue = SchedulerQueueRepository(engine, events=self.events, leases=self.leases)  # type: ignore[arg-type]
 
     @property
@@ -312,8 +308,8 @@ class TestClaimReadyUnderSecondWriterConnection:
         the lease, B's claim returns ``None`` and exactly one CLAIM_READY
         event exists in the durable journal.
         """
-        now = datetime.now(UTC)
         db_a = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        now = landscape_database_now(db_a.engine)
         try:
             _insert_run_node_row_token(db_a, now=now)
             repo_a = TokenSchedulerRepository(db_a.engine)
@@ -323,11 +319,11 @@ class TestClaimReadyUnderSecondWriterConnection:
             try:
                 repo_b = TokenSchedulerRepository(db_b.engine)
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300, now=now)
+                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
 
-                claimed_b = repo_b.claim_ready(run_id=RUN_ID, lease_owner="owner-b", lease_seconds=300, now=now)
+                claimed_b = repo_b.claim_ready(run_id=RUN_ID, lease_owner="owner-b", lease_seconds=300)
                 assert claimed_b is None
 
                 with db_a.engine.connect() as conn:
@@ -357,14 +353,14 @@ class TestClaimReadyUnderSecondWriterConnection:
         work item is never executed twice and never wedged.  (The CAS WHERE
         still re-verifies ``status == READY`` as belt-and-braces.)
         """
-        now = datetime.now(UTC)
         db_a = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+        now = landscape_database_now(db_a.engine)
         try:
             _insert_run_node_row_token(db_a, now=now)
             db_b = self._open_second_db(tmp_path / "audit.db")
             try:
                 rival = TokenSchedulerRepository(db_b.engine)
-                repo_a = _RivalInterposingRepository(db_a.engine, rival, now=now)
+                repo_a = _RivalInterposingRepository(db_a.engine, rival)
                 _enqueue_one_ready(repo_a, now=now)
 
                 # Shrink the rival's busy_timeout so its lock exclusion fails
@@ -377,7 +373,7 @@ class TestClaimReadyUnderSecondWriterConnection:
                 finally:
                     raw.close()
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300, now=now)
+                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
 
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
@@ -386,7 +382,7 @@ class TestClaimReadyUnderSecondWriterConnection:
 
                 # Serialized retry after the commit: refused via the READY
                 # filter — clean None, single owner.
-                assert rival.claim_ready(run_id=RUN_ID, lease_owner="owner-rival", lease_seconds=300, now=now) is None
+                assert rival.claim_ready(run_id=RUN_ID, lease_owner="owner-rival", lease_seconds=300) is None
 
                 with db_a.engine.connect() as conn:
                     item = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == RUN_ID)).mappings().one()

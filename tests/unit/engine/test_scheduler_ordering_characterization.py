@@ -18,9 +18,9 @@ level, against a real Tier-1 SQLite engine:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, insert, select
+from sqlalchemy import create_engine, insert, select, text
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
@@ -38,6 +38,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import expire_lease, landscape_database_now
 
 RUN_ID = "run-order"
 LEADER_WORKER_ID = "test-leader"
@@ -140,7 +141,7 @@ def _claim_tokens_in_order(repo: TokenSchedulerRepository, *, lease_owner: str, 
     """Claim every READY item without terminalizing; return token_ids in claim order."""
     claimed: list[str] = []
     while True:
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=300, now=now)
+        item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=300)
         if item is None:
             return claimed
         claimed.append(item.token_id)
@@ -153,7 +154,11 @@ def _events(engine: Tier1Engine) -> list[dict[str, object]]:
             for row in conn.execute(
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == RUN_ID)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                # Recording order (SQLite rowid; this module runs on the
+                # in-memory Tier-1 engine). The production readers' key
+                # (recorded_at, event_id) ties inside one database second now
+                # that the lease verbs stamp whole-second database time.
+                .order_by(text("rowid"))
             ).mappings()
         ]
 
@@ -162,7 +167,7 @@ def test_claim_ready_order_is_global_ingest_sequence_not_enqueue_order() -> None
     """claim_ready admits work in global ingest_sequence order across sources, regardless of enqueue order."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     payload = _row_payload_json()
     _insert_run_and_nodes(engine, now=now)
 
@@ -212,7 +217,7 @@ def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_i
     deterministic work_item_id last-resort tiebreaker (filigree elspeth-6cb89db535)."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     payload = _row_payload_json()
     _insert_run_and_nodes(engine, now=now)
 
@@ -231,11 +236,14 @@ def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_i
     # token-w: later step_index, earliest created_at — must claim LAST.
     # token-x: step 1 but later created_at — claims after the step-1/t0 pair.
     # token-y / token-z: exact (step_index, created_at) collision — tiebreak on work_item_id.
+    # Every available_at sits in the database's past so the claim CAS admits
+    # all four at once and only the ORDER is under test (ADR-047).
+    t0 = now - timedelta(seconds=10)
     for token_id, step_index, available_at in (
-        ("token-w", 2, now),
-        ("token-x", 1, now + timedelta(seconds=5)),
-        ("token-y", 1, now),
-        ("token-z", 1, now),
+        ("token-w", 2, t0),
+        ("token-x", 1, t0 + timedelta(seconds=5)),
+        ("token-y", 1, t0),
+        ("token-z", 1, t0),
     ):
         items[token_id] = repo.enqueue_ready(
             run_id=RUN_ID,
@@ -260,7 +268,7 @@ def test_live_lease_is_not_reclaimable_and_expired_lease_recovers_exactly_once()
     attempt bump and work_item_id rotation, then is claimable exactly once."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     payload = _row_payload_json()
     _insert_run_and_nodes(engine, now=now)
     _insert_row_with_tokens(
@@ -283,29 +291,29 @@ def test_live_lease_is_not_reclaimable_and_expired_lease_recovers_exactly_once()
         row_payload_json=payload,
     )
 
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30, now=now)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
     assert claimed.attempt == 1
 
     # Live lease: not claimable by a peer, not recoverable by anyone.
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30, now=now + timedelta(seconds=1)) is None
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=now + timedelta(seconds=10), caller_owner="worker-b") == 0
+    assert repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30) is None
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-b") == 0
 
     # Expired lease: the holder's own recovery sweep must NOT reap it (self-steal guard).
-    expired_at = now + timedelta(seconds=31)
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=expired_at, caller_owner="worker-a") == 0
+    expire_lease(engine, claimed.work_item_id)
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-a") == 0
 
     # A peer recovers it exactly once.
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=expired_at, caller_owner="worker-b") == 1
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=expired_at, caller_owner="worker-b") == 0
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-b") == 1
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-b") == 0
 
-    reclaimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30, now=expired_at)
+    reclaimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30)
     assert reclaimed is not None
     assert reclaimed.token_id == "token-1"
     assert reclaimed.attempt == 2
     assert reclaimed.work_item_id != original.work_item_id
     # Exactly one recovered continuation exists.
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30, now=expired_at) is None
+    assert repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30) is None
 
     recovery_events = [event for event in _events(engine) if event["event_type"] == SchedulerEventType.RECOVER_EXPIRED_LEASE.value]
     assert len(recovery_events) == 1
@@ -322,7 +330,7 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
     MARK_PENDING_SINK and token-1's MARK_PENDING_SINK_TERMINAL."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     payload = _row_payload_json()
     _insert_run_and_nodes(engine, now=now)
     for row_id, ingest_sequence, token_id in (("row-0", 0, "token-1"), ("row-1", 1, "token-2")):
@@ -346,7 +354,7 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
             row_payload_json=payload,
         )
 
-    first = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300, now=now + timedelta(seconds=1))
+    first = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300)
     assert first is not None
     assert first.token_id == "token-1"
     repo.mark_pending_sink(
@@ -362,7 +370,7 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
     )
 
     # token-1 is parked non-terminal; token-2 is still claimable past it.
-    second = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300, now=now + timedelta(seconds=3))
+    second = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300)
     assert second is not None
     assert second.token_id == "token-2"
 
@@ -375,7 +383,7 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
     repo.mark_terminal(work_item_id=second.work_item_id, now=now + timedelta(seconds=4), expected_lease_owner="worker-a")
 
     # The parked token drains afterward.
-    drained = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300, now=now + timedelta(seconds=5))
+    drained = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300)
     assert drained is not None
     assert drained.token_id == "token-1"
     assert drained.work_item_id == first.work_item_id

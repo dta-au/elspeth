@@ -40,7 +40,7 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     token_work_items_table,
 )
-from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.tree_gate import iter_gate_sources
 
@@ -121,7 +121,7 @@ def _enqueue(harness: _Harness, name: str, sequence: int) -> tuple[str, str, str
 
 def _claim(harness: _Harness, name: str = "parent", *, owner: str = LEADER) -> tuple[str, str, str]:
     row_id, token_id, work_item_id = _enqueue(harness, name, 0)
-    claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60, now=NOW)
+    claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60)
     assert claimed is not None and claimed.work_item_id == work_item_id
     return row_id, token_id, work_item_id
 
@@ -317,7 +317,7 @@ def test_f06_inactive_registered_worker_cannot_claim(
 ) -> None:
     _row_id, _token_id, work_item_id = _enqueue(harness, "claim", 0)
     if subtype == "pending_sink":
-        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60, now=NOW)
+        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60)
         assert claimed is not None
         harness.repo.mark_pending_sink(
             work_item_id=work_item_id,
@@ -348,7 +348,7 @@ def test_f06_inactive_registered_worker_cannot_claim(
 
     claim = harness.repo.claim_ready if subtype == "ready" else harness.repo.claim_pending_sink
     with pytest.raises(RunWorkerEvictedError) as raised:
-        claim(run_id=RUN_ID, lease_owner=inactive, lease_seconds=60, now=NOW + timedelta(seconds=1))
+        claim(run_id=RUN_ID, lease_owner=inactive, lease_seconds=60)
 
     assert raised.value.worker_id == inactive
     assert raised.value.run_id == RUN_ID
@@ -359,7 +359,7 @@ def test_f06_inactive_registered_worker_cannot_claim(
 def test_f06_absent_worker_claim_is_a_zero_mutation_none(subtype: str, harness: _Harness) -> None:
     _row_id, _token_id, work_item_id = _enqueue(harness, "claim", 0)
     if subtype == "pending_sink":
-        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60, now=NOW)
+        claimed = harness.repo.claim_ready(run_id=RUN_ID, lease_owner=LEADER, lease_seconds=60)
         assert claimed is not None
         harness.repo.mark_pending_sink(
             work_item_id=work_item_id,
@@ -375,7 +375,7 @@ def test_f06_absent_worker_claim_is_a_zero_mutation_none(subtype: str, harness: 
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
 
     claim = harness.repo.claim_ready if subtype == "ready" else harness.repo.claim_pending_sink
-    assert claim(run_id=RUN_ID, lease_owner="unregistered", lease_seconds=60, now=NOW + timedelta(seconds=1)) is None
+    assert claim(run_id=RUN_ID, lease_owner="unregistered", lease_seconds=60) is None
 
     assert capture_state_engine_image(harness.db, run_id=RUN_ID) == before
 
@@ -389,7 +389,7 @@ def _register_peer(harness: _Harness, peer: str, *, status: str = "active") -> N
                 role="follower",
                 status=status,
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(minutes=10),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(minutes=10),
                 departed_at=NOW if status == "departed" else None,
             )
         )
@@ -421,22 +421,28 @@ def _assert_only_leader_heartbeat_delta(before: StateEngineImage, after: StateEn
 
 
 @pytest.mark.parametrize(
-    ("owner", "worker_status", "recover_at"),
+    ("owner", "worker_status", "expired_seconds_ago"),
     (
-        pytest.param(LEADER, None, NOW + timedelta(seconds=61), id="F-07-own-expired-lease"),
-        pytest.param("live-peer", "active", NOW + timedelta(seconds=31), id="F-07-live-peer-fresh-expiry"),
-        pytest.param("dead-peer", "departed", NOW + timedelta(seconds=20), id="F-07-not-yet-expired"),
+        pytest.param(LEADER, None, 61, id="F-07-own-expired-lease"),
+        pytest.param("live-peer", "active", 1, id="F-07-live-peer-fresh-expiry"),
+        pytest.param("dead-peer", "departed", None, id="F-07-not-yet-expired"),
     ),
 )
 def test_f07_ineligible_lease_is_not_recovered(
     harness: _Harness,
     owner: str,
     worker_status: str | None,
-    recover_at: datetime,
+    expired_seconds_ago: int | None,
 ) -> None:
+    """Three leases the sweep must leave LEASED: the caller's own expired lease,
+    a registry-live peer's lease expired inside the stall budget, and a dead
+    peer's lease that has not expired. Expiry is aged through the database
+    (ADR-047); ``None`` leaves the 60 s lease live."""
     if worker_status is not None:
         _register_peer(harness, owner)
     _row_id, _token_id, work_item_id = _claim(harness, owner=owner)
+    if expired_seconds_ago is not None:
+        expire_lease(harness.db.engine, work_item_id, seconds_ago=expired_seconds_ago)
     if worker_status == "departed":
         with harness.db.engine.begin() as conn:
             conn.execute(
@@ -449,7 +455,6 @@ def test_f07_ineligible_lease_is_not_recovered(
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
 
     recovered = harness.repo.recover_expired_leases(
-        now=recover_at,
         coordination_token=harness.coordination_token,
     )
 

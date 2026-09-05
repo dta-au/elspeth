@@ -36,6 +36,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -48,6 +49,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 RUN_ID = "run-fence-order"
 NOW = datetime(2026, 7, 16, 10, 0, 0, tzinfo=UTC)
@@ -65,8 +67,10 @@ def _make_engine() -> Tier1Engine:
     return Tier1Engine(engine)
 
 
-def _seed(engine: Tier1Engine, *, worker_heartbeat_expires_at: datetime) -> CoordinationToken:
+def _seed(engine: Tier1Engine, *, worker_heartbeat_offset: timedelta) -> CoordinationToken:
+    """Seed run, nodes, leader seat and two workers; liveness deadlines are database time + offset."""
     with engine.begin() as conn:
+        database_now = read_landscape_transaction_time(conn)
         conn.execute(
             insert(runs_table).values(
                 run_id=RUN_ID,
@@ -98,7 +102,7 @@ def _seed(engine: Tier1Engine, *, worker_heartbeat_expires_at: datetime) -> Coor
                 run_id=RUN_ID,
                 leader_worker_id=LEADER_ID,
                 leader_epoch=1,
-                leader_heartbeat_expires_at=NOW + timedelta(seconds=WINDOW),
+                leader_heartbeat_expires_at=database_now + timedelta(seconds=WINDOW),
                 updated_at=NOW,
             )
         )
@@ -109,7 +113,7 @@ def _seed(engine: Tier1Engine, *, worker_heartbeat_expires_at: datetime) -> Coor
                 role="leader",
                 status="active",
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(seconds=WINDOW),
+                heartbeat_expires_at=database_now + timedelta(seconds=WINDOW),
             )
         )
         conn.execute(
@@ -119,7 +123,7 @@ def _seed(engine: Tier1Engine, *, worker_heartbeat_expires_at: datetime) -> Coor
                 role="follower",
                 status="active",
                 registered_at=NOW,
-                heartbeat_expires_at=worker_heartbeat_expires_at,
+                heartbeat_expires_at=database_now + worker_heartbeat_offset,
             )
         )
     return CoordinationToken(run_id=RUN_ID, worker_id=LEADER_ID, leader_epoch=1)
@@ -194,41 +198,41 @@ class TestMembershipFenceLockOrder:
 
     def test_claim_ready_locks_membership_row_before_cas(self) -> None:
         engine = _make_engine()
-        _seed(engine, worker_heartbeat_expires_at=NOW + timedelta(seconds=WINDOW))
+        _seed(engine, worker_heartbeat_offset=timedelta(seconds=WINDOW))
         _enqueue_ready_item(engine)
         repo = TokenSchedulerRepository(engine)
 
         with _recorded_statements(engine) as statements:
-            item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300, now=NOW)
+            item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
         assert item is not None
         _assert_membership_lock_before_cas(statements, verb="claim_ready")
 
     def test_heartbeat_lease_locks_membership_row_before_cas(self) -> None:
         engine = _make_engine()
-        _seed(engine, worker_heartbeat_expires_at=NOW + timedelta(seconds=WINDOW))
+        _seed(engine, worker_heartbeat_offset=timedelta(seconds=WINDOW))
         _enqueue_ready_item(engine)
         repo = TokenSchedulerRepository(engine)
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300, now=NOW)
+        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
         assert item is not None
 
+        before = landscape_database_now(engine)
         with _recorded_statements(engine) as statements:
             renewed = repo.heartbeat_lease(
                 run_id=RUN_ID,
                 work_item_id=item.work_item_id,
                 lease_owner=WORKER_ID,
                 lease_seconds=300,
-                now=NOW + timedelta(seconds=5),
                 membership_fenced=True,
             )
-        assert renewed == NOW + timedelta(seconds=305)
+        assert_stamped_between(renewed, start=before, end=landscape_database_now(engine), offset=timedelta(seconds=300))
         _assert_membership_lock_before_cas(statements, verb="heartbeat_lease")
 
     def test_claim_pending_sink_locks_membership_row_before_cas(self) -> None:
         engine = _make_engine()
-        _seed(engine, worker_heartbeat_expires_at=NOW + timedelta(seconds=WINDOW))
+        _seed(engine, worker_heartbeat_offset=timedelta(seconds=WINDOW))
         _enqueue_ready_item(engine)
         repo = TokenSchedulerRepository(engine)
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300, now=NOW)
+        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
         assert item is not None
         # Promote the leased row to a complete durable PENDING_SINK bundle
         # (same promotion shape as the elspeth-28aaa36a62 ABA regression).
@@ -247,7 +251,7 @@ class TestMembershipFenceLockOrder:
             )
 
         with _recorded_statements(engine) as statements:
-            claimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300, now=NOW)
+            claimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
         assert claimed is not None
         _assert_membership_lock_before_cas(statements, verb="claim_pending_sink")
 
@@ -257,7 +261,7 @@ class TestEvictWorkerLockOrder:
 
     def test_evict_worker_locks_target_row_before_live_lease_read(self) -> None:
         engine = _make_engine()
-        token = _seed(engine, worker_heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10))
+        token = _seed(engine, worker_heartbeat_offset=-timedelta(seconds=GRACE + 10))
         coord = RunCoordinationRepository(engine)
 
         with _recorded_statements(engine) as statements:
@@ -280,7 +284,7 @@ class TestEvictWorkerLockOrder:
 
     def test_evict_worker_absent_target_is_benign_skip(self) -> None:
         engine = _make_engine()
-        token = _seed(engine, worker_heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10))
+        token = _seed(engine, worker_heartbeat_offset=-timedelta(seconds=GRACE + 10))
         coord = RunCoordinationRepository(engine)
 
         evicted = coord.evict_worker(
