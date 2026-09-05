@@ -139,8 +139,21 @@ _SECRET_MUTATION_TOOL_NAMES: Final[frozenset[str]] = derive_name_set_for(_REGIST
 _CACHEABLE_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = derive_cacheable_names(_REGISTERED_TOOLS)
 
 # Session-mutable discovery tools — the complement of cacheable within
-# DISCOVERY. Tracked explicitly (as a named, derived constant) so the
-# audit-integrity disjointness assertion below can detect any future drift.
+# DISCOVERY, by construction. Because it is DERIVED BY SUBTRACTION it is
+# disjoint from the cacheable set for every possible declaration content, so
+# no assertion over the two can ever fire (elspeth-235861ee32); one such
+# assertion used to sit below and was validation theatre. No production
+# code keeps a member of this set out of the cache either:
+# ``ToolDeclaration.__post_init__`` constrains only the KIND axis (no
+# non-DISCOVERY tool of any kind may be cacheable), and every member here IS
+# DISCOVERY kind, so it accepts ``cacheable=True`` on any of them. The three
+# stateful discovery tools stay uncached ONLY because two test pins name
+# them: ``tests/unit/web/composer/test_tools.py::TestToolRegistry::
+# test_cacheable_discovery_is_opt_in_with_named_mutable_complement`` (exact
+# set equality, so a new discovery tool cannot land in either category
+# without a deliberate classification) and
+# ``tests/unit/web/composer/test_tool_declarations.py::
+# test_cacheable_subset_is_correct`` (``not in cacheable`` for each).
 _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = _DISCOVERY_TOOL_NAMES - _CACHEABLE_DISCOVERY_TOOL_NAMES
 
 # Blob-store side-effect tools that never advance ``CompositionState``.
@@ -184,12 +197,6 @@ if not _CACHEABLE_DISCOVERY_TOOL_NAMES <= _DISCOVERY_TOOL_NAMES:
         "_CACHEABLE_DISCOVERY_TOOL_NAMES contains names that are not declared "
         "discovery tools: "
         f"{_CACHEABLE_DISCOVERY_TOOL_NAMES - _DISCOVERY_TOOL_NAMES}"
-    )
-if _CACHEABLE_DISCOVERY_TOOL_NAMES & _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES:
-    raise RuntimeError(
-        "Session-mutable discovery tools must NEVER be cacheable — caching "
-        "them would serve stale audit-trail data. Intersection: "
-        f"{_CACHEABLE_DISCOVERY_TOOL_NAMES & _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES}"
     )
 if not _BLOB_STORE_ONLY_MUTATION_TOOL_NAMES <= _BLOB_MUTATION_TOOL_NAMES:
     raise RuntimeError(
