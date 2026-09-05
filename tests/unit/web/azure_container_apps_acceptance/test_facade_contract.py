@@ -105,6 +105,10 @@ def test_private_package_never_imports_the_facade() -> None:
 
 
 def test_static_failure_envelopes_never_carry_content() -> None:
+    # `acceptance_step` deliberately leaves the innermost step set when its body
+    # raises, so any earlier failing step in this process is still current here.
+    # The facade's own `main` clears it the same way before it runs.
+    facade.reset_acceptance_step()
     check = facade.acceptance_error_envelope(AcceptanceCheckError("exec_receipt_schema", missing=("b", "a")))
     assert check == {"error_class": "AcceptanceCheckError", "check": "exec_receipt_schema", "missing": ["a", "b"], "step": None}
     http = facade.acceptance_error_envelope(AcceptanceHttpError("body: secret", error_code="unexpected_http_status", status=502))

@@ -601,15 +601,34 @@ def test_bundle_check_refuses_missing_kinds_invalid_receipts_and_failed_probes(t
     )
     verdict = bundle_check(failed, candidate_sha=CANDIDATE, scenario_id="A")
     assert verdict.failed_probes == ("P3",) and not verdict.passed, "an unreachable P3 is not waived"
+    # `bundle_check` validates the document before it compares the stored hash,
+    # so the two tampers below are refused by different checks. Editing a value
+    # inside the open `evidence` mapping keeps the envelope schema-valid, and
+    # only the content hash catches it.
     tampered = tmp_path / "tampered"
     _fill_store(tampered)
     row = next(row for row in read_receipt_index(tampered) if row["kind"] == "replica-progress")
     path = tampered / f"{row['receipt_sha256']}.json"
     document = json.loads(path.read_text())
     document["details"]["evidence"]["poll_interval_seconds"] = 3.0
+    os.chmod(path, 0o600)
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
     verdict = bundle_check(tampered, candidate_sha=CANDIDATE, scenario_id="A")
-    assert [(item.receipt_sha256, item.check) for item in verdict.invalid_receipts] == [(row["receipt_sha256"], "exec_receipt_schema")]
+    assert [(item.receipt_sha256, item.check) for item in verdict.invalid_receipts] == [(row["receipt_sha256"], "receipt_store_hash")]
+    assert not verdict.passed
+    # Opening the envelope's closed key set is refused earlier, by the schema.
+    opened = tmp_path / "opened-envelope"
+    _fill_store(opened)
+    opened_row = next(row for row in read_receipt_index(opened) if row["kind"] == "replica-progress")
+    opened_path = opened / f"{opened_row['receipt_sha256']}.json"
+    opened_document = json.loads(opened_path.read_text())
+    opened_document["unexpected"] = 1
+    os.chmod(opened_path, 0o600)
+    opened_path.write_text(json.dumps(opened_document, sort_keys=True, separators=(",", ":")))
+    verdict = bundle_check(opened, candidate_sha=CANDIDATE, scenario_id="A")
+    assert [(item.receipt_sha256, item.check) for item in verdict.invalid_receipts] == [
+        (opened_row["receipt_sha256"], "exec_receipt_schema")
+    ]
     assert not verdict.passed
     other_candidate = bundle_check(tmp_path / "partial", candidate_sha="f" * 40, scenario_id="A")
     assert other_candidate.invalid_receipts and not other_candidate.passed
