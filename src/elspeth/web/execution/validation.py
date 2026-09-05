@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
@@ -263,6 +264,20 @@ class _CompiledIdentityDocument:
     """
 
     config: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "config")
+
+    def audit_safe_settings(self) -> Mapping[str, Any]:
+        """Detached plain-container copy for the preflight config swap.
+
+        The swap's extractors parse the document nominally (``type(x) is dict``
+        / ``is list``, the same exact-type parse the run side applies to the
+        YAML it loads), so the frozen document cannot be handed over as-is.
+        Thawing builds fresh dicts and lists on every call: nothing the swap or
+        a plugin does to them can reach ``config``.
+        """
+        return cast(Mapping[str, Any], deep_thaw(self.config))
 
 
 def _compiled_identity_settings(
@@ -580,7 +595,7 @@ def _validate_pipeline_impl(
         def _build_graph_under_authored_identity(settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph:
             with _audit_safe_plugin_configs(
                 bundle,
-                audit_safe_settings=identity_settings.config,
+                audit_safe_settings=identity_settings.audit_safe_settings(),
                 plugin_snapshot=plugin_snapshot,
             ):
                 return dependencies.build_graph(settings, bundle)

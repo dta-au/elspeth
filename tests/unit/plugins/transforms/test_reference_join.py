@@ -8,6 +8,7 @@ only exercised ``process`` would leave that guarantee unasserted.
 
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -854,3 +855,48 @@ class TestAuthorDeclarationsOnJoinedFields:
             schema={"mode": "flexible", "fields": [{"name": "order_id", "type": "str", "required": False, "nullable": False}]}
         )
         assert _declared_output_field(transform, "order_id").required is False
+
+
+NESTED_JSON = json.dumps([{"sku": "hats", "tax": {"rate": 0.1, "codes": ["STD", "EU"]}}])
+
+
+class TestReferenceIndexImmutability:
+    """The resolved table is deep-frozen at load and stays unreachable from rows.
+
+    No thaw happens at emission: PipelineRow deep-freezes row data itself and
+    thaws only in ``to_dict``, so a frozen nested reference value is already the
+    row's native representation, and nothing a consumer does to a thawed export
+    can reach the shared index.
+    """
+
+    def test_index_entries_are_deep_frozen_at_load(self) -> None:
+        transform = build(reference_content=NESTED_JSON, reference_format="json", output={"tax": "ref['tax']"})
+        entries = transform._index.entries
+        assert type(entries) is MappingProxyType
+        assert type(entries["hats"]) is MappingProxyType
+        assert type(entries["hats"]["tax"]) is MappingProxyType
+        assert type(entries["hats"]["tax"]["codes"]) is tuple
+        tax: Any = entries["hats"]["tax"]
+        with pytest.raises(TypeError):
+            tax["rate"] = 9
+
+    def test_nested_value_reaches_the_row_frozen_and_exports_as_plain_containers(self, ctx: "PluginContext") -> None:
+        transform = build(reference_content=NESTED_JSON, reference_format="json", output={"tax": "ref['tax']"})
+        first = transform.process(make_pipeline_row({"product": "hats"}), ctx)
+        assert first.status == "success"
+        assert first.row is not None
+        # In the row the value is frozen, like every nested row value.
+        assert type(first.row["tax"]) is MappingProxyType
+        assert first.row["tax"] == {"rate": 0.1, "codes": ("STD", "EU")}
+        # The export is plain dict/list, and mutating it reaches neither the
+        # index nor the next row.
+        exported = first.row.to_dict()["tax"]
+        assert type(exported) is dict
+        assert type(exported["codes"]) is list
+        assert exported == {"rate": 0.1, "codes": ["STD", "EU"]}
+        exported["codes"].append("MUTATED")
+        exported["rate"] = 9
+        second = transform.process(make_pipeline_row({"product": "hats"}), ctx)
+        assert second.row is not None
+        assert second.row.to_dict()["tax"] == {"rate": 0.1, "codes": ["STD", "EU"]}
+        assert transform._index.entries["hats"]["tax"]["rate"] == 0.1

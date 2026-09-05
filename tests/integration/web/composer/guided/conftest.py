@@ -42,6 +42,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
@@ -137,8 +138,10 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # the plugin-policy stack below, mirroring production create_app wiring).
     blob_service = BlobServiceImpl(engine, tmp_path)
 
-    # FastAPI app
+    # FastAPI app -- with the production session-operation handlers: an
+    # ownership race answers the same 404/409 bodies a deployed worker sends.
     app = FastAPI()
+    register_session_operation_exception_handlers(app)
 
     # Mock auth: all requests authenticated as "alice"
     identity = UserIdentity(user_id="alice", username="alice")

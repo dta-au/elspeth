@@ -21,7 +21,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.helpers.session_fences import FencedComposeTurnHarness
 
 # Integration-suite shared session-insert helper.
 from .conftest import _make_session
@@ -35,7 +35,7 @@ def service(tmp_path):
         poolclass=StaticPool,
     )
     initialize_session_schema(eng)
-    return DualFencedSessionServiceHarness(
+    return FencedComposeTurnHarness(
         eng,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
