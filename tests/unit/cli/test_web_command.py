@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +19,8 @@ from sqlalchemy.engine import Engine
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.schema import auth_events_table
 from elspeth.web.auth.models import AccessPending
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table
@@ -337,6 +341,16 @@ class TestComposerUsersCommand:
             (first_identity_id, f"alice#retired-{first_identity_id}", "disabled")
         ]
 
+        # The retirement is audited to the Landscape the web app would use,
+        # inside the authority's transaction: identity_disabled, cause
+        # credential_deleted, actor operator, joined by identity_id.
+        events = _auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")
+        assert [(row.event_type, row.outcome, row.identity_id) for row in events] == [("identity_disabled", "success", first_identity_id)]
+        metadata = json.loads(events[0].metadata_json)
+        assert metadata["cause"] == "credential_deleted"
+        assert metadata["actor"] == "operator"
+        assert metadata["retired_subject"] == f"alice#retired-{first_identity_id}"
+
         _cli_add(auth_db=auth_db, data_dir=tmp_path)
         closed_provider = build_local_auth_provider(auth_db, session_engine=engine, registration_open=False)
         with pytest.raises(AccessPending):
@@ -348,10 +362,11 @@ class TestComposerUsersCommand:
         assert after[fresh_identity_id].access_state == "pending"
 
     def test_remove_uses_the_configured_sessions_store(self, tmp_path: Path) -> None:
-        """``--session-db-url`` (and the container's env) name the store to retire in."""
+        """``--session-db-url`` / ``--landscape-url`` (and the container's env) name the stores to retire in."""
         auth_db = tmp_path / "auth.db"
         elsewhere = tmp_path / "elsewhere" / "sessions.db"
         elsewhere.parent.mkdir()
+        audit_elsewhere = tmp_path / "elsewhere" / "audit.db"
         _cli_add(auth_db=auth_db, data_dir=tmp_path)
         engine = create_session_engine(f"sqlite:///{elsewhere}")
         initialize_session_schema(engine)
@@ -371,12 +386,16 @@ class TestComposerUsersCommand:
                 str(auth_db),
                 "--session-db-url",
                 f"sqlite:///{elsewhere}",
+                "--landscape-url",
+                f"sqlite:///{audit_elsewhere}",
                 "--yes",
             ],
         )
         assert result.exit_code == 0, result.output
         assert [row.access_state for row in _identity_rows(engine)] == ["disabled"]
         assert not (tmp_path / "sessions.db").exists()
+        assert [row.event_type for row in _auth_event_rows(f"sqlite:///{audit_elsewhere}")] == ["identity_disabled"]
+        assert not (tmp_path / "runs" / "audit.db").exists()
 
     def test_remove_refuses_before_deleting_when_the_sessions_store_is_stale(self, tmp_path: Path) -> None:
         """A store that cannot retire means no credential is deleted at all.
@@ -419,6 +438,11 @@ def _cli_add(*, auth_db: Path, data_dir: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
+
+
+def _auth_event_rows(landscape_url: str) -> list[Row[Any]]:
+    with LandscapeDB.from_url(landscape_url) as db, db.read_only_connection() as conn:
+        return list(conn.execute(select(auth_events_table).order_by(auth_events_table.c.occurred_at)).fetchall())
 
 
 def _identity_rows(engine: Engine) -> list[Row[tuple[str, str, str]]]:

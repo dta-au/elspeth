@@ -1352,10 +1352,7 @@ class WebSettings(BaseModel):
 
     def get_landscape_url(self) -> str:
         """Resolve landscape DB URL, defaulting to data_dir-relative path."""
-        if self.landscape_url is not None:
-            return self.landscape_url
-        db_path = self.data_dir / "runs" / "audit.db"
-        return f"sqlite:///{db_path}"
+        return resolve_landscape_url(data_dir=self.data_dir, landscape_url=self.landscape_url)
 
     def get_payload_store_path(self) -> Path:
         """Resolve payload store path, defaulting to data_dir-relative path."""
@@ -1366,6 +1363,18 @@ class WebSettings(BaseModel):
     def get_session_db_url(self) -> str:
         """Resolve session DB URL, defaulting to data_dir-relative path."""
         return resolve_session_db_url(data_dir=self.data_dir, session_db_url=self.session_db_url)
+
+
+def resolve_landscape_url(*, data_dir: Path, landscape_url: str | None) -> str:
+    """Where the Landscape lives: the configured URL, else ``data_dir/runs/audit.db``.
+
+    Module-level for the same reason as :func:`resolve_session_db_url`: the
+    ``composer users`` CLI writes the identity-retirement audit row to the
+    same Landscape the web app would, resolved by the same rule.
+    """
+    if landscape_url is not None:
+        return landscape_url
+    return f"sqlite:///{data_dir / 'runs' / 'audit.db'}"
 
 
 def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
