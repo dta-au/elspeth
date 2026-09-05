@@ -24,7 +24,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
-from elspeth.web.auth.sso import HANDOFF_TTL_SECONDS, handoff_code_hash, new_handoff_code
+from elspeth.web.auth.sso import HANDOFF_TTL_SECONDS, ConsumedHandoff, handoff_code_hash, new_handoff_code
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table, sso_handoffs_table
@@ -82,7 +82,19 @@ def test_an_issued_handoff_is_consumed_by_the_identity_it_names(store) -> None:
     code = new_handoff_code()
     store.issue(code_hash=handoff_code_hash(code), identity_id="identity-1", request_id="req-1")
 
-    assert store.consume(code_hash=handoff_code_hash(code)) == "identity-1"
+    assert store.consume(code_hash=handoff_code_hash(code)) == ConsumedHandoff("identity-1", "req-1")
+
+
+def test_a_consumed_handoff_carries_the_login_it_came_from(store) -> None:
+    """``complete`` writes ``token_issued`` on a different request from the
+    callback's ``login`` row; the handoff is the only thing that links them."""
+    code = new_handoff_code()
+    store.issue(code_hash=handoff_code_hash(code), identity_id="identity-1", request_id="req-callback-7")
+
+    consumed = store.consume(code_hash=handoff_code_hash(code))
+
+    assert consumed is not None
+    assert consumed.login_request_id == "req-callback-7"
 
 
 def test_two_handoffs_do_not_interfere(store) -> None:
@@ -91,8 +103,8 @@ def test_two_handoffs_do_not_interfere(store) -> None:
     store.issue(code_hash=handoff_code_hash(first), identity_id="identity-1", request_id="req-1")
     store.issue(code_hash=handoff_code_hash(second), identity_id=_OTHER, request_id="req-2")
 
-    assert store.consume(code_hash=handoff_code_hash(first)) == "identity-1"
-    assert store.consume(code_hash=handoff_code_hash(second)) == _OTHER
+    assert store.consume(code_hash=handoff_code_hash(first)) == ConsumedHandoff("identity-1", "req-1")
+    assert store.consume(code_hash=handoff_code_hash(second)) == ConsumedHandoff(_OTHER, "req-2")
 
 
 # --------------------------------------------------------------------------
@@ -105,7 +117,7 @@ def test_a_second_consume_of_the_same_code_yields_nothing(store) -> None:
     code = new_handoff_code()
     store.issue(code_hash=handoff_code_hash(code), identity_id="identity-1", request_id="req-1")
 
-    assert store.consume(code_hash=handoff_code_hash(code)) == "identity-1"
+    assert store.consume(code_hash=handoff_code_hash(code)) == ConsumedHandoff("identity-1", "req-1")
     assert store.consume(code_hash=handoff_code_hash(code)) is None
 
 
@@ -158,7 +170,7 @@ def test_a_handoff_inside_its_ttl_still_works(store, engine) -> None:
             .values(expires_at=now + timedelta(seconds=1))
         )
 
-    assert store.consume(code_hash=handoff_code_hash(code)) == "identity-1"
+    assert store.consume(code_hash=handoff_code_hash(code)) == ConsumedHandoff("identity-1", "req-1")
 
 
 def test_unknown_used_and_expired_are_reported_identically(store, engine) -> None:
@@ -207,7 +219,7 @@ def test_the_stored_hash_cannot_be_redeemed_as_a_code(store, engine) -> None:
         stored_hash = conn.execute(select(sso_handoffs_table.c.code_hash)).scalar_one()
 
     assert store.consume(code_hash=handoff_code_hash(stored_hash)) is None
-    assert store.consume(code_hash=handoff_code_hash(code)) == "identity-1"
+    assert store.consume(code_hash=handoff_code_hash(code)) == ConsumedHandoff("identity-1", "req-1")
 
 
 def test_a_code_hash_that_is_not_a_lowercase_sha256_is_refused_by_the_database(store) -> None:
@@ -247,7 +259,7 @@ def test_issuing_does_not_purge_another_identitys_unexpired_handoff(store, engin
     store.issue(code_hash=handoff_code_hash(new_handoff_code()), identity_id="identity-1", request_id="req-2")
 
     assert handoff_code_hash(theirs) in _code_hashes(engine)
-    assert store.consume(code_hash=handoff_code_hash(theirs)) == _OTHER
+    assert store.consume(code_hash=handoff_code_hash(theirs)) == ConsumedHandoff(_OTHER, "req-1")
 
 
 def test_issuing_purges_only_its_own_identitys_rows(store, engine) -> None:
@@ -291,7 +303,7 @@ def test_the_purge_does_not_remove_a_live_handoff(store, engine) -> None:
     store.issue(code_hash=handoff_code_hash(mine), identity_id="identity-1", request_id="req-2")
     store.consume(code_hash=handoff_code_hash(mine))
 
-    assert store.consume(code_hash=handoff_code_hash(live)) == _OTHER
+    assert store.consume(code_hash=handoff_code_hash(live)) == ConsumedHandoff(_OTHER, "req-1")
 
 
 # --------------------------------------------------------------------------
