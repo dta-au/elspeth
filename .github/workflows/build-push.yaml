@@ -93,7 +93,10 @@ jobs:
       # Export only non-secret digest values. GitHub Actions suppresses job
       # outputs that contain secret-derived values such as the ACR hostname.
       ghcr_digest: ${{ steps.ghcr-push.outputs.digest }}
-      acr_digest: ${{ steps.acr-push.outputs.digest }}
+      # ACR carries either its own build (ACR-only dispatch) or a
+      # digest-preserving copy of the GHCR image (both registries); exactly
+      # one of the two steps runs, so the first non-empty digest is the one.
+      acr_digest: ${{ steps.acr-push.outputs.digest || steps.acr-copy.outputs.digest }}
       # Which registries were actually pushed, so the smoke-test job tests the
       # image that exists rather than unconditionally pulling GHCR.
       push_ghcr: ${{ steps.registries.outputs.push_ghcr }}
@@ -268,11 +271,38 @@ jobs:
           sbom: true
 
       # -----------------------------------------------------------------------
-      # Build and push to ACR
+      # ACR publication.
+      #
+      # When BOTH registries are selected, ACR receives a digest-preserving
+      # COPY of the GHCR image instead of a second build: two independent
+      # builds of identical inputs never share an index digest (their
+      # attestation manifests differ), while a registry-to-registry copy
+      # keeps the digest byte-for-byte — measured 2026-09-05 with two local
+      # registries (docs/plans/2026-09-05-phase6b-azure-container-apps-
+      # platform-facts.md §6.2). The copy is what makes "ACR digest == GHCR
+      # digest" a fact the Azure deployment bundle can assert. An ACR-only
+      # dispatch still builds, because there is no GHCR image to copy.
       # -----------------------------------------------------------------------
+      - name: Copy GHCR image to ACR (digest-preserving)
+        id: acr-copy
+        if: steps.registries.outputs.push_acr == 'true' && steps.registries.outputs.push_ghcr == 'true'
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          GHCR_DIGEST: ${{ steps.ghcr-push.outputs.digest }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          test -n "$GHCR_DIGEST"
+          source_image="ghcr.io/${REPO_OWNER}/${IMAGE_NAME}@${GHCR_DIGEST}"
+          target_tag="${ACR_REGISTRY}/${IMAGE_NAME}:sha-${IMAGE_SHA}"
+          docker buildx imagetools create --tag "$target_tag" "$source_image"
+          ACR_DIGEST="$(docker buildx imagetools inspect "$target_tag" --format '{{.Manifest.Digest}}')"
+          test "$ACR_DIGEST" = "$GHCR_DIGEST"
+          echo "digest=$ACR_DIGEST" >> "$GITHUB_OUTPUT"
+
       - name: Build and push to ACR
         id: acr-push
-        if: steps.registries.outputs.push_acr == 'true'
+        if: steps.registries.outputs.push_acr == 'true' && steps.registries.outputs.push_ghcr != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
@@ -291,7 +321,7 @@ jobs:
       # Sign pushed image digests with GitHub OIDC/Sigstore.
       # -----------------------------------------------------------------------
       - name: Install cosign
-        if: steps.ghcr-push.outputs.digest != '' || steps.acr-push.outputs.digest != ''
+        if: steps.ghcr-push.outputs.digest != '' || steps.acr-push.outputs.digest != '' || steps.acr-copy.outputs.digest != ''
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
 
       - name: Sign GHCR image digest
@@ -301,9 +331,9 @@ jobs:
         run: cosign sign --yes "$IMAGE_DIGEST"
 
       - name: Sign ACR image digest
-        if: steps.acr-push.outputs.digest != ''
+        if: steps.acr-push.outputs.digest != '' || steps.acr-copy.outputs.digest != ''
         env:
-          IMAGE_DIGEST: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
+          IMAGE_DIGEST: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest || steps.acr-copy.outputs.digest }}
         run: cosign sign --yes "$IMAGE_DIGEST"
 
       # -----------------------------------------------------------------------
@@ -355,8 +385,10 @@ jobs:
           ref: ${{ env.IMAGE_SHA }}
 
       # Bind smoke verification to the immutable action-output digests that the
-      # release job will promote. When both registries are enabled, both
-      # independently-pushed digests must pass the runtime contract.
+      # release job will promote. When both registries are enabled the ACR
+      # image is a digest-preserving copy of the GHCR image, so the two digests
+      # are equal and one smoke covers both; an ACR-only dispatch smokes its
+      # own build.
       - name: Determine smoke-test images
         env:
           GHCR_DIGEST: ${{ needs.build-push.outputs.ghcr_digest }}
