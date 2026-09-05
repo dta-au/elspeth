@@ -12,6 +12,7 @@ means the routing acceptance set is empty, not unsampled.
 from __future__ import annotations
 
 import re
+from typing import Any, cast
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import (
@@ -71,7 +72,11 @@ def stated_acceptances_from_message_tokens(message: str, catalog: PolicyCatalogV
             if not after:
                 continue
             raw_value = after[0][0]
-            value: object = int(raw_value) if raw_value.isdigit() else raw_value
+            value: str | int = int(raw_value) if raw_value.isdigit() else raw_value
+            # The operator names ARE the constraint's closed Literal — they are
+            # the keys of the grounding regex table — but that Literal has no
+            # alias to name here, so the cast is at this one boundary.
+            operator_name = cast(Any, operator)
             columns = {token[0] for token in tokens if token[2] <= occurrence.start()}
             targets = set(_DESTINATION_HEAD.findall(message[occurrence.end() :]))
             for column in columns:
@@ -85,7 +90,7 @@ def stated_acceptances_from_message_tokens(message: str, catalog: PolicyCatalogV
                         redacted_summary="oracle",
                         constraints=(
                             StatedPredicateConstraint(
-                                kind="stated_predicate", subject=CSV_SOURCE_SUBJECT, column=column, operator=operator, value=value
+                                kind="stated_predicate", subject=CSV_SOURCE_SUBJECT, column=column, operator=operator_name, value=value
                             ),
                         ),
                     )
@@ -102,7 +107,7 @@ def stated_acceptances_from_message_tokens(message: str, catalog: PolicyCatalogV
                                 kind="stated_gate_routing",
                                 subject=CSV_SOURCE_SUBJECT,
                                 column=column,
-                                operator=operator,
+                                operator=operator_name,
                                 value=value,
                                 true_target=true_target,
                                 false_target=false_target,

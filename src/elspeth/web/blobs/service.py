@@ -64,6 +64,7 @@ from elspeth.web.blobs.protocol import (
     StorageMimeType,
     fork_blob_id,
 )
+from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import (
     _run_lock_cleanup,
@@ -226,7 +227,7 @@ def _uuid_from_db(value: Any) -> UUID:
     return UUID(str(value))
 
 
-def _active_run_pipeline_dict(active_run: Any) -> dict[str, Any]:
+def _active_run_pipeline_dict(active_run: Any) -> LoweredPipelineDocument:
     """Convert an active-run join row to canonical runtime/YAML shape.
 
     The JSON columns arrive in their on-disk envelope; reading them raw
