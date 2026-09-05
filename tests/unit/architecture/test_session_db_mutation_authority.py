@@ -2087,11 +2087,25 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "IdentityAuthority",
         line=1625,
     ),
-    # ── P4-D6 step 4 facet admissions (elspeth-e483fe7f85): writers and contained
-    # acquisitions the scanner already attributes to a named authority, admitted
-    # method-exact from live scanner output. blobs/service.py's phase helpers
-    # (_reserve_pending_blob / _finalize_reserved_blob) hand their connection to
-    # sub-helpers and stay in step 5's escape corpus. ────────────────────────
+    # ── P4-D6 steps 4-5 admissions (elspeth-e483fe7f85): writers and contained
+    # acquisitions the scanner attributes to a named authority, admitted
+    # method-exact from live scanner output -- the step-4 facets, then the
+    # acquisitions the step-5 forwarding proof contained (mutate_fork_creation's
+    # probe; blobs/service.py's phase helpers once the proof followed their
+    # advisory-lock import) and the writer inside them.
+    #
+    # Two SessionOperationAuthority acquisitions remain ESCAPES by design and are
+    # deliberately NOT admitted (hub ruling 2 on elspeth-e483fe7f85); they stay
+    # in the drift counters as honest rows until their seams are restructured:
+    #   _SessionOperationAuthorityRepository._locked_transaction (:3998): nine of
+    #     its ten callers prove contained; ``mutate`` hands the connection to the
+    #     _RepositoryMutationTransaction constructor, the typed seam through
+    #     which the mutation facets execute -- a store by construction.
+    #   __build_locked_fork_pair_controls.locked_pair_transaction (:3952): a
+    #     nested factory def, not a class method; it keeps ``(conn, pair)`` in the
+    #     pair-lock registry that require_active_locked_fork_pair checks by
+    #     connection identity, and forwards to transaction_session_lock.
+    # ─────────────────────────────────────────────────────────────────────────
     # src/elspeth/web/coordination/membership_authority.py :: WebInstanceMembershipAuthority
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2410,11 +2424,6 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SkillMarkdownHistoryAuthority",
         line=62,
     ),
-    # ── P4-D6 step 4 facet admissions (elspeth-e483fe7f85): writers and contained
-    # acquisitions the scanner already attributes to a named authority, admitted
-    # method-exact from live scanner output. blobs/service.py's phase helpers
-    # (_reserve_pending_blob / _finalize_reserved_blob) hand their connection to
-    # sub-helpers and stay in step 5's escape corpus. ────────────────────────
     # src/elspeth/web/coordination/repository.py :: SessionOperationAuthority
     WriterIdentity(
         "src/elspeth/web/coordination/repository.py",
@@ -2426,11 +2435,6 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionOperationAuthority",
         line=4746,
     ),
-    # ── P4-D6 step 4 facet admissions (elspeth-e483fe7f85): writers and contained
-    # acquisitions the scanner already attributes to a named authority, admitted
-    # method-exact from live scanner output. blobs/service.py's phase helpers
-    # (_reserve_pending_blob / _finalize_reserved_blob) hand their connection to
-    # sub-helpers and stay in step 5's escape corpus. ────────────────────────
     # src/elspeth/web/blobs/service.py :: SessionBlobMutationAuthority
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
