@@ -141,15 +141,43 @@ class AntiAnchorTracker:
         """Clear the deque. Any tool success means we have made progress."""
         self._failures.clear()
 
-    def should_fire(self) -> bool:
-        return should_inject_hint(self._failures) or should_inject_drift_hint(self._failures)
+    def next_hint(self) -> str | None:
+        """Return the hint the current failure window earns, or ``None``.
 
-    def build_hint(self) -> str:
+        This is the single authority for hint text: a hint exists only when
+        one of the two trigger predicates holds, and the predicate that
+        holds chooses the text. There is no fallback. The prior
+        ``build_hint`` fell through to ``build_anti_anchor_hint`` when
+        neither predicate matched, and that helper rejects only a SHORT
+        window — so a mixed, non-triggering window of three failures
+        across different tools produced a confident "byte-identical
+        arguments" hint for a pattern that never occurred
+        (elspeth-aa459b4dd0). A hint is control text the model acts on;
+        prose for a state that did not happen is worse than no prose.
+        """
         if should_inject_hint(self._failures):
             return build_anti_anchor_hint(self._failures)
         if should_inject_drift_hint(self._failures):
             return build_drift_hint(self._failures)
-        return build_anti_anchor_hint(self._failures)
+        return None
+
+    def should_fire(self) -> bool:
+        return self.next_hint() is not None
+
+    def build_hint(self) -> str:
+        """Return the hint for a firing window; refuse to manufacture one otherwise.
+
+        Kept for the ``should_fire()`` / ``build_hint()`` caller protocol.
+        Callers that want a single call should use :meth:`next_hint`.
+        """
+        hint = self.next_hint()
+        if hint is None:
+            raise ValueError(
+                "build_hint() called on a failure window that fires no anti-anchor predicate "
+                f"({len(self._failures)} recorded failure(s), not identical and not same-tool drift); "
+                "check should_fire() first or use next_hint()"
+            )
+        return hint
 
     def consume_fire(self) -> None:
         """Reset after a hint is injected to prevent immediate re-fire.
