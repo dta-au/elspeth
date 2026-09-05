@@ -57,6 +57,7 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -532,6 +533,9 @@ def _independent_guided_peer_app(primary: TestClient) -> FastAPI:
     engine = primary_app.state.session_engine
     data_dir = Path(primary_app.state.settings.data_dir)
     app = FastAPI()
+    # The peer is a second deployed worker: it answers an ownership race with
+    # the production handlers (fence lost -> 404, live lease -> 409).
+    register_session_operation_exception_handlers(app)
     identity = UserIdentity(user_id="alice", username="alice")
 
     async def mock_user() -> UserIdentity:
@@ -5240,52 +5244,56 @@ class TestStep2IntraStep:
                 select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
             )
 
+        loser = "correct" if db_winner == "confirm" else "confirm"
+
         async def race_and_replay():
             async with (
                 AsyncClient(transport=ASGITransport(app=primary_app), base_url="http://confirm-worker") as accept_client,
                 AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://correct-worker") as revise_client,
             ):
-                tasks = {
-                    "confirm": asyncio.create_task(
-                        accept_client.post(f"/api/sessions/{session_id}/guided/respond", json=requests["confirm"])
-                    ),
-                    "correct": asyncio.create_task(
-                        revise_client.post(f"/api/sessions/{session_id}/guided/respond", json=requests["correct"])
-                    ),
-                }
-                await asyncio.wait_for(
-                    asyncio.gather(entered["confirm"].wait(), entered["correct"].wait()),
-                    timeout=10,
-                )
+                clients = {"confirm": accept_client, "correct": revise_client}
+                path = f"/api/sessions/{session_id}/guided/respond"
+                winner_task = asyncio.create_task(clients[db_winner].post(path, json=requests[db_winner]))
+                await asyncio.wait_for(entered[db_winner].wait(), timeout=10)
+                # Independent workers serialise at the session-operation
+                # lease, not at admission: the second worker is refused with
+                # the platform's 409 while the first holds the session, before
+                # any guided operation row or settlement double of its own.
+                refused = await asyncio.wait_for(clients[loser].post(path, json=requests[loser]), timeout=10)
+                assert not entered[loser].is_set()
                 release.set()
-                responses = dict(
-                    zip(
-                        ("confirm", "correct"),
-                        await asyncio.wait_for(asyncio.gather(tasks["confirm"], tasks["correct"]), timeout=20),
-                        strict=True,
-                    )
-                )
+                winner_response = await asyncio.wait_for(winner_task, timeout=20)
+                # The refused worker retries once the lease is free. The
+                # winner has already settled the turn, so the retry is
+                # refused at the guided turn contract before it reserves an
+                # operation of its own: it publishes nothing, on either try.
+                loser_response = await asyncio.wait_for(clients[loser].post(path, json=requests[loser]), timeout=20)
+                responses = {db_winner: winner_response, loser: loser_response}
                 replays = {
-                    "confirm": await revise_client.post(
-                        f"/api/sessions/{session_id}/guided/respond",
-                        json=requests["confirm"],
-                    ),
-                    "correct": await accept_client.post(
-                        f"/api/sessions/{session_id}/guided/respond",
-                        json=requests["correct"],
-                    ),
+                    "confirm": await revise_client.post(path, json=requests["confirm"]),
+                    "correct": await accept_client.post(path, json=requests["correct"]),
                 }
-                return responses, replays
+                return refused, responses, replays
 
-        responses, replays = asyncio.run(race_and_replay())
-        loser = "correct" if db_winner == "confirm" else "confirm"
+        refused, responses, replays = asyncio.run(race_and_replay())
+        assert refused.status_code == 409, refused.json()
+        assert refused.json() == {"detail": "Session operation is already active"}
         assert responses[db_winner].status_code == 200, responses[db_winner].json()
         assert responses[loser].status_code == 409, responses[loser].json()
-        assert responses[loser].json()["detail"]["failure_code"] == "stale_conflict"
+        assert responses[loser].json() == {
+            "detail": (
+                "Guided session is already terminal."
+                if db_winner == "confirm"
+                else "proposal_id and draft_hash do not identify the active guided proposal"
+            )
+        }
         for action in ("confirm", "correct"):
             assert replays[action].status_code == responses[action].status_code
             assert replays[action].json() == responses[action].json()
-        assert len(admission_commands) == len(stage_commands) == 1
+        # Only the winner ever reached its settlement double.
+        assert not entered[loser].is_set()
+        assert len(admission_commands if db_winner == "confirm" else stage_commands) == 1
+        assert len(stage_commands if db_winner == "confirm" else admission_commands) == 0
 
         service = primary_app.state.session_service
         proposals = {str(item.id): item for item in asyncio.run(service.list_composition_proposals(UUID(session_id)))}
@@ -5310,12 +5318,11 @@ class TestStep2IntraStep:
             state_count_after = conn.scalar(
                 select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == session_id)
             )
-        assert len(operations) == 2
         winner_operation_id = accept_operation_id if db_winner == "confirm" else revise_operation_id
-        loser_operation_id = revise_operation_id if db_winner == "confirm" else accept_operation_id
+        # The refused worker never reserved an operation: the winner's row is
+        # the only publication of the race.
+        assert set(operations) == {winner_operation_id}
         assert operations[winner_operation_id]["status"] == "completed"
-        assert operations[loser_operation_id]["status"] == "failed"
-        assert operations[loser_operation_id]["failure_code"] == "stale_conflict"
         assert state_count_before is not None and state_count_after == state_count_before + 1
 
         original_id = proposal_payload["proposal_id"]
