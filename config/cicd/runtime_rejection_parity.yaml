@@ -2211,20 +2211,23 @@ sites:
     it protects a reachable build today; the raw BoundRegion/GroupBinding test (test_scoped_expand_whose_collector_sits_outside_region_rejected)
     pins the predicate directly by bypassing compute_bound_regions, which is the ONLY way to exercise
     it — it does not demonstrate the rule ever fires on a real build.'
-- key: 6e0c349d397920ed
+- key: 926c7c980ab1c3ae
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_sese_regions
   exception: GraphValidationError
-  message: Bound region '{}' (opener '{}') reaches sink '{}' before the region's closer. No token may
-    leave a bound region except through its closer — sinks inside a bound
+  message: Bound region '{}' (opener '{}') reaches sink '{}' before the region's closer. {} Move the sink
+    after the closer, or unbind the group.
   ordinal: 0
   disposition: mirrored
   counterpart:
   - bound_region_sink_inside
-  note: Spec §7 rule 4 forward walk, sink limb. Stage-1 mirror (web/composer/state.py::_fork_branch_reaches_sink_before_closer,
-    wired into the WHOLE-ROSTER FORK CLOSURE roster-equality pass) checks the same predicate for fork/coalesce
-    and fork/row_union bound regions; scope/collector regions (ruling 28, Task 8) are not yet covered
-    by either the runtime rule or this mirror.
+  note: Carried from 6e0c349d397920ed (re-keyed by elspeth-46825d0055, which replaces the message's hand-written
+    rule sentence with BOUND_REGION_EXIT_RULE, scoped to success paths and naming the on_error DIVERT
+    exception; the predicate is unchanged). Spec §7 rule 4 forward walk, sink limb. Stage-1 mirror (web/composer/state.py::_fork_branch_reaches_sink_before_closer,
+    wired into the WHOLE-ROSTER FORK CLOSURE roster-equality pass) checks the same predicate and now imports
+    the same rule sentence. Prior note recorded scope/collector regions as uncovered by both sides; the
+    runtime rule now has a collector-bound EXPAND witness in test_bound_regions.py, the mirror's coverage
+    of scope/collector regions was not re-measured in this carry.
 - key: 072048ad48f5a8fa
   path: src/elspeth/core/dag/bound_regions.py
   qualname: validate_sese_regions

@@ -2,7 +2,7 @@
 
 **Document date:** 23 July 2026
 **Release covered:** 0.7.1
-**Audience:** Evaluators, programme teams, operators, and technical reviewers
+**Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide
 

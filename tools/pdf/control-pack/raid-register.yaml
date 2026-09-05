@@ -13,11 +13,11 @@ document-type: "RAID register"
 classification: "OFFICIAL"
 
 # NOTE: a source-control revision is deliberately not carried on the cover
-# -- see programme.yaml.
+# -- see program.yaml.
 
 scope-blurb: >-
   This register records the implementation risks, assumptions, issues and
-  dependencies attached to delivering the programme of outstanding work.  It
+  dependencies attached to delivering the program of outstanding work.  It
   covers the delivery of the product, not the operation of it: operational
   risk from the running service is a separate register, and individual
   defects remain in the issue tracker and are referenced here rather than

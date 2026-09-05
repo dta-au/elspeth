@@ -23,7 +23,7 @@ scope-blurb: >-
   and the jobs they need done, the product model and the invariants that model
   depends on, the current state of the build, the bars that gate a pilot and a
   release, and the requirements and acceptance criteria attached to each.  It
-  is the companion to the Programme of Outstanding Work: this document answers
+  is the companion to the Program of Outstanding Work: this document answers
   what must be true, that one answers what is left to build.  The decisions the
   product needs from its owner are listed separately.
 

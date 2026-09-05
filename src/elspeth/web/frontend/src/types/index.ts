@@ -1257,18 +1257,25 @@ export interface SystemStatus {
     | "protected_cabinet"
     | null;
   /**
-   * The answering process's identity — the same value every response
-   * carries as `X-Elspeth-Instance` and the session-operation fences record
-   * as their owner. Distinct per replica at replicas > 1. Optional only for
-   * fixture tolerance; the server always sends it.
+   * The answering process's identity — the same value every response will
+   * carry as `X-Elspeth-Instance` and the session-operation fences will
+   * record as their owner; distinct per replica at replicas > 1. Wired in
+   * 6b-3's app.py landing; absent on this tip — the header, this status
+   * field and fence ownership are not yet emitted, so the field is optional
+   * because the server does not send it yet, not merely for fixture
+   * tolerance.
    */
   instance_id?: string;
-  /** The closed WebSettings.deployment_target vocabulary (web/config.py). */
+  /**
+   * The closed WebSettings.deployment_target vocabulary (web/config.py).
+   * Wired in 6b-3's app.py landing; absent on this tip.
+   */
   deployment_target?: string;
   /**
    * Platform-stamped revision and replica names when the deployment target's
    * platform publishes them through the environment (Azure Container Apps:
    * CONTAINER_APP_REVISION / CONTAINER_APP_REPLICA_NAME); null elsewhere.
+   * Wired in 6b-3's app.py landing; absent on this tip.
    */
   deployment_revision?: string | null;
   deployment_replica?: string | null;

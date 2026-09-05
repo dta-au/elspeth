@@ -234,3 +234,51 @@ def test_captured_tier1_red_drift_pattern_does_not_trigger() -> None:
     for tool_name, arguments_hash in failures:
         tracker.record_failure(tool_name, arguments_hash)
     assert tracker.should_fire() is True
+
+
+def test_build_hint_refuses_a_non_triggering_window() -> None:
+    """A mixed window of three failures earns NO hint, not a fabricated one.
+
+    Regression for elspeth-aa459b4dd0. ``build_hint`` used to fall through
+    to ``build_anti_anchor_hint``, which only rejects windows shorter than
+    the threshold, so three failures across three different tools yielded
+    a "byte-identical arguments" hint describing a pattern that never
+    happened. Now the only source of hint text is a firing predicate.
+    """
+    tracker = AntiAnchorTracker()
+    tracker.record_failure("set_source", "hash-a")
+    tracker.record_failure("upsert_node", "hash-b")
+    tracker.record_failure("set_output", "hash-c")
+
+    assert tracker.should_fire() is False
+    assert tracker.next_hint() is None
+    with pytest.raises(ValueError, match="fires no anti-anchor predicate"):
+        tracker.build_hint()
+
+
+def test_build_hint_refuses_below_threshold() -> None:
+    tracker = AntiAnchorTracker()
+    tracker.record_failure("set_pipeline", "hash-a")
+    tracker.record_failure("set_pipeline", "hash-a")
+
+    assert tracker.next_hint() is None
+    with pytest.raises(ValueError):
+        tracker.build_hint()
+
+
+def test_next_hint_is_the_single_authority_for_both_predicates() -> None:
+    """``next_hint`` returns exactly what the firing predicate's builder returns."""
+    identical = AntiAnchorTracker()
+    for _ in range(3):
+        identical.record_failure("set_pipeline", "hash-a")
+    expected_identical = build_anti_anchor_hint(deque([("set_pipeline", "hash-a")] * 3, maxlen=5))
+    assert identical.next_hint() == expected_identical
+    assert identical.build_hint() == expected_identical
+
+    drift = AntiAnchorTracker()
+    drift.record_failure("set_pipeline", "hash-a")
+    drift.record_failure("set_pipeline", "hash-b")
+    drift.record_failure("set_pipeline", "hash-c")
+    expected_drift = build_drift_hint(deque([("set_pipeline", "hash-a"), ("set_pipeline", "hash-b"), ("set_pipeline", "hash-c")], maxlen=5))
+    assert drift.next_hint() == expected_drift
+    assert drift.build_hint() == expected_drift
