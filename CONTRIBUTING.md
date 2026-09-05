@@ -156,6 +156,40 @@ extend the gate's expected set deliberately in the same change.
 `cls._declared_input_schema`, so the probe returns a confident wrong answer
 for every plugin. Read `_declared_input_schema` and run a positive control.
 
+### Gate: soft-mapping census (contracts)
+
+**Pins:** the per-file, per-form count of every soft mapping annotation in
+`src/elspeth` — `dict`/`Mapping`/`MutableMapping` with a `str` key and an
+`Any` or `object` value, in every position (all parameter kinds, returns,
+and `AnnAssign` at module, class or function scope, wrappers and unions
+included) — against `config/cicd/soft-mapping-census.yaml`. It runs inside
+`scripts/check_contracts.py`, so the pre-commit `Check Contracts` hook and
+CI's `Enforce contract alignment` step both enforce it. The exact counting
+rule is `CENSUS_METHOD` in that script and is emitted verbatim into the pin.
+
+```bash
+.venv/bin/python -m scripts.check_contracts                  # compare the live tree to the pin
+.venv/bin/python -m scripts.check_contracts --write-census   # re-pin, in the same commit that moved a site
+.venv/bin/python -m pytest tests/unit/scripts/test_check_contracts.py
+```
+
+**Rule.** Any drift from the pin fails, in either direction. Adding a soft
+site, removing one, or rewriting one form as another all change the counts,
+and the re-pin diff is the record of what moved. The burn-down score is the
+`soft` total in the pin's `totals` block; it falls only when a site leaves
+the soft family — converted to an owned type, or parsed at a
+`@trust_boundary` (its `source_param` moves to the `boundary` column, which
+counts as a removal). Rewriting `dict[str, Any]` as `Mapping[str, Any]` or
+`dict[str, object]` moves a count between columns in the same file and is
+not progress; the whitelist-rows-retired figure that credited it is not a
+score.
+
+**Re-pin legitimately.** Run `--write-census` and commit the regenerated
+file with the change that moved the site. Never hand-edit a count: the
+`totals` block is recomputed from the `files` block on every run and a
+mismatch is itself a drift. A rebase onto a tip whose census moved needs a
+re-pin too; check the diff shows only the sites you expect.
+
 ### Gate: masquerade sites (tests included)
 
 **Pins:** every `getattr`, `hasattr` and `getattr_static` probe in the whole

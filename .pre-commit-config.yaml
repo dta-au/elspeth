@@ -227,7 +227,7 @@ repos:
         # This hook fires on any src/elspeth Python change and is EXPECTED to
         # stay red until that drift is burned down — do not whitelist to
         # silence it.
-        files: ^(src/elspeth/.*\.py|scripts/check_contracts\.py|config/cicd/contracts-whitelist\.yaml|tests/unit/core/test_config_alignment\.py)$
+        files: ^(src/elspeth/.*\.py|scripts/check_contracts\.py|config/cicd/contracts-whitelist\.yaml|config/cicd/soft-mapping-census\.yaml|tests/unit/core/test_config_alignment\.py)$
         pass_filenames: false
 
       # Composer skill tool-inventory generator drift gate.
