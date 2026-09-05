@@ -419,12 +419,20 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
       return;
     }
 
+    // Full wire shape: the payload is decoded structurally since 69c910a56
+    // (preferencesDecoder.ts KEYS) and a missing key fails the tutorial gate
+    // closed, which is what hid the "Let's go" welcome turn.
     if (path === "/api/composer-preferences" && method === "GET") {
       await route.fulfill({
         json: {
           default_mode: "guided",
           banner_dismissed_at: null,
+          freeform_intro_dismissed_at: null,
           tutorial_completed_at: null,
+          tutorial_stage: null,
+          tutorial_session_id: null,
+          tutorial_run_id: null,
+          tutorial_source_data_hash: null,
           // The wire contract carries this and the wire-stage assertions below
           // depend on it: with show_advanced false every per-row "Technical
           // details" disclosure starts CLOSED, which is what the expand loop
@@ -442,7 +450,12 @@ async function installCollectorRoutes(page: Page, state: FixtureState): Promise<
         json: {
           default_mode: "guided",
           banner_dismissed_at: null,
+          freeform_intro_dismissed_at: null,
           tutorial_completed_at: null,
+          tutorial_stage: null,
+          tutorial_session_id: null,
+          tutorial_run_id: null,
+          tutorial_source_data_hash: null,
           // The PATCH response echoes the persisted preferences and the store
           // reads show_advanced straight off it, so it carries the same value
           // the GET above states (elspeth-ca456d9d8d).
@@ -675,8 +688,13 @@ test.describe("guided collector authoring (mocked wire-contract canary)", () => 
     // never mounts), and the review card names the node kind, its plugin, the
     // opener (by ordinal label), and the closed policy in plain words.
     // elspeth-ca456d9d8d: the components list names a plugin by its catalog
-    // display label ("Batch Stats"), not its raw id.
-    await expect(page.getByText("node-2 · collector · Batch Stats")).toBeVisible();
+    // display label ("Batch Stats"), not its raw id. Since a27dd8679 the row
+    // text is "<label> · <display name>" and the raw node_type/plugin pair is
+    // humanised out of the visible text into the row's title attribute, so
+    // the kind is asserted there rather than in the sentence.
+    const collectorRow = page.getByText("node-2 · Batch Stats");
+    await expect(collectorRow).toBeVisible();
+    await expect(collectorRow).toHaveAttribute("title", "collector · batch_stats");
     await expect(
       page.getByText(/Collects every row expanded by node-1 and releases the group as one batch, requiring every member to arrive\./),
     ).toBeVisible();

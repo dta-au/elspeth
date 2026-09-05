@@ -25,4 +25,6 @@ Modules:
 - ``compatibility_gate``: the runbook's rollback-refusal jq predicate as code.
 - ``replica_probes``: the replicas > 1 probe driver, its ``ReplicaController``
   port, and the closed ``mechanism`` vocabulary a probe result may claim.
+- ``testcontainer_run``: the ``testcontainer-run`` receipt — the pinned CI
+  selection, the junit reader, one validator and the two provider schema ids.
 """

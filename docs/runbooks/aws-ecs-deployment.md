@@ -680,6 +680,31 @@ persist_sanitized_receipt() {
   fi
 }
 
+record_testcontainer_run() {
+  # The PostgreSQL contention proofs (`-m testcontainer`) are the SAME
+  # selection CI's required testcontainer job runs; the receipt records the
+  # selection, pytest's exit code and the junit id counts. Evidence export
+  # REFUSES a candidate without exactly one passing run bound to the gate
+  # ledger's `tests` stage. The suites provision their own PostgreSQL through
+  # testcontainers on this host (no external-DSN seam exists in the tree), so
+  # Docker must be available here.
+  local exit_status=0 receipt_file receipt_hash
+  rm -f testcontainer-junit.xml
+  uv run --frozen pytest tests/ -m testcontainer -n 0 --junitxml=testcontainer-junit.xml || exit_status=$?
+  receipt_file=$(mktemp -p /tmp elspeth-testcontainer-receipt.XXXXXX)
+  chmod 600 "$receipt_file"
+  uv run --frozen python -m elspeth.web._acceptance_common.testcontainer_run \
+    --provider aws --junit testcontainer-junit.xml --exit-code "$exit_status" \
+    --candidate-sha "$CANDIDATE_SHA" --scenario-id "$ACTIVE_SCENARIO_ID" >"$receipt_file"
+  receipt_hash=$(persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" testcontainer-run \
+    "$(jq -r .junit_sha256 "$receipt_file")" "$receipt_file")
+  uv run --frozen python -m elspeth.web.aws_ecs_acceptance gate-ledger record \
+    --file "$GATE_LEDGER" --check-id tests --exit-status "$exit_status" \
+    --receipt-hash "$receipt_hash" --candidate-sha "$CANDIDATE_SHA"
+  rm -f "$receipt_file" testcontainer-junit.xml
+  return "$exit_status"
+}
+
 require_signed_tf_plan_approval() {
   local scenario_id="$1" receipt_hash="$2"
   uv run --frozen python -m elspeth.web.aws_ecs_acceptance approval-verify \
@@ -2844,6 +2869,17 @@ database-operator-owned archive decision and drop/recreate procedure followed
 by `--init-schema`; never automate it. Predecessor archives are evidence, not
 recovery inputs for the current release. If the fresh candidate fails, fix it
 forward and repeat the uninstall/recreate/reinstall procedure.
+
+Record the testcontainer run before any image is deployed: it is the gate
+ledger's `tests` stage, and `evidence-export-receipt` later refuses the
+candidate (`testcontainer_run_missing`, `testcontainer_run_failed`,
+`testcontainer_run_ledger`) unless exactly one passing run is on record. A
+failed run is stored with its exit code and superseded by a later passing one;
+it is never deleted.
+
+```bash
+record_testcontainer_run
+```
 
 ### 4. Deploy exactly one candidate task
 
