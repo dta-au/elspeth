@@ -5026,11 +5026,31 @@ class TestStep2IntraStep:
                 .mappings()
                 .one()
             )
-        assert operation["status"] == "in_progress"
-        assert operation["failure_code"] is None
-        assert operation["settled_at"] is None
+            terminal_events = (
+                conn.execute(
+                    select(guided_operation_events_table)
+                    .where(guided_operation_events_table.c.session_id == session_id)
+                    .where(guided_operation_events_table.c.operation_id == operation_id)
+                    .where(guided_operation_events_table.c.event_kind == "failed")
+                )
+                .mappings()
+                .all()
+            )
+        # Audit primacy under the Q3 ruling: the failure's evidence could not
+        # be recorded, so the lease guard's audit-free arm terminalises the
+        # row as an integrity failure and commits an EMPTY evidence cohort --
+        # the row says, durably, that it failed and that no evidence row
+        # belongs to it. The invariant is "no evidence row without its state
+        # row", never "no state row without evidence": the chat transcript is
+        # untouched and the canary never leaks.
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
+        assert operation["settled_at"] is not None
+        (terminal_event,) = terminal_events
+        assert terminal_event["failure_audit_cohort"]["count"] == 0
+        assert terminal_event["failure_audit_cohort"]["rows"] == []
         assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
-        assert failure_canary not in repr((exc_info.value, operation))
+        assert failure_canary not in repr((exc_info.value, operation, terminal_event))
 
     @pytest.mark.parametrize(
         "composer_test_client",
