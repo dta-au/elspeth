@@ -126,18 +126,22 @@ class TestValidateSemanticContracts:
         validate_semantic_contracts(_wardline_state(text_separator="\n"))
 
         # EXACT membership, not `>=`. Every transform node is probed as a
-        # candidate consumer before its requirements are known, line_explode's
+        # candidate consumer before its requirements are known, web_scrape's
         # producer is probed for facts, and each sink is probed as a consumer
         # too. A `>=` bound would be met by the transform probes alone and
         # would therefore HIDE a leaked, never-closed sink probe — the precise
         # defect this test exists to catch.
+        #
+        # ONE WebScrapeTransform, not two: its consumer probe and its producer
+        # probe read the same ValidationProbeCache instance for the node
+        # (elspeth-97b15928bc), closed once when the walk's cache closes. Sinks
+        # are not cached, so a leaked sink probe still shows here.
         #
         # NO source class belongs in this list — see the failure message.
         assert sorted(type(instance._delegate).__name__ for instance in tracking.instances) == [
             "JSONSink",
             "JSONSink",
             "LineExplode",
-            "WebScrapeTransform",
             "WebScrapeTransform",
         ], (
             "fixture must exercise both transform-consumer probes, the producer probe, and BOTH sink probes. "

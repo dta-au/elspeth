@@ -80,6 +80,7 @@ from elspeth.web.composer.state import (
     Severity,
     SourceSpec,
     ValidationEntry,
+    ValidationProbeCache,
     _is_config_probe_exception,
     _is_sink_config_probe_exception,
     _is_source_config_probe_exception,
@@ -110,10 +111,11 @@ def _side_effect_free_probe() -> Iterator[None]:
         yield
 
 
-def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:
-    """Construct a consumer transform instance to read its requirements.
+def _instantiate_consumer(node: NodeSpec, probe_cache: ValidationProbeCache) -> BaseTransform | None:
+    """Return the node's shared probe instance to read its requirements.
 
-    The caller owns every non-None instance and must close it in ``finally``.
+    ``probe_cache`` owns every instance and closes it when the owning
+    validate() returns; the caller must not close it.
 
     Returns None when:
     - node.plugin is unset (typed-None on a draft node)
@@ -138,19 +140,10 @@ def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:
     Unexpected exceptions PROPAGATE — a plugin method raising mid-construction
     is a system bug per CLAUDE.md plugin-as-system-code policy.
     """
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
     if node.plugin is None:
         return None
     try:
-        with _side_effect_free_probe():
-            return cast(
-                "BaseTransform",
-                get_shared_plugin_manager().create_transform(
-                    node.plugin,
-                    prepare_validation_probe_options(node.options, plugin=node.plugin),
-                ),
-            )
+        return cast("BaseTransform", probe_cache.transform(node.plugin, node))
     except Exception as exc:
         if _is_config_probe_exception(exc):
             return None
@@ -193,25 +186,22 @@ def _instantiate_source_producer(producer: ProducerEntry, sources: Mapping[str, 
         )
 
 
-def _instantiate_transform_producer(producer: ProducerEntry) -> BaseTransform | None:
-    """Construct a producer transform instance to read its facts."""
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+def _instantiate_transform_producer(producer: ProducerEntry, probe_cache: ValidationProbeCache) -> BaseTransform | None:
+    """Return the producer node's shared probe instance to read its facts.
 
+    ``probe_cache`` owns the instance; ``ProducerEntry.options`` is the
+    node's own options object, so this lands on the same entry the
+    schema-contract and consumer probes use for the node.
+    """
     if producer.plugin_name is None:
         return None
-    with _side_effect_free_probe():
-        return cast(
-            "BaseTransform",
-            get_shared_plugin_manager().create_transform(
-                producer.plugin_name,
-                prepare_validation_probe_options(producer.options, plugin=producer.plugin_name),
-            ),
-        )
+    return cast("BaseTransform", probe_cache.transform(producer.plugin_name, producer))
 
 
 def _safe_output_semantics(
     producer: ProducerEntry,
     sources: Mapping[str, SourceSpec],
+    probe_cache: ValidationProbeCache,
 ) -> OutputSemanticDeclaration | None:
     """Construct producer and read its semantics, tolerating draft-config errors.
 
@@ -236,7 +226,7 @@ def _safe_output_semantics(
     tolerated = _is_source_config_probe_exception if is_source else _is_config_probe_exception
     instance: BaseSource | BaseTransform | None
     try:
-        instance = _instantiate_source_producer(producer, sources) if is_source else _instantiate_transform_producer(producer)
+        instance = _instantiate_source_producer(producer, sources) if is_source else _instantiate_transform_producer(producer, probe_cache)
     except Exception as exc:
         if tolerated(exc):
             return None
@@ -244,6 +234,9 @@ def _safe_output_semantics(
 
     if instance is None:
         return None
+    if not is_source:
+        # A transform probe belongs to probe_cache, which closes it once.
+        return instance.output_semantics()
     try:
         return instance.output_semantics()
     finally:
@@ -539,8 +532,14 @@ def _sink_upstream_producers(resolver: ProducerResolver, sink_name: str) -> tupl
 
 def validate_semantic_contracts(
     state: CompositionState,
+    *,
+    probe_cache: ValidationProbeCache | None = None,
 ) -> tuple[tuple[ValidationEntry, ...], tuple[ValidationEntry, ...], tuple[SemanticEdgeContract, ...]]:
     """Validate semantic contracts across the composition.
+
+    ``probe_cache`` holds one validation-only transform instance per node;
+    ``CompositionState.validate()`` passes the cache it shares with the
+    schema-contract stage, and a standalone call owns one for this walk.
 
     Returns (errors, warnings, contracts):
     - errors: ValidationEntry records suitable for ValidationSummary.errors
@@ -548,6 +547,10 @@ def validate_semantic_contracts(
       UNKNOWN + WARN policy — disclosed but non-blocking
     - contracts: SemanticEdgeContract records for ValidationSummary.semantic_contracts
     """
+    if probe_cache is None:
+        with ValidationProbeCache() as owned_cache:
+            return validate_semantic_contracts(state, probe_cache=owned_cache)
+
     errors: list[ValidationEntry] = []
     warnings: list[ValidationEntry] = []
     contracts: list[SemanticEdgeContract] = []
@@ -570,13 +573,10 @@ def validate_semantic_contracts(
         # test/composition has a bug we MUST surface, otherwise the
         # validator silently skips the case it's meant to check.
         # Producer probes are tolerant (separate _safe_output_semantics).
-        consumer_instance = _instantiate_consumer(node)
+        consumer_instance = _instantiate_consumer(node, probe_cache)
         if consumer_instance is None:
             continue
-        try:
-            requirements = consumer_instance.input_semantic_requirements()
-        finally:
-            consumer_instance.close()
+        requirements = consumer_instance.input_semantic_requirements()
         if not requirements.fields:
             continue
 
@@ -599,7 +599,7 @@ def validate_semantic_contracts(
                 )
             continue
 
-        producer_decl = _safe_output_semantics(upstream_producer, state.sources)
+        producer_decl = _safe_output_semantics(upstream_producer, state.sources, probe_cache)
         for req in requirements.fields:
             _record_producer_edge(
                 consumer=consumer,
@@ -650,7 +650,7 @@ def validate_semantic_contracts(
         # contributes its own blocking error, so one bad arm blocks the sink
         # even when its siblings are satisfied.
         for sink_producer in sink_upstream:
-            sink_producer_decl = _safe_output_semantics(sink_producer, state.sources)
+            sink_producer_decl = _safe_output_semantics(sink_producer, state.sources, probe_cache)
             for req in sink_requirements.fields:
                 _record_producer_edge(
                     consumer=sink_consumer,
