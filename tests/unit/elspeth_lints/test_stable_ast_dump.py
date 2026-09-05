@@ -11,7 +11,10 @@ reports every pinned inventory as drift there (elspeth-b4f1be3f80). Two pins:
   changes this string;
 * on 3.13 itself, byte-equality with :func:`ast.dump` over every Python file
   in the tree, in both annotate modes — the proof that no pinned fingerprint
-  moves when a gate switches to the helper.
+  moves when a gate switches to the helper. The corpus comes from the lint
+  tree's single file-walk authority, :func:`elspeth_lints.core.ast_walker.walk_python_files`
+  (the entry point every rule uses), so this gate carries the shared worktree
+  and dependency-tree exclusions rather than a private ``rglob``.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from elspeth_lints.core.ast_dump import stable_ast_dump
+from elspeth_lints.core.ast_walker import ParsedPythonFile, walk_python_files
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CORPUS_ROOTS = ("src", "elspeth-lints/src", "tests")
@@ -61,16 +65,14 @@ def test_matches_ast_dump_over_the_whole_tree_on_3_13() -> None:
     mismatches: list[str] = []
     checked = 0
     for root in CORPUS_ROOTS:
-        for path in sorted((REPO_ROOT / root).rglob("*.py")):
-            try:
-                tree = ast.parse(path.read_bytes(), filename=str(path))
-            except SyntaxError:
+        for parsed in walk_python_files(REPO_ROOT / root):
+            if not isinstance(parsed, ParsedPythonFile):
                 continue
             checked += 1
             for annotate_fields in (True, False):
-                if stable_ast_dump(tree, annotate_fields=annotate_fields) != ast.dump(
-                    tree, annotate_fields=annotate_fields, include_attributes=False
+                if stable_ast_dump(parsed.tree, annotate_fields=annotate_fields) != ast.dump(
+                    parsed.tree, annotate_fields=annotate_fields, include_attributes=False
                 ):
-                    mismatches.append(f"{path.relative_to(REPO_ROOT)} annotate_fields={annotate_fields}")
+                    mismatches.append(f"{parsed.path.relative_to(REPO_ROOT)} annotate_fields={annotate_fields}")
     assert checked > 1000, checked
     assert mismatches == []
