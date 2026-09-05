@@ -36,20 +36,24 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, ClassVar, Final, Protocol, TypedDict, cast
-from urllib.parse import urlencode
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Final, Literal, Protocol, TypedDict, cast
+from urllib.parse import quote, urlencode
 
 import httpx
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from elspeth.web.auth.models import AuthenticationError
+from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.web.auth.id_token import JWKSTokenValidator
+from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims
 from elspeth.web.auth.urls import DiscoveredEndpoints, validate_discovered_endpoints
 
 # ── failure taxonomy ─────────────────────────────────────────────────────
@@ -99,13 +103,25 @@ class SsoStateMismatch(SsoLoginError):
         super().__init__(detail)
 
 
+IdpErrorReason = Literal["access_denied", "other"]
+
+
 class SsoIdpError(SsoLoginError):
-    """The IdP itself refused. Mapped onto a two-value set, never echoed."""
+    """The IdP itself refused, or answered with something that is not a code.
+
+    ``reason`` is the IdP's ``error`` parameter mapped onto a two-value set.
+    ``access_denied`` is the one value with a distinct meaning for an
+    operator (the user, or the IdP's policy, said no); everything else is
+    ``other``. The raw value is never stored and never in the message: the
+    parameter arrives in a URL the user's browser was redirected to, so it is
+    whatever the redirecting party wanted it to be.
+    """
 
     category: ClassVar[str] = "sso_idp_error"
 
-    def __init__(self, detail: str = "The identity provider refused the sign-in") -> None:
+    def __init__(self, *, reason: IdpErrorReason, detail: str = "The identity provider refused the sign-in") -> None:
         super().__init__(detail)
+        self.reason: IdpErrorReason = reason
 
 
 class SsoTokenExchangeFailed(SsoLoginError):
@@ -138,6 +154,24 @@ class SsoUserinfoInvalid(SsoLoginError):
         super().__init__(detail)
 
 
+class SsoIdentityDisabled(SsoLoginError):
+    """The person proved who they are; an administrator has disabled them."""
+
+    category: ClassVar[str] = "sso_identity_disabled"
+
+    def __init__(self, detail: str = "This account has been disabled") -> None:
+        super().__init__(detail)
+
+
+class SsoAccessPending(SsoLoginError):
+    """The person proved who they are; nobody has admitted them yet."""
+
+    category: ClassVar[str] = "sso_access_pending"
+
+    def __init__(self, detail: str = "This account is awaiting approval") -> None:
+        super().__init__(detail)
+
+
 class SsoHandoffInvalid(SsoLoginError):
     """Unknown, already used, or expired handoff code."""
 
@@ -145,6 +179,24 @@ class SsoHandoffInvalid(SsoLoginError):
 
     def __init__(self, detail: str = "This sign-in link has already been used or has expired") -> None:
         super().__init__(detail)
+
+
+PROVIDER_UNAVAILABLE_CATEGORY: Final = "provider_unavailable"
+"""The one category without the ``sso_`` prefix, and the one that is not a refusal.
+
+Spec §Failure categories names it as a member of the closed set. It is
+carried by the pre-existing ``AuthProviderUnavailable`` (a 503, not a 401)
+rather than by an ``SsoLoginError`` subclass, because the browser's remedy
+is different: every ``sso_*`` category means "start again"; this one means
+"wait". The prefix rule in the tests admits exactly this name.
+"""
+
+
+def failure_category(exc: SsoLoginError | AuthProviderUnavailable) -> str:
+    """The redirect parameter for a login failure. Total over the two types the route catches."""
+    if isinstance(exc, SsoLoginError):
+        return exc.category
+    return PROVIDER_UNAVAILABLE_CATEGORY
 
 
 # The closed set, derived from the classes rather than restated. A runtime
@@ -159,7 +211,10 @@ SSO_FAILURE_CATEGORIES: Final[frozenset[str]] = frozenset(
         SsoIdTokenInvalid.category,
         SsoClaimCheckFailed.category,
         SsoUserinfoInvalid.category,
+        SsoIdentityDisabled.category,
+        SsoAccessPending.category,
         SsoHandoffInvalid.category,
+        PROVIDER_UNAVAILABLE_CATEGORY,
     }
 )
 
@@ -479,9 +534,17 @@ _MAX_DISCOVERY_BYTES: Final = 256 * 1024
 
 
 class SsoDiscoveryFailed(SsoLoginError):
-    """Discovery could not be completed, or returned something unusable."""
+    """Discovery could not be completed, or returned something unusable.
 
-    category: ClassVar[str] = "sso_discovery_failed"
+    Its category is ``provider_unavailable``: spec §2 maps a discovery outage
+    onto the existing 503 path, and from the browser's side an IdP whose
+    discovery document is unreachable and one whose document is unusable
+    are the same event — the provider cannot be used right now, and the
+    remedy is to wait, not to start again. The audit row keeps the
+    distinction through ``exception_class`` and the detail.
+    """
+
+    category: ClassVar[str] = PROVIDER_UNAVAILABLE_CATEGORY
 
 
 def _discovery_string(document: Mapping[str, Any], key: str, *, required: bool) -> str | None:
@@ -684,3 +747,456 @@ def authorization_redirect(
             redirect_uri=redirect_uri,
         ),
     )
+
+
+# ── callback ─────────────────────────────────────────────────────────────
+#
+# The browser is back. Everything it brought — the cookie, the query string —
+# and everything the IdP will now send — the token response, the ID token,
+# the userinfo body — is unverified until the step that verifies it runs.
+# The order below is the order the checks CAN run in: nothing is fetched from
+# the IdP until the cookie has opened and the state has matched, so a
+# callback that was not started by this browser costs no token-endpoint call.
+
+_TOKEN_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
+_USERINFO_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
+
+# A token response is three or four short strings and a JWT; a userinfo body
+# is a handful of claims. Either far past this is a different resource.
+_MAX_TOKEN_RESPONSE_BYTES: Final = 64 * 1024
+_MAX_USERINFO_BYTES: Final = 64 * 1024
+
+# An authorization code is an opaque string the IdP minted moments ago. It
+# is forwarded verbatim to the token endpoint, so its size is bounded here
+# rather than by whatever the token endpoint will accept.
+_MAX_AUTHORIZATION_CODE_LENGTH: Final = 2048
+
+
+@dataclass(frozen=True, slots=True)
+class CallbackQuery:
+    """The three query parameters a callback may carry, as the route read them.
+
+    ``None`` is absence. A present-but-empty parameter is a value, and it is
+    refused where a value would be — an empty ``state`` does not match, an
+    empty ``code`` is not a code.
+    """
+
+    code: str | None
+    state: str | None
+    error: str | None
+
+
+def open_callback(
+    query: CallbackQuery,
+    cookie_value: str | None,
+    *,
+    transaction_secret: str,
+    provider: str,
+    redirect_uri: str,
+    now: int | None = None,
+) -> tuple[str, SsoTransaction]:
+    """Verify the callback belongs to a walk this browser started; return its code.
+
+    THE ORDER IS THE POINT. Cookie, then state, then the IdP's ``error``,
+    then the code — and every step before the code is a check that costs
+    nothing remote. An ``error`` parameter is only honoured once the state
+    has matched, so a link someone crafted to ``?error=access_denied`` does
+    not write an ``sso_idp_error`` row against a walk it was never part of.
+
+    ``state`` is compared in constant time as bytes: ``compare_digest`` on
+    ``str`` raises on non-ASCII, and the query string is attacker-supplied.
+    """
+    if cookie_value is None:
+        raise SsoCookieMissing
+    transaction = open_transaction(cookie_value, secret=transaction_secret, provider=provider, redirect_uri=redirect_uri, now=now)
+
+    if query.state is None or not hmac.compare_digest(query.state.encode("utf-8"), transaction.state.encode("utf-8")):
+        raise SsoStateMismatch
+
+    if query.error is not None:
+        raise SsoIdpError(reason="access_denied" if query.error == "access_denied" else "other")
+
+    code = query.code
+    if code is None or not code or len(code) > _MAX_AUTHORIZATION_CODE_LENGTH or not code.isprintable():
+        # No error and no usable code is not a refusal the IdP expressed; it
+        # is a response that is not an OAuth response. Same category: the
+        # provider's answer could not be used.
+        raise SsoIdpError(reason="other", detail="The identity provider returned no usable authorization code")
+    return code, transaction
+
+
+@dataclass(frozen=True, slots=True)
+class RedeemedTokens:
+    """What the token endpoint returned, for exactly as long as the callback needs it.
+
+    ``access_token`` exists to make ONE userinfo call and is then dropped;
+    ``id_token`` exists to be verified and is then dropped. Neither is ever
+    stored, and neither appears in ``repr`` — a dataclass in a traceback or
+    a log line must not be the place an IdP token is written down.
+
+    A refresh token, if the IdP sent one, is never read out of the response.
+    """
+
+    id_token: str = field(repr=False)
+    access_token: str = field(repr=False)
+
+
+def _token_string(document: Mapping[str, Any], key: str) -> str:
+    value = document[key] if key in document else None
+    if type(value) is not str or not value:
+        raise SsoTokenExchangeFailed(f"token response {key!r} is not a non-empty string")
+    return value
+
+
+@trust_boundary(
+    tier=3,
+    source="token endpoint response JSON from the IdP, after the authorization-code exchange",
+    source_param="document",
+    suppresses=("R1",),
+    invariant="raises SsoTokenExchangeFailed unless document is a JSON object with a Bearer token_type and non-empty id_token and access_token strings; never coerces",
+    test_ref="tests/unit/web/auth/test_sso_callback.py::TestTokenResponseBoundary::test_parse_token_response_non_dict_raises",
+    test_fingerprint="8f300a081a1c9e166b725115f73e27f9edd9f139850b230509a065923df5509c",
+)
+def parse_token_response(document: object) -> RedeemedTokens:
+    """Parse the token endpoint's JSON into the two strings the callback uses.
+
+    ``token_type`` is compared case-insensitively: RFC 6749 §5.1 makes the
+    value case-insensitive and providers differ (``Bearer``, ``bearer``).
+    Anything that is not a bearer token is not a token this code knows how
+    to present to userinfo, so it is refused rather than tried.
+    """
+    if not isinstance(document, dict):
+        raise SsoTokenExchangeFailed(f"token response is not a JSON object (got {type(document).__name__})")
+    mapping = cast("Mapping[str, Any]", document)
+    if _token_string(mapping, "token_type").lower() != "bearer":
+        raise SsoTokenExchangeFailed("token response token_type is not Bearer")
+    return RedeemedTokens(id_token=_token_string(mapping, "id_token"), access_token=_token_string(mapping, "access_token"))
+
+
+def _client_secret_basic(client_id: str, client_secret: str) -> str:
+    """The ``Authorization`` header for ``client_secret_basic``.
+
+    RFC 6749 §2.3.1: the id and secret are form-URL-encoded BEFORE they are
+    joined and base64-encoded. ``httpx``'s Basic auth helper skips the
+    encoding step, which is only harmless while neither value contains a
+    character the encoding would change.
+    """
+    credentials = f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}"
+    return "Basic " + base64.b64encode(credentials.encode("ascii")).decode("ascii")
+
+
+async def redeem_authorization_code(
+    code: str,
+    *,
+    verifier: str,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> RedeemedTokens:
+    """Exchange the code for tokens at the token endpoint, or refuse.
+
+    The client authenticates with ``client_secret_basic``: the secret goes in
+    the ``Authorization`` header, never in the form body, so it is absent
+    from any request log that records bodies. ``client_id`` is repeated in
+    the body because some providers require it there even when the header
+    already identifies the client, and RFC 6749 permits the repetition.
+
+    REDIRECTS ARE DISABLED. A followed redirect would post the client secret
+    and the authorization code to wherever the redirect pointed.
+
+    Every failure is ``SsoTokenExchangeFailed``. The HTTP status is named in
+    the detail because it is the one fact an operator needs and it is not
+    IdP-authored text; the response body never is.
+    """
+    headers = {
+        "Authorization": _client_secret_basic(client_id, client_secret),
+        "Accept": "application/json",
+    }
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False, transport=transport) as client:
+            response = await client.post(token_endpoint, data=form, headers=headers)
+    except httpx.HTTPError as exc:
+        # Class name only: str(exc) can carry the resolved address of the IdP.
+        raise SsoTokenExchangeFailed(f"token request failed ({type(exc).__name__})") from exc
+
+    if response.status_code != 200:
+        raise SsoTokenExchangeFailed(f"token endpoint returned HTTP {response.status_code}")
+    if len(response.content) > _MAX_TOKEN_RESPONSE_BYTES:
+        raise SsoTokenExchangeFailed("token response exceeds the maximum accepted size")
+    try:
+        document = json.loads(response.content)
+    except ValueError as exc:
+        raise SsoTokenExchangeFailed("token response is not valid JSON") from exc
+    return parse_token_response(document)
+
+
+def _media_type(content_type: str) -> str:
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+@trust_boundary(
+    tier=3,
+    source="userinfo endpoint response JSON from the IdP, fetched with the just-redeemed access token",
+    source_param="document",
+    suppresses=("R1",),
+    invariant="raises SsoUserinfoInvalid unless document is a JSON object whose sub is a string equal to expected_subject; never coerces",
+    test_ref="tests/unit/web/auth/test_sso_callback.py::TestUserinfoBoundary::test_parse_userinfo_non_dict_raises",
+    test_fingerprint="ede8a61e1355122e70018faa82b2941179b4e5e3427298d79a4502ea9b223bc5",
+)
+def parse_userinfo(document: object, *, expected_subject: str) -> Mapping[str, Any]:
+    """Bind a userinfo body to the ID token it was fetched for.
+
+    The ONE check that is this function's own: userinfo ``sub`` must equal
+    the ID token's ``sub``, in constant time. Without it, a provider (or a
+    proxy in front of one) that answers userinfo with a different person's
+    claims would have those claims attached to the verified identity.
+
+    The remaining claims are not read here. The profile's ``map_identity``
+    reads exactly the keys it declares and constructs the owned
+    ``IdentityClaims``; this function's job is to establish that the body is
+    an object about the right subject, and to hand over nothing else.
+    """
+    if not isinstance(document, dict):
+        raise SsoUserinfoInvalid(f"userinfo response is not a JSON object (got {type(document).__name__})")
+    mapping = cast("Mapping[str, Any]", document)
+    subject = mapping["sub"] if "sub" in mapping else None
+    if type(subject) is not str or not hmac.compare_digest(subject.encode("utf-8"), expected_subject.encode("utf-8")):
+        raise SsoUserinfoInvalid("userinfo sub does not match the ID token")
+    return mapping
+
+
+async def fetch_userinfo(
+    *,
+    userinfo_endpoint: str,
+    access_token: str,
+    expected_subject: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> Mapping[str, Any]:
+    """Fetch userinfo for the subject just verified, or refuse.
+
+    Spec §Userinfo: 200, ``application/json``, at most 64 KiB, an object
+    whose ``sub`` matches. Anything else — including a transport failure —
+    is ``sso_userinfo_invalid``: the profile declared it cannot build an
+    identity without this call, so there is no login to fall back to.
+    """
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=_USERINFO_TIMEOUT, follow_redirects=False, transport=transport) as client:
+            response = await client.get(userinfo_endpoint, headers=headers)
+    except httpx.HTTPError as exc:
+        raise SsoUserinfoInvalid(f"userinfo request failed ({type(exc).__name__})") from exc
+
+    if response.status_code != 200:
+        raise SsoUserinfoInvalid(f"userinfo endpoint returned HTTP {response.status_code}")
+    content_type = response.headers["content-type"] if "content-type" in response.headers else ""
+    if _media_type(content_type) != "application/json":
+        raise SsoUserinfoInvalid("userinfo response is not application/json")
+    if len(response.content) > _MAX_USERINFO_BYTES:
+        raise SsoUserinfoInvalid("userinfo response exceeds the maximum accepted size")
+    try:
+        document = json.loads(response.content)
+    except ValueError as exc:
+        raise SsoUserinfoInvalid("userinfo response is not valid JSON") from exc
+    return parse_userinfo(document, expected_subject=expected_subject)
+
+
+@dataclass(frozen=True, slots=True)
+class SsoClient:
+    """What this deployment is to its IdP, bound once at startup.
+
+    Everything the callback needs that does not vary per request. The
+    endpoints are the RESOLVED ones — already put through the origin policy
+    by discovery or by the break-glass validation — so nothing here is
+    re-checked per login.
+
+    ``userinfo`` and ``endpoints.userinfo_endpoint`` are made to agree at
+    construction: a profile that needs userinfo against a provider that
+    published no endpoint is a deployment that cannot log anyone in, and it
+    should say so at startup rather than at the first user's callback.
+    """
+
+    provider: AuthProviderType
+    client_id: str
+    client_secret: str = field(repr=False)
+    redirect_uri: str
+    transaction_secret: str = field(repr=False)
+    public_base_url: str
+    endpoints: DiscoveredEndpoints
+    id_token_algorithms: tuple[str, ...]
+    userinfo: bool
+
+    def __post_init__(self) -> None:
+        if self.userinfo and self.endpoints.userinfo_endpoint is None:
+            raise ValueError(f"the {self.provider!r} profile requires userinfo but the provider published no userinfo_endpoint")
+
+
+class AdmittedIdentity(Protocol):
+    """The three facts about an identity row the callback acts on.
+
+    ``web.auth`` does not import ``web.sessions``, so the row type is not
+    named here; this is what the injected upsert must return, and
+    ``IdentityRecord`` satisfies it. Typing only — nothing dispatches on it.
+    """
+
+    @property
+    def identity_id(self) -> str: ...
+    @property
+    def username(self) -> str: ...
+    @property
+    def access_state(self) -> str: ...
+
+
+def admit(identity: AdmittedIdentity) -> None:
+    """Refuse a verified login the container has not admitted.
+
+    Three states, three outcomes, and an unknown state is a refusal rather
+    than a pass: the column carries a CHECK constraint, so a fourth value
+    means the store is not the store this code was written against.
+    """
+    state = identity.access_state
+    if state == "active":
+        return
+    if state == "disabled":
+        raise SsoIdentityDisabled
+    if state == "pending":
+        raise SsoAccessPending
+    raise AuthenticationError(f"identity {identity.identity_id} has an unrecognised access_state")
+
+
+def _spa_location(public_base_url: str, params: Mapping[str, str]) -> str:
+    # The FRAGMENT, not the query: browsers do not send it, so neither the
+    # load balancer nor uvicorn logs it. That is the whole reason the
+    # handoff exists (module docstring). The failure category rides the same
+    # way so the SPA has one route with one parser.
+    return f"{public_base_url.rstrip('/')}/#/auth/callback?{urlencode(params)}"
+
+
+def handoff_location(public_base_url: str, code: str) -> str:
+    """Where to send the browser after a successful callback."""
+    return _spa_location(public_base_url, {"code": code})
+
+
+def failure_location(public_base_url: str, category: str) -> str:
+    """Where to send the browser after a refused callback. Category only."""
+    if category not in SSO_FAILURE_CATEGORIES:
+        # Derived from the classes, so the only way here is a caller passing
+        # something that is not a category — never let it into a URL.
+        raise ValueError(f"{category!r} is not an SSO failure category")
+    return _spa_location(public_base_url, {"error": category})
+
+
+async def login_callback(
+    query: CallbackQuery,
+    cookie_value: str | None,
+    *,
+    client: SsoClient,
+    validator: JWKSTokenValidator,
+    claim_checks: Callable[[Mapping[str, Any]], None],
+    map_identity: Callable[[Mapping[str, Any], Mapping[str, Any] | None], IdentityClaims],
+    upsert_identity: Callable[[IdentityClaims], AdmittedIdentity],
+    record_login: Callable[[AdmittedIdentity], None],
+    handoffs: HandoffStore,
+    request_id: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+    now: int | None = None,
+) -> str:
+    """The whole callback, from cookie to redirect location.
+
+    Injected rather than imported: the identity upsert and the audit write
+    live in ``web.sessions`` and the Landscape, which ``web.auth`` does not
+    depend on, and the route is where a ``Request`` exists to derive the
+    audit row's client host and request id from. Taking them as callables
+    lets THIS function own the order — which is the property worth a test:
+
+    1. cookie → state → IdP error → code, none of it remote;
+    2. token exchange;
+    3. ID-token verification, with the nonce from the cookie;
+    4. the profile's own claim checks;
+    5. userinfo, only if the profile needs it, bound to the ID token's sub;
+    6. ``map_identity`` — the Tier-3 boundary that yields the owned claims;
+    7. the IdP's tokens are dropped: nothing after this line can see them;
+    8. upsert, admit, audit ``login``, THEN issue the handoff.
+
+    The login row is written before the handoff exists, so a handoff can
+    never be redeemed for a login the trail does not record.
+
+    ``AuthProviderUnavailable`` is re-raised as itself: it is a 503 and the
+    browser's remedy is to wait, so it must not be reclassified as an
+    ID-token failure, which says "start again".
+    """
+    code, transaction = open_callback(
+        query,
+        cookie_value,
+        transaction_secret=client.transaction_secret,
+        provider=client.provider,
+        redirect_uri=client.redirect_uri,
+        now=now,
+    )
+    tokens = await redeem_authorization_code(
+        code,
+        verifier=transaction.verifier,
+        token_endpoint=client.endpoints.token_endpoint,
+        client_id=client.client_id,
+        client_secret=client.client_secret,
+        redirect_uri=client.redirect_uri,
+        transport=transport,
+    )
+
+    try:
+        id_claims = await validator.decode_id_token_with_refresh(
+            tokens.id_token,
+            algorithms=client.id_token_algorithms,
+            audience=client.client_id,
+            nonce=transaction.nonce,
+            client_id=client.client_id,
+        )
+    except AuthProviderUnavailable:
+        raise
+    except AuthenticationError as exc:
+        raise SsoIdTokenInvalid from exc
+
+    try:
+        claim_checks(id_claims)
+    except AuthenticationError as exc:
+        raise SsoClaimCheckFailed from exc
+
+    userinfo: Mapping[str, Any] | None = None
+    if client.userinfo:
+        # ``sub`` is in the decoder's required-claims list, so it is present
+        # and a string here; the membership form is kept because this is
+        # still foreign data and the accessor should look like one.
+        subject = id_claims["sub"] if "sub" in id_claims else None
+        if type(subject) is not str:
+            raise SsoIdTokenInvalid
+        userinfo = await fetch_userinfo(
+            # ``__post_init__`` made this non-None whenever ``client.userinfo``.
+            userinfo_endpoint=cast("str", client.endpoints.userinfo_endpoint),
+            access_token=tokens.access_token,
+            expected_subject=subject,
+            transport=transport,
+        )
+
+    try:
+        claims = map_identity(id_claims, userinfo)
+    except AuthenticationError as exc:
+        raise (SsoUserinfoInvalid if userinfo is not None else SsoIdTokenInvalid) from exc
+
+    # ELSPETH never stores IdP tokens. From here on nothing can read them.
+    del tokens
+
+    identity = upsert_identity(claims)
+    admit(identity)
+    record_login(identity)
+
+    handoff = new_handoff_code()
+    handoffs.issue(code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
+    return handoff_location(client.public_base_url, handoff)
