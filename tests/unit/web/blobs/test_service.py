@@ -1093,6 +1093,64 @@ class TestDeleteBlob:
             await blob_service.delete_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["blob_ref", "blob_id"])
+    async def test_delete_blob_rejects_when_active_run_references_blob_in_upper_case(
+        self, blob_service, session_id, db_engine, compose_context, key: str
+    ) -> None:
+        """The composition-state guard compares blob ids by UUID identity, not spelling.
+
+        The binding contract admits ``[0-9a-fA-F]`` hyphenated markers and binds
+        them through ``UUID(...)``, so an upper-case ``blob_ref`` (or a
+        ``blob_id`` custody key) names the SAME blob the store recorded in lower
+        case; a spelling comparison read it as unbound and let the delete through
+        (elspeth-f123a7b3d2).
+        """
+        record = await blob_service.create_blob(
+            session_id=session_id,
+            filename="upper.csv",
+            content=b"important",
+            mime_type="text/csv",
+            created_by="user",
+            session_operation_context=compose_context,
+        )
+        upper = str(record.id).upper()
+        assert upper != str(record.id)
+        # A top-level source ``blob_ref`` is a web-only option key the lowering
+        # strips before the guard walks the run's pipeline dict; the id the
+        # walker must recognise is the NESTED one — an inline-content marker
+        # under a transform option, or a ``blob_id`` custody key.
+        marker: dict[str, object] = (
+            {"blob_ref": upper, "mode": "inline_content", "sha256": record.content_hash} if key == "blob_ref" else {"blob_id": upper}
+        )
+
+        await _seed_active_run(
+            db_engine,
+            session_id,
+            session_operation_context=compose_context,
+            source={
+                "plugin": "csv",
+                "on_success": "classify",
+                "on_validation_failure": "quarantine",
+                "options": {"path": "/data/external/other.csv"},
+            },
+            nodes=[
+                {
+                    "id": "classify",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_out",
+                    "on_success": "output",
+                    "on_error": "discard",
+                    "options": {"system_prompt": marker},
+                }
+            ],
+        )
+
+        with pytest.raises(BlobActiveRunError):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        assert Path(record.storage_path).exists()
+
+    @pytest.mark.asyncio
     async def test_delete_blob_allows_when_active_run_uses_different_source(
         self, blob_service, session_id, db_engine, compose_context
     ) -> None:
