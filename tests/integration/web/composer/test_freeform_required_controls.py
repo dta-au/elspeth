@@ -15,6 +15,7 @@ from pydantic import SecretBytes
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.web.blobs.service import BlobServiceImpl
@@ -44,6 +45,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
 )
+from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _count_rows,
     _harness,
@@ -250,12 +252,14 @@ async def _incremental_textract_state(
     snapshot: PluginAvailabilitySnapshot,
 ) -> tuple[CompositionState, dict[str, Any]]:
     args = _textract_llm_mapper_args(tmp_path)
-    blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
-        UUID(harness.session_id),
-        "manifest.csv",
-        b"doc_key\ninbox/document.pdf\n",
-        "text/csv",
-    )
+    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+            UUID(harness.session_id),
+            "manifest.csv",
+            b"doc_key\ninbox/document.pdf\n",
+            "text/csv",
+            session_operation_context=create_context,
+        )
     args["source"] = {
         "plugin": "csv",
         "on_success": "manifest_rows",
@@ -308,12 +312,14 @@ async def _incremental_named_blob_state(
     sources = {"primary": original_source}
     outputs: tuple[OutputSpec, ...] = ()
     if source_count == 2:
-        extra_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
-            UUID(harness.session_id),
-            "secondary.csv",
-            b"doc_key\ninbox/secondary.pdf\n",
-            "text/csv",
-        )
+        with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+            extra_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+                UUID(harness.session_id),
+                "secondary.csv",
+                b"doc_key\ninbox/secondary.pdf\n",
+                "text/csv",
+                session_operation_context=create_context,
+            )
         sources["secondary"] = SourceSpec(
             plugin=original_source.plugin,
             on_success="secondary_manifest_rows",

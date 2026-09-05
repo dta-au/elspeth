@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -26,6 +27,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 from .test_tools import _mock_catalog, _trained_tool_context
@@ -80,19 +82,21 @@ def harness(tmp_path):
 def _create_ready_blob(harness, *, content: bytes, filename: str, mime_type: str) -> str:
     import asyncio
 
-    _, blob_service, session_id = harness
+    engine, blob_service, session_id = harness
     from uuid import UUID
 
-    record = asyncio.run(
-        blob_service.create_blob(
-            session_id=UUID(session_id),
-            filename=filename,
-            content=content,
-            mime_type=mime_type,  # type: ignore[arg-type]
-            created_by="user",
-            source_description="uploaded",
+    with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+        record = asyncio.run(
+            blob_service.create_blob(
+                session_id=UUID(session_id),
+                filename=filename,
+                content=content,
+                mime_type=mime_type,  # type: ignore[arg-type]
+                created_by="user",
+                source_description="uploaded",
+                session_operation_context=create_context,
+            )
         )
-    )
     return str(record.id)
 
 
@@ -172,15 +176,17 @@ class TestSetSourceFromBlobs:
         import asyncio
         from uuid import UUID
 
-        foreign = asyncio.run(
-            blob_service.create_blob(
-                session_id=UUID(other_session),
-                filename="secret.png",
-                content=_PNG,
-                mime_type="image/png",  # type: ignore[arg-type]
-                created_by="user",
+        with fenced_operation_context(engine, other_session, operation_kind=SessionOperationKind.CREATE) as foreign_context:
+            foreign = asyncio.run(
+                blob_service.create_blob(
+                    session_id=UUID(other_session),
+                    filename="secret.png",
+                    content=_PNG,
+                    mime_type="image/png",  # type: ignore[arg-type]
+                    created_by="user",
+                    session_operation_context=foreign_context,
+                )
             )
-        )
 
         result = _run(harness, {"blob_ids": [str(foreign.id)], "on_success": "docs"})
 

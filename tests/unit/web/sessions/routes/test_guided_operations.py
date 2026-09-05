@@ -505,8 +505,7 @@ async def test_terminal_stale_settlement_conflict_maps_to_safe_http_409() -> Non
 
 @pytest.mark.asyncio
 async def test_guided_lease_guard_repeated_cancellation_fails_guided_before_exact_once_close() -> None:
-    guard_factory = getattr(guided_operations_module, "guided_operation_lease_guard", None)
-    assert guard_factory is not None
+    guard_factory = guided_operations_module.guided_operation_lease_guard
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="guard-cancel", lease_token="guided-secret", attempt=1)
     context = _context(session_id)
@@ -560,8 +559,7 @@ async def test_guided_lease_guard_repeated_cancellation_fails_guided_before_exac
 
 @pytest.mark.asyncio
 async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes() -> None:
-    guard_factory = getattr(guided_operations_module, "guided_operation_lease_guard", None)
-    assert guard_factory is not None
+    guard_factory = guided_operations_module.guided_operation_lease_guard
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="guard-error", lease_token="guided-secret", attempt=1)
     context = _context(session_id)
@@ -592,8 +590,7 @@ async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes
 
 @pytest.mark.asyncio
 async def test_guided_lease_guard_rejects_normal_exit_while_guided_fence_is_still_live() -> None:
-    guard_factory = getattr(guided_operations_module, "guided_operation_lease_guard", None)
-    assert guard_factory is not None
+    guard_factory = guided_operations_module.guided_operation_lease_guard
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="guard-live-return", lease_token="secret", attempt=1)
     context = _context(session_id)

@@ -256,7 +256,9 @@ defects as you find them, and never make the tier-model state worse. There is
 no global obligation for this gate to pass during feature delivery; the global
 obligation is to follow the trust-tier standards and avoid introducing new
 defects or drift. The operator signs once, at package completion, after churn
-has settled.
+has settled. Since 2026-09-05 the `test` and `testcontainer` jobs no longer
+wait on `static-analysis`, so the suites run and report while that job is red;
+`CI Success` still requires `static-analysis`, so the red still blocks merges.
 
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
