@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import json
@@ -26,6 +27,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
@@ -81,7 +83,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
-from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.protocol import CompositionStateRecord, SessionOperationAuthority
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 
 _T = TypeVar("_T")
@@ -98,6 +100,53 @@ _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GUIDED_INLINE_CUSTODY_OPERATION_KINDS = ("guided_plan", "guided_respond")
 _LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
 _INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
+
+# Session-operation kinds admitted to each blob effect. A context whose
+# operation kind is outside the set for an effect is refused before any
+# database or filesystem access: the fence names WHAT the operation is, and a
+# blob create under an ARCHIVE fence (or a delete under a BLOB_READ fence) is
+# a programming error, never something to tolerate.
+_CREATE_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.CREATE,
+        SessionOperationKind.COMPOSE,
+    }
+)
+_READ_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.BLOB_READ,
+        SessionOperationKind.COMPOSE,
+        SessionOperationKind.EXECUTE,
+        SessionOperationKind.SESSION_FORK,
+    }
+)
+_DELETE_BLOB_OPERATION_KINDS = frozenset(
+    {
+        SessionOperationKind.ARCHIVE,
+        SessionOperationKind.COMPOSE,
+    }
+)
+_EXECUTE_BLOB_OPERATION_KINDS = frozenset({SessionOperationKind.EXECUTE})
+# The raced-deletion errnos a content read translates into the typed
+# ``BlobContentMissingError``: ENOENT when the file vanished between the
+# existence guard and the open, ESTALE when a sibling replica's delete revoked
+# the inode under an already-open handle on a shared NFS mount (replicas > 1;
+# elspeth-632373963d). Every other errno is a real I/O fault and propagates.
+_RACED_DELETION_ERRNOS = frozenset({errno.ENOENT, errno.ESTALE})
+
+
+def _require_blob_operation_context(
+    context: SessionOperationContext,
+    *,
+    allowed_kinds: frozenset[SessionOperationKind],
+) -> None:
+    """Refuse anything but an exact context of an admitted operation kind."""
+    if type(context) is not SessionOperationContext:
+        raise TypeError("session_operation_context must be an exact SessionOperationContext")
+    if context.operation_kind not in allowed_kinds:
+        raise ValueError("session operation context has an invalid operation kind for this blob effect")
+
+
 _INLINE_CUSTODY_STAGE_TEMP_SUFFIX = f"{_INLINE_CUSTODY_STAGE_SUFFIX}.custody.tmp"
 
 
@@ -1981,6 +2030,18 @@ def _guard_blob_row_literals(row: Any) -> None:
         )
 
 
+def _aware_utc(value: datetime) -> datetime:
+    """Normalise a stored timestamp to aware UTC; SQLite returns the column naive.
+
+    The session-operation authority's blob facet applies the same rule, so a
+    record read through the fence and a record built here compare equal — the
+    fenced content reads depend on that equality.
+    """
+    if type(value) is not datetime:
+        raise AuditIntegrityError(f"Tier 1: blobs.created_at is {type(value).__name__}, expected datetime")
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _row_to_blob_record(row: Any) -> BlobRecord:
     """Convert a blobs row into a guarded BlobRecord."""
     _guard_blob_row_literals(row)
@@ -1992,7 +2053,7 @@ def _row_to_blob_record(row: Any) -> BlobRecord:
         size_bytes=row.size_bytes,
         content_hash=row.content_hash,
         storage_path=row.storage_path,
-        created_at=row.created_at,
+        created_at=_aware_utc(row.created_at),
         created_by=row.created_by,
         source_description=row.source_description,
         status=row.status,
@@ -2139,13 +2200,71 @@ class BlobServiceImpl:
     executor via _run_sync().
     """
 
-    def __init__(self, engine: Engine, data_dir: Path, max_storage_per_session: int = 500 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        data_dir: Path,
+        max_storage_per_session: int = 500 * 1024 * 1024,
+        *,
+        session_operation_authority: SessionOperationAuthority | None = None,
+    ) -> None:
         self._engine = engine
         self._data_dir = data_dir.expanduser().resolve()
         self._max_storage_per_session = max_storage_per_session
+        if session_operation_authority is None:
+            # The dialect-derived default is the same authority the session
+            # service builds over this engine; a deployment that wires one
+            # explicitly (web/app.py) shares the instance instead.
+            if engine.dialect.name == "sqlite":
+                from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+
+                session_operation_authority = SQLiteLocalSessionOperationAuthority(engine)
+            elif engine.dialect.name == "postgresql":
+                from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+
+                session_operation_authority = PostgresSessionOperationRepository(engine)
+            else:
+                raise NotImplementedError(f"Session operation authority is not implemented for dialect {engine.dialect.name}")
+        self._session_operation_authority = session_operation_authority
 
     async def _run_sync(self, func: Callable[[], _T]) -> _T:
         return await run_sync_in_worker(func)
+
+    def _fenced_blob_record(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
+        """Read one blob's metadata as the fence's session, through the authority.
+
+        One authority mutation: the exact context is compare-and-swapped and
+        the row is read under the session's fence lock, so a stale fence
+        raises ``SessionOperationFenceLost`` and a blob outside the fence's
+        session custody reads exactly like a missing one — the two are
+        indistinguishable by construction, not by a caller's comparison.
+        """
+        # Local import: coordination.repository imports the blob contracts at
+        # module scope; a module-level import here would close that cycle.
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        try:
+            return self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.read_blob(blob_id=blob_id),
+            )
+        except SessionDerivedCustodyError:
+            raise BlobNotFoundError(str(blob_id)) from None
+
+    def _read_bytes_or_missing(self, storage: Path, *, blob_id_str: str, storage_path: str) -> bytes:
+        """Read a ready blob's bytes, typing a raced deletion as missing content."""
+        try:
+            return storage.read_bytes()
+        except OSError as exc:
+            # The file may be deleted after the existence guard but before
+            # the descriptor is acquired (ENOENT), or a sibling replica's
+            # delete on a shared NFS mount may revoke the inode under the
+            # open handle (ESTALE). Both are the raced-deletion case the blob
+            # lifecycle contract types as missing content; any other errno is
+            # a real I/O fault and propagates (elspeth-632373963d).
+            if exc.errno in _RACED_DELETION_ERRNOS:
+                raise BlobContentMissingError(blob_id_str, storage_path=storage_path) from None
+            raise
 
     async def reconcile_inline_custody_publications(self) -> None:
         """Reconcile tracked pre-commit inline stages before serving traffic."""
@@ -2208,21 +2327,35 @@ class BlobServiceImpl:
         mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
-        """Create a blob from content bytes.
+        """Create a blob from content bytes under the caller's CREATE/COMPOSE fence.
 
         Accepts the STORAGE union: which subset applies (text/data vs
         binary document) is decided by the authenticated boundary that
         received the bytes — the upload route enforces the binary
         signature agreement before this method runs (elspeth-0c6a343921).
+
+        The fence is compare-and-swapped once, before the custody lock is
+        taken: the authority's CAS opens its own locked session transaction,
+        and on PostgreSQL that would wait forever behind the custody
+        advisory lock ``_persist_blob_content`` holds, so it cannot double
+        as the per-chunk ``write_guard``. The custody lock then serialises
+        the write against every other same-session blob mutation.
         """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
+        if str(session_id) != session_operation_context.fence.session_id:
+            raise ValueError("session operation context does not own the blob session")
         if created_by not in BLOB_CREATORS:
             raise RuntimeError(f"Invalid created_by {created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
         if mime_type not in STORAGE_MIME_TYPES:
             raise RuntimeError(f"Invalid mime_type {mime_type!r} — not in the storage MIME set")
         blob_id = uuid4()
-        row = await self._run_sync(
-            lambda: _persist_blob_content(
+
+        def _sync() -> Row[Any]:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
+            return _persist_blob_content(
                 engine=self._engine,
                 data_dir=self._data_dir,
                 max_storage_per_session=self._max_storage_per_session,
@@ -2242,7 +2375,8 @@ class BlobServiceImpl:
                 creating_arguments_hash=None,
                 idempotent=False,
             )
-        )
+
+        row = await self._run_sync(_sync)
         return _row_to_blob_record(row)
 
     async def reserve_inline_custody(
@@ -2414,18 +2548,15 @@ class BlobServiceImpl:
 
         return await self._run_sync(_sync)
 
-    async def get_blob(self, blob_id: UUID) -> BlobRecord:
-        """Get blob metadata."""
-        blob_id_str = str(blob_id)
-
-        def _sync() -> BlobRecord:
-            with self._engine.connect() as conn:
-                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if row is None:
-                    raise BlobNotFoundError(blob_id_str)
-                return self._row_to_record(row)
-
-        return await self._run_sync(_sync)
+    async def get_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> BlobRecord:
+        """Get blob metadata through the caller's exact session-operation fence."""
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        return await self._run_sync(lambda: self._fenced_blob_record(blob_id, session_operation_context))
 
     async def list_blobs(
         self,
@@ -2551,11 +2682,31 @@ class BlobServiceImpl:
             if deleted.rowcount != 1:
                 raise AuditIntegrityError(f"blob {blob_id_str} lost its durable deletion cleanup record before purge completion")
 
-    async def delete_blob(self, blob_id: UUID) -> None:
-        """Delete blob metadata and backing file."""
+    async def delete_blob(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """Delete blob metadata and backing file under an ARCHIVE/COMPOSE fence.
+
+        The fence is compare-and-swapped before any lookup, and the blob (or
+        its committed deletion-cleanup row) must be in the custody of the
+        fence's session, so a foreign blob deletes exactly like a missing
+        one. This is a fence CAS plus an ownership check rather than the
+        authority's facet ``read_blob`` because of the cleanup-row arm: a
+        blob whose row is already gone but whose cleanup is still pending has
+        no row for the facet to read, and finishing that cleanup is part of
+        this verb's contract. The deletion itself keeps its custody-locked
+        phases, which serialise it against every other same-session blob
+        mutation.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_DELETE_BLOB_OPERATION_KINDS)
         blob_id_str = str(blob_id)
+        fence_session_id = session_operation_context.fence.session_id
 
         def _sync() -> None:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
             with self._engine.connect() as lookup_conn:
                 blob_session_id = lookup_conn.execute(
                     select(blobs_table.c.session_id).where(blobs_table.c.id == blob_id_str)
@@ -2566,7 +2717,7 @@ class BlobServiceImpl:
             if blob_session_id is not None and cleanup_session_id is not None:
                 raise AuditIntegrityError(f"blob {blob_id_str} has both live metadata and committed deletion cleanup state")
             session_id = blob_session_id if blob_session_id is not None else cleanup_session_id
-            if session_id is None:
+            if session_id is None or session_id != fence_session_id:
                 raise BlobNotFoundError(blob_id_str)
             stage: _StagedBlobDeletion | None = None
             restore_uncommitted_stage = False
@@ -2644,28 +2795,45 @@ class BlobServiceImpl:
             reconcile_blob_storage_versions(Path(row.storage_path), expected_hash=row.content_hash)
             yield row
 
-    async def read_blob_content(self, blob_id: UUID) -> bytes:
-        """Read the raw content of a blob.
+    async def read_blob_content(
+        self,
+        blob_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> bytes:
+        """Read the raw content of a blob under a read-capable fence.
 
-        Enforces two invariants before returning bytes:
+        Enforces three invariants before returning bytes:
 
-        1. **Lifecycle guard**: only ``ready`` blobs are readable.
+        1. **Fence and custody**: the exact context is compare-and-swapped
+           and the blob must be in the fence's session custody — before any
+           byte is read, and again after, so the metadata the bytes were
+           verified against is the metadata the caller's fence still sees.
+           A stale fence raises ``SessionOperationFenceLost`` and touches
+           neither the row nor the file.
+
+        2. **Lifecycle guard**: only ``ready`` blobs are readable.
            Pending blobs have no finalized content; error blobs
            represent failed runs whose output is not trustworthy.
 
-        2. **Integrity verification**: a ready blob must still have a
+        3. **Integrity verification**: a ready blob must still have a
            backing file on disk, and its bytes must match the stored
            ``content_hash``. Missing bytes or hash mismatch indicate
            filesystem corruption, silent data loss, tampering, or a
            write-path bug — all Tier 1 anomalies.
 
-        Both guards evaluate inside the same-session custody lock
+        Guards 2 and 3 evaluate inside the same-session custody lock
         (``_locked_blob_row_for_read``) so the row and the bytes are one
-        version with respect to concurrent update/delete.
+        version with respect to concurrent update/delete. The authority
+        reads bracket that lock rather than nest inside it: the authority's
+        own locked transaction would wait behind the custody lock on
+        PostgreSQL.
         """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         blob_id_str = str(blob_id)
 
         def _sync() -> bytes:
+            before = self._fenced_blob_record(blob_id, session_operation_context)
             with self._locked_blob_row_for_read(blob_id_str) as row:
                 # Lifecycle guard — only ready blobs have finalized content
                 if row.status != "ready":
@@ -2678,13 +2846,7 @@ class BlobServiceImpl:
                 if not storage.exists():
                     raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
 
-                try:
-                    data = storage.read_bytes()
-                except FileNotFoundError:
-                    # The file may be deleted after the existence guard but
-                    # before the descriptor is acquired. Preserve the blob
-                    # lifecycle error contract for that raced deletion.
-                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                data = self._read_bytes_or_missing(storage, blob_id_str=blob_id_str, storage_path=row.storage_path)
 
                 # Integrity verification — Tier 1: our data must be pristine.
                 # A ready blob must always have a content_hash — it is set
@@ -2699,7 +2861,10 @@ class BlobServiceImpl:
                 if not hmac.compare_digest(actual, row.content_hash):
                     raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
 
-                return data
+            after = self._fenced_blob_record(blob_id, session_operation_context)
+            if after != before:
+                raise AuditIntegrityError("blob metadata changed during fenced content read")
+            return data
 
         return await self._run_sync(_sync)
 
@@ -2708,25 +2873,28 @@ class BlobServiceImpl:
         blob_id: UUID,
         *,
         prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[bytes, str, int]:
         """Stream a ready blob, verifying its full content hash incrementally.
 
-        Mirrors ``read_blob_content``'s lifecycle/integrity guards exactly
-        (same status check, same missing-file check, same NULL-hash guard,
-        same hash-mismatch guard) but never holds the full blob in memory:
-        bytes are read and fed into one incremental sha256 digest in
-        ``_STREAM_CHUNK_BYTES``-sized chunks, and only the first
-        ``prefix_bytes`` of those bytes are retained. Memory use is bounded
-        by chunk size + ``prefix_bytes`` regardless of the blob's total size —
-        this is what lets a bounded preview (e.g. source inspection's 8 KiB
-        peek) verify a full-content hash without materializing a 100 MiB
-        upload to do it.
+        Mirrors ``read_blob_content``'s fence, lifecycle and integrity guards
+        exactly (same fence bracket, same status check, same missing-file
+        check, same NULL-hash guard, same hash-mismatch guard) but never
+        holds the full blob in memory: bytes are read and fed into one
+        incremental sha256 digest in ``_STREAM_CHUNK_BYTES``-sized chunks,
+        and only the first ``prefix_bytes`` of those bytes are retained.
+        Memory use is bounded by chunk size + ``prefix_bytes`` regardless of
+        the blob's total size — this is what lets a bounded preview (e.g.
+        source inspection's 8 KiB peek) verify a full-content hash without
+        materializing a 100 MiB upload to do it.
         """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         if prefix_bytes < 1:
             raise ValueError("prefix_bytes must be >= 1")
         blob_id_str = str(blob_id)
 
         def _sync() -> tuple[bytes, str, int]:
+            before = self._fenced_blob_record(blob_id, session_operation_context)
             with self._locked_blob_row_for_read(blob_id_str) as row:
                 # Lifecycle guard — only ready blobs have finalized content
                 if row.status != "ready":
@@ -2752,43 +2920,58 @@ class BlobServiceImpl:
                 prefix = bytearray()
                 total_bytes = 0
                 try:
-                    handle = storage.open("rb")
-                except FileNotFoundError:
-                    # The file may be deleted after the existence guard but
-                    # before the descriptor is acquired. Preserve the blob
-                    # lifecycle error contract for that raced deletion.
-                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
-                with handle:
-                    while True:
-                        chunk = handle.read(_STREAM_CHUNK_BYTES)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                        total_bytes += len(chunk)
-                        if len(prefix) < prefix_bytes:
-                            prefix.extend(chunk[: prefix_bytes - len(prefix)])
+                    with storage.open("rb") as handle:
+                        while True:
+                            chunk = handle.read(_STREAM_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            total_bytes += len(chunk)
+                            if len(prefix) < prefix_bytes:
+                                prefix.extend(chunk[: prefix_bytes - len(prefix)])
+                except OSError as exc:
+                    # Raced deletion between the existence guard and the open
+                    # (ENOENT), or a sibling replica's delete revoking the
+                    # inode under the open handle on NFS (ESTALE): typed as
+                    # missing content; any other errno propagates
+                    # (elspeth-632373963d).
+                    if exc.errno in _RACED_DELETION_ERRNOS:
+                        raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                    raise
 
                 actual = digest.hexdigest()
                 if not hmac.compare_digest(actual, row.content_hash):
                     raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
 
-                return bytes(prefix[:prefix_bytes]), actual, total_bytes
+            after = self._fenced_blob_record(blob_id, session_operation_context)
+            if after != before:
+                raise AuditIntegrityError("blob metadata changed during fenced content read")
+            return bytes(prefix[:prefix_bytes]), actual, total_bytes
 
         return await self._run_sync(_sync)
 
-    async def read_blob_preview(self, blob_id: UUID, *, limit_bytes: int) -> tuple[bytes, bool]:
+    async def read_blob_preview(
+        self,
+        blob_id: UUID,
+        *,
+        limit_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, bool]:
         """Read a bounded prefix of a ready blob for inline UI preview.
 
-        This shares the full-content lifecycle/missing-file guards but does
-        not verify the full SHA-256 digest, because doing so would require
-        reading the whole blob and defeat the preview endpoint's resource cap.
+        This shares the full-content fence bracket and lifecycle/missing-file
+        guards but does not verify the full SHA-256 digest, because doing so
+        would require reading the whole blob and defeat the preview
+        endpoint's resource cap.
         """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         if limit_bytes < 1:
             raise ValueError("limit_bytes must be >= 1")
 
         blob_id_str = str(blob_id)
 
         def _sync() -> tuple[bytes, bool]:
+            before = self._fenced_blob_record(blob_id, session_operation_context)
             with self._locked_blob_row_for_read(blob_id_str) as row:
                 if row.status != "ready":
                     raise BlobStateError(
@@ -2801,15 +2984,20 @@ class BlobServiceImpl:
                     raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
 
                 try:
-                    handle = storage.open("rb")
-                except FileNotFoundError:
-                    # The file may be deleted after the existence guard but
-                    # before the descriptor is acquired. Preserve the blob
-                    # lifecycle error contract for that raced deletion.
-                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
-                with handle:
-                    data = handle.read(limit_bytes + 1)
-                return data[:limit_bytes], len(data) > limit_bytes
+                    with storage.open("rb") as handle:
+                        data = handle.read(limit_bytes + 1)
+                except OSError as exc:
+                    # Raced deletion (ENOENT) or a sibling replica's delete
+                    # revoking the inode under the open handle on NFS
+                    # (ESTALE): typed as missing content; any other errno
+                    # propagates (elspeth-632373963d).
+                    if exc.errno in _RACED_DELETION_ERRNOS:
+                        raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                    raise
+            after = self._fenced_blob_record(blob_id, session_operation_context)
+            if after != before:
+                raise AuditIntegrityError("blob metadata changed during fenced preview read")
+            return data[:limit_bytes], len(data) > limit_bytes
 
         return await self._run_sync(_sync)
 
@@ -2818,13 +3006,29 @@ class BlobServiceImpl:
         blob_id: UUID,
         run_id: UUID,
         direction: BlobRunLinkDirection,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> None:
-        """Record a blob-to-run linkage."""
+        """Record a blob-to-run linkage under the run's EXECUTE fence.
+
+        The fence is compare-and-swapped first; inside the link transaction
+        the blob must be in the custody of the fence's session (a foreign
+        blob links like a missing one) and, as before, the blob and the run
+        must share a session.
+        """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
         if direction not in BLOB_RUN_LINK_DIRECTIONS:
             raise RuntimeError(f"Invalid link direction '{direction}' — must be one of {sorted(BLOB_RUN_LINK_DIRECTIONS)}")
+        fence_session_id = session_operation_context.fence.session_id
 
         def _sync() -> None:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
             with self._engine.begin() as conn:
+                blob_session_id = conn.execute(
+                    select(blobs_table.c.session_id).where(blobs_table.c.id == str(blob_id))
+                ).scalar_one_or_none()
+                if blob_session_id != fence_session_id:
+                    raise BlobNotFoundError(str(blob_id))
                 _assert_blob_run_same_session(
                     conn,
                     blob_id=str(blob_id),
@@ -2881,6 +3085,8 @@ class BlobServiceImpl:
         self,
         run_id: UUID,
         success: bool,
+        *,
+        session_operation_context: SessionOperationContext,
     ) -> BlobFinalizationResult:
         """Finalize pending output blobs for a completed/failed run.
 
@@ -2898,11 +3104,20 @@ class BlobServiceImpl:
 
         Returns a BlobFinalizationResult with both successfully finalized
         blobs and per-blob error records.
+
+        Runs under the run's EXECUTE fence: the fence is compare-and-swapped
+        first and the run must be in the custody of the fence's session.
         """
+        _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
         run_id_str = str(run_id)
+        fence_session_id = session_operation_context.fence.session_id
 
         def _sync() -> BlobFinalizationResult:
+            self._session_operation_authority.compare_and_swap(session_operation_context)
             with self._engine.connect() as conn:
+                run_session_id = conn.execute(select(runs_table.c.session_id).where(runs_table.c.id == run_id_str)).scalar_one_or_none()
+                if run_session_id != fence_session_id:
+                    raise ValueError("session operation context does not own the run")
                 rows = conn.execute(
                     select(blobs_table)
                     .join(
