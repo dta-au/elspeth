@@ -273,3 +273,83 @@ def test_lock_domain_failures_render_complete_redacted_json(
         {"name": "landscape_schema", "ok": True, "detail": "current"},
     ]
     assert raw_cause not in result.output
+
+
+def _patch_deployment_doctor_with_warning_on_settings_load(
+    monkeypatch: pytest.MonkeyPatch,
+    checks: list[ContractCheck],
+) -> None:
+    """Settings load emits a WARNING-level structlog event, as WebSettings does.
+
+    ``WebSettings._warn_composer_turn_budget_underfunded`` (elspeth-f159d2394b)
+    fires inside the pydantic validator during ``settings_from_env()`` — i.e.
+    inside the doctor's own settings-load step, before any check runs.
+    """
+    import structlog
+
+    import elspeth.web.config as web_config
+    import elspeth.web.doctor as doctor
+
+    marker = object()
+
+    def warning_settings() -> object:
+        structlog.get_logger("elspeth.web.config").warning(
+            "composer_turn_budget_underfunded",
+            composer_timeout_seconds=85.0,
+            configured_turns=20,
+            fundable_turns_estimate=5,
+        )
+        return marker
+
+    monkeypatch.setattr(web_config, "settings_from_env", warning_settings)
+
+    def fake_collect(actual_settings: object, *, init_schema: bool = False) -> list[ContractCheck]:
+        assert actual_settings is marker
+        return checks
+
+    monkeypatch.setattr(doctor, "collect_deployment_checks", fake_collect, raising=False)
+    monkeypatch.setattr(doctor, "collect_checks", fake_collect)
+
+
+@pytest.mark.parametrize("subcommand", ["deployment", "aws-ecs"])
+def test_json_mode_stdout_is_exactly_one_document_when_settings_load_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    subcommand: str,
+) -> None:
+    """elspeth-4b27604bb7: stdout IS the report in --json mode; log lines go to stderr.
+
+    The 6/6b acceptance drivers and every PostgreSQL doctor proof ``json.loads``
+    the doctor's stdout. A WARNING emitted on the shared stdout log handler
+    during settings load put an ISO timestamp in front of the document
+    (``"2026"`` parsed as an int, then "Extra data" at char 4).
+    """
+    checks = [ContractCheck("first", True, "ready"), ContractCheck("second", True, "also ready")]
+    _patch_deployment_doctor_with_warning_on_settings_load(monkeypatch, checks)
+
+    result = runner.invoke(app, ["--no-dotenv", "doctor", subcommand, "--json"])
+
+    assert result.exit_code == 0
+    # Exactly one JSON document and nothing else on stdout.
+    assert json.loads(result.stdout) == [
+        {"name": "first", "ok": True, "detail": "ready"},
+        {"name": "second", "ok": True, "detail": "also ready"},
+    ]
+    assert result.stdout.strip().splitlines() == [json.dumps([{"name": c.name, "ok": c.ok, "detail": c.detail} for c in checks])]
+    # The disclosure is not lost: it is on stderr, where the operator reads it.
+    assert "composer_turn_budget_underfunded" in result.stderr
+    assert "composer_turn_budget_underfunded" not in result.stdout
+
+
+def test_text_mode_keeps_log_lines_on_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text mode is the human/container channel and is unchanged: logs stay on stdout."""
+    _patch_deployment_doctor_with_warning_on_settings_load(
+        monkeypatch,
+        [ContractCheck("first", True, "ready")],
+    )
+
+    result = runner.invoke(app, ["--no-dotenv", "doctor", "deployment"])
+
+    assert result.exit_code == 0
+    assert "composer_turn_budget_underfunded" in result.stdout
+    assert "OK first: ready" in result.stdout
+    assert result.stderr == ""
