@@ -45,6 +45,10 @@ from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator.core import Orchestrator
 from elspeth.engine.orchestrator.run_state import ResumeState
+from elspeth.engine.orchestrator.run_status import (
+    assert_bound_groups_settled_from_audit,
+    derive_resume_terminal_status_from_audit,
+)
 from elspeth.engine.orchestrator.types import ExecutionCounters
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
@@ -136,8 +140,13 @@ def test_resume_finalize_asks_the_backstop_before_deriving_the_terminal_status()
 def test_resume_finalize_refuses_an_unsettled_bound_group_and_finalizes_failed() -> None:
     harness = _EarlyCompletionResume("run-backstop-refuse")
     verdict = "Run 'run-backstop-refuse' reached end of run with bound-group members that never settled (elspeth-76e936568e)"
-    backstop = MagicMock(side_effect=OrchestrationInvariantError(verdict))
-    derive = MagicMock(return_value=(RunStatus.COMPLETED, ExecutionCounters(rows_processed=3, rows_succeeded=3)))
+    # Specced against the real callables so the stand-ins refuse a call that
+    # the real signatures would (mock-discipline gate, elspeth-bc97e06221 B6).
+    backstop = MagicMock(spec=assert_bound_groups_settled_from_audit, side_effect=OrchestrationInvariantError(verdict))
+    derive = MagicMock(
+        spec=derive_resume_terminal_status_from_audit,
+        return_value=(RunStatus.COMPLETED, ExecutionCounters(rows_processed=3, rows_succeeded=3)),
+    )
 
     with pytest.raises(OrchestrationInvariantError, match="never settled"):
         harness.drive(backstop=backstop, derive=derive)
