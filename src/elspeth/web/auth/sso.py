@@ -40,13 +40,17 @@ import json
 import os
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import ClassVar, Final, Protocol, TypedDict
+from typing import Any, ClassVar, Final, Protocol, TypedDict, cast
+from urllib.parse import urlencode
 
+import httpx
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from elspeth.web.auth.models import AuthenticationError
+from elspeth.web.auth.urls import DiscoveredEndpoints, validate_discovered_endpoints
 
 # ── failure taxonomy ─────────────────────────────────────────────────────
 #
@@ -456,3 +460,227 @@ class HandoffStore(Protocol):
         existed.
         """
         ...
+
+
+# ── endpoint resolution ──────────────────────────────────────────────────
+#
+# Where the login walk's four URLs come from, and why each is checked before
+# anything is fetched from it. Every URL here is remote-supplied: an IdP that
+# is impersonated, compromised, or merely proxied by something misbehaving can
+# put any string in a discovery document.
+
+_DISCOVERY_PATH: Final = "/.well-known/openid-configuration"
+_DISCOVERY_TIMEOUT: Final = httpx.Timeout(10.0, connect=5.0)
+
+# A discovery document is a handful of URLs. A body far past that is either a
+# different kind of resource or an attempt to make the JSON parser the
+# expensive part of a login attempt.
+_MAX_DISCOVERY_BYTES: Final = 256 * 1024
+
+
+class SsoDiscoveryFailed(SsoLoginError):
+    """Discovery could not be completed, or returned something unusable."""
+
+    category: ClassVar[str] = "sso_discovery_failed"
+
+
+def _discovery_string(document: Mapping[str, Any], key: str, *, required: bool) -> str | None:
+    """Read one endpoint URL out of a Tier-3 discovery document.
+
+    Membership-then-subscript rather than ``.get()``: absence is a decision
+    this function makes explicitly, and for a required endpoint it is fatal.
+    A present-but-wrong-type value is fatal in both cases — a document that
+    puts an object where a URL belongs is not one to take the rest of on
+    trust.
+    """
+    value = document[key] if key in document else None
+    if value is None:
+        if required:
+            raise SsoDiscoveryFailed(f"discovery document is missing a usable {key!r}")
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SsoDiscoveryFailed(f"discovery document {key!r} is not a non-empty string")
+    return value
+
+
+def discovery_endpoints(document: object, *, issuer: str, expected_origins: frozenset[str]) -> DiscoveredEndpoints:
+    """Parse and validate a discovery document into the four endpoints.
+
+    THE ISSUER CHECK IS EXACT, and it is the first thing that happens. A
+    document whose ``issuer`` differs from the configured one — by a trailing
+    slash, by case, by anything — is refused rather than reconciled. Without
+    it, an IdP that can serve the discovery URL can hand back another
+    provider's endpoints and quietly relocate the whole login walk; every
+    later check would then be applied faithfully to the wrong provider.
+
+    Splitting this from the fetch is deliberate: the parse is the part with
+    the security decisions in it, and it is pure, so the adversarial cases can
+    be tested without a network or a fake server standing in the way.
+    """
+    if not isinstance(document, dict):
+        raise SsoDiscoveryFailed(f"discovery document is not a JSON object (got {type(document).__name__})")
+    mapping = cast("Mapping[str, Any]", document)
+
+    document_issuer = mapping["issuer"] if "issuer" in mapping else None
+    if not isinstance(document_issuer, str) or document_issuer != issuer:
+        # Neither value is echoed: one is remote-supplied and the other names
+        # the deployment's IdP.
+        raise SsoDiscoveryFailed("discovery document failed the exact issuer check")
+
+    try:
+        return validate_discovered_endpoints(
+            DiscoveredEndpoints(
+                authorization_endpoint=cast("str", _discovery_string(mapping, "authorization_endpoint", required=True)),
+                token_endpoint=cast("str", _discovery_string(mapping, "token_endpoint", required=True)),
+                jwks_uri=cast("str", _discovery_string(mapping, "jwks_uri", required=True)),
+                userinfo_endpoint=_discovery_string(mapping, "userinfo_endpoint", required=False),
+            ),
+            expected_origins=expected_origins,
+        )
+    except ValueError as exc:
+        # validate_discovered_endpoints raises ValueError with a static
+        # message naming the field and the check. Re-raise as a login failure
+        # so a bad document is a 401-class refusal rather than a 500.
+        raise SsoDiscoveryFailed(str(exc)) from exc
+
+
+async def fetch_discovery_endpoints(
+    *,
+    issuer: str,
+    expected_origins: frozenset[str],
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> DiscoveredEndpoints:
+    """Fetch the discovery document and return its validated endpoints.
+
+    REDIRECTS ARE DISABLED. This is the load-bearing flag, not a default worth
+    keeping: following one would let a response move the document off the
+    origin the issuer names, after which every endpoint in it is attacker-
+    chosen and the origin policy has been applied to a URL nobody fetched.
+    ``httpx`` does not follow redirects unless asked, and it is passed
+    explicitly so that removing it is a visible edit rather than a default
+    quietly changing underneath.
+
+    The body is read with a size bound before it is parsed. A discovery
+    document is a handful of URLs; anything far past that is either a
+    different resource or an attempt to make JSON parsing the expensive part
+    of an unauthenticated request.
+    """
+    url = f"{issuer.rstrip('/')}{_DISCOVERY_PATH}"
+    try:
+        async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT, follow_redirects=False, transport=transport) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            body = response.content
+    except httpx.HTTPError as exc:
+        # Class name only. str(exc) on a connect error can carry the resolved
+        # IP of the IdP, and on an InvalidURL the offending URL itself.
+        raise SsoDiscoveryFailed(f"discovery request failed ({type(exc).__name__})") from exc
+
+    if len(body) > _MAX_DISCOVERY_BYTES:
+        raise SsoDiscoveryFailed("discovery document exceeds the maximum accepted size")
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        raise SsoDiscoveryFailed("discovery document is not valid JSON") from exc
+
+    return discovery_endpoints(document, issuer=issuer, expected_origins=expected_origins)
+
+
+class SsoEndpointSettings(Protocol):
+    """The four break-glass settings, and nothing else.
+
+    Narrower than ``WebSettings`` on purpose: this module has no business
+    reading the rest of the configuration, and a Protocol naming exactly four
+    attributes says so in the type rather than in a comment.
+    """
+
+    @property
+    def sso_authorization_endpoint(self) -> str | None: ...
+    @property
+    def sso_token_endpoint(self) -> str | None: ...
+    @property
+    def sso_jwks_uri(self) -> str | None: ...
+    @property
+    def sso_userinfo_endpoint(self) -> str | None: ...
+
+
+def configured_endpoint_override(settings: SsoEndpointSettings) -> DiscoveredEndpoints | None:
+    """Return the break-glass override, or ``None`` to use discovery.
+
+    Presence of the three required endpoints IS the override — the
+    all-or-none rule and the origin policy were already enforced when the
+    settings were built, so by the time this runs the values are validated or
+    the process never started. Re-validating here would be a second, drifting
+    copy of that decision.
+    """
+    if settings.sso_authorization_endpoint is None or settings.sso_token_endpoint is None or settings.sso_jwks_uri is None:
+        return None
+    return DiscoveredEndpoints(
+        authorization_endpoint=settings.sso_authorization_endpoint,
+        token_endpoint=settings.sso_token_endpoint,
+        jwks_uri=settings.sso_jwks_uri,
+        userinfo_endpoint=settings.sso_userinfo_endpoint,
+    )
+
+
+# ── start ────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationRedirect:
+    """What ``start`` returns: where to send the browser, and what to seal."""
+
+    location: str
+    cookie_value: str
+
+
+def authorization_redirect(
+    *,
+    authorization_endpoint: str,
+    client_id: str,
+    redirect_uri: str,
+    scopes: tuple[str, ...],
+    transaction_secret: str,
+    provider: str,
+    now: int | None = None,
+) -> AuthorizationRedirect:
+    """Build the redirect that starts a login, and the cookie that remembers it.
+
+    ``start`` accepts NO query parameters. It takes nothing from the caller
+    because there is nothing a caller could usefully supply: every value below
+    is generated here or comes from configuration. A ``start`` that accepted,
+    say, a return path would be an open-redirect parameter on the one endpoint
+    guaranteed to be reachable unauthenticated.
+
+    PKCE is S256, never ``plain``. The verifier stays sealed in the cookie and
+    only its hash travels in the URL the browser follows, so the authorization
+    request — which passes through the user's browser and its history — never
+    carries the secret that redeems the code.
+
+    ``state`` and ``nonce`` are generated per walk and sealed together with the
+    verifier: one cookie, opened once, or the callback refuses. Sealing them
+    separately would allow a walk to proceed with a matching state and a nonce
+    from some other login.
+    """
+    transaction = new_transaction(now=now)
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(scopes),
+            "state": transaction.state,
+            "nonce": transaction.nonce,
+            "code_challenge": pkce_challenge(transaction.verifier),
+            "code_challenge_method": "S256",
+        }
+    )
+    return AuthorizationRedirect(
+        location=f"{authorization_endpoint}?{query}",
+        cookie_value=seal_transaction(
+            transaction,
+            secret=transaction_secret,
+            provider=provider,
+            redirect_uri=redirect_uri,
+        ),
+    )
