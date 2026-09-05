@@ -5734,6 +5734,8 @@ class TestMessageRoutes:
             mime_type,
             created_by="user",
             source_description=None,
+            *,
+            session_operation_context,
         ):
             return BlobRecord(
                 id=uuid.uuid4(),
