@@ -7,12 +7,18 @@ transforms whose prompt-template review is RESOLVED against
 unstructured prompt. The helper carries that hash as a TypeScript constant
 rather than re-implementing canonical hashing in TS.
 
-Why this pin exists (a0's condition on elspeth-e5a38115a6 / e425a36805): if
-the hasher or the prompt text drifts, the requirement no longer reads as
-current, the site re-opens as a PENDING prompt-template card, the seed still
-succeeds (pending sites are surfaceable), and Run is silently gated behind 80
-review cards — exactly the geometry the scenario must not measure. A drifted
-constant must fail a test, not a screenshot.
+Why this pin exists (a0's condition on elspeth-e5a38115a6 / e425a36805): no
+composer surface checks the hash before Run. The pending-site enumerator
+(``_missing_prompt_template_review_sites``) returns nothing for any row whose
+``status`` is ``"resolved"`` without comparing the hash, and the seed route's
+``_reject_malformed_interpretation_requirements`` only parses row shape. So if
+the hasher or the prompt text drifts, the fixture still seeds, no review card
+opens, and the drift surfaces only when the run gate
+(``materialize_state_for_execution`` -> ``_validate_prompt_template_review``)
+raises ``ValueError("... prompt-template review hash drifted")``. The
+tall-dialog scenario never presses Run, so in E2E the drift would be
+INVISIBLE: this test is the only guard. A drifted constant must fail a test,
+not go unnoticed.
 """
 
 from __future__ import annotations
