@@ -16,7 +16,7 @@ from typing import Any, Literal
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
+from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
 
 _fcntl: Any
@@ -334,11 +334,11 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
 
 
 @contextlib.contextmanager
-def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
-    """Hold a PostgreSQL session-level lock across multiple transactions."""
+def _postgres_advisory_session_lock(conn: Connection, classid: int, key: str, *, label: str) -> Iterator[None]:
+    """Hold one PostgreSQL session-level advisory lock across multiple transactions."""
     conn.exec_driver_sql(
         "SELECT pg_catalog.pg_advisory_lock(%s, pg_catalog.hashtext(%s))",
-        (ELSPETH_SESSIONS_LOCK_CLASSID, session_id),
+        (classid, key),
     )
     conn.commit()
 
@@ -347,11 +347,11 @@ def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterato
             conn.rollback()
         unlocked = conn.exec_driver_sql(
             "SELECT pg_catalog.pg_advisory_unlock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_SESSIONS_LOCK_CLASSID, session_id),
+            (classid, key),
         ).scalar_one()
         conn.commit()
         if unlocked is not True:
-            raise AuditIntegrityError("PostgreSQL session advisory lock was not held during release")
+            raise AuditIntegrityError(f"{label} was not held during release")
 
     primary_exc: BaseException | None = None
     try:
@@ -362,6 +362,36 @@ def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterato
     finally:
         _run_lock_cleanup(
             _release,
-            label="PostgreSQL session advisory lock release",
+            label=f"{label} release",
             primary_exc=primary_exc,
         )
+
+
+@contextlib.contextmanager
+def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
+    """Hold the sessions-classid session-level lock across multiple transactions."""
+    with _postgres_advisory_session_lock(
+        conn,
+        ELSPETH_SESSIONS_LOCK_CLASSID,
+        session_id,
+        label="PostgreSQL session advisory lock",
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def postgres_blob_custody_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
+    """Hold the blob custody session-level lock across multiple transactions.
+
+    Its own classid namespace: session-operation fence operations take
+    transaction-scoped locks on the same session key in
+    ``ELSPETH_SESSIONS_LOCK_CLASSID``, and a lease renew must never queue
+    behind a blob's filesystem persistence.
+    """
+    with _postgres_advisory_session_lock(
+        conn,
+        ELSPETH_BLOB_CUSTODY_LOCK_CLASSID,
+        session_id,
+        label="PostgreSQL blob custody advisory lock",
+    ):
+        yield
