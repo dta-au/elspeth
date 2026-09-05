@@ -44,10 +44,23 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+INTRODUCED_AFTER_CORPUS = frozenset({"testcontainer-run"})
+"""Receipt kinds added to the ECS binding after the corpus was generated (6b-4 option (b)).
+
+The corpus is never regenerated, so a kind introduced later has no entry; it is
+NEW, not a field on an existing receipt, which is why every pre-existing entry
+still validates byte-for-byte. Widening this set is a deliberate act, never a
+side effect of adding a kind.
+"""
+
+
 def test_corpus_is_the_pre_extraction_tree_and_self_consistent() -> None:
     assert CORPUS["generated_from"] == "02d10e0c1530cbf8aea4d5c76f0e5b30f147efb2"
-    assert set(CORPUS["receipt_kinds"]) == set(receipt_contracts._RECEIPT_KINDS)
-    assert {key.split(":")[0] for key in CORPUS["stored_receipts"]} == set(receipt_contracts._RECEIPT_KINDS)
+    pre_extraction_kinds = set(receipt_contracts._RECEIPT_KINDS) - INTRODUCED_AFTER_CORPUS
+    assert set(receipt_contracts._RECEIPT_KINDS) >= INTRODUCED_AFTER_CORPUS
+    assert set(CORPUS["receipt_kinds"]) == pre_extraction_kinds
+    assert {key.split(":")[0] for key in CORPUS["stored_receipts"]} == pre_extraction_kinds
+    assert not INTRODUCED_AFTER_CORPUS & set(CORPUS["receipt_kinds"])
     for key, entry in CORPUS["stored_receipts"].items():
         assert _canonical(entry["document"]) == entry["canonical"], key
         assert _sha256(entry["canonical"]) == entry["sha256"], key
