@@ -23,8 +23,9 @@ from elspeth.web.auth.session_token import (
     LOCAL_AUDIENCE,
     SessionTokenIssuer,
 )
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome, ensure_identity, read_identity
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -121,17 +122,31 @@ def build_local_auth_provider(
         engine = create_session_engine(f"sqlite:///{sessions_db}")
         initialize_session_schema(engine)
 
+    # The substrate is reached only through its authority, as in app.py.
+    authority = RepositoryIdentityAuthority(engine)
+
     def _principal_is_active(identity_id: str) -> bool:
-        record = read_identity(engine, identity_id)
+        record = authority.read_identity(identity_id=identity_id)
         return record is not None and record.is_active
 
+    def _record_nothing(_identity_id: str, _username: str, _quota_written: bool) -> None:
+        # These tests exercise the provider, not the Landscape admission
+        # pair; app.py binds the real recorder. Explicit, because the
+        # authority refuses to guess that a caller audits nothing.
+        return None
+
+    def _record_no_retirement(_outcome: IdentityRetired) -> None:
+        # Same decision as ``_record_nothing``: the provider tests do not
+        # exercise the Landscape retirement row that app.py records.
+        return None
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
-        return ensure_identity(
-            engine,
+        return authority.ensure_identity(
             claims=claims,
             activate=registration_open,
             quota_tokens_per_day=quota_tokens_per_day,
             quota_storage_bytes=quota_storage_bytes,
+            record_admission=_record_nothing,
         )
 
     return LocalAuthProvider(
@@ -145,4 +160,5 @@ def build_local_auth_provider(
             principal_is_active=_principal_is_active,
         ),
         admit_identity=_admit_identity,
+        retire_identity=local_identity_retirer(authority, _record_no_retirement),
     )
