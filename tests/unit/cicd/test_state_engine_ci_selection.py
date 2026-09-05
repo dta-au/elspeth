@@ -10,6 +10,7 @@ green.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -78,9 +79,36 @@ def test_always_on_test_job_runs_the_ci_equivalent_selection() -> None:
 
 
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
-    commands = _run_lines(_job("testcontainer"))
-    assert "tests/testcontainer/" in commands
+    """The testcontainer job is the ONLY run of the ``testcontainer`` ids.
+
+    pyproject addopts deselect the marker, so the default selection (the
+    ``test`` job) never sees them (elspeth-d8749aeaa3: a PostgreSQL-only
+    schema defect landed on a fully green default suite). Three properties
+    keep the job honest, and each is pinned here because dropping any one of
+    them is a silent green:
+
+    * the selection is the whole tree — four ``tests/integration/web/`` files
+      carry per-test marks and ran nowhere while the job scanned only
+      ``tests/testcontainer/``;
+    * the run is serial — ``tests/testcontainer/web/conftest.py`` shares one
+      PostgreSQL container across the deployment-acceptance files and raises
+      ``UsageError`` under any xdist worker, while addopts default to
+      ``-n 12`` (``CI=1`` disables the auto-xdist plugin, not addopts);
+    * the junit report is emitted and uploaded, so a run URL can carry the
+      P0 pin test as evidence.
+    """
+    job = _job("testcontainer")
+    commands = _run_lines(job)
+    assert re.search(r"pytest tests/\s", commands), "selection must be the whole tree"
+    assert "pytest tests/testcontainer/" not in commands
     assert "-m testcontainer" in commands
+    assert "-n 0" in commands
+    assert "--junitxml=testcontainer-junit.xml" in commands
+    sequential_fixture = (REPO_ROOT / "tests" / "testcontainer" / "web" / "conftest.py").read_text(encoding="utf-8")
+    assert "-n 0" in sequential_fixture, "the job's serial flag mirrors the shared-container fixture's own rule"
+    uploads = [step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    assert any(step.get("if") == "always()" and "testcontainer-junit.xml" in str(step.get("with", {}).get("path")) for step in uploads)
+    assert "testcontainer" in _job("ci-success")["needs"]
 
 
 def test_default_selection_excludes_protected_live_lanes() -> None:
