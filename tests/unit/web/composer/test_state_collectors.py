@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.web.composer.state import (
     CompositionState,
@@ -198,6 +199,21 @@ class TestCollectorIntrinsics:
         state = _state(_transform("explode", "rows", "pages", plugin="no_such_plugin"), _collector())
         assert _errors_for(state, "scope_opener_not_multi_row") == []
 
+    def test_timeout_rejection_names_every_kind_that_accepts_the_field(self) -> None:
+        """elspeth-1768ad240c drift 2: the membership tuple had three kinds and
+        the message named two. The message now derives from the accepting
+        set; queue is excluded at the rule for its own reason (it refuses the
+        field through queue_node_contract_error)."""
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import _TIMEOUT_ACCEPTING_NODE_TYPES
+
+        timed = replace(_transform("explode", "rows", "pages", plugin="json_explode"), timeout_seconds=5.0)
+        [entry] = _errors_for(_state(timed, _collector()), "node_timeout_unsupported")
+        for kind in _TIMEOUT_ACCEPTING_NODE_TYPES:
+            assert kind in entry.message, kind
+        assert "queue" not in entry.message
+
     def test_trigger_is_rejected(self) -> None:
         state = _state(_transform("explode", "rows", "pages"), _collector(trigger={"count": 5}))
         [entry] = _errors_for(state, "collector_has_trigger_invalid")
@@ -365,7 +381,7 @@ class TestCollectorScopeTopology:
             _collector("out"),  # collides with the sink name
         )
         [entry] = _errors_for(state, "node_id_collides_with_source_or_sink")
-        assert "collectors" in entry.message
+        assert RuntimeNodeType.COLLECTOR.value in entry.message  # the rule derives from the enum, so the pin does too
 
     def test_collection_cap_counts_collectors(self) -> None:
         crowd = tuple(_collector(f"stitch_{index:03d}", scope_name=f"scope_{index:03d}", scope_opener="explode") for index in range(101))

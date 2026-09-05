@@ -19,8 +19,8 @@ from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode
 from elspeth.contracts.enums import NodeType as RuntimeNodeType
-from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import SourceProtocol, TransformProtocol
@@ -979,6 +979,13 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
 
 
 _COLLECTOR_SCOPE_BINDING_FIELDS: Final[tuple[str, ...]] = ("scope_name", "scope_opener", "scope_policy")
+
+# The node kinds whose top-level ``timeout_seconds`` the composer accepts. A
+# queue is excluded from the rule that reads this for a different reason —
+# it refuses the field through ``queue_node_contract_error`` — so queue is
+# named at that rule, not here, and the message derives from THIS tuple so
+# it cannot describe a membership it does not report on (elspeth-1768ad240c).
+_TIMEOUT_ACCEPTING_NODE_TYPES: Final[tuple[str, ...]] = ("coalesce", "row_union")
 
 
 def _scope_binding_value(node: NodeSpec, field_name: str) -> str | None:
@@ -6980,8 +6987,7 @@ class CompositionState:
                 errors.append(
                     _err(
                         f"node:{node.id}",
-                        f"Node name '{node.id}' is used by both {node.node_type} and {other}. All node names must be "
-                        "unique across transforms, gates, aggregations, coalesce nodes, row_union nodes, collectors, sources, queues, and sinks.",
+                        f"Node name '{node.id}' is used by both {node.node_type} and {other}. {UNIQUE_NODE_NAMES_RULE}",
                         "high",
                         "node_id_collides_with_source_or_sink",
                     )
@@ -7054,12 +7060,13 @@ class CompositionState:
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every
             # queue consumer shares the same canonical-shape guard.
-            if node.timeout_seconds is not None and node.node_type not in ("coalesce", "row_union", "queue"):
+            if node.timeout_seconds is not None and node.node_type not in (*_TIMEOUT_ACCEPTING_NODE_TYPES, "queue"):
+                accepting = " and ".join(_TIMEOUT_ACCEPTING_NODE_TYPES)
                 errors.append(
                     _err(
                         f"node:{node.id}",
                         f"Node '{node.id}' of type '{node.node_type}' does not accept top-level timeout_seconds; "
-                        "only coalesce and row_union nodes accept that field.",
+                        f"only {accepting} nodes accept that field.",
                         "high",
                         "node_timeout_unsupported",
                     )

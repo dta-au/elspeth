@@ -17,6 +17,7 @@ from typing import get_args
 
 import pytest
 
+from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE
 from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.capability_skill import CAPABILITY_CORE_NODE_GUIDANCE
@@ -100,3 +101,13 @@ def _linear_state():  # type: ignore[no-untyped-def]
         metadata=PipelineMetadata(name="linear", description=""),
         version=1,
     )
+
+
+def test_unique_node_names_rule_names_every_runtime_kind() -> None:
+    """elspeth-1768ad240c drift 3: the nine-kind sentence was hand-typed three
+    times across core/config and web/composer/state. Generated once from the
+    authority, it names every runtime kind — and only those."""
+    for kind in RuntimeNodeType:
+        assert kind.value in UNIQUE_NODE_NAMES_RULE, kind
+    listed = UNIQUE_NODE_NAMES_RULE.split(": ", 1)[1].rstrip(".").split(", ")
+    assert set(listed) == {kind.value for kind in RuntimeNodeType}
