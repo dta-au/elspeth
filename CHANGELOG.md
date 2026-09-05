@@ -99,14 +99,12 @@ schema. Three parts of it are written in production: the persistent
 session-operation authority (fenced, database-clock leases), monotonic
 user-secret row versions, and durable proposal blob-effect receipts. The
 `web_instances` membership table gained its typed writer in 0.8.0
-(elspeth-66a19780b1): `WebInstanceMembershipAuthority` registers an
-instance, renews its lease from the database clock, and records `draining`
-and `stopped`; a peer's fence takeover and orphan-run recovery join that row
-before acting on a dead owner. The web service does not call the writer
-yet — the lifespan and readiness wiring lands with the instance-identity
-work — so no replica writes a membership row, and because both readers fail
-closed on the absent row a killed replica's fenced sessions stay refused and
-its orphaned runs are not recovered by a peer until that wiring lands. The
+(elspeth-66a19780b1): every PostgreSQL-backed replica registers itself
+through `WebInstanceMembershipAuthority` after the startup sweeps, under the
+same instance id it fences with, renews its lease from the database clock,
+records `draining` as the first act of shutdown (readiness fails at once)
+and `stopped` after its executor drains; a peer's fence takeover and
+orphan-run recovery join that row before acting on a dead owner. The
 remaining epoch-51 tables — run-start permits, cross-replica
 websocket tickets, rate-limit state and bounded cleanup claims — are schema
 only: no production writer exists yet (follow-ups on elspeth-6f8c1714d5).
