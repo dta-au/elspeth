@@ -14,15 +14,28 @@ caller's deadline sink.
 from __future__ import annotations
 
 import ast
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import func
+from sqlalchemy import func, insert, select, text
 
+from elspeth.contracts import RunStatus
+from elspeth.contracts.coordination import (
+    DEFAULT_ITEM_STALL_BUDGET_SECONDS,
+    DEFAULT_RUN_HEARTBEAT_SECONDS,
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+)
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.database import LandscapeDB, begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from tests.fixtures.landscape import make_landscape_db
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, verify_and_extend_leader_fence
+from elspeth.core.landscape.schema import run_coordination_table, runs_table
+from tests.fixtures.landscape import assert_deadline_within, landscape_database_now, make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 from tests.unit.core.landscape.test_database_clock_authority import _clock_returning_references, _scan_sources
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -154,3 +167,77 @@ class TestClockAuthorityGateClassification:
                 imported.add(node.module)
         assert imported, "the helper must import its sqlalchemy and contracts dependencies explicitly"
         assert not {name for name in imported if name == "elspeth.web" or name.startswith("elspeth.web.")}
+
+
+class TestFirstFenceDatabaseDeadline:
+    """C6.1: the leader fence writes its deadline from the database clock, in SQL.
+
+    The SQLite text artefact the ADR documents — ``datetime(CURRENT_TIMESTAMP,
+    '+N seconds')`` is whole-second UTC with no fraction, so a fence-written
+    expiry compares as expired up to one second early against a ``.ffffff``
+    bound — is pinned here together with the floor that keeps it harmless:
+    every production liveness window is at least ten seconds.
+    """
+
+    @staticmethod
+    def _seated_run(db: LandscapeDB) -> tuple[str, CoordinationToken]:
+        run_id = f"run-fence-clock-{uuid4().hex[:8]}"
+        with db.engine.begin() as conn:
+            conn.execute(
+                insert(runs_table).values(
+                    run_id=run_id,
+                    started_at=datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC),
+                    config_hash="cfg",
+                    settings_json="{}",
+                    canonical_version="v1",
+                    status=RunStatus.RUNNING.value,
+                    openrouter_catalog_sha256="0" * 64,
+                    openrouter_catalog_source="bundled",
+                )
+            )
+        token = register_run_leader(
+            RunCoordinationRepository(db.engine),
+            run_id=run_id,
+            worker_id="worker-leader",
+            now=datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC),
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        )
+        return run_id, token
+
+    def test_sqlite_fence_deadline_is_database_time_plus_window_as_whole_second_text(self) -> None:
+        db = make_landscape_db()
+        try:
+            run_id, token = self._seated_run(db)
+            with begin_write(db.engine) as conn:
+                database_now = read_landscape_transaction_time(conn)
+                verify_and_extend_leader_fence(conn, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="unit-test")
+            with db.engine.connect() as conn:
+                raw = conn.execute(
+                    text("SELECT leader_heartbeat_expires_at FROM run_coordination WHERE run_id = :run_id"), {"run_id": run_id}
+                ).scalar_one()
+                stamped = conn.execute(
+                    select(run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id)
+                ).scalar_one()
+        finally:
+            db.close()
+        assert isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw), raw
+        assert_deadline_within(stamped, database_now + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS))
+
+    def test_fence_text_artefact_is_under_one_second_against_a_fractional_bound(self) -> None:
+        """A ``.ffffff`` bound for the same instant differs from the fence text by less than the window floor."""
+        db = make_landscape_db()
+        try:
+            _run_id, token = self._seated_run(db)
+            with begin_write(db.engine) as conn:
+                verify_and_extend_leader_fence(conn, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="unit-test")
+            bound = datetime.now(UTC) + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
+            stamped = landscape_database_now(db.engine)  # a whole-second read of the same clock
+        finally:
+            db.close()
+        assert stamped.microsecond == 0
+        assert abs((bound - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)) - stamped) < timedelta(seconds=1)
+
+    def test_every_production_window_is_at_least_ten_seconds(self) -> None:
+        assert DEFAULT_RUN_HEARTBEAT_SECONDS >= 10
+        assert DEFAULT_RUN_LIVENESS_WINDOW_SECONDS >= 10
+        assert DEFAULT_ITEM_STALL_BUDGET_SECONDS >= 10

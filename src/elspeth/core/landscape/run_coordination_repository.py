@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -245,7 +245,6 @@ def verify_and_extend_leader_fence(
     conn: Connection,
     *,
     token: CoordinationToken,
-    now: datetime,
     window_seconds: float,
     verb: str,
 ) -> None:
@@ -257,6 +256,14 @@ def verify_and_extend_leader_fence(
     any payload write. Every fenced verb thereby doubles as the seat
     heartbeat (the predicate is identity+epoch only — NEVER expiry: an idle
     N=1 leader whose seat lapsed mid-run must still pass its own fence).
+
+    The new deadline is written from the database's own clock, in SQL, so no
+    process clock and no caller-supplied ``now`` reaches the seat (ADR-047):
+    SQLite has no interval arithmetic, so its deadline is
+    ``datetime(CURRENT_TIMESTAMP, '+N seconds')`` (whole-second UTC text, no
+    fraction — a fence-written expiry compares as expired up to one second
+    early against a ``.ffffff`` bound, inside every production window);
+    PostgreSQL adds an interval to the transaction timestamp.
 
     On rowcount 0 raises :class:`RunLeadershipLostError`. The caller (or
     :func:`fenced_leader_transaction`) records the ``fence_refusal`` event on
@@ -271,8 +278,12 @@ def verify_and_extend_leader_fence(
             run_coordination_table.c.leader_epoch == token.leader_epoch,
         )
         .values(
-            leader_heartbeat_expires_at=now + timedelta(seconds=window_seconds),
-            updated_at=now,
+            leader_heartbeat_expires_at=(
+                func.datetime(func.current_timestamp(), f"+{window_seconds} seconds")
+                if conn.dialect.name == "sqlite"
+                else func.current_timestamp() + timedelta(seconds=window_seconds)
+            ),
+            updated_at=func.current_timestamp(),
         )
     )
     if result.rowcount != 1:
@@ -289,7 +300,6 @@ def fenced_leader_transaction(
     engine: Tier1Engine,
     *,
     token: CoordinationToken,
-    now: datetime,
     window_seconds: float,
     verb: str,
 ) -> Iterator[Connection]:
@@ -305,18 +315,20 @@ def fenced_leader_transaction(
     """
     try:
         with begin_write(engine) as conn:
-            verify_and_extend_leader_fence(conn, token=token, now=now, window_seconds=window_seconds, verb=verb)
+            verify_and_extend_leader_fence(conn, token=token, window_seconds=window_seconds, verb=verb)
             yield conn
     except RunLeadershipLostError:
         # The begin_write context has exited (rolled back) by the time we get
         # here, so the fresh-connection write cannot deadlock on our own lock.
+        # The refusal's timestamp is forensic (when this process saw the miss),
+        # never an authority deadline: the process clock is the honest source.
         _record_best_effort_event(
             engine,
             run_id=token.run_id,
             event_type="fence_refusal",
             worker_id=token.worker_id,
             leader_epoch=token.leader_epoch,
-            recorded_at=now,
+            recorded_at=datetime.now(UTC),
             context={"verb": verb},
         )
         raise
@@ -890,7 +902,7 @@ class RunCoordinationRepository:
         # token_work_items is only needed by this slice-4 surface.
         from elspeth.core.landscape.schema import token_work_items_table
 
-        with fenced_leader_transaction(self._engine, token=token, now=now, window_seconds=window_seconds, verb="evict_worker") as conn:
+        with fenced_leader_transaction(self._engine, token=token, window_seconds=window_seconds, verb="evict_worker") as conn:
             # Serialize with membership-fenced claim/heartbeat verbs
             # (elspeth-6903f82511): lock the target's registry row BEFORE the
             # no-unexpired-leases precondition read.  Fenced lease verbs take

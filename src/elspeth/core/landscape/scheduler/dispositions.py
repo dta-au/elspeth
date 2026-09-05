@@ -340,7 +340,6 @@ class SchedulerDispositionRepository:
             with fenced_leader_transaction(
                 self._engine,
                 token=coordination_token,
-                now=now,
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="mark_pending_sink_terminal",
             ) as conn:
@@ -450,7 +449,6 @@ class SchedulerDispositionRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="mark_pending_sink_terminal_many",
         ) as conn:

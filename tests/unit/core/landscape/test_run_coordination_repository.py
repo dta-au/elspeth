@@ -46,6 +46,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import (
     RunCoordinationRepository,
     fenced_leader_transaction,
@@ -58,6 +59,7 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
 )
+from tests.fixtures.landscape import assert_deadline_within
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-coord-1"
@@ -402,13 +404,15 @@ class TestVerifyAndExtendLeaderFence:
         _seed_run(engine)
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
-        later = NOW + timedelta(seconds=30)
         with begin_write(engine) as conn:
-            verify_and_extend_leader_fence(conn, token=token, now=later, window_seconds=WINDOW, verb="test_verb")
+            database_now = read_landscape_transaction_time(conn)
+            verify_and_extend_leader_fence(conn, token=token, window_seconds=WINDOW, verb="test_verb")
 
         seat = _seat_row(engine)
-        assert seat["leader_heartbeat_expires_at"] == (later + timedelta(seconds=WINDOW)).replace(tzinfo=None)
-        assert seat["updated_at"] == later.replace(tzinfo=None)
+        # The deadline and the stamp come from the database's own clock, never
+        # from a caller's ``now`` (ADR-047); SQLite stamps whole seconds.
+        assert_deadline_within(cast(datetime, seat["leader_heartbeat_expires_at"]), database_now + timedelta(seconds=WINDOW))
+        assert_deadline_within(cast(datetime, seat["updated_at"]), database_now)
 
     def test_fence_passes_for_lapsed_but_uncontested_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """An idle N=1 leader whose seat lapsed mid-run still passes its own fence.
@@ -422,10 +426,11 @@ class TestVerifyAndExtendLeaderFence:
         _expire_seat(engine)
 
         with begin_write(engine) as conn:
-            verify_and_extend_leader_fence(conn, token=token, now=AFTER_EXPIRY, window_seconds=WINDOW, verb="test_verb")
+            database_now = read_landscape_transaction_time(conn)
+            verify_and_extend_leader_fence(conn, token=token, window_seconds=WINDOW, verb="test_verb")
 
         seat = _seat_row(engine)  # revived: the fenced verb re-heartbeated the seat
-        assert seat["leader_heartbeat_expires_at"] == (AFTER_EXPIRY + timedelta(seconds=WINDOW)).replace(tzinfo=None)
+        assert_deadline_within(cast(datetime, seat["leader_heartbeat_expires_at"]), database_now + timedelta(seconds=WINDOW))
 
     def test_fence_miss_on_stale_epoch_raises_leadership_lost(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
@@ -437,7 +442,7 @@ class TestVerifyAndExtendLeaderFence:
             )
 
         with begin_write(engine) as conn, pytest.raises(RunLeadershipLostError) as excinfo:
-            verify_and_extend_leader_fence(conn, token=stale, now=NOW, window_seconds=WINDOW, verb="complete_run")
+            verify_and_extend_leader_fence(conn, token=stale, window_seconds=WINDOW, verb="complete_run")
         err = excinfo.value
         assert err.run_id == RUN_ID
         assert err.worker_id == stale.worker_id
@@ -450,7 +455,7 @@ class TestVerifyAndExtendLeaderFence:
         foreign = CoordinationToken(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), leader_epoch=1)
 
         with begin_write(engine) as conn, pytest.raises(RunLeadershipLostError):
-            verify_and_extend_leader_fence(conn, token=foreign, now=NOW, window_seconds=WINDOW, verb="save_checkpoint")
+            verify_and_extend_leader_fence(conn, token=foreign, window_seconds=WINDOW, verb="save_checkpoint")
 
 
 class TestFencedLeaderTransaction:
@@ -461,7 +466,7 @@ class TestFencedLeaderTransaction:
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), now=NOW, window_seconds=WINDOW)
 
         probe = mint_worker_id(RUN_ID)
-        with fenced_leader_transaction(engine, token=token, now=NOW, window_seconds=WINDOW, verb="test_verb") as conn:
+        with fenced_leader_transaction(engine, token=token, window_seconds=WINDOW, verb="test_verb") as conn:
             conn.execute(
                 insert(run_workers_table).values(
                     worker_id=probe,
@@ -486,7 +491,7 @@ class TestFencedLeaderTransaction:
 
         with (
             pytest.raises(RunLeadershipLostError),
-            fenced_leader_transaction(engine, token=stale, now=NOW, window_seconds=WINDOW, verb="ingest_source_row") as conn,
+            fenced_leader_transaction(engine, token=stale, window_seconds=WINDOW, verb="ingest_source_row") as conn,
         ):
             conn.execute(  # pragma: no cover — the fence refuses before the body runs
                 insert(run_workers_table).values(

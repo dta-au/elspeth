@@ -596,7 +596,6 @@ class RunLifecycleRepository:
             else fenced_leader_transaction(
                 self._db.engine,
                 token=token,
-                now=timestamp,
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="complete_run",
             )
@@ -1458,7 +1457,6 @@ class RunLifecycleRepository:
             else fenced_leader_transaction(
                 self._db.engine,
                 token=token,
-                now=now(),
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="update_run_status",
             )

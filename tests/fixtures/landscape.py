@@ -321,3 +321,51 @@ def landscape_factory_with_payload_store(landscape_db: LandscapeDB, tmp_path: An
     payload_dir = tmp_path / "payloads"
     payload_store = FilesystemPayloadStore(payload_dir)
     return RecorderFactory(landscape_db, payload_store=payload_store)
+
+
+def landscape_database_now(engine: Any) -> datetime:
+    """Read the Landscape database clock once, outside any decision transaction.
+
+    Test-side control of time goes through the database (ADR-047): compare a
+    deadline the production writer stamped against this value, never against
+    ``datetime.now``. SQLite's ``CURRENT_TIMESTAMP`` is whole-second UTC, so
+    pair it with :func:`assert_deadline_within`.
+    """
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+    with engine.connect() as conn:
+        return read_landscape_transaction_time(conn)
+
+
+def assert_deadline_within(actual: datetime, expected: datetime, *, tolerance: timedelta = timedelta(seconds=1)) -> None:
+    """Assert a database-stamped deadline equals ``expected`` within the clock's resolution.
+
+    SQLite stamps whole seconds with no fraction and PostgreSQL stamps
+    microseconds; a value read back naive is the storage's UTC.
+    """
+    actual_utc = actual if actual.tzinfo is not None else actual.replace(tzinfo=UTC)
+    expected_utc = expected if expected.tzinfo is not None else expected.replace(tzinfo=UTC)
+    assert abs(actual_utc - expected_utc) <= tolerance, (
+        f"deadline {actual_utc.isoformat()} is not within {tolerance} of {expected_utc.isoformat()}"
+    )
+
+
+def assert_stamped_between(
+    actual: datetime,
+    *,
+    start: datetime,
+    end: datetime,
+    offset: timedelta = timedelta(0),
+    tolerance: timedelta = timedelta(seconds=1),
+) -> None:
+    """Assert a database-stamped value lies in ``[start + offset, end + offset]`` within the clock's resolution.
+
+    Bracket a production verb with two :func:`landscape_database_now` reads
+    and hand them in as ``start`` / ``end``: the stamp the verb wrote must
+    fall between them (plus ``offset`` for a deadline), whatever the box's
+    load did to the verb's wall-clock duration.
+    """
+    actual_utc = actual if actual.tzinfo is not None else actual.replace(tzinfo=UTC)
+    lower = (start if start.tzinfo is not None else start.replace(tzinfo=UTC)) + offset - tolerance
+    upper = (end if end.tzinfo is not None else end.replace(tzinfo=UTC)) + offset + tolerance
+    assert lower <= actual_utc <= upper, f"stamp {actual_utc.isoformat()} is outside [{lower.isoformat()}, {upper.isoformat()}]"
