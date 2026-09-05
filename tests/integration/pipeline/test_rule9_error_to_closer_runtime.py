@@ -79,7 +79,7 @@ from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import group_losses_table, token_outcomes_table, token_work_items_table
+from elspeth.core.landscape.schema import group_losses_table, group_records_table, token_outcomes_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.preflight import (
@@ -191,6 +191,22 @@ class PipelineResult:
         with self._connect() as conn:
             rows = conn.execute(select(group_losses_table)).mappings().all()
         return sorted((row["closer_name"], row["member_key"], row["reason"]) for row in rows)
+
+    def expand_group_member_and_loss_counts(self) -> dict[str, tuple[int, int]]:
+        """Per EXPAND group_records row: (member_count, recorded losses for
+        that group_id). The durable reconciliation identity the barrier-scope
+        runs use (member_count == released + lost): a group whose roster
+        settled entirely through the loss ledger shows losses == member_count;
+        a group the run converged past WITHOUT settling shows fewer — the
+        silent-convergence shape elspeth-76e936568e names, which the BLOCKED
+        hold proxy cannot see at member_count == 1."""
+        with self._connect() as conn:
+            groups = conn.execute(
+                select(group_records_table.c.group_id, group_records_table.c.member_count).where(group_records_table.c.kind == "expand")
+            ).all()
+            losses = conn.execute(select(group_losses_table.c.group_id)).all()
+        loss_counts = Counter(row.group_id for row in losses)
+        return {row.group_id: (row.member_count, loss_counts[row.group_id]) for row in groups}
 
     def token_ids_with_path(self, path: str) -> set[str]:
         """Token ids whose recorded terminal path is ``path`` — the per-run
@@ -406,11 +422,13 @@ _COLLECTOR_OMITTED_YAML = _COLLECTOR_EXPLICIT_YAML.replace("on_error: page_stitc
 _COLLECTOR_INPUT_JSONL = json.dumps({"id": 1, "items": [3, 1, 2]}) + "\n" + json.dumps({"id": 2, "items": [5, 7]}) + "\n"
 
 
-def _build_and_run_jsonl(settings_yaml: str, tmp_path: Path) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+def _build_and_run_jsonl(
+    settings_yaml: str, tmp_path: Path, *, input_jsonl: str = _COLLECTOR_INPUT_JSONL
+) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
     """The collector twin needs a LIST-bearing input (json_explode refuses
     strings), so its source is JSONL; otherwise identical to _build_and_run."""
     input_path = tmp_path / "docs.jsonl"
-    input_path.write_text(_COLLECTOR_INPUT_JSONL)
+    input_path.write_text(input_jsonl)
     return _build_and_run(settings_yaml.replace("{input_path}", str(input_path)), tmp_path)
 
 
@@ -465,6 +483,102 @@ def test_transform_explicit_on_error_to_collector_settles_like_the_omitted_twin(
     _collector_error_paths = frozenset({"quarantined_at_source"})
     assert explicit.error_route_token_ids_with_work_items_at("collector_page_stitcher", error_paths=_collector_error_paths) == set()
     assert omitted.error_route_token_ids_with_work_items_at("collector_page_stitcher", error_paths=_collector_error_paths) == set()
+
+
+# ===== Collector arm, DIVERT to an OUTSIDE sink (elspeth-32989096e7) =====
+
+_REJECTS_SINK_YAML = """
+sinks:
+  rejects:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {rejects_path}
+      format: jsonl
+      schema: {{mode: observed}}
+  output:"""
+
+_COLLECTOR_DIVERT_OUT_YAML = _COLLECTOR_EXPLICIT_YAML.replace("on_error: page_stitcher", "on_error: rejects").replace(
+    "\nsinks:\n  output:", _REJECTS_SINK_YAML
+)
+assert "on_error: rejects" in _COLLECTOR_DIVERT_OUT_YAML and "  rejects:" in _COLLECTOR_DIVERT_OUT_YAML
+
+# Three documents, so three EXPAND groups of member_count 3 / 2 / 1: the
+# single-member group is the composition elspeth-32989096e7 asks about
+# (question 4) — the one shape where losing the only member leaves no
+# BLOCKED sibling to hold the drain open.
+_COLLECTOR_DIVERT_INPUT_JSONL = (
+    json.dumps({"id": 1, "items": [3, 1, 2]})
+    + "\n"
+    + json.dumps({"id": 2, "items": [5, 7]})
+    + "\n"
+    + json.dumps({"id": 3, "items": [9]})
+    + "\n"
+)
+
+
+@pytest.mark.parametrize("policy", ["require_all", "best_effort"])
+def test_transform_on_error_to_outside_sink_settles_member_against_its_own_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+) -> None:
+    """Answers elspeth-32989096e7 by execution, both policies (question 5).
+
+    Rule 4 skips DIVERT edges by construction, so a transform inside a
+    collector-bound EXPAND region may route ``on_error`` to a sink OUTSIDE
+    the region and the graph builds clean (the ticket's build evidence). The
+    open questions were runtime ones:
+
+    1. Is a group loss recorded for the diverted member? — yes: one
+       ``group_losses`` row per member, ``reason='error_routed'`` (distinct
+       from the discard twin's ``quarantined``), closer ``page_stitcher``.
+    2. Against which group? — its OWN: every EXPAND ``group_records`` row
+       reconciles ``member_count == losses``, so the loss carried the
+       expand group id out of the region (the ``fork_token`` precedent for
+       dropping a group id on the way out does not recur on the DIVERT leg).
+    3. Does the roster settle? — the run converges with every group
+       reconciled, the collector never flushes (``output`` empty), and no
+       diverted token owns a work item at the collector: it left through
+       the DIVERT edge, not as a pseudo-member.
+    4. Single-member composition with elspeth-76e936568e — the
+       ``member_count == 1`` group reconciles ``(1, 1)`` like the others;
+       the loss replays into settlement, so this route cannot reach the
+       BLOCKED-hold blind spot. That blind spot needs a member removed
+       WITHOUT a loss row, which is not what a DIVERT leg does.
+
+    The 12 hand-run arms of 2026-08-26 (elspeth-494491978d comment 7984)
+    established these answers; this is their regression pin. Verification
+    boundary carried from there: single worker, SQLite.
+    """
+    install_corpus_plugin_manager(monkeypatch)
+    rejects_path = tmp_path / "rejects.jsonl"
+    settings_yaml = _COLLECTOR_DIVERT_OUT_YAML.replace("policy: require_all", f"policy: {policy}").replace(
+        "{rejects_path}", str(rejects_path)
+    )
+
+    db_path, result_data, output_rows = _build_and_run_jsonl(settings_yaml, tmp_path, input_jsonl=_COLLECTOR_DIVERT_INPUT_JSONL)
+    result = PipelineResult(db_path=db_path, result_data=result_data, output_rows=output_rows)
+
+    # Q1: one error_routed loss per member, at the region's own closer.
+    losses = result.group_losses()
+    assert Counter((closer, reason) for closer, _member_key, reason in losses) == Counter({("page_stitcher", "error_routed"): 6})
+    member_keys = [member_key for _closer, member_key, _reason in losses]
+    assert len(set(member_keys)) == 6
+    assert set(member_keys) == result.token_ids_with_path("on_error_routed")
+
+    # Q2 + Q3 + Q4: every EXPAND group — including the single-member one —
+    # reconciles member_count == lost. No group converged unsettled.
+    reconciliation = result.expand_group_member_and_loss_counts()
+    assert sorted(reconciliation.values()) == [(1, 1), (2, 2), (3, 3)]
+
+    # The diverted members really left the region: all six reached the
+    # outside sink, none reached the collector, and the collector never
+    # flushed.
+    rejects_rows = [json.loads(line) for line in rejects_path.read_text().splitlines()]
+    assert sorted(row["item"] for row in rejects_rows) == [1, 2, 3, 5, 7, 9]
+    assert output_rows == []
+    assert result.closer_work_items("collector_page_stitcher") == Counter()
+    assert result.error_route_token_ids_with_work_items_at("collector_page_stitcher", error_paths=frozenset({"on_error_routed"})) == set()
+    assert result.token_outcome_paths().count(("failure", "on_error_routed")) == 6
 
 
 # ===== Gate arm: same equivalence pin, over handle_gate_error_outcome =====
