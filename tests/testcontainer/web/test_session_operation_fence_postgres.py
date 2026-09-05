@@ -1066,3 +1066,46 @@ def test_postgres_archive_delete_cascades_the_read_admissions(postgres_engine: E
     with pytest.raises(SessionOperationFenceLost) as lost:
         repository.compare_and_swap(reader)
     assert lost.value.reason is FenceLossReason.MISSING
+
+
+def test_postgres_forged_read_token_is_a_token_mismatch_on_another_connection(postgres_engine: Engine) -> None:
+    """The third refusal arm on PostgreSQL: the row's lease token is the shared truth.
+
+    The SQLite twin (``test_sqlite_forged_read_token_is_a_token_mismatch``) proves the
+    arm within one process. Here the forgery is presented on a second repository, so
+    the ``TOKEN_MISMATCH`` verdict is read from the committed row rather than from any
+    state the admitting repository holds — and the genuine holder is untouched by it.
+    """
+    admitting = PostgresSessionOperationRepository(postgres_engine)
+    proving = PostgresSessionOperationRepository(postgres_engine)
+    created = _create(admitting, owner=f"creator-{uuid4()}")
+    reader = admitting.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=f"reader-{uuid4()}",
+        lease_seconds=30,
+    )
+    forged = SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=reader.fence.session_id,
+            operation_id=reader.fence.operation_id,
+            lease_token=f"forged-{uuid4()}",
+            operation_epoch=reader.fence.operation_epoch,
+        ),
+        operation_kind=SessionOperationKind.BLOB_READ,
+    )
+    for proof in (
+        lambda: proving.compare_and_swap(forged),
+        lambda: proving.mutate(forged, lambda _transaction: None),
+        lambda: proving.renew(forged, lease_seconds=30),
+        lambda: proving.release(forged),
+    ):
+        with pytest.raises(SessionOperationFenceLost) as lost:
+            proof()
+        assert lost.value.reason is FenceLossReason.TOKEN_MISMATCH
+    # No refused proof wrote: the genuine row still carries the genuine token.
+    row = _postgres_read_row(postgres_engine, session_id=str(created.id), operation_id=reader.fence.operation_id)
+    assert row is not None
+    assert row.lease_token == reader.fence.lease_token
+    proving.compare_and_swap(reader)
+    admitting.release(reader)
