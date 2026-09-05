@@ -39,6 +39,7 @@ READINESS_CHECK_NAMES: tuple[str, ...] = (
     "data_dir",
     "payload_store",
     "blob_dir",
+    "instance_membership",
 )
 _PROBE_SENTINEL = b"elspeth-readiness-probe"
 _slog = structlog.get_logger(__name__)
@@ -361,6 +362,8 @@ async def readiness_report(
     session_engine: Engine,
     runner: ReadinessProbeRunner,
     deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+    *,
+    instance_draining: threading.Event,
 ) -> ReadinessReport:
     state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
     tasks: list[asyncio.Task[_ProbeResult]] = []
@@ -401,6 +404,7 @@ async def readiness_report(
             groups = await asyncio.gather(*tasks)
         by_name = {check.name: check for group in groups for check in group}
         by_name["auth_mode"] = _check_auth_mode(settings)
+        by_name["instance_membership"] = _check_instance_membership(state_mode, instance_draining)
         # Every runner.run() returns a complete named tuple for its labels
         # (timeout and exception paths included), so a missing name is a
         # first-party contract breach: the KeyError propagates into the
@@ -617,3 +621,24 @@ class ReadinessCache:
                 if harvested.report is not None:
                     report = harvested.report
         return report
+
+
+def _check_instance_membership(
+    state_mode: Literal["sqlite-single", "external-postgresql"],
+    instance_draining: threading.Event,
+) -> ReadinessCheck:
+    """Not ready once the lifespan has begun draining this instance.
+
+    The signal is the membership lifecycle's draining event, set as the first
+    act of shutdown — before the ``draining`` row write and before the
+    executor drains — so the platform stops routing new work here at once.
+    A single-process deployment keeps no membership lease but owns the same
+    signal, so draining reads identically on both database modes.
+    """
+    if type(instance_draining) is not threading.Event:
+        raise TypeError("instance_draining must be an exact threading.Event")
+    if instance_draining.is_set():
+        return ReadinessCheck("instance_membership", False, "instance draining; new work refused")
+    if state_mode == "sqlite-single":
+        return ReadinessCheck("instance_membership", True, "single-process deployment; no membership lease")
+    return ReadinessCheck("instance_membership", True, "instance not draining")

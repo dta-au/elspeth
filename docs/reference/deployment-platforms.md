@@ -39,6 +39,12 @@ Terraform package, and the release-specific AWS acceptance controller.
   and GID 1654. Payload persistence is separate from database persistence.
 - For an external database, configure distinct session and Landscape URLs with
   `ELSPETH_WEB__DEPLOYMENT_STATE_MODE=external-postgresql`.
+- Grant the runtime role read access to every session table plus `INSERT` and
+  `UPDATE` on `web_instances`. A read-only runtime role is no longer sufficient:
+  a PostgreSQL-backed replica registers itself in that table at boot, so a role
+  without those two verbs fails startup with `permission denied for table
+  web_instances`. This is provisioning-time work wherever you create the role
+  yourself; the AWS ECS Terraform path already grants it.
 - Initialize empty external schemas once with
   `elspeth doctor deployment --init-schema`, then run the same command without
   `--init-schema` before admitting traffic. AWS keeps the compatible operator
