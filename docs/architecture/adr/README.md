@@ -65,6 +65,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [043](043-project-tooling.md) | Project Tooling — Filigree and Loomweave Only; Everything Else Ruled Out Until Superseded (folds the Wardline, Legis and Warpline retirements) | 2026-08-29 | **Accepted** |
 | [046](046-audit-grade-is-a-product-characteristic.md) | Audit Grade Is a Product Characteristic, Not a Project One | 2026-08-29 | **Accepted** |
 | [047](047-landscape-database-clock-authority.md) | Landscape Database-Clock Authority — Custody, Liveness, Expiry and Takeover Decisions Read the Landscape Database's Clock | 2026-09-05 | **Proposed** |
+| [048](048-required-coordination-token-for-landscape-mutations.md) | Required Coordination Token for Landscape Mutations — Every Mutation API Takes One Current Token, Keyword-Only | 2026-09-06 | **Proposed** |
 
 ## Status Definitions
 
