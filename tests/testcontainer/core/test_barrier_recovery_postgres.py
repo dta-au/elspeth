@@ -11,8 +11,8 @@ from typing import Any
 
 import pytest
 from sqlalchemy import select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.plugins import CollectSink
+from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
     _EmptyBatchTransform,
@@ -57,8 +57,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.mark.timeout(120)

@@ -37,15 +37,27 @@ def _junit(outcomes: list[str | None]) -> bytes:
 
 JUNIT = _junit([None, "failure", "skipped", "error", None])
 RECORD = tr.parse_junit_report(JUNIT)
+DOCKER = tr.resolve_testcontainer_run_target({})
+PROVISIONED_URL = (
+    "postgresql+psycopg://elspeth_admin:s3cret@pg.example.internal:5432/elspeth_admin?sslmode=verify-full&sslrootcert=/etc/ca.pem"
+)
+PROVISIONED = tr.resolve_testcontainer_run_target({tr.PROVISIONED_POSTGRES_URL_ENV: PROVISIONED_URL})
 
 
-def _receipt(provider: tr.Provider = "aws", *, exit_code: int = 1, record: tr.TestcontainerRunRecord = RECORD) -> dict[str, object]:
+def _receipt(
+    provider: tr.Provider = "aws",
+    *,
+    exit_code: int = 1,
+    record: tr.TestcontainerRunRecord = RECORD,
+    target: tr.TestcontainerRunTarget = DOCKER,
+) -> dict[str, object]:
     return tr.build_testcontainer_run_receipt(
         provider=provider,
         candidate_sha=CANDIDATE,
         scenario_id="A",
         exit_code=exit_code,
         record=record,
+        target=target,
         recorded_at=RECORDED_AT,
     )
 
@@ -133,6 +145,40 @@ def test_a_failing_run_is_recorded_with_its_exit_code_not_refused() -> None:
         _receipt(exit_code=1, record=clean)
 
 
+def test_resolve_target_reads_only_the_seam_variable_and_never_hashes_credentials() -> None:
+    """The receipt's database fields come from ELSPETH_TEST_POSTGRES_URL, the variable the suites' seam honours."""
+    assert tr.TestcontainerRunTarget("testcontainers-docker", tr.TESTCONTAINERS_DOCKER_IDENTITY_SHA256) == DOCKER
+    assert tr.resolve_testcontainer_run_target({tr.PROVISIONED_POSTGRES_URL_ENV: "   "}) == DOCKER
+    assert tr.resolve_testcontainer_run_target({"ELSPETH_WEB__DATABASE_URL": PROVISIONED_URL}) == DOCKER
+    assert PROVISIONED.database == "provisioned"
+    assert PROVISIONED.database_identity_sha256 == _sha256(b"pg.example.internal:5432/elspeth_admin")
+    # Credentials, driver, TLS parameters and an explicit default port do not move the identity; a different server does.
+    for variant in (
+        "postgresql://other_role:different@pg.example.internal/elspeth_admin",  # secret-scan: allow-this-line
+        "postgresql+psycopg2://elspeth_admin:s3cret@pg.example.internal:5432/elspeth_admin",
+    ):
+        assert tr.resolve_testcontainer_run_target({tr.PROVISIONED_POSTGRES_URL_ENV: variant}) == PROVISIONED
+    assert (
+        tr.resolve_testcontainer_run_target({tr.PROVISIONED_POSTGRES_URL_ENV: PROVISIONED_URL.replace(":5432/", ":5433/")}) != PROVISIONED
+    )
+    for rejected in (
+        "not a url",
+        "sqlite:////tmp/x.db",
+        "postgresql://elspeth_admin:s3cret@/elspeth_admin",  # secret-scan: allow-this-line
+        "postgresql://:s3cret@pg.example.internal/elspeth_admin",
+        "postgresql://elspeth_admin@pg.example.internal/elspeth_admin",
+        "postgresql://elspeth_admin:s3cret@pg.example.internal",  # secret-scan: allow-this-line
+    ):
+        with pytest.raises(AcceptanceInputError):
+            tr.resolve_testcontainer_run_target({tr.PROVISIONED_POSTGRES_URL_ENV: rejected})
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunTarget("provisioned", tr.TESTCONTAINERS_DOCKER_IDENTITY_SHA256)
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunTarget("testcontainers-docker", "a" * 64)
+    with pytest.raises(ValueError):
+        tr.TestcontainerRunTarget("rds", "a" * 64)  # type: ignore[arg-type]
+
+
 def test_validate_testcontainer_run_receipt_rejects_open_or_inconsistent_receipts() -> None:
     base = _receipt()
     schema_mutations: list[dict[str, object]] = [
@@ -142,6 +188,12 @@ def test_validate_testcontainer_run_receipt_rejects_open_or_inconsistent_receipt
         {**base, "selection": ["tests/testcontainer/", "-m", "testcontainer", "-n", "0", "--junitxml=testcontainer-junit.xml"]},
         {**base, "selection": list(tr.TESTCONTAINER_SELECTION)[:-1]},
         {**base, "selection": " ".join(tr.TESTCONTAINER_SELECTION)},
+        {**base, "database": "rds"},
+        {**base, "database": "provisioned"},
+        {**base, "database_identity_sha256": "a" * 64},
+        {**base, "database_identity_sha256": tr.TESTCONTAINERS_DOCKER_IDENTITY_SHA256.upper()},
+        {**_receipt(target=PROVISIONED), "database_identity_sha256": tr.TESTCONTAINERS_DOCKER_IDENTITY_SHA256},
+        {**_receipt(target=PROVISIONED), "database": "testcontainers-docker"},
         {**base, "exit_code": True},
         {**base, "exit_code": 256},
         {**base, "exit_code": "1"},
@@ -177,15 +229,15 @@ def test_validate_testcontainer_run_receipt_rejects_open_or_inconsistent_receipt
 def test_build_receipt_refuses_inputs_the_validator_would_refuse() -> None:
     with pytest.raises(AcceptanceInputError):
         tr.build_testcontainer_run_receipt(
-            provider="gcp", candidate_sha=CANDIDATE, scenario_id="A", exit_code=0, record=RECORD, recorded_at=RECORDED_AT
+            provider="gcp", candidate_sha=CANDIDATE, scenario_id="A", exit_code=0, record=RECORD, target=DOCKER, recorded_at=RECORDED_AT
         )  # type: ignore[arg-type]
     with pytest.raises(AcceptanceInputError):
         tr.build_testcontainer_run_receipt(
-            provider="aws", candidate_sha="not-a-sha", scenario_id="A", exit_code=0, record=RECORD, recorded_at=RECORDED_AT
+            provider="aws", candidate_sha="not-a-sha", scenario_id="A", exit_code=0, record=RECORD, target=DOCKER, recorded_at=RECORDED_AT
         )
     with pytest.raises(AcceptanceInputError):
         tr.build_testcontainer_run_receipt(
-            provider="aws", candidate_sha=CANDIDATE, scenario_id="A", exit_code=True, record=RECORD, recorded_at=RECORDED_AT
+            provider="aws", candidate_sha=CANDIDATE, scenario_id="A", exit_code=True, record=RECORD, target=DOCKER, recorded_at=RECORDED_AT
         )
     with pytest.raises(AcceptanceInputError):
         tr.build_testcontainer_run_receipt(
@@ -194,6 +246,7 @@ def test_build_receipt_refuses_inputs_the_validator_would_refuse() -> None:
             scenario_id="A",
             exit_code=1,
             record=RECORD,
+            target=DOCKER,
             recorded_at=RECORDED_AT.replace(tzinfo=None),
         )
 
@@ -221,14 +274,29 @@ def test_ecs_binding_accepts_the_aws_receipt_and_refuses_the_azure_one() -> None
         )
 
 
-def test_command_emits_a_storable_receipt_and_mirrors_its_input_failures(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_command_emits_a_storable_receipt_and_mirrors_its_input_failures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     report = tmp_path / "testcontainer-junit.xml"
     report.write_bytes(JUNIT)
     argv = ["--provider", "aws", "--junit", str(report), "--exit-code", "1", "--candidate-sha", CANDIDATE, "--scenario-id", "A"]
+    monkeypatch.delenv(tr.PROVISIONED_POSTGRES_URL_ENV, raising=False)
     assert tr.main(argv) == 0
     receipt = json.loads(capsys.readouterr().out)
     assert _validate(receipt) == receipt
     assert receipt["junit_sha256"] == RECORD.junit_sha256
+    assert (receipt["database"], receipt["database_identity_sha256"]) == (DOCKER.database, DOCKER.database_identity_sha256)
+    # The database is what the environment said when the run was made, never a flag.
+    assert not any(token.startswith("--database") for token in tr.build_parser().format_help().split())
+    monkeypatch.setenv(tr.PROVISIONED_POSTGRES_URL_ENV, PROVISIONED_URL)
+    assert tr.main(argv) == 0
+    provisioned = json.loads(capsys.readouterr().out)
+    assert (provisioned["database"], provisioned["database_identity_sha256"]) == ("provisioned", PROVISIONED.database_identity_sha256)
+    assert "s3cret" not in json.dumps(provisioned) and "pg.example.internal" not in json.dumps(provisioned)
+    monkeypatch.setenv(tr.PROVISIONED_POSTGRES_URL_ENV, "sqlite:////tmp/x.db")
+    assert tr.main(argv) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "input_invalid"
+    monkeypatch.delenv(tr.PROVISIONED_POSTGRES_URL_ENV)
     assert (
         tr.main(
             [

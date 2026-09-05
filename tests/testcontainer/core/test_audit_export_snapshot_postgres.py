@@ -10,7 +10,7 @@ from hashlib import sha256
 
 import pytest
 from sqlalchemy import func, select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
@@ -40,8 +40,8 @@ COMPLETED_AT_TEXT = "2026-07-16T03:04:05.678901Z"
 
 @pytest.fixture
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture

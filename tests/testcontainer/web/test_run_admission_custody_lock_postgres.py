@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 import structlog
 from sqlalchemy import Engine, event
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.web.composer.test_tools import _empty_state, _insert_user_message, _trained_tool_context
 
 from elspeth.contracts.blobs import BlobActiveRunError, BlobNotFoundError, BlobRecord
@@ -57,8 +57,8 @@ _BLOB_CONTENT = b"id,value\n1,alpha\n"
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        url = postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        url = postgres_url
         engine = create_session_engine(url)
         try:
             initialize_session_schema(engine)

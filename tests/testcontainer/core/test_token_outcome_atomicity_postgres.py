@@ -15,9 +15,9 @@ from sqlalchemy import delete, event, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import Executable, Select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import register_test_node
 from tests.fixtures.stores import MockPayloadStore
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
@@ -51,8 +51,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture

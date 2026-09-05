@@ -661,6 +661,13 @@ def test_runbook_records_the_testcontainer_run_before_deploy_and_binds_the_tests
     assert "uv run --frozen pytest " + " ".join(TESTCONTAINER_SELECTION) in helper
     assert "python -m elspeth.web._acceptance_common.testcontainer_run" in helper
     assert "--provider aws" in helper
+    # The run targets the provisioned RDS through the suites' one seam, and the
+    # helper refuses to run without it so the receipt never records a Docker run
+    # on the acceptance host as acceptance evidence (elspeth-0ec6918940).
+    assert "no external-DSN seam" not in helper
+    assert "tests/helpers/postgres_target.py" in helper and "`database`, `database_identity_sha256`" in helper
+    assert ': "${ELSPETH_TEST_POSTGRES_URL:?' in helper
+    assert helper.index(': "${ELSPETH_TEST_POSTGRES_URL:?') < helper.index("uv run --frozen pytest ")
     assert 'persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" testcontainer-run' in helper
     assert "gate-ledger record" in helper and "--check-id tests" in helper and '--receipt-hash "$receipt_hash"' in helper
     assert 'return "$exit_status"' in helper

@@ -7,8 +7,8 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import select
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import make_factory
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.schema import SchemaConfig
@@ -24,8 +24,8 @@ _SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 def _contract(name: str, python_type: type) -> SchemaContract:

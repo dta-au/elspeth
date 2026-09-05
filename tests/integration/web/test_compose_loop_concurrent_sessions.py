@@ -22,7 +22,6 @@ import uuid
 import pytest
 import structlog
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
@@ -30,6 +29,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 # Integration-suite shared session-insert helper.
@@ -53,8 +53,8 @@ def pg_engine():
     is the same path production uses; we explicitly avoid
     ``metadata.create_all`` here because the production schema
     bootstrap is the only path tested in CI."""
-    with PostgresContainer("postgres:16-alpine") as pg:
-        engine = create_session_engine(pg.get_connection_url())
+    with postgres_test_target() as postgres_url:
+        engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
         yield engine
 
