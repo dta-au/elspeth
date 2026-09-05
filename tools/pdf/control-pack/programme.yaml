@@ -1,8 +1,8 @@
 title: "ELSPETH — Programme of Outstanding Work"
-subtitle: "Everything remaining to build, grouped by delivery theme"
+subtitle: "Outstanding work by package, with dependencies and the decisions each requires"
 author: "John Morrissey"
-date: "3 September 2026"
-version: "1.0.0"
+date: "5 September 2026"
+version: "2.0.0"
 status: "DRAFT"
 
 # Template variables
@@ -23,7 +23,7 @@ scope-blurb: >-
   correctness by construction, assurance and release readiness, capability,
   and continuity — and states, for each package, what exists today, what is
   left, and what it depends on.  Figures are measured from the source tree,
-  the issue tracker and the deployed service at the revision named above,
+  the issue tracker and the deployed service at the date named above,
   not estimated.  It is a statement of scope, not a schedule; the decisions
   the programme needs from its owner are listed separately at the end.
 
@@ -33,6 +33,9 @@ org-tagline: "Auditable LLM and Data Pipelines"
 
 # Revision history (newest first)
 revisions:
+  - version: "2.0.0"
+    date: "5 September 2026"
+    changes: "Second issue."
   - version: "1.0.0"
     date: "3 September 2026"
     changes: "Initial issue."

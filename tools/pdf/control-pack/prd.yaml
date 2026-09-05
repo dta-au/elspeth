@@ -1,8 +1,8 @@
 title: "ELSPETH — Product Requirements Document"
 subtitle: "What the product is, who it is for, and what must be true before release"
 author: "John Morrissey"
-date: "3 September 2026"
-version: "1.0.0"
+date: "5 September 2026"
+version: "2.0.0"
 status: "DRAFT"
 
 # Template variables
@@ -33,6 +33,9 @@ org-tagline: "Auditable LLM and Data Pipelines"
 
 # Revision history (newest first)
 revisions:
+  - version: "2.0.0"
+    date: "5 September 2026"
+    changes: "Second issue."
   - version: "1.0.0"
     date: "3 September 2026"
     changes: "Initial issue."
