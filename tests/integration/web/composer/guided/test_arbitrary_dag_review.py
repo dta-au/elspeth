@@ -8,16 +8,16 @@ commit point.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
+from tests.helpers.guided_leases import abandon_guided_worker_leases
 from tests.integration.web.composer.guided.test_plural_sources_outputs import _stage_minimal_plural_proposal
 from tests.integration.web.composer.guided.test_respond import (
     TestStep2IntraStep as _Step2Journey,
@@ -415,22 +415,34 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     state_versions_before = asyncio.run(service.get_state_versions(UUID(session_id)))
     proposal_events_before = asyncio.run(service.list_proposal_events(UUID(session_id)))
 
+    engine = composer_test_client.app.state.session_engine
+
+    def _worker_lost(reason: str) -> _SimulatedWorkerCrash:
+        # A lost process runs no cleanup; its leases lapse and another
+        # replica takes the operation over. Model that here: both of this
+        # worker's authorities lapse BEFORE its exception reaches the lease
+        # guard, so the guard finds no live authority to terminalise (the
+        # Q3 ruling: a takeover is not a failure) and the row stays
+        # ``in_progress`` for the recovery below to claim.
+        abandon_guided_worker_leases(engine, session_id=session_id, operation_id=operation_id)
+        return _SimulatedWorkerCrash(reason)
+
     if crash_point == "after_admission":
 
         async def crash_before_dispatch(**_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after admission")
+            raise _worker_lost("worker lost after admission")
 
         monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", crash_before_dispatch)
     elif crash_point == "after_compute_before_record":
 
         async def crash_before_dispatch_record(*_args, **_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after prepared computation and before durable record")
+            raise _worker_lost("worker lost after prepared computation and before durable record")
 
         monkeypatch.setattr(service, "record_guided_pipeline_dispatch", crash_before_dispatch_record)
     else:
 
         async def crash_before_accept(*_args, **_kwargs):
-            raise _SimulatedWorkerCrash("worker lost after durable dispatch")
+            raise _worker_lost("worker lost after durable dispatch")
 
         monkeypatch.setattr(service, "accept_guided_pipeline_proposal", crash_before_accept)
 
@@ -451,8 +463,7 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
     assert asyncio.run(service.get_state_versions(UUID(session_id))) == state_versions_before
     assert asyncio.run(service.list_proposal_events(UUID(session_id))) == proposal_events_before
 
-    engine = composer_test_client.app.state.session_engine
-    with engine.begin() as connection:
+    with engine.connect() as connection:
         operation = (
             connection.execute(
                 select(guided_operations_table)
@@ -462,14 +473,12 @@ def test_expired_confirmation_takeover_recovers_without_duplicate_dispatch(
             .mappings()
             .one()
         )
+        # The lease guard saw the crash escape with both authorities already
+        # lapsed and did NOT terminalise the row: no failure is recorded
+        # against an operation another replica may still legitimately finish.
         assert operation["status"] == "in_progress"
+        assert operation["failure_code"] is None
         assert operation["proposal_id"] == wire_turn["payload"]["proposal_id"]
-        connection.execute(
-            update(guided_operations_table)
-            .where(guided_operations_table.c.session_id == session_id)
-            .where(guided_operations_table.c.operation_id == operation_id)
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(minutes=1))
-        )
 
     if crash_point == "after_admission":
         monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", original_prepare)

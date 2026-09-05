@@ -1372,8 +1372,15 @@ class SessionPendingInterpretationCommand:
     created_at: datetime
 
     def __post_init__(self) -> None:
-        for field_name in ("event_id", "opt_out_marker_event_id", "composition_state_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        # Every field is read directly: this is a type ELSPETH owns, so a
+        # reflective getattr would only hide a misspelt field name behind a
+        # confident AttributeError-free probe (ADR-032; masquerade gate).
+        for field_name, identifier in (
+            ("event_id", self.event_id),
+            ("opt_out_marker_event_id", self.opt_out_marker_event_id),
+            ("composition_state_id", self.composition_state_id),
+        ):
+            if type(identifier) is not UUID:
                 raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be a UUID")
         if self.event_id == self.opt_out_marker_event_id:
             raise AuditIntegrityError("pending interpretation event ids must be distinct")
@@ -1381,20 +1388,24 @@ class SessionPendingInterpretationCommand:
             raise AuditIntegrityError("SessionPendingInterpretationCommand.kind must be exact")
         if type(self.created_at) is not datetime or self.created_at.utcoffset() is None:
             raise AuditIntegrityError("SessionPendingInterpretationCommand.created_at must be timezone-aware")
-        for field_name in (
-            "affected_node_id",
-            "tool_call_id",
-            "user_term",
-            "llm_draft",
-            "model_identifier",
-            "model_version",
-            "provider",
-            "composer_skill_hash",
-        ):
-            if type(getattr(self, field_name)) is not str:
+        nonblank_text_fields = (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+        )
+        text_fields = (
+            *nonblank_text_fields,
+            ("llm_draft", self.llm_draft),
+            ("composer_skill_hash", self.composer_skill_hash),
+        )
+        for field_name, text in text_fields:
+            if type(text) is not str:
                 raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be an exact string")
-        for field_name in ("affected_node_id", "tool_call_id", "user_term", "model_identifier", "model_version", "provider"):
-            if not getattr(self, field_name).strip():
+        for field_name, text in nonblank_text_fields:
+            if not text.strip():
                 raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be nonblank")
 
 

@@ -105,6 +105,12 @@ class NodeType(StrEnum):
     SINK = "sink"
 
 
+# The rule text every node-name collision reports, generated ONCE from the
+# authority above. It used to be hand-typed three times across core/config
+# and web/composer/state and drifted between them (elspeth-1768ad240c).
+UNIQUE_NODE_NAMES_RULE = "All node names must be unique across every node kind: " + ", ".join(member.value for member in NodeType) + "."
+
+
 class Determinism(StrEnum):
     """Plugin determinism classification for reproducibility.
 

@@ -5801,6 +5801,7 @@ async def post_guided_chat(
     body: GuidedChatRequest,
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> GuidedChatResponse:
     """Settle one current schema-8 Step-1/Step-2 chat operation atomically."""
 

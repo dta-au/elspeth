@@ -326,7 +326,9 @@ def test_build_push_exposes_registry_push_decisions_as_outputs() -> None:
     assert "steps.registries.outputs.push_ghcr" in outputs["push_ghcr"]
     assert "steps.registries.outputs.push_acr" in outputs["push_acr"]
     assert outputs["ghcr_digest"] == "${{ steps.ghcr-push.outputs.digest }}"
-    assert outputs["acr_digest"] == "${{ steps.acr-push.outputs.digest }}"
+    # ACR is either its own build (ACR-only dispatch) or the digest-preserving
+    # copy of the GHCR image (both registries); exactly one step runs.
+    assert outputs["acr_digest"] == "${{ steps.acr-push.outputs.digest || steps.acr-copy.outputs.digest }}"
     assert "secrets." not in str(outputs)
 
 
