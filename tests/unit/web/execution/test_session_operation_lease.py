@@ -609,6 +609,16 @@ async def test_execute_rejects_lease_subclass_before_any_effect() -> None:
     assert executor.submit_calls == []
 
 
+def _durable_effect_call_counts(session_service: Any) -> dict[str, int]:
+    """Call counts of the four session-service effects a run submission may originate."""
+    return {
+        "create_run": session_service.create_run.call_count,
+        "update_run_status": session_service.update_run_status.call_count,
+        "append_run_event": session_service.append_run_event.call_count,
+        "record_blob_inline_resolutions": session_service.record_blob_inline_resolutions.call_count,
+    }
+
+
 @pytest.mark.asyncio
 async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_retains_lease() -> None:
     service, session_service, executor = _execution_service(asyncio.get_running_loop())
@@ -639,10 +649,7 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     worker_shutdown_event = submitted[1][2]
     assert isinstance(worker_shutdown_event, threading.Event)
     assert not worker_shutdown_event.is_set()
-    effect_counts_after_submit = {
-        name: getattr(session_service, name).call_count
-        for name in ("create_run", "update_run_status", "append_run_event", "record_blob_inline_resolutions")
-    }
+    effect_counts_after_submit = _durable_effect_call_counts(session_service)
 
     await asyncio.wait_for(asyncio.to_thread(authority.renew_called.wait, 2), timeout=2)
     assert authority.renew_called.is_set()
@@ -650,7 +657,7 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
     assert executor.future.running() or not executor.future.done()
     assert authority.release_calls == [], "renewal loss signals cancellation but completion still owns the lease"
     await asyncio.sleep(0.02)
-    assert {name: getattr(session_service, name).call_count for name in effect_counts_after_submit} == effect_counts_after_submit, (
+    assert _durable_effect_call_counts(session_service) == effect_counts_after_submit, (
         "renewal loss must not originate a second durable effect path"
     )
     assert not lease.closed, "renewal loss signals the worker but cannot retire authority before worker completion"
@@ -1619,11 +1626,7 @@ def test_done_callback_is_nonblocking_and_async_cleanup_closes_exactly_once() ->
 
 
 def test_submit_failure_terminalizes_under_same_context_before_authority_returns() -> None:
-    nodes = [
-        _function_node(ExecutionServiceImpl, name)
-        for name in ("execute", "_execute_locked", "_handle_pipeline_submission_failure")
-        if hasattr(ExecutionServiceImpl, name)
-    ]
+    nodes = [_function_node(ExecutionServiceImpl, name) for name in ("execute", "_execute_locked", "_handle_pipeline_submission_failure")]
     handlers = [handler for node in nodes for handler in ast.walk(node) if isinstance(handler, ast.ExceptHandler)]
     assert handlers, "execution setup needs an explicit failure path"
     terminal_calls = [

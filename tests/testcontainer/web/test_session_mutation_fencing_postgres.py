@@ -1458,7 +1458,6 @@ async def test_postgres_postcommit_purge_failure_remains_discoverable(
     rendered = "\n".join(
         (
             str(exc_info.value),
-            *(exc_info.value.__notes__ if hasattr(exc_info.value, "__notes__") else ()),
             "".join(traceback.format_exception(exc_info.value)),
         )
     )

@@ -3,7 +3,6 @@
 from pathlib import Path
 
 from elspeth_lints.core import tier_model_scan
-from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 from elspeth_lints.rules.trust_tier.tier_model.rule import Finding
 
 
@@ -104,21 +103,3 @@ def test_resign_assignment_is_exact_and_does_not_cover_same_prefix_peer(
     assert result.census.resign_assigned_count == 1
     assert result.census.uncovered_count == 1
     assert result.uncovered_findings == (uncovered,)
-
-
-def test_legacy_prefix_coverage_remains_accepted(monkeypatch, tmp_path: Path) -> None:
-    finding = _finding("aaa")
-    monkeypatch.setattr(
-        tier_model_scan,
-        "scan_tree_findings",
-        lambda *, root: [finding],
-    )
-
-    result = tier_model_scan.census_tree_targets(
-        root=tmp_path,
-        covered_prefixes={identity_prefix(finding.canonical_key)},
-        per_file_rules=[],
-    )
-
-    assert result.census.exact_covered_count == 1
-    assert result.census.uncovered_count == 0

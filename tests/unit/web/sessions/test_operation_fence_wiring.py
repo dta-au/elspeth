@@ -126,12 +126,7 @@ def test_pending_interpretation_write_requires_exact_operation_context(owner: ty
 
 
 def test_pending_interpretation_preparation_is_handle_free_and_exact() -> None:
-    command = getattr(sessions_protocol, "SessionPendingInterpretationCommand", None)
-    snapshot = getattr(sessions_protocol, "SessionPendingInterpretationSnapshot", None)
-    decision = getattr(sessions_protocol, "SessionPendingInterpretationDecision", None)
-    assert command is not None
-    assert snapshot is not None
-    assert decision is not None
+    command = sessions_protocol.SessionPendingInterpretationCommand
     annotations = inspect.get_annotations(command, eval_str=True)
     assert "Connection" not in repr(annotations)
     assert "Engine" not in repr(annotations)
@@ -341,31 +336,23 @@ def _assert_no_authority_escape(*, owner: type[Any], member_name: str, member: A
 
 def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
     """Every callback surface is an exact domain capability, never generic SQL."""
-    archive_disposition = getattr(sessions_protocol, "SessionArchiveDisposition", None)
-    session_protocol = getattr(sessions_protocol, "SessionOperationSessionMutations", None)
-    composition_protocol = getattr(sessions_protocol, "SessionOperationCompositionMutations", None)
-    interpretation_protocol = getattr(sessions_protocol, "SessionOperationInterpretationMutations", None)
-    run_protocol = getattr(sessions_protocol, "SessionOperationRunMutations", None)
-    blob_protocol = getattr(sessions_protocol, "SessionOperationBlobMutations", None)
-    completion_protocol = getattr(sessions_protocol, "SessionOperationComposerCompletionMutations", None)
-    assert archive_disposition is not None
-    assert session_protocol is not None
-    assert composition_protocol is not None
-    assert interpretation_protocol is not None
-    assert run_protocol is not None
-    assert blob_protocol is not None
-    assert completion_protocol is not None
+    archive_disposition = sessions_protocol.SessionArchiveDisposition
+    session_protocol = sessions_protocol.SessionOperationSessionMutations
+    composition_protocol = sessions_protocol.SessionOperationCompositionMutations
+    interpretation_protocol = sessions_protocol.SessionOperationInterpretationMutations
+    run_protocol = sessions_protocol.SessionOperationRunMutations
+    blob_protocol = sessions_protocol.SessionOperationBlobMutations
+    completion_protocol = sessions_protocol.SessionOperationComposerCompletionMutations
 
     implementation_types = (
         coordination_repository._RepositoryMutationTransaction,
-        getattr(coordination_repository, "_RepositorySessionMutations", None),
-        getattr(coordination_repository, "_RepositoryRunMutations", None),
-        getattr(coordination_repository, "_RepositoryBlobMutations", None),
-        getattr(coordination_repository, "_RepositoryComposerCompletionMutations", None),
-        getattr(coordination_repository, "_RepositoryInterpretationMutations", None),
-        getattr(coordination_repository, "_RepositoryCompositionStateMutations", None),
+        coordination_repository._RepositorySessionMutations,
+        coordination_repository._RepositoryRunMutations,
+        coordination_repository._RepositoryBlobMutations,
+        coordination_repository._RepositoryComposerCompletionMutations,
+        coordination_repository._RepositoryInterpretationMutations,
+        coordination_repository._RepositoryCompositionStateMutations,
     )
-    assert all(owner is not None for owner in implementation_types)
 
     expected_outer = {
         "database_now": datetime,
