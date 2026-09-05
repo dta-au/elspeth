@@ -136,6 +136,7 @@ a target.
 | --- | --- |
 | `ELSPETH_WEB__DEPLOYMENT_TARGET` | `default`, `docker-compose`, `linux-systemd`, `aws-ecs`, `azure-container-apps`, or `kubernetes`. The `azure-container-apps` value is reserved; no supported Container Apps bundle ships in this release. |
 | `ELSPETH_WEB__DEPLOYMENT_STATE_MODE` | `auto`, `sqlite-single`, or `external-postgresql`. Production cloud targets require `external-postgresql`; native Linux can use `sqlite-single` on one host. |
+| `ELSPETH_WEB__INSTANCE_ID` | Optional. Pins the identity this process presents on every response (`X-Elspeth-Instance`), in `/api/system/status`, and as the owner of the session-operation fences it acquires. 1-128 characters of `[A-Za-z0-9._-]` with a leading alphanumeric. Leave unset in production: each process mints a fresh `web-<uuid4>` at startup, which is what keeps two replicas distinguishable. |
 | `ELSPETH_WEB__SESSION_DB_URL` | Session database URL. External mode requires PostgreSQL. |
 | `ELSPETH_WEB__LANDSCAPE_URL` | Landscape database URL. Keep it distinct from the session database. |
 | `ELSPETH_WEB__DATA_DIR` | Persistent application data directory. |

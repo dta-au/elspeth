@@ -34,7 +34,8 @@ none of it is required to contribute.
 
 ```bash
 source .venv/bin/activate      # uv-managed venv (Python 3.12+)
-pytest tests/                  # full suite (~20 min); the plain default selection IS the CI-equivalent run
+pytest tests/                  # default selection (~20 min at -n 12) = what CI's "Test" job runs; it EXCLUDES the PostgreSQL testcontainer suites
+pytest tests/ -m testcontainer -n 0   # CI's required "Testcontainer" job (Docker, serial); never part of the default run
 pytest tests/path::test -n 0   # ONE test: -n 0 disables the default 12 workers (needed for pdb / -s)
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
   elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
@@ -57,6 +58,17 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   a single test or a debugger (`pdb` and `-s` do not work through xdist), and
   note that xdist auto-disables `pytest-benchmark` — the `performance` marker
   is deselected by default anyway.
+- The default selection also deselects the `testcontainer` marker, so a green
+  `pytest tests/` says NOTHING about PostgreSQL. Two 0.8.0 defects passed it:
+  a one-element `IN` CHECK that PostgreSQL reflects as `=` (elspeth-d0e62aea41)
+  and an SSO handoff claim race that SQLite's serialised writers cannot
+  express. If you touched schema, SQL, session or Landscape persistence, or a
+  lock, also run `pytest tests/ -m testcontainer -n 0` (needs Docker; serial
+  because `tests/testcontainer/web/conftest.py` shares one container across the
+  deployment-acceptance files and rejects xdist workers). CI runs exactly that
+  selection in the required `Testcontainer (PostgreSQL contention proofs)` job
+  of `.github/workflows/ci.yaml`; it is the gate for the ids the default run
+  never sees.
 - A handful of process-death / peer-lease / resume tests are FLAKY under
   parallelism (elspeth-0077cb7789): two runs of identical code produced
   DISJOINT failure sets, all passing serially. Before blaming your change for

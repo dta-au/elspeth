@@ -8,36 +8,45 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from types import MappingProxyType
 from typing import cast
 from urllib.parse import urlsplit
 
 import httpx
 
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
-from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
-
-from .contracts import (
+from elspeth.web._acceptance_common.errors import AcceptanceCheckError
+from elspeth.web._acceptance_common.identity import _MAX_IDENTITY_CHARS, SanitizedResourceIdentity
+from elspeth.web._acceptance_common.receipt_validation import _FORBIDDEN_RECEIPT_KEYS as _FORBIDDEN_RECEIPT_KEYS
+from elspeth.web._acceptance_common.receipt_validation import (
     _GIT_SHA_PATTERN,
-    _MAX_IDENTITY_CHARS,
     _SCENARIO_ID_PATTERN,
     _SHA256_PATTERN,
     MAX_EXEC_RECEIPT_CHARS,
     MAX_EXEC_STREAM_BYTES,
-    AcceptanceCheckError,
-    SanitizedResourceIdentity,
+    ExecReceiptDescriptor,
     _parse_utc_z_timestamp,
     _sha256,
+    validate_connection_budget_receipt,
+    validate_exec_receipt_schema,
 )
+from elspeth.web._acceptance_common.receipt_validation import _receipt_nonnegative_integer as _receipt_nonnegative_integer
+from elspeth.web._acceptance_common.receipt_validation import _receipt_number as _receipt_number
+from elspeth.web._acceptance_common.receipt_validation import _receipt_timestamp as _receipt_timestamp
+from elspeth.web._acceptance_common.receipt_validation import _validate_bounded_receipt_document as _validate_bounded_receipt_document
+from elspeth.web._acceptance_common.receipt_validation import _visit_receipt_value as _visit_receipt_value
+from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION as _CANDIDATE_PACKAGE_VERSION
+from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_BASELINE_LANDSCAPE_EPOCH as _ROLLBACK_BASELINE_LANDSCAPE_EPOCH
+from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_BASELINE_SESSION_EPOCH as _ROLLBACK_BASELINE_SESSION_EPOCH
+from elspeth.web._acceptance_common.schema_facts import _ROLLBACK_PACKAGE_VERSION as _ROLLBACK_PACKAGE_VERSION
+from elspeth.web._acceptance_common.schema_facts import _SCENARIO_B_STRUCTURAL_CHANGES as _SCENARIO_B_STRUCTURAL_CHANGES
+from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts as _expected_schema_facts
 
 _METRIC_NAME = "operator.acceptance.sentinel"
 
 _TRACE_NAMES = ("RunStarted", "RunFinished")
 
 _EXEC_RECEIPT_PREFIX = "ELSPETH_ACCEPTANCE_RECEIPT_V1:"
-
-_EXEC_RECEIPT_FIELDS = frozenset({"version", "check", "ok", "candidate_sha", "task_arn_sha256", "scenario_id", "details"})
 
 _S3_DETAIL_FIELDS = frozenset({"object_count", "source_sha256", "sink_sha256", "collision_rejected", "cleanup_succeeded"})
 
@@ -128,52 +137,6 @@ _OPERATOR_METRIC_DIMENSION_FIELDS = (
     ("aws.ecs.task.family", "operator_telemetry_task_definition_family"),
     ("aws.ecs.task.revision", "operator_telemetry_task_definition_revision"),
 )
-
-_CANDIDATE_PACKAGE_VERSION = "0.8.0"
-
-_ROLLBACK_PACKAGE_VERSION = "0.7.1"
-
-_ROLLBACK_BASELINE_SESSION_EPOCH = 35
-
-_ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
-
-# Derived from the live epoch constants: a schema bump must rotate the label a
-# compatibility receipt attests, otherwise a stale receipt keeps validating
-# against a transition the candidate no longer performs.
-_SCENARIO_B_STRUCTURAL_CHANGES = (
-    f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
-    f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
-    "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
-)
-
-
-def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
-    """Truthful release/schema facts the compatibility authority must attest.
-
-    Candidate facts track the live schema-epoch constants so the validators
-    always demand the current build's truth; previous facts are pinned to the
-    Scenario B rollback baseline.
-    """
-    return {
-        "candidate": {
-            "session_epoch": SESSION_SCHEMA_EPOCH,
-            "landscape_epoch": SQLITE_SCHEMA_EPOCH,
-            "run_web_plugin_policy_present": True,
-        },
-        "previous": (
-            {
-                "session_epoch": _ROLLBACK_BASELINE_SESSION_EPOCH,
-                "landscape_epoch": _ROLLBACK_BASELINE_LANDSCAPE_EPOCH,
-                "run_web_plugin_policy_present": True,
-            }
-            if scenario_id == "B"
-            else None
-        ),
-        "structural_changes": (_SCENARIO_B_STRUCTURAL_CHANGES if scenario_id == "B" else "initial_create"),
-        "semantics_only_changes": ("guided_coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
-        "archive_export_decision": ("required_before_forward_migration" if scenario_id == "B" else "not_applicable"),
-        "destructive_reset_required": False,
-    }
 
 
 def _validate_s3_receipt_details(details: Mapping[str, object]) -> None:
@@ -375,6 +338,10 @@ def _validate_operator_receipt_details(details: Mapping[str, object]) -> None:
         )
     except (TypeError, ValueError):
         raise AcceptanceCheckError("exec_receipt_schema") from None
+    # The shared identity admits every provider in its closed set; an ECS
+    # operator receipt attests AWS and nothing else.
+    if resource["cloud_provider"] != "aws":
+        raise AcceptanceCheckError("exec_receipt_schema")
     sentinel_sha256 = details["sentinel_sha256"]
     if type(sentinel_sha256) is not str or _SHA256_PATTERN.fullmatch(sentinel_sha256) is None:
         raise AcceptanceCheckError("exec_receipt_schema")
@@ -464,45 +431,7 @@ def _validate_operator_receipt_details(details: Mapping[str, object]) -> None:
     test_fingerprint="a8fa36aef0fcf1ef09016ec8f411c61ec7a87eb34956a19f67c70b19a1e82488",
 )
 def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
-    if not isinstance(payload, dict) or set(payload) != _EXEC_RECEIPT_FIELDS:
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if payload["version"] != 1 or type(payload["version"]) is not int or payload["ok"] is not True:
-        raise AcceptanceCheckError("exec_receipt")
-    check = payload["check"]
-    candidate_sha = payload["candidate_sha"]
-    task_arn_sha256 = payload["task_arn_sha256"]
-    scenario_id = payload["scenario_id"]
-    details = payload["details"]
-    if type(check) is not str or check not in {
-        "verify-s3",
-        "verify-bedrock",
-        "verify-textract",
-        "verify-bedrock-guardrails",
-        "verify-connection-budget",
-        "verify-operator-telemetry",
-    }:
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if type(candidate_sha) is not str or _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None:
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if type(task_arn_sha256) is not str or _SHA256_PATTERN.fullmatch(task_arn_sha256) is None:
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if type(scenario_id) is not str or _SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if not isinstance(details, dict):
-        raise AcceptanceCheckError("exec_receipt_schema")
-    if check == "verify-s3":
-        _validate_s3_receipt_details(details)
-    elif check == "verify-bedrock":
-        _validate_bedrock_receipt_details(details)
-    elif check == "verify-bedrock-guardrails":
-        _validate_guardrail_receipt_details(details)
-    elif check == "verify-connection-budget":
-        _validate_connection_budget_receipt(details)
-    elif check == "verify-textract":
-        _validate_textract_receipt_details(details)
-    else:
-        _validate_operator_receipt_details(details)
-    return payload
+    return validate_exec_receipt_schema(payload, descriptor=_ECS_EXEC_RECEIPT_DESCRIPTOR)
 
 
 @trust_boundary(
@@ -653,131 +582,6 @@ def extract_exec_receipt(
     return payload
 
 
-_FORBIDDEN_RECEIPT_KEYS = frozenset(
-    {
-        "password",
-        "credential",
-        "credentials",
-        "secret",
-        "token",
-        "access_token",
-        "refresh_token",
-        "command",
-        "environment",
-        "provider_response",
-        "raw_response",
-        "raw_output",
-        "message",
-        "exception_text",
-        "headers",
-        "cookies",
-        "username",
-    }
-)
-
-
-@trust_boundary(
-    tier=3,
-    source="one node of an untrusted receipt document read back from the acceptance receipt store",
-    source_param="value",
-    suppresses=("R1", "R5"),
-    invariant=(
-        "raises AcceptanceCheckError('receipt_store_schema') before use on any container over its size limit, any key "
-        "that is not a bounded safe identifier or that names forbidden or raw content, any control-character or "
-        "oversized string, and any non-JSON or non-finite scalar; the same error also rejects a node that exhausts "
-        "the caller's whole-document node budget or exceeds the depth limit"
-    ),
-    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_receipt_value_visit_rejects_forbidden_key"),
-    test_fingerprint="a173e99eda87d962aa77fa64ae6e9de976ffbfc7d3e3678c282f697aaa95ded4",
-)
-def _visit_receipt_value(value: object, *, depth: int, remaining: int) -> int:
-    """Admit one receipt node and return the node budget left after it.
-
-    The budget is threaded, not reset: every recursive call consumes from and
-    returns the caller's remaining count, so the 4096 cap stays a whole-document
-    node cap rather than a per-branch one.
-    """
-
-    remaining -= 1
-    if remaining < 0 or depth > 8:
-        raise AcceptanceCheckError("receipt_store_schema")
-    if isinstance(value, dict):
-        if len(value) > 256:
-            raise AcceptanceCheckError("receipt_store_schema")
-        for key, child in value.items():
-            if (
-                type(key) is not str
-                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", key) is None
-                or key.lower() in _FORBIDDEN_RECEIPT_KEYS
-                or key.lower().endswith("_raw")
-            ):
-                raise AcceptanceCheckError("receipt_store_schema")
-            remaining = _visit_receipt_value(child, depth=depth + 1, remaining=remaining)
-    elif isinstance(value, list):
-        if len(value) > 1024:
-            raise AcceptanceCheckError("receipt_store_schema")
-        for child in value:
-            remaining = _visit_receipt_value(child, depth=depth + 1, remaining=remaining)
-    elif isinstance(value, str):
-        if len(value) > 16 * 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise AcceptanceCheckError("receipt_store_schema")
-    elif (value is not None and not isinstance(value, (bool, int, float))) or (isinstance(value, float) and not math.isfinite(value)):
-        raise AcceptanceCheckError("receipt_store_schema")
-    return remaining
-
-
-@trust_boundary(
-    tier=3,
-    source="a whole receipt document read back from the acceptance receipt store or the orphan-sweep inventory",
-    source_param="payload",
-    suppresses=("R1", "R5"),
-    invariant=(
-        "raises AcceptanceCheckError('receipt_store_schema') before use when the payload is not a dict, or when any "
-        "node beneath it fails the bounded-document admission the traversal enforces"
-    ),
-    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_bounded_receipt_document_rejects_non_dict_payload"),
-    test_fingerprint="5687a5689ddad1424f50bcdbcc173c5f46a4cfcc2be82ae1dba3b8b7ff39c470",
-)
-def _validate_bounded_receipt_document(payload: object) -> dict[str, object]:
-    if not isinstance(payload, dict):
-        raise AcceptanceCheckError("receipt_store_schema")
-    _visit_receipt_value(payload, depth=0, remaining=4096)
-    return payload
-
-
-@trust_boundary(
-    tier=3,
-    source="one numeric field of an untrusted connection-budget receipt read back from the acceptance receipt store",
-    source_param="value",
-    suppresses=("R1", "R5"),
-    invariant=(
-        "raises AcceptanceCheckError('receipt_store_schema') before use on a bool, a non-real value, a non-finite "
-        "float, or a negative number; returns an owned float otherwise"
-    ),
-    test_ref=("tests/unit/web/aws_ecs_acceptance/test_receipt_contracts.py::test_receipt_number_rejects_bool_as_a_number"),
-    test_fingerprint="72ff8815d1351ec4322f0a795e2a9716a86f9fd42e370c407d36deb103231434",
-)
-def _receipt_number(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
-        raise AcceptanceCheckError("receipt_store_schema")
-    return float(value)
-
-
-def _receipt_nonnegative_integer(value: object) -> int:
-    if type(value) is not int or value < 0:
-        raise AcceptanceCheckError("receipt_store_schema")
-    return value
-
-
-def _receipt_timestamp(value: object) -> datetime:
-    if type(value) is not str:
-        raise AcceptanceCheckError("receipt_store_schema")
-    try:
-        return _parse_utc_z_timestamp(value)
-    except ValueError:
-        raise AcceptanceCheckError("receipt_store_schema") from None
-
-
 @trust_boundary(
     tier=3,
     source=(
@@ -801,70 +605,12 @@ def _validate_connection_budget_receipt(
     expected_acceptance_run_id_sha256: str | None = None,
     expected_cluster_id_sha256: str | None = None,
 ) -> dict[str, object]:
-    if not isinstance(payload, dict) or set(payload) != {
-        "schema",
-        "acceptance_run_id_sha256",
-        "cluster_id_sha256",
-        "window_start",
-        "window_end",
-        "period_seconds",
-        "expected_points",
-        "points",
-        "high_water",
-        "max_connections",
-        "approved_budget",
-        "safety_margin",
-        "ok",
-    }:
-        raise AcceptanceCheckError("receipt_store_schema")
-    if (
-        payload["schema"] != "elspeth.rds-connection-budget.v3"
-        or type(payload["acceptance_run_id_sha256"]) is not str
-        or _SHA256_PATTERN.fullmatch(payload["acceptance_run_id_sha256"]) is None
-        or type(payload["cluster_id_sha256"]) is not str
-        or _SHA256_PATTERN.fullmatch(payload["cluster_id_sha256"]) is None
-    ):
-        raise AcceptanceCheckError("receipt_store_schema")
-    if (expected_acceptance_run_id_sha256 is not None and payload["acceptance_run_id_sha256"] != expected_acceptance_run_id_sha256) or (
-        expected_cluster_id_sha256 is not None and payload["cluster_id_sha256"] != expected_cluster_id_sha256
-    ):
-        raise AcceptanceCheckError("receipt_store_binding")
-    points = payload["points"]
-    window_start = _receipt_timestamp(payload["window_start"])
-    window_end = _receipt_timestamp(payload["window_end"])
-    if (
-        payload["period_seconds"] != 60
-        or payload["expected_points"] != 10
-        or window_end - window_start != timedelta(minutes=10)
-        or window_start.second != 0
-        or window_start.microsecond != 0
-    ):
-        raise AcceptanceCheckError("receipt_store_schema")
-    expected_timestamps = [window_start + timedelta(minutes=offset) for offset in range(10)]
-    if not isinstance(points, list) or len(points) != len(expected_timestamps):
-        raise AcceptanceCheckError("receipt_store_schema")
-    counts: list[float] = []
-    observed_timestamps: list[datetime] = []
-    for point in points:
-        if not isinstance(point, dict) or set(point) != {"timestamp", "count"}:
-            raise AcceptanceCheckError("receipt_store_schema")
-        observed_timestamps.append(_receipt_timestamp(point["timestamp"]))
-        counts.append(_receipt_number(point["count"]))
-    if observed_timestamps != expected_timestamps or len(set(observed_timestamps)) != len(observed_timestamps):
-        raise AcceptanceCheckError("receipt_store_schema")
-    high_water = _receipt_number(payload["high_water"])
-    maximum = _receipt_nonnegative_integer(payload["max_connections"])
-    budget = _receipt_nonnegative_integer(payload["approved_budget"])
-    margin = _receipt_nonnegative_integer(payload["safety_margin"])
-    if (
-        payload["ok"] is not True
-        or high_water != max(counts)
-        or high_water > budget
-        or budget > maximum - margin
-        or maximum - high_water < margin
-    ):
-        raise AcceptanceCheckError("receipt_store_schema")
-    return payload
+    return validate_connection_budget_receipt(
+        payload,
+        schema_id=_RDS_CONNECTION_BUDGET_SCHEMA,
+        expected_acceptance_run_id_sha256=expected_acceptance_run_id_sha256,
+        expected_cluster_id_sha256=expected_cluster_id_sha256,
+    )
 
 
 @trust_boundary(
@@ -1150,3 +896,25 @@ def _validate_stored_receipt(
         ):
             raise AcceptanceCheckError("receipt_store_binding")
     return receipt
+
+
+# Provider bindings for the shared validators. Appended after every positional
+# anchor the signed allowlist holds on this module (phase6b plan §11.3): a new
+# module-level statement ahead of `resolve_exec_receipt_env` would re-stage its
+# key for no reason.
+_RDS_CONNECTION_BUDGET_SCHEMA = "elspeth.rds-connection-budget.v3"
+
+_ECS_EXEC_RECEIPT_DESCRIPTOR = ExecReceiptDescriptor(
+    provider="aws",
+    subject_field="task_arn_sha256",
+    detail_validators=MappingProxyType(
+        {
+            "verify-s3": _validate_s3_receipt_details,
+            "verify-bedrock": _validate_bedrock_receipt_details,
+            "verify-textract": _validate_textract_receipt_details,
+            "verify-bedrock-guardrails": _validate_guardrail_receipt_details,
+            "verify-connection-budget": _validate_connection_budget_receipt,
+            "verify-operator-telemetry": _validate_operator_receipt_details,
+        }
+    ),
+)

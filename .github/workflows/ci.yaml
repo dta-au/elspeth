@@ -16,10 +16,18 @@ on:
   pull_request:
     branches: [main, master, "RC*", "release/**"]
 
-# Cancel in-progress runs when a new commit is pushed
+# Cancel in-progress runs when a new commit is pushed — except on release/**
+# refs. A release branch is landed in bursts (~12 pushes in 11 h on
+# 2026-09-04/05) and every CI run in that window was cancelled by the next
+# push, so the required check never completed on a single sha
+# (elspeth-d8749aeaa3). On a release ref the in-progress run finishes and
+# only the pending run is replaced, so the tip is always tested eventually
+# and every completed run is a verdict on a real sha. The three push
+# workflows (ci, codeql, enforce-allowlist-judge-gates) keep this expression
+# identical; tests/unit/cicd pins it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
 
 env:
   PYTHON_VERSION: "3.13"
@@ -110,6 +118,14 @@ jobs:
 
       - name: Reject touched or broadened permanent multi-rule per-file blankets
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # This job runs inside a container, where GitHub's shell auto-detection
+        # falls back to `sh -e` (dash). dash rejects `set -o pipefail` and has
+        # no `[[`, so without an explicit bash this step died at its first
+        # line ("set: Illegal option -o pipefail", exit 2) on every push run
+        # and the ratchet resolver below never executed (run 33944365102,
+        # elspeth-d8749aeaa3). enforce-allowlist-judge-gates.yaml documents
+        # the same fallback in its header and declares bash for that reason.
+        shell: bash
         env:
           CURRENT_RUN_ID: ${{ github.run_id }}
           GH_TOKEN: ${{ github.event_name != 'pull_request' && github.token || '' }}
@@ -843,7 +859,9 @@ jobs:
     # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
     runs-on: ubuntu-24.04
     needs: [static-analysis]
-    timeout-minutes: 20
+    # 276 ids ran serially in 8 min on the maintainer's box (2026-09-05,
+    # elspeth-d8749aeaa3); hosted runners are slower, so allow ~3x.
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -864,10 +882,30 @@ jobs:
         run: uv sync --frozen --all-extras
 
       - name: Run testcontainer suite
+        # The whole tree, not tests/testcontainer/: four files under
+        # tests/integration/web/ carry per-test testcontainer marks, and the
+        # default selection (pyproject addopts) deselects the marker, so this
+        # job is the only place those ids ever run. -n 0 is mandatory:
+        # tests/testcontainer/web/conftest.py shares one TLS PostgreSQL
+        # container across the deployment-acceptance files and raises
+        # UsageError under any xdist worker, while addopts default to -n 12.
+        # The junit report is the evidence Phase 7 cites for the P0 pin test
+        # tests/testcontainer/web/test_schema_probe_postgres.py::
+        # test_fresh_create_reaches_current (elspeth-d8749aeaa3).
         run: |
-          uv run pytest tests/testcontainer/ \
+          uv run pytest tests/ \
             -v \
-            -m testcontainer
+            -m testcontainer \
+            -n 0 \
+            --junitxml=testcontainer-junit.xml
+
+      - name: Upload testcontainer junit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: testcontainer-junit
+          path: testcontainer-junit.xml
+          retention-days: 30
 
   # ===========================================================================
   # Stage 3c: Dependency and License Audit
