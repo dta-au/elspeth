@@ -25,6 +25,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
@@ -60,6 +61,7 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
@@ -514,22 +516,26 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
                 )
             )
     service = BlobServiceImpl(engine, tmp_path)
-    first_blob = asyncio.run(
-        service.create_blob(
-            UUID(first_session),
-            "first.csv",
-            _FIRST_REVIEWED_BLOB_CONTENT,
-            "text/csv",
+    with fenced_operation_context(engine, first_session, operation_kind=SessionOperationKind.CREATE) as first_context:
+        first_blob = asyncio.run(
+            service.create_blob(
+                UUID(first_session),
+                "first.csv",
+                _FIRST_REVIEWED_BLOB_CONTENT,
+                "text/csv",
+                session_operation_context=first_context,
+            )
         )
-    )
-    second_blob = asyncio.run(
-        service.create_blob(
-            UUID(second_session),
-            "second.csv",
-            b"name,score\nGrace,99\n",
-            "text/csv",
+    with fenced_operation_context(engine, second_session, operation_kind=SessionOperationKind.CREATE) as second_context:
+        second_blob = asyncio.run(
+            service.create_blob(
+                UUID(second_session),
+                "second.csv",
+                b"name,score\nGrace,99\n",
+                "text/csv",
+                session_operation_context=second_context,
+            )
         )
-    )
     return engine, first_session, second_session, (first_blob, second_blob)
 
 

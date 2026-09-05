@@ -27,6 +27,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
@@ -45,6 +46,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _option_shape_summary(*, scalar: int) -> dict[str, object]:
@@ -905,16 +907,18 @@ class TestSetSourceFromBlobDerivedGuarantees:
 
         engine, session_id = _session_engine_with_session()
         blob_service = BlobServiceImpl(engine, tmp_path)
-        record = asyncio.run(
-            blob_service.create_blob(
-                session_id=UUID(session_id),
-                filename="latin.csv",
-                content="colonne,prix\ncaf\xe9,3\n".encode("latin-1"),
-                mime_type="text/csv",  # type: ignore[arg-type]
-                created_by="user",
-                source_description="uploaded",
+        with fenced_operation_context(engine, session_id, operation_kind=SessionOperationKind.CREATE) as create_context:
+            record = asyncio.run(
+                blob_service.create_blob(
+                    session_id=UUID(session_id),
+                    filename="latin.csv",
+                    content="colonne,prix\ncaf\xe9,3\n".encode("latin-1"),
+                    mime_type="text/csv",  # type: ignore[arg-type]
+                    created_by="user",
+                    source_description="uploaded",
+                    session_operation_context=create_context,
+                )
             )
-        )
         ctx = ToolContext(
             catalog=_mock_catalog(),
             data_dir=str(tmp_path),
