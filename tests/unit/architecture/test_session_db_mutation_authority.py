@@ -14,7 +14,7 @@ import hashlib
 import re
 import textwrap
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -2410,6 +2410,22 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SkillMarkdownHistoryAuthority",
         line=62,
     ),
+    # ── P4-D6 step 4 facet admissions (elspeth-e483fe7f85): writers and contained
+    # acquisitions the scanner already attributes to a named authority, admitted
+    # method-exact from live scanner output. blobs/service.py's phase helpers
+    # (_reserve_pending_blob / _finalize_reserved_blob) hand their connection to
+    # sub-helpers and stay in step 5's escape corpus. ────────────────────────
+    # src/elspeth/web/coordination/repository.py :: SessionOperationAuthority
+    WriterIdentity(
+        "src/elspeth/web/coordination/repository.py",
+        "_SessionOperationAuthorityRepository.mutate_fork_creation",
+        "<sessions-write-connection>",
+        "write_connection",
+        "2a24f2fb856584b3",
+        1,
+        "SessionOperationAuthority",
+        line=4746,
+    ),
 )
 
 # These exact connection flows are proven read-only but cannot be resolved to
@@ -2854,6 +2870,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=234,
     ),
+    # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
+    # same-module private callee that executes on it, which the forwarding
+    # proof now inspects; same acquisition, same fingerprint, no escape.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_group_satisfiability_resumable",
@@ -2863,7 +2882,6 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         line=430,
-        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -3339,10 +3357,31 @@ def _contained_connection_authority_for(path: str, symbol: str) -> str | None:
     return None
 
 
+# P4-D6 step 5 (hub ruling on elspeth-e483fe7f85): a connection forwarded to a
+# callable the scanner can INSPECT is contained when every use inside the callee
+# is one of these receivers, a dialect read, an anonymous nested transaction, or
+# a further resolvable forward within the depth bound. Everything else escapes.
+_EXECUTE_RECEIVER_METHODS = frozenset({"execute", "executemany", "exec_driver_sql", "scalar", "scalars"})
+_FORWARDING_MAX_DEPTH = 3
+_NESTED_SCOPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.Lambda,
+    ast.ClassDef,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
+
 class _ProductionWriterCollector(ast.NodeVisitor):
     def __init__(self, path: str, tree: ast.AST) -> None:
         self.path = path
         self.tree = tree
+        # Parallel to ``sites``: the node each site was emitted from, so a
+        # tree-wide post-pass can reason about a site's enclosing function.
+        self.site_nodes: list[ast.AST] = []
         self.import_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.assignment_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
         self.definition_bindings: dict[tuple[int, str], list[_NameBinding]] = {}
@@ -4889,6 +4928,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         connection_escape: bool = False,
     ) -> None:
         symbol = _symbol(node)
+        self.site_nodes.append(node)
         self.sites.append(
             WriterIdentity(
                 path=self.path,
@@ -5646,6 +5686,156 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return any(_ProductionWriterCollector._target_stores_connection_externally(child) for child in target.elts)
         return False
 
+    # -- P4-D6 step 5: forwarding proof (hub ruling, six conditions) ----------
+
+    def _resolvable_private_callee(self, call: ast.Call) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """The callee when it is exactly one same-class method (``self.m(...)``) or one same-module
+        private function (``_f(...)``); ``None`` for anything dispatched through another object,
+        imported, public at module level, or ambiguous (condition 1)."""
+
+        definition = self._local_callable_definition(call)
+        if definition is None:
+            return None
+        if isinstance(call.func, ast.Attribute):
+            return definition if id(definition) in self.method_owners else None
+        parent = getattr(definition, "_inventory_parent", None)
+        if not isinstance(parent, ast.Module) or not definition.name.startswith("_"):
+            return None
+        return definition
+
+    def _is_static_method(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return any(
+            (isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
+            or self._imported_qualified_name(decorator) == "builtins.staticmethod"
+            for decorator in definition.decorator_list
+        )
+
+    def _forwarded_parameter(
+        self,
+        call: ast.Call,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        argument: ast.expr,
+    ) -> str | None:
+        """The callee parameter that receives ``argument`` at ``call``, or ``None`` unless exactly knowable."""
+
+        if any(isinstance(item, ast.Starred) for item in call.args) or any(keyword.arg is None for keyword in call.keywords):
+            return None
+        positional = [*definition.args.posonlyargs, *definition.args.args]
+        if id(definition) in self.method_owners:
+            if not isinstance(call.func, ast.Attribute):
+                return None
+            if not self._is_static_method(definition):
+                if not positional:
+                    return None
+                positional = positional[1:]
+        for index, item in enumerate(call.args):
+            if item is argument:
+                return positional[index].arg if index < len(positional) else None
+        for keyword in call.keywords:
+            if keyword.value is argument:
+                names = {parameter.arg for parameter in (*positional, *definition.args.kwonlyargs)}
+                return keyword.arg if keyword.arg in names else None
+        return None
+
+    @classmethod
+    def _scope_nodes(cls, scope: ast.AST) -> Iterator[ast.AST]:
+        """Every node of ``scope`` without descending into a nested scope (the nested scope itself is yielded)."""
+
+        for child in ast.iter_child_nodes(scope):
+            yield child
+            if isinstance(child, _NESTED_SCOPES):
+                continue
+            yield from cls._scope_nodes(child)
+
+    def _connection_uses_are_contained(
+        self,
+        scope: ast.FunctionDef | ast.AsyncFunctionDef,
+        name: str,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        allow_yield: bool = False,
+    ) -> bool:
+        """Every use of connection ``name`` inside ``scope`` keeps the capability there.
+
+        Permitted: the name is executed on (``_EXECUTE_RECEIVER_METHODS``), its
+        ``dialect`` is read, it opens an anonymous ``with name.begin_nested():``,
+        or it is forwarded to a resolvable private callee whose own uses are
+        contained (recursively, ``_FORWARDING_MAX_DEPTH``, cycle-refusing).
+        ``allow_yield`` admits the one ``yield name`` a contextmanager wrapper
+        is. Anything else -- a store, return, comparison, closure or
+        comprehension capture, star-argument, reassignment, raw DBAPI access,
+        a bound nested transaction, or an unresolvable forward -- refuses.
+        """
+
+        if depth > _FORWARDING_MAX_DEPTH or self._name_reassigned_in(scope, name):
+            return False
+        for node in self._scope_nodes(scope):
+            if isinstance(node, _NESTED_SCOPES):
+                if any(isinstance(inner, ast.Name) and inner.id == name for inner in ast.walk(node)):
+                    return False
+                continue
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if not self._connection_use_is_contained(node, depth=depth, active=active, allow_yield=allow_yield):
+                return False
+        return True
+
+    def _connection_use_is_contained(
+        self,
+        use: ast.Name,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        allow_yield: bool,
+    ) -> bool:
+        parent = getattr(use, "_inventory_parent", None)
+        if isinstance(use.ctx, ast.Del):
+            # ``del conn`` unbinds the local name; nothing receives the capability.
+            return True
+        if not isinstance(use.ctx, ast.Load):
+            # The with-binding that introduces the name is the one permitted store.
+            return isinstance(parent, ast.withitem) and parent.optional_vars is use
+        if isinstance(parent, ast.Attribute) and parent.value is use:
+            grandparent = getattr(parent, "_inventory_parent", None)
+            if parent.attr == "dialect":
+                return True
+            if isinstance(grandparent, ast.Call) and grandparent.func is parent:
+                if parent.attr in _EXECUTE_RECEIVER_METHODS:
+                    return True
+                if parent.attr in {"begin", "begin_nested"}:
+                    item = getattr(grandparent, "_inventory_parent", None)
+                    return isinstance(item, ast.withitem) and item.context_expr is grandparent and item.optional_vars is None
+            return False
+        if allow_yield and isinstance(parent, ast.Yield) and parent.value is use:
+            return isinstance(getattr(parent, "_inventory_parent", None), ast.Expr)
+        call = getattr(parent, "_inventory_parent", None) if isinstance(parent, ast.keyword) else parent
+        if not isinstance(call, ast.Call) or call.func is use:
+            return False
+        if use not in call.args and not any(keyword.value is use for keyword in call.keywords):
+            return False
+        callee = self._resolvable_private_callee(call)
+        if callee is None:
+            return False
+        parameter = self._forwarded_parameter(call, callee, use)
+        if parameter is None:
+            return False
+        key = (id(callee), parameter)
+        if key in active:
+            return False
+        return self._connection_uses_are_contained(callee, parameter, depth=depth + 1, active=active | {key})
+
+    def _forwarding_is_contained(self, call: ast.Call, argument: ast.Name) -> bool:
+        """``helper(conn)`` keeps the connection contained iff the callee is inspectable and proves it."""
+
+        callee = self._resolvable_private_callee(call)
+        if callee is None:
+            return False
+        parameter = self._forwarded_parameter(call, callee, argument)
+        if parameter is None:
+            return False
+        return self._connection_uses_are_contained(callee, parameter, depth=1, active=frozenset({(id(callee), parameter)}))
+
     def _collect_unresolved_connection_flows(self) -> None:
         """Fail closed when an acquired connection reaches an unknown write-capable sink."""
 
@@ -5766,10 +5956,16 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             # ``with engine.begin() as conn: imported_or_local_helper(conn)``.
             # A helper can hide a prebuilt or dynamically generated write, so
             # forwarding a raw connection is write-capable until a typed
-            # authority removes that path.
+            # authority removes that path -- unless the callee can be INSPECTED
+            # and every use inside it is proven contained (P4-D6 step 5); a
+            # callee the scanner cannot resolve keeps the escape.
             for argument in (*call.args, *(keyword.value for keyword in call.keywords)):
-                for acquisition in self._connection_acquisitions_for_expression(call, argument):
-                    self._record_connection(acquisition, escapes=True)
+                acquisitions = self._connection_acquisitions_for_expression(call, argument)
+                if not acquisitions:
+                    continue
+                contained = isinstance(argument, ast.Name) and self._forwarding_is_contained(call, argument)
+                for acquisition in acquisitions:
+                    self._record_connection(acquisition, escapes=not contained)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
@@ -5864,11 +6060,111 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
         collector = _ProductionWriterCollector(relative, tree)
         collected.append((collector, collector.collect()))
     proven = _CallerSideProof(collected).proven_site_indexes()
+    contained = _WrapperContainmentProof(collected).contained_site_indexes()
     sites: list[WriterIdentity] = []
     for collector, collector_sites in collected:
         dropped = proven.get(id(collector), set())
-        sites.extend(site for index, site in enumerate(collector_sites) if index not in dropped)
+        flipped = contained.get(id(collector), set())
+        for index, site in enumerate(collector_sites):
+            if index in dropped:
+                continue
+            sites.append(replace(site, connection_escape=False) if index in flipped else site)
     return sites
+
+
+class _WrapperContainmentProof:
+    """Same-class, state-fed ``@contextmanager`` wrappers (P4-D6 step 5, condition 2).
+
+    A wrapper that acquires from the enclosing instance's own state
+    (``with self._engine.begin() as conn: yield conn``) reports its acquisition
+    as an escape because it yields the connection. It is CONTAINED only when,
+    tree-wide, every reference to the wrapper's name is a ``with self.<wrapper>(...)
+    as target:`` from an instance method of the same class, the wrapper's own
+    uses of the connection are contained (the yield being the one permitted),
+    and the with-target never escapes in ANY caller by the forwarding rule --
+    all call sites, never any; one unproven caller or one foreign reference
+    keeps the wrapper row escaped.
+    """
+
+    def __init__(self, collected: Sequence[tuple[_ProductionWriterCollector, list[WriterIdentity]]]) -> None:
+        self._collected = collected
+
+    def contained_site_indexes(self) -> dict[int, set[int]]:
+        contained: dict[int, set[int]] = {}
+        for collector, sites in self._collected:
+            for index, site in enumerate(sites):
+                if site.operation != "write_connection" or not site.connection_escape:
+                    continue
+                if self._wrapper_is_contained(collector, collector.site_nodes[index]):
+                    contained.setdefault(id(collector), set()).add(index)
+        return contained
+
+    @staticmethod
+    def _self_parameter(definition: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+        positional = (*definition.args.posonlyargs, *definition.args.args)
+        return positional[0].arg if positional else None
+
+    def _acquisition_rooted_in_self(self, wrapper: ast.FunctionDef | ast.AsyncFunctionDef, acquisition: ast.AST) -> bool:
+        if not (isinstance(acquisition, ast.Call) and isinstance(acquisition.func, ast.Attribute)):
+            return False
+        if acquisition.func.attr not in {"begin", "connect"}:
+            return False
+        receiver: ast.expr = acquisition.func.value
+        while isinstance(receiver, ast.Attribute):
+            receiver = receiver.value
+        return isinstance(receiver, ast.Name) and receiver.id == self._self_parameter(wrapper)
+
+    def _wrapper_is_contained(self, collector: _ProductionWriterCollector, acquisition: ast.AST) -> bool:
+        wrapper = collector._enclosing_function(acquisition)
+        if wrapper is None or id(wrapper) not in collector.method_owners or not collector._is_instance_method(wrapper):
+            return False
+        item = getattr(acquisition, "_inventory_parent", None)
+        if not (isinstance(item, ast.withitem) and item.context_expr is acquisition and isinstance(item.optional_vars, ast.Name)):
+            return False
+        if collector._enclosing_function(getattr(item, "_inventory_parent", None)) is not wrapper:
+            return False
+        if not self._acquisition_rooted_in_self(wrapper, acquisition):
+            return False
+        name = item.optional_vars.id
+        yields = collector._direct_yields(wrapper)
+        if not yields or any(
+            not (isinstance(yielded, ast.Yield) and isinstance(yielded.value, ast.Name) and yielded.value.id == name) for yielded in yields
+        ):
+            return False
+        if not collector._connection_uses_are_contained(wrapper, name, depth=0, active=frozenset(), allow_yield=True):
+            return False
+        owner_class = collector.method_owners[id(wrapper)]
+        callers: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+        for other, _ in self._collected:
+            for node in ast.walk(other.tree):
+                if isinstance(node, ast.Name) and node.id == wrapper.name:
+                    return False
+                if not (isinstance(node, ast.Attribute) and node.attr == wrapper.name):
+                    continue
+                if other is not collector:
+                    return False
+                call = getattr(node, "_inventory_parent", None)
+                if not (isinstance(call, ast.Call) and call.func is node):
+                    return False
+                with_item = getattr(call, "_inventory_parent", None)
+                if not (
+                    isinstance(with_item, ast.withitem) and with_item.context_expr is call and isinstance(with_item.optional_vars, ast.Name)
+                ):
+                    return False
+                caller = collector._enclosing_function(call)
+                if (
+                    caller is None
+                    or collector.method_owners.get(id(caller)) is not owner_class
+                    or not collector._is_instance_method(caller)
+                ):
+                    return False
+                if not (isinstance(node.value, ast.Name) and node.value.id == self._self_parameter(caller)):
+                    return False
+                callers.append((caller, with_item.optional_vars.id))
+        if not callers:
+            return False
+        # The caller's own body is depth 0: its forwards count against the bound.
+        return all(collector._connection_uses_are_contained(caller, target, depth=0, active=frozenset()) for caller, target in callers)
 
 
 class _CallerSideProof:
@@ -8554,7 +8850,15 @@ def test_parameter_fed_contextmanager_wrapper_acquisitions_are_attributed_to_cal
 
 
 def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path: Path) -> None:
-    """A wrapper that acquires from its own state is the boundary; callers resolve through it, not around it."""
+    """A wrapper that acquires from its own state is the boundary; callers resolve through it, not around it.
+
+    The acquisition is reported ONCE, in the wrapper's name, never re-homed to a
+    caller. Whether it is an escape is the callers' doing (P4-D6 step 5, hub
+    ruling condition 2): here the one caller is a same-class method that only
+    executes on the with-target, so the wrapper is contained; a caller that
+    leaks it, a foreign caller, or an escape inside the wrapper keeps the
+    flag (``test_wrapper_containment_is_all_callers_and_same_class_only``).
+    """
 
     source = tmp_path / "self_fed_wrapper.py"
     source.write_text(
@@ -8579,7 +8883,7 @@ def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path:
     )
     sites = scan_production_writers([source], anchor=tmp_path)
     assert [(site.symbol, site.table, site.operation, site.connection_escape) for site in sites] == [
-        ("Store._begin", "<sessions-write-connection>", "write_connection", True),
+        ("Store._begin", "<sessions-write-connection>", "write_connection", False),
     ]
 
 
@@ -8991,6 +9295,268 @@ def test_caller_side_proof_refuses_a_cycle_and_a_helper_nobody_calls(tmp_path: P
     findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/cycle.py": cyclic})
     assert findings[("src/elspeth/core/landscape/cycle.py", "pong", "<unresolved-session-write>")] == 1
     assert findings[("src/elspeth/core/landscape/cycle.py", "orphan", "<unresolved-session-write>")] == 1
+
+
+_CONTAINED_FORWARDING_MODULE = """\
+    from contextlib import contextmanager
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        @contextmanager
+        def _tx(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def direct(self, stmt):
+            with self._tx() as conn:
+                conn.execute(stmt)
+
+        def forwarded(self, stmt):
+            with self._tx() as conn:
+                self._apply(conn, stmt)
+
+        def _apply(self, conn, stmt):
+            if conn.dialect.name == "postgresql":
+                conn.exec_driver_sql(stmt)
+            with conn.begin_nested():
+                self._deeper(conn, stmt=stmt)
+
+        def _deeper(self, conn, *, stmt):
+            conn.execute(stmt)
+            _module_helper(conn, stmt)
+            del conn
+
+        def own_acquisition(self, stmt):
+            with self._engine.begin() as conn:
+                _module_helper(conn, stmt)
+
+    def _module_helper(conn, stmt):
+        conn.execute(stmt)
+    """
+
+_ESCAPING_FORWARDING_MODULE = """\
+    from elspeth.web.other import imported_helper
+
+    def helper(conn, stmt):
+        conn.execute(stmt)
+
+    class Repo:
+        def __init__(self, engine, handler):
+            self._engine = engine
+            self._handler = handler
+
+        def stores(self, stmt):
+            with self._engine.begin() as conn:
+                self._keep(conn)
+
+        def _keep(self, conn):
+            self._held = conn
+
+        def returns(self, stmt):
+            with self._engine.begin() as conn:
+                self._give(conn)
+
+        def _give(self, conn):
+            return conn
+
+        def yields(self, stmt):
+            with self._engine.begin() as conn:
+                self._gen(conn)
+
+        def _gen(self, conn):
+            yield conn
+
+        def closure(self, stmt):
+            with self._engine.begin() as conn:
+                self._defer(conn, stmt)
+
+        def _defer(self, conn, stmt):
+            return lambda: conn.execute(stmt)
+
+        def starred(self, stmt, *rest):
+            with self._engine.begin() as conn:
+                self._exec(conn, *rest)
+
+        def _exec(self, conn, *rest):
+            conn.execute(rest[0])
+
+        def cross_module(self, stmt):
+            with self._engine.begin() as conn:
+                imported_helper(conn, stmt)
+
+        def dispatched(self, stmt):
+            with self._engine.begin() as conn:
+                self._handler.run(conn, stmt)
+
+        def public_helper(self, stmt):
+            with self._engine.begin() as conn:
+                helper(conn, stmt)
+
+        def too_deep(self, stmt):
+            with self._engine.begin() as conn:
+                self._d1(conn, stmt)
+
+        def _d1(self, conn, stmt):
+            self._d2(conn, stmt)
+
+        def _d2(self, conn, stmt):
+            self._d3(conn, stmt)
+
+        def _d3(self, conn, stmt):
+            self._d4(conn, stmt)
+
+        def _d4(self, conn, stmt):
+            conn.execute(stmt)
+
+        def raw_dbapi(self, stmt):
+            with self._engine.begin() as conn:
+                self._raw(conn, stmt)
+
+        def _raw(self, conn, stmt):
+            return conn.connection.cursor().execute(stmt)
+
+        def bound_nested(self, stmt):
+            with self._engine.begin() as conn:
+                self._savepoint(conn, stmt)
+
+        def _savepoint(self, conn, stmt):
+            savepoint = conn.begin_nested()
+            conn.execute(stmt)
+            savepoint.rollback()
+
+        def compared(self, stmt):
+            with self._engine.begin() as conn:
+                self._identity(conn)
+
+        def _identity(self, conn):
+            return id(conn)
+    """
+
+_WRAPPER_MODULE = """\
+    from contextlib import contextmanager
+    from elspeth.web.sessions.locking import transaction_lock
+
+    class Repo:
+        def __init__(self, engine):
+            self._engine = engine
+
+        @contextmanager
+        def _one_bad_caller(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def fine(self, stmt):
+            with self._one_bad_caller() as conn:
+                conn.execute(stmt)
+
+        def leaks(self, stmt):
+            with self._one_bad_caller() as conn:
+                self._held = conn
+
+        @contextmanager
+        def _foreign_reference(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def uses_foreign(self, stmt):
+            with self._foreign_reference() as conn:
+                conn.execute(stmt)
+
+        @contextmanager
+        def _escapes_inside(self, session_id):
+            with self._engine.begin() as conn:
+                transaction_lock(conn, session_id)
+                yield conn
+
+        def uses_escaping(self, stmt):
+            with self._escapes_inside("s") as conn:
+                conn.execute(stmt)
+
+        @contextmanager
+        def _passed_not_entered(self):
+            with self._engine.begin() as conn:
+                yield conn
+
+        def hands_out(self):
+            return self._passed_not_entered
+    """
+
+_WRAPPER_FOREIGN_MODULE = """\
+    def borrow(repo, stmt):
+        with repo._foreign_reference() as conn:
+            conn.execute(stmt)
+    """
+
+
+def _acquisition_escapes(tmp_path: Path, modules: dict[str, str]) -> dict[str, bool]:
+    """``symbol -> connection_escape`` for every write_connection row the scan of ``modules`` reports."""
+
+    files = []
+    for relative, body in modules.items():
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(textwrap.dedent(body))
+        files.append(source)
+    escapes: dict[str, bool] = {}
+    for site in scan_production_writers(files, anchor=tmp_path):
+        if site.operation == "write_connection":
+            escapes[site.symbol] = escapes.get(site.symbol, False) or site.connection_escape
+    return escapes
+
+
+def test_forwarding_proof_contains_a_connection_handed_only_to_inspectable_callees(tmp_path: Path) -> None:
+    """Step-5 acceptance: a same-class method chain and a same-module private helper that only
+    execute on the connection (a dialect read, an anonymous nested transaction and a ``del`` of the
+    local name included) keep it contained, three forwards deep; the state-fed wrapper whose every
+    caller is such a method is contained too."""
+
+    assert _acquisition_escapes(tmp_path, {"src/elspeth/web/contained.py": _CONTAINED_FORWARDING_MODULE}) == {
+        "Repo._tx": False,
+        "Repo.own_acquisition": False,
+    }
+
+
+def test_forwarding_proof_refuses_every_escape_form(tmp_path: Path) -> None:
+    """Adversarial: each callee leaks the connection one way -- attribute store, return, yield,
+    closure capture, star-argument call, cross-module callee, attribute-dispatched callee, a PUBLIC
+    module function, depth beyond the bound, raw DBAPI access, a bound nested transaction, a
+    comparison through a builtin -- and each acquisition stays an escape."""
+
+    escapes = _acquisition_escapes(tmp_path, {"src/elspeth/web/escapes.py": _ESCAPING_FORWARDING_MODULE})
+    expected = {
+        "Repo.stores",
+        "Repo.returns",
+        "Repo.yields",
+        "Repo.closure",
+        "Repo.starred",
+        "Repo.cross_module",
+        "Repo.dispatched",
+        "Repo.public_helper",
+        "Repo.too_deep",
+        "Repo.raw_dbapi",
+        "Repo.bound_nested",
+        "Repo.compared",
+    }
+    assert {symbol for symbol, escaped in escapes.items() if escaped} == expected
+
+
+def test_wrapper_containment_is_all_callers_and_same_class_only(tmp_path: Path) -> None:
+    """Adversarial: one caller that stores the with-target, one foreign-module caller, an escape
+    inside the wrapper's own body, and a wrapper handed out uncalled each keep the wrapper's
+    acquisition escaped."""
+
+    escapes = _acquisition_escapes(
+        tmp_path,
+        {"src/elspeth/web/wrappers.py": _WRAPPER_MODULE, "src/elspeth/web/elsewhere.py": _WRAPPER_FOREIGN_MODULE},
+    )
+    assert escapes == {
+        "Repo._one_bad_caller": True,
+        "Repo._foreign_reference": True,
+        "Repo._escapes_inside": True,
+        "Repo._passed_not_entered": True,
+    }
 
 
 def test_declared_factory_handle_verbs_are_acquisitions_only_on_a_plain_name(tmp_path: Path) -> None:
