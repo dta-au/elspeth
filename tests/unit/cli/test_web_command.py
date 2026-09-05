@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -10,9 +11,17 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
+from sqlalchemy import Row, select
+from sqlalchemy.engine import Engine
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.web.auth.models import AccessPending
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
+from elspeth.web.sessions.schema import initialize_session_schema
+from tests.unit.web.auth.conftest import build_local_auth_provider
 
 runner = CliRunner()
 
@@ -232,6 +241,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--data-dir",
+                str(tmp_path),
                 "--auth-db",
                 str(auth_db),
                 "--yes",
@@ -253,6 +264,8 @@ class TestComposerUsersCommand:
                 "users",
                 "remove",
                 "alice",
+                "--data-dir",
+                str(tmp_path),
                 "--auth-db",
                 str(auth_db),
                 "--yes",
@@ -262,6 +275,7 @@ class TestComposerUsersCommand:
         assert result.exit_code == 1
         assert "auth database not found" in result.output
         assert not auth_db.exists()
+        assert not (tmp_path / "sessions.db").exists()
 
     def test_add_unverified_option_is_not_supported(self, tmp_path: Path) -> None:
         auth_db = tmp_path / "auth.db"
@@ -284,3 +298,135 @@ class TestComposerUsersCommand:
 
         assert result.exit_code != 0
         assert not auth_db.exists()
+
+    def test_remove_retires_the_identity_so_the_recreated_username_is_fresh(self, tmp_path: Path) -> None:
+        """A CLI-deleted username must not hand its admission to its next holder.
+
+        ``identities`` binds a local login by ``(provider, subject)`` -- the
+        username -- and ``ensure_identity`` never upgrades an existing row.
+        The web app retired the identity on delete; the CLI, built without a
+        retirer, did not (elspeth-9c171c00fa), so the next ``alice`` logged in
+        AS the deleted alice: same identity_id, her admission, her quota.
+
+        Evidence is the D12 wall itself. The first alice is admitted under
+        open registration. After the CLI removal a second alice registers
+        under CLOSED registration: a fresh identity meets the pending wall
+        and is refused; an inherited one is already active and walks in.
+        """
+        auth_db = tmp_path / "auth.db"
+        sessions_db = tmp_path / "sessions.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+
+        engine = create_session_engine(f"sqlite:///{sessions_db}")
+        initialize_session_schema(engine)
+        open_provider = build_local_auth_provider(auth_db, session_engine=engine, registration_open=True)
+        asyncio.run(open_provider.login("alice", "password123"))
+        first = _identity_rows(engine)
+        assert [row.access_state for row in first] == ["active"]
+        first_identity_id = first[0].identity_id
+
+        result = runner.invoke(
+            app,
+            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+        )
+        assert result.exit_code == 0, result.output
+        assert _auth_user_row(auth_db, "alice") is None
+
+        retired = _identity_rows(engine)
+        assert [(row.identity_id, row.subject, row.access_state) for row in retired] == [
+            (first_identity_id, f"alice#retired-{first_identity_id}", "disabled")
+        ]
+
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+        closed_provider = build_local_auth_provider(auth_db, session_engine=engine, registration_open=False)
+        with pytest.raises(AccessPending):
+            asyncio.run(closed_provider.login("alice", "password123"))
+        after = {row.identity_id: row for row in _identity_rows(engine)}
+        assert set(after) - {first_identity_id}, "the second alice was bound to the retired identity"
+        (fresh_identity_id,) = set(after) - {first_identity_id}
+        assert after[fresh_identity_id].subject == "alice"
+        assert after[fresh_identity_id].access_state == "pending"
+
+    def test_remove_uses_the_configured_sessions_store(self, tmp_path: Path) -> None:
+        """``--session-db-url`` (and the container's env) name the store to retire in."""
+        auth_db = tmp_path / "auth.db"
+        elsewhere = tmp_path / "elsewhere" / "sessions.db"
+        elsewhere.parent.mkdir()
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+        engine = create_session_engine(f"sqlite:///{elsewhere}")
+        initialize_session_schema(engine)
+        asyncio.run(build_local_auth_provider(auth_db, session_engine=engine).login("alice", "password123"))
+
+        result = runner.invoke(
+            app,
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "remove",
+                "alice",
+                "--data-dir",
+                str(tmp_path),
+                "--auth-db",
+                str(auth_db),
+                "--session-db-url",
+                f"sqlite:///{elsewhere}",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert [row.access_state for row in _identity_rows(engine)] == ["disabled"]
+        assert not (tmp_path / "sessions.db").exists()
+
+    def test_remove_refuses_before_deleting_when_the_sessions_store_is_stale(self, tmp_path: Path) -> None:
+        """A store that cannot retire means no credential is deleted at all.
+
+        Deleting the credential and then failing to retire is the inheritance
+        defect with extra steps, so the schema check runs first and a refusal
+        leaves alice's credential exactly where it was.
+        """
+        auth_db = tmp_path / "auth.db"
+        _cli_add(auth_db=auth_db, data_dir=tmp_path)
+        with closing(sqlite3.connect(tmp_path / "sessions.db")) as conn:
+            conn.execute("CREATE TABLE identities (identity_id TEXT)")
+            conn.commit()
+
+        result = runner.invoke(
+            app,
+            ["--no-dotenv", "composer", "users", "remove", "alice", "--data-dir", str(tmp_path), "--auth-db", str(auth_db), "--yes"],
+        )
+
+        assert result.exit_code == 1
+        assert "not at the current schema" in result.output
+        assert _auth_user_row(auth_db, "alice") is not None
+
+
+def _cli_add(*, auth_db: Path, data_dir: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "--no-dotenv",
+            "composer",
+            "users",
+            "add",
+            "alice",
+            "--password",
+            "password123",
+            "--data-dir",
+            str(data_dir),
+            "--auth-db",
+            str(auth_db),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def _identity_rows(engine: Engine) -> list[Row[tuple[str, str, str]]]:
+    with engine.connect() as conn:
+        return list(
+            conn.execute(
+                select(identities_table.c.identity_id, identities_table.c.subject, identities_table.c.access_state).order_by(
+                    identities_table.c.first_seen_at, identities_table.c.identity_id
+                )
+            ).all()
+        )

@@ -205,6 +205,7 @@ LocalAuthProvider(
         principal_is_active=lambda identity_id: True,
     ),
     admit_identity=lambda claims: (_ for _ in ()).throw(AssertionError("no login happens here")),
+    retire_identity=lambda username: (_ for _ in ()).throw(AssertionError("no deletion happens here")),
 )
 print(oct(stat.S_IMODE(path.stat().st_mode)))
 """
@@ -336,6 +337,23 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(token)
+
+    def test_delete_user_retires_even_when_the_credential_is_already_gone(self, tmp_path) -> None:
+        """The retirement a failed first pass owed is retried by the next delete.
+
+        Credential first, then retirement: if the retirement raised after the
+        credential row was gone, gating the retry on "a row was deleted"
+        would make that identity unreachable forever. So the retirer runs on
+        every delete, and the return value keeps reporting the credential.
+        """
+        retired: list[str] = []
+        provider = LocalAuthProvider.for_account_administration(tmp_path / "auth.db", retire_identity=retired.append)
+        provider.create_user("alice", "password123", display_name="Alice")
+
+        assert provider.delete_user("alice") is True
+        assert retired == ["alice"]
+        assert provider.delete_user("alice") is False
+        assert retired == ["alice", "alice"]
 
     def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
         """Audit runs after the durable commit; a failed audit compensates.
