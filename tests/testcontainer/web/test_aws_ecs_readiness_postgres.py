@@ -71,6 +71,24 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     return psycopg.connect(psycopg_url, autocommit=True)
 
 
+def _grant_web_instances_dml(session_owner_url: str, runtime_role: str) -> None:
+    """Grant INSERT and UPDATE on the one table a booting replica writes.
+
+    Read-only is no longer enough for the runtime role: a PostgreSQL replica
+    registers itself in ``web_instances`` during the lifespan, needing UPDATE
+    for the ``SELECT ... FOR UPDATE`` that claims the row and INSERT for a
+    first registration. Deliberately not a blanket DML grant — this helper is
+    what proves which privileges boot actually requires. The table lives in the
+    session database only; an absent table is skipped because provisioning may
+    run before schema init.
+    """
+    with _psycopg_connect(session_owner_url) as owner:
+        existing = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
+        if existing is None or existing[0] is None:
+            return
+        owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
+
+
 @dataclass
 class _RuntimeDatabases:
     postgres_url: str
@@ -128,6 +146,7 @@ class _RuntimeDatabases:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
+        _grant_web_instances_dml(self.session_owner_url, self.runtime_role)
         self.role_created = True
 
     def set_login(self, *, enabled: bool) -> None:

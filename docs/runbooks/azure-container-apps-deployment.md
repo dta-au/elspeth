@@ -410,6 +410,25 @@ URL secret they reference: `rA` runs as `elspeth_runtime_a`, `rB` as
 asserts two distinct `X-Elspeth-Instance` values before scoring a trial and
 cross-checks every replica name against `az containerapp replica list`.
 
+Both runtime roles need write access to `web_instances`. Each replica registers
+itself in that table at boot, so a role holding only `SELECT` fails startup with
+`permission denied for table web_instances` and P3 never gets a row to expire.
+The minimum on the session database is read on every table plus two verbs on
+this one:
+
+```sql
+GRANT USAGE ON SCHEMA public TO elspeth_runtime_a;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO elspeth_runtime_a;
+GRANT INSERT, UPDATE ON web_instances TO elspeth_runtime_a;
+```
+
+Repeat for `elspeth_runtime_b`. Grant it when you provision the roles: the app
+does not fall back to a single-process mode when the role cannot write, because
+a PostgreSQL deployment silently running without membership is the failure this
+table exists to prevent. The AWS ECS Terraform path covers the same requirement
+through `ALTER DEFAULT PRIVILEGES` in
+`deploy/aws-ecs/terraform/modules/scenario/database_bootstrap.tf`.
+
 ```bash
 # One deployment per runtime role: the label selects the role's URL secrets
 # and the doctor Job name (doctor-runtime-a / doctor-runtime-b).
