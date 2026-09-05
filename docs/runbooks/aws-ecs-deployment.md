@@ -1380,19 +1380,18 @@ Cognito/OIDC is recommended. Configure `auth_provider=oidc`, the user-pool
 app-client ID. Set the hosted/custom-domain
 `oidc_authorization_endpoint` and same-origin `oidc_token_endpoint`, exposed
 as `ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT` and
-`ELSPETH_WEB__OIDC_TOKEN_ENDPOINT`. The task environment also sets:
+`ELSPETH_WEB__OIDC_TOKEN_ENDPOINT`.
 
-```bash
-export ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS='["https://example.auth.ap-southeast-2.amazoncognito.com"]'
-export ELSPETH_WEB__OIDC_AUDIENCE_CLAIM=client_id
-```
-
-The allowlist accepts exact normalized HTTPS origins only. Wildcard or suffix
-matching, paths, and automatic Cognito-domain inference are rejected.
-`client_id` mode is exclusively for Cognito access tokens and requires
-`token_use=access`; generic OIDC continues to validate `aud`. The browser uses
-the authorization code flow with S256 PKCE. The public client has no client
-secret, and the implicit flow must not be enabled.
+The former browser-origin allowlist and Cognito access-token audience-claim
+settings are deleted; a task definition that still exports either refuses to
+boot on an unknown setting (`tests/unit/deployment/test_web_settings_exports_resolve.py`
+pins that no tracked export or runbook names a setting that does not exist).
+Explicit endpoints on the legacy path must share the issuer's origin, and tokens
+are validated on `aud` only. Cognito's hosted-domain origin is served by the single sign-on profile
+(`sso_endpoint_origins`), which requires the confidential app client and the
+`sso_*` settings that land with the identity cutover; until then the browser
+uses the authorization code flow with S256 PKCE against the public client, which
+has no client secret, and the implicit flow must not be enabled.
 
 Before browser acceptance, query the one approved pool/client through the
 protected capture wrapper and project only booleans and counts:
