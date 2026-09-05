@@ -87,6 +87,93 @@ def expire_worker(engine: Any, worker_id: str, *, seconds_ago: float = 1.0) -> N
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=lapsed))
 
 
+def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) -> datetime:
+    """Age a LEASED work item's ``lease_expires_at`` to ``seconds_ago`` seconds before database time.
+
+    The lease family (``recover_expired_leases``, ``heartbeat_lease``,
+    ``peer_active_leases``, the claim CAS) decides expiry against the
+    Landscape database clock (ADR-047); a test that needs an expired lease
+    writes the deadline into the database's past instead of handing the verb
+    a future clock. Refuses (``AssertionError``) unless exactly one LEASED
+    row carries ``work_item_id``: ageing a row the sweep can never reap would
+    turn the test into a no-op that still passes. Returns the deadline written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.contracts.scheduler import TokenWorkStatus
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=lapsed)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"expire_lease: expected exactly one LEASED row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return lapsed
+
+
+def reschedule_work_item(engine: Any, work_item_id: str, *, seconds_from_now: float) -> datetime:
+    """Move a work item's ``available_at`` to ``seconds_from_now`` seconds from database time.
+
+    ``claim_ready`` admits a READY row only once ``available_at <= database_now``
+    (ADR-047). A test that needs a row parked in the future, or released into
+    the past, writes that deadline through the database rather than handing
+    the claim a clock. Refuses unless exactly one row carries
+    ``work_item_id``. Returns the ``available_at`` written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        available_at = read_landscape_transaction_time(conn) + timedelta(seconds=seconds_from_now)
+        result = conn.execute(
+            update(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id).values(available_at=available_at)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"reschedule_work_item: expected exactly one row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return available_at
+
+
+def on_fresh_database_second(engine: Any, action: Any) -> Any:
+    """Run ``action(database_now)`` just after a database-second boundary and return its result.
+
+    The exact-boundary arm of a lease decision ("a deadline EQUAL to database
+    time is not yet expired") can only be pinned on SQLite's whole-second
+    clock when the deadline is written and the verb decides inside the same
+    database second. Unlike :func:`within_one_database_second` this does not
+    retry — the action is expected to mutate state — but starting at the top
+    of a fresh second leaves the whole second for the write and the verb, and
+    a rollover during the action is reported as a failure rather than
+    silently scored.
+    """
+    import time
+
+    first = landscape_database_now(engine)
+    deadline = time.monotonic() + 3.0
+    while (before := landscape_database_now(engine)) == first:
+        if time.monotonic() > deadline:
+            raise AssertionError("the Landscape database second did not advance within 3 s")
+        time.sleep(0.002)
+    result = action(before)
+    after = landscape_database_now(engine)
+    if after != before:
+        raise AssertionError(
+            f"the Landscape database second rolled over during the boundary action ({before.isoformat()} -> {after.isoformat()})"
+        )
+    return result
+
+
 def within_one_database_second(engine: Any, action: Any, *, attempts: int = 20) -> Any:
     """Run ``action(database_now)`` and return its result once it completed inside one database second.
 
