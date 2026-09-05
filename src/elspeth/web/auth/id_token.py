@@ -78,8 +78,26 @@ class JWKSTokenValidator:
         jwks_max_stale_seconds: int = 86_400,
         *,
         audience_claim: Literal["aud", "client_id"] = "aud",
+        jwks_uri: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._issuer = validate_oidc_issuer(issuer)
+        # WHERE THE KEYS COME FROM. With ``jwks_uri`` given, every fetch and
+        # every key-miss refresh goes to exactly that URL — the one the
+        # generalised endpoint policy already validated against the profile's
+        # expected origins when the endpoints were resolved. That is what
+        # makes "applied on every JWKS refresh" (spec §Endpoint policy) true:
+        # the refresh cannot fetch a URL the check never saw.
+        #
+        # ``None`` selects the legacy self-discovery path, which re-reads the
+        # discovery document under its own same-origin rule. It exists only
+        # for ``OIDCAuthProvider`` and ``EntraAuthProvider`` and is deleted
+        # with them (identity sprint step E); no new caller may rely on it.
+        #
+        # ``transport`` lets a test stand a fake provider in front of the
+        # validator without patching ``httpx``. Production passes nothing.
+        self._jwks_uri = jwks_uri
+        self._transport = transport
         self._audience = audience
         if audience_claim not in ("aud", "client_id"):
             raise ValueError("audience_claim must be aud or client_id")
@@ -353,11 +371,22 @@ class JWKSTokenValidator:
 
             stale_jwks = self._jwks
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                    discovery_url = f"{self._issuer}/.well-known/openid-configuration"
-                    discovery_resp = await client.get(discovery_url)
-                    discovery_resp.raise_for_status()
-                    jwks_uri = self._validate_discovery_document(discovery_resp.json())
+                # REDIRECTS ARE DISABLED, explicitly. A JWKS fetch that
+                # follows one verifies every signature against whoever the
+                # redirect names. httpx does not follow by default, and the
+                # flag is passed so that enabling it is a visible edit.
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    follow_redirects=False,
+                    transport=self._transport,
+                ) as client:
+                    jwks_uri = self._jwks_uri
+                    if jwks_uri is None:
+                        # Legacy self-discovery; see __init__. Dies in step E.
+                        discovery_url = f"{self._issuer}/.well-known/openid-configuration"
+                        discovery_resp = await client.get(discovery_url)
+                        discovery_resp.raise_for_status()
+                        jwks_uri = self._validate_discovery_document(discovery_resp.json())
 
                     jwks_resp = await client.get(jwks_uri)
                     jwks_resp.raise_for_status()
