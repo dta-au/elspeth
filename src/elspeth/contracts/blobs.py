@@ -778,9 +778,18 @@ class BlobReplacementPlan:
     def __post_init__(self) -> None:
         if type(self.replacement_id) is not UUID or type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
             raise TypeError("BlobReplacementPlan identities must be exact UUID values")
-        for field_name in ("storage_path", "staging_path", "backup_path", "operation_id", "lease_token", "owner_instance_id"):
-            value = getattr(self, field_name)
-            if type(value) is not str or not value.strip():
+        # Every field is read directly: this is a type ELSPETH owns, so a
+        # reflective getattr would only hide a misspelt field name behind a
+        # confident AttributeError-free probe (ADR-032; masquerade gate).
+        for field_name, text in (
+            ("storage_path", self.storage_path),
+            ("staging_path", self.staging_path),
+            ("backup_path", self.backup_path),
+            ("operation_id", self.operation_id),
+            ("lease_token", self.lease_token),
+            ("owner_instance_id", self.owner_instance_id),
+        ):
+            if type(text) is not str or not text.strip():
                 raise ValueError(f"BlobReplacementPlan.{field_name} must be nonblank")
         if len({self.storage_path, self.staging_path, self.backup_path}) != 3:
             raise ValueError("BlobReplacementPlan paths must be distinct")
@@ -793,9 +802,11 @@ class BlobReplacementPlan:
             raise ValueError("BlobReplacementPlan.operation_kind must be COMPOSE or PROPOSAL")
         if self.phase not in {"intent", "swap_pending", "purge_pending"}:
             raise ValueError("BlobReplacementPlan.phase is invalid")
-        for field_name in ("old_blob_snapshot_hash", "replacement_blob_snapshot_hash"):
-            value = getattr(self, field_name)
-            if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        for field_name, digest in (
+            ("old_blob_snapshot_hash", self.old_blob_snapshot_hash),
+            ("replacement_blob_snapshot_hash", self.replacement_blob_snapshot_hash),
+        ):
+            if type(digest) is not str or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
                 raise ValueError(f"BlobReplacementPlan.{field_name} must be lowercase SHA-256")
         if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
             raise TypeError("BlobReplacementPlan timestamps must be exact datetimes")

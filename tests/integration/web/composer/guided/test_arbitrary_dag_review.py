@@ -627,39 +627,50 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
         blocking_wire,
     )
 
-    async def race_and_replay():
+    loser = "wire" if winner == "revert" else "revert"
+
+    async def race():
         async with (
             AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://wire-worker") as wire_client,
             AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://revert-worker") as revert_client,
         ):
-            revert_task = asyncio.create_task(revert_client.post(f"/api/sessions/{session_id}/state/revert", json=revert_request))
-            wire_task = asyncio.create_task(wire_client.post(f"/api/sessions/{session_id}/guided/respond", json=wire_request))
-            await asyncio.wait_for(asyncio.gather(revert_entered.wait(), wire_entered.wait()), timeout=10)
+            clients = {"revert": revert_client, "wire": wire_client}
+            paths = {"revert": f"/api/sessions/{session_id}/state/revert", "wire": f"/api/sessions/{session_id}/guided/respond"}
+            bodies = {"revert": revert_request, "wire": wire_request}
+            entered = {"revert": revert_entered, "wire": wire_entered}
+            winner_task = asyncio.create_task(clients[winner].post(paths[winner], json=bodies[winner]))
+            await asyncio.wait_for(entered[winner].wait(), timeout=10)
+            # Independent workers serialise at the session-operation lease:
+            # the second worker is refused with the platform's 409 while the
+            # first holds the session, before any row or double of its own.
+            refused = await asyncio.wait_for(clients[loser].post(paths[loser], json=bodies[loser]), timeout=10)
+            assert not entered[loser].is_set()
             release_race.set()
-            reverted, wired = await asyncio.wait_for(
-                asyncio.gather(revert_task, wire_task),
-                timeout=20,
-            )
-            revert_replay = await wire_client.post(
-                f"/api/sessions/{session_id}/state/revert",
-                json=revert_request,
-            )
-            wire_replay = await revert_client.post(
-                f"/api/sessions/{session_id}/guided/respond",
-                json=wire_request,
-            )
-            return reverted, wired, revert_replay, wire_replay
+            winner_response = await asyncio.wait_for(winner_task, timeout=20)
+            return refused, winner_response
 
-    reverted, wired, revert_replay, wire_replay = asyncio.run(race_and_replay())
-    responses = {"revert": reverted, "wire": wired}
-    replays = {"revert": revert_replay, "wire": wire_replay}
-    loser = "wire" if winner == "revert" else "revert"
-    assert responses[winner].status_code == 200, responses[winner].json()
-    assert responses[loser].status_code == 409, responses[loser].json()
-    assert responses[loser].json()["detail"]["failure_code"] == "stale_conflict"
-    for action in ("revert", "wire"):
-        assert replays[action].status_code == responses[action].status_code
-        assert replays[action].json() == responses[action].json()
+    async def retry_and_replay():
+        async with (
+            AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://wire-worker") as wire_client,
+            AsyncClient(transport=ASGITransport(app=peer_app), base_url="http://revert-worker") as revert_client,
+        ):
+            clients = {"revert": revert_client, "wire": wire_client}
+            paths = {"revert": f"/api/sessions/{session_id}/state/revert", "wire": f"/api/sessions/{session_id}/guided/respond"}
+            bodies = {"revert": revert_request, "wire": wire_request}
+            loser_response = await asyncio.wait_for(clients[loser].post(paths[loser], json=bodies[loser]), timeout=20)
+            replays = {
+                "revert": await wire_client.post(paths["revert"], json=revert_request),
+                "wire": await revert_client.post(paths["wire"], json=wire_request),
+            }
+            return loser_response, replays
+
+    refused, winner_response = asyncio.run(race())
+    assert refused.status_code == 409, refused.json()
+    assert refused.json() == {"detail": "Session operation is already active"}
+    assert winner_response.status_code == 200, winner_response.json()
+    # The refused worker never reached its double and published nothing: the
+    # race's exact publication is the winner's alone.
+    assert not (wire_entered if loser == "wire" else revert_entered).is_set()
     assert len(asyncio.run(service.get_state_versions(UUID(session_id)))) == state_count_before + 1
     proposals = {str(item.id): item for item in asyncio.run(service.list_composition_proposals(UUID(session_id)))}
     events = asyncio.run(service.list_proposal_events(UUID(session_id)))
@@ -718,17 +729,47 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     operations = {row["operation_id"]: row for row in operation_rows}
     winner_operation_id = revert_operation_id if winner == "revert" else wire_operation_id
     loser_operation_id = wire_operation_id if winner == "revert" else revert_operation_id
-    assert set(operations) == {revert_operation_id, wire_operation_id}
+    # Refused at the session fence, the loser reserved no operation at all.
+    assert set(operations) == {winner_operation_id}
     assert operations[winner_operation_id]["status"] == "completed"
     assert operations[winner_operation_id]["failure_code"] is None
-    assert operations[loser_operation_id]["status"] == "failed"
-    assert operations[loser_operation_id]["failure_code"] == "stale_conflict"
-    assert operations[loser_operation_id]["result_kind"] is None
-    assert operations[loser_operation_id]["result_state_id"] is None
-    assert operations[loser_operation_id]["proposal_id"] is None
     event_kinds = {
         operation_id: [row["event_kind"] for row in operation_event_rows if row["operation_id"] == operation_id]
         for operation_id in (revert_operation_id, wire_operation_id)
     }
     assert event_kinds[winner_operation_id][-1] == "completed"
-    assert event_kinds[loser_operation_id][-1] == "failed"
+    assert event_kinds[loser_operation_id] == []
+
+    # The refused worker retries once the lease is free, and every request
+    # replays exactly on the other worker.
+    loser_response, replays = asyncio.run(retry_and_replay())
+    responses = {winner: winner_response, loser: loser_response}
+    for action in ("revert", "wire"):
+        assert replays[action].status_code == responses[action].status_code
+        assert replays[action].json() == responses[action].json()
+    versions_after_retry = asyncio.run(service.get_state_versions(UUID(session_id)))
+    with engine.connect() as connection:
+        retry_rows = {
+            row["operation_id"]: row
+            for row in connection.execute(
+                select(guided_operations_table)
+                .where(guided_operations_table.c.session_id == session_id)
+                .where(guided_operations_table.c.operation_id.in_((revert_operation_id, wire_operation_id)))
+            ).mappings()
+        }
+    if winner == "revert":
+        # The wire action names a proposal the revert made inactive: refused
+        # at the guided turn contract before any reservation, publishing
+        # nothing on the retry either.
+        assert loser_response.status_code == 409, loser_response.json()
+        assert loser_response.json() == {"detail": "proposal_id and draft_hash do not identify the active guided proposal"}
+        assert set(retry_rows) == {revert_operation_id}
+        assert len(versions_after_retry) == state_count_before + 1
+    else:
+        # A revert issued after the wire action settled is a legitimate new
+        # operation: it completes and publishes exactly one more state.
+        assert loser_response.status_code == 200, loser_response.json()
+        assert set(retry_rows) == {revert_operation_id, wire_operation_id}
+        assert retry_rows[revert_operation_id]["status"] == "completed"
+        assert retry_rows[revert_operation_id]["result_state_id"] == loser_response.json()["id"]
+        assert len(versions_after_retry) == state_count_before + 2
