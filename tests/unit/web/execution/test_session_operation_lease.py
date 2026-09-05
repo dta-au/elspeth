@@ -206,6 +206,9 @@ class _ExecutionSettings:
     auth_provider = "local"
     data_dir = Path("/tmp/execution-lease-gate")
     landscape_passphrase = None
+    # Deny-by-default secret wiring (WebSettings.secret_wiring_allowlist): the
+    # service builds its runtime wiring policy from this at construction.
+    secret_wiring_allowlist = ()
 
     def get_landscape_url(self) -> str:
         return "sqlite:////tmp/execution-lease-gate-landscape.db"
@@ -452,6 +455,7 @@ async def test_fastapi_execute_orders_ownership_before_acquire_before_exact_serv
             "user_id": _USER_ID,
             "auth_provider_type": "local",
             "fanout_ack_token": None,
+            "secret_ack_token": None,
         }
     ]
 
@@ -1173,6 +1177,60 @@ def _has_unique_exact_event_bus_binding(
     return len(event_bus_bindings) == 1 and len(exact_assignments) == 1 and event_bus_constructor_bindings == ()
 
 
+def _enclosing_function_map(owner: ast.ClassDef) -> dict[int, _FunctionNode]:
+    """Map every function nested in a member of ``owner`` to its immediately enclosing function."""
+    enclosing: dict[int, _FunctionNode] = {}
+
+    def visit(node: ast.AST, function: _FunctionNode) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                enclosing[id(child)] = function
+                visit(child, child)
+            else:
+                visit(child, function)
+
+    for member in owner.body:
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit(member, member)
+    return enclosing
+
+
+def _is_unique_exact_blob_service_alias(
+    function: _FunctionNode,
+    *,
+    name: str,
+    live_nodes_of: dict[int, tuple[ast.AST, ...]],
+    enclosing: dict[int, _FunctionNode],
+) -> bool:
+    """``name`` is bound exactly once in its scope, and that binding is ``self._blob_service``.
+
+    A blob effect may reach the service through a local alias
+    (``staging_blob_service = self._blob_service``) but never through a name
+    that is rebound, a parameter, or assigned from anything else: one binding,
+    and it is the exact attribute read. A name free in a nested function is
+    resolved in the lexically enclosing function under the same rule.
+    """
+    if id(function) not in live_nodes_of:
+        live_nodes_of[id(function)] = _reachable_function_nodes(function)
+    live_nodes = live_nodes_of[id(function)]
+    bindings = _binding_nodes(function, live_nodes, name=name)
+    if not bindings:
+        outer = enclosing.get(id(function))
+        if outer is None:
+            return False
+        return _is_unique_exact_blob_service_alias(outer, name=name, live_nodes_of=live_nodes_of, enclosing=enclosing)
+    exact_assignments = [
+        node
+        for node in live_nodes
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == name
+        and ast.unparse(node.value) == "self._blob_service"
+    ]
+    return len(bindings) == 1 and len(exact_assignments) == 1
+
+
 def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, ...]:
     members = {member.name: member for member in owner.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
     local_functions = {
@@ -1232,7 +1290,10 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
         "finalize_run_output_blobs",
     }
     reachable = _reachable_execution_functions(owner)
-    live_nodes = tuple(node for function in reachable for node in _reachable_function_nodes(function))
+    function_live_nodes = {id(function): _reachable_function_nodes(function) for function in reachable}
+    live_nodes = tuple(node for function in reachable for node in function_live_nodes[id(function)])
+    call_owner = {id(node): function for function in reachable for node in function_live_nodes[id(function)] if isinstance(node, ast.Call)}
+    enclosing_functions = _enclosing_function_map(owner)
     live_calls = tuple(node for node in live_nodes if isinstance(node, ast.Call))
     calls = [call for call in live_calls if _call_name(call) in effect_names]
     gate_call_names = effect_names | {"_persist_and_broadcast_run_event", "_finalize_output_blobs"}
@@ -1268,7 +1329,15 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
             "read_blob_content",
             "finalize_run_output_blobs",
         }:
-            assert receiver in {"self._blob_service", "blob_service"}
+            assert receiver == "self._blob_service" or (
+                isinstance(call.func.value, ast.Name)
+                and _is_unique_exact_blob_service_alias(
+                    call_owner[id(call)],
+                    name=call.func.value.id,
+                    live_nodes_of=function_live_nodes,
+                    enclosing=enclosing_functions,
+                )
+            ), f"line {call.lineno}: {ast.unparse(call)} reaches the blob service through an unresolved receiver {receiver!r}"
     observed = {_call_name(call) for call in calls}
     assert observed & {"create_run", "create_pending_run"}, "run creation effect disappeared from execution"
     assert observed & {"update_run_status", "transition_run_status"}, "run status effects disappeared from execution"

@@ -37,6 +37,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-group-loss-1"
 WORKER = f"worker:{RUN_ID}:deadbeef"
@@ -124,7 +125,7 @@ def seat_token(db: LandscapeDB) -> CoordinationToken:
     _seed_row_and_token(db, row_id="row-a", token_id="tok_a", source_row_index=0)
     _seed_row_and_token(db, row_id="row-b", token_id="tok_b", source_row_index=1)
     _seed_row_and_token(db, row_id="row-impostor", token_id="tok_IMPOSTOR", source_row_index=2)
-    return RunCoordinationRepository(db.engine).register_run_leader(run_id=RUN_ID, worker_id=WORKER, now=_NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=_NOW, window_seconds=80.0)
 
 
 @pytest.fixture

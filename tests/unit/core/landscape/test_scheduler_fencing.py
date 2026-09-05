@@ -26,6 +26,7 @@ from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
 from tests.fixtures.landscape import make_landscape_db
+from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.tree_gate import iter_gate_sources
 
 RUN_ID = "run-scheduler-fencing"
@@ -206,7 +207,8 @@ def _seed_leader() -> tuple[LandscapeDB, CoordinationToken]:
                 openrouter_catalog_source="bundled",
             )
         )
-    token = RunCoordinationRepository(db.engine).register_run_leader(
+    token = register_run_leader(
+        RunCoordinationRepository(db.engine),
         run_id=RUN_ID,
         worker_id=WORKER_ID,
         now=NOW,
