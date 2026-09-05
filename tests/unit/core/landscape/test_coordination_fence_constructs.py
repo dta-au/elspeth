@@ -53,9 +53,11 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import assert_deadline_within, make_landscape_db
+from tests.fixtures.landscape import assert_deadline_within, assert_stamped_between, expire_lease, landscape_database_now, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
+# Forensic seed instant (rows, tokens, registrations). Never a lease decision
+# input: deadlines the tests need are written relative to the database clock.
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
 RUN_1 = "run-fence-construct-1"
 RUN_2 = "run-fence-construct-2"
@@ -107,7 +109,7 @@ def _insert_worker(db: LandscapeDB, *, worker_id: str, run_id: str, status: str)
                 role="follower",
                 status=status,
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(hours=1),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
                 evicted_at=NOW if status == "evicted" else None,
             )
         )
@@ -201,7 +203,6 @@ def _seed_unscheduled_item(db: LandscapeDB, run_id: str, *, sequence: int) -> di
         ),
         "available_at": NOW,
         "lease_seconds": 60,
-        "now": NOW,
     }
 
 
@@ -291,7 +292,7 @@ class TestClaimVerbFenceClause:
         work_item_id = _seed_ready_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
 
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60, now=NOW)
+        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60)
 
         assert claimed is None
         with db.engine.connect() as conn:
@@ -307,7 +308,7 @@ class TestClaimVerbFenceClause:
         work_item_id = _seed_pending_sink_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
 
-        claimed = repo.claim_pending_sink(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60, now=NOW)
+        claimed = repo.claim_pending_sink(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60)
 
         assert claimed is None
         with db.engine.connect() as conn:
@@ -367,7 +368,7 @@ class TestClaimVerbFenceClause:
 
         # claim_ready: evicted worker is refused
         with pytest.raises(RunWorkerEvictedError) as exc_info:
-            repo.claim_ready(run_id=RUN_1, lease_owner="worker-evicted", lease_seconds=60, now=NOW)
+            repo.claim_ready(run_id=RUN_1, lease_owner="worker-evicted", lease_seconds=60)
         assert exc_info.value.worker_id == "worker-evicted"
         assert exc_info.value.run_id == RUN_1
 
@@ -414,7 +415,7 @@ class TestClaimVerbFenceClause:
 
         # An ACTIVE worker can still claim (positive control).
         _insert_worker(db, worker_id="worker-active", run_id=RUN_1, status="active")
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-active", lease_seconds=60, now=NOW)
+        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-active", lease_seconds=60)
         assert claimed is not None, "active worker must succeed"
 
 
@@ -461,7 +462,9 @@ class TestEnqueueReadyClaimedMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-active", run_id=RUN_1, status="active")
         enqueue = _seed_unscheduled_item(db, RUN_1, sequence=15)
-        future = NOW + timedelta(seconds=60)
+        # Parked one minute into the DATABASE's future: the claim CAS admits a
+        # row only once available_at <= database time (ADR-047).
+        future = landscape_database_now(db.engine) + timedelta(seconds=60)
         enqueue["available_at"] = future
 
         scheduled = TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
@@ -558,7 +561,7 @@ class TestHeartbeatLeaseMembershipFence:
     def _leased_item(db: LandscapeDB, *, worker_id: str) -> tuple[TokenSchedulerRepository, str]:
         work_item_id = _seed_ready_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60, now=NOW)
+        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60)
         assert claimed is not None and claimed.work_item_id == work_item_id
         return repo, work_item_id
 
@@ -612,7 +615,6 @@ class TestHeartbeatLeaseMembershipFence:
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                now=NOW + timedelta(seconds=30),
                 membership_fenced=True,
             )
 
@@ -636,7 +638,6 @@ class TestHeartbeatLeaseMembershipFence:
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                now=NOW + timedelta(seconds=30),
                 membership_fenced=True,
             )
 
@@ -647,33 +648,37 @@ class TestHeartbeatLeaseMembershipFence:
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
 
+        before = landscape_database_now(db.engine)
         expires_at = repo.heartbeat_lease(
             run_id=RUN_1,
             work_item_id=work_item_id,
             lease_owner="worker-a",
             lease_seconds=60,
-            now=NOW + timedelta(seconds=30),
             membership_fenced=True,
         )
+        after = landscape_database_now(db.engine)
 
-        assert expires_at == NOW + timedelta(seconds=90)
+        assert_stamped_between(expires_at, start=before, end=after, offset=timedelta(seconds=60))
 
     def test_active_owner_can_revive_expired_lease_before_recovery(self, db: LandscapeDB) -> None:
         """Expiry alone is not ownership loss; recovery is the competing CAS."""
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
+        expired_at = expire_lease(db.engine, work_item_id)
 
+        before = landscape_database_now(db.engine)
         expires_at = repo.heartbeat_lease(
             run_id=RUN_1,
             work_item_id=work_item_id,
             lease_owner="worker-a",
             lease_seconds=60,
-            now=NOW + timedelta(seconds=61),
             membership_fenced=True,
         )
+        after = landscape_database_now(db.engine)
 
-        assert expires_at == NOW + timedelta(seconds=121)
+        assert expires_at > expired_at
+        assert_stamped_between(expires_at, start=before, end=after, offset=timedelta(seconds=60))
 
     def test_wrong_active_owner_uses_existing_lease_lost_path(self, db: LandscapeDB) -> None:
         from elspeth.contracts.errors import SchedulerLeaseLostError
@@ -689,7 +694,6 @@ class TestHeartbeatLeaseMembershipFence:
                 work_item_id=work_item_id,
                 lease_owner="worker-b",
                 lease_seconds=60,
-                now=NOW + timedelta(seconds=30),
                 membership_fenced=True,
             )
 
@@ -699,9 +703,9 @@ class TestHeartbeatLeaseMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
+        expire_lease(db.engine, work_item_id)
         recovered = repo.recover_expired_leases_legacy_unfenced(
             run_id=RUN_1,
-            now=NOW + timedelta(seconds=61),
             caller_owner="worker-reaper",
         )
         assert recovered == 1
@@ -712,7 +716,6 @@ class TestHeartbeatLeaseMembershipFence:
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                now=NOW + timedelta(seconds=62),
                 membership_fenced=True,
             )
 
@@ -721,16 +724,17 @@ class TestHeartbeatLeaseMembershipFence:
         _insert_run(db, RUN_1)
         repo, work_item_id = self._leased_item(db, worker_id="direct-harness")
 
+        before = landscape_database_now(db.engine)
         expires_at = repo.heartbeat_lease(
             run_id=RUN_1,
             work_item_id=work_item_id,
             lease_owner="direct-harness",
             lease_seconds=60,
-            now=NOW + timedelta(seconds=30),
             membership_fenced=False,
         )
+        after = landscape_database_now(db.engine)
 
-        assert expires_at == NOW + timedelta(seconds=90)
+        assert_stamped_between(expires_at, start=before, end=after, offset=timedelta(seconds=60))
 
 
 class TestVerifyAndExtendLeaderFence:
@@ -817,7 +821,7 @@ class TestDispositionMembershipFence:
     def _leased_item(self, db: LandscapeDB, *, worker_id: str, sequence: int = 0) -> tuple[TokenSchedulerRepository, str]:
         work_item_id = _seed_ready_item(db, RUN_1, sequence=sequence)
         repo = TokenSchedulerRepository(db.engine)
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60, now=NOW)
+        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60)
         assert claimed is not None and claimed.work_item_id == work_item_id
         return repo, work_item_id
 
