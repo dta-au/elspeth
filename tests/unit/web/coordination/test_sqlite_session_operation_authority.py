@@ -87,18 +87,14 @@ def _callback_slot_graph(root: object) -> tuple[object, ...]:
     return tuple(values)
 
 
-def _active_locked_fork_pair_count() -> int | None:
-    count = getattr(
-        coordination_repository._SessionOperationAuthorityRepository,
-        "_SessionOperationAuthorityRepository__active_locked_fork_pair_count",
-        None,
+def _active_locked_fork_pair_count() -> int:
+    return (
+        coordination_repository._SessionOperationAuthorityRepository._SessionOperationAuthorityRepository__active_locked_fork_pair_count()
     )
-    return None if count is None else count()
 
 
-def _fork_mutation_pair_count() -> int | None:
-    count = getattr(coordination_repository, "_fork_mutation_pair_count", None)
-    return None if count is None else count()
+def _fork_mutation_pair_count() -> int:
+    return coordination_repository._fork_mutation_pair_count()
 
 
 def test_sqlite_adapter_matches_postgres_authority_signatures() -> None:
@@ -1400,19 +1396,6 @@ def test_fork_callback_cannot_forge_secondary_transaction_for_unlocked_live_pair
         token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(token)
         foreign_authority = SessionForkAuthority(parent=fork_authority.parent, child_context=third_context)
-        module_mint = getattr(coordination_repository, "_FORK_TRANSACTION_CONSTRUCTION_AUTHORIZATION", None)
-        forged_token = (
-            module_mint.set(
-                (
-                    connection,
-                    foreign_authority,
-                    fork_authority.parent.parent_context.fence.session_id,
-                    third_context.fence.session_id,
-                )
-            )
-            if module_mint is not None
-            else None
-        )
         foreign_transaction = None
         statements.clear()
         try:
@@ -1434,8 +1417,6 @@ def test_fork_callback_cannot_forge_secondary_transaction_for_unlocked_live_pair
         finally:
             if foreign_transaction is not None:
                 foreign_transaction._close()
-            if forged_token is not None:
-                module_mint.reset(forged_token)
         assert not any("max(" in statement.lower() for statement in statements)
         assert not any(statement.lstrip().lower().startswith("insert") for statement in statements)
         raise ProbeComplete
@@ -1568,12 +1549,6 @@ def test_fork_callback_cannot_seed_fresh_token_pair_for_unlocked_live_child(engi
         canonical_token = object.__getattribute__(transaction, "_ForkCreationTransaction__connection_token")
         connection = coordination_repository._resolve_mutation_connection(canonical_token)
         fresh_token = coordination_repository._register_mutation_connection(connection)
-        module_pair_registry = getattr(coordination_repository, "_FORK_MUTATION_PAIR_REGISTRY", None)
-        if module_pair_registry is not None:
-            module_pair_registry[fresh_token] = (
-                fork_authority.parent.parent_context.fence.session_id,
-                third_context.fence.session_id,
-            )
         statements.clear()
         try:
             foreign_facet = coordination_repository._ForkChildSessionMutations(
@@ -1591,8 +1566,6 @@ def test_fork_callback_cannot_seed_fresh_token_pair_for_unlocked_live_child(engi
                     )
                 )
         finally:
-            if module_pair_registry is not None:
-                module_pair_registry.pop(fresh_token, None)
             coordination_repository._unregister_mutation_connection(fresh_token)
         assert not any("max(" in statement.lower() for statement in statements)
         assert not any(statement.lstrip().lower().startswith("insert") for statement in statements)
@@ -1622,9 +1595,7 @@ def test_fork_callback_cannot_seed_fresh_token_pair_for_unlocked_live_child(engi
 @pytest.mark.parametrize("outcome", ("success", "callback_failure", "constructor_failure"))
 def test_fork_active_lock_scope_registry_cleans_up(engine, monkeypatch, outcome: str) -> None:
     active_before = _active_locked_fork_pair_count()
-    assert active_before is not None
     pair_before = _fork_mutation_pair_count()
-    assert pair_before is not None
     connection_before = dict(coordination_repository._MUTATION_CONNECTION_REGISTRY)
 
     authority = SQLiteLocalSessionOperationAuthority(engine)

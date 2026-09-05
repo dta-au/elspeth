@@ -56,7 +56,7 @@ def engine():
 
 def test_user_secret_authority_protocol_is_handle_free() -> None:
     """The mutation capability must expose domain operations, never a DB handle."""
-    assert getattr(UserSecretAuthority, "_is_runtime_protocol", False) is True
+    assert UserSecretAuthority._is_runtime_protocol is True
     assert set(UserSecretAuthority.__dict__) & {"connection", "engine", "execute"} == set()
     assert tuple(inspect.signature(UserSecretAuthority.upsert_encrypted_secret).parameters) == (
         "self",
