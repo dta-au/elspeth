@@ -1719,7 +1719,7 @@ class ExecutionServiceImpl:
                 await run_sync_in_worker(session_operation_lease.guard_external_effect)
                 blob_record = await self._blob_service.get_blob(
                     parsed_blob_id,
-                    session_operation_context=session_operation_lease.context,
+                    session_operation_context=session_operation_context,
                 )
                 if blob_record.session_id != session_id:
                     raise BlobNotFoundError(blob_ref)
@@ -1819,7 +1819,7 @@ class ExecutionServiceImpl:
                         blob_id=parsed_blob_id,
                         run_id=run_id,
                         direction="input",
-                        session_operation_context=session_operation_lease.context,
+                        session_operation_context=session_operation_context,
                     )
         except BaseException as exc:
             await self._handle_pipeline_submission_failure(
@@ -3466,13 +3466,14 @@ class ExecutionServiceImpl:
         blob_service = self._blob_service
         if blob_service is None:
             raise RuntimeError("_finalize_output_blobs_outcome requires blob_service; caller must check before finalizing")
+        session_operation_context = session_operation_lease.context
         try:
             session_operation_lease.guard_external_effect()
             result = self._call_async(
                 blob_service.finalize_run_output_blobs(
                     UUID(run_id),
                     success=success,
-                    session_operation_context=session_operation_lease.context,
+                    session_operation_context=session_operation_context,
                 )
             )
         except self._FINALIZE_SUPPRESSED as blob_err:
