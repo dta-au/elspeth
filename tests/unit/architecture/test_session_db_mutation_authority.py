@@ -2358,9 +2358,80 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         self.wrapper_call_nodes: dict[int, ast.Call] = {}
         self.method_owners: dict[int, ast.ClassDef] = {}
         self.class_methods: dict[tuple[int, str], ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
+        # Unresolved executions whose connection is a parameter of the enclosing
+        # function: (index into ``sites``, the function, the parameter name).
+        # ``scan_production_writers`` proves or refuses them tree-wide.
+        self.parameter_received: list[tuple[int, ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
         self._collect_aliases()
         self._collect_class_methods()
         self.declared_non_session_module = self._declared_non_session_module()
+
+    def _receiver_parameter(self, execution: ast.Call) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, str] | None:
+        """The enclosing function and parameter name when the execution's receiver is exactly that parameter."""
+
+        receiver = execution.func.value if isinstance(execution.func, ast.Attribute) else None
+        if not isinstance(receiver, ast.Name):
+            return None
+        owner = self._enclosing_function(execution)
+        if owner is None:
+            return None
+        parameters = {argument.arg for argument in (*owner.args.posonlyargs, *owner.args.args, *owner.args.kwonlyargs)}
+        if receiver.id not in parameters or self._name_reassigned_in(owner, receiver.id):
+            return None
+        reaching, complete, scope = self._visible_reaching_bindings(execution, receiver.id)
+        if not complete or scope is not owner or any(binding.value is not None or binding.node is not owner for binding in reaching):
+            return None
+        return owner, receiver.id
+
+    def _call_argument_for_parameter(
+        self,
+        call: ast.Call,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        name: str,
+    ) -> ast.expr | None:
+        """The caller's expression bound to ``name`` at this call, or ``None`` when it cannot be known exactly."""
+
+        positional = [*definition.args.posonlyargs, *definition.args.args]
+        if id(definition) in self.method_owners and self._is_instance_method(definition) and positional:
+            if isinstance(call.func, ast.Attribute):
+                positional = positional[1:]
+            else:
+                return None
+        for keyword in call.keywords:
+            if keyword.arg is None:
+                return None
+            if keyword.arg == name:
+                return keyword.value
+        names = [parameter.arg for parameter in positional]
+        if any(isinstance(argument, ast.Starred) for argument in call.args):
+            return None
+        if name in names:
+            index = names.index(name)
+            if index < len(call.args):
+                return call.args[index]
+            # Omitted: the definition's own default is what the parameter holds.
+            defaults = definition.args.defaults
+            offset = len([*definition.args.posonlyargs, *definition.args.args]) - len(defaults)
+            full_index = [parameter.arg for parameter in (*definition.args.posonlyargs, *definition.args.args)].index(name)
+            return defaults[full_index - offset] if full_index >= offset else None
+        kwonly = [parameter.arg for parameter in definition.args.kwonlyargs]
+        if name in kwonly:
+            return definition.args.kw_defaults[kwonly.index(name)]
+        return None
+
+    def _call_targets_definition(self, call: ast.Call, definition: ast.FunctionDef | ast.AsyncFunctionDef, path: str) -> bool | None:
+        """True/False when this call provably does/does not target ``definition``; ``None`` when unknowable."""
+
+        local = self._local_callable_definition(call)
+        if local is not None:
+            return local is definition and self.path == path
+        if isinstance(call.func, ast.Name):
+            qualified = self._imported_qualified_name(call.func)
+            if qualified is None:
+                return None
+            module, _, name = qualified.rpartition(".")
+            return name == definition.name and f"src/{module.replace('.', '/')}.py" == path and _symbol(definition) == definition.name
+        return None
 
     def _declared_non_session_module(self) -> bool:
         """The package premise, verified on this module's own imports (not asserted from its path)."""
@@ -4642,6 +4713,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                         "<unresolved-session-write>",
                         f"unknown_{func.attr}",
                     )
+                    received = self._receiver_parameter(call)
+                    if received is not None and not acquisitions:
+                        self.parameter_received.append((len(self.sites) - 1, *received))
                     for acquisition in acquisitions:
                         self._record_connection(acquisition, escapes=False)
                     continue
@@ -4659,6 +4733,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                         "<unresolved-session-write>",
                         f"unknown_{func.attr}",
                     )
+                    received = self._receiver_parameter(call)
+                    if (
+                        received is not None
+                        and not acquisitions
+                        and not force_unresolved
+                        and not self._raw_sql_names_sessions_table(statement, use=call)
+                    ):
+                        self.parameter_received.append((len(self.sites) - 1, *received))
                 for acquisition in acquisitions:
                     self._record_connection(acquisition, escapes=False)
                 continue
@@ -4746,7 +4828,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
 
 
 def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[WriterIdentity]:
-    sites: list[WriterIdentity] = []
+    collected: list[tuple[_ProductionWriterCollector, list[WriterIdentity]]] = []
     for source_file in sorted(files):
         relative_path = source_file.resolve().relative_to(anchor.resolve())
         if "node_modules" in relative_path.parts:
@@ -4761,8 +4843,126 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
             raise InventoryScanError(f"cannot parse production source {source_file}: {error}") from error
         _attach_parents(tree)
         relative = relative_path.as_posix()
-        sites.extend(_ProductionWriterCollector(relative, tree).collect())
+        collector = _ProductionWriterCollector(relative, tree)
+        collected.append((collector, collector.collect()))
+    proven = _CallerSideProof(collected).proven_site_indexes()
+    sites: list[WriterIdentity] = []
+    for collector, collector_sites in collected:
+        dropped = proven.get(id(collector), set())
+        sites.extend(site for index, site in enumerate(collector_sites) if index not in dropped)
     return sites
+
+
+class _CallerSideProof:
+    """Tree-wide proof for executions on a parameter-received connection (P4-D6 option (b)).
+
+    A helper that executes on a ``conn`` it was handed is classified
+    non-Sessions ONLY when at least one call site exists among the scanned
+    units and EVERY call site that may target it (call sites are matched by
+    callee name across all classes, an over-approximation) binds that
+    parameter to an expression that proves non-Sessions: by domain, by the
+    caller's own verified module premise, or through the caller's own
+    parameter (recursively, bounded). No call site, a star argument, an
+    unresolvable argument, a cycle, or one contrary call site refuses.
+    """
+
+    _MAX_DEPTH = 3
+
+    def __init__(self, collected: Sequence[tuple[_ProductionWriterCollector, list[WriterIdentity]]]) -> None:
+        self._collectors = [collector for collector, _ in collected]
+        self._calls_by_name: dict[str, list[tuple[_ProductionWriterCollector, ast.Call]]] = {}
+        for collector in self._collectors:
+            for node in ast.walk(collector.tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if isinstance(node.func, ast.Name):
+                    self._calls_by_name.setdefault(node.func.id, []).append((collector, node))
+                elif isinstance(node.func, ast.Attribute):
+                    self._calls_by_name.setdefault(node.func.attr, []).append((collector, node))
+        self._memo: dict[tuple[int, str], bool] = {}
+
+    def proven_site_indexes(self) -> dict[int, set[int]]:
+        proven: dict[int, set[int]] = {}
+        for collector in self._collectors:
+            for index, definition, parameter in collector.parameter_received:
+                if self._parameter_proves_non_session(collector, definition, parameter, depth=0, active=frozenset()):
+                    proven.setdefault(id(collector), set()).add(index)
+        return proven
+
+    def _parameter_proves_non_session(
+        self,
+        collector: _ProductionWriterCollector,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        parameter: str,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+    ) -> bool:
+        key = (id(definition), parameter)
+        if key in self._memo:
+            return self._memo[key]
+        if key in active or depth > self._MAX_DEPTH:
+            return False
+        result = self._prove(collector, definition, parameter, depth=depth, active=active | {key})
+        self._memo[key] = result
+        return result
+
+    def _prove(
+        self,
+        collector: _ProductionWriterCollector,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        parameter: str,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+    ) -> bool:
+        call_sites = 0
+        for caller, call in self._calls_by_name.get(definition.name, ()):
+            targets = caller._call_targets_definition(call, definition, collector.path)
+            if targets is False:
+                continue
+            argument = caller._call_argument_for_parameter(call, definition, parameter)
+            if argument is None:
+                return False
+            if isinstance(argument, ast.Constant) and argument.value is None:
+                # ``conn=None`` (or an omitted optional parameter): the callee
+                # takes its own connection on that path, so this call site
+                # neither proves nor refuses the parameter-received execute.
+                continue
+            call_sites += 1
+            if not self._argument_proves_non_session(caller, call, argument, depth=depth, active=active):
+                return False
+        return call_sites > 0
+
+    def _argument_proves_non_session(
+        self,
+        caller: _ProductionWriterCollector,
+        call: ast.Call,
+        argument: ast.expr,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+    ) -> bool:
+        acquisitions = caller._connection_acquisitions_for_expression(call, argument)
+        if (
+            acquisitions
+            and caller._merge_database_domains(caller._connection_database_domain(acquisition) for acquisition in acquisitions)
+            == "non_sessions"
+        ):
+            return True
+        if caller._expression_database_domain(argument, use=call) == "non_sessions":
+            return True
+        if not isinstance(argument, ast.Name):
+            return False
+        if caller.declared_non_session_module and caller._name_is_module_bound(call, argument.id, depth=0):
+            return True
+        received = caller._enclosing_function(call)
+        if received is None:
+            return False
+        parameters = {item.arg for item in (*received.args.posonlyargs, *received.args.args, *received.args.kwonlyargs)}
+        if argument.id not in parameters or caller._name_reassigned_in(received, argument.id):
+            return False
+        return self._parameter_proves_non_session(caller, received, argument.id, depth=depth + 1, active=active)
 
 
 def _identity_key(site: WriterIdentity) -> tuple[str, str, str, str, str, int, str | None, int, bool]:
