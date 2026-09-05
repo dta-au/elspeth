@@ -283,64 +283,6 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
-def _rival_pipeline_proposal(client: TestClient, session_id: str, *, captured: Mapping[str, Any], base_record) -> UUID:
-    """Create a second genuine PIPELINE proposal with its own planner identity.
-
-    Built from the captured plan's own pipeline/base/reviewed facts so it is
-    a real pipeline proposal, but under a different skill hash and model, so
-    selecting it instead of the originating proposal is detectable field by
-    field rather than only by classification.
-    """
-    from elspeth.contracts.freeze import deep_thaw
-    from elspeth.core.canonical import stable_hash
-    from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
-    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase
-    from elspeth.web.composer.redaction import redact_tool_call_arguments
-    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-
-    plan = captured["plan"]
-    rival = PipelineProposal.create(
-        pipeline=deep_thaw(plan.proposal.pipeline),
-        base=PresentBase(
-            state_id=base_record.id,
-            composition_content_hash=composition_content_hash(state_from_record(base_record)),
-        ),
-        reviewed_facts=guided_private_reviewed_facts(captured["guided"]),
-        surface=PlannerSurface.GUIDED_STAGED,
-        repair_count=0,
-        skill_hash=stable_hash("rival-planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
-    )
-    record = asyncio.run(
-        client.app.state.session_service.create_pipeline_composition_proposal(
-            session_id=UUID(session_id),
-            plan=PipelinePlanResult(
-                proposal=rival,
-                tool_call_id=f"rival-pipeline-{uuid4()}",
-                custody_result="not_required",
-                model_identifier="rival-model",
-                model_version="rival-v9",
-                provider="rival-provider",
-            ),
-            summary="rival pipeline proposal",
-            rationale="shares the committed state",
-            affects=["nodes"],
-            arguments_redacted_json=redact_tool_call_arguments(
-                "set_pipeline",
-                deep_thaw(rival.pipeline),
-                telemetry=NoopRedactionTelemetry(),
-            ),
-            actor="test",
-            composer_model_identifier="rival-model",
-            composer_model_version="rival-v9",
-            composer_provider="rival-provider",
-        )
-    )
-    return record.id
-
-
 def _llm_prompt_template_planner(
     prompt: str,
     *,
@@ -913,6 +855,10 @@ class TestStep2IntraStep:
         blob_content: str | None = None,
     ) -> dict:
         self._drive_to_step_2_single_select(client, session_id, blob_content=blob_content)
+        return self._stage_proposal_from_step_2(client, session_id, filename=filename)
+
+    def _stage_proposal_from_step_2(self, client: TestClient, session_id: str, *, filename: str) -> dict:
+        """Stage from the Step 2 SINGLE_SELECT state (after the source is bound)."""
         _respond(client, session_id, chosen=["json"])
         _respond(
             client,
@@ -6046,22 +5992,28 @@ class TestStep2IntraStep:
     ) -> None:
         """A state id is not a unique proposal locator; the operation's is.
 
-        ``mark_composition_proposal_committed`` accepts any existing state, so
-        more than one proposal can name one committed state — resolving a
-        proposal BY committed state is therefore ambiguous, and can select
-        unrelated provenance or find several rows. The replay must bind the
-        exact proposal its own result locator names.
+        More than one proposal can name one committed state, so resolving a
+        proposal BY committed state is ambiguous: it can select unrelated
+        provenance or find several rows. The replay must bind the exact
+        proposal its own result locator names.
 
-        Rivals are committed on BOTH sides of the originating proposal in
+        On the platform the only facet through which a proposal comes to
+        name an EXISTING committed state is ordinary acceptance of an
+        approval-required blob-store-only proposal under a PROPOSAL lease
+        (``accept_pending_ordinary_proposal`` with ``state=None``): its
+        durable applied-effect receipt lets it bind the current state instead
+        of inserting one. A pipeline proposal always settles a state of its
+        own, so no pipeline rival can share the state through any facet, and
+        the pipeline-authority guard is exercised by generic rivals only.
+
+        Rivals are accepted on BOTH sides of the originating proposal in
         creation order, so neither an oldest-row nor a newest-row state lookup
         can coincide with the right answer. Provenance is asserted against the
         originating proposal row field by field, not merely as "different from
-        the rival".
-
-        Scope note: the rivals are constructed directly through the proposal
-        lifecycle API. This test does NOT drive the real blob acceptance path
-        that motivates the shared-state case in production; it reproduces the
-        shared-state CONDITION, not that workflow.
+        the rival". The rivals are driven through the real accept route --
+        the blob effect is applied, its receipt recorded, and the acceptance
+        committed by production -- so the shared-state condition here is the
+        one production can actually produce.
         """
         from elspeth.web.composer import service as composer_service_module
 
@@ -6071,19 +6023,29 @@ class TestStep2IntraStep:
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
         session_service = composer_test_client.app.state.session_service
+        blob_service = composer_test_client.app.state.blob_service
 
         def _rival(label: str) -> UUID:
-            """One generic proposal that will later name the settled state."""
+            """One approval-required blob-only proposal that will later share the settled state."""
+            blob = asyncio.run(
+                blob_service.create_blob(
+                    UUID(session_id),
+                    f"{label}.csv",
+                    b"order_id,total\n1,10\n",
+                    "text/csv",
+                    created_by="user",
+                )
+            )
             return asyncio.run(
                 session_service.create_composition_proposal(
                     session_id=UUID(session_id),
                     tool_call_id=f"{label}-{uuid4()}",
-                    tool_name="set_pipeline",
+                    tool_name="delete_blob",
                     summary=f"{label} approval",
                     rationale="shares the committed state",
-                    affects=["nodes"],
-                    arguments_json={"pipeline": {}},
-                    arguments_redacted_json={"pipeline": {}},
+                    affects=[],
+                    arguments_json={"blob_id": str(blob.id)},
+                    arguments_redacted_json={"blob_id": str(blob.id)},
                     base_state_id=None,
                     actor="test",
                     composer_model_identifier=f"{label}-model",
@@ -6094,25 +6056,23 @@ class TestStep2IntraStep:
                 )
             ).id
 
-        # Created BEFORE the guided proposal, so it is the oldest row.
-        older_rival = _rival("older-rival")
-
-        captured: dict[str, Any] = {}
-        planner = _llm_prompt_template_planner(prompt)
-
-        async def _capturing_planner(*, guided, base, **kwargs):
-            result = await planner(guided=guided, base=base, **kwargs)
-            captured["plan"] = result[0]
-            captured["guided"] = guided
-            captured["base"] = base
-            return result
+        def _accept_rival(rival_id: UUID) -> None:
+            """Commit a rival through the production accept route (PROPOSAL lease, receipt, facet)."""
+            accepted = composer_test_client.post(f"/api/sessions/{session_id}/proposals/{rival_id}/accept")
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["status"] == "committed"
 
         monkeypatch.setattr(
             composer_test_client.app.state.composer_service,
             "plan_guided_pipeline",
-            _capturing_planner,
+            _llm_prompt_template_planner(prompt),
         )
-        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_shared_state.jsonl")
+        # Bind the source first: a second ready blob before Step 1 would change
+        # the step-1 turn (the upload inspection is no longer unambiguous).
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        # Created BEFORE the guided proposal, so it is the oldest row.
+        older_rival = _rival("older-rival")
+        staged = self._stage_proposal_from_step_2(composer_test_client, session_id, filename="llm_shared_state.jsonl")
         assert staged["next_turn"]["type"] == "propose_pipeline"
         _review_wiring(composer_test_client, session_id)
 
@@ -6144,28 +6104,27 @@ class TestStep2IntraStep:
             original_surface,
         )
 
-        # Rivals on BOTH sides of the originating proposal now name its state.
-        # The newer one is a genuine PIPELINE proposal carrying its own
-        # planner provenance, so a wrong pick survives the pipeline-authority
-        # guard and is caught by the provenance comparison rather than by
-        # classification. The older one is generic, exercising that guard.
+        # Rivals on BOTH sides of the originating proposal now name its state:
+        # each is accepted through the production route after the guided
+        # settlement, so its applied-effect receipt binds it to the settled
+        # state rather than inserting one. Both are generic rivals; the
+        # pipeline-authority guard rejects them and the provenance comparison
+        # below pins the originating proposal's own recorded identity.
         committed_state = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert committed_state is not None
-        newer_rival = _rival_pipeline_proposal(
-            composer_test_client,
-            session_id,
-            captured=captured,
-            base_record=committed_state,
-        )
+        newer_rival = _rival("newer-rival")
         for rival_id in (older_rival, newer_rival):
-            asyncio.run(
-                session_service.mark_composition_proposal_committed(
+            _accept_rival(rival_id)
+        for rival_id in (older_rival, newer_rival):
+            rival_row = asyncio.run(
+                session_service.get_authoritative_composition_proposal(
                     session_id=UUID(session_id),
                     proposal_id=rival_id,
-                    committed_state_id=committed_state.id,
-                    actor="test",
+                    reviewed_facts=None,
                 )
-            )
+            ).row
+            assert rival_row.status == "committed"
+            assert rival_row.committed_state_id == committed_state.id
 
         # The ambiguity this guards against is now real, and brackets the
         # originating proposal in creation order.
