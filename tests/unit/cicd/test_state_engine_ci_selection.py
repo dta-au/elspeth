@@ -46,6 +46,37 @@ def _run_lines(job: dict[str, Any]) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
 
 
+PUSH_WORKFLOWS = (
+    CI_WORKFLOW,
+    REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
+    REPO_ROOT / ".github" / "workflows" / "enforce-allowlist-judge-gates.yaml",
+)
+RELEASE_KEEPS_IN_PROGRESS_RUNS = "${{ !startsWith(github.ref, 'refs/heads/release/') }}"
+
+
+def test_release_refs_never_cancel_an_in_progress_required_run() -> None:
+    """A required gate must be allowed to finish on a release branch.
+
+    With ``cancel-in-progress: true`` every push cancels the running
+    workflow, and a release branch is landed in bursts: on 2026-09-04/05
+    release/0.8.0 took ~12 pushes in 11 h and not one CI run completed, so
+    the required ``CI Success`` check never rendered a verdict on any sha
+    (elspeth-d8749aeaa3). The expression below keeps the cancel for PRs and
+    feature refs and disables it for ``release/**``; the pending run is still
+    replaced by GitHub, so the tip is always tested eventually. All three
+    push-triggered workflows share one group shape and one expression so a
+    policy change is one edit, not three drifting ones.
+    """
+    seen: list[str] = []
+    for path in PUSH_WORKFLOWS:
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+        concurrency = workflow["concurrency"]
+        assert concurrency["group"] == "${{ github.workflow }}-${{ github.ref }}", path.name
+        assert concurrency["cancel-in-progress"] == RELEASE_KEEPS_IN_PROGRESS_RUNS, path.name
+        seen.append(path.name)
+    assert seen == ["ci.yaml", "codeql.yaml", "enforce-allowlist-judge-gates.yaml"]
+
+
 def test_state_engine_validation_job_runs_every_maintained_validator() -> None:
     job = _job("state-engine-validation")
     commands = _run_lines(job)
