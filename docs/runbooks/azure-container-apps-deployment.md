@@ -91,7 +91,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-52 image (session epoch 52, Landscape epoch 37) in the registry.
+- The epoch-53 image (session epoch 53, Landscape epoch 37) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -285,7 +285,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 52
+  with the schema-owner URLs and initializes both schemas at session epoch 53
   and Landscape epoch 37.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
@@ -299,7 +299,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
 
 > **LIVE:** the no-schema dry run against the current `release/0.8.0` image
 > (expected: both schema checks red, everything else green) proves the wiring
-> before the epoch-52 image exists; record its execution names.
+> before the epoch-53 image exists; record its execution names.
 
 ## 4. Deploy the production shape and prove the rollout
 
@@ -359,7 +359,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 52, "landscape_epoch": 37, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 53, "landscape_epoch": 37, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",

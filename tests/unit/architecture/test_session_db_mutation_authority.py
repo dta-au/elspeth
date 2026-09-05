@@ -192,6 +192,9 @@ _TABLE_POLICIES: tuple[TablePolicy, ...] = (
         (("GlobalRunRecoveryAuthority", frozenset({"update"})),),
     ),
     TablePolicy("session_operation_fences", "session", "SessionOperationAuthority"),
+    # Epoch 53 (elspeth-f98e0ae8b2): one row per live BLOB_READ admission,
+    # written only by the operation authority (admit, renew, release, sweep).
+    TablePolicy("session_read_admissions", "session", "SessionOperationAuthority"),
     TablePolicy(
         "sessions",
         "session",
