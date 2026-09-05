@@ -216,7 +216,10 @@ def test_postgres_genuinely_rejects_overlong_reason_at_the_column(pg_db: Landsca
     """
     run_id = f"{RUN_ID}-raw"
     _seed_run(pg_db, run_id, tmp_path)
-    _seed_row_and_token(pg_db, run_id=run_id, row_id="row-1", token_id="tok-branch-b")
+    # ``rows.row_id`` is the table's whole primary key and the container is
+    # module-scoped, so the battery test's ``row-1`` is still present here;
+    # this run seeds its own row.
+    _seed_row_and_token(pg_db, run_id=run_id, row_id="row-raw", token_id="tok-branch-b")
 
     with pytest.raises(DataError), pg_db.engine.begin() as conn:
         conn.execute(

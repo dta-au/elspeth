@@ -5,6 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.check_contracts import (
+    CENSUS_METHOD,
+    SOFT_MAPPING_FORMS,
+    CensusDrift,
+    CensusSite,
     DictAliasIndex,
     FieldCoverageViolation,
     FieldMappingViolation,
@@ -14,10 +18,14 @@ from scripts.check_contracts import (
     ImportIndex,
     SettingsAccessVisitor,
     SettingsViolation,
+    census_file,
+    census_totals,
     check_field_name_mappings,
     check_from_settings_coverage,
     check_hardcode_documentation,
     check_settings_alignment,
+    check_soft_mapping_census,
+    compare_census,
     extract_from_settings_accesses,
     extract_from_settings_field_mappings,
     extract_from_settings_hardcodes,
@@ -26,7 +34,10 @@ from scripts.check_contracts import (
     find_settings_classes,
     find_type_definitions,
     get_settings_class_fields,
+    load_census,
     load_whitelist,
+    tabulate_census,
+    write_census,
 )
 
 
@@ -1879,3 +1890,313 @@ def test_dict_pattern_scan_covers_only_dict_containers_with_an_any_value(tmp_pat
     )
 
     assert find_dict_violations(test_file, whitelist=set(), matched_entries={}) == []
+
+
+# =============================================================================
+# Soft-mapping census (elspeth-10d605be55)
+#
+# The whitelist gate above counts one SPELLING in two positions. The census
+# counts every soft mapping form in every annotation position, so that a
+# rewrite between forms is a swap the pin makes visible, not a retirement the
+# scoreboard credits. These tests pin what the census counts, what it scores
+# as a boundary conversion, and that any drift from the pin fails.
+# =============================================================================
+
+
+def _census_forms(sites: list[CensusSite]) -> list[tuple[str, str, str, bool]]:
+    return [(site.context, site.position, site.form, site.boundary) for site in sites]
+
+
+def test_soft_mapping_census_recognises_every_form_and_spelling(tmp_path: Path) -> None:
+    """The five forms, under both the builtin and typing spellings, each count once."""
+    test_file = tmp_path / "forms.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "import typing",
+                "from collections.abc import Mapping, MutableMapping",
+                "from typing import Any, Dict",
+                "",
+                "def a(p: dict[str, Any]) -> None: ...",
+                "def b(p: Dict[str, typing.Any]) -> None: ...",
+                "def c(p: Mapping[str, Any]) -> None: ...",
+                "def d(p: MutableMapping[str, Any]) -> None: ...",
+                "def e(p: dict[str, object]) -> None: ...",
+                "def f(p: Mapping[str, object]) -> None: ...",
+                "def g(p: typing.Mapping[str, Any]) -> None: ...",
+                "",
+            ]
+        )
+    )
+
+    assert _census_forms(census_file(test_file)) == [
+        ("a", "param:p", "dict[str, Any]", False),
+        ("b", "param:p", "dict[str, Any]", False),
+        ("c", "param:p", "Mapping[str, Any]", False),
+        ("d", "param:p", "MutableMapping[str, Any]", False),
+        ("e", "param:p", "dict[str, object]", False),
+        ("f", "param:p", "Mapping[str, object]", False),
+        ("g", "param:p", "Mapping[str, Any]", False),
+    ]
+    assert set(SOFT_MAPPING_FORMS) == {
+        "dict[str, Any]",
+        "Mapping[str, Any]",
+        "MutableMapping[str, Any]",
+        "dict[str, object]",
+        "Mapping[str, object]",
+    }
+
+
+def test_soft_mapping_census_counts_every_annotation_position(tmp_path: Path) -> None:
+    """Positional-only, variadic, keyword-only, return, and AnnAssign at every scope all count.
+
+    Each of these is a position the whitelist gate deliberately does not scan
+    (see the scope pins above). The census exists precisely so a soft site in
+    one of them is not invisible.
+    """
+    test_file = tmp_path / "positions.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from collections.abc import Mapping",
+                "from typing import Any",
+                "",
+                "MODULE_LEVEL: dict[str, Any] = {}",
+                "",
+                "class Holder:",
+                "    attribute: Mapping[str, Any] = {}",
+                "",
+                "    def method(self, /, first: dict[str, object], *rest: Mapping[str, object], key: dict[str, Any], **extra: Mapping[str, Any]) -> dict[str, Any]:",
+                "        local: MutableMapping[str, Any] = {}",
+                "        return local",
+                "",
+            ]
+        )
+    )
+
+    assert _census_forms(census_file(test_file)) == [
+        ("<module>", "annassign:MODULE_LEVEL", "dict[str, Any]", False),
+        ("Holder", "annassign:attribute", "Mapping[str, Any]", False),
+        ("Holder.method", "param:first", "dict[str, object]", False),
+        ("Holder.method", "param:*rest", "Mapping[str, object]", False),
+        ("Holder.method", "param:key", "dict[str, Any]", False),
+        ("Holder.method", "param:**extra", "Mapping[str, Any]", False),
+        ("Holder.method", "return", "dict[str, Any]", False),
+        ("Holder.method", "annassign:local", "MutableMapping[str, Any]", False),
+    ]
+
+
+def test_soft_mapping_census_counts_every_occurrence_inside_one_annotation(tmp_path: Path) -> None:
+    """A union carrying two soft forms is two occurrences; a wrapper carrying one is one.
+
+    Per-occurrence counting is what makes a form-to-form rewrite a visible swap:
+    `dict[str, Any] | None` -> `Mapping[str, Any] | None` moves one count from
+    one column to the other in the same file, which the pin refuses.
+    """
+    test_file = tmp_path / "nested.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from collections.abc import Mapping",
+                "from typing import Any",
+                "",
+                "def both(p: dict[str, Any] | Mapping[str, Any] | None) -> None: ...",
+                "def wrapped(p: list[dict[str, Any]]) -> tuple[Mapping[str, object], ...]: ...",
+                "def inner(p: dict[str, dict[str, Any]]) -> None: ...",
+                "",
+            ]
+        )
+    )
+
+    assert _census_forms(census_file(test_file)) == [
+        ("both", "param:p", "dict[str, Any]", False),
+        ("both", "param:p", "Mapping[str, Any]", False),
+        ("wrapped", "param:p", "dict[str, Any]", False),
+        ("wrapped", "return", "Mapping[str, object]", False),
+        ("inner", "param:p", "dict[str, Any]", False),
+    ]
+
+
+def test_soft_mapping_census_ignores_hard_mappings(tmp_path: Path) -> None:
+    """A mapping with a hard value type, a non-str key, or a non-mapping container is not soft."""
+    test_file = tmp_path / "hard.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from collections.abc import Mapping, Sequence",
+                "from typing import Any",
+                "",
+                "def a(p: dict[str, int]) -> Mapping[str, str]: ...",
+                "def b(p: dict[int, Any]) -> Mapping[bytes, object]: ...",
+                "def c(p: Sequence[Any]) -> list[object]: ...",
+                "def d(p: dict) -> Mapping: ...",
+                "def e(p: dict[str, list[Any]]) -> None: ...",
+                "",
+            ]
+        )
+    )
+
+    assert census_file(test_file) == []
+
+
+def test_soft_mapping_census_scores_a_trust_boundary_source_param_as_boundary(tmp_path: Path) -> None:
+    """The parameter a @trust_boundary names as its source is a boundary conversion, not a soft site.
+
+    A Tier-3 parse that constructs an owned type is how a soft site is retired
+    honestly (ADR-032), so it scores as a removal. Only the named source_param
+    qualifies: the function's other soft parameters and its return stay soft,
+    and a decorator naming a different parameter changes nothing.
+    """
+    test_file = tmp_path / "boundary.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from collections.abc import Mapping",
+                "from typing import Any",
+                "from elspeth.contracts.trust_boundary import trust_boundary",
+                "",
+                "@trust_boundary(tier=3, source='llm', source_param='options', suppresses=('R5',), invariant='x')",
+                "def parse(options: dict[str, Any], hint: Mapping[str, Any]) -> dict[str, Any]:",
+                "    return {}",
+                "",
+                "@trust_boundary(tier=3, source='llm', source_param='other', suppresses=('R5',), invariant='x')",
+                "def elsewhere(options: dict[str, Any], other: str) -> None:",
+                "    return None",
+                "",
+                "def plain(options: dict[str, Any]) -> None:",
+                "    return None",
+                "",
+            ]
+        )
+    )
+
+    assert _census_forms(census_file(test_file)) == [
+        ("parse", "param:options", "dict[str, Any]", True),
+        ("parse", "param:hint", "Mapping[str, Any]", False),
+        ("parse", "return", "dict[str, Any]", False),
+        ("elsewhere", "param:options", "dict[str, Any]", False),
+        ("plain", "param:options", "dict[str, Any]", False),
+    ]
+
+    table = tabulate_census(census_file(test_file))
+    assert table == {str(test_file): {"dict[str, Any]": 3, "Mapping[str, Any]": 1, "boundary": 1}}
+    assert census_totals(table) == {
+        "soft": 4,
+        "boundary": 1,
+        "dict[str, Any]": 3,
+        "Mapping[str, Any]": 1,
+        "MutableMapping[str, Any]": 0,
+        "dict[str, object]": 0,
+        "Mapping[str, object]": 0,
+    }
+
+
+def test_soft_mapping_census_resolves_dict_aliases(tmp_path: Path) -> None:
+    """A name bound to dict[str, Any] counts as dict[str, Any] in the file that imports it."""
+    package = _alias_package(tmp_path)
+    consumer = package / "reader.py"
+    consumer.write_text(
+        "\n".join(
+            [
+                "from pkg.types import RunDetail",
+                "",
+                "def get_run() -> RunDetail | None:",
+                "    return None",
+                "",
+            ]
+        )
+    )
+
+    index = DictAliasIndex.build(package)
+    aliases = index.names_in_scope(consumer, package)
+    assert _census_forms(census_file(consumer, aliases)) == [("get_run", "return", "dict[str, Any]", False)]
+    # Without the alias set the site is invisible — the laundering the index closes.
+    assert census_file(consumer) == []
+
+
+def test_compare_census_reports_a_rewrite_as_a_swap_not_a_retirement() -> None:
+    """Every per-file, per-form difference from the pin is a drift, in either direction.
+
+    A dict -> Mapping rewrite is two drifts in one file: the pin does not net
+    them out, so the re-pin diff shows the swap. A genuine conversion is one
+    drift (the count falls) and the soft total falls with it.
+    """
+    pinned = {"a.py": {"dict[str, Any]": 2, "Mapping[str, Any]": 1}, "b.py": {"dict[str, object]": 1}}
+
+    assert compare_census(pinned, census_totals(pinned), pinned) == []
+
+    rewrite = {"a.py": {"dict[str, Any]": 1, "Mapping[str, Any]": 2}, "b.py": {"dict[str, object]": 1}}
+    assert compare_census(pinned, census_totals(pinned), rewrite) == [
+        CensusDrift(file="a.py", form="Mapping[str, Any]", pinned=1, live=2),
+        CensusDrift(file="a.py", form="dict[str, Any]", pinned=2, live=1),
+    ]
+
+    conversion = {"a.py": {"dict[str, Any]": 1, "Mapping[str, Any]": 1}, "b.py": {"dict[str, object]": 1}}
+    assert compare_census(pinned, census_totals(pinned), conversion) == [
+        CensusDrift(file="a.py", form="dict[str, Any]", pinned=2, live=1),
+    ]
+
+    new_file = {**pinned, "c.py": {"Mapping[str, object]": 1}}
+    assert compare_census(pinned, census_totals(pinned), new_file) == [
+        CensusDrift(file="c.py", form="Mapping[str, object]", pinned=0, live=1),
+    ]
+
+    removed_file = {"a.py": pinned["a.py"]}
+    assert compare_census(pinned, census_totals(pinned), removed_file) == [
+        CensusDrift(file="b.py", form="dict[str, object]", pinned=1, live=0),
+    ]
+
+    # A hand-edited totals block that no longer matches its own files block is a
+    # drift too, so the header cannot be made to lie about the score.
+    forged = {**census_totals(pinned), "soft": 1}
+    assert compare_census(pinned, forged, pinned) == [
+        CensusDrift(file="<totals>", form="soft", pinned=1, live=4),
+    ]
+
+
+def test_census_round_trips_through_yaml_with_the_method_stated(tmp_path: Path) -> None:
+    """The pin file carries the counting rule in its header and reloads to the same table."""
+    table = {"z.py": {"dict[str, Any]": 1, "boundary": 2}, "a.py": {"Mapping[str, object]": 3}}
+    census_path = tmp_path / "census.yaml"
+
+    write_census(census_path, table)
+    text = census_path.read_text()
+    assert CENSUS_METHOD in text
+    assert text.index("a.py") < text.index("z.py")  # deterministic ordering
+
+    loaded, stored_totals = load_census(census_path)
+    assert loaded == table
+    assert stored_totals == census_totals(table)
+    assert compare_census(loaded, stored_totals, table) == []
+
+
+def test_check_soft_mapping_census_fails_on_drift_and_repins_on_request(tmp_path: Path) -> None:
+    """End to end: a missing pin fails, --write-census creates it, a new soft site fails, re-pin passes."""
+    src_dir = tmp_path / "src" / "pkg"
+    src_dir.mkdir(parents=True)
+    module = src_dir / "mod.py"
+    module.write_text("from typing import Any\n\ndef f(p: dict[str, Any]) -> None: ...\n")
+    census_path = tmp_path / "census.yaml"
+
+    missing = check_soft_mapping_census(src_dir, census_path, DictAliasIndex.build(src_dir), write=False)
+    assert missing.ok is False
+    assert any("--write-census" in line for line in missing.lines)
+
+    written = check_soft_mapping_census(src_dir, census_path, DictAliasIndex.build(src_dir), write=True)
+    assert written.ok is True
+    assert written.totals["soft"] == 1
+
+    clean = check_soft_mapping_census(src_dir, census_path, DictAliasIndex.build(src_dir), write=False)
+    assert clean.ok is True
+
+    module.write_text(
+        "from collections.abc import Mapping\nfrom typing import Any\n\ndef f(p: dict[str, Any]) -> None: ...\n\nX: Mapping[str, Any] = {}\n"
+    )
+    drifted = check_soft_mapping_census(src_dir, census_path, DictAliasIndex.build(src_dir), write=False)
+    assert drifted.ok is False
+    assert drifted.drifts == (CensusDrift(file=str(module), form="Mapping[str, Any]", pinned=0, live=1),)
+    assert any("annassign:X" in line for line in drifted.lines)
+
+    repinned = check_soft_mapping_census(src_dir, census_path, DictAliasIndex.build(src_dir), write=True)
+    assert repinned.ok is True
+    assert repinned.totals["soft"] == 2
