@@ -368,25 +368,15 @@ def _postgres_advisory_session_lock(conn: Connection, classid: int, key: str, *,
 
 
 @contextlib.contextmanager
-def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
-    """Hold the sessions-classid session-level lock across multiple transactions."""
-    with _postgres_advisory_session_lock(
-        conn,
-        ELSPETH_SESSIONS_LOCK_CLASSID,
-        session_id,
-        label="PostgreSQL session advisory lock",
-    ):
-        yield
-
-
-@contextlib.contextmanager
 def postgres_blob_custody_advisory_lock(conn: Connection, session_id: str) -> Iterator[None]:
     """Hold the blob custody session-level lock across multiple transactions.
 
     Its own classid namespace: session-operation fence operations take
     transaction-scoped locks on the same session key in
     ``ELSPETH_SESSIONS_LOCK_CLASSID``, and a lease renew must never queue
-    behind a blob's filesystem persistence.
+    behind a blob's filesystem persistence. This is the only session-level
+    advisory lock ELSPETH holds; the sessions class is taken
+    transaction-scoped only (``acquire_session_advisory_xact_lock``).
     """
     with _postgres_advisory_session_lock(
         conn,
