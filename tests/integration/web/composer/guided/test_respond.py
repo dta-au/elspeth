@@ -5049,6 +5049,10 @@ class TestStep2IntraStep:
         (terminal_event,) = terminal_events
         assert terminal_event["failure_audit_cohort"]["count"] == 0
         assert terminal_event["failure_audit_cohort"]["rows"] == []
+        # The missing-evidence fact is recorded by WHO wrote the terminal
+        # event: the lease guard's audit-free arm, not the route's own
+        # evidence settlement (which is what failed here).
+        assert terminal_event["actor"] == "guided_operation_lease_guard"
         assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
         assert failure_canary not in repr((exc_info.value, operation, terminal_event))
 
