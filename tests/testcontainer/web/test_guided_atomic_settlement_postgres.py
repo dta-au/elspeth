@@ -12,6 +12,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine, select, update
 from testcontainers.postgres import PostgresContainer
+from tests.helpers.session_fences import acquire_compose_context
 
 from elspeth.contracts.composer_llm_audit import (
     ComposerChatInitiator,
@@ -32,11 +33,11 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationClaimed,
     GuidedOperationFence,
     GuidedOperationFenceLostError,
+    GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     GuidedOriginatingUserMessageDraft,
     GuidedResponseDescriptor,
     GuidedStateOperationCommand,
-    StaleComposeStateError,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -142,18 +143,20 @@ async def test_postgres_commits_state_messages_and_operation_as_one_cohort(
     postgres_engine: Engine,
 ) -> None:
     session_id = (await postgres_service.create_session("alice", "PG guided cohort", "local")).id
-    claimed = await postgres_service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id="pg-respond-cohort",
-        kind="guided_respond",
-        request_hash="c" * 64,
-        actor="worker",
-        lease_seconds=60,
-    )
-    assert isinstance(claimed, GuidedOperationClaimed)
-    command = _command(claimed.fence, with_messages=True)
+    async with acquire_compose_context(postgres_service, session_id) as context:
+        claimed = await postgres_service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id="pg-respond-cohort",
+            kind="guided_respond",
+            request_hash="c" * 64,
+            actor="worker",
+            lease_seconds=60,
+            session_operation_context=context,
+        )
+        assert isinstance(claimed, GuidedOperationClaimed)
+        command = _command(claimed.fence, with_messages=True)
 
-    settlement = await postgres_service.settle_guided_state_operation(command)
+        settlement = await postgres_service.settle_guided_state_operation(command, session_operation_context=context)
 
     with postgres_engine.connect() as conn:
         states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session_id))).all()
@@ -177,35 +180,42 @@ async def test_postgres_stale_fence_attempt_cannot_write_after_takeover(
 ) -> None:
     session_id = (await postgres_service.create_session("alice", "PG stale fence", "local")).id
     operation_id = "pg-respond-stale"
-    first = await postgres_service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_respond",
-        request_hash="d" * 64,
-        actor="worker-a",
-        lease_seconds=60,
-    )
-    assert isinstance(first, GuidedOperationClaimed)
-    with postgres_engine.begin() as conn:
-        conn.execute(
-            update(guided_operations_table)
-            .where(guided_operations_table.c.session_id == str(session_id))
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(minutes=1))
+    # One live session lease throughout: the fence under test is the GUIDED
+    # operation fence (worker-a's claim is taken over by worker-b inside the
+    # same session authority), so the stale attempt must be refused by the
+    # guided layer while the session layer is still current.
+    async with acquire_compose_context(postgres_service, session_id) as context:
+        first = await postgres_service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="guided_respond",
+            request_hash="d" * 64,
+            actor="worker-a",
+            lease_seconds=60,
+            session_operation_context=context,
         )
-    second = await postgres_service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=operation_id,
-        kind="guided_respond",
-        request_hash="d" * 64,
-        actor="worker-b",
-        lease_seconds=60,
-    )
-    assert isinstance(second, GuidedOperationTakenOver)
+        assert isinstance(first, GuidedOperationClaimed)
+        with postgres_engine.begin() as conn:
+            conn.execute(
+                update(guided_operations_table)
+                .where(guided_operations_table.c.session_id == str(session_id))
+                .values(lease_expires_at=datetime.now(UTC) - timedelta(minutes=1))
+            )
+        second = await postgres_service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id=operation_id,
+            kind="guided_respond",
+            request_hash="d" * 64,
+            actor="worker-b",
+            lease_seconds=60,
+            session_operation_context=context,
+        )
+        assert isinstance(second, GuidedOperationTakenOver)
 
-    with pytest.raises(GuidedOperationFenceLostError):
-        await postgres_service.settle_guided_state_operation(_command(first.fence))
-    winning = _command(second.fence)
-    settlement = await postgres_service.settle_guided_state_operation(winning)
+        with pytest.raises(GuidedOperationFenceLostError):
+            await postgres_service.settle_guided_state_operation(_command(first.fence), session_operation_context=context)
+        winning = _command(second.fence)
+        settlement = await postgres_service.settle_guided_state_operation(winning, session_operation_context=context)
 
     with postgres_engine.connect() as conn:
         states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session_id))).all()
@@ -220,18 +230,20 @@ async def test_postgres_present_head_settles_derived_successor(
 ) -> None:
     session_id = (await postgres_service.create_session("alice", "PG present head", "local")).id
     predecessor = await _seed_predecessor(postgres_service, session_id)
-    claimed = await postgres_service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id="pg-present-exact",
-        kind="guided_respond",
-        request_hash="e" * 64,
-        actor="worker",
-        lease_seconds=60,
-    )
-    assert isinstance(claimed, GuidedOperationClaimed)
-    command = _command(claimed.fence, predecessor=predecessor)
+    async with acquire_compose_context(postgres_service, session_id) as context:
+        claimed = await postgres_service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id="pg-present-exact",
+            kind="guided_respond",
+            request_hash="e" * 64,
+            actor="worker",
+            lease_seconds=60,
+            session_operation_context=context,
+        )
+        assert isinstance(claimed, GuidedOperationClaimed)
+        command = _command(claimed.fence, predecessor=predecessor)
 
-    settlement = await postgres_service.settle_guided_state_operation(command)
+        settlement = await postgres_service.settle_guided_state_operation(command, session_operation_context=context)
 
     assert settlement.primary_state.derived_from_state_id == predecessor.id
     assert settlement.primary_state.version == predecessor.version + 1
@@ -253,32 +265,38 @@ async def test_postgres_present_head_mismatch_rolls_back_and_retries(
 ) -> None:
     session_id = (await postgres_service.create_session("alice", f"PG present mismatch {mismatch}", "local")).id
     predecessor = await _seed_predecessor(postgres_service, session_id)
-    claimed = await postgres_service.reserve_guided_operation(
-        session_id=session_id,
-        operation_id=f"pg-present-{mismatch}",
-        kind="guided_respond",
-        request_hash="f" * 64,
-        actor="worker",
-        lease_seconds=60,
-    )
-    assert isinstance(claimed, GuidedOperationClaimed)
-    exact = _command(claimed.fence, with_messages=True, predecessor=predecessor)
-    replacements = {
-        "id": {"expected_current_state_id": uuid4()},
-        "version": {"expected_current_state_version": predecessor.version + 1},
-        "content_hash": {"expected_current_content_hash": "0" * 64},
-    }[mismatch]
+    async with acquire_compose_context(postgres_service, session_id) as context:
+        claimed = await postgres_service.reserve_guided_operation(
+            session_id=session_id,
+            operation_id=f"pg-present-{mismatch}",
+            kind="guided_respond",
+            request_hash="f" * 64,
+            actor="worker",
+            lease_seconds=60,
+            session_operation_context=context,
+        )
+        assert isinstance(claimed, GuidedOperationClaimed)
+        exact = _command(claimed.fence, with_messages=True, predecessor=predecessor)
+        replacements = {
+            "id": {"expected_current_state_id": uuid4()},
+            "version": {"expected_current_state_version": predecessor.version + 1},
+            "content_hash": {"expected_current_content_hash": "0" * 64},
+        }[mismatch]
 
-    with pytest.raises((StaleComposeStateError, AuditIntegrityError)):
-        await postgres_service.settle_guided_state_operation(replace(exact, **replacements))
+        # Same contract as the SQLite proof: a content-hash mismatch is an
+        # audit-integrity refusal, an id/version mismatch is the DB-locked
+        # expected-head conflict.
+        expected_error = AuditIntegrityError if mismatch == "content_hash" else GuidedOperationSettlementConflictError
+        with pytest.raises(expected_error):
+            await postgres_service.settle_guided_state_operation(replace(exact, **replacements), session_operation_context=context)
 
-    with postgres_engine.connect() as conn:
-        states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session_id))).all()
-        messages = conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session_id))).all()
-        operation = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == str(session_id))).one()
-    assert [row.id for row in states] == [str(predecessor.id)]
-    assert messages == []
-    assert operation.status == "in_progress"
+        with postgres_engine.connect() as conn:
+            states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(session_id))).all()
+            messages = conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session_id))).all()
+            operation = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == str(session_id))).one()
+        assert [row.id for row in states] == [str(predecessor.id)]
+        assert messages == []
+        assert operation.status == "in_progress"
 
-    settlement = await postgres_service.settle_guided_state_operation(exact)
+        settlement = await postgres_service.settle_guided_state_operation(exact, session_operation_context=context)
     assert settlement.primary_state.derived_from_state_id == predecessor.id
