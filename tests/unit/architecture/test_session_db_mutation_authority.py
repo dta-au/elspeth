@@ -5084,13 +5084,19 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 break
             current = getattr(current, "_inventory_parent", None)
 
-        # ``conn = engine.connect()`` and simple aliases in one lexical scope.
+        # ``conn = engine.connect()`` and simple aliases in one lexical scope --
+        # and a ``with ... as conn`` whose block has already ENDED: the name
+        # stays bound afterwards, so a use after the block (return, yield,
+        # attribute store, closure capture in an enclosing scope) reaches the
+        # same acquisition. A with-binding carries no ``value``; its context
+        # expression is the acquisition (comment 9521 on elspeth-e483fe7f85).
         reaching, _, _ = self._visible_reaching_bindings(use, name)
         acquisitions: dict[int, ast.Call] = {}
         for binding in reaching:
+            bound = binding.value if binding.value is not None else self._with_binding_context(binding, name)
             for acquisition in self._connection_acquisitions_for_expression(
                 binding.node,
-                binding.value,
+                bound,
                 visited=next_visited,
             ):
                 acquisitions[id(acquisition)] = acquisition
@@ -10216,6 +10222,65 @@ def test_writer_authority_must_match_the_table_policy() -> None:
             ),
         ),
     ]
+
+
+def test_connections_that_outlive_their_with_block_are_escapes(tmp_path: Path) -> None:
+    """A with-target used AFTER its block ended has left the acquisition's custody.
+
+    Observed by lane 6b-2 during its per-authority gate mutations (comment
+    9521 on elspeth-e483fe7f85): ``return conn`` after the ``with`` block
+    changed only the fingerprint, while a callable hand-off inside the block
+    was flagged. The name stays bound after the block, so a return, a yield,
+    an attribute store, or a closure that captures it is exactly the
+    escaping-reader class D6 step 5 must see. The contained case at the end
+    pins that nothing here widens the ordinary in-block use.
+    """
+    source = tmp_path / "outliving_connections.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def returned_after_block(engine):
+                with engine.begin() as conn:
+                    pass
+                return conn
+
+            def yielded_after_block(engine):
+                with engine.connect() as conn:
+                    pass
+                yield conn
+
+            def stored_after_block(engine, holder):
+                with engine.connect() as conn:
+                    pass
+                holder.conn = conn
+
+            def captured_by_closure(engine):
+                with engine.connect() as conn:
+                    pass
+
+                def later():
+                    return conn
+
+                return later
+
+            def contained(engine):
+                with engine.begin() as conn:
+                    conn.execute("UPDATE sessions SET title = 'x'")
+                return None
+            """
+        )
+    )
+
+    connections = [site for site in scan_production_writers([source], anchor=tmp_path) if site.operation == "write_connection"]
+    assert Counter((site.symbol, site.connection_escape) for site in connections) == Counter(
+        {
+            ("returned_after_block", True): 1,
+            ("yielded_after_block", True): 1,
+            ("stored_after_block", True): 1,
+            ("captured_by_closure", True): 1,
+            ("contained", False): 1,
+        }
+    )
 
 
 def test_all_production_sessions_writers_are_reviewed_typed_authorities() -> None:
