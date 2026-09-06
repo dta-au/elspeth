@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import event, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.composer import tutorial_telemetry as tutorial_telemetry_module
@@ -29,6 +30,7 @@ from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
 from elspeth.web.preferences.service import (
     CorruptPreferencesError,
     PreferencesService,
+    prior_read_is_serialised,
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import metadata, user_preferences_table
@@ -106,11 +108,11 @@ def test_update_persists_and_round_trips(service):
     payload = UpdateComposerPreferencesRequest(default_mode="freeform")
     # B2 (Phase 8a-2): service returns a transition wrapper; the
     # caller reads ``.current`` for the post-write state. New users
-    # have no prior row — ``.prior`` is None (NOT a synthesised
+    # have no prior row — ``.prior.value`` is None (NOT a synthesised
     # guided-default sentinel; that would fabricate state the system
     # never wrote — see ComposerPreferencesTransition docstring).
     result = asyncio.run(service.update_composer_preferences("alice-update-persist", payload))
-    assert result.prior is None
+    assert result.prior.value is None
     assert result.current.default_mode == "freeform"
     assert result.current.tutorial_completed_at is None
     prefs = asyncio.run(service.get_composer_preferences("alice-update-persist"))
@@ -126,7 +128,7 @@ def test_patch_sets_tutorial_completed_at(service):
             UpdateComposerPreferencesRequest(tutorial_completed_at=stamp),
         )
     )
-    assert result.prior is None
+    assert result.prior.value is None
     assert result.current.tutorial_completed_at == stamp
 
     prefs = asyncio.run(service.get_composer_preferences("alice-tutorial-set"))
@@ -503,7 +505,7 @@ def test_empty_patch_on_no_row_does_not_insert(service, engine):
     )
     # Response is the default (matches GET no-row behaviour); prior is
     # None because no row existed before the empty PATCH.
-    assert result.prior is None
+    assert result.prior.value is None
     assert result.current.default_mode == "guided"
     assert result.current.banner_dismissed_at is None
 
@@ -531,8 +533,8 @@ def test_empty_patch_on_existing_row_bumps_updated_at_only(service, engine):
     assert result.current.default_mode == "freeform"
     # Prior was the freeform row seeded above; empty PATCH bumps
     # updated_at but the mode itself is preserved.
-    assert result.prior is not None
-    assert result.prior.default_mode == "freeform"
+    assert result.prior.value is not None
+    assert result.prior.value.default_mode == "freeform"
 
     with engine.connect() as conn:
         new_updated = conn.execute(select(user_preferences_table.c.updated_at).where(user_preferences_table.c.user_id == user)).scalar_one()
@@ -616,8 +618,8 @@ def test_patch_returns_written_values_not_a_reread(service):
     result = asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="guided")))
     assert result.current.default_mode == "guided"
     # And prior is what we seeded above.
-    assert result.prior is not None
-    assert result.prior.default_mode == "freeform"
+    assert result.prior.value is not None
+    assert result.prior.value.default_mode == "freeform"
 
 
 def test_corrupt_prior_blocks_patch_via_prior_load(service):
@@ -1097,3 +1099,89 @@ def test_show_advanced_defaults_false_and_round_trips(service: PreferencesServic
         )
     )
     assert asyncio.run(service.get_composer_preferences("alice-show-advanced")).show_advanced is True
+
+
+# ── Prior-read serialisation guarantee (elspeth-d336060892) ────────────────
+
+
+def _attach_trace(engine: Engine) -> list[str]:
+    """Capture every SQL statement the SQLite driver executes on the pooled connection."""
+    captured: list[str] = []
+    raw = engine.raw_connection()
+    try:
+        driver_conn = raw.driver_connection
+        assert driver_conn is not None
+        driver_conn.set_trace_callback(captured.append)
+    finally:
+        raw.close()
+    return captured
+
+
+def _detach_trace(engine: Engine) -> None:
+    raw = engine.raw_connection()
+    try:
+        driver_conn = raw.driver_connection
+        assert driver_conn is not None
+        driver_conn.set_trace_callback(None)
+    finally:
+        raw.close()
+
+
+def test_prior_read_runs_under_begin_immediate_on_sqlite(tmp_path):
+    """The SQLite arm of the guarantee, measured on the service's own write path.
+
+    ``create_session_engine`` rebinds ``engine.begin`` so the sessions write
+    transaction opens with ``BEGIN IMMEDIATE`` (``tests/unit/web/sessions/
+    test_engine.py::test_session_engine_begin_uses_begin_immediate`` pins the
+    factory). This test pins that ``update_composer_preferences`` actually
+    reaches that path: the prior-row SELECT is issued after ``BEGIN
+    IMMEDIATE`` and before the upsert, on the same connection, and the
+    transition reports the read as serialised.
+    """
+    engine = create_session_engine(
+        f"sqlite:///{tmp_path / 'preferences-begin-immediate.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    metadata.create_all(engine)
+    service = PreferencesService(engine)
+    user = "alice-begin-immediate"
+    asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="freeform")))
+
+    trace = _attach_trace(engine)
+    try:
+        result = asyncio.run(service.update_composer_preferences(user, UpdateComposerPreferencesRequest(default_mode="guided")))
+    finally:
+        _detach_trace(engine)
+
+    statements = [statement.strip() for statement in trace]
+    begins = [statement for statement in statements if statement.upper().startswith("BEGIN")]
+    assert begins == ["BEGIN IMMEDIATE"], statements
+    begin_idx = statements.index("BEGIN IMMEDIATE")
+    select_idx = next(index for index, statement in enumerate(statements) if statement.upper().startswith("SELECT"))
+    insert_idx = next(index for index, statement in enumerate(statements) if statement.upper().startswith("INSERT"))
+    assert begin_idx < select_idx < insert_idx, statements
+    assert result.prior.serialised is True
+    assert result.prior.value is not None
+    assert result.prior.value.default_mode == "freeform"
+    engine.dispose()
+
+
+def test_prior_read_is_serialised_only_on_sqlite():
+    """The dialect arm of ``PriorPreferencesSnapshot.serialised``.
+
+    PostgreSQL's ``engine.begin()`` is a plain READ COMMITTED ``BEGIN``
+    (``create_session_engine`` returns non-SQLite engines unmodified), so
+    the prior read there is a snapshot a concurrent PATCH can invalidate.
+    """
+    assert prior_read_is_serialised("sqlite") is True
+    assert prior_read_is_serialised("postgresql") is False
+
+
+def test_transition_prior_flag_is_derived_from_the_service_engine_dialect(service):
+    """The flag on the returned transition is the dialect derivation, not a constant."""
+    result = asyncio.run(
+        service.update_composer_preferences("alice-flag-derivation", UpdateComposerPreferencesRequest(default_mode="guided"))
+    )
+    assert result.prior.serialised is prior_read_is_serialised(service._engine.dialect.name)
+    assert service._engine.dialect.name == "sqlite"
