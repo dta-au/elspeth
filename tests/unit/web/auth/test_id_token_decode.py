@@ -367,13 +367,15 @@ class TestIdTokenClaimsBoundary:
         claims = parse_id_token_claims(payload=_claims(iat=1_700_000_000.75))
         assert claims.issued_at == 1_700_000_000
 
-    @pytest.mark.parametrize(("claim", "attribute"), [("nonce", "nonce"), ("azp", "authorized_party")])
-    def test_a_compared_claim_that_is_not_a_string_reads_as_absent(self, claim: str, attribute: str) -> None:
+    def test_a_compared_claim_that_is_not_a_string_reads_as_absent(self) -> None:
         """The comparison is the ONE authority for these two: a non-string cannot match, so it
         arrives there as absent and is refused there, with that check's message (``TestNonceBinding``)."""
-        assert getattr(parse_id_token_claims(payload=_claims(**{claim: 12345})), attribute) is None
-        assert getattr(parse_id_token_claims(payload=_claims(**{claim: _ABSENT})), attribute) is None
-        assert getattr(parse_id_token_claims(payload=_claims(**{claim: "value"})), attribute) == "value"
+        assert parse_id_token_claims(payload=_claims(nonce=12345)).nonce is None
+        assert parse_id_token_claims(payload=_claims(nonce=_ABSENT)).nonce is None
+        assert parse_id_token_claims(payload=_claims(nonce="value")).nonce == "value"
+        assert parse_id_token_claims(payload=_claims(azp=12345)).authorized_party is None
+        assert parse_id_token_claims(payload=_claims(azp=_ABSENT)).authorized_party is None
+        assert parse_id_token_claims(payload=_claims(azp="value")).authorized_party == "value"
 
     def test_a_non_string_cosmetic_claim_reads_as_absent(self) -> None:
         """An IdP sending the wrong type must not deny access over a display name."""
