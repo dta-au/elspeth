@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
-Date: 2026-09-02. Status: design, revision 2.10, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username.
+Date: 2026-09-02. Status: design, revision 2.11, implementation plan = tracker milestone elspeth-07cd19ba73.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. A real client gates live verification and nothing else; §External dependencies is now §Deployment-time inputs, the AWS Terraform is recorded as creating the Cognito confidential client itself, and the VANguard spike is a live confirmation of a profile that is already written. **This revision narrows what it claims, and does not disturb D5.** It means the build and every test wait on nothing: steps 2 to 5 complete without any registration. It does not mean live verification left delivery scope. D5 stands as ruled — Cognito's client the repository's Terraform now mints itself, while VANguard's is issued by the operating organisation on its ABN-gated admin page (§Deployment-time inputs), so VANguard live verification remains a delivery obligation this project cannot discharge alone and must wait on that registration to close. A reader who takes "gates live verification and nothing else" as "nothing remains owed" has read it too broadly.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -76,9 +76,24 @@ The tech-debt-free window is weeks, not months.
 | D32 **[rev2.8]** | Does R3 disable the identity | Yes: `disabled`, `disable_reason='rebound'`, actor `system`, audit row. It honours R5 on the last active human admin rather than bricking the container, and it does **not** run the edge-revocation cascade, which is unrecoverable and fires most often on a marriage or a rename. |
 | D34 **[rev2.8]** | Dormancy versus the last admin | R9 carries R5's last-admin exemption. Otherwise a single-admin container reaches zero active admins at day 91 by doing nothing, and the first-login-only seed cannot re-fire. |
 
+**[rev2.11] D10's narration, not its ruling.** D10 says "the VANguard
+**spike**". rev2.11 renamed that section to §VANguard live confirmation, so
+the word now names nothing; read it as pointing there. Its conditional has
+also moved: the profile is written and keys on `sub` either way
+(`map_vanguard`), and the detection columns `subject_email_at_first_seen`
+and `rebound_at` are on `identities`. What a live token pair still settles
+is whether that `sub` is stable and non-email — the subject is an email
+today — which is exactly why those columns exist. **The R3 refusal itself is
+specified (§Refusals R3, D32) and is not yet implemented:** `rebound_at` is
+only ever written `NULL`, `subject_email_at_first_seen` is written at first
+sight and compared nowhere, and no `disable_reason='rebound'` exists in the
+tree. D10's ruling — no `principals` table, identity merge an unbuilt admin
+action — is unchanged and correct.
+
 ## Architecture
 
-Four units replace the three provider classes and the browser exchange.
+Five units replace the three provider classes and the browser exchange
+[rev2.11: the count read "Four" and omitted §5].
 
 ### 1. IdP profile registry — `src/elspeth/web/auth/providers/`
 
@@ -149,9 +164,23 @@ that profile's configuration for this container. The build carries no
 credentials; the profile carries no deployment facts. The settings
 validator rejects a value with no registered profile by naming the
 registered profiles in the error, readiness reports the active profile
-name and each missing `required_settings` field by name, and
-`GET /api/auth/config` returns the active `provider`. Switching a container
-from one IdP to another is a config change and a restart, never a build.
+name, and `GET /api/auth/config` returns the active `provider`. Switching a
+container from one IdP to another is a config change and a restart, never a
+build.
+
+**A partial identity configuration fails at settings load [rev2.11]. The
+container does not start.** It does not come up and report itself unready:
+`WebSettings` refuses the shape and names every missing `required_settings`
+field, and for a registered profile it cannot wire, `create_app` raises and
+names them again (§5). Earlier revisions of this paragraph said readiness
+would name the missing fields. Readiness still holds that arm as a total
+boundary, and its "no registered profile" arm is live, but no ordinary
+deployment reaches it with an incomplete configuration — it exited before the
+application existed. What an operator sees is a task that starts, exits
+immediately, and restarts, with the reason in the exit log rather than a
+readiness response; see
+[docs/guides/identity-providers.md](../guides/identity-providers.md)
+§The failure mode operators get wrong.
 
 `EntraAuthProvider`
 is deleted; its tenant check moves into the Entra profile and is re-declared
@@ -298,6 +327,29 @@ variant is a recorded future option.
 
 See §Data model.
 
+### 5. Startup wiring — `src/elspeth/web/sso_wiring.py` [rev2.11]
+
+The one place that knows the registry, the login walk, the identity
+substrate and the settings, so the app factory binds one object
+(`app.state.sso`) and the three `/sso/*` routes read that and nothing else.
+Two phases, because the factory is synchronous and discovery is not:
+`build_sso_wiring` runs in the factory and assembles everything needing no
+network (token issuer, handoff store, admission and read callables, the
+profile's claim checks), deciding by the same rule readiness reports on
+whether the deployment is wired at all; `resolve_sso_runtime` runs in
+lifespan and resolves the IdP endpoints — the operator's break-glass
+override, else discovery under the profile's origin policy. Discovery
+failing is a boot failure by choice: a deployment that cannot reach its IdP
+cannot log anyone in, and saying so at startup beats saying it to every user
+at the callback. `build_sso_wiring` returning `None` deliberately means two
+different things — for `local` it is the ordinary answer, there being no IdP
+to wire; for a registered profile it is a boot refusal, because with the
+legacy bearer path deleted (§Deleted outright) there is no second way to
+authenticate anyone. The invariant underneath is that a
+partially configured profile must never produce a partially working login,
+and it is the mechanism behind the boot failure described under §Operator
+selection.
+
 ### ID-token validation [rev2]
 
 A dedicated ID-token decode path on `JWKSTokenValidator` (the Cognito
@@ -435,7 +487,13 @@ Cutover by deployment:
 
 - **ECS (Postgres, both stores):** archive/export required evidence, drop,
   recreate, `--init-schema`, compatibility record updated with
-  `session_epoch: 50`, `landscape_epoch: 37`, `rollback_permitted: false`.
+  `rollback_permitted: false` and this delivery's two epochs — **copy those
+  two numbers from the worked compatibility record in
+  [docs/runbooks/aws-ecs-deployment.md](../runbooks/aws-ecs-deployment.md)
+  (§Bound release/schema compatibility record), never from this spec
+  [rev2.11].** That record is the artefact the acceptance gate re-reads and
+  asserts against; epoch literals pinned here have drifted from
+  `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` before.
   In-place changes are forbidden by the pre-1.0 gate. All live SSO sessions
   are invalidated at this deploy; users log in again. This is stated in the
   operator notice for the window.
@@ -725,7 +783,7 @@ this paragraph previously said the opposite of the paragraph that ruled it].
 
 | profile | issuer | expected origins | extra checks | username | userinfo | notes |
 |---------|--------|------------------|--------------|----------|----------|-------|
-| oidc (Cognito) | `sso_issuer` | issuer + `sso_endpoint_origins` | none | `preferred_username` → `cognito:username` → `sub` | no | confidential app client with the ELSPETH callback URL; new client id (Cognito secrets are fixed at creation; operator to confirm) |
+| oidc (Cognito) | `sso_issuer` | issuer + `sso_endpoint_origins` | none | `preferred_username` → `cognito:username` → `sub` | no | confidential app client with the ELSPETH callback URL; on AWS the repository's Terraform creates it in `upgrade` mode with `generate_secret = true` and passes the minted secret to the task by ARN [rev2.11] |
 | entra | derived from tenant | `login.microsoftonline.com` | `tid` | `preferred_username` → `sub` | no | groups and roles are not collected (D17); the group-overage check is gone with them |
 | vanguard | `sso_issuer` | same as issuer | none | `sub` (email today) | yes | `given_name`, `family_name`, `abn` → `organisation_id`; display name from name parts |
 | google | `https://accounts.google.com` (the bare `accounts.google.com` form is rejected) | the four Google origins above | `email_verified` true; `hd` = `google_hosted_domain` (absent for non-Workspace accounts, fails closed) | `email` → `sub` | no | refuses to start without a hosted domain |
@@ -738,9 +796,12 @@ origin; `S256`; `RS256`; `token_endpoint_auth_methods_supported` =
 `client_secret_post`, `client_secret_basic`, `private_key_jwt`; no
 `claims_supported` published.
 
-### VANguard spike (before the profile is written) [rev2]
+### VANguard live confirmation [rev2.11]
 
-Against a real confidential client and token pair, in this order:
+**[rev2.11: this read "spike (before the profile is written)". The profile is
+written — it keys on `sub` and calls userinfo — so these are the assumptions it
+already ships on, and a deployment holding a real confidential client and token
+pair confirms them. It is not a gate on writing the profile.]** In this order:
 
 1. Does the ID token carry any **stable, non-email subject**? (D10 hinges
    on it. If yes, the profile keys on it and `email` is a claim.)
@@ -749,16 +810,18 @@ Against a real confidential client and token pair, in this order:
 4. Whether the JWKS entries carry `alg`.
 5. Whether the token endpoint accepts `client_secret_basic` for that client.
 
-The real token pair becomes a test fixture (redacted signature, pinned
-claims).
+A real token pair, once a deployment has one, can be added as a fixture
+(redacted signature, pinned claims). It is an addition to the synthetic
+fixtures, never a precondition for them [rev2.11].
 
 ### Google facts measured 2026-09-02 (by review)
 
 Discovery: authorization `accounts.google.com/o/oauth2/v2/auth`, token
 `oauth2.googleapis.com/token`, jwks `www.googleapis.com/oauth2/v3/certs`,
 userinfo `openidconnect.googleapis.com/v1/userinfo`. `claims_supported`
-does not list `hd`; it is emitted for Workspace accounts only. Live check
-waits for a registered client.
+does not list `hd`; it is emitted for Workspace accounts only. A live check
+needs a client from whoever owns the Workspace domain, which is a deployment
+errand; the profile and its tests do not wait for one [rev2.11].
 
 ## Refusals [rev2]
 
@@ -906,8 +969,9 @@ waits for a registered client.
   caller identity it accepts — a capability, not an authorization. The read
   writes an `audit_access_log` row under a new `writer_principal` value,
   added **in this epoch**: one identity reading another's work is the
-  disclosure an auditor will ask about, and adding the value after epoch 50
-  costs exactly the window this spec is structured to take only once.
+  disclosure an auditor will ask about, and adding the value after this
+  delivery's epoch cut costs exactly the window this spec is structured to
+  take only once.
   *Sent*: my own requests with their state, the decider, the decision
   note, and when; opening one sets `decision_seen_at`. A badge on the
   navigation shows unread counts from one summary endpoint. It needs its own
@@ -918,8 +982,11 @@ waits for a registered client.
 
 ## Testing [rev2]
 
-- **Unit.** One fixture module per profile with a signed ID token (and the
-  real VANguard pair from the spike). Every claim check positive and
+- **Unit.** One fixture module per profile with a signed ID token. Every
+  profile's fixtures are synthetic, VANguard's included [rev2.11: this said
+  "and the real VANguard pair from the spike", which made a unit fixture wait
+  on a live client; the tests were written without one]. Every claim check
+  positive and
   fail-closed. Registry parity. Endpoint-origin policy per profile including
   Google's cross-origin document and Cognito's hosted domain
   (`test_urls.py` carried forward). Cookie: tampered, expired, future-skewed,
@@ -987,9 +1054,16 @@ phase 4 closes, not after.
 
 ## Rollout order [rev2]
 
-1. **Operator, first:** register the confidential Cognito client with the
-   ELSPETH callback URL and land its id and secret in the task definition;
-   register the VANguard confidential client; run the VANguard spike.
+1. **Deployment inputs, not a project step [rev2.11]:** each deployment
+   registers its own confidential client with its own provider and supplies
+   the id, secret and issuer as configuration (§Deployment-time inputs). On
+   AWS the repository's own Terraform creates the Cognito client and mints its
+   secret, so there is nothing to land by hand. Steps 2 to 5 do not wait on
+   any of this — the profiles and the login path are proved against the
+   in-process fake IdP — and a real client gates only the live checks in
+   steps 6 and 7. **[rev2.11: this read "Operator, first: register the
+   confidential Cognito client …", which made a deployer's errand a
+   precondition of the build and produced a ruling that had to be reversed.]**
 2. Contracts and schema: both epochs, new tables, re-key, widened CHECKs,
    registry with parity test, readiness rewrite, fan-out checklist. Old
    browser path still intact; tests green.
@@ -1047,7 +1121,7 @@ the bullet, not the heading.
   *export* half of this bullet was stale — it is owned in the plan already
   [rev2.8].
 
-## Workflow tables (sessions store, epoch 50) — "for but not with" [rev2.1, D13]
+## Workflow tables (sessions store, this delivery's epoch) — "for but not with" [rev2.1, D13]
 
 Basic columns only. Every table keys on `identity_id`. Every mutation writes
 its `auth_events` row before responding. Fleshed out later without a new
@@ -1169,8 +1243,40 @@ organisation-wide policy applied into containers; see §Terminology); deriving r
 cookie-based SPA sessions; storing IdP refresh tokens or `offline_access`;
 multiple IdPs in one deployment; identity merge; RP-initiated IdP logout.
 
-## External dependencies
+## Deployment-time inputs [rev2.11]
 
-A confidential VANguard client on the bridge's ABN-gated admin page with
-ELSPETH's callback URL, plus a token pair for the spike. A confidential
-Cognito app client. A Google Cloud OAuth client (live check only).
+Each of the four IdP profiles needs a client registration with its provider,
+and each one is supplied by whoever deploys ELSPETH, for their own
+environment. This repository is public and stores no provider credential, so a
+registration is configuration a deployment brings — `sso_client_id`,
+`sso_client_secret`, and the profile's issuer, tenant or hosted domain — not a
+dependency the project waits on. No source file, and no unit or integration
+test, needs one: every profile is proved against the in-process fake IdP
+(`tests/helpers/fake_idp.py`), which signs with a real RSA key and serves
+discovery, JWKS, token and the userinfo leg VANguard alone calls. The live
+acceptance layer needs one by definition (§Testing, the **Live** bullet) —
+`tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
+`playwright.oidc.config.ts` refuses to start without `STAGING_BASE_URL`, and
+it drives a deployed stack, not a fixture. And `auth_provider=local` needs no
+registration at all. **[rev2.11 replaces
+"External dependencies", which read these as work owed to the project before
+it could proceed; that framing produced a ruling that had to be reversed, see
+§Rollout order step 1.]**
+
+The one thing a real client gates is **live verification against a running
+provider**. Unit and integration coverage runs entirely against the in-process
+fake IdP (§Testing) — it serves discovery, JWKS, token and userinfo and signs
+with its own key — so every profile, claim check, origin policy and refusal is
+provable with no account anywhere.
+
+| profile | who registers the client |
+|---------|--------------------------|
+| oidc (Cognito) | the deployment's own Terraform. In `upgrade` deployment mode `aws_cognito_user_pool_client` carries `generate_secret = true`, so Cognito mints the secret, Terraform reads it as an attribute into Secrets Manager, and the task receives it by ARN reference. There is no console step and no secret in this repository. A `first`-mode cold install creates no client and runs on `local`. |
+| entra | the tenant's own Entra administrator |
+| vanguard | the operating organisation, on the bridge's ABN-gated admin page, carrying ELSPETH's callback URL |
+| google | whoever owns the Workspace domain, as a Google Cloud OAuth client |
+
+Whatever issues it, a registration must carry the redirect URI
+`public_base_url` + `SSO_CALLBACK_PATH` (`/api/auth/sso/callback`), matched
+exactly, and must be confidential: the backend redeems the code, so a public
+client leaves the deployment unable to authenticate anyone (D2).

@@ -77,6 +77,7 @@ Tutorials and operator/developer how-to material.
 - [Web Composer in One Hour — training plan (draft)](guides/composer-training-one-hour.md)
 - [Test System](guides/test-system.md)
 - [Data Trust and Error Handling](guides/data-trust-and-error-handling.md)
+- [Identity Providers](guides/identity-providers.md)
 - [Telemetry Guide](guides/telemetry.md)
 - [Tier-2 Tracing](guides/tier2-tracing.md)
 - [Landscape MCP Analysis](guides/landscape-mcp-analysis.md)

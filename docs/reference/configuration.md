@@ -9,6 +9,7 @@ Complete reference for ELSPETH pipeline configuration.
 - [Configuration File Format](#configuration-file-format)
 - [Top-Level Settings](#top-level-settings)
 - [Web Plugin Policy](#web-plugin-policy)
+- [Identity and Single Sign-On](#identity-and-single-sign-on)
 - [Secrets Settings](#secrets-settings)
 - [Source Settings](#source-settings)
 - [Queue Settings](#queue-settings)
@@ -258,6 +259,283 @@ audit data retain the authored alias form. CLI and batch configuration remain
 explicit and unrestricted by web policy: `instantiate_plugins_from_config()`
 and `make_sink_factory()` consume normal pipeline settings without `WebSettings`
 or a web availability snapshot.
+
+---
+
+## Identity and Single Sign-On
+
+The web service authenticates browsers against either its own local user store
+or exactly one external identity provider. `auth_provider` selects which, and
+every other setting in this section is that choice's configuration for this
+container. The build carries no credentials and the profile carries no
+deployment facts, so registering a client with an identity provider is a
+deployment-time action taken by whoever runs ELSPETH, against their own tenant
+or user pool. Moving a container from one provider to another is a
+configuration change and a restart, never a rebuild.
+
+The backend is a **confidential client**: it redeems the authorization code
+server-side. The browser never holds `sso_client_secret` and never performs the
+token exchange, so the implicit flow must not be enabled on the client you
+register.
+
+These are web-service settings, set as `ELSPETH_WEB__*` environment variables
+(`ELSPETH_WEB__AUTH_PROVIDER`, `ELSPETH_WEB__SSO_CLIENT_ID`, and so on), not in
+the pipeline `settings.yaml`. Collection values are JSON arrays, as elsewhere in
+[Environment configuration](#environment-configuration). An unrecognized
+`ELSPETH_WEB__` name is refused at startup rather than ignored, so a deployment
+still exporting a setting that has since been removed — the retired `oidc_*`
+browser-client settings, for instance — does not boot.
+
+[Identity Providers](../guides/identity-providers.md) walks through registering
+a client with each provider and pointing a container at it. This section is the
+per-setting reference.
+
+### A partial identity configuration does not start
+
+Every rule below is enforced when `WebSettings` is constructed, which happens
+before the application is assembled. A deployment that omits a required setting,
+or carries one belonging to a different provider, raises a configuration error
+and the process exits.
+
+This is not a degraded mode. There is no container to probe, no
+`/api/system/status` to read, and nothing for
+[readiness](#readiness-and-audit-evidence) to report, because readiness never
+runs. An orchestrator sees a task that fails to start, not an unhealthy task.
+Read the startup error, not the health check.
+
+### Providers
+
+`auth_provider` names one profile. Each profile declares what it additionally
+requires, what it additionally accepts, and — by subtraction — what it refuses.
+
+| `auth_provider` | Identity source | Additionally required | Additionally optional | Refused |
+|-----------------|-----------------|-----------------------|-----------------------|---------|
+| `local` | ELSPETH's own user store; no external provider | - | - | `entra_tenant_id` |
+| `entra` | Microsoft Entra ID; issuer derived from the tenant | `entra_tenant_id` | - | `google_hosted_domain`, `sso_endpoint_origins`, `sso_issuer` |
+| `google` | Google Workspace; issuer fixed at `https://accounts.google.com` | `google_hosted_domain` | - | `entra_tenant_id`, `sso_endpoint_origins`, `sso_issuer` |
+| `oidc` | Generic OIDC provider, including AWS Cognito | `sso_issuer` | `sso_endpoint_origins` | `entra_tenant_id`, `google_hosted_domain` |
+| `vanguard` | VANguard; issuer supplied by the operator | `sso_issuer` | - | `entra_tenant_id`, `google_hosted_domain`, `sso_endpoint_origins` |
+
+Any value outside this list is rejected by the schema before any of these rules
+run: `auth_provider: Input should be 'local', 'oidc', 'entra', 'vanguard' or
+'google'`.
+
+Three properties of this table are worth stating explicitly, because each one
+surprises operators:
+
+**Required means required for the provider you selected.** Every non-`local`
+provider also requires the common confidential-client set — `sso_client_id`,
+`sso_client_secret`, `sso_transaction_secret`, `public_base_url`,
+`compartment_id`, `quota_default_tokens_per_day` and
+`quota_default_storage_bytes` — on top of the profile-specific column above. A
+missing member of either set is named individually:
+
+```
+auth_provider='oidc' requires: sso_issuer
+```
+
+**A setting belonging to another provider is refused by name, not ignored.**
+Configuring `entra_tenant_id` under `oidc` is a startup failure, not a
+harmlessly unused variable:
+
+```
+auth_provider='oidc' does not use: entra_tenant_id, google_hosted_domain
+(configuring a setting for a different IdP is silently ignored otherwise)
+```
+
+The refused column is *derived* — each profile subtracts the settings it uses
+from the set of all provider-specific settings — so it cannot drift out of step
+with the profiles the way a hand-maintained list would. This is also why
+`sso_endpoint_origins` is refused everywhere except `oidc`: only the generic
+profile declares it.
+
+**Under `auth_provider=local` the refusal is narrow.** Only `entra_tenant_id`
+is checked (`Local auth does not use entra_tenant_id`). A leftover
+`ELSPETH_WEB__SSO_CLIENT_ID` or `ELSPETH_WEB__SSO_ISSUER` in a local deployment
+is accepted and does nothing. Do not read a clean local startup as evidence
+that an SSO configuration is correct — it is only evidence that it was never
+consulted.
+
+### Provider selection and local authentication
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `auth_provider` | string | No | `"local"` | `local`, `entra`, `google`, `oidc`, or `vanguard`. Selects the profile that decides every other rule in this section |
+| `registration_mode` | string | No | `"open"` | `open`, `email_verified`, or `closed`. Governs **local** self-registration only. Under any identity provider it is accepted and inert: an SSO first login is always pending an administrator regardless of this value |
+| `dev_admin_user` | string | `local` only | - | Names the one local-auth user granted the in-app user-management surface (`/api/auth/admin/users`). Unset removes that surface entirely. Setting it under any identity provider refuses at load: `dev_admin_user requires auth_provider=local; IdP deployments must not carry it`. A blank value is refused too |
+
+`registration_mode: email_verified` on a non-local host (anything other than
+`127.0.0.1`, `localhost` or `::1`) additionally requires a publicly reachable
+`public_base_url`, so that verification links are never derived from a request
+`Host` header.
+
+### Confidential client (required by every identity provider)
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_client_id` | string | Yes (every IdP) | - | The client identifier issued when you registered ELSPETH with your provider |
+| `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser. Supply by reference from a secret store, never as an environment literal |
+| `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
+| `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
+| `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Validated non-blank; no runtime path reads it in this release |
+| `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
+| `quota_default_storage_bytes` | int | Yes (every IdP) | - | Blob storage allowance written into the same row. Must be greater than 0 |
+
+The two quota defaults are required rather than defaulted because an activated
+identity spends the container's shared LLM credential: without a policy row
+there is no ceiling to enforce. An administrator may override either number per
+identity afterwards.
+
+A blank value is never treated as a value. `sso_client_id`, `sso_issuer`,
+`entra_tenant_id`, `google_hosted_domain`, `compartment_id` and the four
+endpoint overrides are rejected outright with `must not be blank (omit the
+field or set to a non-empty value)`. A blank secret is reported as the missing
+required setting it is, and a blank `public_base_url` as `public_base_url must
+not be empty`. This matters more than it
+looks: an empty environment variable in a task definition
+(`ELSPETH_WEB__SSO_ISSUER=`) would otherwise satisfy every "is it set?" check
+on the way to a deployment that cannot complete a login.
+
+### Provider-specific settings
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_issuer` | string | Yes (`oidc`, `vanguard`) | - | The issuer URL tokens must claim to come from, and the origin discovery runs against. Refused under `entra` (derived from the tenant) and `google` (fixed) so two sources of truth cannot disagree |
+| `entra_tenant_id` | string | Yes (`entra`) | - | The Entra tenant this deployment accepts. The profile derives the issuer from it and checks the tenant claim on every token |
+| `google_hosted_domain` | string | Yes (`google`) | - | The Workspace domain this deployment accepts. Required rather than defaulted: without it, any Google account in the world would be a valid login |
+| `sso_endpoint_origins` | JSON array of strings | No (`oidc` only) | `[]` | HTTPS origins the discovered endpoints may use **in addition to** the issuer origin. Exists for AWS Cognito, whose hosted login domain is a different origin from the user-pool issuer, so a same-origin rule would refuse a correct deployment. Each entry must be a bare origin with no path, query, or fragment |
+
+`sso_endpoint_origins` entries are parsed where they are used, not where they
+are declared. A malformed entry fails with `expected origin failed HTTPS check`,
+`failed bare-origin check`, or `failed nonblank check` — at settings load if the
+break-glass overrides below are also configured, and otherwise at startup when
+discovery runs. Either way the process does not serve traffic, but only the
+first of those two is a settings-load failure.
+
+### The redirect URI
+
+The redirect URI ELSPETH presents is `public_base_url` plus the fixed callback
+path `/api/auth/sso/callback`. It is not configurable. For
+`public_base_url: https://elspeth.example.org` the value to register with the
+provider is:
+
+```
+https://elspeth.example.org/api/auth/sso/callback
+```
+
+Providers match redirect URIs exactly, so a mismatched scheme, host, port, or
+trailing slash is rejected by the provider at login time rather than by ELSPETH
+at startup. Every profile requests the scopes `openid profile email` and pins
+`RS256` for ID token signatures; the validator never reads the algorithm from
+the token header.
+
+### Break-glass endpoint overrides
+
+Normal operation is discovery: ELSPETH fetches the provider's discovery
+document and validates the endpoints it names against the profile's origin
+policy. The four overrides below exist for the case where that document is
+wrong or unreachable. They skip **discovery**, and with it two things that
+only discovery does — see below — but not endpoint validation: whatever you
+supply is still held to the same origin policy, and an endpoint outside it is
+refused with `authorization_endpoint failed expected-origin check`.
+
+Discovery is a hard dependency at startup. When it is not overridden and the
+provider cannot be reached, the process exits with `FATAL: SSO discovery
+failed`.
+
+**What skipping discovery costs, and why these are not for permanent use.**
+The exact-issuer check lives inside the discovery path: it is the comparison
+that produces `discovery document failed the exact issuer check`. With the
+trio configured, the provider's document is never fetched, so that check never
+runs, and the origin policy is the only remaining tie between the configured
+issuer and the endpoints in use. Second, `sso_jwks_uri` becomes a fixed
+address rather than one the provider publishes, so a provider that relocates
+its JWKS endpoint breaks every login until the setting is edited by hand. ID
+token validation is unaffected — issuer, audience, expiry and nonce are
+checked on every token regardless.
+
+Set them to survive a broken or unreachable document, then remove them. A
+deployment that carries them permanently has traded a startup dependency it
+can observe for two guarantees it no longer has, which is a worse trade than
+the boot failure it avoids.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_authorization_endpoint` | string | No, all-or-none | - | Authorization endpoint, bypassing discovery |
+| `sso_token_endpoint` | string | No, all-or-none | - | Token endpoint |
+| `sso_jwks_uri` | string | No, all-or-none | - | JWKS URI |
+| `sso_userinfo_endpoint` | string | No | - | Userinfo endpoint. Optional on top of the other three; only the `vanguard` profile calls userinfo during login |
+
+The first three are all-or-none. A partial override would silently mix
+operator-supplied and discovered endpoints, leaving which policy applied to
+which URL dependent on which variables happened to be set, so the mixture is
+refused:
+
+```
+sso endpoint overrides are all-or-none; missing: sso_jwks_uri, sso_token_endpoint
+```
+
+`sso_userinfo_endpoint` is not part of that trio, but it is not an override on
+its own either — with no endpoints to pair it with there is nothing for it to
+bypass discovery *for*:
+
+```
+sso_userinfo_endpoint requires the other sso endpoint overrides:
+sso_authorization_endpoint, sso_token_endpoint, sso_jwks_uri
+```
+
+The overrides apply to every profile. Each is validated against the origin
+policy of the profile in use — the issuer's origin for `oidc` and `vanguard`,
+`https://login.microsoftonline.com` for `entra`, and Google's four published
+origins for `google` — so a profile that derives its issuer rather than
+stating it can still break the glass.
+
+### Bootstrap, quotas, and identity lifecycle
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `sso_admin_subjects` | JSON array of strings | No | `[]` | Provider `sub` claims that may seed the first `admin` role at first login, and **only** while the container has zero active human admins. The gate is a live count re-evaluated at every login, not a record that a bootstrap has happened, so the list **re-arms** if the container ever returns to zero active human admins. Delete it once the first administrator is activated. Entries are matched exactly and are not validated at load |
+| `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `identity_dormancy_days` | int | No | `90` | Intended dormancy window for an activated identity. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
+
+An SSO first login lands **pending** and is activated by an administrator. The
+provider verified who the person is; it did not decide whether this container
+admits them. `sso_admin_subjects` is the one exception, and only for the first
+administrator — a later listed subject logging into a container that already
+has an active human admin follows the ordinary pending path.
+
+That exception is scoped to the count, not to time: should the container fall
+back to zero active human admins, a listed subject seeds themselves again on
+their next login. Remove the setting once the first administrator exists.
+
+`elspeth composer users bootstrap-admin` does the same job from the operator's
+side and leaves no standing entry in the configuration, which makes it the
+better of the two. It is not, however, a general recovery path: it calls the
+same guarded method, so it is refused under the identical condition, and it
+recovers only the zero-admin case — the same case in which the seed re-arms. A
+deployment whose administrator row is active but whose administrator can no
+longer authenticate is recoverable by neither, and needs direct work against
+the sessions store. Keep more than one administrator activated.
+
+### JWKS cache tuning
+
+Applies to every identity provider. Defaults match the provider defaults and
+most deployments should leave them alone.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `jwks_cache_ttl_seconds` | int | No | `3600` | How long a successfully fetched key set is served before refresh. Minimum 1 |
+| `jwks_failure_retry_seconds` | int | No | `300` | How long a failed fetch is throttled before the next attempt. Minimum 10 |
+| `jwks_max_stale_seconds` | int | No | `86400` | Absolute authority of a cached key set, measured from the last successful, fully validated fetch. Failure retries never renew it. Minimum 1 |
+
+Raising `jwks_failure_retry_seconds` lengthens the window in which stale keys
+are served, which is safer during a brief provider outage. Lowering it shrinks
+the blast radius of a sustained one. Its floor is 10 rather than 1 because the
+throttle exists so that during an outage the first caller absorbs the HTTP
+timeout and the rest short-circuit; a one-second window would let concurrent
+logins re-hit the dead provider almost immediately.
 
 ---
 
