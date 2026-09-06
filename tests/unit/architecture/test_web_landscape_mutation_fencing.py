@@ -21,7 +21,7 @@ import hashlib
 import re
 import textwrap
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -505,6 +505,15 @@ def _symbol(node: ast.AST) -> str:
     return ".".join(reversed(names)) or "<module>"
 
 
+def _ancestors(node: ast.AST) -> Iterator[ast.AST]:
+    """Yield the enclosing nodes of ``node``, nearest first, up to the module."""
+
+    current = getattr(node, "_landscape_parent", None)
+    while current is not None:
+        yield current
+        current = getattr(current, "_landscape_parent", None)
+
+
 def _parse_source(path: str, source: str) -> SourceUnit:
     try:
         tree = ast.parse(source, filename=path)
@@ -745,6 +754,30 @@ class _Resolver:
             scope = _lexical_scope(parent) if parent is not None else None
         return None
 
+    def iteration_source(self, name: str, use: ast.AST) -> tuple[ast.expr, ast.expr] | None:
+        """Return ``(target, iterable)`` of the loop or comprehension binding ``name`` around ``use``.
+
+        A loop variable has no assignment to resolve; its value is one element
+        of the iterable.  Only a loop whose BODY encloses ``use`` binds it —
+        a use inside the iterable expression itself is evaluated before the
+        target exists.
+        """
+
+        ancestors: list[ast.AST] = []
+        for current in _ancestors(use):
+            if isinstance(current, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                break
+            ancestors.append(current)
+        lineage = {id(use), *(id(node) for node in ancestors)}
+        for node in ancestors:
+            if isinstance(node, (ast.For, ast.AsyncFor)) and id(node.iter) not in lineage and name in self._target_names(node.target):
+                return node.target, node.iter
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+                for generator in node.generators:
+                    if id(generator.iter) not in lineage and name in self._target_names(generator.target):
+                        return generator.target, generator.iter
+        return None
+
     def is_local(self, name: str, use: ast.AST) -> bool:
         scope = _lexical_scope(use)
         return not isinstance(scope, ast.Module) and name in self.local_names.get(id(scope), set())
@@ -845,14 +878,19 @@ class _Resolver:
             return self.resolve_callable(selected, use=node, seen=seen)
         return node
 
-    def resolve_statement(self, node: ast.expr, *, use: ast.AST, seen: frozenset[str] = frozenset()) -> ast.expr | None:
+    def resolve_statement(self, node: ast.expr, *, use: ast.AST, seen: frozenset[int] = frozenset()) -> ast.expr | None:
         if isinstance(node, ast.Name):
-            if node.id in seen:
-                return None
             binding = self.binding(node.id, use)
-            if binding is None:
+            # The cycle guard keys on the BINDING SITE, not on the name.
+            # ``query = select(...)`` followed by ``query = query.where(...)``
+            # re-binds one name to a refinement of its own earlier value; a
+            # name-keyed guard reads that as a cycle and abandons the walk at
+            # the ``.where(...)`` link, so a conditionally refined SELECT never
+            # resolves to its ``select(...)`` root.  Binding-site identity keeps
+            # a genuine ``a = b`` / ``b = a`` cycle terminating.
+            if binding is None or id(binding) in seen:
                 return None
-            return self.resolve_statement(binding, use=binding, seen=seen | {node.id})
+            return self.resolve_statement(binding, use=binding, seen=seen | {id(binding)})
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             # SQLAlchemy statement chaining: update(...).where(...).values(...)
             return self.resolve_statement(node.func.value, use=node, seen=seen) or node
@@ -940,15 +978,27 @@ _RAW_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# PRAGMA <name> with no ``=`` reads the setting back.  ``foreign_keys``,
+# ``journal_mode`` and ``user_version`` are read in this form by
+# ``verify_sqlite_tier1_pragmas``, ``_sqlite_epoch_is_incompatible`` and
+# ``_get_sqlite_schema_epoch``; ``_verify_sqlite_pragmas`` reads every name in
+# ``_SQLITE_PRAGMA_INVARIANTS_*`` (``busy_timeout``, ``synchronous`` included)
+# through one interpolated statement.  The assignment form is a separate
+# decision (see ``_raw_sql_is_connection_configuration``).
 _RAW_READ_PRAGMAS = frozenset(
     {
+        "busy_timeout",
         "compile_options",
         "database_list",
         "foreign_key_list",
+        "foreign_keys",
         "index_info",
         "index_list",
+        "journal_mode",
+        "synchronous",
         "table_info",
         "table_xinfo",
+        "user_version",
     }
 )
 
@@ -1018,6 +1068,58 @@ def _raw_sql_is_transaction_control(value: str) -> bool:
     return value.lstrip().lower().startswith(("begin", "commit", "rollback", "savepoint", "release"))
 
 
+# PRAGMAs that configure a CONNECTION rather than write Landscape data, each
+# admitted because a measured production site issues it: query_only,
+# journal_mode, synchronous, foreign_keys and busy_timeout come from
+# ``LandscapeDB._configure_sqlite`` / ``read_only_connection``; ``key`` is the
+# SQLCipher passphrase in ``_create_sqlcipher_engine``.  ``user_version`` is
+# NOT here: it stamps the schema epoch, which is a DDL write and stays
+# reported.
+_RAW_CONNECTION_CONFIGURATION_PRAGMAS = frozenset(
+    {
+        "busy_timeout",
+        "foreign_keys",
+        "journal_mode",
+        "key",
+        "query_only",
+        "synchronous",
+    }
+)
+_RAW_PRAGMA_ASSIGNMENT_RE = re.compile(r"^pragma\s+(?:[a-z_][a-z0-9_]*\.)?(?P<name>[a-z_][a-z0-9_]*)\s*=")
+# ``PRAGMA user_version = N`` stamps the schema epoch: a schema-creation write
+# that precedes any token (ADR-048 §8).  It is reported under its own label so
+# the residue reads as the DDL obligation it is, never as a row write.
+_SCHEMA_STAMP_PRAGMAS = frozenset({"user_version"})
+
+
+def _raw_sql_write_detail(value: str) -> str:
+    """Name the write class of a raw statement already known to be a write."""
+
+    shape = _raw_dml_shape_from_text(value)
+    if shape is not None:
+        return f"{shape[1]} {shape[0]}"
+    match = _RAW_PRAGMA_ASSIGNMENT_RE.match(_normalized_raw_sql(value).strip().lower())
+    if match is not None and match.group("name") in _SCHEMA_STAMP_PRAGMAS:
+        return f"DDL schema-stamp (PRAGMA {match.group('name')})"
+    return "write/DDL"
+
+
+def _raw_sql_is_connection_configuration(value: str) -> bool:
+    """True for statements that configure the connection, not Landscape rows."""
+
+    normalized = _normalized_raw_sql(value).rstrip(";").strip().lower()
+    if normalized.startswith(("set transaction", "set session characteristics")):
+        return True
+    match = _RAW_PRAGMA_ASSIGNMENT_RE.match(normalized)
+    return match is not None and match.group("name") in _RAW_CONNECTION_CONFIGURATION_PRAGMAS
+
+
+def _raw_sql_is_single_configuration_statement(value: str) -> bool:
+    """True for exactly one connection-configuration statement (no ``;`` to hide a second)."""
+
+    return ";" not in value and _raw_sql_is_connection_configuration(value)
+
+
 def _raw_sql_is_write(value: str) -> bool:
     normalized = _normalized_raw_sql(value)
     return _RAW_WRITE_RE.search(normalized) is not None or (normalized.lower().startswith("pragma") and "=" in normalized)
@@ -1036,16 +1138,164 @@ def _raw_sql_literal(call: ast.Call, resolver: _Resolver) -> str | None:
     return _constant_string_value(call.args[0], resolver, use=call)
 
 
-def _raw_dml_shape(call: ast.Call, resolver: _Resolver) -> tuple[str, str] | None:
-    value = _raw_sql_literal(call, resolver)
-    if value is None:
+def _raw_sql_text_payload(node: ast.expr, resolver: _Resolver) -> ast.expr | None:
+    """Unwrap ``text("…")`` so its payload can be classified at the executor."""
+
+    if isinstance(node, ast.Call) and node.args and _resolved_callable_name(node.func, resolver, use=node) == "text":
+        return node.args[0]
+    return None
+
+
+def _constant_string_candidates(
+    node: ast.expr,
+    resolver: _Resolver,
+    *,
+    use: ast.AST,
+    seen: frozenset[int] = frozenset(),
+) -> frozenset[str] | None:
+    """Return every string ``node`` can evaluate to, or ``None`` when that set is not finite and static.
+
+    Beyond a plain constant, the only admitted shape is a loop variable drawn
+    from a literal tuple/list (optionally chosen by a conditional expression)
+    whose elements are constants or tuples of constants — the
+    ``for pragma, expected in _SQLITE_PRAGMA_INVARIANTS_*`` form.  A parameter,
+    an attribute, or a call returns ``None``: nothing is ever inferred from a
+    name alone.
+    """
+
+    if id(node) in seen:
         return None
+    next_seen = seen | {id(node)}
+    direct = _constant_string_value(node, resolver, use=use)
+    if direct is not None:
+        return frozenset({direct})
+    if isinstance(node, ast.IfExp):
+        branches = [_constant_string_candidates(branch, resolver, use=node, seen=next_seen) for branch in (node.body, node.orelse)]
+        return None if any(branch is None for branch in branches) else frozenset().union(*(branch or () for branch in branches))
+    if not isinstance(node, ast.Name):
+        return None
+    if resolver.parameter(node.id, use) is not None:
+        return None
+    binding = resolver.binding(node.id, use)
+    if binding is not None:
+        return _constant_string_candidates(binding, resolver, use=binding, seen=next_seen)
+    source = resolver.iteration_source(node.id, use)
+    if source is None:
+        return None
+    target, iterable = source
+    containers = _literal_container_candidates(iterable, resolver, use=use, seen=next_seen)
+    if containers is None:
+        return None
+    position: int | None = None
+    if isinstance(target, (ast.Tuple, ast.List)):
+        slots = [element.id if isinstance(element, ast.Name) else None for element in target.elts]
+        if node.id not in slots:
+            return None
+        position = slots.index(node.id)
+    candidates: set[str] = set()
+    for container in containers:
+        for element in container.elts:
+            member = element
+            if position is not None:
+                if not isinstance(element, (ast.Tuple, ast.List)) or position >= len(element.elts):
+                    return None
+                member = element.elts[position]
+            values = _constant_string_candidates(member, resolver, use=member, seen=next_seen)
+            if values is None:
+                return None
+            candidates.update(values)
+    return frozenset(candidates)
+
+
+def _literal_container_candidates(
+    node: ast.expr,
+    resolver: _Resolver,
+    *,
+    use: ast.AST,
+    seen: frozenset[int],
+) -> tuple[ast.Tuple | ast.List, ...] | None:
+    """Resolve an iterable expression to the literal tuples/lists it can be."""
+
+    if id(node) in seen:
+        return None
+    next_seen = seen | {id(node)}
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return (node,)
+    if isinstance(node, ast.IfExp):
+        branches = [_literal_container_candidates(branch, resolver, use=node, seen=next_seen) for branch in (node.body, node.orelse)]
+        return None if any(branch is None for branch in branches) else tuple(item for branch in branches for item in (branch or ()))
+    if isinstance(node, ast.Name) and resolver.parameter(node.id, use) is None:
+        binding = resolver.binding(node.id, use)
+        if binding is not None:
+            return _literal_container_candidates(binding, resolver, use=binding, seen=next_seen)
+    return None
+
+
+def _raw_sql_exact_texts(node: ast.expr, resolver: _Resolver, *, use: ast.AST) -> frozenset[str] | None:
+    """Return every SQL text the statement can carry, when each is statically known in full.
+
+    An f-string qualifies only when every interpolation has a finite constant
+    candidate set (a DBAPI placeholder, a constant, or a loop variable over a
+    literal table); anything else returns ``None`` so an accept decision can
+    never be made on text the scanner has not seen in full.
+    """
+
+    payload = _raw_sql_text_payload(node, resolver)
+    if payload is not None:
+        return _raw_sql_exact_texts(payload, resolver, use=node)
+    direct = _constant_string_value(node, resolver, use=use)
+    if direct is not None:
+        return frozenset({direct})
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    texts: frozenset[str] = frozenset({""})
+    for part in node.values:
+        if isinstance(part, ast.Constant) and isinstance(part.value, str):
+            texts = frozenset(prefix + part.value for prefix in texts)
+            continue
+        if not isinstance(part, ast.FormattedValue) or part.format_spec is not None:
+            return None
+        interpolated = _constant_string_candidates(part.value, resolver, use=node)
+        if interpolated is None:
+            return None
+        texts = frozenset(prefix + value for prefix in texts for value in interpolated)
+    return texts
+
+
+def _raw_sql_constant_skeleton(node: ast.expr, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    """Return the constant text of a statement, interpolations dropped.
+
+    Only ever used to PROVE a write: dropping an interpolation cannot invent a
+    write keyword, so a skeleton that matches one is a write whatever the
+    interpolation carries.  It is never used to prove a read.
+    """
+
+    if _raw_sql_text_payload(node, resolver) is not None:
+        # A ``text()`` payload is already classified by ``_raw_dml_shape`` at
+        # the wrapper node itself; classifying it again here would report one
+        # statement twice.
+        return None
+    direct = _constant_string_value(node, resolver, use=use)
+    if direct is not None:
+        return direct
+    if not isinstance(node, ast.JoinedStr):
+        return None
+    parts = [part.value for part in node.values if isinstance(part, ast.Constant) and isinstance(part.value, str)]
+    return " ".join(parts) if parts else None
+
+
+def _raw_dml_shape_from_text(value: str) -> tuple[str, str] | None:
     match = _RAW_DML_RE.search(_normalized_raw_sql(value))
     if match is None:
         return None
     raw_operation = match.group("operation").lower()
     operation = "insert" if raw_operation.startswith("insert") else "delete" if raw_operation.startswith("delete") else "update"
     return match.group("table").lower(), f"raw-{operation}"
+
+
+def _raw_dml_shape(call: ast.Call, resolver: _Resolver) -> tuple[str, str] | None:
+    value = _raw_sql_literal(call, resolver)
+    return None if value is None else _raw_dml_shape_from_text(value)
 
 
 def _execution_callback(
@@ -2268,18 +2518,18 @@ def _statement_contains_dml(
     resolver: _Resolver,
     *,
     use: ast.AST,
-    seen: frozenset[str] = frozenset(),
+    seen: frozenset[int] = frozenset(),
 ) -> bool:
     if isinstance(statement, ast.Name):
-        if statement.id in seen:
-            return True
         binding = resolver.binding(statement.id, use)
-        return binding is not None and _statement_contains_dml(
-            binding,
-            resolver,
-            use=binding,
-            seen=seen | {statement.id},
-        )
+        if binding is None:
+            return False
+        # Keyed on the BINDING SITE, not the name: ``query = query.where(...)``
+        # refines one name from its own earlier value and is not a cycle.  A
+        # genuine revisit of the same binding still answers True (fail closed).
+        if id(binding) in seen:
+            return True
+        return _statement_contains_dml(binding, resolver, use=binding, seen=seen | {id(binding)})
     if isinstance(statement, ast.Call) and (_dml_shape(statement, resolver) is not None or _raw_dml_shape(statement, resolver) is not None):
         return True
     return any(
@@ -2344,7 +2594,98 @@ def _is_proven_read(statement: ast.expr, resolver: _Resolver, *, use: ast.AST) -
     if name == "text" and resolved.args:
         value = resolved.args[0]
         return isinstance(value, ast.Constant) and isinstance(value.value, str) and _raw_sql_is_proven_read(value.value)
-    return False
+    # A compound select is admitted by RESOLVED ORIGIN: SQLAlchemy's
+    # ``union``/``intersect``/``except_`` only compose selectables, so the
+    # construction cannot carry a write, but a project callable of the same
+    # spelling proves nothing.
+    qualified = resolver.qualified_name(resolver.resolve_callable(resolved.func, use=resolved), use=resolved)
+    return qualified in _SQLALCHEMY_COMPOUND_READ_ORIGINS
+
+
+_SQLALCHEMY_COMPOUND_READ_ORIGINS = frozenset(
+    {
+        f"{module}.{operation}"
+        for module in ("sqlalchemy", "sqlalchemy.sql", "sqlalchemy.sql.expression")
+        for operation in ("union", "union_all", "intersect", "intersect_all", "except_", "except_all")
+    }
+)
+
+
+def _helper_return_class(statement: ast.Call, resolver: _Resolver, unit: SourceUnit, *, use: ast.AST) -> str | None:
+    """Classify a statement built by a helper defined in the same unit.
+
+    Returns ``"dml"`` when every ``return`` of the helper is a SQLAlchemy DML
+    construction, ``"read"`` when every one is a proven read, and ``None``
+    otherwise — a helper mixing the two, returning ``None``, or defined in
+    another module is not classified on the strength of its name.
+    """
+
+    function = _same_unit_helper(statement.func, resolver, unit, use=use)
+    if function is None:
+        return None
+    classes: set[str | None] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Return):
+            continue
+        if _lexical_scope(node) is not function:
+            continue
+        value = node.value
+        if value is None:
+            return None
+        resolved = resolver.resolve_statement(value, use=node)
+        if isinstance(resolved, ast.Call) and (
+            _dml_shape(resolved, resolver) is not None or _dml_operation_without_table(resolved, resolver, use=node) is not None
+        ):
+            classes.add("dml")
+        elif _is_proven_read(value, resolver, use=node):
+            classes.add("read")
+        else:
+            return None
+    return next(iter(classes)) if len(classes) == 1 else None
+
+
+def _same_unit_helper(
+    func: ast.expr, resolver: _Resolver, unit: SourceUnit, *, use: ast.AST
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    index = _function_index_for_units((unit,))
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in {"self", "cls"}:
+        owner = next((node for node in _ancestors(use) if isinstance(node, ast.ClassDef)), None)
+        if owner is None:
+            return None
+        return index.get((unit.path, f"{_symbol(owner)}.{func.attr}"))
+    if isinstance(func, ast.Name) and resolver.parameter(func.id, use) is None and not resolver.is_local(func.id, use):
+        qualified = resolver.qualified_name(func, use=use)
+        if qualified is None or _module_path_from_qualified(qualified) != unit.path:
+            return None
+        return index.get((unit.path, func.id))
+    return None
+
+
+_SQLALCHEMY_CORE_DML_ORIGINS = frozenset(
+    {
+        f"{module}.{operation}"
+        for module in ("sqlalchemy", "sqlalchemy.sql", "sqlalchemy.sql.expression")
+        for operation in ("insert", "update", "delete")
+    }
+)
+
+
+def _dml_operation_without_table(statement: ast.Call, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    """Return the verb of a DML construction whose table cannot be named.
+
+    Admission is by RESOLVED ORIGIN — a SQLAlchemy core or dialect DML
+    constructor — so a same-spelled project callable is never relabelled as
+    DML on the strength of its spelling.
+    """
+
+    callable_node = resolver.resolve_callable(statement.func, use=statement)
+    qualified = resolver.qualified_name(callable_node, use=use)
+    if qualified is None:
+        return None
+    if qualified in _SQLALCHEMY_CORE_DML_ORIGINS:
+        return qualified.rsplit(".", maxsplit=1)[-1]
+    match = _DIALECT_DML_ORIGIN.match(qualified)
+    return None if match is None else match.group("operation")
 
 
 def _unknown_or_raw_execution_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
@@ -2392,23 +2733,93 @@ def _unknown_or_raw_execution_violations(units: Iterable[SourceUnit]) -> tuple[s
             name = _resolved_callable_name(node.func, resolver, use=node)
             if name not in {"execute", "execute_insert", "execute_update", "exec_driver_sql"} or not node.args:
                 continue
+            statement = node.args[0]
+            # A ``text()`` payload with a raw DML shape was already reported
+            # at the ``text()`` node by the ``_raw_dml_shape`` branch above;
+            # reporting it again here would count one statement twice.
+            if isinstance(statement, ast.Call) and _raw_dml_shape(statement, resolver) is not None:
+                continue
+            # A literal handed straight to a DBAPI cursor or driver never
+            # reaches ``_raw_dml_shape`` (that only reads ``text()`` and
+            # ``exec_driver_sql()`` callables), so classify the SQL here.  The
+            # WRITE decision uses the constant skeleton — dropping an
+            # interpolation cannot invent a write keyword — while every ACCEPT
+            # decision demands the exact text.
+            skeleton = _raw_sql_constant_skeleton(statement, resolver, use=node)
+            exact = _raw_sql_exact_texts(statement, resolver, use=node)
+            # A DBAPI ``execute`` runs ONE statement, so a configuration PRAGMA
+            # whose text carries no ``;`` cannot also carry a row write.
+            configuration = skeleton is not None and _raw_sql_is_single_configuration_statement(skeleton)
+            # The WRITE decision reads every exact candidate, else the skeleton;
+            # among several write candidates the most specific label wins.
+            written = sorted(
+                {
+                    _raw_sql_write_detail(text)
+                    for text in (exact or ())
+                    if _raw_sql_is_write(text) and not _raw_sql_is_single_configuration_statement(text)
+                },
+                key=lambda detail: (detail == "write/DDL", detail),
+            )
+            if not written and exact is None and skeleton is not None and _raw_sql_is_write(skeleton) and not configuration:
+                written = [_raw_sql_write_detail(skeleton)]
+            if written:
+                violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} raw SQL {written[0]} is forbidden")
+                continue
+            if configuration:
+                continue
+            if exact is not None and all(
+                _raw_sql_is_proven_read(text) or _raw_sql_is_transaction_control(text) or _raw_sql_is_single_configuration_statement(text)
+                for text in exact
+            ):
+                continue
             if name == "exec_driver_sql":
-                value = node.args[0]
-                if (
-                    isinstance(value, ast.Constant)
-                    and isinstance(value.value, str)
-                    and (_raw_sql_is_proven_read(value.value) or _raw_sql_is_transaction_control(value.value))
-                ):
-                    continue
                 violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} unknown exec_driver_sql effect")
                 continue
-            resolved = resolver.resolve_statement(node.args[0], use=node)
+            resolved = resolver.resolve_statement(statement, use=node)
             if isinstance(resolved, ast.Call) and _dml_shape(resolved, resolver) is not None:
                 continue
-            if _is_proven_read(node.args[0], resolver, use=node):
+            if _is_proven_read(statement, resolver, use=node):
+                continue
+            # A statement built by a same-unit helper is classified by the
+            # helper's ``return`` expressions: its DML constructions are
+            # inventoried where they are written and its call edge is a
+            # subordinate edge of the fencing gate, so the execute site is
+            # admitted exactly as a direct construction would be.
+            if isinstance(resolved, ast.Call) and _helper_return_class(resolved, resolver, unit, use=node) is not None:
+                continue
+            # Reclassify, never suppress: a site whose class IS provable is
+            # reported by its class so the residue reads as a real fencing
+            # obligation rather than scanner noise.
+            operation = None if not isinstance(resolved, ast.Call) else _dml_operation_without_table(resolved, resolver, use=node)
+            if operation is not None:
+                table_expression = _dotted_name(resolved.args[0]) if isinstance(resolved, ast.Call) and resolved.args else None
+                subject = "an unresolved table" if table_expression is None else f"caller-supplied table {table_expression!r}"
+                violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} DML {operation} on {subject}")
+                continue
+            parameter = _relayed_statement_parameter(statement, resolver, use=node)
+            if parameter is not None:
+                violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} relays caller-supplied statement parameter {parameter!r}")
                 continue
             violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} unclassified .{name} statement")
     return tuple(violations)
+
+
+def _relayed_statement_parameter(statement: ast.expr, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    """Name the parameter a relayed statement arrives through, directly or as a loop element."""
+
+    if not isinstance(statement, ast.Name):
+        return None
+    parameter = resolver.parameter(statement.id, use)
+    if parameter is not None:
+        return parameter.arg
+    source = resolver.iteration_source(statement.id, use)
+    if source is None:
+        return None
+    _target, iterable = source
+    if isinstance(iterable, ast.Name):
+        iterated = resolver.parameter(iterable.id, use)
+        return None if iterated is None else iterated.arg
+    return None
 
 
 def _targets_landscape_schema(expression: ast.expr, resolver: _Resolver, *, use: ast.AST) -> bool:
@@ -4743,6 +5154,247 @@ def test_aliased_dml_imports_are_admitted_by_resolved_origin_not_by_spelling() -
     assert any("aliased DML import update as mutate" in item for item in _dml_callable_escape_violations([core_alias]))
 
 
+def test_execute_statement_classifier_reports_reads_raw_writes_and_caller_supplied_tables() -> None:
+    """P4-D8 defect 2: every ``.execute`` site is classified, never left unknown."""
+
+    refined_read = _parse_source(
+        "src/elspeth/core/landscape/refined_read.py",
+        "from sqlalchemy import select\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def read(conn, only_failed):\n"
+        "    query = select(runs_table)\n"
+        "    if only_failed:\n"
+        "        query = query.where(runs_table.c.status == 'failed')\n"
+        "    return conn.execute(query).fetchall()\n",
+    )
+    assert _unknown_or_raw_execution_violations([refined_read]) == ()
+
+    refined_write = _parse_source(
+        "src/elspeth/core/landscape/refined_write.py",
+        "from sqlalchemy import update\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def write(conn, guarded):\n"
+        "    statement = update(runs_table)\n"
+        "    if guarded:\n"
+        "        statement = statement.where(runs_table.c.status == 'running')\n"
+        "    conn.execute(statement.values(status='failed'))\n",
+    )
+    assert _unknown_or_raw_execution_violations([refined_write]) == ()
+
+    raw_cursor_delete = _parse_source(
+        "src/elspeth/core/landscape/outbox_drain.py",
+        "def drain(cursor, sequence):\n"
+        "    placeholder = '?'\n"
+        "    cursor.execute(f'DELETE FROM sidecar_journal_outbox WHERE sequence = {placeholder}', (sequence,))\n",
+    )
+    assert any(
+        "raw SQL raw-delete sidecar_journal_outbox is forbidden" in item
+        for item in _unknown_or_raw_execution_violations([raw_cursor_delete])
+    )
+
+    raw_cursor_read = _parse_source(
+        "src/elspeth/core/landscape/outbox_read.py",
+        "def read(cursor, owner):\n"
+        "    placeholder = '%s'\n"
+        "    cursor.execute(f'SELECT sequence FROM sidecar_journal_outbox WHERE journal_owner = {placeholder}', (owner,))\n"
+        "    cursor.execute('BEGIN IMMEDIATE')\n",
+    )
+    assert _unknown_or_raw_execution_violations([raw_cursor_read]) == ()
+
+    connection_configuration = _parse_source(
+        "src/elspeth/core/landscape/configure.py",
+        "from sqlalchemy import text\n"
+        "def configure(cursor, conn):\n"
+        "    cursor.execute('PRAGMA journal_mode=WAL')\n"
+        "    cursor.execute('PRAGMA foreign_keys=ON')\n"
+        "    conn.execute(text('SET TRANSACTION READ ONLY'))\n"
+        "    conn.execute(text('PRAGMA query_only = ON'))\n",
+    )
+    assert _unknown_or_raw_execution_violations([connection_configuration]) == ()
+
+    schema_epoch_stamp = _parse_source(
+        "src/elspeth/core/landscape/epoch.py",
+        "def stamp(conn, epoch):\n    conn.exec_driver_sql(f'PRAGMA user_version = {int(epoch)}')\n",
+    )
+    assert any(
+        "raw SQL DDL schema-stamp (PRAGMA user_version) is forbidden" in item
+        for item in _unknown_or_raw_execution_violations([schema_epoch_stamp])
+    )
+
+    epoch_read = _parse_source(
+        "src/elspeth/core/landscape/epoch_read.py",
+        "def read(conn):\n    return conn.exec_driver_sql('PRAGMA user_version').scalar_one()\n",
+    )
+    assert _unknown_or_raw_execution_violations([epoch_read]) == ()
+
+    # A ``text()`` write is reported exactly once: a DML shape at the
+    # ``text()`` node, a DDL statement (no DML shape) at the execute site.
+    text_writes = _parse_source(
+        "src/elspeth/core/landscape/text_writes.py",
+        "from sqlalchemy import text\n"
+        "def write(conn):\n"
+        "    conn.execute(text('DELETE FROM runs WHERE run_id = :run_id'), {'run_id': 'r'})\n"
+        "    conn.execute(text('DROP TABLE runs'))\n",
+    )
+    assert sorted(_unknown_or_raw_execution_violations([text_writes])) == [
+        "src/elspeth/core/landscape/text_writes.py:3 write raw SQL raw-delete runs is forbidden",
+        "src/elspeth/core/landscape/text_writes.py:4 write raw SQL write/DDL is forbidden",
+    ]
+
+    # An interpolated PRAGMA name is exact SQL when the loop variable ranges
+    # over a literal table of constants; drawn from a parameter it stays unknown.
+    tabled_pragma_read = _parse_source(
+        "src/elspeth/core/landscape/pragma_table.py",
+        "_FILE = (('journal_mode', 'wal'), ('busy_timeout', '5000'))\n"
+        "_MEMORY = (('journal_mode', 'memory'), ('synchronous', '1'))\n"
+        "def verify(conn, is_memory):\n"
+        "    invariants = _MEMORY if is_memory else _FILE\n"
+        "    for pragma, _expected in invariants:\n"
+        "        conn.exec_driver_sql(f'PRAGMA {pragma}').scalar_one_or_none()\n",
+    )
+    assert _unknown_or_raw_execution_violations([tabled_pragma_read]) == ()
+    parameter_pragma = _parse_source(
+        "src/elspeth/core/landscape/pragma_parameter.py",
+        "def verify(conn, pragmas):\n    for pragma in pragmas:\n        conn.exec_driver_sql(f'PRAGMA {pragma}')\n",
+    )
+    assert any("unknown exec_driver_sql effect" in item for item in _unknown_or_raw_execution_violations([parameter_pragma]))
+    tabled_pragma_write = _parse_source(
+        "src/elspeth/core/landscape/pragma_table_write.py",
+        "_NAMES = ('journal_mode', 'user_version')\n"
+        "def stamp(conn):\n"
+        "    for pragma in _NAMES:\n"
+        "        conn.exec_driver_sql(f'PRAGMA {pragma} = 1')\n",
+    )
+    assert any(
+        "raw SQL DDL schema-stamp (PRAGMA user_version) is forbidden" in item
+        for item in _unknown_or_raw_execution_violations([tabled_pragma_write])
+    )
+
+    caller_supplied_table = _parse_source(
+        "src/elspeth/core/landscape/execution/conflict_safe.py",
+        "from sqlalchemy.dialects.sqlite import insert as sqlite_insert\n"
+        "def write(conn, table, values):\n"
+        "    statement = sqlite_insert(table).values(**values).on_conflict_do_nothing()\n"
+        "    return conn.execute(statement).fetchone()\n",
+    )
+    assert any(
+        "DML insert on caller-supplied table 'table'" in item for item in _unknown_or_raw_execution_violations([caller_supplied_table])
+    )
+
+    statement_relay = _parse_source(
+        "src/elspeth/core/landscape/relay.py",
+        "def execute_insert(conn, stmt):\n    return conn.execute(stmt)\n",
+    )
+    assert any(
+        "relays caller-supplied statement parameter 'stmt'" in item for item in _unknown_or_raw_execution_violations([statement_relay])
+    )
+    # A loop or comprehension element of a parameter is the same relay, named
+    # by the parameter it came through.
+    loop_relay = _parse_source(
+        "src/elspeth/core/landscape/loop_relay.py",
+        "def execute_all(conn, statements, queries):\n"
+        "    for stmt in statements:\n"
+        "        conn.execute(stmt)\n"
+        "    return [conn.execute(query).fetchall() for query in queries]\n",
+    )
+    loop_relay_violations = _unknown_or_raw_execution_violations([loop_relay])
+    assert any("relays caller-supplied statement parameter 'statements'" in item for item in loop_relay_violations)
+    assert any("relays caller-supplied statement parameter 'queries'" in item for item in loop_relay_violations)
+    assert not any("unclassified" in item for item in loop_relay_violations)
+
+    # A same-unit helper classifies by its ``return`` expressions: all DML or
+    # all proven reads are admitted, anything else stays unclassified.
+    helper_returns = _parse_source(
+        "src/elspeth/core/landscape/helpers_unit.py",
+        "from sqlalchemy import select, union\n"
+        "from sqlalchemy.dialects.postgresql import insert as postgresql_insert\n"
+        "from sqlalchemy.dialects.sqlite import insert as sqlite_insert\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def _selects(run_id):\n"
+        "    return (select(runs_table.c.run_id), select(runs_table.c.status))\n"
+        "def _compound(run_id):\n"
+        "    return union(*_selects(run_id))\n"
+        "class Repository:\n"
+        "    @staticmethod\n"
+        "    def _upsert(conn, values):\n"
+        "        if conn.dialect.name == 'sqlite':\n"
+        "            return sqlite_insert(runs_table).values(**values).on_conflict_do_nothing()\n"
+        "        return postgresql_insert(runs_table).values(**values).on_conflict_do_nothing()\n"
+        "    @staticmethod\n"
+        "    def _decision(run_id):\n"
+        "        return select(runs_table).where(runs_table.c.run_id == run_id)\n"
+        "    @staticmethod\n"
+        "    def _mixed(conn, run_id):\n"
+        "        if conn.dialect.name == 'sqlite':\n"
+        "            return select(runs_table)\n"
+        "        return sqlite_insert(runs_table)\n"
+        "    def write(self, conn, values, run_id):\n"
+        "        conn.execute(self._upsert(conn, values).returning(runs_table.c.run_id))\n"
+        "        conn.execute(self._decision(run_id)).fetchall()\n"
+        "        conn.execute(_compound(run_id)).fetchall()\n"
+        "        conn.execute(self._mixed(conn, run_id))\n",
+    )
+    helper_violations = _unknown_or_raw_execution_violations([helper_returns])
+    assert [item for item in helper_violations if "unclassified" in item] == [
+        "src/elspeth/core/landscape/helpers_unit.py:27 Repository.write unclassified .execute statement"
+    ]
+
+    # A compound select is a read by RESOLVED ORIGIN, not by spelling.
+    project_union = _parse_source(
+        "src/elspeth/core/landscape/project_union.py",
+        "from elspeth.core.landscape.helpers import union\ndef read(conn, parts):\n    return conn.execute(union(*parts)).fetchall()\n",
+    )
+    assert any("unclassified .execute statement" in item for item in _unknown_or_raw_execution_violations([project_union]))
+
+    # Spelling alone never buys a DML label: only a resolved SQLAlchemy origin does.
+    project_callable = _parse_source(
+        "src/elspeth/core/landscape/project_callable.py",
+        "from elspeth.core.landscape.helpers import insert\ndef write(conn, table):\n    return conn.execute(insert(table))\n",
+    )
+    assert any("unclassified .execute statement" in item for item in _unknown_or_raw_execution_violations([project_callable]))
+
+
+def test_statement_walkers_key_their_cycle_guard_on_the_binding_site_not_the_name() -> None:
+    """P4-D8 defect 2: a name re-bound to a refinement of itself is not a cycle.
+
+    ``_statement_contains_dml`` answers True on a genuine revisit (fail closed),
+    so a NAME-keyed guard read ``stmt = stmt.values(...)`` as DML by accident
+    and ``state_id = state_id or ...`` inside a SELECT's WHERE as DML by error.
+    Keyed on the binding site, the insert is proven through its own chain and
+    the incidental scalar rebinding no longer poisons the read.
+    """
+
+    unit = _parse_source(
+        "src/elspeth/core/landscape/rebinding.py",
+        "from sqlalchemy import insert, select\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def write(conn, values):\n"
+        "    stmt = insert(runs_table)\n"
+        "    stmt = stmt.values(**values)\n"
+        "    conn.execute(stmt)\n"
+        "def read(conn, state_id):\n"
+        "    state_id = state_id or generate_id()\n"
+        "    query = select(runs_table)\n"
+        "    query = query.where(runs_table.c.run_id == state_id)\n"
+        "    conn.execute(query).fetchall()\n",
+    )
+    resolver = _resolver_for_unit(unit)
+    executes = {
+        _symbol(node): node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and _call_name(node) == "execute" and _symbol(node) in {"write", "read"}
+    }
+    assert set(executes) == {"write", "read"}
+    write_call, read_call = executes["write"], executes["read"]
+    assert _statement_contains_dml(write_call.args[0], resolver, use=write_call)
+    assert not _is_proven_read(write_call.args[0], resolver, use=write_call)
+    resolved_write = resolver.resolve_statement(write_call.args[0], use=write_call)
+    assert isinstance(resolved_write, ast.Call) and _dml_shape(resolved_write, resolver) == ("runs", "insert")
+    assert not _statement_contains_dml(read_call.args[0], resolver, use=read_call)
+    assert _is_proven_read(read_call.args[0], resolver, use=read_call)
+    assert _unknown_or_raw_execution_violations([unit]) == ()
+
+
 def test_dml_fingerprint_is_stable_when_the_required_fence_wraps_the_same_statement() -> None:
     unfenced = _parse_source(
         "src/elspeth/core/landscape/fillable.py",
@@ -4813,7 +5465,10 @@ def test_raw_writable_cte_is_not_misclassified_as_a_read() -> None:
         "    conn.execute(text('WITH changed AS (UPDATE runs SET status=\"failed\" RETURNING *) SELECT * FROM changed'))\n",
     )
     violations = _unknown_or_raw_execution_violations([unit])
-    assert any("unclassified .execute statement" in item for item in violations)
+    # The UPDATE inside the CTE is a raw write on ``runs``: reported by that
+    # class, exactly once (the ``text()`` node owns the report), never as a
+    # read and never left unclassified.
+    assert violations == ("src/elspeth/core/landscape/writable_cte.py:3 bypass raw SQL raw-update runs is forbidden",)
 
     sqlalchemy_cte = _parse_source(
         "src/elspeth/core/landscape/sqlalchemy_writable_cte.py",
