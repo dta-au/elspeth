@@ -328,7 +328,10 @@ class BarrierIntakeCoordinator:
                 "barrier_blocked_at — the backdated accept instant cannot be derived; journal "
                 "corruption (mark_blocked stamps every hold)."
             )
-        now_wall = self._clock.now_utc()
+        # ADR-047: the hold's age is Landscape database time minus its
+        # database-stamped barrier_blocked_at; only the monotonic offset is
+        # this process's.
+        now_wall = self._scheduler.barriers.database_now()
         return self._clock.monotonic() - max(0.0, (now_wall - row.barrier_blocked_at).total_seconds())
 
     def _token_for_intake(self, row: TokenWorkItem) -> TokenInfo:
@@ -452,7 +455,6 @@ class BarrierIntakeCoordinator:
             barrier_key=row.barrier_key,
             membership=BatchMembershipSpec(batch_id=batch_id, ordinal=ordinal),
             buffered_outcome=BufferedOutcomeSpec(batch_id=batch_id),
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         if not adoption.adopted:
@@ -518,7 +520,6 @@ class BarrierIntakeCoordinator:
             barrier_key=row.barrier_key,
             membership=None,
             buffered_outcome=None,
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         if not adoption.adopted:
@@ -580,7 +581,6 @@ class BarrierIntakeCoordinator:
                 run_id=self._run_id,
                 barrier_key=str(coalesce_name),
                 token_ids=(token.token_id,),
-                now=self._clock.now_utc(),
                 coordination_token=coordination_token,
                 release_context={
                     "late_arrival": True,
@@ -694,7 +694,6 @@ class BarrierIntakeCoordinator:
             barrier_key=row.barrier_key,
             membership=None,
             buffered_outcome=None,
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         if not adoption.adopted:
@@ -716,7 +715,6 @@ class BarrierIntakeCoordinator:
                 run_id=self._run_id,
                 barrier_key=str(row_union_name),
                 token_ids=(token.token_id,),
-                now=self._clock.now_utc(),
                 coordination_token=coordination_token,
                 release_context={
                     "late_arrival": True,
@@ -768,7 +766,6 @@ class BarrierIntakeCoordinator:
                 run_id=self._run_id,
                 barrier_key=str(row_union_name),
                 token_ids=tuple(consumed.token_id for consumed in outcome.consumed_tokens),
-                now=self._clock.now_utc(),
                 coordination_token=coordination_token,
                 release_context={
                     "reason": outcome.failure_reason,
@@ -839,7 +836,6 @@ class BarrierIntakeCoordinator:
             barrier_key=row.barrier_key,
             membership=None,
             buffered_outcome=None,
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         if not adoption.adopted:
@@ -1008,7 +1004,6 @@ class BarrierIntakeCoordinator:
                     run_id=self._run_id,
                     barrier_key=barrier_key,
                     token_ids=tuple(token.token_id for token in consumed_tokens),
-                    now=self._clock.now_utc(),
                     coordination_token=self._require_coordination_token(),
                     release_context={
                         "reason": outcome.failure_reason,
@@ -1192,7 +1187,6 @@ class BarrierIntakeCoordinator:
         self._scheduler.adopt_group_losses(
             run_id=self._run_id,
             loss_ids=[loss.loss_id for loss in losses],
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
         collector_names = {str(name) for name in self._collector_node_ids}
@@ -1555,7 +1549,6 @@ class BarrierIntakeCoordinator:
             frame_kind=frame_kind,
             declared_roster=binding.member_roster if frame_kind is FrameKind.FORK else None,
             recorded_by=self._scheduler_lease_owner,
-            now=self._clock.now_utc(),
             coordination_token=coordination_token,
         )
 
@@ -1684,7 +1677,12 @@ class BarrierRecoveryCoordinator:
                 barrier_key, missing/foreign batch ids, membership mismatch,
                 NULL barrier_blocked_at, missing hold state ...).
         """
-        now = self._clock.now_utc()
+        # ADR-047: every hold age this restore derives is measured as Landscape
+        # database time minus the row's database-stamped barrier_blocked_at,
+        # so a leader whose process clock has drifted cannot fire or starve a
+        # timeout by the size of its drift. The monotonic clock still paces
+        # the restored triggers.
+        now = self._scheduler.barriers.database_now()
         # ADR-030 §E.4 belt: one run-wide duplicate-acceptance sweep at restore
         # entry. token_outcomes has NO non-terminal uniqueness — the adoption
         # CAS is the structural guard; >1 live BUFFERED rows for a token means
@@ -1934,7 +1932,6 @@ class BarrierRecoveryCoordinator:
                             run_id=self._run_id,
                             barrier_key=str(node_id),
                             token_ids=tuple(item.token_id for item in reconciled),
-                            now=now,
                             coordination_token=self._coordination_token,
                             release_context={
                                 "reason": "failed_flush_crash_reconcile",
@@ -2097,7 +2094,6 @@ class BarrierRecoveryCoordinator:
                         run_id=self._run_id,
                         barrier_key=str(item.barrier_key),
                         token_ids=(item.token_id,),
-                        now=now,
                         coordination_token=self._coordination_token,
                         release_context={
                             "late_arrival": True,
@@ -2175,7 +2171,6 @@ class BarrierRecoveryCoordinator:
                             run_id=self._run_id,
                             barrier_key=str(item.barrier_key),
                             token_ids=(item.token_id,),
-                            now=now,
                             coordination_token=self._coordination_token,
                             release_context={
                                 "reason": "row_union_failed_closure_crash_reconcile",
@@ -2337,7 +2332,6 @@ class BarrierRecoveryCoordinator:
                             run_id=self._run_id,
                             barrier_key=str(coalesce_name_str),
                             token_ids=(item.token_id,),
-                            now=now,
                             coordination_token=self._coordination_token,
                             release_context={
                                 "late_arrival": True,

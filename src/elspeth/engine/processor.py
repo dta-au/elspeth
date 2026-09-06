@@ -4183,7 +4183,7 @@ class RowProcessor:
         to READY within the liveness window instead of waiting out the full item
         lease TTL.  Returns the number of leases recovered this pass.
         """
-        return self._scheduler_drain.run_maintenance(self._clock.now_utc())
+        return self._scheduler_drain.run_maintenance()
 
     def active_scheduled_row_ids(self) -> frozenset[str]:
         """Return row IDs currently represented by active scheduler work."""
@@ -4232,7 +4232,6 @@ class RowProcessor:
             run_id=self._run_id,
             barrier_key=barrier_key,
             token_ids=token_ids,
-            now=self._clock.now_utc(),
             coordination_token=self._require_coordination_token(),
             group_losses=group_losses,
         )
@@ -4419,7 +4418,6 @@ class RowProcessor:
             consumed_token_ids=residual.member_token_ids,
             emitted_pending_sink=tuple(emitted_pending_sink),
             emitted_ready=tuple(emitted_ready),
-            now=self._clock.now_utc(),
             intake_snapshot_token_ids=frozenset(residual.member_token_ids),
             coordination_token=self._require_coordination_token(),
             pending_sink_lease_owner=self._scheduler_lease_owner,
@@ -4629,7 +4627,6 @@ class RowProcessor:
             consumed_token_ids=residual.member_token_ids,
             emitted_pending_sink=(() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),)),
             emitted_ready=(() if merged_item is None else (self._work_codec.ready_emission(merged_item),)),
-            now=self._clock.now_utc(),
             intake_snapshot_token_ids=frozenset(residual.member_token_ids),
             scope_row_id=residual.row_id,
             coordination_token=self._require_coordination_token(),
@@ -4745,7 +4742,6 @@ class RowProcessor:
             # field equality; a crash before that loop leaves durable READY
             # work for resume instead of losing the continuation.
             emitted_ready=tuple(self._work_codec.ready_emission(item) for item in child_items),
-            now=self._clock.now_utc(),
             # §E.3 per-firing-group snapshot: this batch's adopted members.
             intake_snapshot_token_ids=frozenset(token.token_id for token in buffered_tokens),
             coordination_token=self._require_coordination_token(),
@@ -4835,7 +4831,6 @@ class RowProcessor:
             # against the row inserted here by deterministic ``work_item_id``
             # and strict field equality.
             emitted_ready=() if merged_item is None else (self._work_codec.ready_emission(merged_item),),
-            now=self._clock.now_utc(),
             # §E.3 per-firing-group snapshot: the fired group's adopted branches.
             intake_snapshot_token_ids=frozenset(consumed_token_ids),
             scope_row_id=scope_row_id,
@@ -4870,7 +4865,6 @@ class RowProcessor:
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=(),
             emitted_ready=tuple(self._work_codec.ready_emission(item) for item in released_items),
-            now=self._clock.now_utc(),
             intake_snapshot_token_ids=frozenset(consumed_token_ids),
             scope_row_id=scope_row_id,
             coordination_token=self._require_coordination_token(),
@@ -5096,7 +5090,6 @@ class RowProcessor:
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=tuple(self._sink_emission_from_result(result) for result in release.sink_results),
             emitted_ready=tuple(self._work_codec.ready_emission(item) for item in release.items),
-            now=self._clock.now_utc(),
             intake_snapshot_token_ids=frozenset(consumed_token_ids),
             scope_row_id=scope_row_id,
             coordination_token=self._require_coordination_token(),
@@ -5304,7 +5297,6 @@ class RowProcessor:
         terminalized = self._scheduler.mark_pending_sink_terminal(
             run_id=self._run_id,
             token_id=token_id,
-            now=self._clock.now_utc(),
             expected_lease_owner=self._scheduler_lease_owner,
             coordination_token=self._require_coordination_token(),
         )
@@ -5319,7 +5311,6 @@ class RowProcessor:
         terminalized = self._scheduler.mark_pending_sink_terminal_many(
             run_id=self._run_id,
             token_ids=token_ids,
-            now=self._clock.now_utc(),
             expected_lease_owner=self._scheduler_lease_owner,
             coordination_token=self._require_coordination_token(),
         )

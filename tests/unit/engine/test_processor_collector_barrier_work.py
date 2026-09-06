@@ -102,7 +102,6 @@ def _persist_blocked_collector_member(factory: RecorderFactory, processor: RowPr
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
-        now=processor._clock.now_utc(),
         expected_lease_owner=_LEASE_OWNER,
     )
     return str(item.work_item_id)
@@ -116,7 +115,6 @@ def _persist_blocked_queue_hold(factory: RecorderFactory, processor: RowProcesso
         work_item_id=item.work_item_id,
         queue_key=str(_COLLECTOR_NODE),
         barrier_key=None,
-        now=processor._clock.now_utc(),
         expected_lease_owner=_LEASE_OWNER,
     )
 
@@ -144,7 +142,6 @@ def test_settled_collector_member_stops_counting_as_barrier_work() -> None:
         run_id=processor.run_id,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
         token_ids=("member-0",),
-        now=processor._clock.now_utc(),
         coordination_token=leader_coordination_token(factory, processor.run_id),
     )
     assert released == 1
@@ -232,7 +229,6 @@ def test_eof_loop_exits_once_the_real_collector_hold_settles(monkeypatch: pytest
             run_id=processor.run_id,
             barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
             token_ids=("member-0",),
-            now=processor._clock.now_utc(),
             coordination_token=leader_coordination_token(factory, processor.run_id),
         )
         return []

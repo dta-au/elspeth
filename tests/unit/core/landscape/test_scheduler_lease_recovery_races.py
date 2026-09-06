@@ -499,7 +499,6 @@ def test_ts04_and_ts06_sink_redrive_claim_and_recovery_preserve_complete_bundle(
         path=TerminalPath.ON_ERROR_ROUTED.value,
         error_hash="a" * 64,
         error_message="sink retry evidence",
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     pending_row = _work_item_row(engine, "token-0")
@@ -585,7 +584,6 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
         path=TerminalPath.COALESCED.value,
         error_hash=None,
         error_message=None,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     pending_row = _work_item_row(engine, "token-0")
@@ -703,7 +701,6 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     sink_claim = repo.claim_pending_sink(
@@ -849,12 +846,10 @@ def test_aux06_inactive_registered_workers_cannot_claim_either_lease_subtype(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     repo.mark_terminal(
         work_item_id=originals["token-producer"].work_item_id,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     _insert_worker(engine, worker_id="inactive", status=status)
@@ -889,7 +884,6 @@ def test_ts06_recovery_refuses_malformed_sink_redrive_bundle_without_mutation(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     assert repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redriver", lease_seconds=30) is not None
@@ -924,7 +918,6 @@ def test_ts06_recovery_cas_rechecks_bundle_and_rolls_back_same_transaction_corru
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=BASE + timedelta(seconds=1),
         expected_lease_owner="producer",
     )
     assert repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redriver", lease_seconds=30) is not None

@@ -168,7 +168,6 @@ def _parked_pending_sink(crashed: _CrashedRun, *, ingest_sequence: int, claim_ba
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=crashed.clock.now_utc(),
         expected_lease_owner=WORKER_OLD,
     )
     if claim_back:
@@ -354,7 +353,6 @@ class TestSuspendedWinnerFences:
             work_item_id=work_item_id,
             queue_key=None,
             barrier_key="barrier-1",
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
         )
         current = _usurp(crashed)
@@ -372,7 +370,6 @@ class TestSuspendedWinnerFences:
                 consumed_token_ids=(token_id,),
                 emitted_pending_sink=(),
                 emitted_ready=(),
-                now=crashed.clock.now_utc(),
                 coordination_token=token_old,
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
@@ -391,7 +388,6 @@ class TestSuspendedWinnerFences:
             consumed_token_ids=(token_id,),
             emitted_pending_sink=(),
             emitted_ready=(),
-            now=crashed.clock.now_utc(),
             coordination_token=current,
         )
         assert _work_item(crashed.db, token_id)["status"] == TokenWorkStatus.TERMINAL.value
@@ -412,7 +408,6 @@ class TestSuspendedWinnerFences:
             work_item_id=work_item_id,
             queue_key=None,
             barrier_key="agg-1",
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
         )
         batch = crashed.factory.execution.create_batch(crashed.run_id, crashed.journal_node_id)
@@ -432,7 +427,6 @@ class TestSuspendedWinnerFences:
                 barrier_key="agg-1",
                 membership=BatchMembershipSpec(batch_id=batch.batch_id, ordinal=0),
                 buffered_outcome=BufferedOutcomeSpec(batch_id=batch.batch_id),
-                now=crashed.clock.now_utc(),
                 coordination_token=coordination_token,
             )
 
@@ -513,7 +507,6 @@ class TestSuspendedWinnerFences:
             crashed.repo.adopt_group_losses(
                 run_id=crashed.run_id,
                 loss_ids=(loss.loss_id,),
-                now=crashed.clock.now_utc(),
                 coordination_token=token_old,
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
@@ -529,7 +522,6 @@ class TestSuspendedWinnerFences:
         marked = crashed.repo.adopt_group_losses(
             run_id=crashed.run_id,
             loss_ids=(loss.loss_id,),
-            now=crashed.clock.now_utc(),
             coordination_token=current,
         )
         assert marked == 1
@@ -572,7 +564,6 @@ class TestSuspendedWinnerFences:
                 frame_kind=FrameKind.FORK,
                 declared_roster=("outer_a",),
                 recorded_by=WORKER_OLD,
-                now=crashed.clock.now_utc(),
                 coordination_token=coordination_token,
             )
 
@@ -734,7 +725,6 @@ class TestSuspendedWinnerFences:
             crashed.repo.mark_pending_sink_terminal_many(
                 run_id=crashed.run_id,
                 token_ids=(token_id,),
-                now=crashed.clock.now_utc(),
                 expected_lease_owner=WORKER_OLD,
                 coordination_token=token_old,
             )
@@ -751,7 +741,6 @@ class TestSuspendedWinnerFences:
         terminalized = crashed.repo.mark_pending_sink_terminal_many(
             run_id=crashed.run_id,
             token_ids=(token_id,),
-            now=crashed.clock.now_utc(),
             expected_lease_owner=WORKER_OLD,
             coordination_token=current,
         )
@@ -786,7 +775,6 @@ class TestSuspendedWinnerFences:
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
                 run_id=crashed.run_id,
-                now=crashed.clock.now_utc(),
                 caller_owner=WORKER_OLD,
                 coordination_token=token_old,
             )
@@ -802,7 +790,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader's sweep repairs it.
         repaired = crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
             run_id=crashed.run_id,
-            now=crashed.clock.now_utc(),
             caller_owner=USURPER,
             coordination_token=current,
         )

@@ -289,7 +289,6 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=2),
         expected_lease_owner="producer-worker",
     )
     return item.work_item_id

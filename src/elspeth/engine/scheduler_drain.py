@@ -337,7 +337,7 @@ class SchedulerDrainCoordinator:
     # Maintenance cadence
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run_maintenance(self, now: datetime) -> int:
+    def run_maintenance(self) -> int:
         """Evict dead members then recover expired peer leases (§C.2 path 1).
 
         Ordering: evict-before-reap (§C.2 :232) ensures that when we rotate
@@ -459,7 +459,7 @@ class SchedulerDrainCoordinator:
         preclaimed_queue = list(preclaimed_items or ())
 
         if self._maintenance_due(recover_pending_sinks=recover_pending_sinks):
-            self.run_maintenance(self._clock.now_utc())
+            self.run_maintenance()
 
         while True:
             iterations += 1
@@ -505,12 +505,12 @@ class SchedulerDrainCoordinator:
             for intake_child in intake_child_items:
                 self.enqueue_work_item(intake_child, pending_items)
 
-            # ``now`` feeds maintenance scheduling and disposition stamps only;
-            # claim_ready decides availability on Landscape database time
-            # (ADR-047), which is also what the intake's enqueues stamp.
-            now = self._clock.now_utc()
+            # Every scheduler decision and stamp is Landscape database time
+            # (ADR-047): claim_ready decides availability on it, the intake's
+            # enqueues and the dispositions stamp it; no process instant is
+            # handed to the repository.
             if iterations - maintenance_iteration >= SCHEDULER_MAINTENANCE_INTERVAL:
-                self.run_maintenance(now)
+                self.run_maintenance()
                 maintenance_iteration = iterations
 
             claimed: TokenWorkItem | None
@@ -524,7 +524,7 @@ class SchedulerDrainCoordinator:
                 )
             if claimed is None:
                 if recover_pending_sinks:
-                    recovered = self.run_maintenance(self._clock.now_utc())
+                    recovered = self.run_maintenance()
                     if recovered:
                         continue
                 if pending_items:
@@ -680,7 +680,6 @@ class SchedulerDrainCoordinator:
                         try:
                             self._scheduler.mark_failed(
                                 work_item_id=claimed.work_item_id,
-                                now=self._clock.now_utc(),
                                 expected_lease_owner=claimed_lease_owner,
                                 group_losses=self.take_claim_group_losses(claimed),
                                 worker_id=self._disposition_fence_worker_id(),
@@ -712,7 +711,6 @@ class SchedulerDrainCoordinator:
                     self._mark_claimed_scheduler_work_blocked(
                         claimed,
                         item,
-                        now=self._clock.now_utc(),
                         queue_key=None,
                         barrier_key=self.barrier_key_for_live_hold(claimed.token_id),
                     )
@@ -727,7 +725,7 @@ class SchedulerDrainCoordinator:
                     continue
 
                 if result is None and not child_items:
-                    self._mark_claimed_scheduler_work_blocked(claimed, item, now=self._clock.now_utc())
+                    self._mark_claimed_scheduler_work_blocked(claimed, item)
                     # §E.2: ALWAYS take another iteration (see the buffered arm).
                     continue
 
@@ -738,7 +736,6 @@ class SchedulerDrainCoordinator:
                     path = sink_bound_result.path.value
                     error_hash = scheduler_error_hash(sink_bound_result)
                     error_message = scheduler_error_message(sink_bound_result)
-                    pending_sink_now = self._clock.now_utc()
                     group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
@@ -751,7 +748,6 @@ class SchedulerDrainCoordinator:
                             path=path,
                             error_hash=error_hash,
                             error_message=error_message,
-                            now=pending_sink_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
@@ -766,7 +762,6 @@ class SchedulerDrainCoordinator:
                             path=path,
                             error_hash=error_hash,
                             error_message=error_message,
-                            now=pending_sink_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
@@ -775,14 +770,12 @@ class SchedulerDrainCoordinator:
                         self._spans.mark_error(row_span, RowResultError())
                     result = with_scheduler_pending_sink_handoff(result, claimed.token_id)
                 elif scheduler_result_failed_claimed_token(result, claimed.token_id):
-                    failed_now = self._clock.now_utc()
                     group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
                         _, scheduled_children = self._scheduler.mark_failed_with_ready_children(
                             work_item_id=claimed.work_item_id,
                             emitted_ready=tuple(self._work_codec.ready_emission(child_item) for child_item in child_items),
-                            now=failed_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
@@ -791,21 +784,18 @@ class SchedulerDrainCoordinator:
                     else:
                         self._scheduler.mark_failed(
                             work_item_id=claimed.work_item_id,
-                            now=failed_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
                         )
                     self._spans.mark_error(row_span, RowResultError())
                 else:
-                    terminal_now = self._clock.now_utc()
                     group_losses = self.take_claim_group_losses(claimed)
                     worker_id = self._disposition_fence_worker_id()
                     if child_items:
                         _, scheduled_children = self._scheduler.mark_terminal_with_ready_children(
                             work_item_id=claimed.work_item_id,
                             emitted_ready=tuple(self._work_codec.ready_emission(child_item) for child_item in child_items),
-                            now=terminal_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
@@ -814,7 +804,6 @@ class SchedulerDrainCoordinator:
                     else:
                         self._scheduler.mark_terminal(
                             work_item_id=claimed.work_item_id,
-                            now=terminal_now,
                             expected_lease_owner=claimed_lease_owner,
                             group_losses=group_losses,
                             worker_id=worker_id,
@@ -863,13 +852,11 @@ class SchedulerDrainCoordinator:
                     "Possible infinite loop in PENDING_SINK recovery."
                 )
 
-            now = self._clock.now_utc()
             self._scheduler.recover_expired_leases(
                 coordination_token=coordination_token,
             )
             repaired = self._scheduler.terminalize_pending_sinks_with_terminal_outcomes(
                 run_id=self._run_id,
-                now=now,
                 caller_owner=self._scheduler_lease_owner,
                 coordination_token=coordination_token,
             )
@@ -954,7 +941,6 @@ class SchedulerDrainCoordinator:
         claimed: TokenWorkItem,
         item: WorkItem,
         *,
-        now: datetime,
         queue_key: str | None = None,
         barrier_key: str | None = None,
     ) -> None:
@@ -971,7 +957,6 @@ class SchedulerDrainCoordinator:
             work_item_id=claimed.work_item_id,
             queue_key=queue_key,
             barrier_key=barrier_key,
-            now=now,
             expected_lease_owner=self._claimed_scheduler_lease_owner(claimed),
             worker_id=self._disposition_fence_worker_id(),
         )

@@ -860,7 +860,7 @@ def test_ts14_scheduler_callback_loss_repairs_without_republishing_s3_effect(
     (token,) = _live_tokens(factory, run_id=run_id, source_id=source_id, rows=[dict(_ROW)])
     ctx = PluginContext(run_id=run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=sink_id)
     leader = leader_coordination_token(factory, run_id)
-    now = datetime.now(UTC)
+    datetime.now(UTC)
     ready = factory.scheduler.enqueue_ready(
         run_id=run_id,
         token_id=token.token_id,
@@ -884,7 +884,6 @@ def test_ts14_scheduler_callback_loss_repairs_without_republishing_s3_effect(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=now,
         expected_lease_owner=leader.worker_id,
         worker_id=leader.worker_id,
     )

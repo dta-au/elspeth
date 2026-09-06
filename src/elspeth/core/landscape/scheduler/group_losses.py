@@ -27,6 +27,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape.database import Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import group_losses_table, token_lineage_frames_table
 
@@ -267,7 +268,6 @@ class GroupLossRepository:
         *,
         run_id: str,
         loss_ids: Sequence[str],
-        now: datetime,
         coordination_token: CoordinationToken,
     ) -> int:
         """Fenced replay-cursor mark: ``adopted_epoch NULL → epoch`` (§E.5).
@@ -305,7 +305,6 @@ class GroupLossRepository:
         frame_kind: FrameKind,
         declared_roster: tuple[str, ...] | None,
         recorded_by: str,
-        now: datetime,
         coordination_token: CoordinationToken,
     ) -> bool:
         """Escalation staging (spec §6.3, Task 8): authenticate the spec
@@ -326,4 +325,6 @@ class GroupLossRepository:
             verb="stage_escalation_loss",
         ) as conn:
             authenticate_adoption_loss(conn, run_id=run_id, spec=spec, frame_kind=frame_kind, declared_roster=declared_roster)
-            return record_group_loss(conn, run_id=run_id, spec=spec, recorded_by=recorded_by, now=now)
+            # The loss is recorded at Landscape database time (ADR-047), the
+            # same clock the fence that admitted this transaction used.
+            return record_group_loss(conn, run_id=run_id, spec=spec, recorded_by=recorded_by, now=read_landscape_transaction_time(conn))

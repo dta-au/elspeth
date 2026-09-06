@@ -47,7 +47,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import landscape_database_now, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-adopt-1"
@@ -165,15 +165,17 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
     )
     claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
-    blocked_at = NOW + timedelta(seconds=2)
     repo.mark_blocked(
         work_item_id=claimed.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=blocked_at,
         expected_lease_owner=WORKER,
     )
-    return token_id, claimed.work_item_id, blocked_at
+    # The hold instant is Landscape database time stamped by mark_blocked
+    # (ADR-047); the adoption backdates its BUFFERED outcome to it.
+    blocked_at = _work_item(db, token_id)["barrier_blocked_at"]
+    assert isinstance(blocked_at, datetime)
+    return token_id, claimed.work_item_id, blocked_at.replace(tzinfo=UTC)
 
 
 def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_name: str) -> tuple[str, str, datetime]:
@@ -219,15 +221,15 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
     )
     claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
-    blocked_at = NOW + timedelta(seconds=2)
     repo.mark_blocked(
         work_item_id=claimed.work_item_id,
         queue_key=None,
         barrier_key=collector_barrier_key(collector_name, "g-1"),
-        now=blocked_at,
         expected_lease_owner=WORKER,
     )
-    return token_id, claimed.work_item_id, blocked_at
+    blocked_at = _work_item(db, token_id)["barrier_blocked_at"]
+    assert isinstance(blocked_at, datetime)
+    return token_id, claimed.work_item_id, blocked_at.replace(tzinfo=UTC)
 
 
 def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: CoordinationToken) -> None:
@@ -313,7 +315,6 @@ def _adopt(db: LandscapeDB, token: CoordinationToken, *, token_id: str, work_ite
         "barrier_key": BARRIER_KEY,
         "membership": BatchMembershipSpec(batch_id=BATCH_ID, ordinal=0) if aggregation else None,
         "buffered_outcome": BufferedOutcomeSpec(batch_id=BATCH_ID, context={"branch": "left"}) if aggregation else None,
-        "now": ADOPT_NOW,
         "coordination_token": token,
     }
     kwargs.update(overrides)
@@ -324,7 +325,9 @@ class TestAdoption:
     def test_aggregation_arm_adopts_with_membership_and_backdated_buffered_outcome(self, db: LandscapeDB, token: CoordinationToken) -> None:
         token_id, work_item_id, blocked_at = _seed_blocked_barrier_hold(db, sequence=0)
 
+        adopt_from = landscape_database_now(db.engine)
         result = _adopt(db, token, token_id=token_id, work_item_id=work_item_id)
+        adopt_until = landscape_database_now(db.engine)
 
         assert result.adopted is True
         assert result.barrier_adopted_epoch == token.leader_epoch
@@ -350,7 +353,9 @@ class TestAdoption:
         assert recorded_at.replace(tzinfo=UTC) == blocked_at, "§E.2 backdated accept: recorded_at == barrier_blocked_at, NOT now"
         context = json.loads(str(outcome["context_json"]))
         assert context["adopted_epoch"] == token.leader_epoch
-        assert context["adopted_at"] == ADOPT_NOW.isoformat()
+        # The adoption instant is Landscape database time read inside the
+        # fenced transaction (ADR-047), not a caller-supplied stamp.
+        assert adopt_from <= datetime.fromisoformat(context["adopted_at"]) <= adopt_until
         assert context["branch"] == "left", "caller context merges in"
 
     def test_idempotent_readoption_skips_all_inserts(self, db: LandscapeDB, token: CoordinationToken) -> None:
@@ -403,7 +408,6 @@ class TestAdoption:
             barrier_key="coalesce:merge",
             membership=None,
             buffered_outcome=None,
-            now=ADOPT_NOW,
             coordination_token=token,
         )
 
@@ -430,7 +434,6 @@ class TestAdoption:
             "barrier_key": collector_barrier_key("stitch", "g-1"),
             "membership": None,
             "buffered_outcome": None,
-            "now": ADOPT_NOW,
             "coordination_token": token,
         }
         first = repo.adopt_blocked_barrier_item(**adopt_kwargs)
@@ -509,7 +512,6 @@ class TestAdoptionRefusals:
             run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             token_ids=(token_id,),
-            now=NOW,
             coordination_token=token,
         )
 

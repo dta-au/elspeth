@@ -204,8 +204,6 @@ files:
   src/elspeth/core/landscape/scheduler/barrier.py:
     Mapping[str, object]: 6
     dict[str, object]: 3
-  src/elspeth/core/landscape/scheduler/dispositions.py:
-    Mapping[str, object]: 1
   src/elspeth/core/landscape/scheduler/events.py:
     Mapping[str, object]: 1
   src/elspeth/core/landscape/scheduler/work_items.py:
@@ -1018,9 +1016,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 893
-  Mapping[str, object]: 285
+  Mapping[str, object]: 284
   MutableMapping[str, Any]: 13
   boundary: 64
   dict[str, Any]: 1154
   dict[str, object]: 389
-  soft: 2734
+  soft: 2733

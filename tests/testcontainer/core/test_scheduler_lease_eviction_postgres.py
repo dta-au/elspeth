@@ -390,7 +390,6 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=now,
             expected_lease_owner=first_owner,
             worker_id=first_owner,
         )
@@ -733,7 +732,6 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         path=TerminalPath.COALESCED.value,
         error_hash=None,
         error_message=None,
-        now=now,
         expected_lease_owner=original_token.worker_id,
         worker_id=original_token.worker_id,
     )

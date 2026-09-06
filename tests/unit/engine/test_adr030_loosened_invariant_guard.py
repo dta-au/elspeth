@@ -201,7 +201,7 @@ def test_n1_self_failed_still_raises() -> None:
     # Claim under the leader, then mark FAILED under the leader's OWN owner.
     claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == work_item_id
-    scheduler.mark_failed(work_item_id=work_item_id, now=clock.now_utc(), expected_lease_owner=LEADER_OWNER)
+    scheduler.mark_failed(work_item_id=work_item_id, expected_lease_owner=LEADER_OWNER)
 
     pending = _pending_work_item(work_item_id, token)
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=[work_item_id]) == 0
@@ -235,7 +235,6 @@ def test_n1_self_blocked_still_raises_and_backstop_counts_blocked() -> None:
         work_item_id=work_item_id,
         queue_key=None,
         barrier_key="barrier-1",
-        now=clock.now_utc(),
         expected_lease_owner=LEADER_OWNER,
     )
 
@@ -377,7 +376,7 @@ def test_mixed_self_failed_and_peer_still_raises() -> None:
     self_item_id, self_token = _enqueue_ready(setup, scheduler, clock, sequence=1)
     claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == self_item_id
-    scheduler.mark_failed(work_item_id=self_item_id, now=clock.now_utc(), expected_lease_owner=LEADER_OWNER)
+    scheduler.mark_failed(work_item_id=self_item_id, expected_lease_owner=LEADER_OWNER)
 
     pending = {
         peer_item_id: WorkItem(token=peer_token, current_node_id=NodeID(NODE_ID)),

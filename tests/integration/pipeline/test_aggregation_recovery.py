@@ -66,7 +66,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import age_barrier_hold, make_factory
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -1510,11 +1510,12 @@ class TestAggregationRecoveryIntegration:
         self._register_nodes_raw(db, run.run_id)
 
         now = datetime.now(UTC)
-        first_blocked_at = now - timedelta(seconds=30.0)
 
         # 3 rows accepted into one in-progress batch; their tokens are
         # BLOCKED at the barrier through the production scheduler verbs
-        # (mark_blocked stamps barrier_blocked_at — the restore's age source).
+        # (mark_blocked stamps barrier_blocked_at from Landscape database time
+        # — the restore's age source, ADR-047 — so the age is written into the
+        # database's past rather than handed to the verb).
         tokens = []
         batch = factory.execution.create_batch(
             run_id=run.run_id,
@@ -1544,14 +1545,13 @@ class TestAggregationRecoveryIntegration:
             )
             claimed = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="seeder", lease_seconds=60)
             assert claimed is not None and claimed.token_id == token.token_id
-            blocked_at = first_blocked_at + timedelta(seconds=i)  # oldest row anchors the age
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key="sum_aggregator",
-                now=blocked_at,
                 expected_lease_owner="seeder",
             )
+            age_barrier_hold(db.engine, claimed.work_item_id, seconds_ago=30.0 - i)  # oldest row anchors the age
         factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
 
         # === PHASE 2: Resume and verify timeout preservation ===

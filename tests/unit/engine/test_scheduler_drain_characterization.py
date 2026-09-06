@@ -355,7 +355,6 @@ def _park_pending_sink(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=clock.now_utc(),
         expected_lease_owner=owner,
     )
     return work_item_id, token

@@ -99,7 +99,13 @@ from elspeth.plugins.infrastructure.clients.llm import LLMClientError
 from elspeth.plugins.transforms.batch_replicate import BatchReplicateConfig
 from elspeth.testing import make_contract, make_pipeline_row, make_row, make_source_row, make_token_info
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import await_database_time, landscape_database_now, leader_coordination_token, make_recorder_with_run
+from tests.fixtures.landscape import (
+    age_barrier_hold,
+    await_database_time,
+    landscape_database_now,
+    leader_coordination_token,
+    make_recorder_with_run,
+)
 
 # =============================================================================
 # Helpers
@@ -201,12 +207,14 @@ def _persist_blocked_scheduler_work(
     adopted: bool = True,
     coalesce_name: str | None = None,
     collector_name: str | None = None,
-) -> None:
-    """Persist BLOCKED scheduler work matching a fabricated buffered token.
+) -> str:
+    """Persist BLOCKED scheduler work matching a fabricated buffered token; return its work_item_id.
 
     Uses the production journal verbs (enqueue+claim, then mark_blocked) so
     the BLOCKED row carries ``barrier_blocked_at`` exactly as a live barrier
-    hold would (F1: the journal is the only barrier-buffer truth).
+    hold would (F1: the journal is the only barrier-buffer truth), stamped
+    from Landscape database time (ADR-047); a test that needs an older hold
+    ages it with ``age_barrier_hold``.
 
     ``adopted=True`` (the default) stamps ``barrier_adopted_epoch`` — the
     post-adoption journal image (ADR-030 §E.2). Tests that fabricate executor
@@ -215,7 +223,6 @@ def _persist_blocked_scheduler_work(
     fabricate an intake-pending deposit instead.
     """
     _persist_token_for_scheduler(factory, token, ingest_sequence=ingest_sequence)
-    now = processor._clock.now_utc()
     item = processor._scheduler.enqueue_ready_claimed_legacy_unfenced(
         run_id=processor.run_id,
         token_id=token.token_id,
@@ -234,11 +241,11 @@ def _persist_blocked_scheduler_work(
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=now,
         expected_lease_owner="test-harness",
     )
     if adopted:
         _stamp_blocked_rows_adopted(processor._scheduler, work_item_id=item.work_item_id)
+    return item.work_item_id
 
 
 def _stamp_blocked_rows_adopted(
@@ -838,7 +845,6 @@ class TestConstructorErrorEdgeMap:
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        now = datetime.now(UTC) - timedelta(seconds=2)
         batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
         tokens: list[TokenInfo] = []
         for ordinal, token_id in enumerate(["t1", "t2"]):
@@ -879,13 +885,20 @@ class TestConstructorErrorEdgeMap:
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node),
-                now=now,
                 expected_lease_owner="seeder",
             )
+            # The hold is two database seconds old at restore (ADR-047): the
+            # restored trigger latch's elapsed age must cover the 1.5 s
+            # count_fire_offset the checkpoint carries.
+            age_barrier_hold(db.engine, claimed.work_item_id, seconds_ago=2.0)
 
         with db.connection() as conn:
             rows_before = conn.execute(select(func.count()).select_from(token_work_items_table)).scalar_one()
 
+        # The resuming processor's own clock sits in 2023 (ADR-047 control):
+        # the restored latch's age must come from the database, or the
+        # drifted clock would report a negative age and refuse the 1.5 s
+        # count_fire_offset the checkpoint carries.
         processor = _make_processor(
             factory,
             aggregation_settings={
@@ -897,6 +910,7 @@ class TestConstructorErrorEdgeMap:
                     trigger={"count": 2},
                 ),
             },
+            clock=MockClock(start=1_700_000_000.0),
             barrier_restore=BarrierJournalRestoreContext(
                 resume_checkpoint_id="ckpt-resume-1",
                 barrier_scalars=BarrierScalars(
@@ -928,7 +942,7 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": 7})
         token = TokenInfo(row_id="row-ghost", token_id="tok-ghost", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
-        ghost_now = datetime.now(UTC)
+        datetime.now(UTC)
         ghost_item = factory.scheduler.enqueue_ready_claimed_legacy_unfenced(
             run_id="test-run",
             token_id="tok-ghost",
@@ -944,7 +958,6 @@ class TestConstructorErrorEdgeMap:
             work_item_id=ghost_item.work_item_id,
             queue_key=None,
             barrier_key="ghost-barrier",
-            now=ghost_now,
             expected_lease_owner="test-harness",
         )
 
@@ -971,7 +984,7 @@ class TestConstructorErrorEdgeMap:
 
         db, factory = _make_factory()
         agg_node = NodeID("agg-1")
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         payload = make_row({"value": 9})
         token = TokenInfo(row_id="row-q", token_id="tok-q", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
@@ -990,7 +1003,6 @@ class TestConstructorErrorEdgeMap:
             work_item_id=claimed.work_item_id,
             queue_key="queue-1",
             barrier_key=None,
-            now=now,
             expected_lease_owner="seeder",
         )
 
@@ -1071,7 +1083,7 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": ordinal})
         token = TokenInfo(row_id=f"row-{ordinal}", token_id=token_id, row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id=token_id,
@@ -1087,7 +1099,6 @@ class TestConstructorErrorEdgeMap:
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key=str(agg_node),
-            now=now,
             expected_lease_owner="seeder",
         )
         return token
@@ -4514,7 +4525,6 @@ class TestDurableSchedulerResumeDrain:
             # EMPTY original message: the class where a recomputed replay
             # hash diverges from the originally-audited one.
             error_message="",
-            now=datetime.now(UTC),
             expected_lease_owner="crashed-worker",
         )
         if error_hash is None:
@@ -5177,8 +5187,16 @@ class TestDurableSchedulerResumeDrain:
         # transition without a subsequent claim).
         assert sorted(statuses_after) == ["leased", "leased", "pending_sink"]
 
-    def test_drain_scheduler_transitions_use_injected_clock(self) -> None:
-        """Durable scheduler state transitions must be deterministic under MockClock."""
+    def test_drain_scheduler_transitions_stamp_database_time_not_the_injected_clock(self) -> None:
+        """C6 stage 3 control (ADR-047): a disposition's stamp is Landscape database time.
+
+        The processor's injected MockClock sits in 2023; the durable
+        transition it drives must carry the database's own instant, so a
+        worker whose process clock is wrong cannot mis-stamp the scheduler
+        ledger.
+        """
+        from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
+
         db, factory = _make_factory()
         clock = MockClock(start=1_700_000_000.0)
         transform_node = NodeID("transform-1")
@@ -5230,8 +5248,10 @@ class TestDurableSchedulerResumeDrain:
             clock.advance(5.0)
             return (success_result, token, None)
 
+        drained_from = landscape_database_now(db.engine)
         with patch.object(processor._transform_executor, "execute_transform", side_effect=executor_side_effect):
             processor.drain_scheduled_work(ctx)
+        drained_until = landscape_database_now(db.engine)
 
         from sqlalchemy import select
 
@@ -5244,7 +5264,8 @@ class TestDurableSchedulerResumeDrain:
                 )
             ).one()
         assert status == "pending_sink"
-        assert updated_at.replace(tzinfo=UTC) == clock.now_utc()
+        assert_stamped_between(updated_at, start=drained_from, end=drained_until, tolerance=timedelta(0))
+        assert updated_at.replace(tzinfo=UTC) != clock.now_utc()
 
     def test_recovers_expired_lease_then_drains_without_source_replay(self) -> None:
         """Expired LEASED scheduler work is recovered and advanced by a fresh processor."""
@@ -6040,7 +6061,7 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
         self._seed_held_coalesce_branch(factory, coalesce_node)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         # Block the row through the production claim path WITHOUT the
         # accept()-written hold node_state (simulates a crash between adoption
         # CAS commit and accept() in _intake_adopt_coalesce_row).
@@ -6050,7 +6071,6 @@ class TestDurableSchedulerResumeDrain:
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner="seeder",
         )
 
@@ -6219,7 +6239,6 @@ class TestDurableSchedulerResumeDrain:
             work_item_id=stray_work.work_item_id,
             queue_key=None,
             barrier_key=str(agg_node),
-            now=datetime.now(UTC),
             expected_lease_owner="test-worker",
         )
 
@@ -8512,7 +8531,7 @@ class TestCompleteCoalesceMerge:
         factory.data_flow.create_token(
             row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
         )
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id="token-held-a",
@@ -8531,7 +8550,6 @@ class TestCompleteCoalesceMerge:
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner="seeder",
         )
         held_token = TokenInfo(
