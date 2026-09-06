@@ -235,7 +235,7 @@ def _install_profile_run_liveness() -> None:
         kwargs.setdefault("window_seconds", _PROFILE_RUN_LIVENESS_SECONDS)
         real_heartbeat_init(self, *args, **kwargs)
 
-    RunHeartbeatThread.__init__ = profile_heartbeat_init  # type: ignore[method-assign]
+    pytest.MonkeyPatch().setattr(RunHeartbeatThread, "__init__", profile_heartbeat_init)
 
 
 def _install_short_scheduler_lease() -> None:
