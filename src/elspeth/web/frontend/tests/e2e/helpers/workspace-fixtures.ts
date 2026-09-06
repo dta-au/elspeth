@@ -87,15 +87,15 @@ interface InstallWorkspaceScenarioOptions {
 const INSTALLED_SCENARIOS = new WeakMap<Page, InstalledScenario>();
 const SOURCE_FILENAME = "workspace-geometry.csv";
 const FIXED_TIME = "2026-08-11T08:00:00.000Z";
-// Sized so the Run dialog's body overflows at every DESKTOP_VIEWPORTS entry
-// with in-domain (38-character) stage ids. The dialog widens with the
-// viewport and its body grows with content up to calc(100dvh - 32px), so
-// the binding case is 2560x1280: ~1100 px of body against a visible stage
-// list measuring 5.9 px per stage (measured 2026-09-06), i.e. 80 stages fit
-// without scrolling and ~160 is the break-even. 200 overflows there by
-// ~1.25x. The seed's review-debt check is ~0.4 s at 160 stages once every
-// prompt review is RESOLVED, so the count is not seed-bound.
-const TALL_DIALOG_NODE_COUNT = 200;
+// Sized so the Run dialog's body overflows by >= 1.2x at every viewport the
+// tall scenario runs at (DESKTOP_VIEWPORTS minus 2560x1280 — see the
+// geometry spec's loop) with in-domain (38-character) stage ids, while the
+// seed stays well under Playwright's 30 s test timeout. The dialog widens
+// with the viewport and its body grows with content up to
+// calc(100dvh - 32px), so the binding case is 2048x1050. Measured
+// 2026-09-06 at this count: see the ratios recorded in the spec commit.
+// Exported so the visual spec's graph node count derives from it.
+export const TALL_DIALOG_NODE_COUNT = 117;
 const TALL_DIALOG_PROMPT_TEMPLATE =
   "Review category {{ row.category }} and return a concise classification.";
 // elspeth.core.canonical.stable_hash(TALL_DIALOG_PROMPT_TEMPLATE), 2026-09-05,
