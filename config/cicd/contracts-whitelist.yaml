@@ -28,6 +28,14 @@ allowed_external_types:
   # authority just wrote, the recorder holds a Landscape URL and passphrase.
   - "web/coordination/identity_authority:IdentityRetired"
   - "web/auth/audit:AuthAuditRecorder"
+  # `composer users bootstrap-admin` (identity sprint step D) makes the first
+  # admin through the SAME authority call the login-worker seed uses: it
+  # constructs the owned IdentityClaims the authority binds a row to, and
+  # its record callback is typed by the IdentityActivated outcome that
+  # callback receives. Neither is a serializable L0 DTO (the outcome carries
+  # the IdentityRecord and RoleGrant the authority just wrote).
+  - "web/auth/models:IdentityClaims"
+  - "web/coordination/identity_authority:IdentityActivated"
   # SSRF safety type - security infrastructure, tightly coupled to validation logic
   - "core/security/web:SSRFSafeRequest"
   # Engine types used in testing factories - test infrastructure wraps these for convenience

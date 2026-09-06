@@ -420,6 +420,74 @@ class TestComposerUsersCommand:
         assert _auth_user_row(auth_db, "alice") is not None
 
 
+class TestComposerUsersBootstrapAdmin:
+    """``composer users bootstrap-admin``: the operator's lockout recovery (spec D20)."""
+
+    def _invoke(self, tmp_path: Path, *extra: str, provider: str = "oidc", subject: str = "ada") -> Any:
+        return runner.invoke(
+            app,
+            [
+                "--no-dotenv",
+                "composer",
+                "users",
+                "bootstrap-admin",
+                provider,
+                subject,
+                "--note",
+                "recovery",
+                "--data-dir",
+                str(tmp_path),
+                *extra,
+            ],
+        )
+
+    def test_bootstrap_admin_makes_the_first_admin_with_the_audit_rows(self, tmp_path: Path) -> None:
+        from elspeth.web.sessions.models import identity_roles_table
+
+        result = self._invoke(tmp_path, "--quota-tokens-per-day", "1000", "--quota-storage-bytes", "1000000")
+        assert result.exit_code == 0, result.output
+        assert "Bootstrapped admin ada" in result.output
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            rows = _identity_rows(engine)
+            assert [(row.subject, row.access_state) for row in rows] == [("ada", "active")]
+            with engine.connect() as conn:
+                roles = conn.execute(select(identity_roles_table.c.role, identity_roles_table.c.revoked_at)).all()
+            assert [(row.role, row.revoked_at) for row in roles] == [("admin", None)]
+        finally:
+            engine.dispose()
+
+        events = _auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")
+        assert [row.event_type for row in events] == ["identity_activated", "role_granted", "quota_set"]
+        assert {row.identity_id for row in events} == {rows[0].identity_id}
+        activated = json.loads(events[0].metadata_json)
+        assert activated["actor"] == "operator" and activated["cause"] == "bootstrap" and activated["note"] == "recovery"
+        assert (activated["on_behalf_of"], activated["console_request_id"]) == (None, None)
+        assert events[0].request_id is None and events[0].client_host is None
+
+    def test_bootstrap_admin_is_refused_once_an_admin_exists(self, tmp_path: Path) -> None:
+        assert self._invoke(tmp_path).exit_code == 0
+        second = self._invoke(tmp_path, subject="bob")
+        assert second.exit_code == 1
+        assert "already exists" in second.output
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        try:
+            assert [row.subject for row in _identity_rows(engine)] == ["ada"]
+        finally:
+            engine.dispose()
+        assert len(_auth_event_rows(f"sqlite:///{tmp_path / 'runs' / 'audit.db'}")) == 2
+
+    def test_bootstrap_admin_refuses_an_unknown_provider_and_half_a_quota(self, tmp_path: Path) -> None:
+        unknown = self._invoke(tmp_path, provider="ldap")
+        assert unknown.exit_code == 2
+        assert "unknown provider" in unknown.output
+        half = self._invoke(tmp_path, "--quota-tokens-per-day", "1000")
+        assert half.exit_code == 2
+        assert "go together" in half.output
+        assert not (tmp_path / "sessions.db").exists()
+
+
 def _cli_add(*, auth_db: Path, data_dir: Path) -> None:
     result = runner.invoke(
         app,

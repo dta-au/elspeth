@@ -161,3 +161,155 @@ async def test_a_wired_deployments_first_login_lands_pending(tmp_path: Path, sub
     assert admitted.access_state == "pending"
     assert wiring.read_identity(admitted.identity_id) is not None
     assert wiring.token_issuer.mint(identity_id=admitted.identity_id, username=admitted.username)
+
+
+# ── D20 bootstrap seed ───────────────────────────────────────────────────
+
+
+def _seeded_settings(tmp_path: Path, idp: FakeIdP, *subjects: str) -> WebSettings:
+    # The web app creates data_dir/runs at boot; the seed's audit rows go to
+    # the Landscape there, so the fixture stands in for that boot step.
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    return _oidc_wired(tmp_path, idp, sso_admin_subjects=subjects)
+
+
+def _claims_for(wiring, idp: FakeIdP, subject: str):
+    return wiring.map_identity(
+        IdTokenClaims(issuer=idp.issuer, subject=subject, audience=idp.client_id, issued_at=1_700_000_000, expires_at=1_700_000_300),
+        None,
+    )
+
+
+def _auth_event_rows(settings: WebSettings):
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import auth_events_table
+
+    with LandscapeDB.from_url(settings.get_landscape_url()) as db, db.read_only_connection() as conn:
+        return conn.execute(select(auth_events_table).order_by(auth_events_table.c.occurred_at)).fetchall()
+
+
+def test_a_listed_subject_becomes_the_first_admin_at_first_login_with_the_audit_pair(tmp_path: Path, substrate) -> None:
+    """``sso_admin_subjects`` seeds a listed subject ONLY while the container has zero active human admins (spec D20)."""
+    import json
+
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _seeded_settings(tmp_path, idp, "ada")
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    admitted = wiring.upsert_identity(_claims_for(wiring, idp, "ada"))
+
+    assert admitted.access_state == "active"
+    assert [grant.role for grant in authority.active_roles(identity_id=admitted.identity_id)] == ["admin"]
+    assert authority.count_active_human_admins() == 1
+    rows = _auth_event_rows(settings)
+    assert [row.event_type for row in rows] == ["identity_activated", "role_granted", "quota_set"]
+    assert {row.identity_id for row in rows} == {admitted.identity_id}
+    assert all(row.request_id is None and row.client_host is None for row in rows), "no request to read in the login worker"
+    activated = json.loads(rows[0].metadata_json)
+    assert activated["actor"] == "operator" and activated["cause"] == "bootstrap"
+    assert activated["on_behalf_of"] is None and activated["console_request_id"] is None
+    assert json.loads(rows[1].metadata_json)["role"] == "admin"
+    quota = json.loads(rows[2].metadata_json)
+    assert (quota["tokens_per_day"], quota["storage_bytes"]) == (100_000, 1_000_000)
+
+    # A repeat login by the bootstrapped admin is an ordinary login: still active, no second activation.
+    again = wiring.upsert_identity(_claims_for(wiring, idp, "ada"))
+    assert again.identity_id == admitted.identity_id and again.access_state == "active"
+    assert len(_auth_event_rows(settings)) == 3
+
+
+def test_the_seed_list_is_inert_once_an_active_human_admin_exists(tmp_path: Path, substrate) -> None:
+    """A second listed subject lands pending like anyone else: the list never becomes a standing grant."""
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _seeded_settings(tmp_path, idp, "ada", "bob")
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    ada = wiring.upsert_identity(_claims_for(wiring, idp, "ada"))
+    bob = wiring.upsert_identity(_claims_for(wiring, idp, "bob"))
+
+    assert ada.access_state == "active"
+    assert bob.access_state == "pending"
+    assert authority.active_roles(identity_id=bob.identity_id) == ()
+    assert authority.count_active_human_admins() == 1
+    assert [row.event_type for row in _auth_event_rows(settings)] == ["identity_activated", "role_granted", "quota_set"]
+
+
+def test_an_unlisted_first_login_lands_pending_even_with_no_admin(tmp_path: Path, substrate) -> None:
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _seeded_settings(tmp_path, idp, "ada")
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    carol = wiring.upsert_identity(_claims_for(wiring, idp, "carol"))
+
+    assert carol.access_state == "pending"
+    assert authority.count_active_human_admins() == 0
+    assert not (tmp_path / "runs" / "audit.db").exists() or _auth_event_rows(settings) == []
+
+
+@pytest.mark.asyncio
+async def test_the_spec_pin_a_fresh_store_and_one_listed_subject_walk_to_a_token_with_exactly_admin(tmp_path: Path, substrate) -> None:
+    """Spec §identity_roles [rev2.7]: fresh ``--init-schema`` store + one listed subject, start → callback → complete → token, roles == admin."""
+    from urllib.parse import parse_qs, urlsplit
+
+    import jwt as pyjwt
+
+    from elspeth.web.auth.sso import CallbackQuery, authorization_redirect, complete_login, login_callback
+
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _seeded_settings(tmp_path, idp, "ada")
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+    runtime = await resolve_sso_runtime(wiring, settings, transport=idp.transport())
+    client = runtime.client
+
+    # start
+    redirect = authorization_redirect(
+        authorization_endpoint=client.endpoints.authorization_endpoint,
+        client_id=client.client_id,
+        redirect_uri=client.redirect_uri,
+        scopes=("openid",),
+        transaction_secret=client.transaction_secret,
+        provider=client.provider,
+    )
+    sent = parse_qs(urlsplit(redirect.location).query)
+    # callback
+    code = idp.authorize(nonce=sent["nonce"][0], subject="ada")
+    seen: list[str] = []
+    location = await login_callback(
+        CallbackQuery(code=code, state=sent["state"][0], error=None),
+        redirect.cookie_value,
+        client=client,
+        validator=runtime.validator,
+        claim_checks=runtime.claim_checks,
+        map_identity=runtime.map_identity,
+        upsert_identity=runtime.upsert_identity,
+        record_login=lambda identity: seen.append(identity.identity_id),
+        handoffs=runtime.handoffs,
+        request_id="walk-1",
+        transport=runtime.transport,
+    )
+    # The code rides in the fragment as ``#/auth/callback?code=...`` (one SPA route, one parser).
+    handoff = parse_qs(urlsplit("x://x/" + urlsplit(location).fragment).query)["code"][0]
+    # complete
+    session = complete_login(
+        handoff,
+        handoffs=runtime.handoffs,
+        read_identity=runtime.read_identity,
+        issuer=runtime.issuer,
+        record_token_issued=lambda identity, token, login_request_id: None,
+    )
+
+    identity_id = pyjwt.decode(session.access_token, options={"verify_signature": False})["sub"]
+    assert seen == [identity_id]
+    assert [grant.role for grant in authority.active_roles(identity_id=identity_id)] == ["admin"]
+    assert authority.count_active_human_admins() == 1
+    assert [row.event_type for row in _auth_event_rows(settings)] == ["identity_activated", "role_granted", "quota_set"]

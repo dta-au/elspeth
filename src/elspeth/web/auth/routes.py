@@ -6,6 +6,7 @@ POST /verify-email consumes a local-auth email verification token.
 POST /token re-issues a JWT from a valid existing token (local only).
 GET /config returns auth configuration for frontend discovery (unauthenticated).
 GET /me returns the full UserProfile for any auth provider.
+POST /logout records the end of a session for any auth provider; the client discards the token.
 """
 
 from __future__ import annotations
@@ -539,6 +540,27 @@ def create_auth_router() -> APIRouter:
         )
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=new_token)
+
+    @router.post("/logout", status_code=204, response_class=Response)
+    async def logout(request: Request) -> Response:
+        """Record that a session ended on purpose; the client discards the token.
+
+        Mounted for every provider. Server-side revocation is a future
+        ``jti`` denylist (spec rev2), so the row is the whole effect: the
+        audit trail reads it alongside the ``login`` and ``token_issued``
+        rows it closes, and it is written before the response.
+        """
+        settings: WebSettings = request.app.state.settings
+        user = await get_current_user(request)
+        _auth_audit_recorder(request).record_logout(
+            request,
+            provider=settings.auth_provider,
+            identity_id=user.user_id,
+            username=user.username,
+        )
+        response = Response(status_code=204)
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
 
     @router.get("/config", response_model=AuthConfigResponse)
     async def auth_config(request: Request, response: Response) -> AuthConfigResponse:

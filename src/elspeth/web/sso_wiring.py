@@ -55,11 +55,19 @@ from elspeth.web.auth.sso import (
     fetch_discovery_endpoints,
 )
 from elspeth.web.config import WebSettings, configured_auth_settings
-from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
+from elspeth.web.coordination.identity_authority import (
+    AdminAlreadyBootstrapped,
+    IdentityActivated,
+    IdentityAlreadyDisabled,
+    RepositoryIdentityAuthority,
+    RoleForbiddenForIdentity,
+)
 from elspeth.web.key_derivation import derive_session_token_key
 from elspeth.web.sessions.sso_handoff_repository import SsoHandoffRepository
 
 SSO_CALLBACK_PATH = "/api/auth/sso/callback"
+BOOTSTRAP_SEED_NOTE = "seeded by sso_admin_subjects at first login (spec D20)"
+"""The activation note the bootstrap seed writes; an activation must carry one and no human typed it."""
 
 
 def sso_missing_settings(settings: WebSettings) -> tuple[str, ...]:
@@ -138,8 +146,50 @@ def build_sso_wiring(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_bootstrap(event: IdentityActivated) -> None:
+        # Runs INSIDE bootstrap_admin's transaction, like _record_admission:
+        # a seed the trail cannot hold does not commit. No request: the seed
+        # fires in the login worker, so the request columns are NULL.
+        audit_recorder.record_identity_activated(
+            None,
+            provider=provider,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            actor_identity_id=None,
+            cause="bootstrap",
+            note=event.note,
+            role=None if event.role is None else event.role.role,
+            role_id=None if event.role is None else event.role.role_id,
+            tokens_per_day=settings.quota_default_tokens_per_day if event.quota_written else None,
+            storage_bytes=settings.quota_default_storage_bytes if event.quota_written else None,
+            on_behalf_of=event.on_behalf_of,
+            console_request_id=event.console_request_id,
+        )
+
     def _upsert_identity(claims: IdentityClaims) -> AdmittedIdentity:
-        # D12: every SSO first login is PENDING until an administrator
+        # D20 bootstrap seed: a listed subject activates itself as the first
+        # admin ONLY while the container has zero active human admins. The
+        # count here is a pre-check that keeps the common path (every later
+        # login) off the population lock; bootstrap_admin re-counts under
+        # the lock and is the authority on the race.
+        if claims.subject in settings.sso_admin_subjects and identity_authority.count_active_human_admins() == 0:
+            try:
+                return identity_authority.bootstrap_admin(
+                    claims=claims,
+                    note=BOOTSTRAP_SEED_NOTE,
+                    quota_tokens_per_day=settings.quota_default_tokens_per_day,
+                    quota_storage_bytes=settings.quota_default_storage_bytes,
+                    record=_record_bootstrap,
+                ).record
+            except (AdminAlreadyBootstrapped, IdentityAlreadyDisabled, RoleForbiddenForIdentity):
+                # Lost the race to another replica, or the listed subject's
+                # row is disabled or not human: the list is inert for this
+                # login and the ordinary path below decides, as it would
+                # for anyone else. Nothing is swallowed -- the login is
+                # still recorded and complete() still refuses a non-active
+                # row.
+                pass
+        # D12: every other SSO first login is PENDING until an administrator
         # activates it. There is no open-registration reading for an IdP
         # login -- the IdP verified who the person is, not whether this
         # container admits them.
