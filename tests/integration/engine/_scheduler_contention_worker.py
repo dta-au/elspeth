@@ -107,6 +107,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--sweep-every", type=int, default=8)
     parser.add_argument("--lease-seconds", type=int, default=0)
     parser.add_argument("--beat-interval-ms", type=int, default=250)
+    # The cross-owner reap the parent asserts per hammer (A9). The measurement
+    # window is a floor: a hammer keeps going past it until it has reaped this
+    # many peer leases, because that needs the peer to have claimed before this
+    # hammer's last sweep, and a lock-starved peer's first claim can land after
+    # any fixed window. The parent's join timeout bounds the wait.
+    parser.add_argument("--min-recovered", type=int, default=1)
     return parser.parse_args(argv)
 
 
@@ -204,7 +210,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         deadline = start + args.duration_seconds
         next_beat = start  # first beat fires immediately
         iteration = 0
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline or recovered_total < args.min_recovered:
             iteration += 1
             try:
                 item = timed(
@@ -263,6 +269,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
             "owner": args.owner,
             "pragmas": pragmas,
             "errors": errors,
+            "elapsed_seconds": time.monotonic() - start,
             "claims": claims,
             "claim_none": claim_none,
             "sweeps": sweeps,
