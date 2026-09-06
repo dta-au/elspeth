@@ -145,6 +145,9 @@ class SinkEffectRepository:
     def takeover_expired(self, effect_id: str, *, owner: str, ttl: timedelta) -> SinkEffectLease:
         return self._lifecycle.takeover_expired(effect_id, owner=owner, ttl=ttl)
 
+    def lease_validity_seconds(self, effect_id: str) -> float | None:
+        return self._lifecycle.lease_validity_seconds(effect_id)
+
     def begin_attempt(self, request: SinkEffectAttemptRequest) -> SinkEffectAttempt:
         return self._lifecycle.begin_attempt(request)
 

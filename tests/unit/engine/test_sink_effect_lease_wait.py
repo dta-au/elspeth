@@ -22,6 +22,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
     SinkEffectState,
 )
+from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectLifecycle
@@ -34,6 +35,7 @@ from elspeth.engine.executors.sink_effects import (
     SinkEffectLeaseHeld,
     SinkEffectPredecessorPending,
 )
+from tests.fixtures.landscape import expire_sink_effect_lease
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 from tests.unit.engine.test_sink_effect_executor import _CumulativeObservableSink, _CumulativeTarget, _execution_request
@@ -69,6 +71,30 @@ def _shutdown_error() -> GracefulShutdownError:
         rows_routed_failure=0,
         routed_destinations={},
     )
+
+
+class _ExpireLeaseOnceBudgetElapsed:
+    """After-sleep hook: lapse the held lease on the Landscape database clock once a TTL of polling has elapsed.
+
+    The repository decides expiry against database time (ADR-047), which a
+    ``MockClock`` cannot move; the sleeps still advance the waiter's own
+    clock, so its wait budget is exercised exactly as before and the lease
+    lapses in the database at the moment it would have lapsed on that clock.
+    Bind ``sleep`` after constructing the :class:`_AdvanceSleep` that calls it.
+    """
+
+    def __init__(self, db: LandscapeDB, effect_id: str, lease_ttl: timedelta) -> None:
+        self._db = db
+        self._effect_id = effect_id
+        self._budget_seconds = lease_ttl.total_seconds()
+        self.sleep: _AdvanceSleep | None = None
+        self.expired = False
+
+    def __call__(self) -> None:
+        assert self.sleep is not None, "bind the _AdvanceSleep before polling starts"
+        if not self.expired and sum(self.sleep.calls) >= self._budget_seconds:
+            self.expired = True
+            expire_sink_effect_lease(self._db.engine, self._effect_id)
 
 
 def _held_effect(
@@ -118,7 +144,10 @@ def test_foreign_lease_expires_then_waiter_reclaims_and_publishes_once(
 ) -> None:
     lease_ttl = timedelta(seconds=2)
     db, factory, request, sink, target, clock = _held_effect(monkeypatch, lease_ttl=lease_ttl)
-    sleep = _AdvanceSleep(clock)
+    (held,) = factory.execution.sink_effects.get_effects_for_run(request.reservation.run_id)
+    expire = _ExpireLeaseOnceBudgetElapsed(db, held.effect_id, lease_ttl)
+    sleep = _AdvanceSleep(clock, after_sleep=expire)
+    expire.sleep = sleep
     try:
         result = SinkEffectCoordinator(
             factory=factory,
@@ -1010,6 +1039,10 @@ def test_concurrent_expired_takeover_loser_waits_for_single_reclaim_publication(
     lease_ttl = timedelta(seconds=2)
     db, factory, request, _sink, target, clock = _held_effect(monkeypatch, lease_ttl=lease_ttl)
     clock.advance(lease_ttl.total_seconds() + 0.01)
+    # The held lease lapses on the Landscape database clock (ADR-047), which
+    # the mock clock cannot move.
+    (held,) = factory.execution.sink_effects.get_effects_for_run(request.reservation.run_id)
+    expire_sink_effect_lease(db.engine, held.effect_id)
     takeover_barrier = threading.Barrier(2)
     reconcile_entered = threading.Event()
     release_reconcile = threading.Event()
@@ -1239,6 +1272,9 @@ def test_peer_takeover_after_heartbeat_retirement_fences_finalization(
         if effect is None or effect.state is not SinkEffectState.IN_FLIGHT or rival_claims:
             return
         clock.advance(lease_ttl.total_seconds() + 0.01)
+        # The retiring holder's lease lapses on the Landscape database clock
+        # (ADR-047), which the mock clock cannot move.
+        expire_sink_effect_lease(db.engine, heartbeat._claim.effect_id)
         rival_claims.append(
             heartbeat._effects.takeover_expired(
                 heartbeat._claim.effect_id,

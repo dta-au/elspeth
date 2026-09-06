@@ -30,6 +30,7 @@ from elspeth.engine.executors.sink_effects import (
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.sinks.json_sink import JSONSink
 from tests.fixtures.base_classes import as_sink, as_source, inject_write_failure
+from tests.fixtures.landscape import expire_sink_effect_lease
 from tests.fixtures.plugins import ListSource
 
 
@@ -79,11 +80,19 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
     lease_ttl = timedelta(seconds=2)
     clock = MockClock(start=datetime.now(UTC).timestamp())
     poll_sleeps: list[float] = []
+    # The crashed attempt's lease lapses on the Landscape database clock
+    # (ADR-047), which the mock clock cannot move: once the resume has polled
+    # for a TTL, the deadline is written into the database's past exactly
+    # where it would have lapsed on the resume's own clock.
+    held_lease: list[tuple[LandscapeDB, str]] = []
 
     def advance_clock(seconds: float) -> None:
         assert seconds > 0.0
         poll_sleeps.append(seconds)
         clock.advance(seconds)
+        if held_lease and sum(poll_sleeps) >= lease_ttl.total_seconds():
+            lease_db, effect_id = held_lease.pop()
+            expire_sink_effect_lease(lease_db.engine, effect_id)
 
     original_init = SinkEffectCoordinator.__init__
 
@@ -157,6 +166,7 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
     reopened_checkpoints = CheckpointManager(reopened)
     resumed_config, resumed_graph = _pipeline(output)
     try:
+        held_lease.append((reopened, effect_before.effect_id))
         recovery = RecoveryManager(reopened, reopened_checkpoints)
         check = recovery.can_resume(run_id, resumed_graph)
         assert check.can_resume, check.reason

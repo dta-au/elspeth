@@ -477,6 +477,78 @@ def test_heartbeat_lease_lost_records_event_when_expired_lease_was_recovered() -
     }
 
 
+def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_own_recovery_by_seq() -> None:
+    """Epoch 38 control for the heartbeat's reader (elspeth-2d436dd6e8).
+
+    ``heartbeat_lease`` is the one production caller of
+    ``recovery_event_for_previous_work_item``, which walks recovery events
+    newest-first by ``seq``. Two recoveries of one token inside one database
+    second tie on ``recorded_at``; each lapsed owner's heartbeat must still be
+    attributed to the recovery that rotated ITS work item, and the newest
+    recovery must be the first the reader yields.
+    """
+    from elspeth.contracts.scheduler import SchedulerEventType
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+
+    engine = _make_scheduler_engine()
+    repo = TokenSchedulerRepository(engine)
+    now = landscape_database_now(engine)
+    payload = _insert_scheduler_prerequisites(engine, now=now)
+    first = repo.enqueue_ready(
+        run_id="run-1",
+        token_id="token-1",
+        row_id="row-1",
+        node_id="normalize",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=payload,
+    )
+
+    def two_recoveries_inside_one_second(_database_now: datetime) -> tuple[str, str]:
+        assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
+        expire_lease(engine, first.work_item_id)
+        assert repo.recover_expired_leases_legacy_unfenced(run_id="run-1", caller_owner="reaper") == 1
+        second_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+        assert second_claim is not None and second_claim.work_item_id != first.work_item_id
+        expire_lease(engine, second_claim.work_item_id)
+        assert repo.recover_expired_leases_legacy_unfenced(run_id="run-1", caller_owner="reaper") == 1
+        return first.work_item_id, second_claim.work_item_id
+
+    first_item_id, second_item_id = on_fresh_database_second(engine, two_recoveries_inside_one_second)
+    recoveries = [event for event in _scheduler_events(engine) if event.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value]
+    assert len(recoveries) == 2
+    assert recoveries[0].recorded_at == recoveries[1].recorded_at
+    first_recovery, second_recovery = recoveries
+    assert json.loads(first_recovery.context_json)["previous_work_item_id"] == first_item_id
+    assert json.loads(second_recovery.context_json)["previous_work_item_id"] == second_item_id
+
+    from elspeth.core.landscape.scheduler.events import SchedulerEventStore
+
+    with engine.connect() as conn:
+        newest_for_second = SchedulerEventStore.recovery_event_for_previous_work_item(
+            conn, run_id="run-1", previous_work_item_id=second_item_id
+        )
+        newest_for_first = SchedulerEventStore.recovery_event_for_previous_work_item(
+            conn, run_id="run-1", previous_work_item_id=first_item_id
+        )
+    assert newest_for_second is not None and newest_for_second["seq"] == second_recovery.seq
+    assert newest_for_first is not None and newest_for_first["seq"] == first_recovery.seq
+    assert second_recovery.seq > first_recovery.seq
+
+    for owner, item_id, recovery in (("worker-a", first_item_id, first_recovery), ("worker-b", second_item_id, second_recovery)):
+        with pytest.raises(SchedulerLeaseLostError):
+            repo.heartbeat_lease(run_id="run-1", work_item_id=item_id, lease_owner=owner, lease_seconds=30, membership_fenced=False)
+        lease_lost = _scheduler_events(engine)[-1]
+        assert lease_lost.event_type == SchedulerEventType.LEASE_LOST.value
+        assert lease_lost.work_item_id == item_id
+        assert lease_lost.from_lease_owner == owner
+        assert json.loads(lease_lost.context_json) == {
+            "reason": "heartbeat_cas_miss_after_recovery",
+            "recovered_work_item_id": recovery.work_item_id,
+            "recovery_event_id": recovery.event_id,
+        }
+
+
 def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
     from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository

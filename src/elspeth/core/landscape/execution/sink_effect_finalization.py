@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, Final
 
@@ -37,6 +36,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.artifacts import ArtifactRepository
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
@@ -44,6 +44,7 @@ from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
 )
+from elspeth.core.landscape.execution.sink_effect_lifecycle import lease_is_live
 from elspeth.core.landscape.model_loaders import (
     ArtifactLoader,
     NodeStateLoader,
@@ -73,10 +74,6 @@ def _descriptor_payload(descriptor: ArtifactDescriptor) -> dict[str, object]:
         "path_or_uri": descriptor.path_or_uri,
         "size_bytes": descriptor.size_bytes,
     }
-
-
-def _utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _validate_result_diversion_attribution(attribution: object, diverted_ordinals: Sequence[int]) -> None:
@@ -476,7 +473,8 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("sink effect finalization has stale lease owner")
             if effect.generation != request.generation:
                 raise LandscapeRecordError("sink effect finalization has stale generation")
-            if effect.lease_expires_at is None or _utc(effect.lease_expires_at) < now():
+            database_now = read_landscape_transaction_time(conn)
+            if not lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now):
                 raise LandscapeRecordError("sink effect finalization lease has expired")
         primary_effect_ids = {str(member.primary_effect_id) for member in members if member.primary_effect_id is not None}
         common_primary_effect_id = next(iter(primary_effect_ids)) if len(primary_effect_ids) == 1 else None

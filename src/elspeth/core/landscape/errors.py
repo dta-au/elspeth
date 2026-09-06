@@ -23,6 +23,17 @@ class LandscapeRecordError(AuditIntegrityError):
     """
 
 
+class SinkEffectLeaseLiveError(LandscapeRecordError):
+    """A sink-effect lease verb refused because another worker's lease is live at Landscape database time.
+
+    Raised by ``claim_preparation`` (a live foreign preparation claim) and
+    ``takeover_expired`` (a lease that has not expired). The repository is
+    the only clock authority for that decision (ADR-047); a caller that wants
+    to wait rather than fail catches this type instead of re-deciding
+    liveness from its own process clock.
+    """
+
+
 @tier_1_error(
     reason="ADR-010: narrow recorder failure marker for update targets missing their required audit row",
     caller_module=__name__,
