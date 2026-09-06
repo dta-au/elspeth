@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import Engine, create_engine, insert, select
 from sqlalchemy.engine import make_url
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.web.auth.sso import ConsumedHandoff, handoff_code_hash, new_handoff_code
 from elspeth.web.coordination.database_clock import database_now
@@ -41,8 +41,8 @@ _CONTENDERS = 8
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture
