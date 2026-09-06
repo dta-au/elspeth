@@ -31,7 +31,7 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_transaction_time
 from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
@@ -58,6 +58,23 @@ def _require_hash(value: object, field_name: str) -> None:
 def _require_positive_ttl(ttl: timedelta) -> None:
     if type(ttl) is not timedelta or ttl <= timedelta(0):
         raise ValueError("lease ttl must be a positive timedelta")
+
+
+def _aligned_lease_ttl(conn: Connection, ttl: timedelta) -> timedelta:
+    """Return the DURATION to add to database time so the deadline outlasts ``ttl``.
+
+    A duration, never an instant: this reads no clock, it rounds ``ttl`` up to
+    a whole multiple of the clock's own resolution. ADR-047 puts the stamp and
+    every later liveness test on that one clock, and SQLite's is whole-second,
+    so a raw ``database_now + ttl`` is compared as though it had been stamped
+    at the top of the second: a sub-second lease then lapses at the next
+    boundary after ``1 - fraction`` seconds, with a floor of zero, instead of
+    lasting its TTL. Rounding up makes the stamp instant's own discarded
+    fraction the worst the comparison can cost. Whole-second TTLs -- which is
+    every lease TTL in ``src`` -- are unchanged on both dialects.
+    """
+    resolution = landscape_clock_resolution(conn)
+    return -(-ttl // resolution) * resolution
 
 
 def _utc(value: datetime) -> datetime:
@@ -157,7 +174,11 @@ class SinkEffectLifecycle:
                 raise SinkEffectLeaseLiveError("sink effect preparation has a live claim owned by another worker")
             self._require_predecessor_finalized(conn, row)
             generation = int(row.generation) + 1
-            expires_at = database_now + ttl
+            # ADR-047: the TTL is rounded up to the clock's resolution before
+            # it is added, or SQLite's whole second discards the stamp
+            # instant's own fraction and a sub-second lease lapses at the next
+            # boundary instead of after its TTL.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             claimed = conn.execute(
                 sink_effects_table.update()
                 .where(
@@ -370,7 +391,11 @@ class SinkEffectLifecycle:
                     return SinkEffectLease(row.effect_id, row.lease_owner, row.generation, _utc(row.lease_expires_at))
                 raise LandscapeRecordError(f"sink effect cannot acquire lease from state {row.state!r}")
             self._require_predecessor_finalized(conn, row)
-            expires_at = database_now + ttl
+            # ADR-047: the TTL is rounded up to the clock's resolution before
+            # it is added, or SQLite's whole second discards the stamp
+            # instant's own fraction and a sub-second lease lapses at the next
+            # boundary instead of after its TTL.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             generation = int(row.generation) + 1
             conn.execute(
                 sink_effects_table.update()
@@ -411,7 +436,11 @@ class SinkEffectLifecycle:
                 or (row.state == SinkEffectState.IN_FLIGHT.value and not lease_live)
             ):
                 raise LandscapeRecordError("sink effect lease heartbeat has stale owner or generation")
-            expires_at = database_now + ttl
+            # ADR-047: the TTL is rounded up to the clock's resolution before
+            # it is added, or SQLite's whole second discards the stamp
+            # instant's own fraction and a sub-second lease lapses at the next
+            # boundary instead of after its TTL.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             conn.execute(
                 sink_effects_table.update()
                 .where(sink_effects_table.c.effect_id == effect_id)
@@ -433,7 +462,11 @@ class SinkEffectLifecycle:
             if lease_live:
                 raise SinkEffectLeaseLiveError("sink effect lease has not expired")
             generation = int(row.generation) + 1
-            expires_at = database_now + ttl
+            # ADR-047: the TTL is rounded up to the clock's resolution before
+            # it is added, or SQLite's whole second discards the stamp
+            # instant's own fraction and a sub-second lease lapses at the next
+            # boundary instead of after its TTL.
+            expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             conn.execute(
                 sink_effects_table.update()
                 .where(

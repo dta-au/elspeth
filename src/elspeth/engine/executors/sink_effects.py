@@ -448,11 +448,20 @@ class SinkEffectCoordinator:
                 # strictly PAST the deadline, so a lease stamped at whole
                 # second S with TTL T is held until second S + T + 1. The
                 # budget therefore carries one clock resolution ABOVE the
-                # capped validity; capping the sum at the TTL instead left a
-                # wait that began inside the stamp's own second up to one
-                # second short of the takeover instant (nine recovery
-                # resumes in one gate run). The TTL still bounds the wait.
-                initial_budget = min(self._lease_ttl.total_seconds(), remaining_validity) + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
+                # remaining validity.
+                #
+                # The cap is the TTL ROUNDED UP to that same resolution, which
+                # is what the repository stamps (``_lease_deadline``). Capping
+                # at the raw TTL assumes a lease cannot outlive the TTL it was
+                # asked for, and on a quantised clock it always can: that
+                # assumption cost nine recovery resumes once already, patched
+                # then by adding a resolution on top of the wrong cap rather
+                # than correcting it. Remaining validity never exceeds the
+                # rounded TTL, so the cap binds only on a corrupt deadline.
+                quantised_ttl = (
+                    math.ceil(self._lease_ttl.total_seconds() / _LANDSCAPE_CLOCK_RESOLUTION_SECONDS) * _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
+                )
+                initial_budget = min(quantised_ttl, remaining_validity) + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
                 # Repository takeover is deliberately strict (expires_at < now).
                 # One bounded poll interval permits the final authority check to
                 # cross an exact equality without introducing an open-ended wait.

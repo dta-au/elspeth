@@ -557,3 +557,80 @@ def test_lease_decisions_ignore_the_process_clock_and_follow_database_time(
     taken = repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=ttl)
     assert taken.generation == lease.generation + 1
     assert_deadline_within(taken.expires_at, landscape_database_now(db.engine) + ttl)
+
+
+def test_a_sub_second_lease_is_live_for_its_whole_ttl_when_stamped_late_in_a_database_second(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    """C6-34-FIX: a lease is live for at least the TTL asked for, wherever in a database second it is stamped.
+
+    ADR-047 puts the stamp (``database_now + ttl``) and every later liveness
+    test (``lease_expires_at >= database_now``) on the same whole-second SQLite
+    clock. A raw sum discards the stamp instant's own fraction, so a 0.2 s
+    lease stamped 0.95 s into second S lapsed 50 ms later and the finalizer
+    then refused its OWN live lease ("sink effect finalization lease has
+    expired"). Rounding the TTL up to the clock's resolution restores the
+    guarantee; whole-second TTLs, which is every TTL in ``src``, are
+    unaffected.
+    """
+    import time
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.execution.sink_effect_lifecycle import lease_is_live
+    from tests.fixtures.landscape import late_in_a_database_second
+
+    db, factory = db_factory
+    repo = factory.execution.sink_effects
+    effect = _reserved(factory)
+    ttl = timedelta(milliseconds=200)
+
+    claim = late_in_a_database_second(
+        db.engine,
+        lambda _database_now: repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=ttl),
+    )
+    stamped_at = time.monotonic()
+
+    def _still_live() -> bool:
+        with db.write_connection() as conn:
+            database_now = read_landscape_transaction_time(conn)
+            return lease_is_live(conn, effect.effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+
+    assert _still_live(), f"the claim was not live at the instant it was stamped (deadline {claim.expires_at.isoformat()})"
+    # Measure the lifetime the lease actually delivers. Sampling and load can
+    # only ever OVER-report it, so a slow box cannot turn this assertion red;
+    # it can only mask the defect, which the mutant in the ledger covers.
+    give_up = time.monotonic() + 5.0
+    while time.monotonic() < give_up and _still_live():
+        time.sleep(0.005)
+    delivered = time.monotonic() - stamped_at
+    assert delivered >= ttl.total_seconds(), (
+        f"a lease claimed late in a database second delivered {delivered:.3f}s of its {ttl.total_seconds():.3f}s TTL "
+        f"(deadline {claim.expires_at.isoformat()})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("ttl", "expected"),
+    [
+        # SQLite's whole second: the corner that let a 0.2 s lease lapse.
+        (timedelta(milliseconds=200), timedelta(seconds=1)),
+        (timedelta(milliseconds=1), timedelta(seconds=1)),
+        # A fractional TTL above the resolution rounds UP, never down.
+        (timedelta(seconds=1, milliseconds=1), timedelta(seconds=2)),
+        # Whole seconds are untouched, so no production deadline moves: the
+        # only sink-effect TTL in ``src`` is the coordinator's 5 minutes.
+        (timedelta(seconds=1), timedelta(seconds=1)),
+        (timedelta(minutes=5), timedelta(minutes=5)),
+    ],
+)
+def test_aligned_lease_ttl_rounds_up_to_the_database_clock_resolution(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+    ttl: timedelta,
+    expected: timedelta,
+) -> None:
+    """The rounding is a pure duration: same clock resolution in, same offset out."""
+    from elspeth.core.landscape.execution.sink_effect_lifecycle import _aligned_lease_ttl
+
+    db, _factory = db_factory
+    with db.engine.connect() as conn:
+        assert _aligned_lease_ttl(conn, ttl) == expected

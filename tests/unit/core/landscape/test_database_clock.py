@@ -31,7 +31,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB, begin_write
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, verify_and_extend_leader_fence
 from elspeth.core.landscape.schema import run_coordination_table, runs_table
 from tests.fixtures.landscape import assert_deadline_within, make_landscape_db, within_one_database_second
@@ -267,3 +267,18 @@ class TestFirstFenceDatabaseDeadline:
         assert DEFAULT_RUN_HEARTBEAT_SECONDS >= 10
         assert DEFAULT_RUN_LIVENESS_WINDOW_SECONDS >= 10
         assert DEFAULT_ITEM_STALL_BUDGET_SECONDS >= 10
+
+
+def test_landscape_clock_resolution_is_each_dialect_s_own_granularity() -> None:
+    """The lease stamp rounds up to this, so it must match what the dialect's clock can express."""
+    assert landscape_clock_resolution(_FakeConnection("sqlite", None)) == timedelta(seconds=1)  # type: ignore[arg-type]
+    assert landscape_clock_resolution(_FakeConnection("postgresql", None)) == timedelta(microseconds=1)  # type: ignore[arg-type]
+    with pytest.raises(NotImplementedError, match="mysql"):
+        landscape_clock_resolution(_FakeConnection("mysql", None))  # type: ignore[arg-type]
+
+
+def test_landscape_clock_resolution_reads_no_clock() -> None:
+    """It reports the dialect's granularity; it is not another read of the clock."""
+    conn = _FakeConnection("sqlite", None)
+    assert type(landscape_clock_resolution(conn)) is timedelta  # type: ignore[arg-type]
+    assert conn.statements == []

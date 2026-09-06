@@ -267,6 +267,35 @@ def on_fresh_database_second(engine: Any, action: Any) -> Any:
     return result
 
 
+def late_in_a_database_second(engine: Any, action: Any, *, fraction: float = 0.95) -> Any:
+    """Run ``action(database_now)`` in the last sliver of a database second and return its result.
+
+    The mirror of :func:`on_fresh_database_second`, and the corner where a
+    quantised clock is least forgiving: a deadline stamped as
+    ``database_now + ttl`` from here discards almost a whole second of the
+    stamp instant, so a lease that should live for ``ttl`` lapses at the
+    boundary a few tens of milliseconds away. Any lever that stamps a deadline
+    and then asserts it survives a real interval belongs here rather than at
+    the top of a second, where the same defect is invisible.
+    """
+    import time
+
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("fraction must sit strictly inside one second")
+    first = landscape_database_now(engine)
+    deadline = time.monotonic() + 3.0
+    while (before := landscape_database_now(engine)) == first:
+        if time.monotonic() > deadline:
+            raise AssertionError("the Landscape database second did not advance within 3 s")
+        time.sleep(0.002)
+    # ``before`` is the first read of a fresh second; hold until ``fraction``
+    # of that second has passed, then act.
+    boundary = time.monotonic()
+    while time.monotonic() - boundary < fraction:
+        time.sleep(0.002)
+    return action(before)
+
+
 def within_one_database_second(engine: Any, action: Any, *, attempts: int = 20) -> Any:
     """Run ``action(database_now)`` and return its result once it completed inside one database second.
 
