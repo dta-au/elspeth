@@ -33,6 +33,7 @@ from elspeth.contracts.schema import (
     get_raw_producer_guaranteed_fields,
     get_raw_schema_config,
     get_raw_sink_required_fields,
+    node_type_nests_contract_options,
     raw_options_have_schema,
 )
 from elspeth.contracts.sink import (
@@ -1738,7 +1739,7 @@ def _batch_aware_placement_error(
 
 
 def _batch_distribution_profile_contract_options(node: NodeSpec) -> Mapping[str, Any]:
-    if node.node_type != "aggregation":
+    if not node_type_nests_contract_options(node.node_type):
         return node.options
     contract_options, _owner = get_aggregation_contract_options(node.options, owner=f"node:{node.id}")
     return contract_options
@@ -3990,14 +3991,15 @@ def _locked_input_field_set(options: Mapping[str, Any], owner: str) -> frozenset
 def _consumer_locked_input_set(node: NodeSpec) -> frozenset[str] | None:
     """Return the consumer node's accepted-input set when input is locked.
 
-    Aggregation nodes carry their contract under either flat ``options`` or a
-    nested ``options.options`` wrapper; resolve via ``get_aggregation_contract_options``
-    so locked-input detection uses the same alias resolution as the rest of
-    the contract pipeline. The augmented owner string the helper returns is
-    discarded so the caller's existing error-message wording is preserved.
+    The node kinds in ``NESTED_CONTRACT_OPTIONS_NODE_TYPES`` carry their
+    contract under either flat ``options`` or a nested ``options.options``
+    wrapper; resolve via ``get_aggregation_contract_options`` so locked-input
+    detection uses the same alias resolution as the rest of the contract
+    pipeline. The augmented owner string the helper returns is discarded so
+    the caller's existing error-message wording is preserved.
     """
     owner = f"node:{node.id}"
-    if node.node_type == "aggregation":
+    if node_type_nests_contract_options(node.node_type):
         contract_options, _ = get_aggregation_contract_options(node.options, owner=owner)
         return _locked_input_field_set(contract_options, owner=owner)
     return _locked_input_field_set(node.options, owner=owner)
@@ -4779,7 +4781,7 @@ def _check_schema_contracts(
         contract_owner = _producer_owner(producer)
         if not is_source_producer_id(producer.producer_id):
             producer_node = node_by_id[producer.producer_id]
-            if producer_node.node_type == "aggregation":
+            if node_type_nests_contract_options(producer_node.node_type):
                 try:
                     contract_options, contract_owner = get_aggregation_contract_options(
                         producer.options,
@@ -5835,12 +5837,13 @@ def _check_schema_contracts(
         fields via ``SchemaConfig.get_effective_required_fields``. Runtime
         marks those declared fields as required on the generated input Pydantic
         model, so Phase-2 type validation rejects a typed producer that does
-        not guarantee one. This helper mirrors that, honouring the aggregation
-        contract-options alias the rest of the contract pipeline uses.
+        not guarantee one. This helper mirrors that, honouring the nested
+        contract-options alias the rest of the contract pipeline uses for the
+        kinds in ``NESTED_CONTRACT_OPTIONS_NODE_TYPES``.
         """
         contract_options = node.options
         contract_owner = f"node:{node.id}"
-        if node.node_type == "aggregation":
+        if node_type_nests_contract_options(node.node_type):
             contract_options, contract_owner = get_aggregation_contract_options(node.options, owner=contract_owner)
         schema_config = get_raw_schema_config(contract_options, owner=contract_owner)
         if schema_config is None:
@@ -6045,7 +6048,7 @@ def _check_schema_contracts(
         try:
             consumer_options = consumer.options
             consumer_owner = consumer_component
-            if isinstance(consumer, NodeSpec) and consumer.node_type == "aggregation":
+            if isinstance(consumer, NodeSpec) and node_type_nests_contract_options(consumer.node_type):
                 consumer_options, consumer_owner = get_aggregation_contract_options(consumer.options, owner=consumer_owner)
             consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
         except ValueError:
@@ -6724,7 +6727,7 @@ def _check_schema_contracts(
             return
         try:
             contract_options = options
-            if node_type == "aggregation":
+            if node_type_nests_contract_options(node_type):
                 contract_options, _ = get_aggregation_contract_options(options, owner=owner)
             get_raw_schema_config(contract_options, owner=owner)
         except ValueError as exc:
