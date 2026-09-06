@@ -865,8 +865,26 @@ jobs:
           # pytest.skip / importorskip when their credentials are absent, which
           # is exit 0 anyway. ``|| status=$?`` captures the code without letting
           # ``set -e`` abort before we can inspect it.
+          #
+          # No `-m` here: the marker selection is pyproject addopts' (the single
+          # source of truth, pinned in tests/unit/cicd). The `-m integration`
+          # that used to sit on this line narrowed NOTHING — tests/integration/
+          # conftest.py auto-marks every node under this path `integration`, so
+          # it selected 3153 of 3153 — while REPLACING the addopts expression
+          # and so dropping every guard in it: 55 live_provider, 27
+          # testcontainer and 33 slow/stress/performance ids were selected (83
+          # distinct, overlapping). tests/conftest.py refuses a selected
+          # live_provider node with a UsageError, which is exit 4, and the only
+          # non-zero code this job tolerates is 5 — so the first genuinely green
+          # Test job would have failed this one and taken the run conclusion,
+          # and build-push.yaml with it (elspeth-7103e36698; the same defect as
+          # the closed elspeth-6128fc7f95 in the Test job, one job over).
+          # Nothing is retired by the narrower selection: the 27 testcontainer
+          # ids are a measured subset of the 298 the testcontainer job runs
+          # tree-wide, and the live_provider ids are operator-gated
+          # (`--run-live-provider`) and by design run in no CI job at all.
           status=0
-          uv run pytest tests/integration/ -v -m integration || status=$?
+          uv run pytest tests/integration/ -v || status=$?
           if [ "$status" -eq 5 ]; then
             echo "No integration tests collected (exit 5) — treating as a skip."
             exit 0
