@@ -2048,6 +2048,7 @@ async def run_tool_batch(
                     initial_version=initial_version,
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
+                    plugin_snapshot=ctx.plugin_snapshot,
                 )
             except ComposerRuntimePreflightError as preflight_exc:
                 recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
