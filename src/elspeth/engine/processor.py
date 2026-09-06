@@ -2685,7 +2685,6 @@ class RowProcessor:
                 "Fenced source ingest requires a coordination token; the unfenced arm must not reach this helper."
             )
         token = item.token
-        now = self._clock.now_utc()
         fields = self._work_codec.ready_fields(item, ingest_sequence=ingest_sequence)
 
         def insert_row_and_token(conn: Connection) -> tuple[AuditRow, AuditToken]:
@@ -2714,7 +2713,6 @@ class RowProcessor:
 
         _row, _token_record, scheduled = self._scheduler.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=now,
             insert_row_and_token=insert_row_and_token,
             token_id=fields.token_id,
             row_id=fields.row_id,
@@ -4133,7 +4131,6 @@ class RowProcessor:
         peer_owners = self._scheduler.peer_active_leases(
             run_id=self._run_id,
             caller_owner=self._scheduler_lease_owner,
-            now=self._clock.now_utc(),
         )
         if peer_owners:
             logger.debug(
@@ -4161,7 +4158,6 @@ class RowProcessor:
             self._scheduler.peer_active_leases(
                 run_id=self._run_id,
                 caller_owner=self._scheduler_lease_owner,
-                now=self._clock.now_utc(),
             )
         )
 
@@ -4178,7 +4174,6 @@ class RowProcessor:
         return self._scheduler.peer_active_leases(
             run_id=self._run_id,
             caller_owner=self._scheduler_lease_owner,
-            now=self._clock.now_utc(),
         )
 
     def reap_expired_peer_leases(self) -> int:

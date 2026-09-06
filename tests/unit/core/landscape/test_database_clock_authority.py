@@ -38,7 +38,7 @@ _ROOT = Path(__file__).resolve().parents[4]
 _CLOCK_AUTHORITY_VERBS = frozenset(
     {
         "_acquire_run_leadership_on",
-        "_recover_expired_leases",
+        "_rotate_expired_leases",
         "acquire_lease",
         "acquire_run_leadership",
         "admit_follower",
@@ -122,7 +122,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/engine/orchestrator/",
 )
-_CLOCK_BOUNDARY_DIGEST = "6e256864b43ab502abee6032acd80b880f1acfff40af3ff98db89eca96000497"
+_CLOCK_BOUNDARY_DIGEST = "8ee57c08a577512c4a821bafff79dc6509ebb3cc026e70620fc813ba12076b00"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -246,7 +246,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.adopt_group_losses"),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.stage_escalation_loss"),
-        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._recover_expired_leases"),
+        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._rotate_expired_leases"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_ready"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.claim_ready_row"),
@@ -2139,6 +2139,12 @@ class _ClockScanner(ast.NodeVisitor):
                 sources.add("process")
         elif isinstance(node, ast.Attribute):
             lowered = node.attr.lower()
+            if lowered.endswith("_id") and not _name_has_clock_marker(node.attr):
+                # An identity read (``run.run_id``, ``token.worker_id``) is not
+                # a clock, whatever clock the object it hangs off was built
+                # with (``Run(started_at=now())``); it contributes no source,
+                # so a deadline written from it still reads missing-database-time.
+                return frozenset(sources)
             if lowered in _FORENSIC_NAMES:
                 sources.add("forensic")
             if self._is_process_clock_callable(node, seen=seen, scope=scope):
@@ -2155,7 +2161,14 @@ class _ClockScanner(ast.NodeVisitor):
             if not process_clock and not database_clock and self._is_unresolved_clock_callable(node.func):
                 sources.add("unresolved")
 
-        for child in ast.iter_child_nodes(node):
+        children: list[ast.AST] = list(ast.iter_child_nodes(node))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "order_by":
+            # A column referenced only to ORDER a query (``.order_by(t.c.created_at)``)
+            # is a sort key, not a clock the query decides on: the rows it yields
+            # inherit no clock source from it. The receiver chain is still walked,
+            # so a WHERE or VALUES on the same query keeps its provenance.
+            children = [node.func]
+        for child in children:
             sources.update(self._clock_sources(child, seen=seen, scope=scope))
         return frozenset(sources)
 
@@ -2810,6 +2823,8 @@ def _deadline_expression_is_database_authoritative(
             return is_database_deadline(node.body) and is_database_deadline(node.orelse)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return (is_database_clock(node.left) and is_duration(node.right)) or (is_database_clock(node.right) and is_duration(node.left))
+        if isinstance(node, ast.Call) and _is_canonical_sqlite_strftime(node) and len(node.args) == 3:
+            return True
         return (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -2957,6 +2972,35 @@ def _first_fence_dependency_is_rebound(
     return False
 
 
+# SQLAlchemy's SQLite DateTime storage format. A fence deadline written with
+# ``strftime`` in exactly this format (fraction included) compares byte-for-byte
+# against a bound ``datetime`` of the same instant; ``CURRENT_TIMESTAMP`` alone
+# is fractionless text that sorts before such a bound value.
+_SQLITE_STORAGE_FORMAT = "%Y-%m-%d %H:%M:%S.000000"
+
+
+def _is_canonical_sqlite_strftime(call: ast.Call) -> bool:
+    """``func.strftime(<storage format>, func.current_timestamp()[, '+N seconds'])`` and nothing else."""
+    return (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "func"
+        and call.func.attr == "strftime"
+        and not call.keywords
+        and len(call.args) in {2, 3}
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == _SQLITE_STORAGE_FORMAT
+        and isinstance(call.args[1], ast.Call)
+        and isinstance(call.args[1].func, ast.Attribute)
+        and isinstance(call.args[1].func.value, ast.Name)
+        and call.args[1].func.value.id == "func"
+        and call.args[1].func.attr == "current_timestamp"
+        and not call.args[1].args
+        and not call.args[1].keywords
+        and (len(call.args) == 2 or _is_positive_seconds_modifier(call.args[2]))
+    )
+
+
 def _first_fence_statement_is_effect_free(statement: ast.expr) -> bool:
     for call in (candidate for candidate in ast.walk(statement) if isinstance(candidate, ast.Call)):
         terminal = _terminal_name(call.func)
@@ -2970,6 +3014,8 @@ def _first_fence_statement_is_effect_free(statement: ast.expr) -> bool:
             and (call.func.attr == "datetime" or not call.args)
             and not call.keywords
         ):
+            continue
+        if _is_canonical_sqlite_strftime(call):
             continue
         if (
             isinstance(call.func, ast.Name)
@@ -3364,6 +3410,37 @@ def test_first_fence_shape_accepts_effect_free_dialect_specific_database_deadlin
         1,
     )
     assert _first_fence_contract_violations(source) == ()
+
+
+def test_first_fence_shape_accepts_canonical_sqlite_storage_text_deadline_and_rejects_any_other_format() -> None:
+    """The SQLite fence may write its deadline as ``strftime`` in the exact DateTime storage format, and only that."""
+    canonical = _GOOD_FENCE_SOURCE.replace(
+        "func.current_timestamp() + window_seconds",
+        "(func.strftime('%Y-%m-%d %H:%M:%S.000000', func.current_timestamp(), f'+{window_seconds} seconds') "
+        "if conn.dialect.name == 'sqlite' else "
+        "func.current_timestamp() + timedelta(seconds=window_seconds))",
+        1,
+    ).replace(
+        "updated_at=func.current_timestamp(),",
+        "updated_at=(func.strftime('%Y-%m-%d %H:%M:%S.000000', func.current_timestamp()) "
+        "if conn.dialect.name == 'sqlite' else func.current_timestamp()),",
+        1,
+    )
+    assert _first_fence_contract_violations(canonical) == ()
+
+    fractionless = canonical.replace(
+        "'%Y-%m-%d %H:%M:%S.000000', func.current_timestamp(), f'+{window_seconds} seconds'",
+        "'%Y-%m-%d %H:%M:%S', func.current_timestamp(), f'+{window_seconds} seconds'",
+    )
+    assert fractionless != canonical
+    assert set(_first_fence_contract_violations(fractionless)) >= {"effectful-first-fence-expression", "missing-database-time-expression"}
+
+    caller_instant = canonical.replace(
+        "func.strftime('%Y-%m-%d %H:%M:%S.000000', func.current_timestamp(), f'+{window_seconds} seconds')",
+        "func.strftime('%Y-%m-%d %H:%M:%S.000000', caller_now, f'+{window_seconds} seconds')",
+    )
+    assert caller_instant != canonical
+    assert "missing-database-time-expression" in _first_fence_contract_violations(caller_instant)
 
 
 def test_first_fence_shape_ignores_unrelated_function_local_dependency_names_positive_control() -> None:
@@ -3820,6 +3897,109 @@ def rotate_custody(conn):
     ))
 """
     assert _scan_source(safe, path=path) == ()
+
+
+def test_column_referenced_only_in_order_by_contributes_no_clock_source() -> None:
+    """``.order_by(t.c.created_at)`` sorts; it does not make the selected row a forwarded clock.
+
+    A forensic column used to ORDER the claim SELECT must not taint the row
+    it yields (the ``claim_ready`` -> ``claim_ready_row`` seam), while the
+    same column in a ``values(...)`` or ``where(...)`` still reads as a
+    forensic clock reaching an authority deadline.
+    """
+    authority_path = "src/elspeth/core/landscape/custody_impl.py"
+    caller_path = "src/elspeth/core/landscape/claim_facade.py"
+    authority = """
+from datetime import timedelta
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+def claim_ready_row(conn, *, row, run_id, lease_owner, lease_seconds):
+    database_now = read_landscape_transaction_time(conn)
+    conn.execute(update(token_work_items_table).values(lease_expires_at=database_now + timedelta(seconds=lease_seconds)))
+"""
+    ordered_forward = """
+from elspeth.core.landscape.custody_impl import claim_ready_row
+
+def claim_ready(conn, *, run_id, lease_owner, lease_seconds):
+    row = conn.execute(
+        select(token_work_items_table)
+        .where(token_work_items_table.c.run_id == run_id)
+        .order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.created_at)
+        .limit(1)
+    ).mappings().first()
+    return claim_ready_row(conn, row=row, run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds)
+"""
+    assert [
+        violation for violation in _scan_sources({authority_path: authority, caller_path: ordered_forward}) if violation.path == caller_path
+    ] == []
+
+    values_from_forensic = ordered_forward.replace(
+        "    return claim_ready_row(",
+        "    conn.execute(update(token_work_items_table).values(lease_expires_at=row['created_at']))\n    return claim_ready_row(",
+    )
+    values_kinds = {
+        violation.kind
+        for violation in _scan_sources({authority_path: authority, caller_path: values_from_forensic})
+        if violation.path == caller_path
+    }
+    # The row carries no clock source any more, so a deadline written from
+    # it reads as a deadline with no database provenance — still refused.
+    assert values_kinds & {"forensic-clock-authority", "missing-database-time"}, values_kinds
+
+    where_from_forensic = ordered_forward.replace(
+        ".order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.created_at)",
+        ".where(token_work_items_table.c.lease_expires_at < token_work_items_table.c.created_at)"
+        ".order_by(token_work_items_table.c.ingest_sequence)",
+    )
+    where_kinds = {
+        violation.kind
+        for violation in _scan_sources({authority_path: authority, caller_path: where_from_forensic})
+        if violation.path == caller_path
+    }
+    assert where_kinds & {"forensic-clock-authority", "caller-clock-forwarding"}, where_kinds
+
+
+def test_identity_attribute_of_a_clock_built_object_is_not_a_forwarded_clock() -> None:
+    """``run.run_id`` off ``Run(started_at=now())`` names no clock; ``run.started_at`` still does."""
+    authority_path = "src/elspeth/core/landscape/custody_impl.py"
+    caller_path = "src/elspeth/core/landscape/lifecycle_facade.py"
+    authority = """
+from datetime import timedelta
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+def register_run_leader_on(conn, *, run_id, worker_id, window_seconds):
+    database_now = read_landscape_transaction_time(conn)
+    conn.execute(update(run_workers_table).values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds)))
+"""
+    identity_forward = """
+from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.custody_impl import register_run_leader_on
+
+def begin_run(conn, run_id):
+    timestamp = now()
+    run = Run(run_id=run_id, started_at=timestamp)
+    worker_id = mint_worker_id(run.run_id)
+    register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=80.0)
+"""
+    assert [
+        violation
+        for violation in _scan_sources({authority_path: authority, caller_path: identity_forward})
+        if violation.path == caller_path
+    ] == []
+
+    forensic_forward = identity_forward.replace("run_id=run.run_id, worker_id=worker_id", "run_id=run.run_id, worker_id=run.started_at")
+    forensic_kinds = {
+        violation.kind
+        for violation in _scan_sources({authority_path: authority, caller_path: forensic_forward})
+        if violation.path == caller_path
+    }
+    assert "caller-clock-forwarding" in forensic_kinds
+
+    identity_deadline = """
+def rotate(conn, run):
+    conn.execute(update(run_workers_table).values(heartbeat_expires_at=run.run_id))
+"""
+    assert "missing-database-time" in {violation.kind for violation in _scan_source(identity_deadline, path=authority_path)}
 
 
 def test_structural_inventory_follows_cross_file_authority_wrappers() -> None:
@@ -5619,7 +5799,6 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             node_id=source_node_id,
             step_index=0,
             ingest_sequence=0,
-            available_at=database_now() - timedelta(seconds=1),
             row_payload_json=row_payload,
         )
         landscape_before = database_now()

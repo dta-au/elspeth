@@ -234,10 +234,9 @@ def _enqueue_and_block(
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30, now=now + timedelta(seconds=1))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30)
     assert claimed is not None
     assert claimed.work_item_id == item.work_item_id
     repo.mark_blocked(
@@ -416,7 +415,6 @@ def test_complete_barrier_crash_atomicity() -> None:
         node_id=None,
         step_index=4,
         ingest_sequence=3,
-        available_at=NOW,
         row_payload_json=payload,
     )
     events_before = len(_events(engine))
@@ -750,7 +748,7 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
     assert json.loads(emission_enqueues[0]["context_json"]) == {"barrier_key": BARRIER_KEY, "consumed_count": 3}
 
     # The emitted READY continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-next", lease_seconds=30, now=NOW + timedelta(seconds=3))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-next", lease_seconds=30)
     assert claimed is not None
     assert claimed.token_id == "t-next"
 
@@ -826,8 +824,8 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
     )
 
     claimed = [
-        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30, now=NOW + timedelta(seconds=3)),
-        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30, now=NOW + timedelta(seconds=3)),
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
+        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
     ]
     assert [item.token_id if item is not None else None for item in claimed] == ["token-a", "token-b"]
 
@@ -1147,7 +1145,7 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
     assert len(enqueue_events) == 1
     assert json.loads(enqueue_events[0]["context_json"]) == {"barrier_key": COALESCE_KEY, "consumed_count": 2}
     # The merged continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-merged", lease_seconds=30, now=NOW + timedelta(seconds=3))
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-merged", lease_seconds=30)
     assert claimed is not None
     assert claimed.token_id == "t1-merged"
 

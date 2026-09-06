@@ -108,7 +108,7 @@ def token(db: LandscapeDB) -> CoordinationToken:
                 created_at=NOW,
             )
         )
-    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 def _bump_epoch(db: LandscapeDB) -> None:
@@ -162,9 +162,8 @@ def _seed_blocked_barrier_hold(db: LandscapeDB, *, sequence: int, barrier_key: s
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     blocked_at = NOW + timedelta(seconds=2)
     repo.mark_blocked(
@@ -216,10 +215,9 @@ def _seed_blocked_collector_hold(db: LandscapeDB, *, sequence: int, collector_na
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
         collector_name=collector_name,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     blocked_at = NOW + timedelta(seconds=2)
     repo.mark_blocked(
@@ -268,7 +266,6 @@ def test_facade_enqueue_ready_forwards_collector_name(db: LandscapeDB, token: Co
         step_index=1,
         ingest_sequence=0,
         row_payload_json=_payload_json(),
-        available_at=NOW,
         collector_name="stitch",
     )
     assert _work_item(db, token_id)["collector_name"] == "stitch"

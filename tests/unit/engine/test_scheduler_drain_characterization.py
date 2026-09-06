@@ -75,7 +75,7 @@ from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL, DAGTraversa
 from elspeth.engine.scheduler_drain import ProcessorMode
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
-from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, expire_lease, leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.helpers.tree_gate import iter_gate_sources
 
 NODE_ID = "normalize"
@@ -305,7 +305,6 @@ def _enqueue_ready(
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=clock.now_utc(),
         row_payload_json=_PAYLOAD,
         lineage_path=lineage_path,
     )
@@ -346,7 +345,7 @@ def _park_pending_sink(
 ) -> tuple[str, TokenInfo]:
     """Claim a READY row under ``owner`` and park it PENDING_SINK (crash image)."""
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=sequence)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=owner, lease_seconds=300, now=clock.now_utc())
+    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=owner, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_pending_sink(
         work_item_id=work_item_id,
@@ -932,10 +931,12 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
 
     # Model the successor process's lease reap through the repository's named
     # crash-image adapter, then enter through the production recovery drain.
+    # The crashed parent's lease is aged into the database's past (ADR-047):
+    # advancing the process MockClock cannot expire a database-time lease.
     clock.advance(1_000)
+    expire_lease(setup.db.engine, parent_work_item_id)
     recovered = setup.factory.scheduler.recover_expired_leases_legacy_unfenced(
         run_id=setup.run_id,
-        now=clock.now_utc(),
         caller_owner="restart-reaper",
     )
     assert recovered == 1
@@ -1141,7 +1142,7 @@ def test_non_recovery_drains_run_maintenance_every_interval() -> None:
     processor._drain_scheduler_claims(ctx=ctx, pending_items={}, recover_pending_sinks=False)
     recoveries = spy.calls_for("recover_expired_leases")
     assert len(recoveries) == 1
-    assert set(recoveries[0]) == {"now", "coordination_token"}
+    assert set(recoveries[0]) == {"coordination_token"}
     assert recoveries[0]["coordination_token"].worker_id == LEADER_OWNER
 
 

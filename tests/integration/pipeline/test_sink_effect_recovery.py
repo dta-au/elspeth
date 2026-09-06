@@ -199,13 +199,11 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
-            available_at=now,
         )
         claimed = factory.scheduler.claim_ready(
             run_id=run_id,
             lease_owner=leader.worker_id,
             lease_seconds=300,
-            now=now,
         )
         assert claimed is not None and claimed.work_item_id == ready.work_item_id
         parked = factory.scheduler.mark_pending_sink(

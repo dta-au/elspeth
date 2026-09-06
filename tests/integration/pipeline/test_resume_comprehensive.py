@@ -684,7 +684,6 @@ class TestResumeComprehensive:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(scheduled_row),
-            available_at=datetime.now(UTC),
         )
 
         output_path.write_text("id,value\n")

@@ -45,11 +45,12 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from sqlalchemy import and_, literal_column, select
+from sqlalchemy import and_, literal_column, select, update
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
@@ -65,6 +66,7 @@ from elspeth.core.config import (
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     node_states_table,
@@ -256,10 +258,21 @@ class _LeaseBusterTransform(BaseTransform):
             # fortiori the shorter heartbeat interval — the RowProcessor
             # constructor enforces heartbeat < lease) without sleeping.
             self._clock.advance(_LEASE_EXPIRY_ADVANCE)
+            # Lease expiry is decided on the Landscape database clock
+            # (ADR-047), which the process MockClock cannot move: age the
+            # in-flight lease — the only LEASED row at this point — into that
+            # clock's past so the peer sweep finds it lapsed.
+            with self._db.engine.begin() as conn:
+                aged = conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.run_id == ctx.run_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
+                )
+                assert aged.rowcount == 1, f"expected exactly the in-flight lease to be LEASED, matched {aged.rowcount}"
             peer_repo = TokenSchedulerRepository(self._db.engine)
             self.peer_recovered_count = peer_repo.recover_expired_leases_legacy_unfenced(
                 run_id=ctx.run_id,
-                now=self._clock.now_utc(),
                 caller_owner=self._peer_owner,
             )
         return TransformResult.success(row, success_reason={"action": "lease_buster"})

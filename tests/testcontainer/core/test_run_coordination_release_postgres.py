@@ -10,8 +10,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import event, insert, select
+from sqlalchemy import event, func, insert, select, update
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.fixtures.landscape import assert_stamped_between, expire_leader_seat, landscape_database_now, stamp_inside_next_transaction
 from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -172,28 +173,29 @@ def test_postgresql_initial_leader_registration_is_atomic(postgres_url: str) -> 
     event.listen(db.engine, "before_cursor_execute", fail_first_evidence)
     try:
         with pytest.raises(RuntimeError, match="forced PostgreSQL coordination evidence failure"):
-            register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
+            register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=30)
     finally:
         event.remove(db.engine, "before_cursor_execute", fail_first_evidence)
 
     assert capture_state_engine_image(db, run_id=run_id) == before
-    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=30)
+    registered_from = landscape_database_now(db.engine)
+    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=30)
+    registered_until = landscape_database_now(db.engine)
     try:
         assert token == CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
         with db.read_only_connection() as conn:
             seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).mappings().one()
             member = conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == worker_id)).mappings().one()
-        assert (seat["leader_worker_id"], seat["leader_epoch"], seat["leader_heartbeat_expires_at"]) == (
-            worker_id,
-            1,
-            now + timedelta(seconds=30),
+        assert (seat["leader_worker_id"], seat["leader_epoch"]) == (worker_id, 1)
+        assert (member["run_id"], member["role"], member["status"]) == (run_id, "leader", "active")
+        # Both deadlines are the ONE database-time read of the registering
+        # transaction plus the window (ADR-047): identical, and inside the bracket.
+        assert seat["leader_heartbeat_expires_at"] == member["heartbeat_expires_at"]
+        assert_stamped_between(
+            seat["leader_heartbeat_expires_at"], start=registered_from, end=registered_until, offset=timedelta(seconds=30)
         )
-        assert (member["run_id"], member["role"], member["status"], member["heartbeat_expires_at"]) == (
-            run_id,
-            "leader",
-            "active",
-            now + timedelta(seconds=30),
-        )
+        assert_stamped_between(seat["updated_at"], start=registered_from, end=registered_until)
+        assert_stamped_between(member["registered_at"], start=registered_from, end=registered_until)
         events = _coordination_events(db, run_id=run_id)
         assert [row["event_type"] for row in events] == ["worker_register", "leader_acquire"]
         assert all(row["leader_epoch"] == 1 for row in events)
@@ -203,34 +205,45 @@ def test_postgresql_initial_leader_registration_is_atomic(postgres_url: str) -> 
 
 @pytest.mark.timeout(120)
 def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(postgres_url: str) -> None:
-    """RC-02 uses a strict-expiry conditional update at microsecond precision."""
+    """RC-02 uses a strict-expiry conditional update at microsecond precision.
+
+    The CAS compares the seat against the Landscape database's transaction
+    time (ADR-047), so each boundary arm stamps the seat INSIDE the takeover's
+    own transaction from ``CURRENT_TIMESTAMP``: equal to it (not expired,
+    refused, rolled back with the refusal) and one microsecond before it
+    (strictly expired, admitted).
+    """
     now = datetime(2026, 8, 12, 7, 0, tzinfo=UTC)
-    expiry = now + timedelta(seconds=1)
     run_id = "run-postgresql-takeover-boundary"
     incumbent_id = mint_worker_id(run_id)
     db = LandscapeDB.from_url(postgres_url)
     repo = RunCoordinationRepository(db.engine)
     _seed_run(db, run_id=run_id, now=now, status="failed")
-    register_run_leader(repo, run_id=run_id, worker_id=incumbent_id, now=now, window_seconds=1)
+    register_run_leader(repo, run_id=run_id, worker_id=incumbent_id, window_seconds=30)
     before_equality = capture_state_engine_image(db, run_id=run_id)
     equality_contender = mint_worker_id(run_id)
+    seat_deadline = update(run_coordination_table).where(run_coordination_table.c.run_id == run_id)
 
-    with pytest.raises(NonResumableRunError, match="run leadership is held by"):
+    with (
+        stamp_inside_next_transaction(db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp())),
+        pytest.raises(NonResumableRunError, match="run leadership is held by"),
+    ):
         repo.acquire_run_leadership(
             run_id=run_id,
             worker_id=equality_contender,
-            now=expiry,
             window_seconds=30,
         )
     assert capture_state_engine_image(db, run_id=run_id) == before_equality
 
     successor_id = mint_worker_id(run_id)
-    token = repo.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=successor_id,
-        now=expiry + timedelta(microseconds=1),
-        window_seconds=30,
-    )
+    with stamp_inside_next_transaction(
+        db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp() - timedelta(microseconds=1))
+    ):
+        token = repo.acquire_run_leadership(
+            run_id=run_id,
+            worker_id=successor_id,
+            window_seconds=30,
+        )
     try:
         assert token == CoordinationToken(run_id=run_id, worker_id=successor_id, leader_epoch=2)
         with db.read_only_connection() as conn:
@@ -270,22 +283,20 @@ def test_postgresql_concurrent_takeover_conditional_update_has_one_winner(postgr
             RunCoordinationRepository(first_db.engine),
             run_id=run_id,
             worker_id=incumbent_id,
-            now=now,
-            window_seconds=1,
+            window_seconds=30,
         )
+        expire_leader_seat(first_db, run_id)
         outcomes = _run_takeover_contenders(
             first_db,
             lambda: RunCoordinationRepository(first_db.engine).acquire_run_leadership(
                 run_id=run_id,
                 worker_id=first_id,
-                now=now + timedelta(seconds=2),
                 window_seconds=30,
             ),
             second_db,
             lambda: RunCoordinationRepository(second_db.engine).acquire_run_leadership(
                 run_id=run_id,
                 worker_id=second_id,
-                now=now + timedelta(seconds=2),
                 window_seconds=30,
             ),
         )
@@ -313,19 +324,28 @@ def test_postgresql_concurrent_takeover_conditional_update_has_one_winner(postgr
 
 @pytest.mark.timeout(120)
 def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(postgres_url: str) -> None:
-    """RC-03 heartbeat keeps one active PostgreSQL leader live at equality."""
+    """RC-03 heartbeat keeps one active PostgreSQL leader live at equality.
+
+    The beat's transaction finds both deadlines EQUAL to its own transaction
+    time (stamped inside it from ``CURRENT_TIMESTAMP``) and moves both to
+    database time + window in one read (ADR-047), without an event.
+    """
     now = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
     run_id = "run-postgresql-active-heartbeat"
     worker_id = mint_worker_id(run_id)
     db = LandscapeDB.from_url(postgres_url)
     repo = RunCoordinationRepository(db.engine)
     _seed_run(db, run_id=run_id, now=now, status="failed")
-    register_run_leader(repo, run_id=run_id, worker_id=worker_id, now=now, window_seconds=5)
+    register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=5)
     events_before = _coordination_events(db, run_id=run_id)
 
-    heartbeat_at = now + timedelta(seconds=5)
-    snapshot = repo.worker_heartbeat(worker_id=worker_id, now=heartbeat_at, window_seconds=5)
-    extended_expiry = now + timedelta(seconds=10)
+    at_equality = (
+        update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=func.current_timestamp())
+    )
+    beat_from = landscape_database_now(db.engine)
+    with stamp_inside_next_transaction(db.engine, at_equality):
+        snapshot = repo.worker_heartbeat(worker_id=worker_id, window_seconds=5)
+    beat_until = landscape_database_now(db.engine)
     try:
         assert snapshot.worker_active is True
         assert snapshot.leader_worker_id == worker_id
@@ -338,15 +358,14 @@ def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(post
             worker_expiry = conn.execute(
                 select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == worker_id)
             ).scalar_one()
-        assert seat_expiry == extended_expiry
-        assert worker_expiry == extended_expiry
+        assert seat_expiry == worker_expiry
+        assert_stamped_between(seat_expiry, start=beat_from, end=beat_until, offset=timedelta(seconds=5))
         assert _coordination_events(db, run_id=run_id) == events_before
 
         with pytest.raises(NonResumableRunError, match="run leadership is held by"):
             repo.acquire_run_leadership(
                 run_id=run_id,
                 worker_id=mint_worker_id(run_id),
-                now=extended_expiry,
                 window_seconds=30,
             )
         assert _coordination_events(db, run_id=run_id) == events_before
@@ -358,7 +377,6 @@ def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(post
 def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgres_url: str) -> None:
     """RC-06: departure is terminal for the worker identity on PostgreSQL."""
     now = datetime(2026, 8, 12, 9, 30, tzinfo=UTC)
-    departed_at = now + timedelta(seconds=10)
     run_id = "run-postgresql-follower-departure"
     leader_id = "leader-follower-departure"
     follower_id = "follower-departure"
@@ -366,12 +384,11 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
     try:
         repo = RunCoordinationRepository(db.engine)
         _seed_run(db, run_id=run_id, now=now)
-        register_run_leader(repo, run_id=run_id, worker_id=leader_id, now=now, window_seconds=30)
+        register_run_leader(repo, run_id=run_id, worker_id=leader_id, window_seconds=30)
         repo.admit_follower(
             run_id=run_id,
             worker_id=follower_id,
             config_hash="config",
-            now=now,
             window_seconds=30,
         )
         with db.read_only_connection() as conn:
@@ -380,12 +397,16 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
             )
         events_before = _coordination_events(db, run_id=run_id)
 
-        repo.depart_worker(worker_id=follower_id, now=departed_at)
+        departed_from = landscape_database_now(db.engine)
+        repo.depart_worker(worker_id=follower_id)
+        departed_until = landscape_database_now(db.engine)
 
         with db.read_only_connection() as conn:
             follower_after = dict(
                 conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == follower_id)).mappings().one()
             )
+        departed_at = follower_after["departed_at"]
+        assert_stamped_between(departed_at, start=departed_from, end=departed_until)
         expected_follower = dict(follower_before)
         expected_follower["status"] = "departed"
         expected_follower["departed_at"] = departed_at
@@ -404,7 +425,6 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
 
         snapshot = repo.worker_heartbeat(
             worker_id=follower_id,
-            now=departed_at + timedelta(seconds=1),
             window_seconds=30,
         )
 
@@ -436,7 +456,8 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
             )
         )
     incumbent_id = mint_worker_id(RUN_ID)
-    token = register_run_leader(repo, run_id=RUN_ID, worker_id=incumbent_id, now=NOW, window_seconds=1)
+    token = register_run_leader(repo, run_id=RUN_ID, worker_id=incumbent_id, window_seconds=30)
+    expire_leader_seat(db, RUN_ID)  # the takeover arm needs an expired seat; the release arm ignores expiry
     successor_id = mint_worker_id(RUN_ID)
 
     release_has_first_lock = threading.Event()
@@ -478,7 +499,7 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
 
     def release() -> None:
         try:
-            repo.release_seat(token=token, now=NOW + timedelta(seconds=3))
+            repo.release_seat(token=token)
             outcomes["release"] = "returned"
         except BaseException as exc:  # pragma: no cover - asserted below
             outcomes["release"] = exc
@@ -488,7 +509,6 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
             outcomes["acquire"] = repo.acquire_run_leadership(
                 run_id=RUN_ID,
                 worker_id=successor_id,
-                now=NOW + timedelta(seconds=3),
                 window_seconds=30,
             )
         except BaseException as exc:  # pragma: no cover - asserted below

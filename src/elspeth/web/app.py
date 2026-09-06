@@ -72,12 +72,6 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_endpoints,
     validate_oidc_issuer,
 )
-from elspeth.web.aws_ecs_startup import (
-    AwsEcsSchemaNotReadyError,
-    enforce_aws_ecs_contract,
-    require_runtime_directories_mounted,
-    validate_only_schema_or_raise,
-)
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
@@ -88,33 +82,35 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.membership_authority import (
+    RepositoryWebInstanceMembershipAuthority,
+    web_instance_identity_from_settings,
+)
+from elspeth.web.coordination.membership_lifecycle import (
+    RegisteredWebInstanceMembership,
+    SingleProcessWebInstanceMembership,
+    WebInstanceMembership,
+)
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS, resolve_deployment_state_mode
+from elspeth.web.deployment_contract import resolve_deployment_state_mode
+from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
-from elspeth.web.external_state_startup import (
-    _CONNECT_TIMEOUT_SECONDS,
-    ExternalStateSchemaNotReadyError,
-    enforce_external_state_contract,
-)
-from elspeth.web.external_state_startup import (
-    require_runtime_directories_mounted as require_external_runtime_directories_mounted,
-)
-from elspeth.web.external_state_startup import (
-    validate_only_schema_or_raise as validate_external_schema_or_raise,
-)
+from elspeth.web.external_state_startup import _CONNECT_TIMEOUT_SECONDS
 from elspeth.web.key_derivation import (
     derive_binding_generation_key,
     derive_session_token_key,
     derive_user_secret_master_key,
 )
 from elspeth.web.landscape_access import open_landscape_db
+from elspeth.web.middleware.instance_identity import InstanceIdentityMiddleware
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
@@ -136,12 +132,7 @@ from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import (
-    EnsureIdentityOutcome,
-    ensure_identity,
-    read_identity,
-    retire_identity,
-)
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -560,6 +551,12 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             attributes={"source": "startup", "excluded_live_runs": 0},
         )
 
+    # Join the deployment only after the startup sweeps have settled: from
+    # here on peers see this process as a live owner. A registration failure
+    # (a live process already holds this instance id, or the database is
+    # unreachable) fails boot, exactly like the sweeps above.
+    await app.state.web_instance_membership.start()
+
     # Resolve the paired browser endpoints from discovery or explicit config.
     if settings.auth_provider in ("oidc", "entra"):
         if settings.oidc_issuer:
@@ -799,6 +796,11 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Drain first: readiness fails at once and the membership row says
+        # ``draining`` while the executor's work drains, so the platform stops
+        # routing new work here before anything is torn down. The row write's
+        # outcome is returned, never raised — shutdown proceeds regardless.
+        await app.state.web_instance_membership.begin_drain()
         # Cancel periodic cleanup before shutting down the executor. A fatal
         # sweeper failure cancels this owning task via the done callback above;
         # awaiting the completed task then restores that original failure.
@@ -814,7 +816,14 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             # Shutdown execution service thread pool without blocking the loop:
             # worker cleanup still schedules terminal-state writes back onto it.
             try:
-                await execution_service.shutdown()
+                try:
+                    await execution_service.shutdown()
+                finally:
+                    # The membership row records ``stopped`` (lease expired at
+                    # once, so peers take over immediately) only after the
+                    # executor has drained; a failed executor shutdown must
+                    # not leave the row draining under a live lease.
+                    await app.state.web_instance_membership.stop()
             finally:
                 # Tier-2 operator telemetry stops only after all audited execution
                 # work has drained. Expected collector outages are bounded/redacted
@@ -1019,7 +1028,7 @@ def _session_token_audience(settings: WebSettings) -> str:
 
 def _build_local_auth_provider(
     settings: WebSettings,
-    session_engine: Engine,
+    identity_authority: RepositoryIdentityAuthority,
     *,
     resolved_state_mode: Literal["sqlite-single", "external-postgresql"],
 ) -> LocalAuthProvider:
@@ -1028,7 +1037,10 @@ def _build_local_auth_provider(
     ``auth.db`` holds credentials, the identities substrate holds admission,
     and the issuer holds the token. This function is the only place that knows
     all three, which is what keeps ``LocalAuthProvider`` from needing an
-    engine and the issuer from needing settings.
+    engine and the issuer from needing settings. The substrate arrives as the
+    ``RepositoryIdentityAuthority`` -- the one writer of the identity tables --
+    never as the engine, so nothing built here can reach those tables around
+    it (P4-D6).
     """
     # The SAME resolved mode the app-state recorder gets. Letting this one
     # re-resolve would be two recorders that can disagree about which
@@ -1037,7 +1049,7 @@ def _build_local_auth_provider(
     audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
 
     def _principal_is_active(identity_id: str) -> bool:
-        record = read_identity(session_engine, identity_id)
+        record = identity_authority.read_identity(identity_id=identity_id)
         # An absent row is never an implicit grant.
         return record is not None and record.is_active
 
@@ -1062,14 +1074,25 @@ def _build_local_auth_provider(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_retirement(outcome: IdentityRetired) -> None:
+        # Runs INSIDE retire_identity's transaction: a credential deletion
+        # whose identity event the Landscape cannot hold does not retire the
+        # identity, the same rule the admission pair follows.
+        audit_recorder.record_identity_retired(
+            provider="local",
+            identity_id=outcome.record.identity_id,
+            username=outcome.record.username,
+            retired_subject=outcome.record.subject,
+            reason=outcome.reason,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
         # may admit themselves, so it would be incoherent to hold back the
         # people who did so before this table existed while admitting every
         # newcomer instantly.
-        return ensure_identity(
-            session_engine,
+        return identity_authority.ensure_identity(
             claims=claims,
             activate=settings.registration_mode == "open",
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
@@ -1086,19 +1109,14 @@ def _build_local_auth_provider(
         principal_is_active=_principal_is_active,
     )
 
-    def _retire_identity(username: str) -> None:
-        retire_identity(
-            session_engine,
-            provider="local",
-            subject=username,
-            reason="local credential deleted",
-        )
-
     return LocalAuthProvider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
-        retire_identity=_retire_identity,
+        # The same retirement collaborator every surface that deletes a local
+        # credential binds, so the provider, subject and reason are decided
+        # in exactly one place.
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 
@@ -1143,14 +1161,27 @@ def _create_app(
 
     resolved_state_mode = resolve_deployment_state_mode(settings)
     external_state = resolved_state_mode == "external-postgresql"
+    # One closed profile per deployment target names the startup hooks this
+    # process boots through and the platform variables that carry its replica
+    # identity (web/deployment_profiles.py); app.py never branches on the
+    # target vocabulary itself.
+    profile = deployment_startup_profile(settings.deployment_target)
+    # The identity this process presents: on every response as
+    # X-Elspeth-Instance, in /api/system/status, and as the owner of the
+    # session-operation fences it acquires. Minted once per process unless
+    # WebSettings.instance_id pins it.
+    instance_id = resolve_instance_id(settings)
+    # Tier-3 read of the platform-stamped revision/replica names (absent off
+    # the platform; a malformed value refuses the boot).
+    platform_identity = read_platform_identity(profile)
 
     # Reject incomplete deployment policy before installing the process-global
     # provider. A failed first create_app() must not strand a later corrected
-    # boot on a provider selected from invalid settings.
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-        enforce_aws_ecs_contract(settings, resolved_state_mode=resolved_state_mode)
-    elif external_state:
-        enforce_external_state_contract(settings, resolved_state_mode=resolved_state_mode)
+    # boot on a provider selected from invalid settings. The aws-ecs contract
+    # is enforced in every state mode (it is the contract that rejects a
+    # non-external mode); the provider-neutral one only under external state.
+    if external_state or profile.contract_family == "aws-ecs":
+        profile.enforce_contract(settings, resolved_state_mode=resolved_state_mode)
 
     operator_runtime = bootstrap_operator_telemetry(settings)
     operator_meter = operator_runtime.provider.get_meter(__name__, __version__)
@@ -1368,15 +1399,21 @@ def _create_app(
     # a body-too-large rejection has no useful pairing to a slog event.
     app.add_middleware(_BodySizeLimitMiddleware)
     app.add_middleware(_BrowserDocumentHeadersMiddleware)
+    # Instance identity registered after every other middleware so it runs
+    # OUTERMOST: every response — the body-size 413, the request-id
+    # middleware's synthesized 500, error envelopes — carries
+    # X-Elspeth-Instance, because a probe scoring a cross-replica conflict
+    # needs the identity of the replica that refused as much as the one that
+    # served. It only wraps send; nothing inbound is read.
+    app.add_middleware(InstanceIdentityMiddleware, instance_id=instance_id)
 
     app.state.settings = settings
+    app.state.instance_id = instance_id
+    app.state.platform_identity = platform_identity
 
     external_session_engine: Engine | None = None
     if external_state:
-        if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-            require_runtime_directories_mounted(settings)
-        else:
-            require_external_runtime_directories_mounted(settings)
+        profile.require_runtime_directories_mounted(settings)
         raw_session_url = settings.session_db_url
         assert raw_session_url is not None
         try:
@@ -1386,21 +1423,12 @@ def _create_app(
                 **postgres_engine_kwargs(raw_session_url),
             )
         except (SQLAlchemyError, ImportError):
-            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-                raise AwsEcsSchemaNotReadyError(
-                    "AWS ECS session_schema engine could not be constructed. Run 'elspeth doctor aws-ecs' for full diagnostics."
-                ) from None
-            raise ExternalStateSchemaNotReadyError(
-                "External-state session_schema engine could not be constructed. Run 'elspeth doctor deployment' for full diagnostics."
-            ) from None
+            raise profile.session_engine_not_ready_error() from None
         session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         try:
-            if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-                validate_only_schema_or_raise(settings, external_session_engine)
-            else:
-                validate_external_schema_or_raise(settings, external_session_engine)
+            profile.validate_only_schema_or_raise(settings, external_session_engine)
         except BaseException as exc:
             _run_session_engine_finalizer(session_engine_finalizer, primary_error=exc)
             raise
@@ -1468,6 +1496,13 @@ def _create_app(
     app.state.sessions_telemetry = sessions_telemetry
 
     app.state.session_engine = session_engine  # available to guided step handlers
+    # --- Identity authority ---
+    # The ONE writer of identities / identity_roles / identity_relationships
+    # (and the quota row an admission grants). Built before the auth provider
+    # because a local provider admits and retires through it, and published
+    # on app.state for the identity routes.
+    identity_authority = RepositoryIdentityAuthority(session_engine)
+    app.state.identity_authority = identity_authority
 
     # --- Auth provider setup ---
     #
@@ -1476,7 +1511,7 @@ def _create_app(
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
     if settings.auth_provider == "local":
-        local_provider = _build_local_auth_provider(settings, session_engine, resolved_state_mode=resolved_state_mode)
+        local_provider = _build_local_auth_provider(settings, identity_authority, resolved_state_mode=resolved_state_mode)
         local_provider.publish_pending_email_verifications(settings.data_dir / "email-verifications.jsonl")
         auth_provider = local_provider
     elif settings.auth_provider == "oidc":
@@ -1606,8 +1641,31 @@ def _create_app(
         session_operation_authority=session_operation_authority,
         audit_access_log_authority=audit_access_log_authority,
         skill_markdown_history_authority=skill_markdown_history_authority,
+        # The fence rows this replica writes name the same identity the wire
+        # shows, so a 409 from one replica pairs with the 2xx from the other.
+        owner_instance_id=instance_id,
     )
     app.state.session_service = session_service
+
+    # --- Web-instance membership (the web_instances writer) ---
+    # A PostgreSQL-backed replica registers itself under the SAME instance id
+    # it fences with (session_operation_owner_instance_id): peers join an
+    # expired fence's owner to web_instances and may take over only once the
+    # membership lease has also expired. A single-process SQLite deployment
+    # keeps no membership rows but owns the same draining signal, so the
+    # readiness gate reads identically on both modes. Registration and the
+    # heartbeat start in the lifespan, after the startup sweeps.
+    web_instance_membership: WebInstanceMembership
+    if session_engine.dialect.name == "postgresql":
+        web_instance_membership = RegisteredWebInstanceMembership(
+            RepositoryWebInstanceMembershipAuthority(session_engine),
+            web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+    else:
+        web_instance_membership = SingleProcessWebInstanceMembership()
+    app.state.web_instance_membership = web_instance_membership
+    app.state.instance_draining = web_instance_membership.draining
     readiness_probe_runner = ReadinessProbeRunner()
     app.state.readiness_probe_runner = readiness_probe_runner
     app.state.readiness_cache = ReadinessCache()
@@ -1996,6 +2054,7 @@ def _create_app(
                 request.app.state.session_engine,
                 request.app.state.readiness_probe_runner,
                 request.app.state.deployment_state_mode,
+                instance_draining=request.app.state.instance_draining,
             )
 
         try:
@@ -2043,6 +2102,17 @@ def _create_app(
             # renders it as the classification banner in the reserved
             # overlay band.
             "classification_banner": settings.classification_banner,
+            # The answering process's identity — the same value every
+            # response carries as X-Elspeth-Instance and the session-
+            # operation fences record as their owner; distinct per replica.
+            "instance_id": instance_id,
+            "deployment_target": settings.deployment_target,
+            # Platform-stamped revision/replica names when the target's
+            # platform publishes them through the environment (Azure
+            # Container Apps: CONTAINER_APP_REVISION /
+            # CONTAINER_APP_REPLICA_NAME); null elsewhere.
+            "deployment_revision": platform_identity.revision,
+            "deployment_replica": platform_identity.replica,
         }
 
     # --- Prometheus metrics scrape endpoint ---

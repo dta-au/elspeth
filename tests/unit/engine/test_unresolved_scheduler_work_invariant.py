@@ -80,13 +80,12 @@ def _enqueue_ready_token(setup: RecorderSetup, scheduler: TokenSchedulerReposito
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=_PAYLOAD,
     )
 
 
 def _claim(scheduler: TokenSchedulerRepository, run_id: str) -> TokenWorkItem:
-    item = scheduler.claim_ready(run_id=run_id, lease_owner=LEASE_OWNER, lease_seconds=300, now=NOW)
+    item = scheduler.claim_ready(run_id=run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
     assert item is not None
     return item
 
@@ -166,9 +165,7 @@ def test_passes_for_leased_pending_sink_reclaim() -> None:
     _enqueue_ready_token(setup, scheduler)
     claimed = _claim(scheduler, setup.run_id)
     _mark_pending_sink(scheduler, claimed.work_item_id)
-    reclaimed = scheduler.claim_pending_sink(
-        run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300, now=NOW + timedelta(seconds=2)
-    )
+    reclaimed = scheduler.claim_pending_sink(run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
     assert reclaimed is not None
     assert reclaimed.status is TokenWorkStatus.LEASED
     assert reclaimed.pending_sink_name == "sink-a"

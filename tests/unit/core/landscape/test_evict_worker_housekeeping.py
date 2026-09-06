@@ -37,6 +37,7 @@ from elspeth.contracts.coordination import (
     CoordinationToken,
 )
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -50,6 +51,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import landscape_database_now
 
 RUN_ID = "run-evict-housekeeping"
 NOW = datetime(2026, 6, 13, 10, 0, 0, tzinfo=UTC)
@@ -232,9 +234,8 @@ def _seed_leased_item(
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=now,
     )
-    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds, now=now)
+    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds)
     assert item is not None
     return item.work_item_id
 
@@ -251,11 +252,11 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         coord = RunCoordinationRepository(engine)
         _seed_run(engine)
 
-        sweep_at = NOW + timedelta(seconds=200)  # well past grace threshold
         leader_id = "leader-w"
         token = _seed_leader(engine, leader_id=leader_id, now=NOW)
 
-        # Two followers with expired heartbeats.
+        # Two followers with expired heartbeats (the sweep judges them against
+        # the Landscape database clock, ADR-047; NOW is months in its past).
         follower_a, follower_b = "follower-a", "follower-b"
         expired_hb = NOW - timedelta(seconds=GRACE + 10)
         _seed_follower(engine, worker_id=follower_a, now=NOW, heartbeat_expires_at=expired_hb)
@@ -264,7 +265,6 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         dead = coord.dead_non_leader_workers(
             run_id=RUN_ID,
             leader_worker_id=leader_id,
-            now=sweep_at,
             grace_seconds=GRACE,
         )
         assert set(dead) == {follower_a, follower_b}
@@ -273,14 +273,12 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         evicted_a = coord.evict_worker(
             token=token,
             target_worker_id=follower_a,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
         evicted_b = coord.evict_worker(
             token=token,
             target_worker_id=follower_b,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -310,14 +308,12 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         # One live follower, one dead follower.
         live_follower = "follower-live"
         dead_follower = "follower-dead"
-        _seed_follower(engine, worker_id=live_follower, now=NOW, heartbeat_expires_at=NOW + timedelta(hours=1))
+        _seed_follower(engine, worker_id=live_follower, now=NOW, heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1))
         _seed_follower(engine, worker_id=dead_follower, now=NOW, heartbeat_expires_at=NOW - timedelta(seconds=GRACE + 10))
 
-        sweep_at = NOW + timedelta(seconds=200)
         dead = coord.dead_non_leader_workers(
             run_id=RUN_ID,
             leader_worker_id=leader_id,
-            now=sweep_at,
             grace_seconds=GRACE,
         )
         assert dead == (dead_follower,)  # tuple, deterministic by registered_at
@@ -346,7 +342,6 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         dead = coord.dead_non_leader_workers(
             run_id=RUN_ID,
             leader_worker_id=leader_id,
-            now=NOW + timedelta(seconds=200),
             grace_seconds=GRACE,
         )
 
@@ -371,7 +366,6 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         result = coord.evict_worker(
             token=token,
             target_worker_id=target,
-            now=NOW + timedelta(seconds=200),
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -399,7 +393,6 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         result = coord.evict_worker(
             token=token,
             target_worker_id=target,
-            now=NOW + timedelta(seconds=200),
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -421,13 +414,11 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
 
         # Follower has a FRESH heartbeat — the grace CAS will miss.
         fresh_follower = "follower-fresh"
-        _seed_follower(engine, worker_id=fresh_follower, now=NOW, heartbeat_expires_at=NOW + timedelta(hours=1))
+        _seed_follower(engine, worker_id=fresh_follower, now=NOW, heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1))
 
-        sweep_at = NOW + timedelta(seconds=200)
         result = coord.evict_worker(
             token=token,
             target_worker_id=fresh_follower,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -447,16 +438,15 @@ class TestEvictWorkerHousekeepingIndividualNotBulk:
         token = _seed_leader(engine, leader_id=leader_id, now=NOW)
 
         target = "worker-with-lease"
-        # Expired heartbeat but holds an UNEXPIRED item lease.
+        # Expired heartbeat but holds an UNEXPIRED item lease (the lease is
+        # judged against the Landscape database clock, so it is minted from it).
         expired_hb = NOW - timedelta(seconds=GRACE + 10)
         _seed_follower(engine, worker_id=target, now=NOW, heartbeat_expires_at=expired_hb)
-        _seed_leased_item(engine, token_id="token-held", lease_owner=target, now=NOW, lease_seconds=600)
+        _seed_leased_item(engine, token_id="token-held", lease_owner=target, now=landscape_database_now(engine), lease_seconds=600)
 
-        sweep_at = NOW + timedelta(seconds=200)
         result = coord.evict_worker(
             token=token,
             target_worker_id=target,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -493,21 +483,19 @@ class TestEvictionBeforeReapOrdering:
         from sqlalchemy import update
 
         _seed_leased_item(engine, token_id="token-dead-owned", lease_owner=dead_member, now=NOW, lease_seconds=10)
-        # Force-expire the lease.
-        sweep_at = NOW + timedelta(seconds=200)
+        # Force-expire the lease one second into the database's past (ADR-047).
         with engine.begin() as conn:
             conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.run_id == RUN_ID)
                 .where(token_work_items_table.c.lease_owner == dead_member)
-                .values(lease_expires_at=NOW - timedelta(seconds=1))
+                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
             )
 
         # Step 1: evict before reap.
         evicted = coord.evict_worker(
             token=token,
             target_worker_id=dead_member,
-            now=sweep_at,
             grace_seconds=GRACE,
             window_seconds=WINDOW,
         )
@@ -516,7 +504,6 @@ class TestEvictionBeforeReapOrdering:
 
         # Step 2: reap. The owner is now status='evicted' → owner_registry_dead (arm b).
         reaped = scheduler.recover_expired_leases(
-            now=sweep_at,
             coordination_token=token,
             grace_seconds=GRACE,
             stall_budget_seconds=1.0,  # very short budget to force reap regardless

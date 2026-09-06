@@ -11,10 +11,10 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import make_factory, register_test_node, stamp_inside_next_transaction
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
@@ -24,6 +24,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -97,7 +98,6 @@ def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) ->
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=PAYLOAD,
     )
     return item.work_item_id
@@ -127,6 +127,9 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
     ids["foreign-ready"] = _enqueue(factory, OTHER_RUN_ID, "foreign-ready", 100)
 
     with db.engine.begin() as conn:
+        # Liveness and lease expiry are judged against the Landscape database
+        # clock (ADR-047; PostgreSQL transaction time inside this seed).
+        database_now = read_landscape_transaction_time(conn)
         for owner in (PEER_A, PEER_B):
             conn.execute(
                 insert(run_workers_table).values(
@@ -135,7 +138,7 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
                     role="follower",
                     status="active",
                     registered_at=NOW,
-                    heartbeat_expires_at=NOW + timedelta(minutes=5),
+                    heartbeat_expires_at=database_now + timedelta(minutes=5),
                 )
             )
 
@@ -146,26 +149,26 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
             "leased-self",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=LEADER,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=database_now + timedelta(seconds=10),
         )
         for name, owner in (("leased-peer-a", PEER_A), ("leased-peer-b", PEER_B)):
             set_item(
                 name,
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=owner,
-                lease_expires_at=NOW + timedelta(seconds=10),
+                lease_expires_at=database_now + timedelta(seconds=10),
             )
         set_item(
             "leased-peer-equality",
             status=TokenWorkStatus.LEASED.value,
             lease_owner="worker:rm-postgresql-run:equality",
-            lease_expires_at=NOW,
+            lease_expires_at=database_now,
         )
         set_item(
             "leased-sink-redrive",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=PEER_A,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=database_now + timedelta(seconds=10),
             pending_sink_name="sink-a",
             pending_outcome=TerminalOutcome.SUCCESS.value,
             pending_path=TerminalPath.DEFAULT_FLOW.value,
@@ -259,7 +262,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
     )
 
     # RM-06: duplicate owners collapse and exact expiry equality is inactive.
-    assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER, now=NOW) == (PEER_A, PEER_B)
+    assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER) == (PEER_A, PEER_B)
 
     # RM-09..RM-13: active identities, barrier subtype partition, and order.
     assert repository.active_row_ids(run_id=RUN_ID) == frozenset(
@@ -302,22 +305,31 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
     _begin_run(factory, run_id, leader)
     coordination = RunCoordinationRepository(postgres_db.engine)
 
-    occupied = coordination.live_leader(run_id=run_id, now=NOW)
+    occupied = coordination.live_leader(run_id=run_id)
     assert occupied is not None
     assert occupied.leader_worker_id == leader
     assert occupied.seat_live is True
-    equality = coordination.live_leader(run_id=run_id, now=occupied.leader_heartbeat_expires_at)
+    # Liveness is judged against the reading transaction's own database time
+    # (ADR-047): a deadline stamped EQUAL to it inside that transaction is live.
+    seat_at_equality = (
+        update(run_coordination_table)
+        .where(run_coordination_table.c.run_id == run_id)
+        .values(leader_heartbeat_expires_at=func.current_timestamp())
+    )
+    with stamp_inside_next_transaction(postgres_db.engine, seat_at_equality):
+        equality = coordination.live_leader(run_id=run_id)
     assert equality is not None
     assert equality.seat_live is True
-    assert coordination.live_leader(run_id="rm-postgresql-missing", now=NOW) is None
+    assert coordination.live_leader(run_id="rm-postgresql-missing") is None
 
-    threshold = NOW - timedelta(seconds=10)
+    # NOW is in the database clock's past: these deadlines are all beyond the
+    # grace threshold; "equality" is re-stamped inside the sweep's transaction.
     registered_at = NOW - timedelta(minutes=2)
     workers = (
-        ("dead-z", "follower", "active", threshold - timedelta(seconds=1), registered_at),
-        ("dead-a", "follower", "active", threshold - timedelta(seconds=1), registered_at),
-        ("equality", "follower", "active", threshold, registered_at + timedelta(seconds=1)),
-        ("departed", "follower", "departed", threshold - timedelta(seconds=2), registered_at),
+        ("dead-z", "follower", "active", NOW - timedelta(seconds=11), registered_at),
+        ("dead-a", "follower", "active", NOW - timedelta(seconds=11), registered_at),
+        ("equality", "follower", "active", NOW - timedelta(seconds=10), registered_at + timedelta(seconds=1)),
+        ("departed", "follower", "departed", NOW - timedelta(seconds=12), registered_at),
     )
     with postgres_db.engine.begin() as conn:
         for worker_id, role, status, expires_at, registered in workers:
@@ -332,12 +344,18 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
                     departed_at=NOW if status == "departed" else None,
                 )
             )
-    assert coordination.dead_non_leader_workers(
-        run_id=run_id,
-        leader_worker_id=leader,
-        now=NOW,
-        grace_seconds=10,
-    ) == ("dead-a", "dead-z")
+    member_at_threshold = (
+        update(run_workers_table)
+        .where(run_workers_table.c.worker_id == "equality")
+        .values(heartbeat_expires_at=func.current_timestamp() - timedelta(seconds=10))
+    )
+    with stamp_inside_next_transaction(postgres_db.engine, member_at_threshold):
+        dead = coordination.dead_non_leader_workers(
+            run_id=run_id,
+            leader_worker_id=leader,
+            grace_seconds=10,
+        )
+    assert dead == ("dead-a", "dead-z")
 
     with postgres_db.engine.begin() as conn:
         conn.execute(
@@ -345,7 +363,7 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
             .where(run_coordination_table.c.run_id == run_id)
             .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=NOW)
         )
-    assert coordination.live_leader(run_id=run_id, now=NOW) is None
+    assert coordination.live_leader(run_id=run_id) is None
 
 
 def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(

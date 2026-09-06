@@ -116,6 +116,21 @@ def _psycopg_connect(url: str) -> psycopg.Connection[Any]:
     )
 
 
+def _grant_web_instances_dml(session_owner_url: str, runtime_role: str) -> None:
+    """Grant INSERT and UPDATE on the one table a booting replica writes.
+
+    ``web_instances`` lives in the session database only, and provisioning runs
+    both before and after schema init, so an absent table is skipped: boot
+    cannot register into a table that does not exist, and validate-only refuses
+    earlier with a schema-not-ready error.
+    """
+    with _psycopg_connect(session_owner_url) as owner:
+        existing = owner.execute("SELECT to_regclass('public.web_instances')").fetchone()
+        if existing is None or existing[0] is None:
+            return
+        owner.execute(sql.SQL("GRANT INSERT, UPDATE ON web_instances TO {}").format(sql.Identifier(runtime_role)))
+
+
 @dataclass(slots=True)
 class _DatabasePair:
     postgres_url: str
@@ -171,15 +186,27 @@ class _DatabasePair:
                 )
 
         self.role_created = True
-        self.grant_runtime_read_permissions()
+        self.grant_runtime_permissions()
 
-    def grant_runtime_read_permissions(self) -> None:
+    def grant_runtime_permissions(self) -> None:
+        """Grant the runtime role its documented minimum: read everything, write ``web_instances``.
+
+        Read-only is no longer enough. A PostgreSQL replica registers itself in
+        ``web_instances`` during the lifespan, so boot needs UPDATE (for the
+        ``SELECT ... FOR UPDATE`` that claims the row) and INSERT (for a first
+        registration) on that one table. Deliberately NOT a blanket DML grant:
+        this helper is what proves which privileges boot actually requires, so
+        widening it would stop the test catching a new write. "Validate-only"
+        is unchanged — it means DDL denied, which ``_assert_ddl_denied`` still
+        pins, and it never meant no DML at boot.
+        """
         assert self.role_created
         for owner_url in (self.session_owner_url, self.landscape_owner_url):
             with _psycopg_connect(owner_url) as owner:
                 owner.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
                 owner.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
                 owner.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(self.runtime_role)))
+        _grant_web_instances_dml(self.session_owner_url, self.runtime_role)
 
 
 @pytest.fixture
@@ -446,7 +473,7 @@ def test_validate_only_startup_rejects_missing_and_stale_schema_without_leaking_
         assert probe_session_schema(session_owner) is SchemaState.MISSING
 
         init_session_schema(session_owner)
-        database_pair.grant_runtime_read_permissions()
+        database_pair.grant_runtime_permissions()
         with session_owner.begin() as connection:
             connection.execute(update(session_schema_identity_table).values(schema_epoch=SESSION_SCHEMA_EPOCH - 1))
         assert probe_session_schema(session_owner) is SchemaState.STALE

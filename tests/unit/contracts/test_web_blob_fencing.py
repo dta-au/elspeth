@@ -3182,13 +3182,14 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
 
     The number is the substrate's LIVE epoch, and it moves whenever the
     session schema does -- 51 for the coordination substrate, 52 once the
-    pluggable-SSO identity substrate landed on top of it. The claim the test
+    pluggable-SSO identity substrate landed on top of it, 53 once the read
+    admissions took their own rows (elspeth-f98e0ae8b2). The claim the test
     makes is unchanged either way: the fence vocabulary lives in the session
     schema and the web coordination PROTOCOL version does not move with it.
     The assertion exists to fail when someone bumps one without the other.
     """
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 52
+    assert SESSION_SCHEMA_EPOCH == 53
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

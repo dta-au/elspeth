@@ -272,14 +272,16 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     inspector = inspect(eng)
 
     # 48 -> 51 by the multi-replica merge (elspeth-4d6c0dd0f5), then -> 52
-    # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73).
+    # when the pluggable-SSO identity substrate landed (elspeth-07cd19ba73),
+    # then -> 53 for the per-admission read records (elspeth-f98e0ae8b2).
     # _COORDINATION_HARD_CUT_EPOCH tracks this by exact equality, so a bump
     # that missed it would stop every session DB from opening.
-    assert SESSION_SCHEMA_EPOCH == 52
+    assert SESSION_SCHEMA_EPOCH == 53
     expected_tables = frozenset(
         {
             "web_instances",
             "session_operation_fences",
+            "session_read_admissions",
             "run_start_permits",
             "run_execution_inputs",
             "websocket_tickets",
@@ -295,6 +297,7 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     expected_indexes = {
         "web_instances": {"ix_web_instances_compatibility", "ix_web_instances_lease_expires_at"},
         "session_operation_fences": {"ix_session_operation_fences_lease_expires_at"},
+        "session_read_admissions": {"ix_session_read_admissions_expires_at"},
         "run_start_permits": {"ix_run_start_permits_retention_expires_at"},
         "run_execution_inputs": set(),
         "websocket_tickets": {"ix_websocket_tickets_expires_at", "ix_websocket_tickets_run_id"},
@@ -332,6 +335,15 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
             "ck_session_operation_fences_positive_epoch",
             "ck_session_operation_fences_session_id_nonblank",
             "ck_session_operation_fences_token_not_owner",
+        },
+        "session_read_admissions": {
+            "ck_session_read_admissions_expiry_after_admission",
+            "ck_session_read_admissions_lease_token_nonblank",
+            "ck_session_read_admissions_operation_id_nonblank",
+            "ck_session_read_admissions_owner_nonblank",
+            "ck_session_read_admissions_positive_epoch",
+            "ck_session_read_admissions_session_id_nonblank",
+            "ck_session_read_admissions_token_not_owner",
         },
         "run_start_permits": {
             "ck_run_start_permits_run_id_nonblank",

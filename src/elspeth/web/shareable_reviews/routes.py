@@ -81,10 +81,13 @@ def create_shareable_reviews_router() -> APIRouter:
         await verify_session_ownership(session_id, user, request)
         service: ShareableReviewService = request.app.state.shareable_review_service
         session_service: SessionServiceProtocol = request.app.state.session_service
+        # Marking ready writes a composer-completion event, so this is a
+        # writer: it takes COMPOSE authority and answers 409 while another
+        # compose is live (elspeth-bf52d495a2, option A).
         lease = await SessionOperationLease.acquire(
             session_service.session_operation_authority,
             session_id=session_id,
-            operation_kind=SessionOperationKind.BLOB_READ,
+            operation_kind=SessionOperationKind.COMPOSE,
             owner_instance_id=session_service.session_operation_owner_instance_id,
             lease_seconds=session_service.session_operation_lease_seconds,
         )

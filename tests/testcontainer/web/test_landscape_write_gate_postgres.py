@@ -346,7 +346,6 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             node_id="transform",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
         duplicate = scheduler.enqueue_ready(
@@ -356,7 +355,6 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             node_id="transform",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
         assert duplicate.work_item_id == item.work_item_id

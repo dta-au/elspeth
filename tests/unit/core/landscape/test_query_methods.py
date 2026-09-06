@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -2563,7 +2562,6 @@ class TestGetSchedulerEventsForTokens:
         factory.data_flow.create_token("row-1", token_id="tok-1")
         factory.data_flow.create_token("row-2", token_id="tok-2")
         payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, _MINIMAL_CONTRACT))
-        now = datetime.now(UTC)
         for token_id, row_id, ingest in (("tok-1", "row-1", 0), ("tok-2", "row-2", 1)):
             factory.scheduler.enqueue_ready(
                 run_id="run-1",
@@ -2572,7 +2570,6 @@ class TestGetSchedulerEventsForTokens:
                 node_id="transform-1",
                 step_index=1,
                 ingest_sequence=ingest,
-                available_at=now,
                 row_payload_json=payload,
             )
         return factory

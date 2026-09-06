@@ -16,13 +16,15 @@ from typing import Any
 
 import pytest
 
+from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
 from elspeth.web.execution.preflight import _authored_named_components, _authored_options, _authored_sources
 from elspeth.web.execution.validation import _CompiledIdentityDocument
 
 
-def _authored_document() -> dict[str, Any]:
+def _authored_document() -> LoweredPipelineDocument:
+    """The shape ``generate_yaml`` lowers to: ``sources`` (never the historical singular ``source``)."""
     return {
-        "source": {"plugin": "csv", "options": {"path": "in.csv", "columns": ["a", "b"]}},
+        "sources": {"source": {"plugin": "csv", "options": {"path": "in.csv", "columns": ["a", "b"]}}},
         "transforms": [{"name": "enrich", "plugin": "reference_join", "options": {"output": {"d": "ref['d']"}}}],
         "sinks": {"out": {"plugin": "json", "options": {"path": "out.json"}}},
     }
@@ -36,7 +38,7 @@ class TestFrozenDocument:
         assert type(document.config) is MappingProxyType
         assert type(document.config["transforms"]) is tuple
         assert type(document.config["transforms"][0]) is MappingProxyType
-        assert type(document.config["source"]["options"]["columns"]) is tuple
+        assert type(document.config["sources"]["source"]["options"]["columns"]) is tuple
 
         # Mutating the caller's dict after construction cannot reach the document.
         source["transforms"][0]["options"]["output"]["d"] = "ref['other']"
@@ -59,14 +61,14 @@ class TestAuditSafeSettingsEgress:
         assert type(thawed) is dict
         assert type(thawed["transforms"]) is list
         assert type(thawed["transforms"][0]) is dict
-        assert type(thawed["source"]["options"]["columns"]) is list
+        assert type(thawed["sources"]["source"]["options"]["columns"]) is list
         assert thawed is not document.config
 
         # Deep mutation of the egress leaves the document and the next egress intact.
         thawed["transforms"][0]["options"]["output"]["d"] = "ref['mutated']"
-        thawed["source"]["options"]["columns"].append("z")
+        thawed["sources"]["source"]["options"]["columns"].append("z")
         assert document.config["transforms"][0]["options"]["output"]["d"] == "ref['d']"
-        assert document.config["source"]["options"]["columns"] == ("a", "b")
+        assert document.config["sources"]["source"]["options"]["columns"] == ("a", "b")
         again = document.audit_safe_settings()
         assert again == expected
         assert again is not thawed

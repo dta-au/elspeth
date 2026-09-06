@@ -30,8 +30,9 @@ from typing import Any, cast
 
 import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
-from sqlalchemy import event, insert, select
+from sqlalchemy import event, func, insert, select, update
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, stamp_inside_next_transaction
 from tests.helpers.state_engine import capture_state_engine_image
 
 from elspeth.contracts import TerminalOutcome, TerminalPath
@@ -43,6 +44,7 @@ from elspeth.contracts.errors import RunWorkerEvictedError, SchedulerLeaseLostEr
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -174,7 +176,6 @@ def _enqueue_ready_item(
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=now,
         join_group_id=join_group_id,
     )
 
@@ -335,9 +336,9 @@ def test_postgresql_ready_claim_conditional_update_has_one_winner(
         second_repo = TokenSchedulerRepository(second_db.engine)
         outcomes = _run_two_contenders(
             first_db,
-            lambda: first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30, now=now),
+            lambda: first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30),
             second_db,
-            lambda: second_repo.claim_ready(run_id=run_id, lease_owner=second_owner, lease_seconds=30, now=now),
+            lambda: second_repo.claim_ready(run_id=run_id, lease_owner=second_owner, lease_seconds=30),
         )
         winners = [outcome for outcome in outcomes if isinstance(outcome, TokenWorkItem)]
         losers = [outcome for outcome in outcomes if outcome is None]
@@ -375,7 +376,7 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
         first_repo = TokenSchedulerRepository(first_db.engine)
         second_repo = TokenSchedulerRepository(second_db.engine)
         item = _enqueue_ready_item(first_db.engine, run_id=run_id, token_id="tok-pending-winner", now=now)
-        claimed = first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30, now=now)
+        claimed = first_repo.claim_ready(run_id=run_id, lease_owner=first_owner, lease_seconds=30)
         assert claimed is not None
         pending = first_repo.mark_pending_sink(
             work_item_id=item.work_item_id,
@@ -401,9 +402,9 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
         )
         outcomes = _run_two_contenders(
             first_db,
-            lambda: first_repo.claim_pending_sink(run_id=run_id, lease_owner=first_owner, lease_seconds=30, now=now),
+            lambda: first_repo.claim_pending_sink(run_id=run_id, lease_owner=first_owner, lease_seconds=30),
             second_db,
-            lambda: second_repo.claim_pending_sink(run_id=run_id, lease_owner=second_owner, lease_seconds=30, now=now),
+            lambda: second_repo.claim_pending_sink(run_id=run_id, lease_owner=second_owner, lease_seconds=30),
         )
         winners = [outcome for outcome in outcomes if isinstance(outcome, TokenWorkItem)]
         assert len(winners) == 1
@@ -428,7 +429,6 @@ def test_postgresql_pending_sink_conditional_update_preserves_exact_bundle(postg
 def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_at(postgres_url: str) -> None:
     """AUX-01: a successful registered heartbeat emits no scheduler event."""
     now = datetime(2026, 8, 12, 2, 30, tzinfo=UTC)
-    heartbeat_at = now + timedelta(seconds=5)
     run_id = "run-postgresql-lease-heartbeat"
     owner = "leader-lease-heartbeat"
     db = LandscapeDB.from_url(postgres_url)
@@ -444,24 +444,30 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
         )
         repo = TokenSchedulerRepository(db.engine)
         item = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-lease-heartbeat", now=now)
-        assert repo.claim_ready(run_id=run_id, lease_owner=owner, lease_seconds=10, now=now) is not None
+        assert repo.claim_ready(run_id=run_id, lease_owner=owner, lease_seconds=10) is not None
         before = _work_item_row(db, run_id=run_id)
         events_before = _scheduler_events(db, run_id=run_id)
 
+        heartbeat_from = landscape_database_now(db.engine)
         new_expiry = repo.heartbeat_lease(
             run_id=run_id,
             work_item_id=item.work_item_id,
             lease_owner=owner,
             lease_seconds=30,
-            now=heartbeat_at,
             membership_fenced=True,
         )
+        heartbeat_until = landscape_database_now(db.engine)
 
+        # The heartbeat's deadline and stamp are one PostgreSQL transaction
+        # instant + lease_seconds (ADR-047); nothing else in the image moves.
+        after = _work_item_row(db, run_id=run_id)
+        assert_stamped_between(after["updated_at"], start=heartbeat_from, end=heartbeat_until, tolerance=timedelta(0))
+        assert after["lease_expires_at"] == after["updated_at"] + timedelta(seconds=30)
+        assert new_expiry == after["lease_expires_at"]
         expected = dict(before)
-        expected["lease_expires_at"] = heartbeat_at + timedelta(seconds=30)
-        expected["updated_at"] = heartbeat_at
-        assert new_expiry == expected["lease_expires_at"]
-        assert _work_item_row(db, run_id=run_id) == expected
+        expected["lease_expires_at"] = after["lease_expires_at"]
+        expected["updated_at"] = after["updated_at"]
+        assert after == expected
         assert _scheduler_events(db, run_id=run_id) == events_before
     finally:
         db.close()
@@ -471,7 +477,6 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
 def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_lost(postgres_url: str) -> None:
     """AUX-02: a recovered generation refuses its predecessor with evidence."""
     now = datetime(2026, 8, 12, 2, 45, tzinfo=UTC)
-    lease_expiry = now + timedelta(seconds=10)
     run_id = "run-postgresql-heartbeat-cas-loss"
     original_leader = "leader-heartbeat-loss"
     lease_owner = "worker-heartbeat-loss"
@@ -489,28 +494,28 @@ def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_
         repo = TokenSchedulerRepository(db.engine)
         coord = RunCoordinationRepository(db.engine)
         original = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-heartbeat-cas-loss", now=now)
-        claimed = repo.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=10, now=now)
+        claimed = repo.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=10)
         assert claimed is not None
         successor = coord.acquire_run_leadership(
             run_id=run_id,
             worker_id="leader-heartbeat-loss-successor",
-            now=now + timedelta(seconds=2),
             window_seconds=WINDOW,
         )
-        recovered_at = lease_expiry + timedelta(microseconds=1)
-        assert repo.recover_expired_leases(now=recovered_at, coordination_token=successor, grace_seconds=0) == 1
+        expire_lease(db.engine, claimed.work_item_id)
+        assert repo.recover_expired_leases(coordination_token=successor, grace_seconds=0) == 1
         row_before = _work_item_row(db, run_id=run_id)
         events_before = _scheduler_events(db, run_id=run_id)
 
+        heartbeat_from = landscape_database_now(db.engine)
         with pytest.raises(SchedulerLeaseLostError):
             repo.heartbeat_lease(
                 run_id=run_id,
                 work_item_id=original.work_item_id,
                 lease_owner=lease_owner,
                 lease_seconds=30,
-                now=recovered_at + timedelta(seconds=1),
                 membership_fenced=True,
             )
+        heartbeat_until = landscape_database_now(db.engine)
 
         assert _work_item_row(db, run_id=run_id) == row_before
         events_after = _scheduler_events(db, run_id=run_id)
@@ -537,7 +542,8 @@ def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_
             original.attempt + 1,
             lease_owner,
         )
-        assert lease_lost["recorded_at"] == recovered_at + timedelta(seconds=1)
+        # The evidence is stamped from the refused heartbeat's own transaction time (ADR-047).
+        assert_stamped_between(lease_lost["recorded_at"], start=heartbeat_from, end=heartbeat_until, tolerance=timedelta(0))
         assert '"reason":"heartbeat_cas_miss_after_recovery"' in str(lease_lost["context_json"])
         assert _scheduler_event_types(db, run_id=run_id)[-1] == SchedulerEventType.LEASE_LOST.value
     finally:
@@ -547,7 +553,6 @@ def test_postgresql_heartbeat_cas_loss_after_strict_recovery_records_only_lease_
 @pytest.mark.timeout(120)
 def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_once(postgres_url: str) -> None:
     now = datetime(2026, 8, 12, 3, 0, tzinfo=UTC)
-    lease_expiry = now + timedelta(seconds=10)
     run_id = "run-transform-recovery-boundary"
     original_leader = "leader-transform-original"
     db = LandscapeDB.from_url(postgres_url)
@@ -563,19 +568,36 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
     repo = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
     original = _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-transform-recovery", now=now)
-    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10, now=now)
-    assert claimed is not None and claimed.lease_expires_at == lease_expiry
+    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10)
+    assert claimed is not None
     successor = coord.acquire_run_leadership(
         run_id=run_id,
         worker_id="leader-transform-successor",
-        now=now + timedelta(seconds=2),
         window_seconds=WINDOW,
     )
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
-        assert repo.recover_expired_leases(now=lease_expiry, coordination_token=successor) == 0
+        fenced_from = landscape_database_now(db.engine)
+        # Exact-expiry arm: the deadline is written from the sweep's OWN
+        # transaction time as its first statement, so it EQUALS the
+        # database_now the sweep decides on; ``lease_expires_at <
+        # database_now`` is strict, so nothing is recoverable.
+        with stamp_inside_next_transaction(
+            db.engine,
+            update(token_work_items_table)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=func.current_timestamp()),
+        ):
+            assert repo.recover_expired_leases(coordination_token=successor) == 0
+        fenced_until = landscape_database_now(db.engine)
         after_equality = capture_state_engine_image(db, run_id=run_id)
-        assert before_equality.diff(after_equality).changed_columns == {"run_coordination": {"leader_heartbeat_expires_at", "updated_at"}}
+        # The boundary stamp is the only token_work_items write; the sweep
+        # itself moved nothing but the leader fence's seat refresh.
+        assert before_equality.diff(after_equality).changed_columns == {
+            "run_coordination": {"leader_heartbeat_expires_at", "updated_at"},
+            "token_work_items": {"lease_expires_at"},
+        }
         with db.read_only_connection() as conn:
             equality_seat = conn.execute(
                 select(
@@ -583,13 +605,19 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
                     run_coordination_table.c.updated_at,
                 ).where(run_coordination_table.c.run_id == run_id)
             ).one()
-        assert tuple(equality_seat) == (lease_expiry + timedelta(seconds=WINDOW), lease_expiry)
+        # The leader fence re-stamps the seat from the database's transaction
+        # time (ADR-047): deadline = that instant + WINDOW, updated_at = that instant.
+        assert equality_seat[0] - equality_seat[1] == timedelta(seconds=WINDOW)
+        assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
         equality_image = _work_item_row(db, run_id=run_id)
+        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
+        assert equality_image["lease_expires_at"] == equality_seat[1]
         assert equality_image["work_item_id"] == original.work_item_id
         assert equality_image["status"] == TokenWorkStatus.LEASED.value
         assert equality_image["attempt"] == 1
 
-        assert repo.recover_expired_leases(now=lease_expiry + timedelta(microseconds=1), coordination_token=successor) == 1
+        expire_lease(db.engine, original.work_item_id)
+        assert repo.recover_expired_leases(coordination_token=successor) == 1
         recovered = _work_item_row(db, run_id=run_id)
         assert recovered["work_item_id"] != original.work_item_id
         assert recovered["status"] == TokenWorkStatus.READY.value
@@ -604,7 +632,6 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
 def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves_bundle(postgres_url: str) -> None:
     """TS-06 preserves a legal COALESCED bundle through claim and recovery."""
     now = datetime(2026, 8, 12, 4, 0, tzinfo=UTC)
-    lease_expiry = now + timedelta(seconds=10)
     run_id = "run-sink-recovery-boundary"
     original_leader = "leader-sink-original"
     join_group_id = "join-postgresql-sink-recovery"
@@ -627,7 +654,7 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         now=now,
         join_group_id=join_group_id,
     )
-    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=30, now=now)
+    claimed = repo.claim_ready(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=30)
     assert claimed is not None
     pending = repo.mark_pending_sink(
         work_item_id=item.work_item_id,
@@ -641,8 +668,8 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         expected_lease_owner=original_token.worker_id,
         worker_id=original_token.worker_id,
     )
-    redrive = repo.claim_pending_sink(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10, now=now)
-    assert redrive is not None and redrive.lease_expires_at == lease_expiry
+    redrive = repo.claim_pending_sink(run_id=run_id, lease_owner=original_token.worker_id, lease_seconds=10)
+    assert redrive is not None
     bundle_columns = (
         "work_item_id",
         "attempt",
@@ -671,14 +698,31 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
     successor = coord.acquire_run_leadership(
         run_id=run_id,
         worker_id="leader-sink-successor",
-        now=now + timedelta(seconds=2),
         window_seconds=WINDOW,
     )
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
-        assert repo.recover_expired_leases(now=lease_expiry, coordination_token=successor) == 0
+        fenced_from = landscape_database_now(db.engine)
+        # Exact-expiry arm: the deadline is written from the sweep's OWN
+        # transaction time as its first statement, so it EQUALS the
+        # database_now the sweep decides on; ``lease_expires_at <
+        # database_now`` is strict, so nothing is recoverable.
+        with stamp_inside_next_transaction(
+            db.engine,
+            update(token_work_items_table)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=func.current_timestamp()),
+        ):
+            assert repo.recover_expired_leases(coordination_token=successor) == 0
+        fenced_until = landscape_database_now(db.engine)
         after_equality = capture_state_engine_image(db, run_id=run_id)
-        assert before_equality.diff(after_equality).changed_columns == {"run_coordination": {"leader_heartbeat_expires_at", "updated_at"}}
+        # The boundary stamp is the only token_work_items write; the sweep
+        # itself moved nothing but the leader fence's seat refresh.
+        assert before_equality.diff(after_equality).changed_columns == {
+            "run_coordination": {"leader_heartbeat_expires_at", "updated_at"},
+            "token_work_items": {"lease_expires_at"},
+        }
         with db.read_only_connection() as conn:
             equality_seat = conn.execute(
                 select(
@@ -686,10 +730,17 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
                     run_coordination_table.c.updated_at,
                 ).where(run_coordination_table.c.run_id == run_id)
             ).one()
-        assert tuple(equality_seat) == (lease_expiry + timedelta(seconds=WINDOW), lease_expiry)
-        assert tuple(_work_item_row(db, run_id=run_id)[column] for column in bundle_columns) == before_bundle
+        # The leader fence re-stamps the seat from the database's transaction
+        # time (ADR-047): deadline = that instant + WINDOW, updated_at = that instant.
+        assert equality_seat[0] - equality_seat[1] == timedelta(seconds=WINDOW)
+        assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
+        equality_image = _work_item_row(db, run_id=run_id)
+        assert tuple(equality_image[column] for column in bundle_columns) == before_bundle
+        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
+        assert equality_image["lease_expires_at"] == equality_seat[1]
 
-        assert repo.recover_expired_leases(now=lease_expiry + timedelta(microseconds=1), coordination_token=successor) == 1
+        expire_lease(db.engine, redrive.work_item_id)
+        assert repo.recover_expired_leases(coordination_token=successor) == 1
         recovered = _work_item_row(db, run_id=run_id)
         assert tuple(recovered[column] for column in bundle_columns) == before_bundle
         assert recovered["status"] == TokenWorkStatus.PENDING_SINK.value
@@ -702,7 +753,13 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
 
 @pytest.mark.timeout(120)
 def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(postgres_url: str) -> None:
-    """RC-07 backend semantics only; this does not enable PostgreSQL followers."""
+    """RC-07 backend semantics only; this does not enable PostgreSQL followers.
+
+    The grace predicate compares the member's deadline against the evicting
+    transaction's own database time (ADR-047), so each boundary arm stamps the
+    deadline INSIDE that transaction from ``CURRENT_TIMESTAMP``: exactly at
+    ``database_now - grace`` (inert) and one microsecond before it (evicted).
+    """
     now = datetime(2026, 8, 12, 5, 0, tzinfo=UTC)
     run_id = "run-eviction-boundary"
     worker_id = "worker-eviction-boundary"
@@ -712,37 +769,53 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
         run_id=run_id,
         leader_id="leader-eviction-boundary",
         worker_id=worker_id,
-        worker_heartbeat_expires_at=now - timedelta(seconds=GRACE),
+        worker_heartbeat_expires_at=now + timedelta(hours=1),
         now=now,
     )
     coord = RunCoordinationRepository(db.engine)
+    member_deadline = update(run_workers_table).where(run_workers_table.c.worker_id == worker_id)
+    grace = timedelta(seconds=GRACE)
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
-        assert (
-            coord.evict_worker(
-                token=token,
-                target_worker_id=worker_id,
-                now=now,
-                grace_seconds=GRACE,
-                window_seconds=WINDOW,
+        with stamp_inside_next_transaction(db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace)):
+            assert (
+                coord.evict_worker(
+                    token=token,
+                    target_worker_id=worker_id,
+                    grace_seconds=GRACE,
+                    window_seconds=WINDOW,
+                )
+                is False
             )
-            is False
+        # The inert verb committed only its leader-fence refresh (and the
+        # test's own boundary stamp): no status, eviction stamp, or event.
+        before_equality.diff(capture_state_engine_image(db, run_id=run_id)).assert_only(
+            {
+                "run_coordination": {"leader_heartbeat_expires_at", "updated_at"},
+                "run_workers": {"heartbeat_expires_at"},
+            }
         )
-        assert capture_state_engine_image(db, run_id=run_id) == before_equality
-        assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id, now=now) == ("active", [])
+        assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id) == (
+            "active",
+            [],
+        )
 
-        after_boundary = now + timedelta(microseconds=1)
-        assert (
-            coord.evict_worker(
-                token=token,
-                target_worker_id=worker_id,
-                now=after_boundary,
-                grace_seconds=GRACE,
-                window_seconds=WINDOW,
+        with stamp_inside_next_transaction(
+            db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace - timedelta(microseconds=1))
+        ):
+            assert (
+                coord.evict_worker(
+                    token=token,
+                    target_worker_id=worker_id,
+                    grace_seconds=GRACE,
+                    window_seconds=WINDOW,
+                )
+                is True
             )
-            is True
+        assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id) == (
+            "evicted",
+            [],
         )
-        assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id, now=after_boundary) == ("evicted", [])
     finally:
         db.close()
 
@@ -781,8 +854,10 @@ def _await_done_or_lock_wait(
     raise AssertionError(f"thread neither finished nor blocked on a lock within {timeout}s")
 
 
-def _worker_status_and_live_leases(db: LandscapeDB, *, run_id: str, worker_id: str, now: datetime) -> tuple[str, list[str]]:
+def _worker_status_and_live_leases(db: LandscapeDB, *, run_id: str, worker_id: str) -> tuple[str, list[str]]:
+    """The worker's registry status and the leases it still holds live on the database clock (ADR-047)."""
     with db.read_only_connection() as conn:
+        database_now = read_landscape_transaction_time(conn)
         status = conn.execute(
             select(run_workers_table.c.status).where(
                 run_workers_table.c.worker_id == worker_id,
@@ -799,7 +874,7 @@ def _worker_status_and_live_leases(db: LandscapeDB, *, run_id: str, worker_id: s
             .mappings()
             .all()
         )
-    live = [str(lease["work_item_id"]) for lease in leases if lease["lease_expires_at"] and lease["lease_expires_at"] > now]
+    live = [str(lease["work_item_id"]) for lease in leases if lease["lease_expires_at"] and lease["lease_expires_at"] > database_now]
     return str(status), live
 
 
@@ -863,7 +938,6 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
             results["evict"] = coord.evict_worker(
                 token=token,
                 target_worker_id=worker_id,
-                now=now,
                 grace_seconds=GRACE,
                 window_seconds=WINDOW,
             )
@@ -872,7 +946,7 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
 
     def claim() -> None:
         try:
-            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300, now=now)
+            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300)
         except BaseException as exc:
             results["claim"] = exc
         finally:
@@ -909,7 +983,7 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
         assert isinstance(results["claim"], RunWorkerEvictedError), (
             f"the racing claim must be refused with RunWorkerEvictedError, got: {results['claim']!r}"
         )
-        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id, now=now)
+        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id)
         assert status == "evicted"
         assert live == [], f"an evicted worker must not hold a live lease, found: {live}"
     finally:
@@ -920,7 +994,6 @@ def test_fenced_claim_blocks_behind_in_flight_eviction_and_is_refused(postgres_u
 def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postgres_url: str) -> None:
     """A renewal racing an uncommitted eviction must observe it and be refused."""
     t0 = datetime(2026, 7, 16, 11, 0, 0, tzinfo=UTC)
-    t1 = t0 + timedelta(seconds=GRACE + 100)
     run_id = "run-heartbeat-vs-evict"
     worker_id = "worker-heartbeat"
     db = LandscapeDB.from_url(postgres_url)
@@ -935,8 +1008,9 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
     _enqueue_ready_item(db.engine, run_id=run_id, token_id="tok-heartbeat", now=t0)
     scheduler = TokenSchedulerRepository(db.engine)
     coord = RunCoordinationRepository(db.engine)
-    item = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=10, now=t0)
-    assert item is not None  # lease is expired well before t1
+    item = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=10)
+    assert item is not None
+    expire_lease(db.engine, item.work_item_id)  # expired on the database clock before the eviction runs
 
     pids: dict[str, int] = {}
     evictor_paused = threading.Event()
@@ -954,7 +1028,6 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
             results["evict"] = coord.evict_worker(
                 token=token,
                 target_worker_id=worker_id,
-                now=t1,
                 grace_seconds=GRACE,
                 window_seconds=WINDOW,
             )
@@ -968,7 +1041,6 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
                 work_item_id=item.work_item_id,
                 lease_owner=worker_id,
                 lease_seconds=300,
-                now=t1,
                 membership_fenced=True,
             )
         except BaseException as exc:
@@ -1007,7 +1079,7 @@ def test_heartbeat_renewal_blocks_behind_in_flight_eviction_and_is_refused(postg
         assert isinstance(results["heartbeat"], RunWorkerEvictedError), (
             f"the racing renewal must be refused with RunWorkerEvictedError, got: {results['heartbeat']!r}"
         )
-        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id, now=t1)
+        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id)
         assert status == "evicted"
         assert live == [], f"an evicted worker must not retain a renewed lease, found: {live}"
     finally:
@@ -1060,7 +1132,9 @@ def test_eviction_defers_to_in_flight_fenced_claim(postgres_url: str) -> None:
 
     def claim() -> None:
         try:
-            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300, now=now)
+            # evict_worker judges the lease against the database clock (ADR-047);
+            # the claim mints its lease from that clock so the lease is live.
+            results["claim"] = scheduler.claim_ready(run_id=run_id, lease_owner=worker_id, lease_seconds=300)
         except BaseException as exc:  # pragma: no cover - asserted below
             results["claim"] = f"RAISED {type(exc).__name__}: {exc}"
 
@@ -1069,7 +1143,6 @@ def test_eviction_defers_to_in_flight_fenced_claim(postgres_url: str) -> None:
             results["evict"] = coord.evict_worker(
                 token=token,
                 target_worker_id=worker_id,
-                now=now,
                 grace_seconds=GRACE,
                 window_seconds=WINDOW,
             )
@@ -1109,7 +1182,7 @@ def test_eviction_defers_to_in_flight_fenced_claim(postgres_url: str) -> None:
         assert results["claim"] is not None and not isinstance(results["claim"], str), (
             f"the fenced claim must succeed, got: {results['claim']!r}"
         )
-        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id, now=now)
+        status, live = _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id)
         assert status == "active", "a worker holding a live lease must not be evicted"
         assert len(live) == 1
     finally:

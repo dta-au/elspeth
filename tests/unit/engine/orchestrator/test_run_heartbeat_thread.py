@@ -71,8 +71,8 @@ class _StubRepo:
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
         self.record_heartbeat_degraded_calls: list[dict[str, Any]] = []
 
-    def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> CoordinationSnapshot:
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "now": now, "window_seconds": window_seconds})
+    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
+        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
         if self.side_effects:
             result = self.side_effects.pop(0)
             if isinstance(result, Exception):
@@ -150,7 +150,12 @@ def _make_thread(
 
 class TestBeatsCorrectly:
     def test_calls_worker_heartbeat_with_correct_args(self) -> None:
-        """worker_heartbeat is called with the thread's worker_id, now, and window."""
+        """worker_heartbeat is called with the thread's worker_id and window — never a caller clock.
+
+        The beat's deadline is the Landscape database clock plus the window
+        (ADR-047); the thread's ``now_fn`` survives only for its wait loop
+        and the forensic degraded record.
+        """
         repo = _StubRepo()
         repo.snapshot = _HEALTHY_SNAPSHOT
 
@@ -161,9 +166,7 @@ class TestBeatsCorrectly:
 
         assert len(repo.worker_heartbeat_calls) == 1
         call = repo.worker_heartbeat_calls[0]
-        assert call["worker_id"] == _WORKER_ID
-        assert call["now"] == fixed_now
-        assert call["window_seconds"] == DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        assert call == {"worker_id": _WORKER_ID, "window_seconds": DEFAULT_RUN_LIVENESS_WINDOW_SECONDS}
 
     def test_healthy_beat_does_not_set_latch(self) -> None:
         """A healthy beat leaves check_and_raise() quiet."""

@@ -54,7 +54,7 @@ import traceback
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from multiprocessing.connection import Connection
 from multiprocessing.connection import wait as wait_for_connection
 from multiprocessing.process import BaseProcess
@@ -67,6 +67,7 @@ from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.scheduler import SchedulerEventType
@@ -77,6 +78,7 @@ from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -100,6 +102,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSourceBase, as_sink, as_source, as_transform
+from tests.fixtures.landscape import expire_lease
 from tests.fixtures.plugins import CollectSink
 
 # Deterministic epoch for the injected MockClock (UTC datetimes derive from it).
@@ -686,6 +689,7 @@ def _craft_crashed_lease(
     ingest_sequence: int,
     lease_owner: str,
     lease_seconds: int,
+    expired: bool = True,
 ) -> str:
     """Write the rows a hard-killed worker leaves behind, via production writers.
 
@@ -734,14 +738,15 @@ def _craft_crashed_lease(
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-        available_at=now,
     )
     # Register the fictional crashed worker as ACTIVE so the membership fence
-    # in claim_ready admits it.  The heartbeat is set to exactly ``now`` (the
-    # registration instant) so it is already stale: once the test advances the
-    # clock by more than the liveness grace window the worker is DEAD and
-    # recover_expired_leases correctly reaps its in-flight leases.
+    # in claim_ready admits it. Liveness is judged against the Landscape
+    # database clock (ADR-047), so the heartbeat is written explicitly into
+    # that clock's past, lapsed by more than the liveness grace window: the
+    # worker is already DEAD to every sweep, and advancing the harness's
+    # process MockClock neither ages nor revives it.
     with crashed.db.engine.begin() as conn:
+        stale_heartbeat = read_landscape_transaction_time(conn) - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1)
         conn.execute(
             insert(run_workers_table).values(
                 worker_id=lease_owner,
@@ -749,7 +754,7 @@ def _craft_crashed_lease(
                 role="follower",
                 status="active",
                 registered_at=now,
-                heartbeat_expires_at=now,
+                heartbeat_expires_at=stale_heartbeat,
                 entry_point="harness",
             )
         )
@@ -757,9 +762,13 @@ def _craft_crashed_lease(
         run_id=crashed.run_id,
         lease_owner=lease_owner,
         lease_seconds=lease_seconds,
-        now=now,
     )
     assert claimed is not None and claimed.token_id == token.token_id
+    if expired:
+        # A crashed worker's lease has lapsed on the database clock; a test
+        # that needs the lease still live (``expired=False``) ages it itself
+        # with ``expire_lease`` at the point its scenario says it lapses.
+        expire_lease(crashed.db.engine, claimed.work_item_id)
     crashed.crashed_token_ids[ingest_sequence] = token.token_id
     return token.token_id
 

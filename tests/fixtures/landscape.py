@@ -13,6 +13,8 @@ Factory hierarchy:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -51,19 +53,197 @@ def expire_leader_seat(db: LandscapeDB, run_id: str) -> None:
     via ``begin_run(...)`` + direct status writes (instead of running the real
     engine, whose ceremony arms release the seat) call this to produce the
     post-window image deterministically rather than sleeping out the window.
-    """
-    from datetime import UTC, datetime, timedelta
 
+    The lapsed deadline is written relative to the Landscape database clock
+    (ADR-047): the takeover CAS compares against that clock, never a process
+    clock, so tests control time through the database.
+    """
     from sqlalchemy import update
 
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
     from elspeth.core.landscape.schema import run_coordination_table
 
     with db.engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=1)
         conn.execute(
-            update(run_coordination_table)
-            .where(run_coordination_table.c.run_id == run_id)
-            .values(leader_heartbeat_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            update(run_coordination_table).where(run_coordination_table.c.run_id == run_id).values(leader_heartbeat_expires_at=lapsed)
         )
+
+
+def expire_worker(engine: Any, worker_id: str, *, seconds_ago: float = 1.0) -> None:
+    """Lapse an active ``run_workers`` heartbeat ``seconds_ago`` seconds before database time.
+
+    The liveness sweep (``dead_non_leader_workers`` / ``evict_worker``) judges
+    ``heartbeat_expires_at < database_now - grace`` against the Landscape
+    database clock (ADR-047); a test that needs a dead member writes the
+    deadline into the database's past instead of handing the verb a clock.
+    """
+    from sqlalchemy import update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+    with engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=lapsed))
+
+
+def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) -> datetime:
+    """Age a LEASED work item's ``lease_expires_at`` to ``seconds_ago`` seconds before database time.
+
+    The lease family (``recover_expired_leases``, ``heartbeat_lease``,
+    ``peer_active_leases``, the claim CAS) decides expiry against the
+    Landscape database clock (ADR-047); a test that needs an expired lease
+    writes the deadline into the database's past instead of handing the verb
+    a future clock. Refuses (``AssertionError``) unless exactly one LEASED
+    row carries ``work_item_id``: ageing a row the sweep can never reap would
+    turn the test into a no-op that still passes. Returns the deadline written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.contracts.scheduler import TokenWorkStatus
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+            .values(lease_expires_at=lapsed)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"expire_lease: expected exactly one LEASED row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return lapsed
+
+
+def await_database_time(engine: Any, instant: datetime, *, timeout_seconds: float = 5.0) -> datetime:
+    """Block until the Landscape database clock is strictly past ``instant``; return the clock read.
+
+    For the few tests whose audit witness must stay intact — source-completion
+    reconciliation compares the row's ``lease_expires_at`` with the CLAIM_READY
+    event's ``to_lease_expires_at`` — a lease can only expire the way it does
+    in production: by database time passing. Pair with a one-second lease so
+    the wait is bounded by two whole SQLite seconds.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        database_now = landscape_database_now(engine)
+        if database_now > instant:
+            return database_now
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"Landscape database time {database_now.isoformat()} did not pass {instant.isoformat()} within {timeout_seconds} s"
+            )
+        time.sleep(0.05)
+
+
+def reschedule_work_item(engine: Any, work_item_id: str, *, seconds_from_now: float) -> datetime:
+    """Move a work item's ``available_at`` to ``seconds_from_now`` seconds from database time.
+
+    ``claim_ready`` admits a READY row only once ``available_at <= database_now``
+    (ADR-047). A test that needs a row parked in the future, or released into
+    the past, writes that deadline through the database rather than handing
+    the claim a clock. Refuses unless exactly one row carries
+    ``work_item_id``. Returns the ``available_at`` written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        available_at = read_landscape_transaction_time(conn) + timedelta(seconds=seconds_from_now)
+        result = conn.execute(
+            update(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id).values(available_at=available_at)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"reschedule_work_item: expected exactly one row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return available_at
+
+
+def on_fresh_database_second(engine: Any, action: Any) -> Any:
+    """Run ``action(database_now)`` just after a database-second boundary and return its result.
+
+    The exact-boundary arm of a lease decision ("a deadline EQUAL to database
+    time is not yet expired") can only be pinned on SQLite's whole-second
+    clock when the deadline is written and the verb decides inside the same
+    database second. Unlike :func:`within_one_database_second` this does not
+    retry — the action is expected to mutate state — but starting at the top
+    of a fresh second leaves the whole second for the write and the verb, and
+    a rollover during the action is reported as a failure rather than
+    silently scored.
+    """
+    import time
+
+    first = landscape_database_now(engine)
+    deadline = time.monotonic() + 3.0
+    while (before := landscape_database_now(engine)) == first:
+        if time.monotonic() > deadline:
+            raise AssertionError("the Landscape database second did not advance within 3 s")
+        time.sleep(0.002)
+    result = action(before)
+    after = landscape_database_now(engine)
+    if after != before:
+        raise AssertionError(
+            f"the Landscape database second rolled over during the boundary action ({before.isoformat()} -> {after.isoformat()})"
+        )
+    return result
+
+
+def within_one_database_second(engine: Any, action: Any, *, attempts: int = 20) -> Any:
+    """Run ``action(database_now)`` and return its result once it completed inside one database second.
+
+    SQLite's ``CURRENT_TIMESTAMP`` is whole-second, so an exact-boundary arm
+    ("a deadline EQUAL to database time minus the grace is not yet expired")
+    can only be pinned when the row is seeded and the verb decides within the
+    same database second. ``action`` receives the database time read just
+    before it ran and must be safe to repeat: when the clock rolled over
+    during the attempt the result is untrustworthy and the action runs again.
+    """
+    for _ in range(attempts):
+        before = landscape_database_now(engine)
+        result = action(before)
+        if landscape_database_now(engine) == before:
+            return result
+    raise AssertionError(f"the Landscape database second rolled over during every one of {attempts} attempts")
+
+
+@contextmanager
+def stamp_inside_next_transaction(engine: Any, statement: Any) -> Iterator[None]:
+    """Run ``statement`` as the FIRST statement of the next transaction begun on ``engine``.
+
+    PostgreSQL's ``CURRENT_TIMESTAMP`` is transaction time, so a deadline the
+    statement writes from ``func.current_timestamp()`` equals, to the
+    microsecond, the ``database_now`` the production verb reads inside that
+    same transaction — the only way to pin an exact-boundary arm ("a deadline
+    EQUAL to database time is not yet expired") against a microsecond clock.
+    The stamp shares the verb's transaction, so a refused verb rolls it back
+    with everything else. One-shot: the block must begin exactly one
+    transaction on ``engine`` before any other.
+    """
+    from sqlalchemy import event
+
+    fired: list[bool] = []
+
+    def stamp(conn: Any) -> None:
+        if fired:
+            return
+        fired.append(True)
+        conn.execute(statement)
+
+    event.listen(engine, "begin", stamp)
+    try:
+        yield
+    finally:
+        event.remove(engine, "begin", stamp)
+    assert fired, "no transaction began on the engine while the boundary stamp was armed"
 
 
 def insert_crashed_leader_seat(conn: Any, *, run_id: str) -> None:
@@ -73,15 +253,15 @@ def insert_crashed_leader_seat(conn: Any, *, run_id: str) -> None:
     ``begin_run``, which at epoch 21 mints the seat atomically with the run):
     without a seat row, resume's takeover CAS refuses with
     ``AuditIntegrityError`` ("no run_coordination seat row"). Call on the same
-    connection/transaction that inserted the ``runs`` row (FK).
+    connection/transaction that inserted the ``runs`` row (FK). The lapsed
+    deadline is relative to the Landscape database clock (ADR-047).
     """
-    from datetime import UTC, datetime, timedelta
-
     from sqlalchemy import insert as sa_insert
 
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
     from elspeth.core.landscape.schema import run_coordination_table
 
-    lapsed = datetime.now(UTC) - timedelta(seconds=1)
+    lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=1)
     conn.execute(
         sa_insert(run_coordination_table).values(
             run_id=run_id,
@@ -103,9 +283,8 @@ def leader_coordination_token(factory: RecorderFactory, run_id: str) -> Coordina
     epoch 1); this helper reads it back. The fence predicate is identity+epoch
     only — an expired seat still passes its own leader's fence.
     """
-    from datetime import UTC, datetime
 
-    leader = factory.run_coordination.live_leader(run_id=run_id, now=datetime.now(UTC))
+    leader = factory.run_coordination.live_leader(run_id=run_id)
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
@@ -321,3 +500,51 @@ def landscape_factory_with_payload_store(landscape_db: LandscapeDB, tmp_path: An
     payload_dir = tmp_path / "payloads"
     payload_store = FilesystemPayloadStore(payload_dir)
     return RecorderFactory(landscape_db, payload_store=payload_store)
+
+
+def landscape_database_now(engine: Any) -> datetime:
+    """Read the Landscape database clock once, outside any decision transaction.
+
+    Test-side control of time goes through the database (ADR-047): compare a
+    deadline the production writer stamped against this value, never against
+    ``datetime.now``. SQLite's ``CURRENT_TIMESTAMP`` is whole-second UTC, so
+    pair it with :func:`assert_deadline_within`.
+    """
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+
+    with engine.connect() as conn:
+        return read_landscape_transaction_time(conn)
+
+
+def assert_deadline_within(actual: datetime, expected: datetime, *, tolerance: timedelta = timedelta(seconds=1)) -> None:
+    """Assert a database-stamped deadline equals ``expected`` within the clock's resolution.
+
+    SQLite stamps whole seconds with no fraction and PostgreSQL stamps
+    microseconds; a value read back naive is the storage's UTC.
+    """
+    actual_utc = actual if actual.tzinfo is not None else actual.replace(tzinfo=UTC)
+    expected_utc = expected if expected.tzinfo is not None else expected.replace(tzinfo=UTC)
+    assert abs(actual_utc - expected_utc) <= tolerance, (
+        f"deadline {actual_utc.isoformat()} is not within {tolerance} of {expected_utc.isoformat()}"
+    )
+
+
+def assert_stamped_between(
+    actual: datetime,
+    *,
+    start: datetime,
+    end: datetime,
+    offset: timedelta = timedelta(0),
+    tolerance: timedelta = timedelta(seconds=1),
+) -> None:
+    """Assert a database-stamped value lies in ``[start + offset, end + offset]`` within the clock's resolution.
+
+    Bracket a production verb with two :func:`landscape_database_now` reads
+    and hand them in as ``start`` / ``end``: the stamp the verb wrote must
+    fall between them (plus ``offset`` for a deadline), whatever the box's
+    load did to the verb's wall-clock duration.
+    """
+    actual_utc = actual if actual.tzinfo is not None else actual.replace(tzinfo=UTC)
+    lower = (start if start.tzinfo is not None else start.replace(tzinfo=UTC)) + offset - tolerance
+    upper = (end if end.tzinfo is not None else end.replace(tzinfo=UTC)) + offset + tolerance
+    assert lower <= actual_utc <= upper, f"stamp {actual_utc.isoformat()} is outside [{lower.isoformat()}, {upper.isoformat()}]"

@@ -444,7 +444,6 @@ class RowTokenRepository:
         return fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
-            now=now(),
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="create_row_with_token",
         )

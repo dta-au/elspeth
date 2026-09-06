@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Hashable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, get_args
 
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
@@ -67,6 +68,10 @@ from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
+
+if TYPE_CHECKING:
+    # Runtime import would be circular: the resolver imports this module.
+    from elspeth.web.composer._producer_resolver import ProducerEntry
 
 NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
@@ -1959,6 +1964,104 @@ def _is_source_config_probe_exception(exc: Exception) -> bool:
     return _is_plugin_config_probe_exception(exc, config_error_prefix=_SOURCE_CONFIG_ERROR_PREFIX)
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationProbeEntry:
+    """One cached construction outcome: the instance, or the exception it raised.
+
+    ``holder`` is retained only so the options object whose identity keys
+    the entry cannot be collected and its id recycled while the cache lives.
+    """
+
+    holder: NodeSpec | ProducerEntry
+    instance: TransformProtocol | None
+    failure: Exception | None
+
+
+class ValidationProbeCache:
+    """One validation-only transform instance per node for the life of one ``validate()``.
+
+    Stage 1 asks a constructed transform six questions per node — its output
+    schema, collision surface, declared inputs, pass-through vote, emit
+    profile and, in the semantic validator, its input requirements — and
+    every question used to construct and close an instance of its own. Each
+    construction is a pydantic parse of the plugin config, so an 80-node llm
+    chain paid for 480 parses per validate, and the composer's review-debt
+    check runs validate four times per import (elspeth-97b15928bc). The
+    questions are pure reads of the same declared surfaces, so one instance
+    per node answers all of them.
+
+    Keyed on the plugin name and the IDENTITY of the node's deep-frozen
+    options object: ``ProducerEntry.options`` IS ``NodeSpec.options`` (the
+    resolver stores the same object), so every site that names a node lands
+    on one entry. A construction failure is cached and re-raised at every
+    site, so each site's own tolerance arm still decides what a failed draft
+    node means for its rule. Instances are built under
+    ``plugin_preflight_mode`` — a validate is a question, not a run, exactly
+    as ``_semantic_validator._side_effect_free_probe`` documents — and are
+    closed exactly once, when the owning ``validate()`` returns.
+    """
+
+    __slots__ = ("_entries",)
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, int], _ValidationProbeEntry] = {}
+
+    def __enter__(self) -> ValidationProbeCache:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def transform(self, plugin: str, holder: NodeSpec | ProducerEntry) -> TransformProtocol:
+        """Return the node's probe instance, constructing it on first use.
+
+        Raises the construction exception — the same object, every time —
+        when the plugin does not build from the node's options; callers apply
+        ``_is_config_probe_exception`` exactly as they did to their own
+        construction.
+        """
+        key = (plugin, id(holder.options))
+        if key not in self._entries:
+            return self._construct(key, plugin, holder)
+        entry = self._entries[key]
+        if entry.failure is not None:
+            raise entry.failure
+        if entry.instance is None:
+            raise AssertionError(f"probe entry for {plugin!r} holds neither an instance nor a failure")
+        return entry.instance
+
+    def _construct(self, key: tuple[str, int], plugin: str, holder: NodeSpec | ProducerEntry) -> TransformProtocol:
+        # Imported at call time, like every probe site before it: tests
+        # substitute the shared manager by patching this module attribute.
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+        try:
+            with plugin_preflight_mode(True):
+                instance = get_shared_plugin_manager().create_transform(
+                    plugin, prepare_validation_probe_options(holder.options, plugin=plugin)
+                )
+        except Exception as exc:
+            # Remembered so every later site sees the same failure, then
+            # re-raised for this site's own tolerance arm.
+            self._entries[key] = _ValidationProbeEntry(holder, instance=None, failure=exc)
+            raise
+        self._entries[key] = _ValidationProbeEntry(holder, instance=instance, failure=None)
+        return instance
+
+    def close(self) -> None:
+        """Close every constructed instance once.
+
+        ``ExitStack`` runs every close even when one raises, so a failing
+        plugin close cannot leak its siblings; the failures chain out.
+        """
+        entries, self._entries = self._entries, {}
+        with ExitStack() as stack:
+            for entry in entries.values():
+                if entry.instance is not None:
+                    stack.callback(entry.instance.close)
+
+
 def _probe_sink_declared_required_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
     """Read ``plugin``'s ``declared_required_fields`` off a constructed sink.
 
@@ -2196,7 +2299,7 @@ def _runtime_connection_lineage(
     this makes the originating fork gate the traversal boundary while retaining
     every node inside the branch for row_union hazard checks.
     """
-    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
+    from elspeth.web.composer._producer_resolver import ProducerResolver, is_source_producer_id
 
     resolver = ProducerResolver.build(
         source=None,
@@ -3922,14 +4025,24 @@ def _check_schema_contracts(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
     outputs: tuple[OutputSpec, ...],
+    *,
+    probe_cache: ValidationProbeCache | None = None,
 ) -> tuple[
     tuple[ValidationEntry, ...],
     tuple[ValidationEntry, ...],
     tuple[EdgeContract, ...],
 ]:
-    """Validate producer/consumer schema contracts across declarative routing."""
+    """Validate producer/consumer schema contracts across declarative routing.
+
+    ``probe_cache`` holds the one validation-only instance per node that every
+    probe site below reads from; ``validate()`` passes the cache it shares
+    with the semantic validator, and a standalone call owns one for the walk.
+    """
+    if probe_cache is None:
+        with ValidationProbeCache() as owned_cache:
+            return _check_schema_contracts(sources, nodes, outputs, probe_cache=owned_cache)
+
     from elspeth.web.composer._producer_resolver import (
-        ProducerEntry,
         ProducerResolver,
         is_source_producer_id,
         published_success_connection,
@@ -4332,29 +4445,21 @@ def _check_schema_contracts(
         transforms = get_shared_plugin_manager().get_transforms()
         return frozenset(cls.name for cls in transforms if cls.passes_through_input)
 
-    def _probe_transform_output_schema(plugin: str, options: Mapping[str, Any]) -> tuple[bool, SchemaConfig | None]:
-        """Read ``plugin``'s output schema, closing the validation-only instance.
+    def _probe_transform_output_schema(plugin: str, node: NodeSpec) -> tuple[bool, SchemaConfig | None]:
+        """Read ``plugin``'s output schema from the node's shared probe instance.
 
         The boolean distinguishes an expected construction failure from a
         successfully constructed plugin that abstains from an output schema.
-        Genuine engine defects crash through. Once construction succeeds,
-        close() owns every success, return, and inspection-exception path.
+        Genuine engine defects crash through. The instance belongs to
+        ``probe_cache``, which closes it once when validate() returns.
         """
-        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
         try:
-            transform = get_shared_plugin_manager().create_transform(
-                plugin,
-                prepare_validation_probe_options(options, plugin=plugin),
-            )
+            transform = probe_cache.transform(plugin, node)
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
             return False, None
-        try:
-            return True, transform._output_schema_config
-        finally:
-            transform.close()
+        return True, transform._output_schema_config
 
     def _probe_field_mapper_config(options: Mapping[str, Any]) -> FieldMapperConfig | None:
         """Parse ``options`` through the plugin's own config class, or abstain.
@@ -4377,17 +4482,16 @@ def _check_schema_contracts(
         declared_output_fields: frozenset[str]
         can_overwrite_input: bool
 
-    def _probe_transform_collision_surface(plugin: str, options: Mapping[str, Any]) -> _CollisionProbe:
-        """Read ``plugin``'s collision surface in ONE probe, closing the instance.
+    def _probe_transform_collision_surface(plugin: str, node: NodeSpec) -> _CollisionProbe:
+        """Read ``plugin``'s collision surface from the node's shared probe instance.
 
         Two facts, both only on a constructed instance: ``declared_output_fields``
         (the set the executor's collision preflight actually tests) and the
         ``can_overwrite_input_fields`` capability (whether the write path
         preserves the input row — ``passes_through_input`` /
         ``forwards_input_fields`` are instance-level on field_mapper and the
-        explode transforms, so the class alone cannot answer). One construction
-        for both, because the lifecycle tests pin exactly one probe instance
-        per site.
+        explode transforms, so the class alone cannot answer). Both come from
+        the one instance ``probe_cache`` holds for the node.
 
         Deliberately NOT served from ``_probe_transform_output_schema``:
         ``_output_schema_config.guaranteed_fields`` is a documented SUPERSET of
@@ -4403,40 +4507,32 @@ def _check_schema_contracts(
         paths, and Rule D must not turn an incomplete draft into a hard error.
         """
         from elspeth.contracts.field_collision import can_overwrite_input_fields
-        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
         try:
-            transform = get_shared_plugin_manager().create_transform(
-                plugin,
-                prepare_validation_probe_options(options, plugin=plugin),
-            )
+            transform = probe_cache.transform(plugin, node)
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
             return _CollisionProbe(frozenset(), False)
-        try:
-            return _CollisionProbe(
-                transform.declared_output_fields,
-                can_overwrite_input_fields(
-                    passes_through_input=transform.passes_through_input,
-                    forwards_input_fields=transform.forwards_input_fields,
-                ),
-            )
-        finally:
-            transform.close()
+        return _CollisionProbe(
+            transform.declared_output_fields,
+            can_overwrite_input_fields(
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            ),
+        )
 
     class _DeclaredInputs(NamedTuple):
         fields: frozenset[str]
         string_fields: frozenset[str]
 
-    def _probe_transform_declared_inputs(plugin: str, options: Mapping[str, Any]) -> _DeclaredInputs:
-        """Read ``plugin``'s ``declared_input_fields`` AND ``declared_string_input_fields`` in one probe.
+    def _probe_transform_declared_inputs(plugin: str, node: NodeSpec) -> _DeclaredInputs:
+        """Read ``plugin``'s ``declared_input_fields`` AND ``declared_string_input_fields`` from the node's shared probe instance.
 
         Both live only on a constructed instance (``keyword_filter`` sets its
         string-typed scan fields from ``fields``; the Azure document
-        transforms from ``source_field``), and one construction is enough to
-        read both — the lifecycle tests pin exactly one probe instance per
-        site.
+        transforms from ``source_field``), and the one instance ``probe_cache``
+        holds for the node answers both.
 
         Input-side twin of ``_probe_transform_collision_surface``. Six
         transform configs compute this as a property over their own options
@@ -4455,21 +4551,13 @@ def _check_schema_contracts(
         owned by the existing config-validation paths, and this rule must not
         turn an incomplete draft into a hard error.
         """
-        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
         try:
-            transform = get_shared_plugin_manager().create_transform(
-                plugin,
-                prepare_validation_probe_options(options, plugin=plugin),
-            )
+            transform = probe_cache.transform(plugin, node)
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
             return _DeclaredInputs(frozenset(), frozenset())
-        try:
-            return _DeclaredInputs(transform.declared_input_fields, transform.declared_string_input_fields)
-        finally:
-            transform.close()
+        return _DeclaredInputs(transform.declared_input_fields, transform.declared_string_input_fields)
 
     def _string_input_field_type_conflict(
         producer: ProducerEntry,
@@ -4590,14 +4678,8 @@ def _check_schema_contracts(
 
         is_known_pass_through = producer_node.plugin in _known_pass_through_plugins()
 
-        transform: TransformProtocol | None = None
         try:
-            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
-            transform = get_shared_plugin_manager().create_transform(
-                producer_node.plugin,
-                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
-            )
+            transform = probe_cache.transform(producer_node.plugin, producer_node)
             is_pass_through_instance = transform.passes_through_input
             output_schema_config = transform._output_schema_config
         except Exception as exc:
@@ -4646,9 +4728,6 @@ def _check_schema_contracts(
             if is_known_pass_through:
                 return True, frozenset()
             return raw_participates, raw_guaranteed
-        finally:
-            if transform is not None:
-                transform.close()
 
         forwards_input = transform.forwards_input_fields
         forwards_through_open_contract = forwards_input and (output_schema_config is None or output_schema_config.allows_extra_fields)
@@ -4723,7 +4802,7 @@ def _check_schema_contracts(
             producer_node = node_by_id[producer.producer_id]
             if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
                 return None
-            constructed, computed_schema = _probe_transform_output_schema(producer_node.plugin, producer_node.options)
+            constructed, computed_schema = _probe_transform_output_schema(producer_node.plugin, producer_node)
             if not constructed:
                 return None
             schema_config = computed_schema or raw_schema
@@ -5346,47 +5425,39 @@ def _check_schema_contracts(
             return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
 
         try:
-            from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
-
-            transform = get_shared_plugin_manager().create_transform(
-                producer_node.plugin,
-                prepare_validation_probe_options(producer_node.options, plugin=producer_node.plugin),
-            )
+            transform = probe_cache.transform(producer_node.plugin, producer_node)
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
             return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
 
-        try:
-            output_config = transform._output_schema_config
-            passes_through = transform.passes_through_input
-            # The forwarding declaration is the weaker sibling of
-            # passes_through_input (elspeth-15c72686f2); a plugin that can make
-            # the stronger claim never needs this one, so the two are unioned
-            # rather than ordered, and `removes` is empty for a pass-through.
-            forwards = passes_through or transform.forwards_input_fields
-            removes = frozenset() if passes_through else transform.removed_input_fields
-            if output_config is None:
-                return _ProducerEmitProfile(_effective_producer_guarantees(producer), forwards, removes)
-            extras_firewall = not output_config.allows_extra_fields
-            propagates = forwards and not extras_firewall
-            if output_config.guaranteed_fields is not None:
-                if extras_firewall and passes_through:
-                    # ADDITIVE behind the firewall: the computed set names only
-                    # what this plugin ADDS, so it must be unioned with the
-                    # declared-required fields the transform forwards.
-                    return _ProducerEmitProfile(output_config.get_effective_guaranteed_fields(), False, frozenset())
-                # The plugin computed its own emit set — authoritative, and the
-                # only set that stays correct for REDUCTIVE transforms. For a
-                # forwarding plugin it names what this node ADDS (line_explode's
-                # output_field); the propagated upstream arrives on top of it.
-                return _ProducerEmitProfile(frozenset(output_config.guaranteed_fields), propagates, removes)
-            if extras_firewall:
+        output_config = transform._output_schema_config
+        passes_through = transform.passes_through_input
+        # The forwarding declaration is the weaker sibling of
+        # passes_through_input (elspeth-15c72686f2); a plugin that can make
+        # the stronger claim never needs this one, so the two are unioned
+        # rather than ordered, and `removes` is empty for a pass-through.
+        forwards = passes_through or transform.forwards_input_fields
+        removes = frozenset() if passes_through else transform.removed_input_fields
+        if output_config is None:
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), forwards, removes)
+        extras_firewall = not output_config.allows_extra_fields
+        propagates = forwards and not extras_firewall
+        if output_config.guaranteed_fields is not None:
+            if extras_firewall and passes_through:
+                # ADDITIVE behind the firewall: the computed set names only
+                # what this plugin ADDS, so it must be unioned with the
+                # declared-required fields the transform forwards.
                 return _ProducerEmitProfile(output_config.get_effective_guaranteed_fields(), False, frozenset())
-            # No computed emit set available — fall back to declared.
-            return _ProducerEmitProfile(_effective_producer_guarantees(producer), propagates, removes)
-        finally:
-            transform.close()
+            # The plugin computed its own emit set — authoritative, and the
+            # only set that stays correct for REDUCTIVE transforms. For a
+            # forwarding plugin it names what this node ADDS (line_explode's
+            # output_field); the propagated upstream arrives on top of it.
+            return _ProducerEmitProfile(frozenset(output_config.guaranteed_fields), propagates, removes)
+        if extras_firewall:
+            return _ProducerEmitProfile(output_config.get_effective_guaranteed_fields(), False, frozenset())
+        # No computed emit set available — fall back to declared.
+        return _ProducerEmitProfile(_effective_producer_guarantees(producer), propagates, removes)
 
     def _arm_emit_profile(producer: ProducerEntry) -> _ProducerEmitProfile:
         """Return one resolved row_union arm's predicted emit profile.
@@ -6039,7 +6110,7 @@ def _check_schema_contracts(
         # defect stated as fact: the raw config surfaces miss a written-from
         # field exactly as they miss a transform's projected input.)
         declared_inputs = (
-            _probe_transform_declared_inputs(node.plugin, node.options)
+            _probe_transform_declared_inputs(node.plugin, node)
             if node.node_type == "transform" and node.plugin is not None
             else _DeclaredInputs(frozenset(), frozenset())
         )
@@ -6502,7 +6573,7 @@ def _check_schema_contracts(
             # default and falls into the additive/loose-bound regime that we
             # cannot adjudicate without knowing the upstream emit set.
             continue
-        _constructed, output_config = _probe_transform_output_schema(node.plugin, node.options)
+        _constructed, output_config = _probe_transform_output_schema(node.plugin, node)
         if output_config is None:
             continue
 
@@ -6576,7 +6647,7 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
-        declared_output, node_can_overwrite = _probe_transform_collision_surface(node.plugin, node.options)
+        declared_output, node_can_overwrite = _probe_transform_collision_surface(node.plugin, node)
         if not declared_output:
             continue
         # Capability key, in lockstep with TransformExecutor._run_preflight and
@@ -6971,6 +7042,16 @@ class CompositionState:
 
     def validate(self) -> ValidationSummary:
         """Run Stage 1 composition-time validation.
+
+        Owns the ``ValidationProbeCache`` for this walk: one validation-only
+        transform instance per node, shared by the schema-contract and
+        semantic stages and closed once here (elspeth-97b15928bc).
+        """
+        with ValidationProbeCache() as probe_cache:
+            return self._validate_with_probe_cache(probe_cache)
+
+    def _validate_with_probe_cache(self, probe_cache: ValidationProbeCache) -> ValidationSummary:
+        """Run Stage 1 composition-time validation against ``probe_cache``.
 
         Pure function of the current state — no DAG build or session mutation.
         Returns ValidationSummary with is_valid and human-readable errors.
@@ -8210,7 +8291,7 @@ class CompositionState:
         # Generic semantic-contract check.
         from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 
-        semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(self)
+        semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(self, probe_cache=probe_cache)
         errors.extend(semantic_errors)
 
         numeric_contract_errors, numeric_contract_warnings = _batch_distribution_profile_value_field_entries(self.sources, self.nodes)
@@ -8565,7 +8646,9 @@ class CompositionState:
                 suggestions.append(_sug(component, message, "low"))
 
         # 9. Schema contract validation
-        contract_errors, contract_warnings, edge_contracts = _check_schema_contracts(self.sources, self.nodes, self.outputs)
+        contract_errors, contract_warnings, edge_contracts = _check_schema_contracts(
+            self.sources, self.nodes, self.outputs, probe_cache=probe_cache
+        )
         errors.extend(contract_errors)
         warnings.extend(contract_warnings)
 

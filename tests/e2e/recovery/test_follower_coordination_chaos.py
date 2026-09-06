@@ -45,6 +45,7 @@ from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import run_workers_table, token_work_items_table
 from elspeth.engine.clock import MockClock
@@ -64,6 +65,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
+from tests.fixtures.landscape import expire_lease
 
 _GUARD_LIVE_SEAT_WINDOW_SECONDS = 10**9
 
@@ -103,7 +105,6 @@ def _seed_ready_row_direct(crashed: Any, *, ingest_sequence: int) -> tuple[str, 
     Safe to call multiple times: each call produces an independent READY row
     with no run_workers side effects.  Returns (token_id, work_item_id).
     """
-    now = crashed.clock.now_utc()
     data = {"id": ingest_sequence, "value": ingest_sequence * 10}
     row = crashed.factory.data_flow.create_row(
         run_id=crashed.run_id,
@@ -122,7 +123,6 @@ def _seed_ready_row_direct(crashed: Any, *, ingest_sequence: int) -> tuple[str, 
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-        available_at=now,
         # No worker_id → unfenced legacy enqueue (test/harness use case)
     )
     return token.token_id, work_item.work_item_id
@@ -166,7 +166,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -178,7 +177,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_a is not None and claimed_a.token_id == token_id
         assert claimed_a.lease_owner == follower_a
@@ -188,7 +186,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_b is None, "follower-B must not claim follower-A's LEASED row"
 
@@ -236,7 +233,6 @@ class TestFollowerIsolation:
                 run_id=crashed.run_id,
                 lease_owner=follower_id,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
-                now=clock.now_utc(),
             )
 
         assert exc_info.value.worker_id == follower_id
@@ -272,7 +268,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -285,7 +280,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_a is not None
         token_a_claimed = claimed_a.token_id
@@ -295,7 +289,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_b is not None
         token_b_claimed = claimed_b.token_id
@@ -345,7 +338,6 @@ class TestFollowerIsolation:
             follower_b = _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
-                now=clock.now_utc(),
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
 
@@ -358,7 +350,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_a is not None
         assert claimed_a.token_id in (token_a, token_b)
@@ -369,7 +360,6 @@ class TestFollowerIsolation:
             run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed_b is not None
         assert claimed_b.token_id in (token_a, token_b)
@@ -450,7 +440,6 @@ class TestFollowerChaos:
             run_id=crashed.run_id,
             lease_owner=leader_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert leader_claim is not None, "leader must claim one of the READY rows"
 
@@ -459,7 +448,6 @@ class TestFollowerChaos:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert follower_claim is not None, "follower must claim the second READY row"
 
@@ -516,7 +504,6 @@ class TestFollowerChaos:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -529,14 +516,14 @@ class TestFollowerChaos:
                 .values(status="departed", departed_at=clock.now_utc())
             )
 
-        # Advance clock past the item lease + grace window.
+        # The departed follower's lease lapses on the database clock (ADR-047).
         clock.advance(_DEFAULT_LEASE_SECONDS + 100)
+        expire_lease(crashed.db.engine, claimed.work_item_id)
 
         # This direct crash-image harness has no leader seat, so it opts into
         # the explicitly named legacy recovery adapter.
         recovered = crashed.repo.recover_expired_leases_legacy_unfenced(
             run_id=crashed.run_id,
-            now=clock.now_utc(),
             caller_owner=leader_id,
         )
         assert recovered >= 1, "reaper must recover the follower's lapsed lease"
@@ -579,7 +566,6 @@ class TestFollowerChaos:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=lambda _: None,
         )
 
@@ -626,7 +612,6 @@ class TestFollowerChaos:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -638,8 +623,12 @@ class TestFollowerChaos:
         clock.advance(_DEFAULT_LEASE_SECONDS + 10)
         from datetime import timedelta
 
-        far_future = clock.now_utc() + timedelta(hours=1)
+        # Every liveness deadline is judged against the Landscape database
+        # clock (ADR-047): the item lease is aged into its past, the registry
+        # heartbeats and the seat an hour into its future.
+        expire_lease(crashed.db.engine, claimed.work_item_id)
         with crashed.db.engine.begin() as conn:
+            far_future = read_landscape_transaction_time(conn) + timedelta(hours=1)
             conn.execute(
                 update(run_workers_table).where(run_workers_table.c.worker_id == follower_id).values(heartbeat_expires_at=far_future)
             )
@@ -662,7 +651,6 @@ class TestFollowerChaos:
         # liveness-aware gate (§A.5) is active.  The follower's item lease IS
         # expired, but its run_workers row is still registry-live → reaper skips it.
         crashed.repo.recover_expired_leases(
-            now=clock.now_utc(),
             coordination_token=leader_token,
         )
         # The reaper skips items owned by registry-live workers.
@@ -711,7 +699,6 @@ class TestFollowerChaos:
             token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
-            now_fn=lambda: clock.now_utc(),
             wait_fn=_wait,
             idle_poll_seconds=0.001,
         )

@@ -77,7 +77,7 @@ security and recovery fixes. The notes below intentionally cover only major
 changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 52. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 53. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -121,14 +121,12 @@ schema. Three parts of it are written in production: the persistent
 session-operation authority (fenced, database-clock leases), monotonic
 user-secret row versions, and durable proposal blob-effect receipts. The
 `web_instances` membership table gained its typed writer in 0.8.0
-(elspeth-66a19780b1): `WebInstanceMembershipAuthority` registers an
-instance, renews its lease from the database clock, and records `draining`
-and `stopped`; a peer's fence takeover and orphan-run recovery join that row
-before acting on a dead owner. The web service does not call the writer
-yet — the lifespan and readiness wiring lands with the instance-identity
-work — so no replica writes a membership row, and because both readers fail
-closed on the absent row a killed replica's fenced sessions stay refused and
-its orphaned runs are not recovered by a peer until that wiring lands. The
+(elspeth-66a19780b1): every PostgreSQL-backed replica registers itself
+through `WebInstanceMembershipAuthority` after the startup sweeps, under the
+same instance id it fences with, renews its lease from the database clock,
+records `draining` as the first act of shutdown (readiness fails at once)
+and `stopped` after its executor drains; a peer's fence takeover and
+orphan-run recovery join that row before acting on a dead owner. The
 remaining epoch-51 tables — run-start permits, cross-replica
 websocket tickets, rate-limit state and bounded cleanup claims — are schema
 only: no production writer exists yet (follow-ups on elspeth-6f8c1714d5).
@@ -141,7 +139,12 @@ one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
 provider discriminator widens from three values to five on both `sessions` and
 `user_secrets`, and the identity, org-tree and workflow-governance tables land
 in the same epoch so the sprint costs exactly one cutover window rather than
-two (elspeth-07cd19ba73).
+two (elspeth-07cd19ba73). Epoch 53 adds `session_read_admissions`: one row per
+live shareable blob-read admission, written only by the session operation
+authority, so a released or expired read context is refused on its next proof
+instead of keeping read authority until the session is archived or deleted
+(elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
+shareable read.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 37. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their

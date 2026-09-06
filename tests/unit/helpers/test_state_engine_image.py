@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import pytest
+from tests.fixtures.landscape import landscape_database_now
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
     STATE_ENGINE_TABLES,
@@ -93,7 +94,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         data={"id": 1},
     )
     token = factory.data_flow.create_token(row.row_id)
-    now = datetime.now(UTC)
+    now = landscape_database_now(db.engine)
     item = factory.scheduler.enqueue_ready(
         run_id=run.run_id,
         token_id=token.token_id,
@@ -104,13 +105,11 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         row_payload_json=factory.scheduler.serialize_row_payload(
             PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         ),
-        available_at=now,
     )
     claimed = factory.scheduler.claim_ready(
         run_id=run.run_id,
         lease_owner=worker_id,
         lease_seconds=30,
-        now=now,
     )
     assert claimed is not None and claimed.work_item_id == item.work_item_id
 
@@ -165,7 +164,6 @@ def test_durable_image_reports_only_allowlisted_delta(seeded_run: _SeededRun) ->
         work_item_id=seeded_run.work_item_id,
         lease_owner=seeded_run.worker_id,
         lease_seconds=60,
-        now=seeded_run.now,
         membership_fenced=True,
     )
     after = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)

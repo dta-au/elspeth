@@ -51,6 +51,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
+from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now
 from tests.helpers.state_engine import capture_state_engine_image
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
@@ -104,7 +105,6 @@ def _claim_ready_as_registered_process(
         run_id=run_id,
         lease_owner=worker_id,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
-        now=datetime.fromisoformat(now_iso),
     )
     if expected_token_id is None:
         assert claimed is None
@@ -153,7 +153,6 @@ def _park_pending_sink_as_registered_process(
         run_id=run_id,
         lease_owner=worker_id,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
-        now=now,
     )
     assert claimed is not None
     assert claimed.token_id == expected_token_id
@@ -183,7 +182,6 @@ def _claim_pending_sink_as_registered_process(
         run_id=run_id,
         lease_owner=worker_id,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
-        now=datetime.fromisoformat(now_iso),
     )
     if expected_token_id is None:
         assert claimed is None
@@ -231,7 +229,6 @@ def _recover_expired_as_registered_leader_process(
 ) -> None:
     """Child action: run the strict leader-fenced production recovery verb."""
     recovered = RecorderFactory(db).scheduler.recover_expired_leases(
-        now=datetime.fromisoformat(now_iso),
         coordination_token=CoordinationToken(
             run_id=run_id,
             worker_id=leader_id,
@@ -250,7 +247,6 @@ def _release_leader_process(
 ) -> None:
     RunCoordinationRepository(db.engine).release_seat(
         token=CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=leader_epoch),
-        now=datetime.fromisoformat(now_iso),
     )
 
 
@@ -264,7 +260,6 @@ def _acquire_leader_process(
     token = RunCoordinationRepository(db.engine).acquire_run_leadership(
         run_id=run_id,
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
         window_seconds=10**9,
     )
     assert token == CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=expected_epoch)
@@ -282,7 +277,6 @@ def _refuse_live_seat_process(
         RunCoordinationRepository(db.engine).acquire_run_leadership(
             run_id=run_id,
             worker_id=worker_id,
-            now=datetime.fromisoformat(now_iso),
             window_seconds=10**9,
         )
 
@@ -302,7 +296,6 @@ def _join_follower_process(
         worker_id = Orchestrator(db).join_run(
             run_id=run_id,
             settings=types.SimpleNamespace(),  # type: ignore[arg-type]  # resolved settings are patched at this process boundary
-            now=datetime.fromisoformat(now_iso),
             window_seconds=10**9,
         )
     Path(worker_id_path).write_text(worker_id, encoding="utf-8")
@@ -311,7 +304,6 @@ def _join_follower_process(
 def _depart_follower_process(db: LandscapeDB, worker_id: str, now_iso: str) -> None:
     RunCoordinationRepository(db.engine).depart_worker(
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
     )
 
 
@@ -326,7 +318,6 @@ def _evict_follower_process(
     evicted = RunCoordinationRepository(db.engine).evict_worker(
         token=CoordinationToken(run_id=run_id, worker_id=leader_id, leader_epoch=leader_epoch),
         target_worker_id=target_worker_id,
-        now=datetime.fromisoformat(now_iso),
         grace_seconds=0,
         window_seconds=10**9,
     )
@@ -361,7 +352,6 @@ def _worker_heartbeat_process(
     """RC-03: heartbeat an active registered worker through production."""
     snapshot = RunCoordinationRepository(db.engine).worker_heartbeat(
         worker_id=worker_id,
-        now=datetime.fromisoformat(now_iso),
         window_seconds=10**9,
     )
     assert snapshot.worker_active is True
@@ -378,16 +368,18 @@ def _lease_heartbeat_process(
     now_iso: str,
 ) -> None:
     """AUX-01: renew a registered worker's lease beyond its original TTL."""
-    now = datetime.fromisoformat(now_iso)
+    del now_iso  # the deadline is Landscape database time + lease_seconds (ADR-047), not a caller clock
+    heartbeat_from = landscape_database_now(db.engine)
     expires_at = RecorderFactory(db).scheduler.heartbeat_lease(
         run_id=run_id,
         work_item_id=work_item_id,
         lease_owner=worker_id,
         lease_seconds=2 * _DEFAULT_LEASE_SECONDS,
-        now=now,
         membership_fenced=True,
     )
-    assert expires_at == now + timedelta(seconds=2 * _DEFAULT_LEASE_SECONDS)
+    assert_stamped_between(
+        expires_at, start=heartbeat_from, end=landscape_database_now(db.engine), offset=timedelta(seconds=2 * _DEFAULT_LEASE_SECONDS)
+    )
 
 
 def _refuse_inactive_claim_process(
@@ -402,7 +394,6 @@ def _refuse_inactive_claim_process(
             run_id=run_id,
             lease_owner=worker_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=datetime.fromisoformat(now_iso),
         )
 
 
@@ -444,7 +435,6 @@ def _refuse_inactive_enqueue_process(
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=datetime.fromisoformat(now_iso),
             worker_id=worker_id,
         )
 
@@ -459,7 +449,6 @@ def _refuse_recovery_process(
     """Refuse stale or foreign strict leader authority before recovery."""
     with pytest.raises(RunLeadershipLostError):
         RecorderFactory(db).scheduler.recover_expired_leases(
-            now=datetime.fromisoformat(now_iso),
             coordination_token=CoordinationToken(
                 run_id=run_id,
                 worker_id=worker_id,
@@ -481,7 +470,6 @@ def _refuse_evict_process(
         RunCoordinationRepository(db.engine).evict_worker(
             token=CoordinationToken(run_id=run_id, worker_id=leader_id, leader_epoch=leader_epoch),
             target_worker_id=target_worker_id,
-            now=datetime.fromisoformat(now_iso),
             grace_seconds=0,
             window_seconds=10**9,
         )
@@ -1073,6 +1061,10 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
             .where(run_workers_table.c.worker_id.in_((transform_owner, sink_owner)))
             .values(status="departed", departed_at=recovery_now)
         )
+    # Both departed owners' leases lapse on the Landscape database clock
+    # (ADR-047) before the registered leader's fenced sweep runs.
+    expire_lease(crashed.db.engine, str(leased_rows[transform_token_id]["work_item_id"]))
+    expire_lease(crashed.db.engine, str(leased_rows[sink_token_id]["work_item_id"]))
 
     with spawn_database_process_at_seam(
         database_url=crashed.db.connection_string,
@@ -1333,7 +1325,11 @@ def test_registered_process_coordination_release_takeover_join_depart_and_evict(
         ) as refusal:
             refusal.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             _release_and_assert_clean(refusal)
-    assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == before_ineligible_evictions
+    # Each refused eviction still ran under the leader fence, which re-stamps
+    # the seat from the Landscape database clock (ADR-047); nothing else moves.
+    before_ineligible_evictions.diff(capture_state_engine_image(crashed.factory, run_id=crashed.run_id)).assert_only(
+        {"run_coordination": {"leader_heartbeat_expires_at", "updated_at"}}
+    )
     assert capture_state_engine_image(crashed.factory, run_id=foreign_run_id) == before_foreign_run
 
     with crashed.db.engine.connect() as conn:

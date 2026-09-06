@@ -181,7 +181,6 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                 node_id="normalize",
                 step_index=1,
                 ingest_sequence=ingest_sequence,
-                available_at=now,
                 row_payload_json=payload,
             )
     finally:

@@ -62,7 +62,9 @@ from elspeth.contracts.audit_export import (
     AuditExportTerminalWitness,
 )
 from elspeth.contracts.auth import (
+    ActivationRole,
     AuthProviderType,
+    IdentityAccessState,
     IdentityProviderType,
     IdentityRole,
     RelationshipType,
@@ -460,7 +462,9 @@ __all__ = [  # Grouped by category for readability
     "TransformErrorRecord",
     "ValidationErrorRecord",
     # auth
+    "ActivationRole",
     "AuthProviderType",
+    "IdentityAccessState",
     "IdentityProviderType",
     "IdentityRole",
     "RelationshipType",

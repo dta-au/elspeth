@@ -127,7 +127,6 @@ class CheckpointManager:
         return fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
-            now=datetime.now(UTC),
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb=verb,
         )

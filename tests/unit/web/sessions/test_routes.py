@@ -15261,3 +15261,71 @@ def test_recompose_auto_commit_revoked_persists_the_post_rebind_message(tmp_path
     messages = asyncio.run(service.get_messages(session_id, limit=None))
     assistant_rows = [message for message in messages if message.role == "assistant"]
     assert [message.content for message in assistant_rows] == [PIPELINE_STAGED_REVIEW_MESSAGE]
+
+
+# --- P4-A-3 (elspeth-bf52d495a2): DELETE while a page read admission is open ---
+
+
+@pytest.mark.asyncio
+async def test_delete_session_succeeds_while_a_blob_read_admission_is_open(tmp_path) -> None:
+    """A page's read lease never blocks the archive; the reader loses custody afterwards.
+
+    Before the read admission was shareable the ARCHIVE acquire hit the
+    reader's fence row and DELETE answered 409 (E2E teardown). The stated
+    outcome is: archive wins, DELETE is 204, the session is gone, and the open
+    reader's next custody proof fails — MISSING when the archive deleted the
+    session row, OWNER_INACTIVE when it only marked it archived.
+    """
+    from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Open reader"}).json()["id"])
+    reader = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    service.session_operation_authority.compare_and_swap(reader)
+
+    assert client.delete(f"/api/sessions/{session_id}").status_code == 204
+    assert client.get(f"/api/sessions/{session_id}").status_code == 404
+
+    with pytest.raises(SessionOperationFenceLost) as lost:
+        service.session_operation_authority.compare_and_swap(reader)
+    assert lost.value.reason in {FenceLossReason.MISSING, FenceLossReason.OWNER_INACTIVE}
+
+
+@pytest.mark.asyncio
+async def test_get_state_yaml_is_409_while_another_compose_is_live(tmp_path) -> None:
+    """The export records a completion event, so it holds COMPOSE authority and
+    contends with a live compose (elspeth-bf52d495a2 option A; recorded as an
+    observation — a state-scoped audit-only kind would relax it)."""
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session_id = uuid.UUID(client.post("/api/sessions", json={"title": "Exporting"}).json()["id"])
+    writer = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    try:
+        # This bare app registers no exception handlers, so the conflict the
+        # full app maps to 409 (app.py) surfaces here as the raised error.
+        with pytest.raises(SessionOperationConflictError):
+            client.get(f"/api/sessions/{session_id}/state/yaml")
+    finally:
+        service.session_operation_authority.release(writer)
+    # A page read admission does not contend with the export.
+    reader = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.BLOB_READ,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=30,
+    )
+    try:
+        assert client.get(f"/api/sessions/{session_id}/state/yaml").status_code != 409
+    finally:
+        service.session_operation_authority.release(reader)

@@ -15,7 +15,7 @@ durable roster authority instead (declared FORK roster, or an EXPAND
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import insert
@@ -36,7 +36,7 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-group-loss-1"
@@ -125,7 +125,7 @@ def seat_token(db: LandscapeDB) -> CoordinationToken:
     _seed_row_and_token(db, row_id="row-a", token_id="tok_a", source_row_index=0)
     _seed_row_and_token(db, row_id="row-b", token_id="tok_b", source_row_index=1)
     _seed_row_and_token(db, row_id="row-impostor", token_id="tok_IMPOSTOR", source_row_index=2)
-    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, now=_NOW, window_seconds=80.0)
+    return register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id=WORKER, window_seconds=80.0)
 
 
 @pytest.fixture
@@ -166,9 +166,8 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
         step_index=1,
         ingest_sequence=10,
         row_payload_json=_payload_json(),
-        available_at=_NOW,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=_NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None
     return db, repo, claimed
 
@@ -229,9 +228,12 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
     marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=_NOW, coordination_token=seat_token)
     assert marked_first == 1
 
-    later = _NOW + timedelta(seconds=200)  # past seat_token's 80s heartbeat window
+    # The adopt refreshed the seat from the DATABASE clock (ADR-047), so the
+    # window lapses through the database too, not through a future ``now``.
+    expire_leader_seat(db, run_id)
+    later = datetime.now(UTC)
     new_epoch_token = RunCoordinationRepository(db.engine).acquire_run_leadership(
-        run_id=run_id, worker_id=f"{WORKER}-takeover", now=later, window_seconds=80.0
+        run_id=run_id, worker_id=f"{WORKER}-takeover", window_seconds=80.0
     )
     assert new_epoch_token.leader_epoch != seat_token.leader_epoch
     marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=later, coordination_token=new_epoch_token)

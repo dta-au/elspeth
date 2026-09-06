@@ -32,6 +32,7 @@ from elspeth.contracts.scheduler import (
 )
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcome_guarded
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
@@ -279,7 +280,7 @@ class BarrierJournalRepository:
         if scope_row_id is not None:
             blocked_select = blocked_select.where(token_work_items_table.c.row_id == scope_row_id)
 
-        with fenced_write(self._engine, coordination_token=coordination_token, now=now, verb="complete_barrier") as conn:
+        with fenced_write(self._engine, coordination_token=coordination_token, verb="complete_barrier") as conn:
             if terminal_outcome_token_ids:
                 locked_tokens = conn.execute(
                     select(tokens_table.c.token_id, tokens_table.c.run_id)
@@ -466,8 +467,9 @@ class BarrierJournalRepository:
                 # created_at before its token-derived work_item_id fallback.
                 # Preserve the caller's emission tuple order durably by giving
                 # each READY row a distinct logical creation instant ending at
-                # the barrier completion timestamp. available_at remains
-                # ``now`` so a pinned/mock clock can claim the whole group.
+                # the barrier completion timestamp. available_at is stamped
+                # from Landscape database time inside the insert (ADR-047), so
+                # the whole group is claimable by the very next claim_ready.
                 claim_order_at = now - timedelta(microseconds=ready_emission_count - emission_index - 1)
                 self._insert_ready_emission(
                     conn,
@@ -768,7 +770,9 @@ class BarrierJournalRepository:
             step_index=emission.step_index,
             ingest_sequence=emission.ingest_sequence,
             row_payload_json=emission.row_payload_json,
-            available_at=now,
+            # Available at the completing transaction's database time
+            # (ADR-047): claim_ready admits the row against that same clock.
+            available_at=read_landscape_transaction_time(conn),
             attempt=emission.attempt,
             queue_key=emission.queue_key,
             barrier_key=emission.barrier_key,
@@ -976,7 +980,6 @@ class BarrierJournalRepository:
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
-            now=now,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_blocked_barrier_item",
         ) as conn:
