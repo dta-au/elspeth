@@ -5092,7 +5092,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         except SyntaxError:
             return None
         parsed = expression.body
-        parsed._inventory_parent = annotation  # type: ignore[attr-defined]
+        parsed.__dict__["_inventory_parent"] = annotation
         _attach_parents(parsed)
         return parsed
 
