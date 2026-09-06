@@ -262,16 +262,23 @@ function expectBottomRowContract(
 test.describe("Composer deterministic workspace geometry", () => {
   for (const viewport of DESKTOP_VIEWPORTS) {
     for (const scenario of WORKSPACE_SCENARIOS) {
-      if (scenario === "tall-confirmation-dialog" && viewport.width === 2560) {
+      if (
+        scenario === "tall-confirmation-dialog" &&
+        (viewport.width === 2560 || viewport.width === 2048)
+      ) {
         // The tall scenario asserts an OVERFLOWING run dialog. The dialog
         // widens with the viewport and its body grows with content up to
-        // calc(100dvh - 32px), so at 2560x1280 the in-domain fixture
-        // (TALL_DIALOG_NODE_COUNT stages with 38-character ids, the engine's
-        // name limit) fits without scrolling: measured 2026-09-06, 80 stages
-        // gave body scrollHeight 632 / clientHeight 632 there, and the
-        // break-even is ~160 stages, whose seed cost is a CI flake source.
-        // A fitting dialog at that size is the product working, not a
-        // geometry defect, so the scenario runs at the other four viewports.
+        // calc(100dvh - 32px), so at the two largest desktop viewports an
+        // in-domain fixture (38-character stage ids, the engine's name
+        // limit) fits without scrolling. Measured 2026-09-06 with 80 stages:
+        // 2560x1280 body scrollHeight 632 / clientHeight 632 (>= 1.2x
+        // overflow would need ~200 stages); 2048x1050 767 / 767 (>= 1.2x
+        // needs 117 stages). The seed route's cost grows roughly
+        // quadratically with stages (117 stages seeded in ~7 s on a quiet
+        // box, ~9 s under load) and the CI runner is slower, so those counts
+        // are a CI flake source. A fitting dialog at those sizes is the
+        // product working, not a geometry defect; the scenario runs at the
+        // other three viewports, sized by TALL_DIALOG_NODE_COUNT.
         continue;
       }
       test(`${scenario} is operable at ${viewport.width}x${viewport.height}`, async ({
