@@ -7561,17 +7561,6 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return False
         return self._forward_is_contained(call, use, depth=depth + 1, active=active, strict=strict)
 
-    def _is_wrapper_parameter_yield(self, node: ast.Yield) -> bool:
-        """A direct ``yield <parameter>`` of a contextmanager wrapper, the parameter unreassigned."""
-
-        if not isinstance(node.value, ast.Name):
-            return False
-        wrapper = self._enclosing_function(node)
-        if wrapper is None or not self._is_contextmanager_definition(wrapper) or node not in self._direct_yields(wrapper):
-            return False
-        parameters = {argument.arg for argument in (*wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs)}
-        return node.value.id in parameters and not self._name_reassigned_in(wrapper, node.value.id)
-
     def _forward_is_own_wrapper_acquisition(
         self,
         call: ast.Call,
@@ -7646,15 +7635,12 @@ class _ProductionWriterCollector(ast.NodeVisitor):
 
         for node in ast.walk(self.tree):
             if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
-                if isinstance(node, ast.Yield) and self._is_wrapper_parameter_yield(node):
-                    # ``yield held_connection`` in ``_blob_phase_transaction``:
-                    # the wrapper hands back the connection a caller forwarded
-                    # into it. That forward is judged at the CALLER (a forward
-                    # into its own parameter-fed wrapper acquisition, or an
-                    # ordinary forward whose walk refuses this yield), never
-                    # as a yield-escape charged to every caller's acquisition
-                    # (elspeth-e483fe7f85 family H, family B finding F1).
-                    continue
+                # ``yield held_connection`` in ``_blob_phase_transaction`` needs no
+                # suppression here: the yielded name is the wrapper's own parameter,
+                # which resolves to no acquisition in the wrapper's scope, so this
+                # loop records nothing for it. Containment of that forward is carried
+                # entirely at the CALLER by ``_forward_is_own_wrapper_acquisition``
+                # (elspeth-e483fe7f85 family H, family B finding F1).
                 for acquisition in self._connection_acquisitions_for_expression(node, node.value):
                     self._record_connection(acquisition, escapes=True)
                 continue
