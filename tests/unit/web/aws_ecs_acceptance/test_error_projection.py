@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -90,7 +91,24 @@ def test_acceptance_step_requires_a_vocabulary_name() -> None:
         pytest.fail("step body must not run")
 
 
+def _require_non_root() -> None:
+    """chmod-based unreadable/unwritable setups do not bind for uid 0.
+
+    A container job runs as root and would report "DID NOT RAISE" for every
+    permission projection below. Skipping there is truthful only because the
+    `host-runner-unit` job (.github/workflows/ci.yaml) sets
+    ELSPETH_CI_NON_ROOT_REQUIRED and runs this file as the runner user, where
+    uid 0 is a broken gate, not an environment quirk (elspeth-bc97e06221 B3).
+    """
+    if os.geteuid() != 0:
+        return
+    if os.environ.get("ELSPETH_CI_NON_ROOT_REQUIRED"):
+        pytest.fail("a non-root uid is required by ELSPETH_CI_NON_ROOT_REQUIRED but the process runs as root")
+    pytest.skip("running as root: chmod-based permission projections cannot be exercised")
+
+
 def test_unwritable_state_directory_projects_state_file_unwritable(tmp_path: Path) -> None:
+    _require_non_root()
     # F12: the bind-mounted acceptance dir is not writable by the container
     # user; this must surface as a named code, not an internal error.
     state_dir = tmp_path / "acceptance"
@@ -104,6 +122,7 @@ def test_unwritable_state_directory_projects_state_file_unwritable(tmp_path: Pat
 
 
 def test_state_read_failures_project_distinct_closed_codes(tmp_path: Path) -> None:
+    _require_non_root()
     missing = tmp_path / "missing.json"
     with pytest.raises(contracts.AcceptanceStateError) as raised:
         read_acceptance_state(missing)
@@ -143,6 +162,7 @@ def _client_env(**updates: str) -> dict[str, str]:
 
 
 def test_declared_ca_bundle_must_be_readable_before_any_request(tmp_path: Path) -> None:
+    _require_non_root()
     # F12: a 0600 root-owned ca.pem was unreadable by uid 1654 and produced
     # only AcceptanceInternalError.  The client now preflights the declared
     # trust bundle and names the failure.
@@ -279,6 +299,7 @@ def test_main_projects_state_file_unwritable_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _require_non_root()
     state_dir = tmp_path / "acceptance"
     state_dir.mkdir(mode=0o500)
 

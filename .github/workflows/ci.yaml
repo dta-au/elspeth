@@ -689,6 +689,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
+          # Full history: tests/unit/docs/test_adr_public_integrity.py and
+          # tests/unit/deployment/test_aws_ecs_terraform_package.py resolve
+          # cited commits and fail loudly under GITHUB_ACTIONS when history
+          # is missing (their own rule, elspeth-af1efcb8d8); the default
+          # depth-1 checkout made both red on every push (elspeth-bc97e06221 B4).
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -702,9 +708,17 @@ jobs:
 
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # nodejs: tests/unit/test_dir_bug_sweep_workflow_contract.py runs the
+        # workflow script under `node -e` (30 ids); ripgrep:
+        # tests/unit/architecture/test_sink_publication_callers.py's alias
+        # sweep; sqlite3: examples/multi_worker_showcase/outcome_stats.sh
+        # under tests/e2e/examples. All three were absent from the
+        # python:*-bookworm image and 32 ids failed on every push
+        # (elspeth-bc97e06221 B1). Docker is NOT available inside a container
+        # job; the docker-CLI tests run in the host-runner-unit job below.
         run: |
           apt-get update -q
-          apt-get install -y -q libsqlcipher-dev jq unzip
+          apt-get install -y -q libsqlcipher-dev jq unzip nodejs ripgrep sqlite3
 
       - name: Install Terraform (native deployment-package contract tests)
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -918,6 +932,48 @@ jobs:
           name: testcontainer-junit
           path: testcontainer-junit.xml
           retention-days: 30
+
+  host-runner-unit:
+    name: Host-runner unit (docker CLI, non-root filesystem)
+    # Two unit files need what a container job cannot give: a docker CLI
+    # (tests/unit/deployment/test_compose_bundle.py renders the compose bundle
+    # with `docker compose config`) and a non-root uid (tests/unit/web/
+    # aws_ecs_acceptance/test_error_projection.py proves chmod-based
+    # unreadable/unwritable projections, which uid 0 ignores). In the `test`
+    # container job those ids skip with a reason; here the ELSPETH_CI_*_REQUIRED
+    # variables turn the skips into failures, so the ids are proven on every
+    # push rather than silently absent (elspeth-bc97e06221 B1, B3).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libsqlcipher-dev
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Run host-only unit tests
+        env:
+          ELSPETH_CI_DOCKER_REQUIRED: "1"
+          ELSPETH_CI_NON_ROOT_REQUIRED: "1"
+        run: |
+          uv run pytest \
+            tests/unit/deployment/test_compose_bundle.py \
+            tests/unit/web/aws_ecs_acceptance/test_error_projection.py \
+            -v \
+            -n 0
 
   # ===========================================================================
   # Stage 3c: Dependency and License Audit
@@ -1245,6 +1301,7 @@ jobs:
       - static-analysis
       - test
       - testcontainer
+      - host-runner-unit
       - state-engine-validation
       - azure-container-apps-bicep
       - supply-chain-audit
@@ -1264,6 +1321,10 @@ jobs:
           fi
           if [[ "${{ needs.testcontainer.result }}" != "success" ]]; then
             echo "Testcontainer (PostgreSQL contention proofs) job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.host-runner-unit.result }}" != "success" ]]; then
+            echo "Host-runner unit (docker CLI, non-root filesystem) job failed"
             exit 1
           fi
           if [[ "${{ needs.state-engine-validation.result }}" != "success" ]]; then

@@ -19,6 +19,27 @@ from elspeth.web import config as web_config
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import validate_aws_ecs_settings
 
+_REQUIRED_WEB_ENV = {
+    "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "15",
+    "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+    "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85.0",
+    "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+    "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+}
+
+
+@pytest.fixture
+def required_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The five no-default WebSettings fields, supplied by the test, not by an operator's .env.
+
+    `settings_from_env` reads only the process environment; locally
+    pytest-dotenv loads the maintainer's untracked `.env`, which carried these
+    five values, so every `settings_from_env` test passed here and failed in
+    CI with "5 validation errors ... Field required" (elspeth-bc97e06221 B2).
+    """
+    for name, value in _REQUIRED_WEB_ENV.items():
+        monkeypatch.setenv(name, value)
+
 
 def test_playwright_local_backend_secret_key_satisfies_non_pytest_guard() -> None:
     """The Playwright-managed backend runs outside pytest and needs a 32-byte key."""
@@ -2019,6 +2040,7 @@ def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_regio
     assert settings.deployment_aws_region == "ap-southeast-1"
 
 
+@pytest.mark.usefixtures("required_web_env")
 def test_settings_from_env_parses_s3_source_profiles_without_repr_leaking_private_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2048,6 +2070,7 @@ def test_settings_from_env_parses_s3_source_profiles_without_repr_leaking_privat
     assert private_prefix not in repr(settings.aws_s3_source_profiles[0])
 
 
+@pytest.mark.usefixtures("required_web_env")
 def test_settings_from_env_parses_textract_profiles_without_repr_leaking_private_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2147,6 +2170,7 @@ def test_settings_from_env_rejects_conflicting_blank_or_unsupported_ambient_regi
         web_config.settings_from_env()
 
 
+@pytest.mark.usefixtures("required_web_env")
 def test_settings_from_env_retains_well_formed_unsupported_region_for_scoped_unavailability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2194,6 +2218,7 @@ class TestDevAdminUser:
         with pytest.raises(ValidationError, match="dev_admin_user"):
             _settings(dev_admin_user="   ")
 
+    @pytest.mark.usefixtures("required_web_env")
     def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__DEV_ADMIN_USER", "john")
         assert web_config.settings_from_env().dev_admin_user == "john"
@@ -2231,6 +2256,7 @@ class TestInstanceId:
         with pytest.raises(ValidationError, match="instance_id"):
             _settings(instance_id=value)
 
+    @pytest.mark.usefixtures("required_web_env")
     def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "rA--pinned.01")
         assert web_config.settings_from_env().instance_id == "rA--pinned.01"
