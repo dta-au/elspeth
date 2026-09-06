@@ -5047,6 +5047,47 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         finally:
             blob_service._mark_run_output_ready = original
 
+    @pytest.mark.asyncio
+    async def test_custody_refusal_during_recovery_mark_propagates(
+        self,
+        blob_service,
+        session_id,
+        db_engine,
+        run_env,
+    ) -> None:
+        """A custody refusal while marking ``error`` after a DB fault is a Tier-1 anomaly, not a swallowed no-op.
+
+        The recovery mark runs only after an I/O or DB fault left the row
+        pending under this operation's EXECUTE fence; the facet refusing it
+        means the row changed under the fence, so the refusal propagates.
+        """
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
+
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+
+        original_ready = blob_service._mark_run_output_ready
+        original_error = blob_service._mark_run_output_error
+
+        def _db_fault(*args, **kwargs):
+            raise OperationalError("UPDATE blobs", {}, Exception("connection reset"))
+
+        def _refused(*args, **kwargs):
+            raise SessionDerivedCustodyError()
+
+        blob_service._mark_run_output_ready = _db_fault
+        blob_service._mark_run_output_error = _refused
+        try:
+            with pytest.raises(SessionDerivedCustodyError):
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        finally:
+            blob_service._mark_run_output_ready = original_ready
+            blob_service._mark_run_output_error = original_error
+
 
 # ---------------------------------------------------------------------------
 # read_blob_content — lifecycle and integrity guards (elspeth-6082ad9636)

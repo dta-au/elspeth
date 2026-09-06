@@ -3033,11 +3033,14 @@ class BlobServiceImpl:
         caller can record them in ``BlobFinalizationResult.errors`` and proceed
         to the next blob.  The suppressed set is exact: the facet's typed
         custody refusal ``SessionDerivedCustodyError`` (the row is gone, or is
-        not an output of this run in the fence's session), ``BlobStateError``
-        (already finalized), ``OSError`` and ``SQLAlchemyError``.  Programmer
-        bugs (TypeError, AttributeError, AssertionError), any other
-        RuntimeError, and the facet's ``AuditIntegrityError`` for a row
-        another EXECUTE operation reserved all propagate.
+        not an output of this run in the fence's session) and
+        ``BlobStateError`` (already finalized) are recorded as the whole
+        outcome — there is nothing left to transition; ``OSError`` and
+        ``SQLAlchemyError`` are recorded and followed by one best-effort
+        ``error`` mark.  Programmer bugs (TypeError, AttributeError,
+        AssertionError), any other RuntimeError, and the facet's
+        ``AuditIntegrityError`` for a row another EXECUTE operation reserved
+        all propagate.
         """
         # Local import: coordination.repository imports the blob contracts at
         # module scope (see _fenced_blob_record).
@@ -3077,7 +3080,12 @@ class BlobServiceImpl:
                     storage.unlink()
                 record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
             return record
-        except (SessionDerivedCustodyError, BlobStateError, OSError, SQLAlchemyError) as exc:
+        except (SessionDerivedCustodyError, BlobStateError) as exc:
+            # The row is gone, is not this run's output, or is already
+            # finalized: there is nothing left to transition, so the facet's
+            # refusal is the whole per-blob outcome.
+            return [BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc))]
+        except (OSError, SQLAlchemyError) as exc:
             # Best-effort: transition the failed blob to "error" so it does
             # not remain permanently pending.  Return explicit error records
             # (never a silent swallow) describing the primary fault and any
@@ -3109,23 +3117,18 @@ class BlobServiceImpl:
     ) -> SQLAlchemyError | OSError | None:
         """Transition a still-pending output of this operation to ``error``, best effort.
 
-        The facet refuses when there is nothing left to mark — the row is
-        already deleted or no longer this run's output
-        (``SessionDerivedCustodyError``), or already finalized
-        (``BlobStateError``) — exactly the rows the former
-        ``WHERE status='pending'`` update matched zero of, so those refusals
-        are the same no-op here.  Returns the DB/IO fault if the mutation
-        itself failed (so the caller records a ``RecoveryFailed[...]`` audit
-        entry) or ``None`` otherwise.  Narrow to DB/IO faults — programmer
-        bugs (TypeError, AttributeError, AssertionError) must propagate per
-        offensive-programming policy.
+        Reached only after an I/O or DB fault left the row pending, so the
+        row is still this operation's pending output: the caller holds the
+        session's EXECUTE fence and the facet finalizes under that fence's
+        exact custody.  Returns the DB/IO fault if the mutation itself
+        failed (so the caller records a ``RecoveryFailed[...]`` audit entry)
+        or ``None`` otherwise.  Narrow to DB/IO faults — the facet's custody
+        or state refusal here means the row changed under the fence, a Tier-1
+        anomaly that propagates, as do programmer bugs (TypeError,
+        AttributeError, AssertionError) per offensive-programming policy.
         """
-        from elspeth.web.coordination.repository import SessionDerivedCustodyError
-
         try:
             self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
-        except (SessionDerivedCustodyError, BlobStateError):
-            return None
         except (SQLAlchemyError, OSError) as rec_exc:
             return rec_exc
         return None

@@ -2624,7 +2624,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "12c8ea3131981744",
         2,
         "SessionBlobMutationAuthority",
-        line=3344,
+        line=3349,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -2634,7 +2634,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "12c8ea3131981744",
         3,
         "SessionBlobMutationAuthority",
-        line=3385,
+        line=3390,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -2644,7 +2644,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "12c8ea3131981744",
         4,
         "SessionBlobMutationAuthority",
-        line=3445,
+        line=3450,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
