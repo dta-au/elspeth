@@ -9,14 +9,15 @@ schema; stale local/runtime files should be deleted and recreated.
 from __future__ import annotations
 
 from threading import Lock
-from typing import Any, NoReturn
+from typing import Any, NoReturn, final
 
-from sqlalchemy import Connection, Engine, inspect, text
+from sqlalchemy import Connection, Engine, insert, inspect, text
 from sqlalchemy.engine.reflection import Inspector
 
 from elspeth.core.schema_identity import (
+    SCHEMA_IDENTITY_APPLICATION_ID,
+    SCHEMA_IDENTITY_SINGLETON_ID,
     SCHEMA_IDENTITY_TABLE_NAME,
-    insert_schema_identity,
     read_schema_identities,
     schema_identity_mismatch,
 )
@@ -238,6 +239,191 @@ def explain_non_current_schema(bind: Engine | Connection) -> NoReturn:
     )
 
 
+@final
+class SessionSchemaAuthority:
+    """The session store's schema-management authority (P4-D6 family S).
+
+    Owns the three schema-management operations on the session database and
+    nothing else: stamping the schema sentinels after creation, asserting
+    them on an existing database, and validating the required audit
+    triggers. It is a nominal type (ADR-032): the writer inventory binds
+    these methods, and only these, to ``elspeth_schema_identity`` and the
+    SQLite header sentinels, so no other symbol in the tree may stamp them.
+    Construct it on the bind the caller already holds -- a supplied
+    ``Connection`` is used directly so a caller holding the only connection
+    of a bounded pool cannot deadlock on a second checkout; an ``Engine``
+    opens one connection per operation and releases it.
+    """
+
+    __slots__ = ("_bind",)
+
+    def __init__(self, bind: Engine | Connection) -> None:
+        self._bind = bind
+
+    def stamp_sentinels(self) -> None:
+        """Write the SQLite header sentinels and the identity row of a freshly created schema."""
+        if isinstance(self._bind, Connection):
+            self._stamp_on(self._bind)
+        else:
+            with self._bind.begin() as connection:
+                self._stamp_on(connection)
+
+    def _stamp_on(self, connection: Connection) -> None:
+        if SCHEMA_IDENTITY_TABLE_NAME not in _user_tables(inspect(connection)):
+            # Distinct wording from the initializer's post-verify failure in
+            # ``schema_probe``. Both once said "initialization did not produce the
+            # current schema", which made two unrelated faults indistinguishable
+            # in a log: this one is "create_all ran and the table set is still
+            # wrong", a first-party defect; that one is "the tables exist and
+            # their SHAPE does not match", which is drift.
+            raise SessionSchemaError(
+                f"Session database initialization created no {SCHEMA_IDENTITY_TABLE_NAME} table, so the "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH} sentinels cannot be stamped. The table set is "
+                "incomplete after create_all rather than merely out of date, which is a defect in this build "
+                "and not a database an operator can fix by deleting."
+            )
+        if connection.dialect.name == "sqlite":
+            connection.execute(text(f"PRAGMA application_id = {SESSION_DB_APPLICATION_ID}"))
+            connection.execute(text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH}"))
+        # Duplicate stamps fail closed on the singleton primary key.
+        connection.execute(
+            insert(schema_identity_table).values(
+                singleton_id=SCHEMA_IDENTITY_SINGLETON_ID,
+                application_id=SCHEMA_IDENTITY_APPLICATION_ID,
+                store_kind="session",
+                schema_epoch=SESSION_SCHEMA_EPOCH,
+            )
+        )
+
+    def assert_sentinels(self) -> None:
+        """Crash with an actionable message unless the sentinels match this build."""
+        if isinstance(self._bind, Connection):
+            self._assert_on(self._bind)
+        else:
+            with self._bind.connect() as connection:
+                self._assert_on(connection)
+
+    def _assert_on(self, connection: Connection) -> None:
+        inspector = inspect(connection)
+        tables = _user_tables(inspector)
+
+        if connection.dialect.name == "sqlite":
+            app_id = connection.execute(text("PRAGMA application_id")).scalar_one()
+            user_ver = connection.execute(text("PRAGMA user_version")).scalar_one()
+            if app_id not in {0, SESSION_DB_APPLICATION_ID}:
+                raise SessionSchemaError(
+                    f"Session DB has unexpected application_id={app_id:#010x}. "
+                    f"Expected {SESSION_DB_APPLICATION_ID:#010x} (ELSP) or 0 (new database). "
+                    f"This SQLite file does not belong to ELSPETH. "
+                    f"Delete the session DB file and restart."
+                )
+            if user_ver not in {0, SESSION_SCHEMA_EPOCH}:
+                raise SessionSchemaError(
+                    f"Session DB schema version {user_ver} does not match "
+                    f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                    f"does not migrate session databases. "
+                    f"Delete the session DB file and restart."
+                )
+
+        if SCHEMA_IDENTITY_TABLE_NAME not in tables:
+            if tables:
+                raise SessionSchemaError(
+                    f"Session DB is missing {SCHEMA_IDENTITY_TABLE_NAME} for "
+                    f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                    "does not migrate session databases. Delete the session DB file and restart."
+                )
+            return
+
+        # Validate the live identity-table shape BEFORE selecting from it:
+        # ``read_schema_identities`` selects the declared model columns, so a
+        # missing or renamed column would otherwise leak a raw SQLAlchemy
+        # OperationalError instead of the actionable delete-and-restart error
+        # (elspeth-5cf1ca2852). Column presence is all the read requires; type
+        # drift is classified by ``read_schema_identities`` itself and full-shape
+        # drift by the downstream schema validator.
+        live_identity_columns = {column["name"] for column in inspector.get_columns(SCHEMA_IDENTITY_TABLE_NAME)}
+        missing_identity_columns = {column.name for column in schema_identity_table.columns} - live_identity_columns
+        if missing_identity_columns:
+            raise SessionSchemaError(
+                f"Session DB {SCHEMA_IDENTITY_TABLE_NAME} table is missing column(s) "
+                f"{', '.join(sorted(missing_identity_columns))} for "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                "does not migrate session databases. Delete the session DB file and restart."
+            )
+
+        rows = read_schema_identities(connection, schema_identity_table)
+        mismatch = schema_identity_mismatch(rows, store_kind="session", schema_epoch=SESSION_SCHEMA_EPOCH)
+        if mismatch is not None:
+            raise SessionSchemaError(
+                f"Session DB schema identity mismatch ({mismatch}) for "
+                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
+                "does not migrate session databases. Delete the session DB file and restart."
+            )
+
+    def validate_required_triggers(self) -> None:
+        """Confirm the required audit triggers are present in the live database."""
+        if self._bind.dialect.name == "sqlite":
+            query = text("SELECT name FROM sqlite_master WHERE type='trigger'")
+        elif self._bind.dialect.name == "postgresql":
+            query = text(
+                """
+                SELECT trigger.tgname
+                FROM pg_catalog.pg_trigger AS trigger
+                JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+                JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE NOT trigger.tgisinternal
+                  AND trigger.tgenabled IN ('O', 'A')
+                  AND namespace.nspname = current_schema()
+                  AND (
+                    (relation.relname = 'interpretation_events' AND trigger.tgname IN (
+                      'trg_interpretation_events_immutable_resolved',
+                      'trg_interpretation_events_no_delete_resolved'
+                    ))
+                    OR (relation.relname = 'composer_completion_events' AND trigger.tgname IN (
+                      'trg_composer_completion_events_no_update',
+                      'trg_composer_completion_events_no_delete'
+                    ))
+                    OR (relation.relname = 'chat_messages' AND trigger.tgname IN (
+                      'trg_chat_messages_immutable_content',
+                      'trg_chat_messages_no_delete'
+                    ))
+                    OR (relation.relname = 'guided_operation_events' AND trigger.tgname IN (
+                      'trg_guided_operation_events_no_update',
+                      'trg_guided_operation_events_no_delete'
+                    ))
+                    OR (relation.relname = 'guided_operation_admission_blocks' AND trigger.tgname IN (
+                      'trg_guided_operation_admission_blocks_no_update',
+                      'trg_guided_operation_admission_blocks_no_delete',
+                      'trg_guided_operation_admission_blocks_reject_existing_operation'
+                    ))
+                    OR (relation.relname = 'guided_operations' AND trigger.tgname IN (
+                      'trg_guided_operations_terminal_immutable',
+                      'trg_guided_operations_reject_admission_block_insert',
+                      'trg_guided_operations_reject_admission_block_update'
+                    ))
+                  )
+                """
+            )
+        else:
+            _schema_error(
+                "audit trigger validation unsupported dialect",
+                expected=["postgresql", "sqlite"],
+                actual=[self._bind.dialect.name],
+            )
+        if isinstance(self._bind, Connection):
+            present = {str(row[0]) for row in self._bind.execute(query)}
+        else:
+            with self._bind.connect() as connection:
+                present = {str(row[0]) for row in connection.execute(query)}
+        missing = _REQUIRED_AUDIT_TRIGGERS - present
+        if missing:
+            _schema_error(
+                "missing audit trigger(s)",
+                expected=sorted(_REQUIRED_AUDIT_TRIGGERS),
+                actual=sorted(present),
+            )
+
+
 def _stamp_schema_sentinels(bind: Engine | Connection) -> None:
     """Write the SQLite PRAGMAs and cross-dialect identity row after creation.
 
@@ -245,31 +431,7 @@ def _stamp_schema_sentinels(bind: Engine | Connection) -> None:
     freshly-created schema, and any pre-existing row is evidence that creation
     ordering or target selection is wrong.
     """
-    if isinstance(bind, Connection):
-        _stamp_schema_sentinels_on_connection(bind)
-    else:
-        with bind.begin() as connection:
-            _stamp_schema_sentinels_on_connection(connection)
-
-
-def _stamp_schema_sentinels_on_connection(connection: Connection) -> None:
-    if SCHEMA_IDENTITY_TABLE_NAME not in _user_tables(inspect(connection)):
-        # Distinct wording from the initializer's post-verify failure in
-        # ``schema_probe``. Both once said "initialization did not produce the
-        # current schema", which made two unrelated faults indistinguishable
-        # in a log: this one is "create_all ran and the table set is still
-        # wrong", a first-party defect; that one is "the tables exist and
-        # their SHAPE does not match", which is drift.
-        raise SessionSchemaError(
-            f"Session database initialization created no {SCHEMA_IDENTITY_TABLE_NAME} table, so the "
-            f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH} sentinels cannot be stamped. The table set is "
-            "incomplete after create_all rather than merely out of date, which is a defect in this build "
-            "and not a database an operator can fix by deleting."
-        )
-    if connection.dialect.name == "sqlite":
-        connection.execute(text(f"PRAGMA application_id = {SESSION_DB_APPLICATION_ID}"))
-        connection.execute(text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH}"))
-    insert_schema_identity(connection, schema_identity_table, store_kind="session", schema_epoch=SESSION_SCHEMA_EPOCH)
+    SessionSchemaAuthority(bind).stamp_sentinels()
 
 
 def _assert_schema_sentinels(bind: Engine | Connection) -> None:
@@ -302,69 +464,7 @@ def _assert_schema_sentinels(bind: Engine | Connection) -> None:
     that state is indistinguishable from "empty DB about to be
     initialised" and is handled by the fresh-DB branch upstream.
     """
-    if isinstance(bind, Connection):
-        _assert_schema_sentinels_on_connection(bind)
-    else:
-        with bind.connect() as connection:
-            _assert_schema_sentinels_on_connection(connection)
-
-
-def _assert_schema_sentinels_on_connection(connection: Connection) -> None:
-    inspector = inspect(connection)
-    tables = _user_tables(inspector)
-
-    if connection.dialect.name == "sqlite":
-        app_id = connection.execute(text("PRAGMA application_id")).scalar_one()
-        user_ver = connection.execute(text("PRAGMA user_version")).scalar_one()
-        if app_id not in {0, SESSION_DB_APPLICATION_ID}:
-            raise SessionSchemaError(
-                f"Session DB has unexpected application_id={app_id:#010x}. "
-                f"Expected {SESSION_DB_APPLICATION_ID:#010x} (ELSP) or 0 (new database). "
-                f"This SQLite file does not belong to ELSPETH. "
-                f"Delete the session DB file and restart."
-            )
-        if user_ver not in {0, SESSION_SCHEMA_EPOCH}:
-            raise SessionSchemaError(
-                f"Session DB schema version {user_ver} does not match "
-                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-                f"does not migrate session databases. "
-                f"Delete the session DB file and restart."
-            )
-
-    if SCHEMA_IDENTITY_TABLE_NAME not in tables:
-        if tables:
-            raise SessionSchemaError(
-                f"Session DB is missing {SCHEMA_IDENTITY_TABLE_NAME} for "
-                f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-                "does not migrate session databases. Delete the session DB file and restart."
-            )
-        return
-
-    # Validate the live identity-table shape BEFORE selecting from it:
-    # ``read_schema_identities`` selects the declared model columns, so a
-    # missing or renamed column would otherwise leak a raw SQLAlchemy
-    # OperationalError instead of the actionable delete-and-restart error
-    # (elspeth-5cf1ca2852). Column presence is all the read requires; type
-    # drift is classified by ``read_schema_identities`` itself and full-shape
-    # drift by the downstream schema validator.
-    live_identity_columns = {column["name"] for column in inspector.get_columns(SCHEMA_IDENTITY_TABLE_NAME)}
-    missing_identity_columns = {column.name for column in schema_identity_table.columns} - live_identity_columns
-    if missing_identity_columns:
-        raise SessionSchemaError(
-            f"Session DB {SCHEMA_IDENTITY_TABLE_NAME} table is missing column(s) "
-            f"{', '.join(sorted(missing_identity_columns))} for "
-            f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-            "does not migrate session databases. Delete the session DB file and restart."
-        )
-
-    rows = read_schema_identities(connection, schema_identity_table)
-    mismatch = schema_identity_mismatch(rows, store_kind="session", schema_epoch=SESSION_SCHEMA_EPOCH)
-    if mismatch is not None:
-        raise SessionSchemaError(
-            f"Session DB schema identity mismatch ({mismatch}) for "
-            f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}. Pre-release ELSPETH "
-            "does not migrate session databases. Delete the session DB file and restart."
-        )
+    SessionSchemaAuthority(bind).assert_sentinels()
 
 
 def _user_tables(inspector: Inspector) -> frozenset[str]:
@@ -460,67 +560,7 @@ def _validate_required_triggers(bind: Engine | Connection) -> None:
     otherwise only surface the next time someone tried to mutate a
     protected row (which may be never on a quiescent DB).
     """
-    if bind.dialect.name == "sqlite":
-        query = text("SELECT name FROM sqlite_master WHERE type='trigger'")
-    elif bind.dialect.name == "postgresql":
-        query = text(
-            """
-            SELECT trigger.tgname
-            FROM pg_catalog.pg_trigger AS trigger
-            JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
-            JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-            WHERE NOT trigger.tgisinternal
-              AND trigger.tgenabled IN ('O', 'A')
-              AND namespace.nspname = current_schema()
-              AND (
-                (relation.relname = 'interpretation_events' AND trigger.tgname IN (
-                  'trg_interpretation_events_immutable_resolved',
-                  'trg_interpretation_events_no_delete_resolved'
-                ))
-                OR (relation.relname = 'composer_completion_events' AND trigger.tgname IN (
-                  'trg_composer_completion_events_no_update',
-                  'trg_composer_completion_events_no_delete'
-                ))
-                OR (relation.relname = 'chat_messages' AND trigger.tgname IN (
-                  'trg_chat_messages_immutable_content',
-                  'trg_chat_messages_no_delete'
-                ))
-                OR (relation.relname = 'guided_operation_events' AND trigger.tgname IN (
-                  'trg_guided_operation_events_no_update',
-                  'trg_guided_operation_events_no_delete'
-                ))
-                OR (relation.relname = 'guided_operation_admission_blocks' AND trigger.tgname IN (
-                  'trg_guided_operation_admission_blocks_no_update',
-                  'trg_guided_operation_admission_blocks_no_delete',
-                  'trg_guided_operation_admission_blocks_reject_existing_operation'
-                ))
-                OR (relation.relname = 'guided_operations' AND trigger.tgname IN (
-                  'trg_guided_operations_terminal_immutable',
-                  'trg_guided_operations_reject_admission_block_insert',
-                  'trg_guided_operations_reject_admission_block_update'
-                ))
-              )
-            """
-        )
-    else:
-        _schema_error(
-            "audit trigger validation unsupported dialect",
-            expected=["postgresql", "sqlite"],
-            actual=[bind.dialect.name],
-        )
-
-    if isinstance(bind, Connection):
-        present = {str(row[0]) for row in bind.execute(query)}
-    else:
-        with bind.connect() as connection:
-            present = {str(row[0]) for row in connection.execute(query)}
-    missing = _REQUIRED_AUDIT_TRIGGERS - present
-    if missing:
-        _schema_error(
-            "missing audit trigger(s)",
-            expected=sorted(_REQUIRED_AUDIT_TRIGGERS),
-            actual=sorted(present),
-        )
+    SessionSchemaAuthority(bind).validate_required_triggers()
 
 
 def _validate_partial_index_dialect_symmetry() -> None:
