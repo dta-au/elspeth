@@ -1,7 +1,7 @@
 # Pluggable SSO and identity substrate — backend-for-frontend login for Entra, VANguard, Google, and generic OIDC
 
 Date: 2026-09-02. Status: design, revision 2.11, implementation plan = tracker milestone elspeth-07cd19ba73.
-Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. A real client gates live verification and nothing else; §External dependencies is now §Deployment-time inputs, the AWS Terraform is recorded as creating the Cognito confidential client itself, and the VANguard spike is a live confirmation of a profile that is already written. **This revision narrows what it claims, and does not disturb D5.** It means the build and every test wait on nothing: steps 2 to 5 complete without any registration. It does not mean live verification left delivery scope. D5 stands as ruled — Cognito's client the repository's Terraform now mints itself, while VANguard's is issued by the operating organisation on its ABN-gated admin page (§Deployment-time inputs), so VANguard live verification remains a delivery obligation this project cannot discharge alone and must wait on that registration to close. A reader who takes "gates live verification and nothing else" as "nothing remains owed" has read it too broadly.
+Revision 2.2 applies the second review round (solution architect, systems thinker, security architect) on the operator's compartment model; items are marked **[rev2.2]**. The four operator decisions from that round (D14–D17) were ruled 2026-09-02 and applied as **[rev2.3]**. Revision 2.4 pins operator selection of the IdP profile by configuration alone, marked **[rev2.4]**. Revision 2.5 adds the per-person disk quota for uploaded blobs (D18), marked **[rev2.5]**. Revision 2.6 adds the approval and review mailbox, the round trip of request note and decision note between requester and approver, marked **[rev2.6]**. Revision 2.7 closes the four blocking defects a ten-seat panel review found on 2026-09-03 (D19 the provider discriminator, D20 the bootstrap admin, D21 the withdrawn VM in-place rebuild, and the epoch-freeze note), marked **[rev2.7]**. Revision 2.8 applies the verified remainder of that review — the surviving high and medium findings and rulings D24 to D34 — marked **[rev2.8]**; findings the verification pass refuted were not applied, and are listed with their refuting reason in the review record. Revision 2.9 corrects what implementation measured against the tree, marked **[rev2.9]**: the §Discriminator widening site inventory undercounted the `routes.py` local-only guards (four, not two) and misclassified them as sites needing a value edit. Revision 2.10 records five further things implementation measured, marked **[rev2.10]**: the third raw consumer of `secret_key`, what a pre-existing local user's first login does, the refresh chain's unverified-claim input, the conditional quota row, and the three places that compared a user id with a configured username. Revision 2.11 corrects a framing error, marked **[rev2.11]**: identity-provider client registrations were written as external dependencies owed to the project, when this is a public repository that stores no provider credential and a registration is a deployment-time input supplied by whoever deploys ELSPETH. A real client gates live verification and nothing else; §External dependencies is now §Deployment-time inputs, the AWS Terraform is recorded as creating the Cognito confidential client itself, and the VANguard spike is a live confirmation of a profile that is already written. **This revision narrows what it claims, and does not disturb D5.** It means the build and every test wait on nothing: steps 2 to 5 complete without any registration. It does not mean live verification left delivery scope. D5 stands as ruled — Cognito's client the repository's Terraform now mints itself, while VANguard's is issued by the operating organisation on its ABN-gated admin page (§Deployment-time inputs), so VANguard live verification remains a delivery obligation this project cannot discharge alone and must wait on that registration to close. A reader who takes "gates live verification and nothing else" as "nothing remains owed" has read it too broadly. Revision 2.12 corrects claims this document made about the tree that the tree does not support, marked **[rev2.12]**, found by sweeping the whole file for them rather than fixing them one at a time as they surfaced — three had surfaced separately on 2026-09-07 before the sweep was run, which is what made a sweep the right response. Two are defects rather than staleness and are now tracked: the `audit_access_log` `writer_principal` third value D27 required (elspeth-e6c2d254b2) and the four `calls` token columns rev2.1 specified (elspeth-255ae1a544) were both placed inside the delivery's one-way epoch window, neither rode it, and the window has cut — so each now costs the second `rollback_permitted: false` window this spec was structured to avoid, and `token_usage_ledger`'s `run` source arm has no data path in the meantime. The third is the epoch literals in §Discriminator widening, which have been removed rather than corrected: this spec states elsewhere that epoch numbers come from the runbook's compatibility record and never from here, and a document carrying that rule should not print the number. **This revision changes no ruling.** Every correction is to a statement of fact about what is built; where a requirement went unbuilt, the requirement stands and is now traceable to a ticket instead of reading as already satisfied.
 Branch: `release/0.8.0`.
 Revision 2 incorporates six independent reviews (security architecture,
 solution design, reality check against the tree, systems risk, functional
@@ -68,7 +68,7 @@ The tech-debt-free window is weeks, not months.
 | D21 **[rev2.7]** | VM in-place rebuild | Withdrawn. Both deployment paths use the existing reset runbook, because the pre-1.0 gate this spec cites for ECS forbids in-place migration everywhere, and the promised byte-for-byte preservation of `user_secrets` is false across a key-derivation change. Re-admission of the known cohort moves inside the cutover window. **Applied on review recommendation; the fact it rests on is the runbook's own standing rule, not an assumption.** |
 | D24 **[rev2.8]** | Storage quota exactness | **Eventually consistent, not exact.** The per-session lock does not serialise two sessions of one identity, and making it exact needs an identity-scoped lock held across the fork copy loop, which would serialise every other upload by that identity for the duration of a fork. R13 instead enumerates all four byte-admitting sites, which is where the real hole was. Revisit only if measurement shows real overshoot. |
 | D26 **[rev2.8]** | Record of a requested review | A sibling `review_requests` table. Widening `review_attestations` with a `requested` verdict contradicts its own append-only, non-null-reviewer, ledger-not-control design and would fill the audit view with requests nobody completed. |
-| D27 **[rev2.8]** | Approver's read of another identity's session | Authorized per request over roles plus the live request row, minting no token, never through the shareable-review bearer capability. It writes an `audit_access_log` row under a new `writer_principal` value added **in this epoch**, because adding it later costs the one-way window. |
+| D27 **[rev2.8]** | Approver's read of another identity's session | Authorized per request over roles plus the live request row, minting no token, never through the shareable-review bearer capability. It writes an `audit_access_log` row under a new `writer_principal` value, which this ruling required be added in the delivery's epoch because adding it later costs the one-way window. **That value was never added and the epoch has since cut [rev2.12].** `web/sessions/models.py` still constrains the column to `('audit_grade_view', 'admin_tool')`; the window closed at sessions epoch 52 and the head is past it. D27's own cost argument therefore now applies to D27: implementing the approver read costs exactly the second window this ruling was written to avoid. Tracked as elspeth-e6c2d254b2 — the cheap remedy is to fold the value into whatever epoch bump happens next for another reason, which is why it is filed now rather than when the mailbox is built. |
 | D28 **[rev2.8]** | Actor column on the container-ceiling quota row | Nullable FK plus a closed `set_by_actor` CHECK (`identity`, `config`, `operator`, `system`), mirroring `writer_principal`. A placeholder identity would put a fake row in the table R5 counts. |
 | D29 **[rev2.8]** | Workflow-table FK deletion rule | `RESTRICT`, declared explicitly, plus `durable_history_exists` extended to count approvals, attestations and library entries so archive refuses instead of discarding them. `published_from_session_id` becomes a provenance column, not an FK. Declaring nothing was never neutral: it ships `RESTRICT` by accident. |
 | D30 **[rev2.8]** | Acceptance criteria for the workflow half | Ship them with it. §Testing gains a workflow-governance subsection, R11 refuses at startup loudly rather than switching enforcement off silently, and the suite runs against a closed local deployment. |
@@ -446,9 +446,9 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 2. `web/sessions/models.py` `_AUTH_PROVIDER_TYPE_CHECK`, used by BOTH
    `sessions` and `user_secrets` and staying at the five login values; **plus
    the new `_IDENTITY_PROVIDER_TYPE_CHECK` on `identities.provider` alone
-   [rev2.7]**; `SESSION_SCHEMA_EPOCH` 49 → 50.
+   [rev2.7]**; `SESSION_SCHEMA_EPOCH` bumps.
 3. `core/landscape/schema.py` `ck_run_attributions_auth_provider_type`,
-   `ck_auth_events_provider`; `SQLITE_SCHEMA_EPOCH` 36 → 37.
+   `ck_auth_events_provider`; `SQLITE_SCHEMA_EPOCH` bumps.
    `core/landscape/database.py` needs no edit (it lists names only).
 4. `core/landscape/run_lifecycle_repository.py` `_AUTH_PROVIDER_TYPES`.
 5. `web/readiness.py::_check_auth_mode` — rewritten to iterate the active
@@ -474,6 +474,32 @@ Closed set, each an explicit exception class, never a `detail` prefix:
     `set(get_args(IdentityProviderType)) == set(get_args(AuthProviderType)) | {"service"}`
     — equality over flat strings, which fails loudly if the alias is ever
     rewritten as a union [rev2.7.1].
+
+**This list deliberately names no epoch number [rev2.12].** Each constant
+carries its own numbered history comment recording which delivery took which
+value — `SESSION_SCHEMA_EPOCH`'s block in `web/sessions/models.py` and
+`SQLITE_SCHEMA_EPOCH`'s in `core/landscape/schema.py` — and the operator's
+authority is the compatibility record in
+[docs/runbooks/aws-ecs-deployment.md](../runbooks/aws-ecs-deployment.md).
+A literal repeated here can only drift, and it did: until 2026-09-07 these
+two entries read "49 → 50" and "36 → 37", while the sessions bump this
+delivery actually took was **51 → 52** — the coordination substrate claimed
+51 on the release line first and the sentinel is exact equality, so the
+number this spec predicted was never available. Nobody re-derived it after
+that landed. The Landscape half, 36 → 37, happened to stay true, which is
+the more instructive half: a list where one number silently rots and its
+neighbour silently survives gives a reader no way to tell which is which.
+
+Three source comments and one test docstring repeat that same wrong 50
+(`web/sessions/models.py` at the identity-substrate and workflow-governance
+section headers, `core/landscape/schema.py`'s epoch-37 entry where it names
+the paired sessions window, and
+`tests/unit/web/sessions/test_identity_tables_schema.py`'s module docstring).
+They are stale for the same reason and are tracked separately. Note what
+their existence did while this spec also carried 50: a reader checking the
+spec against the tree found agreement and concluded the spec was right. Two
+records agreeing is not corroboration when one was copied from the other,
+and the cross-check that should have caught this instead confirmed it.
 
 ### Two epochs, one window [rev2]
 
@@ -601,19 +627,45 @@ whole state in **one audited transaction**: `access_state='active'`,
 `role_granted` audit pair.
 
 - `sso_admin_subjects` seeds a listed subject at first login **only while the
-  container has zero active human admins**. Once one exists the list is inert,
-  so it never becomes a standing grant and the compartment argument holds.
-- The operator CLI does the same thing on demand, for recovery. It is the only
-  path once an admin exists.
+  container has zero active human admins**.
+- The operator CLI (`elspeth composer users bootstrap-admin`) does the same
+  thing on demand.
 
-Lockout recovery is **not** a config edit [rev2.2]: adding a subject to a
-container that already has an active admin does nothing. R5 counts only
-*active human* identities with an unexpired, unrevoked `admin` role. Grant and
-revoke are admin-only in this delivery; delegated administration is phase 4.
+**Both are gated on the same live count, and it is a count, not a lifecycle
+fact [rev2.11].** `bootstrap_admin` refuses when
+`_active_human_admin_count(...) > 0`, re-evaluated inside the transaction
+under the population lock; no durable "has ever been bootstrapped" flag
+exists in the schema, and no column could answer that question. Two
+consequences the earlier text had backwards:
 
-Pinned by an integration test: a fresh `--init-schema` store plus one listed
-subject, walked through `start → callback → complete`, yields a session token
-and a role list of exactly `admin` [rev2.7].
+- The seed **re-arms**. It is inert *while* an active human admin exists, not
+  permanently. Should the container fall back to zero — the sole admin
+  disabled, deleted, or offboarded — every subject still listed self-grants
+  `admin` at their next login. A deployment must therefore DELETE the setting
+  once the first administrator is activated; leaving it is a standing grant
+  in all but name (elspeth-f4e69fe3bc).
+- The CLI is **not** the path once an admin exists. It calls the same guarded
+  method and is refused under the identical condition, so it recovers only
+  the zero-admin case — the same case in which the seed re-arms. It is
+  preferable to the seed because it leaves nothing behind in configuration,
+  not because it reaches further. A lockout where the admin row is active but
+  that person can no longer authenticate is recoverable by neither, and needs
+  direct work against the sessions store.
+
+An earlier revision said "once one exists the list is inert, so it never
+becomes a standing grant", and that lockout recovery is "**not** a config
+edit" [rev2.2]. The first is false whenever the count returns to zero; the
+second is true only while an admin exists, which is precisely the state in
+which nobody is locked out. R5 counts only *active human* identities with an
+unexpired, unrevoked `admin` role. Grant and revoke are admin-only in this
+delivery; delegated administration is phase 4.
+
+The D20 walk is proved at UNIT level. An integration-level pin — a fresh
+`--init-schema` store plus one listed subject, walked through
+`start → callback → complete`, yielding a session token and a role list of
+exactly `admin` — is **outstanding work, not a shipped test**
+(elspeth-b9a109f9f0). rev2.7 wrote it in the present tense as "pinned by an
+integration test"; no such test exists in the tree [rev2.11].
 
 ### `identity_relationships` (sessions store) [rev2]
 
@@ -687,6 +739,16 @@ test keeps pinning that none of these boundaries widens to `str`.
   counts live inside the response payload blob and are not queryable, and
   the MCP "LLM usage report" counts pipeline row-tokens, not LLM tokens.
   So "tokens used in runs" is NOT exposed today; these columns expose it.
+  **None of the four was added, and the Landscape epoch has cut [rev2.12].**
+  `core/landscape/schema.py`'s `calls_table` carries none of them, and the
+  epoch-37 history entry records what actually rode that window —
+  `auth_events.identity_id`, the `event_type` widening, the provider
+  discriminator — with no `calls` change. The 2026-09-02 measurement above
+  therefore still describes the tree exactly: run token counts remain
+  unqueryable. Note what made this hard to see: `contracts/token_usage.py`
+  defines all four field names on `TokenUsage`, so a tree-wide grep for them
+  succeeds and reads as confirmation. The contract exists; nothing persists
+  it. Tracked as elspeth-255ae1a544.
 - New nullable indexed column `identity_id`.
 - `login` is written at callback, `token_issued` at complete, joined by
   `request_id`. `metadata_json` for `login` is `{identity_id, provider,
@@ -967,11 +1029,19 @@ errand; the profile and its tests do not wait for one [rev2.11].
   shareable-review transport, which is a 30-day unrevocable bearer
   capability whose resolve route writes no audit row and never reads the
   caller identity it accepts — a capability, not an authorization. The read
-  writes an `audit_access_log` row under a new `writer_principal` value,
-  added **in this epoch**: one identity reading another's work is the
-  disclosure an auditor will ask about, and adding the value after this
-  delivery's epoch cut costs exactly the window this spec is structured to
-  take only once.
+  writes an `audit_access_log` row under a new `writer_principal` value: one
+  identity reading another's work is the disclosure an auditor will ask
+  about, and adding the value after this delivery's epoch cut costs exactly
+  the window this spec is structured to take only once.
+  **It was not added, and that cut has happened [rev2.12].** The column is
+  still `('audit_grade_view', 'admin_tool')` in `web/sessions/models.py`,
+  whose own comment calls those two "the entire universe of" the enum and
+  requires a design review, a destructive session-DB recreation and a spec
+  amendment to widen it. Everything else in that window rode it — the four
+  identity tables and all five workflow governance tables shipped — so this
+  is a single stranded item, not an unbuilt half. Read the paragraph above
+  as the requirement it always was; do not read it as a description of the
+  tree. Tracked as elspeth-e6c2d254b2.
   *Sent*: my own requests with their state, the decider, the decision
   note, and when; opening one sets `decision_seen_at`. A badge on the
   navigation shows unread counts from one summary endpoint. It needs its own
@@ -1158,7 +1228,7 @@ table R5 counts.
 | review_requests **[rev2.8, D26]** | request_id PK; session_id FK; state_id; requested_by_identity_id FK; reviewer_identity_id NULL FK; requested_at; cancelled_at NULL; request_note NULL (4 KiB) | The rev2.6 mailbox promises an Inbox of "review requests addressed to me" and nothing recorded one: `review_attestations` is append-only with a non-null reviewer and exists only once a review has *happened*. A sibling table, rather than nullable columns and a `requested` verdict on the attestation ledger, because that would contradict the ledger's own append-only, "not a control" design and would fill the approver's audit view with requests nobody ever completed. `reviewer_identity_id` NULL means "any active `reviewer`", matching the role-based eligibility already ruled for approvals. Closed by an attestation on the same `(session_id, state_id)`, or by `cancelled_at`. The badge counts open rows addressed to the caller plus open unaddressed rows the caller is eligible for. |
 | library_entries | entry_id PK; published_from_session_id provenance column (**not an FK** [rev2.8, D29]); payload_digest; compartment_id; title; version int; published_by_identity_id FK; curated_by_identity_id NULL FK; published_at; accepted_at NULL; rejected_at NULL; rejection_note NULL; deprecated_at NULL; recalled_at NULL; note NULL | Frozen, content-addressed. **A library entry is the public projection (`generate_public_yaml` shape), never a session reference, and it is config-only [rev2.2]:** publishing a pipeline that reads an uploaded blob is refused with a named `error_type` ("publish a profile-bound source instead"), because blob custody proves same-principal on fork and a cross-user fork of a blob-backed source cannot copy the blob without becoming an intra-container exfiltration path. Forking a library entry instantiates the projection into the forker's own staging session; `forked_from_session_id` points at that staging session and the entry's `payload_digest` carries provenance. Visible deployment-wide once `accepted_at` is set by a `curator`. Curator ≠ publisher (CHECK). Recall flags, never deletes. `rejection_note` is required non-blank on rejection and bounded at 4 KiB [rev2.8]. `library_published` audit rows carry `payload_digest` and `compartment_id` so the same artifact appearing in two containers is detectable later. |
 | quota_policies | policy_id PK; identity_id NULL FK; tokens_per_day int; storage_bytes int [rev2.5, D18]; dual_control_above_tokens NULL int; set_by_identity_id FK; set_at; revoked_at NULL | Per person (D11) **plus the container ceiling row (`identity_id` NULL) shipped now [rev2.2]**, because activation otherwise grants unbounded spend on the container's shared LLM credential. Two partial uniques, both dialects: active per identity, and active `WHERE identity_id IS NULL` (NULLs are distinct for uniqueness in Postgres, so one predicate does not cover both). **Every path that makes an identity `active` writes the per-identity row** from `quota_default_tokens_per_day` and `quota_default_storage_bytes` [rev2.8, D31] — `POST activate`, local registration under `registration_mode=open`, pre-provisioning, the D20 bootstrap seed and operator CLI, and the D21 cutover re-admission. "At activation" was true of one path of six, and on the other five the identity's first run or upload refused with the audit record this spec defines as evidence of corruption. No applicable policy still refuses; it is now genuinely unreachable. Every `quota_set` / `quota_exceeded` event records the cap and the ceiling in force. **Storage [rev2.5]:** `storage_bytes` is a standing level, not a daily rate; usage is `SUM(blobs.size_bytes)` joined through `sessions.identity_id` over live rows (deleted blobs leave no row), evaluated at each of the four byte-admitting sites R13 enumerates. The bound is eventually consistent, not exact: the existing blob lock is keyed on `session_id` alone, so two sessions of one identity do not serialise against each other [rev2.8, D24]. Blobs created by the system on the identity's behalf (inline custody, fork copies) count against the identity; the `system` exemption applies to tokens only. Admin set/revoke is one route for both dimensions. |
-| token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall.usage` (today persisted only inside JSON audit payloads, not queryable). Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
+| token_usage_ledger | entry_id PK; identity_id NULL FK; source CHECK `('composer','run','auto_title','system')` [rev2.2]; session_id NULL FK; run_id NULL; model; prompt_tokens; completion_tokens; cached_prompt_tokens NULL; reasoning_tokens NULL; recorded_at | Operational accounting index, not audit truth (Landscape `calls` is). Composer writes one row per LLM call from `ComposerLLMCall.usage` (today persisted only inside JSON audit payloads, not queryable). Auto-titling (a paid background call per first message, which its own docstring flags as bypassing rate limits) writes `auto_title`; the boot probe writes `system` with `identity_id` NULL. Runs write one row per run at finalisation from the new `calls` token columns — **a source that does not exist [rev2.12]**, so the `run` arm of this table's own `source` CHECK has no data path (elspeth-255ae1a544). The table shipped; that arm did not. Since the quota check below is a `SUM` over this ledger and the rule is "accounting unavailable ⇒ refuse", whoever wires the run arm decides whether run spend has been silently uncounted or is refusing — the answer is not settled here, and must not be assumed from this row. Quota check = `SUM` over the ledger for the identity in the current UTC day, evaluated at execute and at composer turn start only; post-response spend lands in the next window. Over quota refuses and writes `quota_exceeded`. Accounting unavailable ⇒ refuse (fail closed); the `system` arm is exempt from the check. |
 
 ## Terminology
 
