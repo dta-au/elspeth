@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, create_autospec
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 from typer.testing import CliRunner
 
 from elspeth.contracts import FrameworkBugError, RunStatus, TerminalOutcome, TerminalPath
@@ -519,10 +519,7 @@ payload_store:
                     scheduler_events_table.c.run_id == run_id,
                     scheduler_events_table.c.token_id == token_id,
                 )
-                # Recording order (SQLite rowid): the production key
-                # (recorded_at, event_id) ties inside one database second
-                # now that the lease verbs stamp database time (ADR-047).
-                .order_by(text("rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).all()
             followers = conn.execute(
                 select(run_workers_table.c.worker_id, run_workers_table.c.status).where(

@@ -28,7 +28,7 @@ import json
 from typing import Any, ClassVar
 
 import pytest
-from sqlalchemy import literal_column, select
+from sqlalchemy import select
 
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
 from elspeth.core.config import QueueSettings, SourceSettings, TransformSettings, load_settings_from_yaml_string
@@ -86,13 +86,13 @@ def _scheduler_timeline(db: LandscapeDB, run_id: str) -> list[tuple[int, str, st
     with db.connection() as conn:
         rows = conn.execute(
             select(
-                literal_column("scheduler_events.rowid").label("seq"),
+                scheduler_events_table.c.seq,
                 scheduler_events_table.c.token_id,
                 scheduler_events_table.c.event_type,
                 scheduler_events_table.c.to_status,
             )
             .where(scheduler_events_table.c.run_id == run_id)
-            .order_by(literal_column("scheduler_events.rowid"))
+            .order_by(scheduler_events_table.c.seq)
         ).all()
     return [(row.seq, row.token_id, row.event_type, row.to_status) for row in rows]
 

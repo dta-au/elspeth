@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, insert, select, text, update
+from sqlalchemy import create_engine, insert, select, update
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
@@ -152,13 +152,7 @@ def _events(engine: Tier1Engine) -> list[dict[str, object]]:
         return [
             dict(row)
             for row in conn.execute(
-                select(scheduler_events_table)
-                .where(scheduler_events_table.c.run_id == RUN_ID)
-                # Recording order (SQLite rowid; this module runs on the
-                # in-memory Tier-1 engine). The production readers' key
-                # (recorded_at, event_id) ties inside one database second now
-                # that the lease verbs stamp whole-second database time.
-                .order_by(text("rowid"))
+                select(scheduler_events_table).where(scheduler_events_table.c.run_id == RUN_ID).order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 

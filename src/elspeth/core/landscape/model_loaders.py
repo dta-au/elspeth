@@ -263,6 +263,7 @@ class SchedulerEventLoader:
 
     def load(self, row: SARow[Any]) -> SchedulerEvent:
         return SchedulerEvent(
+            seq=row.seq,
             event_id=row.event_id,
             run_id=row.run_id,
             token_id=row.token_id,

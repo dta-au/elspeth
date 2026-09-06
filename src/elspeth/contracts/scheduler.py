@@ -226,8 +226,14 @@ class BlockedPendingSinkHandoff:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerEvent:
-    """Immutable audit event for a scheduler work-item transition."""
+    """Immutable audit event for a scheduler work-item transition.
 
+    ``seq`` is the row identity and the authoritative replay order (epoch 38);
+    ``event_id`` is a content digest of the transition and is not unique.
+    ``recorded_at`` is evidence, never an ordering key.
+    """
+
+    seq: int
     event_id: str
     run_id: str
     token_id: str
@@ -247,6 +253,7 @@ class SchedulerEvent:
     context_json: str = "{}"
 
     def __post_init__(self) -> None:
+        require_int(self.seq, "seq", min_value=1)
         _validate_scheduler_enum(self.event_type, SchedulerEventType, "event_type")
         _validate_scheduler_enum(self.from_status, TokenWorkStatus, "from_status", optional=True)
         _validate_scheduler_enum(self.to_status, TokenWorkStatus, "to_status")

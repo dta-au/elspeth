@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from sqlalchemy import and_, literal_column, select, update
+from sqlalchemy import and_, select, update
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
@@ -452,7 +452,7 @@ def _scheduler_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
             dict(row)
             for row in conn.execute(
                 select(
-                    literal_column("scheduler_events.rowid").label("seq"),
+                    scheduler_events_table.c.seq,
                     scheduler_events_table.c.token_id,
                     scheduler_events_table.c.event_type,
                     scheduler_events_table.c.from_status,
@@ -465,7 +465,7 @@ def _scheduler_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
                     scheduler_events_table.c.context_json,
                 )
                 .where(scheduler_events_table.c.run_id == run_id)
-                .order_by(literal_column("scheduler_events.rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 

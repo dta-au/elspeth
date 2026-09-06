@@ -145,7 +145,7 @@ authority, so a released or expired read context is refused on its next proof
 instead of keeping read authority until the session is archived or deleted
 (elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
 shareable read.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 37. Epoch 30 adds durable
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epoch 30 adds durable
 row-union barrier attribution, epoch 31 closes scheduler status over the public
 six-state vocabulary, epoch 32 atomically records aggregation results and their
 ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
@@ -159,12 +159,18 @@ audit-integrity failure. Epoch 37 widens the auth provider CHECK constraints
 on `auth_events` and `run_attributions` to admit `vanguard` and `google`; the
 constraint only widens, but Landscape compares declared CHECK text against the
 reflected constraint structurally, so it is a schema change like any other and
-cuts over in the same service-stop window as session epoch 50.
+cuts over in the same service-stop window as session epoch 50. Epoch 38 gives
+`scheduler_events` an auto-incrementing `seq` primary key that is the
+authoritative replay order; `event_id` becomes a non-unique content digest of
+the transition. Database-stamped events tie on `recorded_at` inside one SQLite
+second or one PostgreSQL transaction, so the old `(recorded_at, event_id)` key
+replayed them in hash order and two identical transitions of one work item in
+one second collided on the primary key.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.0. A Landscape database below
-epoch 37 is not current and must be recreated. Do not roll older code back over
+epoch 38 is not current and must be recreated. Do not roll older code back over
 the recreated databases; keep the service drained and repair this release
 forward.
 
