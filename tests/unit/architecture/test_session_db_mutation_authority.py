@@ -4448,6 +4448,18 @@ _SQLALCHEMY_INSPECT = frozenset({"sqlalchemy.inspect", "sqlalchemy.inspection.in
 _REVIEWED_LOCK_HOLDING_HOPS: dict[str, str] = {
     "elspeth.web.sessions.locking.transaction_session_lock": "40235a1377ac1002",
 }
+# Session settings a probe may set on its own connection (P4-D6 family K):
+# ``SET LOCAL <name> = <literal>`` for a CLOSED set of names, and nothing
+# else. The value is scoped to the current transaction, changes no row and
+# names no table. Deliberately excluded, and left unresolved: ``SET SESSION``
+# (outlives the transaction), and any name that changes authorization or name
+# resolution -- ``ROLE``, ``SESSION AUTHORIZATION``, ``search_path`` -- whose
+# effect is precisely to make the SAME later statement mean something else.
+_SESSION_LOCAL_SETTINGS = frozenset({"idle_in_transaction_session_timeout", "lock_timeout", "statement_timeout"})
+_SESSION_LOCAL_SETTING_STATEMENT = re.compile(
+    r"SET\s+LOCAL\s+(?P<setting>[A-Za-z_][A-Za-z0-9_]*)\s*(?:=|\s+TO\s+)\s*(?:'[^']*'|[A-Za-z0-9_.]+)\s*;?",
+    flags=re.IGNORECASE,
+)
 _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
     {
         "elspeth.web.execution.protocol.ExecutionService",
@@ -5278,6 +5290,15 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             and node.target.value.id == positional[0].arg
         ]
         return annotations[0] if len(annotations) == 1 else None
+
+    def _is_local_session_setting(self, statement: ast.expr | None, *, use: ast.AST) -> bool:
+        """Every text the statement can hold is ``SET LOCAL <allowlisted setting> = <literal>``."""
+
+        texts = self._literal_statement_texts(statement, use=use)
+        if texts is None:
+            return False
+        matches = [_SESSION_LOCAL_SETTING_STATEMENT.fullmatch(text.strip()) for text in texts]
+        return bool(matches) and all(match is not None and match.group("setting").lower() in _SESSION_LOCAL_SETTINGS for match in matches)
 
     def _is_sqlite_sentinel_stamp(self, statement: ast.expr | None, *, use: ast.AST) -> bool:
         """Every text the statement can hold is a ``PRAGMA application_id|user_version = <int>`` stamp."""
@@ -8096,6 +8117,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                     self._emit(call, _SCHEMA_IDENTITY_TABLE, "stamp_sqlite_sentinel")
                     continue
                 if self._is_session_engine_configuration(call, statement):
+                    self.classified_execution_calls.add(id(call))
+                    continue
+                if self._is_local_session_setting(statement, use=call):
                     self.classified_execution_calls.add(id(call))
                     continue
                 statement_domain, force_unresolved = self._statement_database_evidence(statement)
@@ -11181,7 +11205,8 @@ def test_pragma_reads_use_a_closed_allowlist_and_unknown_or_mutating_forms_fail_
 def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed(tmp_path: Path) -> None:
     """P4-D6: an acquisition in scope used to swallow every literal the scanner could not classify.
 
-    A TRUNCATE, an unknown PRAGMA, a session setting inside an authority's own
+    A TRUNCATE, an unknown PRAGMA, a session setting outside the closed
+    ``SET LOCAL`` allowlist inside an authority's own
     ``with engine.begin()`` block moved the acquisition's fingerprint and
     nothing else, so a mechanical re-pin admitted it unread.  Every literal
     the scanner can read and no recogniser admits is an unresolved write now,
@@ -11239,7 +11264,7 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
 
                 def session_setting(self):
                     with self._engine.begin() as conn:
-                        conn.execute(text("SET LOCAL statement_timeout = '1000ms'"))
+                        conn.execute(text("SET LOCAL work_mem = '64MB'"))
 
                 def bound_name(self):
                     statement = "RESET max_connections"
@@ -17215,3 +17240,96 @@ def test_session_schema_authority_is_exact_contained_and_bidirectional() -> None
     assert Counter(site.operation for site in identity_writers) == Counter({"stamp_sqlite_sentinel": 2, "insert": 1})
     assert {policy.table: policy.authority for policy in _TABLE_POLICIES}["elspeth_schema_identity"] == "SessionSchemaAuthority"
     assert reviewed_read_connection_policy_violations(reads) == []
+
+
+# ── P4-D6 family K: startup / doctor / readiness (elspeth-9ebb0fcf10) ───────
+
+
+def test_local_session_settings_use_a_closed_allowlist_and_every_other_form_is_unresolved(tmp_path: Path) -> None:
+    """``SET LOCAL <allowlisted timeout> = <literal>`` is a transaction-scoped setting, not a write.
+
+    It changes no row and names no table, and ``LOCAL`` scopes it to the
+    transaction the probe already opened.  The allowlist is closed on the
+    SETTING NAME, not on the syntax: ``SET SESSION`` outlives the transaction,
+    and ``ROLE`` / ``SESSION AUTHORIZATION`` / ``search_path`` change
+    authorization or name resolution, which is exactly how the SAME later
+    statement comes to mean something else -- so each stays an unresolved
+    write.  The match is anchored at both ends, so a setting with a second
+    statement appended to it is not the setting.  Mutants: drop the
+    recogniser (``statement_timeout`` is ``unknown_execute`` again); admit any
+    setting name (``role`` / ``search_path`` pass unread); make ``LOCAL``
+    optional (``not_local`` passes); match a prefix instead of the whole text
+    (``trailing_opaque`` is swallowed).
+    """
+    source = tmp_path / "session_settings.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import text
+
+
+            def allowlisted_quoted(conn):
+                conn.execute(text("SET LOCAL statement_timeout = '1000ms'"))
+
+            def allowlisted_bare(conn):
+                conn.execute(text("SET LOCAL lock_timeout = 250"))
+
+            def allowlisted_to(conn):
+                conn.execute(text("SET LOCAL idle_in_transaction_session_timeout TO '5s'"))
+
+            def not_local(conn):
+                conn.execute(text("SET SESSION statement_timeout = '1000ms'"))
+
+            def bare_set(conn):
+                conn.execute(text("SET statement_timeout = '1000ms'"))
+
+            def role(conn):
+                conn.execute(text("SET LOCAL ROLE elspeth_admin"))
+
+            def search_path(conn):
+                conn.execute(text("SET LOCAL search_path = untrusted"))
+
+            def computed_value(conn, timeout):
+                conn.execute(text(f"SET LOCAL statement_timeout = '{timeout}'"))
+
+            def trailing_dml(conn):
+                conn.execute(text("SET LOCAL statement_timeout = '1s'; DELETE FROM sessions"))
+
+            def trailing_opaque(conn):
+                conn.execute(text("SET LOCAL statement_timeout = '1s'; TRUNCATE audit_access_log"))
+            """
+        )
+    )
+
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.operation) for site in sites) == Counter(
+        {
+            ("not_local", "unknown_execute"): 1,
+            ("bare_set", "unknown_execute"): 1,
+            ("role", "unknown_execute"): 1,
+            ("search_path", "unknown_execute"): 1,
+            ("computed_value", "unknown_execute"): 1,
+            ("trailing_dml", "raw_delete_from"): 1,
+            ("trailing_opaque", "unknown_execute"): 1,
+        }
+    )
+    assert {setting.islower() for setting in _SESSION_LOCAL_SETTINGS} == {True}
+
+
+def test_readiness_probe_sets_only_an_allowlisted_local_timeout() -> None:
+    """The live readiness probe's only non-read statement is the allowlisted transaction timeout.
+
+    Bidirectional: the recogniser above is what removes this statement's row,
+    and this pins that the live tree still contains exactly the statement the
+    recogniser was written for. The acquisition itself stays an escape (the
+    probe forwards its connection to the schema probes) and is reported in
+    ``test_live_connection_domain_classification_is_exact``.
+    """
+    root = _repo_root()
+    path = root / "src/elspeth/web/readiness.py"
+    live = scan_production_writers([path], anchor=root)
+    assert [(site.symbol, site.operation, site.connection_escape) for site in live] == [
+        ("_probe_database_engine", "write_connection", True)
+    ]
+    source = path.read_text(encoding="utf-8")
+    assert "text(\"SET LOCAL statement_timeout = '1000ms'\")" in source
