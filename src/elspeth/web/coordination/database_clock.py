@@ -71,10 +71,12 @@ def database_now(conn: Connection) -> datetime:
     else:
         raise NotImplementedError(f"sessions database time not implemented for {dialect}")
 
-    # SQLite hands back a string; PostgreSQL hands back a datetime.
-    if isinstance(value, str):
+    # SQLite hands back a string; PostgreSQL hands back a datetime. Exactly
+    # those two: the driver's value is foreign data, and a subclass of either
+    # is not something a driver produces.
+    if type(value) is str:
         value = datetime.fromisoformat(value)
-    if not isinstance(value, datetime):
+    if type(value) is not datetime:
         raise RuntimeError("sessions database clock returned a non-datetime value")
 
     # Naive values are UTC by construction — SQLite's CURRENT_TIMESTAMP is

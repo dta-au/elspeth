@@ -43,7 +43,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar, Final, Literal, NamedTuple, Protocol, TypedDict, cast
+from typing import ClassVar, Final, Literal, NamedTuple, Protocol, TypedDict, cast, final
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -341,10 +341,15 @@ def open_transaction(
         payload = json.loads(plaintext)
     except json.JSONDecodeError as exc:
         raise SsoCookieInvalid from exc
-    if type(payload) is not dict or payload.get("v") != _TRANSACTION_VERSION:
+    if type(payload) is not dict:
+        raise SsoCookieInvalid
+    # Membership-then-subscript, as for every other wire document: the
+    # cookie was sealed by this service, but it was still read off the wire.
+    version = payload["v"] if "v" in payload else None
+    if version != _TRANSACTION_VERSION:
         raise SsoCookieInvalid
 
-    issued_at = payload.get("iat")
+    issued_at = payload["iat"] if "iat" in payload else None
     if type(issued_at) is not int:
         raise SsoCookieInvalid
     # Two bounds, not one. The age bound is the real lifetime; the future
@@ -358,7 +363,7 @@ def open_transaction(
 
     values: dict[str, str] = {}
     for field_name in ("state", "nonce", "verifier"):
-        field_value = payload.get(field_name)
+        field_value = payload[field_name] if field_name in payload else None
         if type(field_value) is not str or not field_value:
             raise SsoCookieInvalid
         values[field_name] = field_value
@@ -603,7 +608,7 @@ def discovery_endpoints(document: object, *, issuer: str, expected_origins: froz
     the security decisions in it, and it is pure, so the adversarial cases can
     be tested without a network or a fake server standing in the way.
     """
-    if not isinstance(document, dict):
+    if type(document) is not dict:
         raise SsoDiscoveryFailed(f"discovery document is not a JSON object (got {type(document).__name__})")
 
     # Membership-then-subscript rather than ``.get()``: absence is a decision
@@ -891,7 +896,7 @@ def parse_token_response(document: object) -> RedeemedTokens:
     Anything that is not a bearer token is not a token this code knows how
     to present to userinfo, so it is refused rather than tried.
     """
-    if not isinstance(document, dict):
+    if type(document) is not dict:
         raise SsoTokenExchangeFailed(f"token response is not a JSON object (got {type(document).__name__})")
 
     def field_value(key: str) -> object:
@@ -997,7 +1002,7 @@ def parse_userinfo(document: object, *, expected_subject: str) -> UserinfoClaims
     each a visible string or ``None``, and nothing else in the body is
     carried past this line.
     """
-    if not isinstance(document, dict):
+    if type(document) is not dict:
         raise SsoUserinfoInvalid(f"userinfo response is not a JSON object (got {type(document).__name__})")
 
     def field_value(key: str) -> object:
@@ -1371,12 +1376,14 @@ class SsoAuthProvider:
         return UserProfile(user_id=identity.identity_id, username=identity.username)
 
 
+@final
 @dataclass(frozen=True, slots=True)
 class SsoRuntime:
     """Everything the three routes need, bound once at startup onto ``app.state.sso``.
 
     The routes read THIS and nothing else off the app: one attribute, one
-    owned type, checked by ``isinstance`` (ADR-032). Absent or wrong-typed
+    owned type, checked by exact type (ADR-032; the class is final, so a
+    subclass is an impostor, not a variant). Absent or wrong-typed
     means the deployment is not wired for SSO, and the routes refuse
     closed — never an ``AttributeError`` half-way through a login.
 

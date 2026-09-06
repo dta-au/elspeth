@@ -106,9 +106,11 @@ def _numeric_date(value: object, *, name: str) -> int:
     PyJWT compared the whole-second value against the clock; that is what
     is kept. ``bool`` is a JSON boolean, not a number, and is refused.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise AuthenticationError(f"Invalid token: {name} claim is not a number")
-    return int(value)
+    if type(value) is int:
+        return value
+    if type(value) is float:
+        return int(value)
+    raise AuthenticationError(f"Invalid token: {name} claim is not a number")
 
 
 def _compared_string(value: object) -> str | None:
@@ -281,13 +283,13 @@ class JWKSTokenValidator:
         Reject them at the boundary as ``AuthenticationError`` rather
         than letting ``TypeError``/``KeyError`` escape as HTTP 500.
         """
-        if not isinstance(discovery, dict):
+        if type(discovery) is not dict:
             raise AuthenticationError(f"OIDC discovery document is not a JSON object (got {type(discovery).__name__})")
-        discovery_issuer = discovery.get("issuer")
-        if not isinstance(discovery_issuer, str) or discovery_issuer != self._issuer:
+        discovery_issuer = discovery["issuer"] if "issuer" in discovery else None
+        if type(discovery_issuer) is not str or discovery_issuer != self._issuer:
             raise AuthenticationError("OIDC discovery document failed exact issuer check")
-        jwks_uri = discovery.get("jwks_uri")
-        if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        jwks_uri = discovery["jwks_uri"] if "jwks_uri" in discovery else None
+        if type(jwks_uri) is not str or not jwks_uri.strip():
             raise AuthenticationError("OIDC discovery document missing non-empty string 'jwks_uri'")
         return self._validate_jwks_uri_policy(jwks_uri)
 
@@ -334,7 +336,7 @@ class JWKSTokenValidator:
         present but not a string can never be named by a token header and
         is not carried; PyJWT skips it for the same reason.
         """
-        if not isinstance(jwks, dict):
+        if type(jwks) is not dict:
             raise AuthenticationError(f"JWKS document is not a JSON object (got {type(jwks).__name__})")
         keys = jwks["keys"] if "keys" in jwks else None
         if type(keys) is not list:
