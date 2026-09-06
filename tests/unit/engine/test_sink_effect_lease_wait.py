@@ -29,13 +29,14 @@ from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectLif
 from elspeth.core.landscape.schema import sink_effects_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.sink_effects import (
+    _LANDSCAPE_CLOCK_RESOLUTION_SECONDS,
     SinkEffectCoordinator,
     SinkEffectExecutionSeam,
     SinkEffectInjectedFault,
     SinkEffectLeaseHeld,
     SinkEffectPredecessorPending,
 )
-from tests.fixtures.landscape import expire_sink_effect_lease
+from tests.fixtures.landscape import expire_sink_effect_lease, landscape_database_now, on_fresh_database_second
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 from tests.unit.engine.test_sink_effect_executor import _CumulativeObservableSink, _CumulativeTarget, _execution_request
@@ -165,6 +166,67 @@ def test_foreign_lease_expires_then_waiter_reclaims_and_publishes_once(
         assert all(0.0 < seconds <= 0.5 for seconds in sleep.calls)
         assert sum(sleep.calls) <= lease_ttl.total_seconds() + 0.5
         assert len(factory.execution.sink_effects.get_effects_for_run(result.effect.run_id)) == 1
+    finally:
+        db.close()
+
+
+def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_time() -> None:
+    """A wait that begins in the same database second the foreign lease was stamped in still reaches the takeover.
+
+    Real clocks throughout. A lease stamped at whole database second S with
+    a TTL of T seconds (ADR-047: ``expires_at = database_now + ttl``) is
+    refused for takeover until the database clock is strictly past S + T,
+    i.e. until second S + T + 1. A waiter that starts inside second S reads
+    "T seconds remain", so a budget capped at the TTL ends inside the
+    lease's last second and re-raises the refusal one poll before the
+    takeover instant. The window is forced: the holder stamps at the top of
+    a fresh database second and the waiter starts before that second ends.
+    """
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    lease_ttl = timedelta(seconds=1)
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    request = _execution_request(run_id, sink_id, members)
+    target = DuplicateObservableTarget()
+    sink = DuplicateObservableSink(target)
+
+    def stop_before_publication(seam: SinkEffectExecutionSeam) -> None:
+        if seam is SinkEffectExecutionSeam.BEFORE_EFFECT:
+            raise SinkEffectInjectedFault(seam)
+
+    def hold_lease(_database_now: datetime) -> None:
+        with pytest.raises(SinkEffectInjectedFault):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="lease-holder",
+                lease_ttl=lease_ttl,
+                fault_hook=stop_before_publication,
+            ).execute(request, sink)
+
+    try:
+        on_fresh_database_second(db.engine, hold_lease)
+        (held,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        assert held.state is SinkEffectState.IN_FLIGHT
+        assert held.lease_owner == "lease-holder"
+        assert held.lease_expires_at is not None
+        stamp_second = held.lease_expires_at.replace(tzinfo=UTC) - lease_ttl
+        assert landscape_database_now(db.engine) == stamp_second, "the wait must begin inside the stamp's database second"
+
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id="lease-waiter",
+            lease_ttl=lease_ttl,
+            poll_interval=0.05,
+        ).execute_with_lease_wait(request, sink)
+
+        assert result.effect.state is SinkEffectState.FINALIZED
+        # The holder faulted before publishing, so the one publication is the waiter's.
+        assert target.publication_count == 1
+        # The takeover happened on the database clock's terms: strictly past
+        # the stamped deadline, never inside the lease's last second.
+        assert landscape_database_now(db.engine) >= stamp_second + lease_ttl + timedelta(seconds=1)
     finally:
         db.close()
 
@@ -587,7 +649,10 @@ def test_live_lease_through_budget_reraises_original_exception_after_bounded_wai
         assert target.publication_count == 0
         assert sleep.calls
         assert all(0.0 < seconds <= 0.5 for seconds in sleep.calls)
-        assert sum(sleep.calls) <= lease_ttl.total_seconds() + 0.5
+        # Budget = capped validity + one database-clock resolution (the
+        # takeover needs database time strictly past the deadline) + one
+        # poll interval; the validity never exceeds the TTL.
+        assert sum(sleep.calls) <= lease_ttl.total_seconds() + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS + 0.5
         current = factory.execution.sink_effects.get_effect(effect.effect_id)
         assert current is not None
         assert (current.lease_owner, current.generation) == ("lease-holder", effect.generation)

@@ -444,13 +444,15 @@ class SinkEffectCoordinator:
             if deadline is None:
                 # The repository reports validity against Landscape database
                 # time, whole-second on SQLite (ADR-047): "N seconds remain"
-                # means [N, N + 1), so the budget covers that resolution or the
-                # wait could give up inside the lease's last second. The TTL
-                # still caps it.
-                initial_budget = min(
-                    self._lease_ttl.total_seconds(),
-                    remaining_validity + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS,
-                )
+                # means [N, N + 1), and the takeover needs the database clock
+                # strictly PAST the deadline, so a lease stamped at whole
+                # second S with TTL T is held until second S + T + 1. The
+                # budget therefore carries one clock resolution ABOVE the
+                # capped validity; capping the sum at the TTL instead left a
+                # wait that began inside the stamp's own second up to one
+                # second short of the takeover instant (nine recovery
+                # resumes in one gate run). The TTL still bounds the wait.
+                initial_budget = min(self._lease_ttl.total_seconds(), remaining_validity) + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
                 # Repository takeover is deliberately strict (expires_at < now).
                 # One bounded poll interval permits the final authority check to
                 # cross an exact equality without introducing an open-ended wait.

@@ -28,22 +28,23 @@ processor binds the post-usurpation token.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.enums import FrameKind, TerminalPath, TriggerType
 from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from elspeth.core.landscape.schema import run_coordination_table
+from elspeth.core.landscape.schema import run_coordination_table, token_work_items_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
 from elspeth.engine.processor import BarrierJournalRestoreContext, _LiveBarrierHold
@@ -52,6 +53,7 @@ from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.group_lineage import ensure_fork_group_record
+from tests.fixtures.landscape import age_barrier_hold, on_fresh_database_second
 from tests.unit.engine.test_adr030_slice3_intake import (
     AGG_NODE,
     _agg_processor,
@@ -65,6 +67,11 @@ from tests.unit.engine.test_processor import (
 )
 
 _T0 = 1_750_000_000.0
+# ``pytest.approx`` defaults to a RELATIVE 1e-6 tolerance: at a monotonic
+# reading of 1.75e9 that is ±1750 s, which would let an anchor a whole
+# timeout window off pass. The anchors are exact arithmetic on the mock
+# clock, so pin them absolutely.
+_ANCHOR_TOLERANCE_SECONDS = 1e-6
 RUN_ID = "test-run"
 USURPER = "worker-usurper"
 TIMEOUT_SECONDS = 10.0
@@ -97,6 +104,18 @@ def _restore_context() -> BarrierJournalRestoreContext:
         barrier_scalars=None,
         batch_id_remap={},
     )
+
+
+def _blocked_work_item_ids(db: LandscapeDB) -> list[str]:
+    """Every BLOCKED journal row of the run, in ingest order (the holds a restore adopts)."""
+    with db.engine.connect() as conn:
+        rows = conn.execute(
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == RUN_ID)
+            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+            .order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.work_item_id)
+        ).all()
+    return [str(row.work_item_id) for row in rows]
 
 
 def _real_coalesce_executor(factory: Any, clock: MockClock, *, policy: str = "best_effort") -> CoalesceExecutor:
@@ -155,7 +174,7 @@ class TestAggregationTimeoutInvariance:
 
         # (1) Frame A anchor == the clamped wall→monotonic transform of T_b.
         evaluator_a = processor_a._aggregation_executor._nodes[AGG_NODE].trigger
-        assert evaluator_a._first_accept_time == pytest.approx(mono_at_tb)
+        assert evaluator_a._first_accept_time == pytest.approx(mono_at_tb, rel=0, abs=_ANCHOR_TOLERANCE_SECONDS)
 
         # Frame A batch composition (the open DRAFT batch A's adoptions filled).
         batches_a = factory.execution.get_batches(RUN_ID)
@@ -169,14 +188,24 @@ class TestAggregationTimeoutInvariance:
         assert should_fire_a is False
 
         # ── Takeover mid-window: usurp the seat, restore as leader B. ──────
-        _usurp_seat(db, RUN_ID, clock)
-        processor_b = _agg_processor(
-            factory,
-            trigger={"timeout_seconds": TIMEOUT_SECONDS},
-            transform=_passthrough_flush_transform(),
-            clock=clock,
-            barrier_restore=_restore_context(),
-        )
+        # A restored hold's age is durable state measured on the Landscape
+        # database clock (ADR-047); the MockClock's advance never reaches the
+        # database, so the SAME T_b+timeout-ε age is written into the
+        # database's past and the restore reads it inside one whole SQLite
+        # second (a rollover would be reported, not silently scored).
+        def take_over(_database_now: datetime) -> Any:
+            for work_item_id in _blocked_work_item_ids(db):
+                age_barrier_hold(db.engine, work_item_id, seconds_ago=TIMEOUT_SECONDS - 0.5)
+            _usurp_seat(db, RUN_ID, clock)
+            return _agg_processor(
+                factory,
+                trigger={"timeout_seconds": TIMEOUT_SECONDS},
+                transform=_passthrough_flush_transform(),
+                clock=clock,
+                barrier_restore=_restore_context(),
+            )
+
+        processor_b = on_fresh_database_second(db.engine, take_over)
 
         # (3) Composition identical: restore created NO new batch and NO new
         # members — the durable membership set is byte-identical.
@@ -188,7 +217,7 @@ class TestAggregationTimeoutInvariance:
 
         # (1) Frame B anchor == the SAME transform of the SAME durable stamp.
         evaluator_b = processor_b._aggregation_executor._nodes[AGG_NODE].trigger
-        assert evaluator_b._first_accept_time == pytest.approx(mono_at_tb)
+        assert evaluator_b._first_accept_time == pytest.approx(mono_at_tb, rel=0, abs=_ANCHOR_TOLERANCE_SECONDS)
         assert evaluator_b.batch_count == 2
 
         # (2) Frame B at the SAME instant (T_b+timeout-ε): must not fire.
@@ -233,13 +262,15 @@ class TestCoalesceTimeoutInvariance:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-row-1", member_key="a"),),
         )
         mono_at_tb = clock.monotonic()
-        _persist_blocked_scheduler_work(
+        work_item_id = _persist_blocked_scheduler_work(
             factory, processor_a, token_a, node_id=COALESCE_NODE, barrier_key="merge", adopted=False, coalesce_name="merge"
         )
         # META-38: the crafted FORK group needs the group_records row a real
         # fork mints — the merge reads the written release fact for it.
         ensure_fork_group_record(factory, run_id="test-run", group_id="fg-row-1", opener_token_id=token_a.token_id)
-        processor_a._live_barrier_holds[token_a.token_id] = _LiveBarrierHold(token=token_a, barrier_key="merge")
+        processor_a._live_barrier_holds[token_a.token_id] = _LiveBarrierHold(
+            token=token_a, barrier_key="merge", arrived_monotonic=mono_at_tb
+        )
         intake_results = processor_a.run_barrier_intake(ctx)
         assert intake_results == []
 
@@ -247,23 +278,31 @@ class TestCoalesceTimeoutInvariance:
         # Live accept() is fork_group_id-keyed (WS4 Task 8); token_a's FORK
         # frame group_id is "fg-row-1".
         pending_a = executor_a._pending[("merge", "fg-row-1")]
-        assert pending_a.first_arrival == pytest.approx(mono_at_tb)
+        assert pending_a.first_arrival == pytest.approx(mono_at_tb, rel=0, abs=_ANCHOR_TOLERANCE_SECONDS)
 
         # (2) Frame A at T_b+timeout-ε: no timeout fire (pure when not firing).
         clock.advance(TIMEOUT_SECONDS - 0.5)
         assert executor_a.check_timeouts("merge") == []
 
         # ── Takeover mid-window. ────────────────────────────────────────────
-        _usurp_seat(db, RUN_ID, clock)
-        executor_b = _real_coalesce_executor(factory, clock)
-        processor_b = _make_processor(
-            factory,
-            coalesce_executor=executor_b,
-            coalesce_node_ids={CoalesceName("merge"): COALESCE_NODE},
-            node_step_map={COALESCE_NODE: 2},
-            clock=clock,
-            barrier_restore=_restore_context(),
-        )
+        # The restored hold's age is measured on the Landscape database clock
+        # (ADR-047): write the SAME T_b+timeout-ε age into the database's past
+        # and restore inside one whole SQLite second (see the aggregation twin).
+        def take_over(_database_now: datetime) -> tuple[CoalesceExecutor, Any]:
+            age_barrier_hold(db.engine, work_item_id, seconds_ago=TIMEOUT_SECONDS - 0.5)
+            _usurp_seat(db, RUN_ID, clock)
+            executor = _real_coalesce_executor(factory, clock)
+            processor = _make_processor(
+                factory,
+                coalesce_executor=executor,
+                coalesce_node_ids={CoalesceName("merge"): COALESCE_NODE},
+                node_step_map={COALESCE_NODE: 2},
+                clock=clock,
+                barrier_restore=_restore_context(),
+            )
+            return executor, processor
+
+        executor_b, processor_b = on_fresh_database_second(db.engine, take_over)
         assert processor_b.has_blocked_barrier_work() is True
 
         # (1) Frame B anchor: restored from the SAME durable barrier_blocked_at.
@@ -271,7 +310,7 @@ class TestCoalesceTimeoutInvariance:
         # same key shape as pending_a's live-accept key above ("fg-row-1"),
         # closing the premise-break window T8-alone would have left.
         pending_b = executor_b._pending[("merge", "fg-row-1")]
-        assert pending_b.first_arrival == pytest.approx(mono_at_tb)
+        assert pending_b.first_arrival == pytest.approx(mono_at_tb, rel=0, abs=_ANCHOR_TOLERANCE_SECONDS)
         assert set(pending_b.branches) == {"a"}
 
         # (2) Frame B at the SAME instant: no fire.

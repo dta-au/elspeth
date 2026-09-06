@@ -2100,6 +2100,7 @@ class RowProcessor:
         self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
             token=current_token,
             barrier_key=str(node_id),
+            arrived_monotonic=self._clock.monotonic(),
         )
         return (
             RowResult(
@@ -3225,6 +3226,7 @@ class RowProcessor:
         self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
             token=current_token,
             barrier_key=str(coalesce_name),
+            arrived_monotonic=self._clock.monotonic(),
         )
         return True, None
 
@@ -3259,6 +3261,7 @@ class RowProcessor:
         self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
             token=current_token,
             barrier_key=str(row_union_name),
+            arrived_monotonic=self._clock.monotonic(),
         )
         return True, None
 
@@ -3328,6 +3331,7 @@ class RowProcessor:
         self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
             token=current_token,
             barrier_key=collector_barrier_key(str(collector_name), frame.group_id),
+            arrived_monotonic=self._clock.monotonic(),
         )
         return True, None
 
