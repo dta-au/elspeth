@@ -44,6 +44,14 @@ installation. Its tfvars must name the nonempty Cognito subject that the
 acceptance run owns; the resolved inventory binds that subject to the
 Terraform-owned pool.
 
+This package creates the Cognito pool and its confidential client only in
+`upgrade` deployment mode, which is Scenario B alone — A and C are `first`
+mode and come up on local authentication. For what the eight identity
+settings this package exports mean, how to point a deployment at Entra,
+Google Workspace or VANguard instead, and — the step most often missed —
+**how the first administrator comes to exist on a pool that ships empty**,
+see the [Identity Providers guide](../../../docs/guides/identity-providers.md).
+
 ### Scenario C: cold install with a custom LLM gateway
 
 `scenario-c/` is Scenario A's deployment shape with the direct Bedrock LLM

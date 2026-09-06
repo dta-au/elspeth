@@ -189,9 +189,17 @@ def map_vanguard(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> I
 
     The subject is an email TODAY (measured 2026-09-02); whether it is stable
     and non-email is the open question D10 turns on, and the rebound
-    detection on ``identities`` exists precisely because it may not be. The
-    mapping does not care: it keys on ``sub`` either way, and R3 notices if
-    the email behind a subject changes.
+    detection columns on ``identities`` exist precisely because it may not
+    be. The mapping does not care: it keys on ``sub`` either way.
+
+    Those columns are RECORDING ONLY. ``subject_email_at_first_seen`` is
+    written at first sight and compared nowhere, ``rebound_at`` is only ever
+    written NULL, and no ``disable_reason='rebound'`` exists in the tree: the
+    R3 refusal is specified (spec §Refusals R3, D32) and NOT implemented
+    (elspeth-9c25083a03). An earlier version of this docstring said "R3
+    notices if the email behind a subject changes", which asserted behaviour
+    the tree does not have. Until R3 is built, a provider that recycles a
+    subject binds the new holder to the prior one's identity row.
 
     ``abn`` becomes ``organisation_id``. The display name is assembled from
     name parts because VANguard does not send a composed ``name``.
