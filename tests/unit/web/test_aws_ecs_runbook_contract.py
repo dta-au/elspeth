@@ -686,7 +686,15 @@ def test_load_scenario_clears_every_closed_assignment_before_loading() -> None:
 
 def test_runbook_pins_exact_oidc_redirect_phases_and_closed_evidence() -> None:
     text = _text()
-    assert 'OIDC_REDIRECT_URI="${ALB_BASE_URL}/"' in text
+    # The preflight must assert the CONFIDENTIAL client the Terraform builds.
+    # Both of these pins exist because the commit that made the client
+    # confidential updated the runbook's prose and left its executable jq
+    # asserting the public shape: hasClientSecret == false, and the load
+    # balancer root as the redirect. Prose review does not catch that and
+    # neither does a unit gate, because the jq only runs during live
+    # acceptance -- so the assertion itself is pinned here.
+    assert 'OIDC_REDIRECT_URI="${ALB_BASE_URL}/api/auth/sso/callback"' in text
+    assert "and .hasClientSecret == true" in text
     assert '--arg callback "$OIDC_REDIRECT_URI"' in text
     assert "STAGING_BASE_URL is the slashless origin" not in text
     for phase in (

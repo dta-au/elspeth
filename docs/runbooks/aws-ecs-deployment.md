@@ -1424,10 +1424,10 @@ prepare_scenario_b_oidc() {
     --client-id "$OIDC_EXPECTED_AUDIENCE" \
     --query "UserPoolClient.{clientId:ClientId,allowedOAuthFlowsUserPoolClient:AllowedOAuthFlowsUserPoolClient,allowedOAuthFlows:AllowedOAuthFlows,allowedOAuthScopes:AllowedOAuthScopes,callbackURLs:CallbackURLs,hasClientSecret:contains(keys(@), 'ClientSecret')}" \
     --output json)
-  OIDC_REDIRECT_URI="${ALB_BASE_URL}/"
+  OIDC_REDIRECT_URI="${ALB_BASE_URL}/api/auth/sso/callback"
   jq -e --arg callback "$OIDC_REDIRECT_URI" '
     keys == ["allowedOAuthFlows","allowedOAuthFlowsUserPoolClient","allowedOAuthScopes","callbackURLs","clientId","hasClientSecret"]
-    and .hasClientSecret == false
+    and .hasClientSecret == true
     and .allowedOAuthFlowsUserPoolClient == true
     and (.allowedOAuthFlows | index("code") != null)
     and (.allowedOAuthFlows | index("implicit") == null)
@@ -1461,13 +1461,16 @@ prepare_scenario_b_oidc() {
 ```
 
 `ALB_BASE_URL` is an exact HTTPS origin with no path, query, fragment, or
-trailing slash. `OIDC_REDIRECT_URI` is the exact slash-bearing root URL the
-frontend sends during authorization and token exchange. ELSPETH disables
-Uvicorn's raw request-line access logger so
-the PKCE callback code is not logged. If ALB access logging is enabled, its
-short retention and access policy must be separately approved because those
-logs retain callback codes even though PKCE prevents redemption without the
-verifier.
+trailing slash. `OIDC_REDIRECT_URI` is the exact callback URL the BACKEND
+redeems against: `ALB_BASE_URL` joined to `sso_wiring.SSO_CALLBACK_PATH`. It
+must equal the `callback_urls` entry the Terraform sets, because Cognito
+matches that list exactly — the load balancer root is refused at the callback
+with nothing in the browser to say why. ELSPETH disables Uvicorn's raw
+request-line access logger so the callback code is not logged. If ALB access
+logging is enabled, its short retention and access policy must be separately
+approved because those logs retain callback codes. Redemption additionally
+requires the confidential client's secret and the PKCE verifier sealed in the
+transaction cookie, and neither is in the URL.
 
 Local auth (`auth_provider=local`) is an explicit single-task option. Mount
 `data_dir/auth.db` on EFS and keep SQLite journal mode `DELETE`, never WAL.

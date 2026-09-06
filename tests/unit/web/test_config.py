@@ -2135,6 +2135,41 @@ def test_all_four_overrides_on_an_expected_origin_are_accepted() -> None:
     assert settings.sso_token_endpoint == f"{_VANGUARD_ISSUER}/token"
 
 
+# entra and google put sso_issuer in their DERIVED forbidden set, so it is
+# always None on those profiles. A narrowing assert on it here refused a
+# correct break-glass configuration with a bare "Assertion failed" naming no
+# setting — and only when Python ran without -O, which made the recovery path
+# behave differently in production than under test. These two cases are
+# parametrized over the profiles that forbid the setting, because the ones
+# that require it could never have shown the defect.
+_ISSUERLESS_PROFILES = [
+    ("entra", {"entra_tenant_id": "11111111-2222-3333-4444-555555555555"}, "https://login.microsoftonline.com"),
+    ("google", {"google_hosted_domain": "example.gov.au"}, "https://accounts.google.com"),
+]
+
+
+@pytest.mark.parametrize(("provider", "profile_setting", "origin"), _ISSUERLESS_PROFILES)
+def test_break_glass_is_reachable_on_a_profile_that_forbids_an_issuer_setting(
+    provider: str, profile_setting: dict[str, Any], origin: str
+) -> None:
+    """The outage this path exists for does not skip the IdPs whose issuer is
+    derived. Both origins here are the profile's OWN expected origin, so the
+    policy below would have accepted them all along."""
+    settings = _wired_idp(provider, **profile_setting, **_all_four(origin))
+
+    assert settings.sso_token_endpoint == f"{origin}/token"
+
+
+@pytest.mark.parametrize(("provider", "profile_setting", "origin"), _ISSUERLESS_PROFILES)
+def test_an_off_origin_override_is_still_refused_on_those_profiles(provider: str, profile_setting: dict[str, Any], origin: str) -> None:
+    """The other half of the pair, and the reason the one above is not enough:
+    a 'fix' that merely deleted the origin check would satisfy it. Reaching
+    the policy is the point — being reachable is not the same as being open."""
+    values = _all_four(origin, sso_token_endpoint="https://attacker.example.net/token")
+    with pytest.raises(ValidationError, match="token_endpoint failed expected-origin check"):
+        _wired_idp(provider, **profile_setting, **values)
+
+
 @pytest.mark.parametrize("omitted", ["sso_authorization_endpoint", "sso_token_endpoint", "sso_jwks_uri"])
 def test_a_partial_override_is_refused(omitted: str) -> None:
     """All-or-none. A partial override silently mixes operator-supplied and
