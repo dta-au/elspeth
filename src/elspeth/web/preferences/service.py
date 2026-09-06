@@ -18,10 +18,8 @@ SQLite and PostgreSQL both use ``ON CONFLICT ... DO UPDATE``, but SQLAlchemy's
 upsert construct is dialect-specific. The write path selects the matching
 insert builder from the active connection before constructing the statement.
 
-Async/sync bridge: uses ``run_sync_in_worker`` from
-``elspeth.web.async_workers`` (bounded shared pool; a running worker
-survives caller cancellation, a still-queued one is dropped). See
-``sessions/service.py`` for the canonical usage pattern.
+Async/sync bridge: ``run_sync_in_worker`` (``elspeth.web.async_workers``, bounded shared
+pool); see ``sessions/service.py`` for the canonical usage pattern.
 """
 
 from __future__ import annotations
@@ -50,39 +48,39 @@ from elspeth.web.sessions.models import user_preferences_table
 
 
 @dataclass(frozen=True, slots=True)
-class ComposerPreferencesTransition:
-    """Result of an account-level composer-preferences PATCH.
+class PriorPreferencesSnapshot:
+    """The ``user_preferences`` row as read just before an upsert.
 
-    Carries the prior state (or ``None`` if no row existed before the
-    PATCH) and the current state. The prior load happens **inside the
-    same transaction** as the write, so there is no TOCTOU window — the
-    Phase 8 plan §"Service signature precondition (B2 — load-bearing)"
-    explicitly rejects the route-handler read-before-write alternative.
-
-    ``prior`` is ``None`` when no row existed before this PATCH.
-    Synthesising a ``ComposerPreferences(default_mode="guided", ...)``
-    sentinel here would fabricate a state the system never wrote, which
-    contradicts CLAUDE.md §"Three-Tier Trust Model" fabrication test
-    ("if the external system's behaviour changes and the field starts
-    appearing with a different value than what we inferred, will the
-    audit trail silently contain two contradictory sources of truth?").
-    Callers are expected to handle ``prior is None`` explicitly.
-
-    Per B2.b (load-bearing): the account-level Phase 8 telemetry
-    consumer reads only ``current.default_mode``. The symmetric
-    ``(prior, current)`` shape is preserved for code-shape consistency
-    with the per-session function and to leave the seam open if a
-    future phase wires account-level preferences into an execution
-    boundary (the future-promotion criterion documented in the
-    module-level "Operational signal only" comment).
-
-    Both fields hold immutable Pydantic models or ``None``; no
-    container fields, so no ``__post_init__`` deep-freeze guard is
-    required (CLAUDE.md §"Frozen Dataclass Immutability"; scalar /
-    model wrappers do not need guards).
+    ``value`` is ``None`` when no row existed (never a synthesised
+    default: that would fabricate state the system never wrote).
+    ``serialised`` is derived from the engine dialect at call time and
+    says whether that read was serialised against concurrent writers of
+    the same row. SQLite: ``True``; ``create_session_engine`` opens every
+    ``engine.begin()`` with ``BEGIN IMMEDIATE`` and the
+    ``contract_invariants.session_engine_factory`` lint forbids any other
+    sessions engine. PostgreSQL: ``False``; the transaction is a plain
+    READ COMMITTED ``BEGIN`` with no advisory lock, so a concurrent PATCH
+    for the same user can commit between this read and the upsert and
+    the losing writer's ``value`` is a stale snapshot. The durable row is
+    still correct on both dialects (the upsert itself is atomic). A
+    snapshot with ``serialised=False`` MUST NOT be promoted into a
+    Landscape or audit emit without a user-keyed lock;
+    tests/unit/web/preferences/test_prior_snapshot_inventory.py pins that
+    no consumer reads ``prior`` at all today.
     """
 
-    prior: ComposerPreferences | None
+    value: ComposerPreferences | None
+    serialised: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerPreferencesTransition:
+    """Result of an account-level composer-preferences PATCH: ``current``
+    is built from the values just written; ``prior`` is the pre-write read
+    whose per-dialect guarantee ``PriorPreferencesSnapshot`` states.
+    """
+
+    prior: PriorPreferencesSnapshot
     current: ComposerPreferences
 
 
@@ -113,18 +111,10 @@ class CorruptPreferencesError(RuntimeError):
         self.bad_value = bad_value
 
 
-# ── Telemetry (Panel S1) ───────────────────────────────────────────────────
-# Operational signal only — preferences are user state, not a pipeline
-# decision boundary, so NO Landscape emit (see CLAUDE.md primacy rule:
-# audit/telemetry/log in order; preferences don't gate any audit-visible
-# pipeline behaviour today). The counter exists so the no-Landscape
-# decision is *acknowledged in code* rather than implicit silence;
-# CLAUDE.md "every emission point must send or explicitly acknowledge
-# nothing to send" is satisfied by the explicit no-op shape.
-#
-# If a future phase wires a preference into an execution boundary
-# (e.g. trust_mode gating auto-commit), promote this to a Landscape emit
-# at that moment — the counter is the seam.
+# ── Telemetry (Panel S1): operational signal only. Preferences are user
+# state, not a pipeline decision boundary, so there is NO Landscape emit;
+# the counter is the explicit "nothing to send" acknowledgement. A future
+# promotion needs a serialised ``prior`` (see ``PriorPreferencesSnapshot``).
 _meter = metrics.get_meter(__name__)
 _PREFERENCES_PATCH_COUNTER = _meter.create_counter(
     "composer.preferences.patch_total",
@@ -145,6 +135,16 @@ _VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"guided", "run", "
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def prior_read_is_serialised(dialect_name: str) -> bool:
+    """Whether a pre-upsert read under ``engine.begin()`` is serialised on this dialect.
+
+    SQLite: ``create_session_engine`` opens the transaction with ``BEGIN
+    IMMEDIATE``, so no concurrent writer can interpose. Every other dialect
+    (PostgreSQL in production) opens a plain READ COMMITTED ``BEGIN``.
+    """
+    return dialect_name == "sqlite"
 
 
 def _select_preferences_for_user(user_id: str) -> Any:
@@ -271,38 +271,38 @@ class PreferencesService:
     async def update_composer_preferences(self, user_id: str, payload: UpdateComposerPreferencesRequest) -> ComposerPreferencesTransition:
         """Upsert the preferences row, touching only fields in ``payload``.
 
-        Empty payloads are accepted as no-ops (the request succeeds; if a
-        row already exists, only ``updated_at`` advances).
+        Empty payloads are accepted as no-ops (the request succeeds; if a row already exists,
+        only ``updated_at`` advances). An empty PATCH against a user with no row inserts
+        nothing (Panel C2), so the GET side's lazy-write contract holds.
 
-        Returns a ``ComposerPreferencesTransition`` carrying both the
-        prior row state (or ``None`` when no row existed before the
-        PATCH) and the post-write state built directly from the written
-        values — no round-trip read for ``current``. This prevents the
-        corrupt-mode PATCH lockout: a pre-existing corrupt
-        ``default_mode`` row would crash a re-read even when the PATCH
-        write succeeded and supplied a valid new mode. Since the values
-        just written are validated (Tier-3 boundary already ran on
-        ``payload``) and trusted, the Tier-1 guard is not re-run on
-        ``current``.
+        Returns a ``ComposerPreferencesTransition``. ``current`` is built directly from the
+        written values, never re-read: a pre-existing corrupt ``default_mode`` row would crash
+        a re-read even when this PATCH just wrote a valid mode (Finding 7). The values passed
+        the Tier-3 boundary on ``payload``, so the Tier-1 read guard is not re-run on ``current``.
 
-        ``transition.prior`` is loaded inside the same transaction as
-        the write (B2 — Phase 8 plan §"Service signature precondition")
-        — no TOCTOU window between read and write. ``prior is None``
-        when no row existed before this PATCH; the no-row-but-non-empty
-        PATCH path produces ``prior=None`` AND a new ``current`` row.
+        Concurrency guarantee, per dialect (elspeth-d336060892):
 
-        telemetry: increments ``composer.preferences.patch_total`` with
-        attributes describing whether the mode or banner field was touched
-        and whether a row was actually written (the empty-PATCH-no-row
-        guard returns ``wrote_row=False``). Operational signal only — no
-        Landscape emit; see module-level comment for the no-Landscape
-        rationale.
+        - Durable row state is correct on BOTH dialects. The write is one
+          ``INSERT ... ON CONFLICT (user_id) DO UPDATE`` whose update clause carries
+          only the fields the caller set, so two concurrent PATCHes for one user
+          never lose each other's fields and never raise a unique violation.
+        - ``prior`` is read inside the same transaction as the upsert. On SQLite
+          ``create_session_engine`` opens that transaction with ``BEGIN IMMEDIATE``,
+          so the read is serialised against every other writer. On PostgreSQL the
+          transaction is a plain READ COMMITTED ``BEGIN`` with no advisory lock and
+          no ``SELECT ... FOR UPDATE``, so a concurrent PATCH can commit between the
+          read and the upsert and the losing writer's ``prior`` is a stale snapshot
+          of a row it did not conflict with. The empty-PATCH no-row guard can race
+          the same way; both writers then skip, which is harmless because neither
+          intended a write.
+        - ``transition.prior.serialised`` carries that fact, derived from the engine
+          dialect at call time. ``prior`` MUST NOT be promoted into a Landscape or
+          audit emit while it can be unserialised; the route discards it and the
+          inventory test pins that.
 
-        Empty-payload contract (Panel C2): a PATCH with no fields set
-        against a user with no existing row is a no-op success — the
-        response is the default-construct payload and NO row is inserted.
-        The earlier behaviour (insert a default row on empty PATCH)
-        contradicted the documented lazy-write contract on the GET side.
+        telemetry: increments ``composer.preferences.patch_total`` with attributes naming which
+        fields were touched and whether a row was written (the empty-PATCH-no-row guard reports
+        ``wrote_row=False``). Operational signal only: no Landscape emit.
         """
         now = self._now()
         tutorial_in_payload = "tutorial_completed_at" in payload.model_fields_set
@@ -332,12 +332,12 @@ class PreferencesService:
         def _sync() -> tuple[ComposerPreferences, bool, ComposerPreferences | None]:
             """Returns (current_prefs, wrote, prior_prefs)."""
             with self._engine.begin() as conn:
-                # B2 (load-bearing): load the prior row inside the same
-                # transaction as the upsert. The result is `None` if no
-                # row exists for this user — synthesising a default
-                # sentinel here would fabricate state the system never
-                # wrote (see ComposerPreferencesTransition docstring and
-                # CLAUDE.md §"Three-Tier Trust Model" fabrication test).
+                # Load the prior row inside the same transaction as the
+                # upsert. ``None`` when no row exists: synthesising a
+                # default here would fabricate state the system never
+                # wrote (see PriorPreferencesSnapshot). Whether this read
+                # is serialised against a concurrent PATCH depends on the
+                # dialect; the method docstring states the guarantee.
                 prior_row = conn.execute(_select_preferences_for_user(user_id)).first()
                 prior_prefs: ComposerPreferences | None
                 if prior_row is None:
@@ -346,12 +346,12 @@ class PreferencesService:
                     prior_prefs = self._row_to_prefs(prior_row, user_id)
 
                 # Panel C2 guard: empty PATCH against a no-row user is a
-                # no-write no-op. Check existence BEFORE the upsert so we
-                # can skip the INSERT entirely. The B2 prior-load above
-                # already SELECTed the row under the sessions engine's
-                # BEGIN IMMEDIATE write transaction; no concurrent writer can
-                # interpose between the existence check and the downstream
-                # upsert.
+                # no-write no-op, so skip the INSERT entirely. On SQLite
+                # the prior-load above ran under BEGIN IMMEDIATE and no
+                # writer can interpose; on PostgreSQL (READ COMMITTED,
+                # no lock) a concurrent PATCH can insert the row between
+                # this check and commit. Both writers then skip, which
+                # is harmless: neither intended a write.
                 if payload_is_empty and prior_row is None:
                     return (
                         ComposerPreferences(
@@ -539,4 +539,11 @@ class PreferencesService:
                 record_tutorial_completed_path("retake")
             elif prior_tutorial is not None and payload.tutorial_completed_at is not None:
                 record_tutorial_completed_path("repeat")
-        return ComposerPreferencesTransition(prior=prior_prefs, current=current)
+        # Derived from the engine dialect at call time, outside ``_sync`` so
+        # the writer's transaction body stays exactly what the session-DB
+        # mutation-authority manifest fingerprints.
+        prior = PriorPreferencesSnapshot(
+            value=prior_prefs,
+            serialised=prior_read_is_serialised(self._engine.dialect.name),
+        )
+        return ComposerPreferencesTransition(prior=prior, current=current)
