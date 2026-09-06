@@ -816,7 +816,7 @@ class _Resolver:
             if attribute_name is not None:
                 prefix = self.qualified_name(node.args[0], use=use or node, seen=seen)
                 return None if prefix is None else f"{prefix}.{attribute_name}"
-        if isinstance(node, ast.Call) and _resolved_callable_name(node.func, self, use=node) == "import_module" and node.args:
+        if isinstance(node, ast.Call) and _resolved_callable_name(node.func, self, use=node, seen=seen) == "import_module" and node.args:
             return _constant_string_value(node.args[0], self, use=node)
         if isinstance(node, ast.Name):
             if node.id in seen:
@@ -1025,13 +1025,23 @@ def _constant_string_value(
     return None
 
 
-def _resolved_callable_name(node: ast.expr, resolver: _Resolver, *, use: ast.AST) -> str | None:
-    resolved = resolver.resolve_callable(node, use=use)
+def _resolved_callable_name(
+    node: ast.expr,
+    resolver: _Resolver,
+    *,
+    use: ast.AST,
+    seen: frozenset[str] = frozenset(),
+) -> str | None:
+    # ``seen`` is ``qualified_name``'s cycle guard.  This helper sits on the
+    # lap ``qualified_name`` (Call branch) -> here -> ``qualified_name``, so it
+    # must carry the guard through both hops: a guard dropped on one path is
+    # the same defect as no guard (elspeth-5a50d4b9f3).
+    resolved = resolver.resolve_callable(node, use=use, seen=seen)
     if isinstance(resolved, ast.Call) and _call_name(resolved) == "getattr" and len(resolved.args) >= 2:
         name = _constant_string_value(resolved.args[1], resolver, use=resolved)
         if name is not None:
             return name
-    qualified = resolver.qualified_name(resolved, use=use)
+    qualified = resolver.qualified_name(resolved, use=use, seen=seen)
     if qualified is not None:
         return qualified.rsplit(".", maxsplit=1)[-1]
     if isinstance(resolved, ast.Attribute):
@@ -5393,6 +5403,49 @@ def test_statement_walkers_key_their_cycle_guard_on_the_binding_site_not_the_nam
     assert not _statement_contains_dml(read_call.args[0], resolver, use=read_call)
     assert _is_proven_read(read_call.args[0], resolver, use=read_call)
     assert _unknown_or_raw_execution_violations([unit]) == ()
+
+
+def test_resolver_cycle_guard_survives_the_callable_name_hop() -> None:
+    """elspeth-5a50d4b9f3: ``seen`` must be carried through ``_resolved_callable_name``.
+
+    A name re-bound to a multi-line chain over its own earlier value binds, for
+    a use INSIDE that chain, to the very assignment being evaluated (the use's
+    line is below the assignment's line), so the value graph is genuinely
+    cyclic.  ``qualified_name`` guards that with ``seen``; the guard was
+    dropped at the Call-branch hop into ``_resolved_callable_name`` and again
+    on the way back into ``qualified_name``, so every lap reset it and the
+    walk recursed without bound.  The fixture is the shape of
+    ``RepositoryIdentityAuthority.list_relationships``.
+    """
+
+    unit = _parse_source(
+        "src/elspeth/web/coordination/rebound_chain.py",
+        "from sqlalchemy import or_, select\n"
+        "from elspeth.web.sessions.models import identity_relationships_table as table\n"
+        "def list_relationships(conn, limit, offset):\n"
+        "    statement = select(table)\n"
+        "    statement = statement.where(or_(table.c.a == 'x', table.c.b == 'y'))\n"
+        "    statement = statement.where(table.c.revoked_at.is_(None))\n"
+        "    statement = (\n"
+        "        statement.order_by(table.c.created_at.desc(), table.c.id.asc())\n"
+        "        .limit(limit)\n"
+        "        .offset(offset)\n"
+        "    )\n"
+        "    return conn.execute(statement).fetchall()\n",
+    )
+    resolver = _resolver_for_unit(unit)
+    chain_calls = [
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"order_by", "limit", "offset"}
+    ]
+    assert len(chain_calls) == 3
+    for call in chain_calls:
+        # Each hop terminates instead of recursing; the chain has no
+        # qualified name because its root re-binds to itself.
+        assert _resolved_callable_name(call.func, resolver, use=call) == call.func.attr
+        assert resolver.qualified_name(call, use=call) is None
+    assert _mutation_callable_escapes([unit]) == ()
 
 
 def test_dml_fingerprint_is_stable_when_the_required_fence_wraps_the_same_statement() -> None:
