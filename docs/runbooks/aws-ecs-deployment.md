@@ -1375,23 +1375,42 @@ completed or an interruption/failure requires Task 6.
 
 ## Authentication and secret injection
 
-Cognito/OIDC is recommended. Configure `auth_provider=oidc`, the user-pool
-`oidc_issuer`, and set both `oidc_audience` and `oidc_client_id` to the public
-app-client ID. Set the hosted/custom-domain
-`oidc_authorization_endpoint` and same-origin `oidc_token_endpoint`, exposed
-as `ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT` and
-`ELSPETH_WEB__OIDC_TOKEN_ENDPOINT`.
+A cold install (`first` mode) comes up on `auth_provider=local`, because it
+has no user pool yet and an operator has to be able to sign in to it. The
+upgrade deployment carries a Cognito user pool and selects `auth_provider=oidc`.
 
-The former browser-origin allowlist and Cognito access-token audience-claim
-settings are deleted; a task definition that still exports either refuses to
-boot on an unknown setting (`tests/unit/deployment/test_web_settings_exports_resolve.py`
-pins that no tracked export or runbook names a setting that does not exist).
-Explicit endpoints on the legacy path must share the issuer's origin, and tokens
-are validated on `aud` only. Cognito's hosted-domain origin is served by the single sign-on profile
-(`sso_endpoint_origins`), which requires the confidential app client and the
-`sso_*` settings that land with the identity cutover; until then the browser
-uses the authorization code flow with S256 PKCE against the public client, which
-has no client secret, and the implicit flow must not be enabled.
+Cognito is registered as a CONFIDENTIAL client, and Terraform creates it:
+`generate_secret = true` on `aws_cognito_user_pool_client.web`. Cognito mints
+the secret, Terraform reads it as an attribute into the runtime Secrets
+Manager entry beside the database credentials and the signing keys, and the
+task definition references it by ARN. There is no console step and no secret
+in the repository. The backend redeems the authorization code as that client:
+the browser never holds the secret and never performs the token exchange, and
+the implicit flow must not be enabled.
+
+The upgrade mode exports all eight settings the profile requires, together:
+`ELSPETH_WEB__SSO_ISSUER` (the user pool), `ELSPETH_WEB__SSO_CLIENT_ID` and
+`ELSPETH_WEB__SSO_CLIENT_SECRET` (the confidential client, the secret by ARN
+reference), `ELSPETH_WEB__SSO_ENDPOINT_ORIGINS` (the hosted domain, a JSON
+list, because Cognito serves authorize and token from a different origin than
+the pool issuer), `ELSPETH_WEB__SSO_TRANSACTION_SECRET`,
+`ELSPETH_WEB__PUBLIC_BASE_URL`, `ELSPETH_WEB__COMPARTMENT_ID` and the two
+quota defaults. Fewer than all eight is a task definition that does not
+start: since the legacy browser-client path was deleted, every registered
+profile is validated from the profile registry, and a partial identity
+configuration fails at settings load rather than reporting "not ready". They
+land in one revision rather than incrementally, for that reason.
+
+The client's `callback_urls` is the exact URI the backend redeems against,
+`https://<alb>/api/auth/sso/callback`. Cognito matches it exactly, so the
+load balancer root would be refused at the callback with nothing in the
+browser to say why.
+
+The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
+and the Cognito access-token audience-claim mode are deleted; a task
+definition that still exports any of them refuses to boot on an unknown
+setting (`tests/unit/deployment/test_web_settings_exports_resolve.py` pins
+that no tracked export or runbook names a setting that does not exist).
 
 Before browser acceptance, query the one approved pool/client through the
 protected capture wrapper and project only booleans and counts:

@@ -38,7 +38,6 @@ import elspeth.web.deployment_contract as deployment_contract_module
 import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth.contracts import RunStatus
-from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -981,9 +980,8 @@ class TestBrowserDocumentHeaders:
         return directives
 
     @staticmethod
-    def _app(token_endpoint: str | None) -> FastAPI:
+    def _app() -> FastAPI:
         app = FastAPI()
-        app.state.oidc_token_endpoint = token_endpoint
         app.add_middleware(_BrowserDocumentHeadersMiddleware)
 
         @app.get("/")
@@ -993,7 +991,14 @@ class TestBrowserDocumentHeaders:
         return app
 
     def test_callback_document_is_no_referrer_and_non_cacheable(self) -> None:
-        with TestClient(self._app(None)) as client:
+        """The document policy is a constant: no request can widen it.
+
+        The middleware once read ``app.state.oidc_token_endpoint`` and added
+        that origin to ``connect-src`` for the browser-client code exchange.
+        The exchange is the backend's now (spec D2), so the header carries no
+        IdP origin at all and there is nothing left for a request to vary.
+        """
+        with TestClient(self._app()) as client:
             response = client.get("/?code=secret&state=state")
         assert response.headers["Referrer-Policy"] == "no-referrer"
         assert response.headers["Cache-Control"] == "no-store"
@@ -1007,23 +1012,12 @@ class TestBrowserDocumentHeaders:
             "connect-src": ("'self'", "ws://localhost:*", "wss://localhost:*"),
             "frame-ancestors": ("'none'",),
         }
-
-    def test_csp_adds_only_exact_validated_cross_origin_token_origin(self) -> None:
-        endpoint = "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token"
-        with TestClient(self._app(endpoint)) as client:
-            response = client.get("/")
-        directives = self._csp_directives(response)
-        assert directives["connect-src"] == (
-            "'self'",
-            "ws://localhost:*",
-            "wss://localhost:*",
-            "https://example.auth.ap-southeast-2.amazoncognito.com",
-        )
-        assert directives["frame-ancestors"] == ("'none'",)
-        assert "https:" not in response.headers["Content-Security-Policy"].replace(
-            "https://example.auth.ap-southeast-2.amazoncognito.com", ""
-        )
-        assert "*" not in response.headers["Content-Security-Policy"].replace("ws://localhost:*", "").replace("wss://localhost:*", "")
+        # No third-party origin and no wildcard beyond the two local
+        # WebSocket sources -- the guards the deleted origin-widening test
+        # carried, kept as properties of the constant itself.
+        policy = response.headers["Content-Security-Policy"]
+        assert "https:" not in policy
+        assert "*" not in policy.replace("ws://localhost:*", "").replace("wss://localhost:*", "")
 
     def test_static_spa_callback_and_hash_document_is_protected_without_mislabeling_api(self, tmp_path: Path) -> None:
         from starlette.staticfiles import StaticFiles
@@ -1033,7 +1027,6 @@ class TestBrowserDocumentHeaders:
         (dist / "index.html").write_text("<html><body>SPA</body></html>", encoding="utf-8")
 
         app = FastAPI()
-        app.state.oidc_token_endpoint = None
         app.add_middleware(_BrowserDocumentHeadersMiddleware)
 
         @app.get("/api/status")
@@ -1449,151 +1442,6 @@ class TestExecutionWiring:
         assert [error.error_code for error in result.errors] == ["unauthorized_secret_ref"]
 
 
-class TestOidcDiscoveryStartup:
-    """OIDC discovery in lifespan() must validate response shape before storing it."""
-
-    @staticmethod
-    def _oidc_settings(tmp_path: Path) -> WebSettings:
-        return _settings(
-            tmp_path,
-            auth_provider="oidc",
-            composer_boot_probe_enabled=False,
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="test-audience",
-            oidc_client_id="test-client-id",
-            secret_key="dev-secret",
-        )
-
-    def test_create_app_refuses_the_deleted_cognito_access_token_mode_at_boot(self, tmp_path) -> None:
-        """The decode branch is gone; a deployment still configured for it must not boot into 401s."""
-        with pytest.raises(RuntimeError, match="oidc_audience_claim"):
-            create_app(
-                _settings(
-                    tmp_path / "oidc",
-                    auth_provider="oidc",
-                    oidc_issuer="https://issuer.example.com",
-                    oidc_audience="client",
-                    oidc_client_id="client",
-                    oidc_audience_claim="client_id",
-                    secret_key="dev-secret",
-                )
-            )
-
-    @pytest.mark.parametrize("auth_provider", ["oidc", "entra"])
-    def test_create_app_pins_the_profiles_algorithms_on_the_validator(self, tmp_path, auth_provider: AuthProviderType) -> None:
-        settings = {
-            "auth_provider": auth_provider,
-            "oidc_audience": "client",
-            "oidc_client_id": "client",
-            "secret_key": "dev-secret",
-        }
-        if auth_provider == "oidc":
-            settings["oidc_issuer"] = "https://issuer.example.com"
-        else:
-            settings["entra_tenant_id"] = "tenant"
-
-        app = create_app(_settings(tmp_path / auth_provider, **settings))
-
-        assert app.state.auth_provider._validator._algorithms == get_profile(auth_provider).id_token_algorithms
-
-    @pytest.mark.parametrize("auth_provider", ["oidc", "entra"])
-    def test_create_app_threads_jwks_max_stale_age(self, tmp_path, auth_provider: str) -> None:
-        settings = {
-            "auth_provider": auth_provider,
-            "oidc_audience": "client",
-            "oidc_client_id": "client",
-            "jwks_max_stale_seconds": 12_345,
-            "secret_key": "dev-secret",
-        }
-        if auth_provider == "oidc":
-            settings["oidc_issuer"] = "https://issuer.example.com"
-        else:
-            settings["entra_tenant_id"] = "tenant"
-
-        app = create_app(_settings(tmp_path / auth_provider, **settings))
-
-        assert app.state.auth_provider._validator._jwks_max_stale_seconds == 12_345
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            [],
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": 123, "token_endpoint": "https://issuer.example.com/token"},
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": "   ", "token_endpoint": "https://issuer.example.com/token"},
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "javascript:alert(1)",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "http://issuer.example.com/oauth2/authorize",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {
-                "issuer": "https://issuer.example.com",
-                "authorization_endpoint": "https://evil.example.com/oauth2/authorize",
-                "token_endpoint": "https://evil.example.com/token",
-            },
-            {
-                "issuer": "https://wrong.example.com",
-                "authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
-                "token_endpoint": "https://issuer.example.com/token",
-            },
-            {"issuer": "https://issuer.example.com", "authorization_endpoint": "https://issuer.example.com/oauth2/authorize"},
-        ],
-    )
-    async def test_lifespan_rejects_invalid_discovery_authorization_endpoint(self, tmp_path, payload) -> None:
-        """Malformed discovery JSON must fail as deterministic startup error."""
-        app = create_app(self._oidc_settings(tmp_path))
-
-        with (
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])),
-            pytest.raises(SystemExit, match="OIDC discovery failed"),
-        ):
-            async with lifespan(app):
-                pass
-
-    @pytest.mark.asyncio
-    async def test_lifespan_accepts_same_origin_https_discovery_authorization_endpoint(self, tmp_path) -> None:
-        """Discovery authorization endpoints are stored only after issuer-origin validation."""
-        app = create_app(self._oidc_settings(tmp_path))
-
-        payload = {
-            "issuer": "https://issuer.example.com",
-            "authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
-            "token_endpoint": "https://issuer.example.com/oauth2/token",
-        }
-        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])):
-            async with lifespan(app):
-                assert app.state.oidc_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
-                assert app.state.oidc_token_endpoint == "https://issuer.example.com/oauth2/token"
-
-    @pytest.mark.asyncio
-    async def test_lifespan_refuses_a_cross_origin_discovery_pair_without_an_allowlist(self, tmp_path) -> None:
-        """The browser-origin allowlist is deleted: the legacy path is issuer-origin only.
-
-        Cognito's hosted domain differs from its pool issuer, which is exactly
-        the deployment the SSO profile (sso_endpoint_origins) now serves.
-        """
-        settings = self._oidc_settings(tmp_path).model_copy(
-            update={"oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id"}
-        )
-        app = create_app(settings)
-        payload = {
-            "issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-            "authorization_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
-            "token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-        }
-        with (
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([_StaticJsonResponse(payload)])),
-            pytest.raises(SystemExit, match="OIDC discovery failed"),
-        ):
-            async with lifespan(app):
-                pass
-
-
 class TestSsoWiring:
     """A deployment whose profile is fully configured is wired for SSO at boot; anything less refuses closed."""
 
@@ -1646,23 +1494,46 @@ class TestSsoWiring:
                 assert started.status_code == 302
                 assert started.headers["location"].startswith("https://idp.example.gov.au/authorize?")
 
-    def test_an_unwired_oidc_deployment_keeps_the_legacy_bearer_path_and_refuses_the_sso_routes(self, tmp_path) -> None:
-        app = create_app(
-            _settings(
-                tmp_path,
-                auth_provider="oidc",
-                composer_boot_probe_enabled=False,
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="test-audience",
-                oidc_client_id="test-client-id",
-                secret_key="dev-secret",
-            )
-        )
-        assert app.state.sso_wiring is None
-        assert not isinstance(app.state.auth_provider, SsoAuthProvider)
-        client = TestClient(app)
-        assert client.get("/api/auth/config").json()["sso_start_url"] is None
-        assert client.get("/api/auth/sso/start", follow_redirects=False).status_code == 503
+    @pytest.mark.asyncio
+    async def test_lifespan_threads_the_profiles_algorithms_and_stale_bound_onto_the_validator(self, tmp_path) -> None:
+        """The validator's algorithms come from the profile, its stale bound from settings.
+
+        Both used to be threaded by ``create_app`` onto the deleted
+        ``OIDCAuthProvider``/``EntraAuthProvider``, and were pinned per
+        provider for oidc and entra. The seam moved to ``build_sso_runtime``,
+        so the assertion moves with it: the profile's pinned algorithm tuple,
+        never a value read from a token header, and the operator's
+        ``jwks_max_stale_seconds`` rather than the default.
+
+        Vanguard, not oidc/entra, because it is the profile this class already
+        has a wired-settings helper for and the threading is profile-agnostic.
+        ``test_sso_wiring.py`` covers the same validator without an app.
+        """
+        app = create_app(self._vanguard_settings(tmp_path, jwks_max_stale_seconds=12_345))
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                validator = app.state.sso.validator
+                assert validator._algorithms == get_profile("vanguard").id_token_algorithms
+                assert validator._jwks_max_stale_seconds == 12_345
+
+    def test_an_unwired_deployment_refuses_to_boot_and_names_its_missing_settings(self, tmp_path) -> None:
+        """``create_app``'s total boundary: an IdP provider with no wiring cannot serve anyone.
+
+        There is no legacy bearer path left to fall back to, so a non-local
+        provider whose profile is not fully configured must fail at boot
+        rather than accept requests it can never authenticate.
+
+        No operator reaches this by configuration: ``WebSettings`` now
+        enforces the same profile-required set that ``build_sso_wiring``
+        reads, so a validly constructed settings object for a non-local
+        provider is always wired. ``model_copy`` is how the test reaches the
+        boundary -- it skips validation, which is exactly the mocked or
+        corrupted settings object the arm exists to catch.
+        """
+        unwired = self._vanguard_settings(tmp_path).model_copy(update={"sso_client_id": None})
+
+        with pytest.raises(RuntimeError, match="vanguard is not wired for single sign-on: missing sso_client_id"):
+            create_app(unwired)
 
 
 class TestLifespanShutdown:
@@ -2450,10 +2321,17 @@ class TestSettingsFromEnv:
             settings_from_env()
 
     def test_nullable_field_null_becomes_none(self, monkeypatch) -> None:
-        """'null' → None for nullable fields, enabling default fallback."""
-        monkeypatch.setenv("ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT", "null")
+        """'null' → None for nullable fields, enabling default fallback.
+
+        A local-auth settings load, like every test in this class: the
+        break-glass endpoint overrides are all-or-none, but that rule runs
+        only on the non-local branch, so this lone override reaches the field
+        parser and nothing else. What is under test is the parser mapping
+        'null' to None rather than to the four-character string.
+        """
+        monkeypatch.setenv("ELSPETH_WEB__SSO_AUTHORIZATION_ENDPOINT", "null")
         settings = settings_from_env()
-        assert settings.oidc_authorization_endpoint is None
+        assert settings.sso_authorization_endpoint is None
 
     def test_nullable_db_url_null_becomes_none(self, monkeypatch) -> None:
         """'null' → None for landscape_url, so get_landscape_url() uses the default."""

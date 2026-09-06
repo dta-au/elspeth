@@ -10,6 +10,7 @@ login attempt asked for it. Those are the gaps below.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from typing import Any
 
@@ -22,10 +23,17 @@ from tests.unit.web.auth.conftest import build_rsa_jwk, make_rsa_token
 ISSUER = "https://issuer.example.gov.au"
 AUDIENCE = "elspeth-client"
 NONCE = "nonce-from-the-sealed-cookie"
+# Required since step E: the validator no longer discovers a key URL for
+# itself, so every one is built with the jwks_uri sso_wiring already resolved
+# and origin-checked. Nothing in this file fetches it — each test hands
+# ``decode_id_token`` a JwkSet it built through the JWKS boundary directly —
+# but the constructor will not produce a validator that has not been told
+# where its keys come from, and that refusal is the point.
+JWKS_URI = f"{ISSUER}/.well-known/jwks.json"
 
 
 def _validator(algorithms: tuple[str, ...] = ("RS256",)) -> JWKSTokenValidator:
-    return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=algorithms)
+    return JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=algorithms, jwks_uri=JWKS_URI)
 
 
 @pytest.fixture
@@ -110,15 +118,6 @@ class TestAlgorithmConfusion:
         payload = _decode(_validator(("PS256",)), token, build_rsa_jwk(public_key, alg="PS256"))
         assert payload.subject == "subject-1"
 
-    def test_the_bearer_path_is_the_same_pin(self, validator, rsa_keypair) -> None:
-        """``decode_token`` used to read ``alg`` from the header. It cannot now."""
-        private_key, public_key = rsa_keypair
-        token = make_rsa_token(private_key, _claims(), algorithm="PS256")
-        with pytest.raises(AuthenticationError, match="Invalid token"):
-            validator.decode_token(token, _jwks(build_rsa_jwk(public_key, alg="PS256")))
-        accepted = validator.decode_token(make_rsa_token(private_key, _claims()), _jwks(build_rsa_jwk(public_key)))
-        assert accepted.subject == "subject-1"
-
     @pytest.mark.parametrize("algorithms", [(), ("RS256", "HS256"), ("none",), ("HS256",), ("RS256", "")])
     def test_a_profile_cannot_declare_a_symmetric_or_absent_signature(self, algorithms: tuple[str, ...]) -> None:
         """A JWKS is public. An HMAC or ``none`` entry would make it the secret."""
@@ -128,7 +127,7 @@ class TestAlgorithmConfusion:
     def test_the_pin_must_be_a_tuple(self) -> None:
         not_a_tuple: Any = ["RS256"]
         with pytest.raises(ValueError, match="tuple"):
-            JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=not_a_tuple)
+            JWKSTokenValidator(issuer=ISSUER, audience=AUDIENCE, algorithms=not_a_tuple, jwks_uri=JWKS_URI)
 
 
 class TestKeyTypeConfusion:
@@ -285,7 +284,7 @@ class TestSignature:
 
 
 # --------------------------------------------------------------------------
-# Moved here with JWKSTokenValidator itself. These four tests are the
+# Moved here with JWKSTokenValidator itself. The tests below are the
 # CONTRACTUAL anchors of the @trust_boundary decorators in
 # ``elspeth/web/auth/id_token.py`` — the trust_boundary.tests rule resolves
 # each ``test_ref`` nodeid and fails when it does not exist. Left in
@@ -295,22 +294,21 @@ class TestSignature:
 
 
 class TestJWKSValidatorBoundaryRaises:
-    """Direct-call boundary tests for the @trust_boundary-decorated JWKS validators.
+    """Direct-call boundary test for the @trust_boundary-decorated JWKS validator.
 
-    These tests invoke each validator with the malformed external value passed
-    DIRECTLY as the decorator's ``source_param`` (no httpx mock indirection) so
-    the trust_boundary.tests honesty gate can prove the raising invariant
-    against the named parameter. The IdP-driven shape-failure paths are also
-    exercised end-to-end through ``authenticate`` in
-    ``TestOIDCJWKSShapeValidation`` above; these direct-call tests pin the
+    It invokes the validator with the malformed external value passed DIRECTLY
+    as the decorator's ``source_param`` (no httpx mock indirection) so the
+    trust_boundary.tests honesty gate can prove the raising invariant against
+    the named parameter. The same shape failure is exercised end-to-end
+    against a real provider in ``test_fake_idp.py``; this direct call pins the
     boundary contract at the function granularity the decorator attests.
-    """
 
-    def test_validate_discovery_document_non_dict_raises(self) -> None:
-        """A non-object discovery payload is rejected at the boundary, not coerced."""
-        validator = _validator()
-        with pytest.raises(AuthenticationError, match="not a JSON object"):
-            validator._validate_discovery_document(discovery=["not", "a", "dict"])
+    The discovery document is no longer one of these. Step E deleted
+    ``_validate_discovery_document`` along with the validator's self-discovery
+    path: sso_wiring resolves and origin-checks the jwks_uri, and the
+    validator never reads a discovery document at all. That it does not is
+    pinned in ``test_id_token_jwks_source.py``.
+    """
 
     def test_validate_jwks_document_missing_keys_raises(self) -> None:
         """A JWKS document without a 'keys' list is rejected at the boundary."""
@@ -394,15 +392,22 @@ class TestIdTokenClaimsBoundary:
         assert (claims.tenant_id, claims.hosted_domain, claims.cognito_username) == ("tenant", "example.gov.au", "cog")
         assert (claims.given_name, claims.family_name, claims.abn) == ("Ada", "Lovelace", "51 824 753 556")
 
-    def test_legacy_group_claims_keep_the_bearer_paths_shape_rule(self) -> None:
-        """Deleted with the legacy providers (step E); until then the rule they applied lives here."""
-        claims = parse_id_token_claims(payload=_claims(groups=["g1", 2], roles=["admin"]))
-        assert claims.groups == ("g1", "2") and claims.roles == ("admin",)
-        with pytest.raises(AuthenticationError, match="Unexpected type for 'groups' claim"):
-            parse_id_token_claims(payload=_claims(groups="not-a-list"))
-        assert parse_id_token_claims(payload=_claims(hasgroups=True)).groups_overage is True
-        assert parse_id_token_claims(payload=_claims(_claim_names={"groups": "src1"})).groups_overage is True
-        assert parse_id_token_claims(payload=_claims()).groups_overage is False
+    def test_a_group_claim_is_read_past_rather_than_carried(self) -> None:
+        """The closed set has no group field, so a token carrying one still parses.
+
+        Step E deleted ``groups``/``roles``/``groups_overage`` with the bearer
+        path that consumed them (D17: IdP groups are organisation facts, not
+        compartment facts). The risk in removing fields from a closed set is
+        the opposite of the one they were added for: a token that carries the
+        claim must still be a VALID token, or every Entra deployment whose
+        app registration emits groups would stop being able to log in. So
+        this pins that the claim is ignored, not refused — including the
+        overage forms, which arrive as an ordinary unread claim now.
+        """
+        claims = parse_id_token_claims(payload=_claims(groups=["g1", 2], roles=["admin"], hasgroups=True))
+        assert claims.subject == "subject-1"
+        assert "groups" not in {declared.name for declared in dataclasses.fields(claims)}
+        assert parse_id_token_claims(payload=_claims(groups="not-a-list")).subject == "subject-1"
 
 
 class TestHeaderKeyIdBoundary:

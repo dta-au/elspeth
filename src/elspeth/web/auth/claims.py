@@ -26,7 +26,6 @@ __all__ = [
     "claim_is_exactly_true",
     "optional_string_claim",
     "required_string_claim",
-    "string_list_claim",
 ]
 
 
@@ -61,24 +60,6 @@ def claim_is_exactly_true(value: object) -> bool:
     return value is True
 
 
-def string_list_claim(value: object, *, name: str) -> tuple[str, ...]:
-    """Read a list-valued claim as a tuple of strings, or refuse the document.
-
-    Absent is the empty tuple. Elements are rendered with ``str`` -- an IdP
-    may send integers where identifiers belong (Entra group object ids), and
-    that is the one deliberate Tier-3 coercion the legacy bearer path made.
-    Any other shape is an IdP misconfiguration and is refused rather than
-    read as "no entries".
-    """
-    if value is None:
-        return ()
-    if type(value) is not list:
-        raise AuthenticationError(
-            f"Unexpected type for {name!r} claim: {type(value).__name__} (expected list) — check IdP token configuration"
-        )
-    return tuple(str(entry) for entry in value)
-
-
 @final
 @dataclass(frozen=True, slots=True)
 class IdTokenClaims:
@@ -98,11 +79,9 @@ class IdTokenClaims:
     wrong type or no visible content; ``email_verified`` is true only for the
     JSON boolean.
 
-    LEGACY BEARER PATH ONLY: ``groups``, ``roles`` and ``groups_overage``
-    exist for ``OIDCAuthProvider`` and ``EntraAuthProvider`` and are deleted
-    in the same commit that deletes them (identity sprint step E). The SSO
-    walk never reads them (D17: IdP groups are organisation facts, not
-    compartment facts).
+    IdP group and role claims are deliberately NOT read: they are
+    organisation facts, not compartment facts (D17), and the legacy bearer
+    path that consumed them was deleted in identity sprint step E.
     """
 
     issuer: str
@@ -126,10 +105,6 @@ class IdTokenClaims:
     family_name: str | None = None
     abn: str | None = None
     """VANguard's Australian Business Number claim."""
-    groups: tuple[str, ...] = ()
-    roles: tuple[str, ...] = ()
-    groups_overage: bool = False
-    """Entra emitted a group-overage marker instead of the groups themselves."""
 
 
 @final

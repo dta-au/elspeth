@@ -32,8 +32,6 @@ from elspeth.web.auth.providers import IdPProfile, get_profile
 from elspeth.web.auth.urls import (
     DiscoveredEndpoints,
     validate_discovered_endpoints,
-    validate_oidc_browser_endpoints,
-    validate_oidc_issuer,
 )
 from elspeth.web.composer.reasoning import ReasoningEffort
 from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
@@ -97,15 +95,6 @@ DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
 
 def _allow_insecure_test_keys(host: str) -> bool:
     return host in _LOCAL_HOSTS and ("pytest" in sys.modules or os.environ.get("ELSPETH_ENV") == "test")
-
-
-# Providers whose REQUIRED settings are enforced from the profile registry
-# today. ``oidc`` and ``entra`` still carry hand-written arms for their legacy
-# ``oidc_*`` fields, which the old browser path reads and which are deleted
-# with it; enforcing both vocabularies at once would demand two sets of
-# credentials for one deployment. They join the registry when those fields
-# die, at which point this constant goes with them and no provider has an arm.
-_REGISTRY_VALIDATED_PROVIDERS: frozenset[str] = frozenset({"vanguard", "google"})
 
 
 def is_default_secret_key_placeholder(secret_key: str) -> bool:
@@ -500,13 +489,7 @@ class WebSettings(BaseModel):
         ),
     )
 
-    # OIDC / Entra-specific (optional)
-    oidc_issuer: str | None = None
-    oidc_audience: str | None = None
-    oidc_client_id: str | None = None
-    oidc_authorization_endpoint: str | None = None
-    oidc_token_endpoint: str | None = None
-    oidc_audience_claim: Literal["aud", "client_id"] = "aud"
+    # Entra-specific: the profile derives its issuer from the tenant.
     entra_tenant_id: str | None = None
 
     # --- Pluggable SSO (elspeth-07cd19ba73, spec §Settings) ---------------
@@ -657,11 +640,6 @@ class WebSettings(BaseModel):
     )
 
     @field_validator(
-        "oidc_issuer",
-        "oidc_audience",
-        "oidc_client_id",
-        "oidc_authorization_endpoint",
-        "oidc_token_endpoint",
         "entra_tenant_id",
         # Pluggable SSO. A blank here is worse than an omission: it satisfies
         # every ``is not None`` check on the way to a deployment that cannot
@@ -1032,86 +1010,17 @@ class WebSettings(BaseModel):
             if not self.dev_admin_user.strip():
                 raise ValueError("dev_admin_user must name a local-auth user, not be blank")
 
+        # Registry-driven SSO validation: the forbidden-setting rule and the
+        # required-setting rule for EVERY registered provider come from the
+        # profile registry, so there is no per-provider arm here to fall out
+        # of step with readiness (which reads the same matrix). The legacy
+        # browser path's hand-written ``oidc``/``entra`` arms and their
+        # ``oidc_*`` fields were deleted with that path (identity sprint
+        # step E).
         if self.auth_provider == "local":
-            if self.oidc_audience_claim != "aud":
-                raise ValueError("Local auth does not permit the OIDC client_id audience claim mode")
-            configured = [
-                name
-                for name, val in (
-                    ("oidc_issuer", self.oidc_issuer),
-                    ("oidc_audience", self.oidc_audience),
-                    ("oidc_client_id", self.oidc_client_id),
-                    ("oidc_authorization_endpoint", self.oidc_authorization_endpoint),
-                    ("oidc_token_endpoint", self.oidc_token_endpoint),
-                    ("entra_tenant_id", self.entra_tenant_id),
-                )
-                if val is not None
-            ]
-            if configured:
-                raise ValueError(f"Local auth does not use OIDC/Entra fields: {', '.join(configured)}")
-        elif self.auth_provider == "oidc":
-            missing = [
-                name
-                for name, val in (
-                    ("oidc_issuer", self.oidc_issuer),
-                    ("oidc_audience", self.oidc_audience),
-                    ("oidc_client_id", self.oidc_client_id),
-                )
-                if not val
-            ]
-            if missing:
-                raise ValueError(f"OIDC auth requires: {', '.join(missing)}")
-            if self.oidc_audience_claim == "client_id" and self.oidc_audience != self.oidc_client_id:
-                raise ValueError("oidc_audience must match oidc_client_id when oidc_audience_claim is client_id")
-            assert self.oidc_issuer is not None
-            object.__setattr__(self, "oidc_issuer", validate_oidc_issuer(self.oidc_issuer))
-            if (self.oidc_authorization_endpoint is None) != (self.oidc_token_endpoint is None):
-                raise ValueError("OIDC authorization_endpoint and token_endpoint must be configured both or neither")
-            if self.oidc_authorization_endpoint is not None and self.oidc_token_endpoint is not None:
-                authorization_endpoint, token_endpoint = validate_oidc_browser_endpoints(
-                    self.oidc_authorization_endpoint,
-                    self.oidc_token_endpoint,
-                    issuer=self.oidc_issuer,
-                )
-                object.__setattr__(self, "oidc_authorization_endpoint", authorization_endpoint)
-                object.__setattr__(self, "oidc_token_endpoint", token_endpoint)
-        elif self.auth_provider == "entra":
-            # oidc_issuer is NOT required — EntraAuthProvider derives it
-            # from entra_tenant_id (login.microsoftonline.com/{tid}/v2.0).
-            missing = [
-                name
-                for name, val in (
-                    ("oidc_audience", self.oidc_audience),
-                    ("oidc_client_id", self.oidc_client_id),
-                    ("entra_tenant_id", self.entra_tenant_id),
-                )
-                if not val
-            ]
-            if missing:
-                raise ValueError(f"Entra auth requires: {', '.join(missing)}")
-            if self.oidc_audience_claim != "aud":
-                raise ValueError("Entra auth does not permit the OIDC client_id audience claim mode")
-            if (self.oidc_authorization_endpoint is None) != (self.oidc_token_endpoint is None):
-                raise ValueError("Entra authorization_endpoint and token_endpoint must be configured both or neither")
-            if self.oidc_authorization_endpoint is not None and self.oidc_token_endpoint is not None:
-                assert self.entra_tenant_id is not None
-                authorization_endpoint, token_endpoint = validate_oidc_browser_endpoints(
-                    self.oidc_authorization_endpoint,
-                    self.oidc_token_endpoint,
-                    issuer=f"https://login.microsoftonline.com/{self.entra_tenant_id}/v2.0",
-                )
-                object.__setattr__(self, "oidc_authorization_endpoint", authorization_endpoint)
-                object.__setattr__(self, "oidc_token_endpoint", token_endpoint)
-
-        # Registry-driven SSO validation. The arms above govern the OLD
-        # browser path and its ``oidc_*`` fields, which are deleted with that
-        # path; they are deliberately left alone here so those settings and
-        # their tests churn once, at deletion, rather than twice.
-        #
-        # What is registry-driven from birth: the forbidden-setting rule for
-        # EVERY provider, and the required-setting rule for the providers
-        # that never had a hand-written arm.
-        if self.auth_provider != "local":
+            if self.entra_tenant_id is not None:
+                raise ValueError("Local auth does not use entra_tenant_id")
+        else:
             profile = get_profile(self.auth_provider)
             configured_settings = configured_auth_settings(self)
             configured_but_meaningless = sorted(name for name in profile.forbidden_settings if configured_settings[name])
@@ -1121,10 +1030,9 @@ class WebSettings(BaseModel):
                     f"{', '.join(configured_but_meaningless)} "
                     f"(configuring a setting for a different IdP is silently ignored otherwise)"
                 )
-            if self.auth_provider in _REGISTRY_VALIDATED_PROVIDERS:
-                missing = [name for name in profile.required_settings if not configured_settings[name]]
-                if missing:
-                    raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
+            missing = [name for name in profile.required_settings if not configured_settings[name]]
+            if missing:
+                raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
             self._validate_sso_endpoint_overrides(profile)
         return self
 

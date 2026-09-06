@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, Response
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.util.types import AttributeValue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
+from pydantic import SecretStr
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -71,11 +71,6 @@ from elspeth.web.auth.session_token import (
     session_token_audience,
 )
 from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
-from elspeth.web.auth.urls import (
-    oidc_browser_endpoint_origin,
-    validate_oidc_browser_endpoints,
-    validate_oidc_issuer,
-)
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
@@ -208,41 +203,6 @@ def _run_session_engine_finalizer(
 def _close_readiness_runner(runner: ReadinessProbeRunner) -> None:
     """Close readiness workers for app instances that never run lifespan."""
     runner.close()
-
-
-class _BrowserEndpointDiscoveryDocument(BaseModel):
-    """Minimal OIDC discovery shape required by the browser login flow."""
-
-    model_config = ConfigDict(hide_input_in_errors=True)
-    issuer: str
-    authorization_endpoint: str
-    token_endpoint: str
-
-    @field_validator("issuer", "authorization_endpoint", "token_endpoint")
-    @classmethod
-    def _validate_nonblank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("discovery browser endpoint field must not be blank")
-        return value
-
-
-def _validate_browser_endpoint_discovery_document(
-    discovery: object,
-    *,
-    issuer: str,
-) -> tuple[str, str]:
-    """Validate discovery issuer and return its exact browser endpoint pair."""
-    try:
-        document = _BrowserEndpointDiscoveryDocument.model_validate(discovery)
-    except ValidationError as exc:
-        raise ValueError("OIDC discovery document failed required browser endpoint shape check") from exc
-    if document.issuer != issuer:
-        raise ValueError("OIDC discovery document failed exact issuer check")
-    return validate_oidc_browser_endpoints(
-        document.authorization_endpoint,
-        document.token_endpoint,
-        issuer=issuer,
-    )
 
 
 def _parse_worker_count(raw_value: str, *, signal_name: str) -> int:
@@ -601,43 +561,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     # unreachable) fails boot, exactly like the sweeps above.
     await app.state.web_instance_membership.start()
 
-    # Resolve the paired browser endpoints from discovery or explicit config.
-    # LEGACY browser-client path: served only while an oidc/entra deployment
-    # is NOT wired for SSO (identity sprint step E deletes it).
-    if settings.auth_provider in ("oidc", "entra") and sso_wiring is None:
-        if settings.oidc_issuer:
-            issuer = validate_oidc_issuer(settings.oidc_issuer)
-        elif settings.auth_provider == "entra" and settings.entra_tenant_id:
-            issuer = validate_oidc_issuer(f"https://login.microsoftonline.com/{settings.entra_tenant_id}/v2.0")
-        else:
-            raise SystemExit("FATAL: OIDC discovery requires either oidc_issuer or entra_tenant_id to derive the issuer URL.")
-
-        if settings.oidc_authorization_endpoint and settings.oidc_token_endpoint:
-            authorization_endpoint, token_endpoint = validate_oidc_browser_endpoints(
-                settings.oidc_authorization_endpoint,
-                settings.oidc_token_endpoint,
-                issuer=issuer,
-            )
-            app.state.oidc_authorization_endpoint = authorization_endpoint
-            app.state.oidc_token_endpoint = token_endpoint
-        else:
-            discovery_url = f"{issuer}/.well-known/openid-configuration"
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                    resp = await client.get(discovery_url)
-                    resp.raise_for_status()
-                    authorization_endpoint, token_endpoint = _validate_browser_endpoint_discovery_document(
-                        resp.json(),
-                        issuer=issuer,
-                    )
-                    app.state.oidc_authorization_endpoint = authorization_endpoint
-                    app.state.oidc_token_endpoint = token_endpoint
-            except (httpx.HTTPError, ValueError) as exc:
-                raise SystemExit(
-                    f"FATAL: OIDC discovery failed browser endpoint check ({type(exc).__name__}). "
-                    "Configure a valid explicit authorization_endpoint/token_endpoint pair or fix discovery."
-                ) from None
-
     # Sub-5: Construct ProgressBroadcaster and ExecutionServiceImpl
     # These require a running event loop, which is only available here.
     loop = asyncio.get_running_loop()
@@ -957,15 +880,20 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-_SPA_CSP_PREFIX = (
+# The browser only ever talks to ELSPETH itself: the SSO code exchange is the
+# backend's, as a confidential client (spec D2), so no IdP origin is ever
+# admitted to ``connect-src``. The legacy browser-client path that widened
+# it to the token endpoint's origin was deleted in identity sprint step E.
+_SPA_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "font-src 'self'; img-src 'self' data:; "
-    "connect-src 'self' ws://localhost:* wss://localhost:*"
+    "connect-src 'self' ws://localhost:* wss://localhost:*; "
+    "frame-ancestors 'none'"
 )
 
 
 class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
-    """Apply callback secrecy, framing denial, and runtime OIDC policy."""
+    """Apply callback secrecy and framing denial to every HTML document."""
 
     async def dispatch(self, request: StarletteRequest, call_next):  # type: ignore[no-untyped-def]
         response = await call_next(request)
@@ -973,24 +901,7 @@ class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
         if not content_type.lower().startswith("text/html"):
             return response
 
-        connect_origin: str | None = None
-        # ``app.state.oidc_token_endpoint`` is assigned unconditionally in
-        # ``create_app`` (settings value, ``str | None``) and only ever
-        # overwritten with a validated endpoint in ``_service_lifespan``.
-        token_endpoint: str | None = request.app.state.oidc_token_endpoint
-        if token_endpoint is not None:
-            token_origin = oidc_browser_endpoint_origin(token_endpoint)
-            request_port = request.url.port
-            default_port = 443 if request.url.scheme == "https" else 80
-            request_host = request.url.hostname or ""
-            request_origin = f"{request.url.scheme}://{request_host.lower()}"
-            if request_port not in (None, default_port):
-                request_origin += f":{request_port}"
-            if token_origin != request_origin:
-                connect_origin = token_origin
-
-        connect_policy = _SPA_CSP_PREFIX if connect_origin is None else f"{_SPA_CSP_PREFIX} {connect_origin}"
-        response.headers["Content-Security-Policy"] = f"{connect_policy}; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = _SPA_CSP
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
@@ -1544,19 +1455,11 @@ def _create_app(
     # provider needs the identities substrate to mint a token at all -- ``sub``
     # is the identity_id. It used to run before the engine existed.
     auth_provider: AuthProvider
-    if settings.auth_provider == "oidc" and settings.oidc_audience_claim != "aud":
-        # The Cognito access-token decode branch is deleted (spec §ID-token
-        # validation); a deployment still configured for it must hear that at
-        # boot, not as every login failing its audience check. The setting
-        # itself goes with the rest of ``oidc_*`` in identity sprint step E.
-        raise RuntimeError(
-            "oidc_audience_claim='client_id' (Cognito access-token mode) is no longer supported: "
-            "register Cognito as a confidential client through the SSO profile."
-        )
     # Wired for SSO when the active profile has every setting it requires
-    # (the same rule readiness reports on). ``None`` means the legacy bearer
-    # path below serves an oidc/entra deployment, and the /api/auth/sso
-    # routes refuse — one fact, read by both.
+    # (the same rule readiness reports on). ``None`` for a non-local provider
+    # means the deployment cannot serve anyone and boot refuses below; the
+    # /api/auth/sso routes read the same fact. There is no other bearer path:
+    # the legacy OIDC/Entra providers were deleted in identity sprint step E.
     sso_wiring = build_sso_wiring(
         settings,
         session_engine=session_engine,
@@ -1572,40 +1475,15 @@ def _create_app(
         # Every bearer after ``complete`` is an ELSPETH session token; the
         # IdP's tokens never leave the backend (spec D2).
         auth_provider = SsoAuthProvider(issuer=sso_wiring.token_issuer, read_identity=sso_wiring.read_identity)
-    elif settings.auth_provider == "oidc":
-        from elspeth.web.auth.oidc import OIDCAuthProvider
-
-        # Validator _validate_auth_fields guarantees non-None
-        assert settings.oidc_issuer is not None
-        assert settings.oidc_audience is not None
-        auth_provider = OIDCAuthProvider(
-            issuer=settings.oidc_issuer,
-            audience=settings.oidc_audience,
-            jwks_cache_ttl_seconds=settings.jwks_cache_ttl_seconds,
-            jwks_failure_retry_seconds=settings.jwks_failure_retry_seconds,
-            jwks_max_stale_seconds=settings.jwks_max_stale_seconds,
-        )
-    elif settings.auth_provider == "entra":
-        from elspeth.web.auth.entra import EntraAuthProvider
-
-        assert settings.entra_tenant_id is not None
-        assert settings.oidc_audience is not None
-        auth_provider = EntraAuthProvider(
-            tenant_id=settings.entra_tenant_id,
-            audience=settings.oidc_audience,
-            jwks_cache_ttl_seconds=settings.jwks_cache_ttl_seconds,
-            jwks_failure_retry_seconds=settings.jwks_failure_retry_seconds,
-            jwks_max_stale_seconds=settings.jwks_max_stale_seconds,
-        )
     else:
-        # A registered profile with no legacy bearer path and an incomplete
-        # SSO configuration cannot serve anyone; readiness names the same
-        # fields, this names them before the first request.
+        # A registered profile with an incomplete SSO configuration cannot
+        # serve anyone; readiness names the same fields, this names them
+        # before the first request. ``WebSettings`` refuses the shape first,
+        # so this is the total boundary for a mocked or corrupted settings
+        # object, not the operator-facing message.
         raise RuntimeError(f"{settings.auth_provider} is not wired for single sign-on: missing {', '.join(sso_missing_settings(settings))}")
     app.state.auth_provider = auth_provider
     app.state.auth_audit_recorder = AuthAuditRecorder.from_settings(settings, resolved_state_mode)
-    app.state.oidc_authorization_endpoint = settings.oidc_authorization_endpoint
-    app.state.oidc_token_endpoint = settings.oidc_token_endpoint
 
     # --- Preferences service ---
     # Per-user composer settings (default_composer_mode, banner_dismissed_at,

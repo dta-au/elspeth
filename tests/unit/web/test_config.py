@@ -974,10 +974,10 @@ class TestSecretKeyGuard:
 
 
 class TestAuthFieldValidation:
-    """Tests for OIDC/Entra conditional field requirements."""
+    """Local auth's field rules, and the registry-driven rule for every IdP."""
 
-    def test_local_provider_no_oidc_fields_required(self) -> None:
-        """Local auth (default) should work without any OIDC fields."""
+    def test_local_provider_needs_no_idp_fields(self) -> None:
+        """Local auth (the default) must start with no IdP configuration at all."""
         settings = WebSettings(
             auth_provider="local",
             composer_max_composition_turns=15,
@@ -988,6 +988,26 @@ class TestAuthFieldValidation:
         )
         assert settings.auth_provider == "local"
 
+    def test_local_provider_rejects_entra_tenant_id(self) -> None:
+        """Local auth must not accept inert Entra configuration.
+
+        ``entra_tenant_id`` is the one provider-specific setting local auth
+        still refuses by name. The ``sso_*`` settings are deliberately NOT
+        refused under local: a deployment may carry its IdP wiring while
+        running local auth, and flipping ``auth_provider`` is then a
+        one-variable change rather than a re-plumbing.
+        """
+        with pytest.raises(ValidationError, match="Local auth does not use entra_tenant_id"):
+            WebSettings(
+                auth_provider="local",
+                entra_tenant_id="a-tenant",
+                composer_max_composition_turns=15,
+                composer_max_discovery_turns=10,
+                composer_timeout_seconds=85.0,
+                composer_rate_limit_per_minute=10,
+                shareable_link_signing_key=b"\x00" * 32,
+            )
+
     @pytest.mark.parametrize(
         "field_name",
         [
@@ -995,12 +1015,21 @@ class TestAuthFieldValidation:
             "oidc_audience",
             "oidc_client_id",
             "oidc_authorization_endpoint",
-            "entra_tenant_id",
+            "oidc_token_endpoint",
+            "oidc_audience_claim",
         ],
     )
-    def test_local_provider_rejects_oidc_entra_fields(self, field_name: str) -> None:
-        """Local auth must not accept inert OIDC/Entra configuration."""
-        with pytest.raises(ValidationError, match=field_name):
+    def test_retired_legacy_oidc_settings_fail_closed_rather_than_being_ignored(self, field_name: str) -> None:
+        """A stale task definition must fail at startup, not authenticate differently.
+
+        The legacy browser-bearer path and its six ``oidc_*`` settings were
+        deleted (identity sprint step E). An operator upgrading a running
+        deployment still has those variables in their task definition, and the
+        dangerous outcome is not a crash -- it is a container that starts,
+        ignores the issuer it was told to trust, and serves an IdP nobody
+        configured. Both the model and the environment reader refuse the name.
+        """
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
             WebSettings(
                 auth_provider="local",
                 **{field_name: "https://issuer.example.com"},
@@ -1011,9 +1040,22 @@ class TestAuthFieldValidation:
                 shareable_link_signing_key=b"\x00" * 32,
             )
 
-    def test_oidc_provider_missing_fields_raises(self) -> None:
-        """OIDC provider without required fields should raise."""
-        with pytest.raises(ValidationError, match="OIDC auth requires"):
+    @pytest.mark.usefixtures("required_web_env")
+    def test_retired_legacy_oidc_environment_variable_is_refused_by_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The upgrade failure an operator actually meets, named in their own vocabulary."""
+        monkeypatch.setenv("ELSPETH_WEB__OIDC_ISSUER", "https://issuer.example.com")
+
+        with pytest.raises(RuntimeError, match="Unknown ELSPETH_WEB__ setting: ELSPETH_WEB__OIDC_ISSUER"):
+            web_config.settings_from_env()
+
+    def test_idp_provider_missing_every_required_setting_names_them_all(self) -> None:
+        """An unconfigured IdP deployment is refused, and the refusal is a worklist.
+
+        The names come from the profile registry -- the common set every IdP
+        needs plus the profile's own -- so this message and readiness cannot
+        drift apart into two different answers about what is missing.
+        """
+        with pytest.raises(ValidationError, match=r"auth_provider='oidc' requires: .*sso_client_id.*sso_issuer"):
             WebSettings(
                 auth_provider="oidc",
                 composer_max_composition_turns=15,
@@ -1147,349 +1189,220 @@ class TestServerSecretAllowlistValidation:
             )
 
 
+# What EVERY IdP deployment needs, whichever profile is selected: a
+# confidential client's credentials, a transaction secret, this container's
+# own public origin for the redirect URI, and the compartment and quota an
+# activated identity is created with. Stated once, exactly as
+# ``_COMMON_IDP_REQUIRED`` states it in the profile registry, so a test that
+# means "wired except for X" cannot drift into "wired except for X and two
+# things nobody noticed".
+_IDP_COMMON_REQUIRED: dict[str, Any] = {
+    "sso_client_id": "elspeth",
+    "sso_client_secret": "s" * 40,
+    "sso_transaction_secret": "t" * 40,
+    "public_base_url": "https://elspeth.example.gov.au",
+    "compartment_id": "example-compartment",
+    "quota_default_tokens_per_day": 100_000,
+    "quota_default_storage_bytes": 1_000_000,
+}
+
+
+def _wired_idp(provider: str, **overrides: Any) -> WebSettings:
+    """A deployment configured well enough for ``provider`` to complete a login."""
+    return _settings(auth_provider=provider, **{**_IDP_COMMON_REQUIRED, **overrides})
+
+
 class TestAuthFieldValidationContinued:
-    """Additional OIDC/Entra field requirement coverage."""
+    """The registry's required and forbidden rules, per profile."""
 
-    def test_oidc_provider_with_all_fields_valid(self) -> None:
-        """OIDC provider with all required fields should succeed."""
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            composer_max_composition_turns=15,
-            composer_max_discovery_turns=10,
-            composer_timeout_seconds=85.0,
-            composer_rate_limit_per_minute=10,
-            shareable_link_signing_key=b"\x00" * 32,
-        )
+    def test_oidc_provider_with_every_required_setting_is_accepted(self) -> None:
+        """The positive control: a rule that refused every oidc config would pass
+        every negative test below and ship a provider nobody can deploy."""
+        settings = _wired_idp("oidc", sso_issuer="https://issuer.example.com")
+
         assert settings.auth_provider == "oidc"
-        assert settings.oidc_issuer == "https://issuer.example.com"
+        assert settings.sso_issuer == "https://issuer.example.com"
 
-    def test_oidc_provider_partial_fields_raises(self) -> None:
-        """OIDC provider with only some fields should name the missing ones."""
-        with pytest.raises(ValidationError, match="oidc_audience"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_oidc_provider_with_only_its_issuer_names_the_common_settings_it_lacks(self) -> None:
+        """A profile-specific setting does not excuse the seven every IdP needs."""
+        with pytest.raises(ValidationError, match=r"auth_provider='oidc' requires: sso_client_id, .*quota_default_storage_bytes"):
+            _settings(auth_provider="oidc", sso_issuer="https://issuer.example.com")
 
-    def test_entra_provider_missing_fields_raises(self) -> None:
-        """Entra provider without required fields should raise."""
-        with pytest.raises(ValidationError, match="Entra auth requires"):
-            WebSettings(
-                auth_provider="entra",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_entra_provider_missing_every_required_setting_raises(self) -> None:
+        with pytest.raises(ValidationError, match=r"auth_provider='entra' requires: .*entra_tenant_id"):
+            _settings(auth_provider="entra")
 
-    def test_entra_provider_missing_tenant_id_raises(self) -> None:
-        """Entra with OIDC fields but no tenant_id should raise."""
-        with pytest.raises(ValidationError, match="entra_tenant_id"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_issuer="https://login.microsoftonline.com/t/v2.0",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                composer_max_composition_turns=15,
-                composer_max_discovery_turns=10,
-                composer_timeout_seconds=85.0,
-                composer_rate_limit_per_minute=10,
-                shareable_link_signing_key=b"\x00" * 32,
-            )
+    def test_entra_provider_missing_only_its_tenant_id_names_just_that(self) -> None:
+        """The refusal is the shortest true worklist, not the whole matrix again."""
+        with pytest.raises(ValidationError) as exc_info:
+            _wired_idp("entra")
 
-    def test_entra_provider_with_all_fields_valid(self) -> None:
-        """Entra provider with all required fields should succeed."""
-        settings = WebSettings(
-            auth_provider="entra",
-            oidc_issuer="https://login.microsoftonline.com/t/v2.0",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            entra_tenant_id="my-tenant-id",
-            composer_max_composition_turns=15,
-            composer_max_discovery_turns=10,
-            composer_timeout_seconds=85.0,
-            composer_rate_limit_per_minute=10,
-            shareable_link_signing_key=b"\x00" * 32,
-        )
+        message = str(exc_info.value)
+        assert "auth_provider='entra' requires: entra_tenant_id" in message
+        assert "sso_client_id" not in message
+
+    def test_entra_provider_with_every_required_setting_is_accepted(self) -> None:
+        settings = _wired_idp("entra", entra_tenant_id="my-tenant-id")
+
         assert settings.auth_provider == "entra"
         assert settings.entra_tenant_id == "my-tenant-id"
 
+    def test_entra_provider_refuses_an_issuer_it_would_silently_ignore(self) -> None:
+        """Entra DERIVES its issuer from the tenant, so accepting ``sso_issuer``
+        as well would let two sources of truth disagree about who signs tokens.
+
+        The forbidden set is derived by subtracting what a profile uses from
+        the provider-specific settings, so this refusal is not a hand-written
+        list that a new setting could be left out of.
+        """
+        with pytest.raises(ValidationError, match="auth_provider='entra' does not use: sso_issuer"):
+            _wired_idp("entra", entra_tenant_id="my-tenant-id", sso_issuer="https://login.microsoftonline.com/t/v2.0")
+
 
 class TestOIDCIssuerValidation:
-    """OIDC issuer config must be safe before startup discovery can fetch it."""
+    """The issuer must be safe before anything fetches its discovery document.
 
-    _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
-        "composer_max_composition_turns": 15,
-        "composer_max_discovery_turns": 10,
-        "composer_timeout_seconds": 85.0,
-        "composer_rate_limit_per_minute": 10,
-        "shareable_link_signing_key": b"\x00" * 32,
+    ``sso_issuer`` reaches :func:`validate_oidc_issuer` through the profile's
+    ``resolve_issuer``, which the endpoint-override validator calls to compute
+    the expected origins. A deployment that supplies the break-glass overrides
+    therefore has its issuer parsed at config time, and each refusal below
+    names the check that failed.
+    """
+
+    _ENDPOINTS: typing.ClassVar[dict[str, object]] = {
+        "sso_authorization_endpoint": "https://issuer.example.com/oauth2/authorize",
+        "sso_token_endpoint": "https://issuer.example.com/oauth2/token",
+        "sso_jwks_uri": "https://issuer.example.com/oauth2/keys",
     }
 
     @pytest.mark.parametrize(
-        "issuer",
+        ("issuer", "check"),
         [
-            "http://issuer.example.com",
-            "https://user:pass@issuer.example.com",
-            "https://127.0.0.1",
-            "https://169.254.169.254",
-            "https://issuer.example.com?tenant=default",
-            "https://issuer.example.com#fragment",
+            ("http://issuer.example.com", "HTTPS"),
+            ("https://user:pass@issuer.example.com", "no-credentials"),
+            ("https://127.0.0.1", "public-literal-IP"),
+            ("https://169.254.169.254", "public-literal-IP"),
+            ("https://issuer.example.com?tenant=default", "no-query-or-fragment"),
+            ("https://issuer.example.com#fragment", "no-query-or-fragment"),
         ],
     )
-    def test_oidc_provider_rejects_unsafe_issuer(self, issuer: str) -> None:
-        with pytest.raises(ValidationError):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer=issuer,
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+    def test_oidc_provider_rejects_unsafe_issuer(self, issuer: str, check: str) -> None:
+        with pytest.raises(ValidationError, match=f"issuer failed {check} check"):
+            _wired_idp("oidc", sso_issuer=issuer, **self._ENDPOINTS)
 
-    def test_oidc_provider_accepts_path_issuer_and_same_origin_authorization_endpoint(self) -> None:
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com/tenant/v2.0/",
-            oidc_audience="my-audience",
-            oidc_client_id="my-client-id",
-            oidc_authorization_endpoint="https://issuer.example.com/oauth2/authorize",
-            oidc_token_endpoint="https://issuer.example.com/oauth2/token",
-            **self._COMPOSER_DEFAULTS,
-        )
+    def test_oidc_provider_accepts_path_issuer_and_same_origin_endpoints(self) -> None:
+        """An issuer may carry a path -- Cognito pools and Keycloak realms do --
+        and its endpoints then sit at the origin, not under the path.
 
-        assert settings.oidc_issuer == "https://issuer.example.com/tenant/v2.0"
-        assert settings.oidc_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
-        assert settings.oidc_token_endpoint == "https://issuer.example.com/oauth2/token"
+        ``sso_issuer`` is stored as the operator typed it, trailing slash and
+        all: normalisation belongs to ``resolve_issuer``, which every consumer
+        of the issuer goes through, so the setting stays the operator's own
+        text rather than a second, silently rewritten answer.
+        """
+        settings = _wired_idp("oidc", sso_issuer="https://issuer.example.com/tenant/v2.0/", **self._ENDPOINTS)
+
+        assert settings.sso_issuer == "https://issuer.example.com/tenant/v2.0/"
+        assert settings.sso_authorization_endpoint == "https://issuer.example.com/oauth2/authorize"
+        assert settings.sso_token_endpoint == "https://issuer.example.com/oauth2/token"
 
 
 class TestOIDCBlankStringRejection:
-    """Blank/whitespace-only OIDC/Entra fields must be rejected at config time."""
+    """Blank/whitespace-only IdP fields must be rejected at config time.
 
-    _COMPOSER_DEFAULTS: typing.ClassVar[dict[str, object]] = {
-        "composer_max_composition_turns": 15,
-        "composer_max_discovery_turns": 10,
-        "composer_timeout_seconds": 85.0,
-        "composer_rate_limit_per_minute": 10,
-        "shareable_link_signing_key": b"\x00" * 32,
-    }
+    A blank is worse than an omission: it satisfies every ``is not None``
+    check on the way to a deployment that cannot complete a login, and it is
+    exactly the shape an empty environment variable in a task definition
+    produces.
+    """
+
+    _COGNITO_ISSUER = "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id"
+    _COGNITO_HOSTED_DOMAIN = "https://example.auth.ap-southeast-2.amazoncognito.com"
 
     def test_oidc_empty_string_issuer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="")
 
     def test_oidc_whitespace_issuer_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="   ",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_oidc_empty_audience_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="",
-                oidc_client_id="my-client-id",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="   ")
 
     def test_oidc_empty_client_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("oidc", sso_issuer="https://issuer.example.com", sso_client_id="")
 
     def test_entra_empty_tenant_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("entra", entra_tenant_id="")
 
     def test_entra_whitespace_tenant_id_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="   ",
-                **self._COMPOSER_DEFAULTS,
-            )
+            _wired_idp("entra", entra_tenant_id="   ")
 
     def test_oidc_empty_authorization_endpoint_rejected(self) -> None:
         with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="",
-                **self._COMPOSER_DEFAULTS,
+            _wired_idp(
+                "oidc",
+                sso_issuer="https://issuer.example.com",
+                sso_authorization_endpoint="",
+                sso_token_endpoint="https://issuer.example.com/oauth2/token",
+                sso_jwks_uri="https://issuer.example.com/oauth2/keys",
             )
 
-    def test_oidc_http_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="HTTPS"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="http://issuer.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://issuer.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
+    def test_oidc_cross_origin_endpoints_rejected_without_an_allowlist(self) -> None:
+        """The generic profile MAY widen beyond its issuer's origin, but only
+        where an operator said so. Silence is same-origin, not anything."""
+        with pytest.raises(ValidationError, match="authorization_endpoint failed expected-origin check"):
+            _wired_idp(
+                "oidc",
+                sso_issuer="https://issuer.example.com",
+                sso_authorization_endpoint="https://evil.example.com/oauth2/authorize",
+                sso_token_endpoint="https://evil.example.com/oauth2/token",
+                sso_jwks_uri="https://evil.example.com/oauth2/keys",
             )
 
-    def test_oidc_cross_origin_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint="https://evil.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://evil.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
-            )
+    def test_cognito_cross_origin_endpoints_require_an_exact_allowlist(self) -> None:
+        """Cognito's hosted domain is genuinely not the pool issuer's origin.
 
-    def test_entra_cross_origin_authorization_endpoint_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(
-                auth_provider="entra",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                entra_tenant_id="test-tenant-id",
-                oidc_authorization_endpoint="https://evil.example.com/oauth2/authorize",
-                oidc_token_endpoint="https://evil.example.com/oauth2/token",
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_oidc_browser_fields_have_closed_defaults(self) -> None:
-        settings = WebSettings(**self._COMPOSER_DEFAULTS)
-        assert settings.oidc_token_endpoint is None
-        assert settings.oidc_audience_claim == "aud"
-
-    def test_client_id_audience_claim_is_oidc_only(self) -> None:
-        settings = WebSettings(
-            auth_provider="oidc",
-            oidc_issuer="https://issuer.example.com",
-            oidc_audience="client",
-            oidc_client_id="client",
-            oidc_audience_claim="client_id",
-            **self._COMPOSER_DEFAULTS,
-        )
-        assert settings.oidc_audience_claim == "client_id"
-        for provider, fields in (
-            ("local", {}),
-            (
-                "entra",
-                {
-                    "oidc_audience": "client",
-                    "oidc_client_id": "client",
-                    "entra_tenant_id": "tenant",
-                },
-            ),
-        ):
-            with pytest.raises(ValidationError, match="audience claim"):
-                WebSettings(
-                    auth_provider=provider,  # type: ignore[arg-type]
-                    oidc_audience_claim="client_id",
-                    **fields,
-                    **self._COMPOSER_DEFAULTS,
-                )
-
-    def test_client_id_audience_claim_rejects_browser_backend_client_mismatch(self) -> None:
-        with pytest.raises(ValidationError, match="oidc_audience must match oidc_client_id"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="backend-client",
-                oidc_client_id="browser-client",
-                oidc_audience_claim="client_id",
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_invalid_audience_claim_mode_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match=r"aud|client_id"):
-            WebSettings(
-                oidc_audience_claim="fallback",  # type: ignore[arg-type]
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    @pytest.mark.parametrize(
-        ("authorization_endpoint", "token_endpoint"),
-        [
-            ("https://issuer.example.com/oauth2/authorize", None),
-            (None, "https://issuer.example.com/oauth2/token"),
-        ],
-    )
-    def test_oidc_explicit_browser_endpoints_are_both_or_neither(
-        self,
-        authorization_endpoint: str | None,
-        token_endpoint: str | None,
-    ) -> None:
-        with pytest.raises(ValidationError, match="both or neither"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com/pool",
-                oidc_audience="my-audience",
-                oidc_client_id="my-client-id",
-                oidc_authorization_endpoint=authorization_endpoint,
-                oidc_token_endpoint=token_endpoint,
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_cognito_cross_origin_pair_requires_exact_allowlist(self) -> None:
-        values = {
-            "auth_provider": "oidc",
-            "oidc_issuer": "https://cognito-idp.ap-southeast-2.amazonaws.com/pool-id",
-            "oidc_audience": "client-id",
-            "oidc_client_id": "client-id",
-            "oidc_authorization_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/authorize",
-            "oidc_token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
-            **self._COMPOSER_DEFAULTS,
+        This is why ``sso_endpoint_origins`` exists and why it is the generic
+        profile's alone: the widening is per-deployment operator knowledge, so
+        the same pair is refused without it and accepted with the exact origin
+        named. An allowlist that could be skipped would make the break-glass
+        path an unauthenticated redirect of the whole login walk.
+        """
+        endpoints: dict[str, Any] = {
+            "sso_issuer": self._COGNITO_ISSUER,
+            "sso_authorization_endpoint": f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize",
+            "sso_token_endpoint": f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/token",
+            "sso_jwks_uri": f"{self._COGNITO_ISSUER}/.well-known/jwks.json",
         }
-        # There is no browser-origin allowlist any more: an IdP whose endpoints
-        # live off the issuer's origin (Cognito's hosted domain) is served by the
-        # SSO profile and its per-profile sso_endpoint_origins, never by the
-        # legacy browser path.
-        with pytest.raises(ValidationError, match="not allowed"):
-            WebSettings(**values)
 
-    def test_local_auth_blank_oidc_field_still_rejected(self) -> None:
-        """Field validator fires regardless of auth_provider — blank is always invalid."""
-        with pytest.raises(ValidationError, match="must not be blank"):
-            WebSettings(
-                auth_provider="local",
-                oidc_issuer="",
-                **self._COMPOSER_DEFAULTS,
+        with pytest.raises(ValidationError, match="authorization_endpoint failed expected-origin check"):
+            _wired_idp("oidc", **endpoints)
+
+        allowed = _wired_idp("oidc", sso_endpoint_origins=(self._COGNITO_HOSTED_DOMAIN,), **endpoints)
+        assert allowed.sso_authorization_endpoint == f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize"
+
+    def test_an_allowlist_authorizes_only_the_origin_it_names(self) -> None:
+        """Naming one extra origin is not a general amnesty for cross-origin endpoints."""
+        with pytest.raises(ValidationError, match="token_endpoint failed expected-origin check"):
+            _wired_idp(
+                "oidc",
+                sso_issuer=self._COGNITO_ISSUER,
+                sso_endpoint_origins=(self._COGNITO_HOSTED_DOMAIN,),
+                sso_authorization_endpoint=f"{self._COGNITO_HOSTED_DOMAIN}/oauth2/authorize",
+                sso_token_endpoint="https://evil.example.com/oauth2/token",
+                sso_jwks_uri=f"{self._COGNITO_ISSUER}/.well-known/jwks.json",
             )
+
+    def test_local_auth_blank_sso_field_still_rejected(self) -> None:
+        """Field validator fires regardless of auth_provider — blank is always invalid.
+
+        Local auth accepts ``sso_*`` settings (they are the wiring a deployment
+        keeps while running local auth), which is exactly why a blank one must
+        still be refused rather than read as "unset".
+        """
+        with pytest.raises(ValidationError, match="must not be blank"):
+            _settings(auth_provider="local", sso_issuer="")
 
 
 class TestDBURLValidation:
@@ -2164,24 +2077,12 @@ class TestDevAdminUser:
         assert _settings(dev_admin_user="john").dev_admin_user == "john"
 
     def test_rejected_for_oidc_provider(self) -> None:
-        with pytest.raises(ValidationError, match="dev_admin_user"):
-            _settings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="aud",
-                oidc_client_id="client",
-                dev_admin_user="john",
-            )
+        with pytest.raises(ValidationError, match="dev_admin_user requires auth_provider=local"):
+            _wired_idp("oidc", sso_issuer="https://issuer.example.com", dev_admin_user="john")
 
     def test_rejected_for_entra_provider(self) -> None:
-        with pytest.raises(ValidationError, match="dev_admin_user"):
-            _settings(
-                auth_provider="entra",
-                oidc_audience="aud",
-                oidc_client_id="client",
-                entra_tenant_id="tenant",
-                dev_admin_user="john",
-            )
+        with pytest.raises(ValidationError, match="dev_admin_user requires auth_provider=local"):
+            _wired_idp("entra", entra_tenant_id="tenant", dev_admin_user="john")
 
     def test_rejected_when_blank(self) -> None:
         with pytest.raises(ValidationError, match="dev_admin_user"):
@@ -2207,19 +2108,7 @@ _VANGUARD_ISSUER = "https://idp.example.gov.au"
 
 
 def _vanguard(**overrides: Any) -> WebSettings:
-    base: dict[str, Any] = {
-        "auth_provider": "vanguard",
-        "sso_issuer": _VANGUARD_ISSUER,
-        "sso_client_id": "elspeth",
-        "sso_client_secret": "s" * 40,
-        "sso_transaction_secret": "t" * 40,
-        "public_base_url": "https://elspeth.example.gov.au",
-        "compartment_id": "example-compartment",
-        "quota_default_tokens_per_day": 100_000,
-        "quota_default_storage_bytes": 1_000_000,
-    }
-    base.update(overrides)
-    return _settings(**base)
+    return _wired_idp("vanguard", sso_issuer=_VANGUARD_ISSUER, **overrides)
 
 
 def _all_four(origin: str = _VANGUARD_ISSUER, **overrides: Any) -> dict[str, Any]:

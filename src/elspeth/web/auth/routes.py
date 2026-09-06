@@ -155,10 +155,8 @@ class AuthConfigResponse(_StrictResponse):
 
     provider: AuthProviderType
     registration_mode: str
-    oidc_issuer: str | None = None
-    oidc_client_id: str | None = None
-    authorization_endpoint: str | None = None
-    token_endpoint: str | None = None
+    # The browser never learns the IdP's endpoints or the client id: the code
+    # exchange is the backend's, as a confidential client (spec D2).
     # Where the SPA's "Sign in with SSO" button navigates. ``None`` whenever
     # the deployment is not wired for SSO — the same fact that makes the
     # three ``/sso/*`` routes refuse — so the button is hidden by the
@@ -575,10 +573,6 @@ def create_auth_router() -> APIRouter:
         return AuthConfigResponse(
             provider=settings.auth_provider,
             registration_mode=settings.registration_mode,
-            oidc_issuer=settings.oidc_issuer,
-            oidc_client_id=settings.oidc_client_id,
-            authorization_endpoint=request.app.state.oidc_authorization_endpoint,
-            token_endpoint=request.app.state.oidc_token_endpoint,
             sso_start_url=None if sso_runtime is None else sso_runtime.client.start_url,
         )
 

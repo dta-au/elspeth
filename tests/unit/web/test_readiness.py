@@ -562,9 +562,6 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
         "landscape_url": None,
         "data_dir": data_dir,
         "payload_store_path": payload_dir,
-        "oidc_issuer": None,
-        "oidc_audience": None,
-        "oidc_client_id": None,
         "entra_tenant_id": None,
         # Every name auth_setting_values() reads. The stub has to carry all
         # of them or it stops modelling WebSettings: a missing attribute

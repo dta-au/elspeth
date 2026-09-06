@@ -486,7 +486,7 @@ def test_runbook_pins_core_runtime_and_identity_contracts() -> None:
         "Cognito/OIDC",
         "auth.db",
         "DELETE",
-        "ELSPETH_WEB__OIDC_TOKEN_ENDPOINT",
+        "ELSPETH_WEB__SSO_ENDPOINT_ORIGINS",
         "AllowedOAuthFlowsUserPoolClient",
         "AllowedOAuthFlows",
         "AllowedOAuthScopes",
