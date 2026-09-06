@@ -21,6 +21,7 @@ observed order, not on line order in the source.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass
@@ -287,7 +288,10 @@ class TestUserinfoBoundary:
         parsed = parse_userinfo(body, expected_subject="ada")
         assert (parsed.subject, parsed.given_name, parsed.abn) == ("ada", "Ada", "12 345 678 901")
         assert parsed.family_name is None, "a non-string cosmetic claim reads as absent"
-        assert not hasattr(parsed, "picture"), "nothing outside the closed set is carried"
+        # Asserted against the DECLARED fields: UserinfoClaims is an owned
+        # type, so its shape is knowable statically and probing it would be
+        # attribute masquerading.
+        assert "picture" not in {declared.name for declared in dataclasses.fields(parsed)}, "nothing outside the closed set is carried"
 
     @pytest.mark.parametrize(
         "document",
