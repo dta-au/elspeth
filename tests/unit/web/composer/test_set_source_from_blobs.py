@@ -196,18 +196,12 @@ class TestSetSourceFromBlobs:
         assert "secret.png" not in repr(result.data)
 
     def test_pending_blob_rejected(self, harness) -> None:
-        _, blob_service, session_id = harness
-        import asyncio
+        engine, blob_service, session_id = harness
         from uuid import UUID
 
-        pending = asyncio.run(
-            blob_service.create_pending_blob(
-                session_id=UUID(session_id),
-                filename="out.csv",
-                mime_type="text/csv",
-                created_by="pipeline",
-            )
-        )
+        from tests.unit.web.blobs.test_service import _seed_pending_blob
+
+        pending = _seed_pending_blob(engine, blob_service, UUID(session_id), "out.csv")
 
         result = _run(harness, {"blob_ids": [str(pending.id)], "on_success": "docs"})
 

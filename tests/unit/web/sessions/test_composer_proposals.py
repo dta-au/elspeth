@@ -130,13 +130,11 @@ async def _create_pending_test_blob(
     blob_service: BlobServiceImpl,
     session_id: UUID,
 ) -> BlobRecord:
+    """Seed the pending row ``create_blob``'s reservation phase leaves, through the blob-service test seeder."""
+    from tests.unit.web.blobs.test_service import _seed_pending_blob
+
     del service
-    return await blob_service.create_pending_blob(
-        session_id=session_id,
-        filename="proposal.csv",
-        mime_type="text/csv",
-        created_by="assistant",
-    )
+    return _seed_pending_blob(blob_service._engine, blob_service, session_id, "proposal.csv")
 
 
 async def _delete_test_blob(

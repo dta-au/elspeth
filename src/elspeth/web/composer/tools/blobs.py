@@ -178,8 +178,9 @@ class BlobContentPayload(TypedDict):
     Read them as a PAIR.  ``creation_modality`` alone is not an authorship
     statement: four unrelated paths write ``verbatim`` — the composer, for
     content copied out of the user's own message; ``create_blob`` behind the
-    upload route; ``create_pending_blob`` for pipeline output; and
-    ``copy_blobs_for_fork``.  ``created_by`` is what separates them.
+    upload route; the authority facet's ``reserve_pending_output_blob`` for
+    pipeline output; and ``copy_blobs_for_fork``.  ``created_by`` is what
+    separates them.
 
     Both fields report what the row RECORDS, which is not always what
     happened: fork copy preserves ``created_by`` but resets the modality to

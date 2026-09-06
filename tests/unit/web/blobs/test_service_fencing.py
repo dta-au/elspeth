@@ -24,13 +24,13 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError
-from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blob_run_links_table, blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
-from tests.unit.web.blobs.test_service import _seed_active_run
+from tests.unit.web.blobs.test_service import _seed_active_run, reserve_output_blob
 
 
 @pytest.fixture()
@@ -289,3 +289,170 @@ class TestStorageMimeGuard:
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
         with pytest.raises(AuditIntegrityError, match="not in the storage MIME set"):
             await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped writes go through the authority facet (D6 family B, elspeth-af0fdc3cc6)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingAuthority:
+    """The real authority, with every entry the blob service takes written down.
+
+    Explicit forwarding only: the blob service reaches the authority through
+    ``mutate`` and ``compare_and_swap``, so those are the two seams this
+    recorder exposes. A third entry would be a new production dependency and
+    fails loudly here instead of being forwarded unseen.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.mutations: list[SessionOperationContext] = []
+        self.standalone_cas: list[SessionOperationContext] = []
+
+    def mutate(self, context, mutation):
+        self.mutations.append(context)
+        return self._inner.mutate(context, mutation)
+
+    def compare_and_swap(self, context) -> None:
+        self.standalone_cas.append(context)
+        self._inner.compare_and_swap(context)
+
+
+async def _seed_run(db_engine, session_id: UUID, compose_context: SessionOperationContext) -> UUID:
+    run_id = await _seed_active_run(
+        db_engine,
+        session_id,
+        session_operation_context=compose_context,
+        source={
+            "plugin": "csv",
+            "on_success": "output",
+            "on_validation_failure": "quarantine",
+            "options": {"path": "/data/external/input.csv"},
+        },
+        status="running",
+    )
+    return UUID(run_id)
+
+
+class TestRunWritesGoThroughTheAuthorityFacet:
+    """``link_blob_to_run`` and run-output finalization are authority mutations, not raw session writes.
+
+    Until D6 family B both verbs compare-and-swapped the fence and then opened
+    their own ``engine.begin()`` to write ``blob_run_links`` / ``blobs``
+    directly. The facet (``insert_blob_run_link``,
+    ``mark_run_output_blob_ready`` / ``_error``) existed with no production
+    caller. Now every such write is one ``mutate`` under the EXECUTE context,
+    so the facet's custody checks are the ones that decide.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_link_is_one_authority_mutation(self, blob_service, db_engine, session_id, compose_context) -> None:
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        run_id = await _seed_run(db_engine, session_id, compose_context)
+        execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        recorder = _RecordingAuthority(blob_service._session_operation_authority)
+        blob_service._session_operation_authority = recorder
+
+        await blob_service.link_blob_to_run(record.id, run_id, "input", session_operation_context=execute)
+
+        assert recorder.mutations == [execute]
+        assert recorder.standalone_cas == []
+        with db_engine.connect() as conn:
+            links = conn.execute(
+                select(blob_run_links_table.c.run_id, blob_run_links_table.c.direction).where(
+                    blob_run_links_table.c.blob_id == str(record.id)
+                )
+            ).all()
+        assert [tuple(link) for link in links] == [(str(run_id), "input")]
+
+    @pytest.mark.asyncio
+    async def test_run_link_still_names_a_cross_session_run_as_a_contract_violation(
+        self, blob_service, db_engine, session_id, compose_context
+    ) -> None:
+        """A blob in custody but a run outside it is a caller bug, not a missing blob."""
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        other = _insert_session(db_engine)
+        foreign_run_id = await _seed_run(db_engine, other, seed_live_compose_context(db_engine, other))
+        execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+
+        with pytest.raises(RuntimeError, match="cross-session reference"):
+            await blob_service.link_blob_to_run(record.id, foreign_run_id, "input", session_operation_context=execute)
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(record.id))).all() == []
+
+    @pytest.mark.asyncio
+    async def test_output_finalization_is_one_authority_mutation_per_blob(
+        self, blob_service, db_engine, session_id, compose_context
+    ) -> None:
+        run_id = await _seed_run(db_engine, session_id, compose_context)
+        execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        written = reserve_output_blob(blob_service, session_id, run_id, execute, filename="written.csv")
+        unwritten = reserve_output_blob(blob_service, session_id, run_id, execute, filename="unwritten.csv")
+        content = b"col\n1\n2\n"
+        Path(written.storage_path).write_bytes(content)
+        recorder = _RecordingAuthority(blob_service._session_operation_authority)
+        blob_service._session_operation_authority = recorder
+
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+
+        assert list(result.errors) == []
+        by_id = {record.id: record for record in result.finalized}
+        assert by_id[written.id].status == "ready"
+        assert by_id[written.id].size_bytes == len(content)
+        assert by_id[written.id].content_hash == content_hash(content)
+        assert by_id[unwritten.id].status == "error"
+        # One mutation per blob; the run's output set is read once under the CAS first.
+        assert recorder.mutations == [execute, execute]
+        assert recorder.standalone_cas == [execute]
+        with db_engine.connect() as conn:
+            custody = (
+                conn.execute(select(blobs_table.c.custody_operation_id).where(blobs_table.c.id.in_([str(written.id), str(unwritten.id)])))
+                .scalars()
+                .all()
+            )
+        assert custody == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_output_reserved_under_another_execute_operation_is_an_integrity_anomaly(
+        self, blob_service, db_engine, session_id, compose_context
+    ) -> None:
+        """The facet binds a reservation to the EXECUTE operation that made it.
+
+        A later operation finding that row among its run's pending outputs is
+        a Tier-1 anomaly: the facet raises ``AuditIntegrityError``, which is
+        not in the per-blob suppressed set, so the batch aborts and the row
+        keeps its original custody instead of being finalized out from under
+        it. Until family B the service updated the row unconditionally.
+        """
+        run_id = await _seed_run(db_engine, session_id, compose_context)
+        first_execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        reserved = reserve_output_blob(blob_service, session_id, run_id, first_execute)
+        Path(reserved.storage_path).write_bytes(b"late\n")
+        second_execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+
+        with pytest.raises(AuditIntegrityError, match="exact EXECUTE custody"):
+            await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=second_execute)
+
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == str(reserved.id))).one()
+        assert row.status == "pending"
+        assert row.custody_operation_id == first_execute.fence.operation_id
+        assert Path(reserved.storage_path).read_bytes() == b"late\n"
+
+    @pytest.mark.asyncio
+    async def test_output_over_quota_is_marked_error_and_its_file_removed(self, db_engine, session_id, tmp_path, compose_context) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=8)
+        run_id = await _seed_run(db_engine, session_id, compose_context)
+        execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        reserved = reserve_output_blob(service, session_id, run_id, execute)
+        storage = Path(reserved.storage_path)
+        storage.write_bytes(b"x" * 64)
+
+        result = await service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+
+        assert list(result.errors) == []
+        assert [(record.id, record.status, record.size_bytes, record.content_hash) for record in result.finalized] == [
+            (reserved.id, "error", 0, None)
+        ]
+        assert not storage.exists()
