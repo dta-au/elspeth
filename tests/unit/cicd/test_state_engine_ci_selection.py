@@ -219,6 +219,53 @@ def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
     assert "testcontainer" in _job("ci-success")["needs"]
 
 
+def test_test_job_has_full_history_and_the_tools_its_ids_shell_out_to() -> None:
+    """The Test job's checkout and apt line are what its own tests demand.
+
+    Two unit files fail loudly under GITHUB_ACTIONS when git history is
+    missing (their rule, elspeth-af1efcb8d8), and 32 ids shell out to node,
+    rg and sqlite3; a depth-1 checkout and the bare bookworm image made every
+    one of them red on every push (elspeth-bc97e06221 B1, B4).
+    """
+    job = _job("test")
+    checkout = next(step for step in job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"]["fetch-depth"] == 0
+    apt = next(step for step in job["steps"] if step.get("name") == "Install system dependencies")
+    tokens = apt["run"].split()
+    for tool in ("nodejs", "ripgrep", "sqlite3"):
+        assert tool in tokens, tool
+
+
+def test_host_runner_unit_job_proves_the_docker_and_non_root_ids_on_every_push() -> None:
+    """The ids that skip in the root container job are REQUIRED on a host runner.
+
+    test_compose_bundle.py needs a docker CLI and test_error_projection.py a
+    non-root uid; in the container `test` job both skip with a reason. This
+    job runs exactly those files on a host runner with the ELSPETH_CI_*_REQUIRED
+    variables set, which turns the skips into failures, and ci-success
+    requires it, so the ids are proven rather than silently absent
+    (elspeth-bc97e06221 B1, B3).
+    """
+    job = _job("host-runner-unit")
+    assert "container" not in job
+    assert job["runs-on"] == "ubuntu-24.04"
+    run = next(step for step in job["steps"] if "pytest" in str(step.get("run", "")))
+    assert run["env"] == {"ELSPETH_CI_DOCKER_REQUIRED": "1", "ELSPETH_CI_NON_ROOT_REQUIRED": "1"}
+    tokens = run["run"].replace("\\\n", " ").split()
+    assert "tests/unit/deployment/test_compose_bundle.py" in tokens
+    assert "tests/unit/web/aws_ecs_acceptance/test_error_projection.py" in tokens
+    assert "-n" in tokens and tokens[tokens.index("-n") + 1] == "0"
+    ci_success = _job("ci-success")
+    assert "host-runner-unit" in ci_success["needs"]
+    assert "needs.host-runner-unit.result" in _run_lines(ci_success)
+    for path, variable in (
+        ("tests/unit/deployment/test_compose_bundle.py", "ELSPETH_CI_DOCKER_REQUIRED"),
+        ("tests/unit/web/aws_ecs_acceptance/test_error_projection.py", "ELSPETH_CI_NON_ROOT_REQUIRED"),
+    ):
+        source = (REPO_ROOT / path).read_text(encoding="utf-8")
+        assert variable in source and "pytest.fail(" in source and "pytest.skip(" in source, path
+
+
 def test_default_selection_excludes_protected_live_lanes() -> None:
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     addopts = pyproject["tool"]["pytest"]["ini_options"]["addopts"]

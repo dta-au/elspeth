@@ -4,13 +4,33 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _require_docker_compose() -> None:
+    """Skip with the missing capability named; fail loudly where CI promises it.
+
+    `docker compose config` is the only honest renderer of the bundle, and a
+    container job has no docker CLI. Skipping there is truthful only because
+    the `host-runner-unit` job (.github/workflows/ci.yaml) sets
+    ELSPETH_CI_DOCKER_REQUIRED and runs this file on a host runner, where an
+    absent CLI is a broken gate, not an environment quirk (elspeth-bc97e06221 B1).
+    """
+    if shutil.which("docker") is not None:
+        return
+    if os.environ.get("ELSPETH_CI_DOCKER_REQUIRED"):
+        pytest.fail("docker CLI is required by ELSPETH_CI_DOCKER_REQUIRED but is not installed")
+    pytest.skip("docker CLI not installed: the compose bundle cannot be rendered here")
+
+
 BASE_COMPOSE = REPO_ROOT / "docker-compose.yaml"
 POSTGRES_COMPOSE = REPO_ROOT / "deploy" / "compose" / "postgres.yaml"
 WEB_COMPOSE = REPO_ROOT / "deploy" / "compose" / "web-postgres.yaml"
@@ -57,6 +77,7 @@ def _volume_targets(service: dict[str, Any]) -> list[str]:
 
 
 def _rendered_bundle() -> dict[str, Any]:
+    _require_docker_compose()
     result = subprocess.run(
         [
             "docker",
@@ -310,6 +331,7 @@ def test_example_environment_names_the_repository_root_destination() -> None:
 
 
 def test_supported_three_file_compose_bundle_renders() -> None:
+    _require_docker_compose()
     result = subprocess.run(
         [
             "docker",
