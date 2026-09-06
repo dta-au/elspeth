@@ -16,7 +16,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
@@ -27,6 +27,7 @@ from elspeth.contracts.audit_export import (
     derive_audit_export_bundle,
 )
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.errors import CoalesceCollisionError
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
@@ -140,6 +141,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     TerminalSchedulerWorkProjection,
     normalize_template_name,
 )
+from tests.fixtures.landscape import expire_lease, expire_worker
 
 EXPECTED_RUN_ERROR_TYPES: Mapping[str, type[BaseException]] = MappingProxyType({"CoalesceCollisionError": CoalesceCollisionError})
 
@@ -4269,7 +4271,17 @@ def _pending_sink_redrive_recovery_case(
 
     del first_resume_store, first_resume_built, first_resume_rendered, first_recovery, first_check, first_point, first_factory
 
+    # TS-06 precondition: the first resume's sink-redrive lease and its owner's
+    # registry heartbeat have lapsed on the Landscape database clock (ADR-047).
+    # Advancing the process MockClock expires neither; the final resume's
+    # fenced sweep decides both on database time.
     clock.advance(360.0)
+    aging_db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        expire_lease(aging_db.engine, str(leased_before_recovery["work_item_id"]))
+        expire_worker(aging_db.engine, str(leased_before_recovery["lease_owner"]), seconds_ago=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1)
+    finally:
+        aging_db.close()
     final_db = LandscapeDB.from_url(db_url, create_tables=False)
     try:
         final_store = FilesystemPayloadStore(payload_root)
@@ -4373,7 +4385,10 @@ def _pending_sink_redrive_recovery_case(
                     select(scheduler_events_table)
                     .where(scheduler_events_table.c.run_id == run_id)
                     .where(scheduler_events_table.c.event_type == "claim_pending_sink")
-                    .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                    # Recording order (SQLite rowid): the production key
+                    # (recorded_at, event_id) ties inside one database second
+                    # now that claims stamp database time (ADR-047).
+                    .order_by(text("rowid"))
                 ).mappings()
             )
         if len(recovery_events) != 1:
