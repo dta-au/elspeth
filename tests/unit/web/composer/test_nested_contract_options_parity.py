@@ -55,6 +55,28 @@ from elspeth.web.composer.state import (
 
 _KINDS = sorted(str(kind) for kind in NESTED_CONTRACT_OPTIONS_NODE_TYPES)
 
+# The concrete ``ast`` classes whose ``body`` is a list of statements — the
+# blocks an early-return ``if`` can sit in. Nominal typing per ADR-032: the
+# structural walker below asks ``isinstance`` against these, never whether a
+# node happens to carry a ``body`` attribute (``Lambda``, ``IfExp`` and
+# ``Expression`` carry one that is a single expression, not a block).
+_BLOCK_NODES = (
+    ast.Module,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.If,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+    ast.TryStar,
+    ast.ExceptHandler,
+    ast.match_case,
+)
+
 # Each scenario: the closer's contract options (flat form) and, where the
 # scenario needs one, a downstream consumer that reads what the closer
 # publishes. Nested form = the same mapping under an ``options`` key.
@@ -203,8 +225,8 @@ def _guards_of_every_unwrap_site() -> list[tuple[int, list[ast.expr]]]:
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
+        for descendant in ast.iter_child_nodes(node):
+            parents[descendant] = node
     sites: list[tuple[int, list[ast.expr]]] = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "get_aggregation_contract_options"):
@@ -219,11 +241,11 @@ def _guards_of_every_unwrap_site() -> list[tuple[int, list[ast.expr]]]:
             # The early-return shape: ``if <guard>: return ...`` immediately
             # before the statement carrying the call, in the same block —
             # including the enclosing function's own body.
-            body = getattr(cursor, "body", None)
-            if isinstance(body, list) and child in body:
-                index = body.index(child)
-                if index > 0 and isinstance(body[index - 1], ast.If):
-                    guards.append(body[index - 1].test)
+            if isinstance(cursor, _BLOCK_NODES) and isinstance(child, ast.stmt) and child in cursor.body:
+                index = cursor.body.index(child)
+                previous = cursor.body[index - 1] if index > 0 else None
+                if isinstance(previous, ast.If):
+                    guards.append(previous.test)
             if isinstance(cursor, ast.FunctionDef):
                 break
             child, cursor = cursor, parents.get(cursor)
