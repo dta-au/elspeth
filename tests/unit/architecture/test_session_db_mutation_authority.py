@@ -2792,8 +2792,18 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
     # write and finalize). The forward walk refuses at the helper's
     # ``held_connection is None`` arm; the honest fix is a scanner rule for a
     # wrapper the scanner already records as the caller's own
-    # parameter-fed acquisition, which belongs to DLINEAGE, not this family.
-    # Until it lands the five rows stay in the drift counters.
+    # parameter-fed acquisition. That rule landed (elspeth-e483fe7f85 family
+    # H slice 3): the custody-lock acquisitions below are contained rows.
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "12c8ea3131981744",
+        1,
+        "SessionBlobMutationAuthority",
+        line=3348,
+    ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
         "BlobServiceImpl._cleanup_blobs_for_fork_sync",
@@ -2853,6 +2863,16 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         1,
         "SessionBlobMutationAuthority",
         line=2560,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "e75089e65b6e9654",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2576,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -2960,9 +2980,29 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "<sessions-write-connection>",
         "write_connection",
         "60a1a4d583a6ae84",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1600,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "publish_inline_custody_publication",
+        "<sessions-write-connection>",
+        "write_connection",
+        "60a1a4d583a6ae84",
         2,
         "SessionBlobMutationAuthority",
         line=1606,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "reconcile_inline_custody_publications",
+        "<sessions-write-connection>",
+        "write_connection",
+        "34265085cd2f92dc",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1668,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -4391,6 +4431,21 @@ def _symbol(node: ast.AST) -> str:
             names.append(current.name)
         current = getattr(current, "_inventory_parent", None)
     return ".".join(reversed(names)) or "<module>"
+
+
+def _parent_node(node: ast.AST) -> ast.AST:
+    """The parent ``_attach_parents`` stamped on ``node``.
+
+    Every node below a stamped tree's root carries one, so the lookup is a
+    direct read of our own stamp and raises when it is genuinely absent
+    rather than masquerading a missing parent as ``None``. The instance
+    ``__dict__`` is the honest spelling: ``ast.AST`` declares no such
+    attribute, and the lane may not silence that with a suppression.
+    """
+
+    parent = node.__dict__["_inventory_parent"]
+    assert isinstance(parent, ast.AST)
+    return parent
 
 
 def _attach_parents(tree: ast.AST) -> None:
@@ -8436,9 +8491,9 @@ class _CallerSideProof:
         for caller, node in self._references_by_name.get(definition.name, ()):
             if caller is not collector or not isinstance(node, (ast.Name, ast.Attribute)):
                 continue
-            parent = getattr(node, "_inventory_parent", None)
+            parent = _parent_node(node)
             if isinstance(parent, ast.keyword):
-                parent = getattr(parent, "_inventory_parent", None)
+                parent = _parent_node(parent)
             if not isinstance(parent, ast.Call) or parent.func is node:
                 continue
             if caller._imported_qualified_name(parent.func) == "sqlalchemy.event.listen":
@@ -8489,7 +8544,7 @@ class _CallerSideProof:
         for node in ast.walk(callee):
             if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == bound):
                 continue
-            parent = getattr(node, "_inventory_parent", None)
+            parent = _parent_node(node)
             if isinstance(parent, ast.Call) and parent.func is node:
                 argument = self._bind_callback_argument(parent, names, kwonly, parameter)
                 if argument is None:
@@ -8498,7 +8553,7 @@ class _CallerSideProof:
                 continue
             forward = parent
             if isinstance(forward, ast.keyword):
-                forward = getattr(forward, "_inventory_parent", None)
+                forward = _parent_node(forward)
             if isinstance(forward, ast.Call) and forward.func is not node:
                 if not self._follow_callback(callee_collector, forward, definition, names, kwonly, parameter, sites, depth=depth + 1):
                     return False
@@ -9273,8 +9328,11 @@ def test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority()
     the block is the boundary. The writers that had an EXECUTE context and no
     custody lock -- the run link and the per-output ready/error marks -- are
     gone from this inventory: they now go through the authority facet. The
-    five custody-lock forwards the scanner's proof refuses (finding F1) are
-    pinned here by symbol as the family's documented residue, not admitted.
+    custody-lock forwards into ``_blob_phase_transaction`` (finding F1) are
+    contained since the forward proof follows a caller's own parameter-fed
+    wrapper acquisition (elspeth-e483fe7f85 family H slice 3), so every
+    blob acquisition under the authority is a reviewed, non-escaping row and
+    the file carries no escaping acquisition at all.
     """
     root = _repo_root()
     service_path = "src/elspeth/web/blobs/service.py"
@@ -9357,7 +9415,7 @@ def test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority()
     ]
     contained = [site for site in acquisitions if not site.connection_escape]
     escaped = [site for site in acquisitions if site.connection_escape]
-    assert len(contained) == 11
+    assert len(contained) == 15
     assert {site.symbol for site in contained} == contained_symbols
     assert connection_authority_violations(contained) == []
     reviewed_acquisitions = [
@@ -9366,20 +9424,10 @@ def test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority()
     assert inventory_drift(contained, reviewed_acquisitions) == ([], [])
     assert not any(site.connection_escape for site in reviewed_acquisitions)
 
-    # Finding F1: the custody-lock forward into ``_blob_phase_transaction``,
-    # one per phase helper, refused by the forward proof and NOT admitted.
-    residue = [site for site in scanned if site.operation == "write_connection" and site.connection_escape]
-    assert sorted(site.symbol for site in residue) == sorted(
-        [
-            "_persist_blob_content",
-            "publish_inline_custody_publication",
-            "reconcile_inline_custody_publications",
-            "BlobServiceImpl._delete_blob_sync",
-            "BlobServiceImpl._cleanup_blobs_for_fork_sync",
-        ]
-    )
-    assert [site.symbol for site in escaped] == [site.symbol for site in residue if site.symbol != "_persist_blob_content"]
-    assert connection_authority_violations(residue) == residue
+    # Finding F1 is closed: no acquisition in either file escapes; the
+    # custody-lock forward into ``_blob_phase_transaction`` is contained.
+    assert escaped == []
+    assert [site for site in scanned if site.operation == "write_connection" and site.connection_escape] == []
 
 
 def test_plugin_crash_breadcrumb_facet_identity_is_exact_and_bidirectional() -> None:
