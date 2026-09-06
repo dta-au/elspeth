@@ -208,6 +208,46 @@ def test_integration_job_carries_no_marker_expression_of_its_own() -> None:
     assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), pytest_steps[0].get("name")
 
 
+def test_no_job_restates_the_marker_selection_except_the_testcontainer_override() -> None:
+    """One assertion over every job, because two job-named pins stop two jobs.
+
+    The two pins above name ``test`` and ``integration``, which is the shape of
+    the defect they each fix: a copy of the marker selection drifts away from
+    pyproject addopts', the single owner. A third pytest job added later with
+    its own ``-m`` would pass both of them, and this defect has now been found
+    twice (elspeth-6128fc7f95, elspeth-7103e36698) — so the rule is stated once,
+    over ``jobs``, and holds for jobs nobody has written yet.
+
+    Measured at 85fee5cfa: six pytest steps across five jobs (``test`` twice,
+    then ``integration``, ``testcontainer``, ``host-runner-unit`` and
+    ``azure-container-apps-bicep``), and exactly one marker expression among
+    them. That one is the testcontainer job's, and it is the single override
+    that cannot be avoided: selecting those ids REQUIRES replacing addopts'
+    ``not testcontainer``. It is safe for the same reason it is narrow —
+    ``testcontainer and live_provider`` and ``testcontainer and (slow or stress
+    or performance)`` each collect zero ids tree-wide, so no guard it drops has
+    anything to catch. Pinning the expression to exactly ``testcontainer``
+    keeps it that way: a widened override here would silently re-select the
+    live lanes, which is the failure this whole family is about.
+    """
+    steps_with_pytest: list[tuple[str, str]] = []
+    marker_expressions: dict[str, list[str]] = {}
+    for job_name, job in _workflow()["jobs"].items():
+        for step in job.get("steps", []):
+            run = str(step.get("run", ""))
+            if "pytest" not in run:
+                continue
+            steps_with_pytest.append((job_name, str(step.get("name"))))
+            tokens = run.replace("\\\n", " ").split()
+            assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), job_name
+            markers = [tokens[index + 1] for index, token in enumerate(tokens) if token == "-m" and index + 1 < len(tokens)]
+            if markers:
+                marker_expressions.setdefault(job_name, []).extend(markers)
+    assert len(steps_with_pytest) >= 6, steps_with_pytest  # never pass by finding nothing to check
+    assert set(marker_expressions) == {"testcontainer"}, marker_expressions
+    assert marker_expressions["testcontainer"] == ["testcontainer"], marker_expressions
+
+
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
     """The testcontainer job is the ONLY run of the ``testcontainer`` ids.
 
