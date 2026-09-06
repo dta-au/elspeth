@@ -25,7 +25,11 @@ from elspeth.web._acceptance_common.errors import AcceptanceCheckError, Acceptan
 from elspeth.web._acceptance_common.replica_probes import MECHANISMS as PROBE_MECHANISMS_SET
 from elspeth.web._acceptance_common.replica_probes import PROBE_MECHANISMS, Mechanism, Probe, ProbeResult
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
-from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_RUN_RECEIPT_KIND, TESTCONTAINER_SELECTION
+from elspeth.web._acceptance_common.testcontainer_run import (
+    TESTCONTAINER_RUN_RECEIPT_KIND,
+    TESTCONTAINER_SELECTION,
+    resolve_testcontainer_run_target,
+)
 from elspeth.web._aws_ecs_acceptance import receipt_contracts as ecs_receipt_contracts
 from elspeth.web._azure_container_apps_acceptance import receipt_contracts as contracts
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import (
@@ -587,6 +591,9 @@ def test_extract_exec_receipt_rejects_malformed_streams_and_wrong_bindings() -> 
             )
 
 
+_TARGET = resolve_testcontainer_run_target({})
+
+
 def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontainer-run.v1", exit_code: int = 0) -> dict[str, object]:
     return {
         "schema": schema,
@@ -602,6 +609,11 @@ def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontai
         "skipped": 0,
         "junit_sha256": "d" * 64,
         "recorded_at": "2026-09-05T10:00:00Z",
+        # The receipt shape is shared across providers (TestcontainerRunReceipt);
+        # only the schema id is Azure's. The database fields come from the same
+        # resolver the CLI uses, here its Docker arm (elspeth-0ec6918940).
+        "database": _TARGET.database,
+        "database_identity_sha256": _TARGET.database_identity_sha256,
     }
 
 
