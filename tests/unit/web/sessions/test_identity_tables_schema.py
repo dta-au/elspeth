@@ -1,6 +1,6 @@
 """Pin the identity substrate's shape and the rules it enforces in SQL.
 
-Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model (epoch 50).
+Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model (epoch 52).
 
 These tables carry authority, so what the database refuses matters more than
 what it stores. Each test below drives a real insert against a real engine

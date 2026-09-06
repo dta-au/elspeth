@@ -359,7 +359,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        database exactly as the 2026-08-14 index change did; it is a schema
 #        change even though every value the old constraint admitted is still
 #        admitted. Cut over in the SAME service-stop window as sessions
-#        epoch 50 (one window, two stores). Pre-1.0 delete-and-recreate
+#        epoch 52 (one window, two stores). Pre-1.0 delete-and-recreate
 #        boundary; no migration, rollback_permitted: false.
 #   38 → scheduler_events replay order (elspeth-2d436dd6e8,
 #        elspeth-5d66fc5ed1): scheduler_events gains an AUTOINCREMENT ``seq``

@@ -3200,7 +3200,7 @@ audit_access_log_table = Table(
 )
 
 
-# === Identity substrate (epoch 50, elspeth-07cd19ba73) ==================
+# === Identity substrate (epoch 52, elspeth-07cd19ba73) ==================
 #
 # Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model.
 #
@@ -3470,7 +3470,7 @@ sso_handoffs_table = Table(
 Index("ix_sso_handoffs_expires_at", sso_handoffs_table.c.expires_at)
 
 
-# === Workflow governance (epoch 50, elspeth-07cd19ba73) ================
+# === Workflow governance (epoch 52, elspeth-07cd19ba73) ================
 #
 # Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Workflow tables.
 # "For but not with": basic columns only, every table keyed on identity_id,
