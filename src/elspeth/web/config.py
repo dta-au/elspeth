@@ -1071,7 +1071,15 @@ class WebSettings(BaseModel):
             missing = sorted(set(overrides) - set(supplied))
             raise ValueError(f"sso endpoint overrides are all-or-none; missing: {', '.join(missing)}")
 
-        assert self.sso_issuer is not None
+        # Only the three ENDPOINT settings are narrowed here, because only
+        # they are what the all-or-none check above just established. The
+        # issuer is NOT: ``sso_issuer`` is in the derived forbidden set for
+        # entra and google, so asserting it here refused a correct
+        # break-glass configuration on half the profiles -- and, being an
+        # assert, did so only when Python was not run with -O. Each profile's
+        # resolve_issuer states its own precondition: issuer_from_settings
+        # asserts sso_issuer with a message, issuer_from_entra_tenant reads
+        # the tenant instead, and google_issuer returns a constant.
         assert self.sso_authorization_endpoint is not None
         assert self.sso_token_endpoint is not None
         assert self.sso_jwks_uri is not None
