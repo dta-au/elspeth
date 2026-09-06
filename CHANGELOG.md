@@ -30,31 +30,6 @@ All notable changes to ELSPETH are documented here.
 
 ### Removed
 
-- **Wardline trust-boundary gate** — the `weft.toml` stanza, `.mcp.json`
-  server, `scripts/wardline_pack.py` grammar pack, `wardline-gate` skill
-  copies, and the standing agent instruction to run `wardline scan` before
-  handoff. It arrived with a Loomweave upgrade rather than by decision; in
-  two months and 18 scans its taint rule (`PY-WL-101`) never fired because
-  the project declares no sinks, and its only output (`PY-WL-102`, 115
-  findings) was contract-shape noise already enforced by `elspeth-lints`
-  `trust_boundary.tests`. Rationale in ADR-043 (project tooling: Filigree and
-  Loomweave only, everything else ruled out until superseded). Boundary honesty stays with
-  `elspeth-lints` (`trust_boundary.*` and the masquerade gate).
-- **Legis governance layer** — the `.mcp.json` server, SessionStart hook,
-  `AGENTS.md` installer block and `legis-workflow` skill copies. It arrived
-  with the same tooling sweep as Wardline; its audit log had zero rows, no
-  policy cell was ever configured, and every capability it describes (LLM
-  judge wall, HMAC-signed verdicts bound to fingerprint + AST path, operator
-  escalation, append-only trail) is already a first-party mechanism of the
-  elspeth-judge / `sign-bundle` seam. Rationale in ADR-043 (project tooling).
-- **Warpline change-impact layer** — the `.mcp.json` server, SessionStart
-  hook, `AGENTS.md` installer block and `warpline-workflow` skill copies.
-  Its only ingestion path was a per-clone `post-commit` hook, so the
-  worktree-authored commits and `--no-ff` merges that land this project's
-  work were never recorded: a live probe saw 3 of 14 changed files, an
-  empty impact radius 2,178 commits behind its last snapshot, and a
-  re-verify worklist naming no tests. Loomweave answers the caller
-  question; git answers the rest. Rationale in ADR-043 (project tooling).
 - **Composer pipeline recipes** — the `list_recipes` and
   `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
   slot-schema contracts behind them. The server-side prose-to-recipe matcher
