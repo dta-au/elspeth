@@ -59,7 +59,17 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         ingest_sequence=0,
         data={"source": True},
     )
-    parents = [first.data_flow.create_token(row.row_id) for _ in range(2)]
+    # The parents must share one innermost FORK lineage frame: a coalesce
+    # closes exactly its own fork frame (spec rulings 24/28; the META-38 guard
+    # in coalesce_tokens refuses frame-less parents before any effect write),
+    # so mint them through the real fork path rather than as bare tokens.
+    root = first.data_flow.create_token(row.row_id)
+    parents, _fork_group_id = first.data_flow.fork_token(
+        TokenRef(token_id=root.token_id, run_id=run.run_id),
+        row.row_id,
+        ["left", "right"],
+        step_in_pipeline=3,
+    )
     refs = tuple(TokenRef(token_id=token.token_id, run_id=run.run_id) for token in parents)
     state_ids = tuple(
         first.execution.begin_node_state(
@@ -148,7 +158,8 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
             assert not thread.is_alive()
 
         assert set(results) == {"winner", "loser"}
-        assert not any(isinstance(result, BaseException) for result in results.values())
+        failures = {name: f"{type(result).__name__}: {result}" for name, result in results.items() if isinstance(result, BaseException)}
+        assert not failures, failures
         winner = results["winner"]
         loser = results["loser"]
         assert winner == loser
@@ -156,8 +167,22 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
 
         with first_db.connection() as conn:
             assert conn.execute(select(func.count()).select_from(coalesce_effects_table)).scalar_one() == 1
-            assert conn.execute(select(func.count()).select_from(tokens_table)).scalar_one() == 3
-            assert conn.execute(select(func.count()).select_from(token_parents_table)).scalar_one() == 2
+            # root + two fork children + ONE merged token: the loser reused
+            # the winner's effect instead of minting a second merged token.
+            assert conn.execute(select(func.count()).select_from(tokens_table)).scalar_one() == 4
+            # two fork links (root -> left/right) + two coalesce links, and the
+            # merged token's ordered parents are exactly the fork children.
+            assert conn.execute(select(func.count()).select_from(token_parents_table)).scalar_one() == 4
+            merged_parents = (
+                conn.execute(
+                    select(token_parents_table.c.parent_token_id)
+                    .where(token_parents_table.c.token_id == winner.token_id)
+                    .order_by(token_parents_table.c.ordinal)
+                )
+                .scalars()
+                .all()
+            )
+            assert tuple(merged_parents) == tuple(ref.token_id for ref in refs)
     finally:
         release_winner.set()
         for thread in threads:
