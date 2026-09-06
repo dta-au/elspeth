@@ -1406,6 +1406,40 @@ The client's `callback_urls` is the exact URI the backend redeems against,
 load balancer root would be refused at the callback with nothing in the
 browser to say why.
 
+**A working upgrade deployment admits nobody until an operator makes the first
+administrator, and nothing in the deploy fails to tell you so.** The pool is
+created with `allow_admin_create_user_only = true`, so it ships with no users:
+you create one with `aws cognito-idp admin-create-user`. That person then
+authenticates successfully and lands **pending**, because an SSO first login
+is always pending until an administrator activates it — and on a new
+deployment there is no administrator to do it. The task is healthy, readiness
+passes, and the login walk works end to end; there is simply no way in. The
+seed setting is not exported by this package, and `dev_admin_user` is refused
+outright on any non-local provider, so there is no fallback to reach for.
+
+Make the first administrator with the operator command, against the
+deployment's sessions store:
+
+```bash
+elspeth composer users bootstrap-admin oidc <cognito-sub> \
+  --note "first administrator, <run id>"
+```
+
+`<cognito-sub>` is the user's `sub` claim, not their email or username — the
+same value `admin-get-user` reports and the acceptance inventory binds. The
+command creates or binds the identity row, activates it, grants a
+deployment-wide `admin`, writes its quota row and records the audit rows, in
+one transaction, and is refused once an active human admin exists.
+
+Then activate a second administrator through the admin API. Both bootstrap
+paths are gated on the deployment having *zero* active human admins, so
+neither can help once the count is above zero — and a deployment whose sole
+administrator keeps an active row but loses their provider account is
+recoverable by neither, only by direct work against the sessions store. Full
+background, including the alternative seed path and its hazards, is in the
+[Identity Providers guide](../guides/identity-providers.md), §Admitting the
+first person.
+
 The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
 and the Cognito access-token audience-claim mode are deleted; a task
 definition that still exports any of them refuses to boot on an unknown
