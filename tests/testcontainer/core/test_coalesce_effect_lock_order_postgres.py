@@ -12,7 +12,7 @@ from testcontainers.postgres import PostgresContainer  # type: ignore[import-unt
 from tests.fixtures.landscape import register_test_node
 
 from elspeth.contracts import NodeType
-from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.audit import Token, TokenRef
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -126,7 +126,7 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
 
     monkeypatch.setattr(first.data_flow.tokens, "_lock_coalesce_dependencies", pause_winner)
     monkeypatch.setattr(second.data_flow.tokens, "_lock_coalesce_dependencies", observe_loser)
-    results: dict[str, object] = {}
+    results: dict[str, Token | BaseException] = {}
 
     def materialize(name: str, factory: RecorderFactory) -> None:
         try:
@@ -162,6 +162,7 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         assert not failures, failures
         winner = results["winner"]
         loser = results["loser"]
+        assert isinstance(winner, Token)
         assert winner == loser
         assert backend_pids["winner"] != backend_pids["loser"]
 
