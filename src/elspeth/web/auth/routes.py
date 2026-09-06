@@ -203,8 +203,10 @@ def _sso_runtime_if_wired(request: Request) -> SsoRuntime | None:
     try:
         candidate = request.app.state.sso
     except AttributeError:
+        # Absent IS the answer: this deployment is not wired. Returning the
+        # "not wired" value here is the refusal, not a swallowed error.
         return None
-    if not isinstance(candidate, SsoRuntime):
+    if type(candidate) is not SsoRuntime:
         return None
     return candidate
 
