@@ -5404,6 +5404,26 @@ def test_statement_walkers_key_their_cycle_guard_on_the_binding_site_not_the_nam
     assert _is_proven_read(read_call.args[0], resolver, use=read_call)
     assert _unknown_or_raw_execution_violations([unit]) == ()
 
+    # A GENUINE revisit still answers True.  Inside a parenthesised rebinding
+    # the use of ``stmt`` sits below the assignment's own line, so it binds
+    # to the assignment being evaluated: the binding site is revisited and
+    # the walker fails closed instead of proving a read it has not seen.
+    cyclic = _parse_source(
+        "src/elspeth/core/landscape/cyclic.py",
+        "from sqlalchemy import insert\n"
+        "from elspeth.core.landscape.schema import runs_table\n"
+        "def write(conn, values):\n"
+        "    stmt = insert(runs_table)\n"
+        "    stmt = (\n"
+        "        stmt\n"
+        "        .values(**values)\n"
+        "    )\n"
+        "    conn.execute(stmt)\n",
+    )
+    cyclic_resolver = _resolver_for_unit(cyclic)
+    cyclic_call = next(node for node in ast.walk(cyclic.tree) if isinstance(node, ast.Call) and _call_name(node) == "execute")
+    assert _statement_contains_dml(cyclic_call.args[0], cyclic_resolver, use=cyclic_call)
+
 
 def test_resolver_cycle_guard_survives_the_callable_name_hop() -> None:
     """elspeth-5a50d4b9f3: ``seen`` must be carried through ``_resolved_callable_name``.
