@@ -25,7 +25,7 @@ is the coordinator-level contract net.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -60,6 +60,9 @@ from elspeth.engine.work_items import WorkItem, WorkItemFactory
 
 _CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
 _NOW = datetime(2026, 7, 3, 12, 0, 0, tzinfo=UTC)
+# The coordinator's MockClock starts at 100.0; a live hold's witness is the
+# monotonic reading the accept path took when the arrival was stashed.
+_LIVE_ARRIVAL_MONOTONIC = 100.0
 _AGG_NODE = NodeID("agg-node")
 _COALESCE = CoalesceName("merge")
 
@@ -153,6 +156,7 @@ class RecordingAggregationExecutor:
         self.should_flush = should_flush
         self.calls: list[str] = []
         self.accepted: list[TokenInfo] = []
+        self.accept_times: list[float] = []
 
     def open_batch_membership(self, node_id: NodeID) -> tuple[str, int]:
         self.calls.append("open_batch")
@@ -161,6 +165,7 @@ class RecordingAggregationExecutor:
     def accept_adopted_row(self, node_id: NodeID, token: TokenInfo, *, accept_time: float) -> None:
         self.calls.append("accept")
         self.accepted.append(token)
+        self.accept_times.append(accept_time)
 
     def check_flush_status(self, node_id: NodeID) -> tuple[bool, TriggerType | None]:
         self.calls.append("check_flush")
@@ -171,9 +176,11 @@ class RecordingCoalesceExecutor:
     def __init__(self, outcome: CoalesceOutcome) -> None:
         self.outcome = outcome
         self.accepted: list[str] = []
+        self.arrival_times: list[float] = []
 
     def accept(self, *, token: TokenInfo, coalesce_name: str, arrival_time: float) -> CoalesceOutcome:
         self.accepted.append(token.token_id)
+        self.arrival_times.append(arrival_time)
         return self.outcome
 
     def has_recorded_branch_loss(self, coalesce_name: str, fork_group_id: str, branch_name: str) -> bool:
@@ -355,7 +362,7 @@ class TestAggregationIntakeOrdering:
         scheduler.calls = combined
         agg = RecordingAggregationExecutor(should_flush=False)
         agg.calls = combined
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         coordinator = _make_coordinator(scheduler=scheduler, aggregation_executor=agg, live_holds=holds)
 
         outcome = coordinator.run_intake_pass(_ctx())
@@ -383,7 +390,7 @@ class TestAggregationIntakeOrdering:
         row = _blocked_row(barrier_key=str(_AGG_NODE))
         scheduler = RecordingScheduler(pending=[row])
         agg = RecordingAggregationExecutor(should_flush=True)
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         flush_calls: list[tuple[NodeID, TriggerType]] = []
         coordinator = _make_coordinator(
             scheduler=scheduler,
@@ -400,6 +407,54 @@ class TestAggregationIntakeOrdering:
         assert len(outcome.child_items) == 1
 
 
+class TestIntakeArrivalInstant:
+    """Which instant an adopted row is accepted at (ADR-047 with a live witness).
+
+    A live arrival (this process stashed the hold) is accepted at the exact
+    monotonic reading the accept path witnessed. Only a journal-only row —
+    a leader takeover, no stash — takes the durable ``barrier_blocked_at``
+    aged against the Landscape database clock and backdated onto the
+    monotonic scale. The durable stamp is whole-second on SQLite, so a live
+    arrival routed through it would be misordered around a second boundary.
+    """
+
+    def test_live_hold_is_accepted_at_its_witnessed_arrival_not_the_backdated_stamp(self) -> None:
+        # The durable stamp is 30 s before the fake's database clock, so the
+        # backdated instant would be 100.0 - 30 = 70.0; the witness says 99.25.
+        row = _blocked_row(barrier_key=str(_AGG_NODE), blocked_at=_NOW - timedelta(seconds=30))
+        scheduler = RecordingScheduler(pending=[row])
+        agg = RecordingAggregationExecutor(should_flush=False)
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE), arrived_monotonic=99.25)}
+        coordinator = _make_coordinator(scheduler=scheduler, aggregation_executor=agg, live_holds=holds)
+
+        coordinator.run_intake_pass(_ctx())
+
+        assert agg.accept_times == [99.25]
+        assert holds == {}
+
+    def test_journal_only_row_is_accepted_at_the_database_aged_stamp_backdated_onto_the_monotonic_scale(self) -> None:
+        row = _blocked_row(barrier_key=str(_AGG_NODE), blocked_at=_NOW - timedelta(seconds=30))
+        scheduler = RecordingScheduler(pending=[row])
+        agg = RecordingAggregationExecutor(should_flush=False)
+        coordinator = _make_coordinator(scheduler=scheduler, aggregation_executor=agg, live_holds={})
+
+        coordinator.run_intake_pass(_ctx())
+
+        # clock.monotonic() (100.0) minus (database_now - barrier_blocked_at) (30 s).
+        assert agg.accept_times == [pytest.approx(70.0, rel=0, abs=1e-9)]
+
+    def test_coalesce_live_hold_is_accepted_at_its_witnessed_arrival(self) -> None:
+        row = _blocked_row(barrier_key=str(_COALESCE), blocked_at=_NOW - timedelta(seconds=30))
+        scheduler = RecordingScheduler(pending=[row])
+        coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=True))
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE), arrived_monotonic=99.25)}
+        coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
+
+        coordinator.run_intake_pass(_ctx())
+
+        assert coalesce.arrival_times == [99.25]
+
+
 class TestAggregationIntakeDispatch:
     """Nominal (negative) dispatch at the intake flush seam (elspeth-8783933d99).
 
@@ -414,7 +469,7 @@ class TestAggregationIntakeDispatch:
         row = _blocked_row(barrier_key=str(_AGG_NODE))
         scheduler = RecordingScheduler(pending=[row])
         agg = RecordingAggregationExecutor(should_flush=True)
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_AGG_NODE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         return scheduler, agg, holds
 
     def test_gate_at_aggregation_node_raises_gate_specific_error(self) -> None:
@@ -472,7 +527,7 @@ class TestCoalesceIntakeTaxonomy:
         row = _blocked_row(barrier_key=str(_COALESCE))
         scheduler = RecordingScheduler(pending=[row])
         coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=True))
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
 
         outcome = coordinator.run_intake_pass(_ctx())
@@ -490,7 +545,9 @@ class TestCoalesceIntakeTaxonomy:
                 late_arrival=True,
             )
         )
-        holds = {row.token_id: _LiveBarrierHold(token=_branch_token(), barrier_key=str(_COALESCE))}
+        holds = {
+            row.token_id: _LiveBarrierHold(token=_branch_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)
+        }
         coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
 
         outcome = coordinator.run_intake_pass(_ctx())
@@ -507,7 +564,7 @@ class TestCoalesceIntakeTaxonomy:
         row = _blocked_row(barrier_key=str(_COALESCE))
         scheduler = RecordingScheduler(pending=[row])
         coalesce = RecordingCoalesceExecutor(CoalesceOutcome(held=False, failure_reason=None, late_arrival=True))
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         coordinator = _make_coordinator(scheduler=scheduler, coalesce_executor=coalesce, live_holds=holds)
 
         with pytest.raises(OrchestrationInvariantError, match="no failure_reason"):
@@ -522,7 +579,7 @@ class TestCoalesceIntakeTaxonomy:
         coalesce = RecordingCoalesceExecutor(
             CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=consumed, join_group_id="join-1")
         )
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         fire_calls: list[dict[str, object]] = []
         coordinator = _make_coordinator(
             scheduler=scheduler,
@@ -546,7 +603,7 @@ class TestCoalesceIntakeTaxonomy:
         coalesce = RecordingCoalesceExecutor(
             CoalesceOutcome(held=False, merged_token=merged, consumed_tokens=(_token(token_id="tok-a"),), join_group_id="join-1")
         )
-        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE))}
+        holds = {row.token_id: _LiveBarrierHold(token=_token(), barrier_key=str(_COALESCE), arrived_monotonic=_LIVE_ARRIVAL_MONOTONIC)}
         fire_calls: list[dict[str, object]] = []
         coordinator = _make_coordinator(
             scheduler=scheduler,

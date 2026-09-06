@@ -96,10 +96,20 @@ class _LiveBarrierHold:
     used (N=1 parity). Inherited rows with no stash entry (leader takeover)
     fall back to journal rehydration with audit-derived attempt offsets —
     the same semantics as the restore path.
+
+    ``arrived_monotonic`` is this process's exact witness of the arrival
+    instant on the monotonic scale. The durable ``barrier_blocked_at`` is
+    Landscape database time (ADR-047), whole-second on SQLite, so a live
+    arrival must not round-trip through it: a branch stamped just before a
+    second boundary and adopted just after it would be backdated before an
+    earlier live arrival, and the recorded arrival order would contradict
+    the accept order. Journal-only rows carry no witness and take the
+    database-measured age (``_backdated_accept_monotonic``).
     """
 
     token: TokenInfo
     barrier_key: str
+    arrived_monotonic: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +330,10 @@ class BarrierIntakeCoordinator:
         transform the journal restore uses (coalesce restore_from_journal /
         aggregation elapsed_age derivation): trigger latches and coalesce
         arrival anchors are pure functions of durable state + config, hence
-        invariant under leader takeover (§H 476).
+        invariant under leader takeover (§H 476). Journal-only rows only: a
+        live arrival carries its own exact monotonic witness
+        (``_LiveBarrierHold.arrived_monotonic``), and the durable stamp is
+        whole-second on SQLite.
         """
         if row.barrier_blocked_at is None:
             raise AuditIntegrityError(
@@ -334,25 +347,31 @@ class BarrierIntakeCoordinator:
         now_wall = self._scheduler.database_now()
         return self._clock.monotonic() - max(0.0, (now_wall - row.barrier_blocked_at).total_seconds())
 
-    def _token_for_intake(self, row: TokenWorkItem) -> TokenInfo:
-        """Resolve the TokenInfo to feed executor memory for one adopted row.
+    def _intake_arrival(self, row: TokenWorkItem) -> tuple[TokenInfo, float]:
+        """Resolve the TokenInfo and the monotonic arrival instant for one adopted row.
 
         Live stash first (N=1 parity: the exact post-transform token the old
-        in-claim accept used, with its original resume provenance). Without a
-        live stash, the durable row is still authoritative: fresh leaders use
+        in-claim accept used, with its original resume provenance, and this
+        process's exact monotonic witness of the arrival). Without a live
+        stash, the durable row is still authoritative: fresh leaders use
         offset zero for normal follower handoffs, while resume leaders use the
-        audit-derived offset stamped with checkpoint provenance.
+        audit-derived offset stamped with checkpoint provenance; the arrival
+        instant is the durable stamp backdated onto the monotonic scale.
         """
         hold = self._live_barrier_holds.pop(row.token_id, None)
         if hold is not None:
-            return hold.token
+            return hold.token, hold.arrived_monotonic
+        arrived_monotonic = self._backdated_accept_monotonic(row)
         if self._resume_checkpoint_id is None:
-            return token_from_journal_item(row, attempt_offset=0, resume_checkpoint_id=None)
+            return token_from_journal_item(row, attempt_offset=0, resume_checkpoint_id=None), arrived_monotonic
         max_attempts = self._barrier_restore_reads.get_max_node_state_attempts(self._run_id, [row.token_id])
-        return token_from_journal_item(
-            row,
-            attempt_offset=max_attempts.get(row.token_id, -1) + 1,
-            resume_checkpoint_id=self._resume_checkpoint_id,
+        return (
+            token_from_journal_item(
+                row,
+                attempt_offset=max_attempts.get(row.token_id, -1) + 1,
+                resume_checkpoint_id=self._resume_checkpoint_id,
+            ),
+            arrived_monotonic,
         )
 
     def run_intake_pass(self, ctx: PluginContext) -> BarrierIntakePassOutcome:
@@ -446,7 +465,7 @@ class BarrierIntakeCoordinator:
         # Resolve the token BEFORE the fenced verb so an invalid journal row is
         # refused with ZERO durable mutation. Valid follower handoffs can be
         # rebuilt from the durable row even without a live stash entry.
-        token = self._token_for_intake(row)
+        token, arrived_monotonic = self._intake_arrival(row)
         batch_id, ordinal = self._aggregation_executor.open_batch_membership(node_id)
         adoption = self._scheduler.adopt_blocked_barrier_item(
             run_id=self._run_id,
@@ -461,7 +480,7 @@ class BarrierIntakeCoordinator:
             # Idempotent success-SKIP: already adopted (a racing duplicate of
             # this leader's own pass). MUST NOT re-feed memory (§C.4 row 6a).
             return None
-        self._aggregation_executor.accept_adopted_row(node_id, token, accept_time=self._backdated_accept_monotonic(row))
+        self._aggregation_executor.accept_adopted_row(node_id, token, accept_time=arrived_monotonic)
 
         # Step 2: per-adoption trigger evaluation — the §E.2 home of the old
         # in-claim count/condition flush decision (accept-then-check), so
@@ -512,7 +531,7 @@ class BarrierIntakeCoordinator:
         coordination_token = self._require_coordination_token()
         # Resolve the token BEFORE the fenced verb (refusal-before-mutation
         # for invalid journal rows — see the aggregation arm).
-        token = self._token_for_intake(row)
+        token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
             run_id=self._run_id,
             work_item_id=row.work_item_id,
@@ -527,7 +546,7 @@ class BarrierIntakeCoordinator:
         outcome = self._coalesce_executor.accept(
             token=token,
             coalesce_name=str(coalesce_name),
-            arrival_time=self._backdated_accept_monotonic(row),
+            arrival_time=arrived_monotonic,
         )
 
         if outcome.held:
@@ -686,7 +705,7 @@ class BarrierIntakeCoordinator:
             raise OrchestrationInvariantError(f"Intake row_union row for {row.barrier_key!r} but the fire-completion seams are not wired.")
         row_union_name = RowUnionName(row.barrier_key)
         coordination_token = self._require_coordination_token()
-        token = self._token_for_intake(row)
+        token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
             run_id=self._run_id,
             work_item_id=row.work_item_id,
@@ -701,7 +720,7 @@ class BarrierIntakeCoordinator:
         outcome = self._row_union_executor.accept(
             token=token,
             row_union_name=str(row_union_name),
-            arrival_time=self._backdated_accept_monotonic(row),
+            arrival_time=arrived_monotonic,
         )
 
         if outcome.held:
@@ -828,7 +847,7 @@ class BarrierIntakeCoordinator:
                 f"{row.barrier_key!r} but its cursor/frame derive {expected_key!r}; journal corruption."
             )
         coordination_token = self._require_coordination_token()
-        token = self._token_for_intake(row)
+        token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
             run_id=self._run_id,
             work_item_id=row.work_item_id,
@@ -844,7 +863,7 @@ class BarrierIntakeCoordinator:
             token,
             str(row.collector_name),
             ctx,
-            arrival_time=self._backdated_accept_monotonic(row),
+            arrival_time=arrived_monotonic,
         )
         return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
 

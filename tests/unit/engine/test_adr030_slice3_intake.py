@@ -226,7 +226,9 @@ class TestLateArrivalRelease:
         _persist_blocked_scheduler_work(
             factory, processor, late_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False
         )
-        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(token=late_token, barrier_key="merge")
+        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(
+            token=late_token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 

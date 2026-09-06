@@ -2428,6 +2428,7 @@ class TestProcessRowNoTransforms:
         processor._live_barrier_holds["token-a"] = _LiveBarrierHold(
             token=make_token_info(row_id="row-a", token_id="token-a", data={"value": 1}),
             barrier_key="aggregation_a",
+            arrived_monotonic=processor._clock.monotonic(),
         )
         assert processor._barrier_key_for_live_hold("token-a") == "aggregation_a"
 
@@ -8259,7 +8260,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with (
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
@@ -8318,7 +8321,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -8382,7 +8387,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with pytest.raises(OrchestrationInvariantError, match="Coalesce 'merge' not in on_success map"):
             processor._run_barrier_intake_pass(ctx)
@@ -8435,7 +8442,9 @@ class TestMaybeCoalesceToken:
         # Slice 3 re-pin (ADR-030 §E.2): the merge fires from the
         # journal-first intake, not from an in-claim accept.
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -8483,7 +8492,9 @@ class TestMaybeCoalesceToken:
         )
         ctx = make_context(landscape=factory.plugin_audit_writer())
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
-        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+        processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+            token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         with pytest.raises(OrchestrationInvariantError, match="invalid state"):
             processor._run_barrier_intake_pass(ctx)
