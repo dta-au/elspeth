@@ -809,6 +809,20 @@ entries:
     sentinel default IS the root test, not a presence probe on an owned contract.
     No fallback behaviour: every walker terminates or raises when the link is missing.'
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _ancestors
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'AST scanner helper (P4-D8 elspeth-43ddb79074, reviewed 2026-09-06):
+    the one ancestor iterator behind iteration_source and _same_unit_helper; both
+    occurrences read the scanner-attached parent link on a stdlib ast.AST node. ast
+    nodes are not ELSPETH-owned types and the link is absent by design at the tree
+    root, so the sentinel default IS the root test, not a presence probe on an owned
+    contract. No fallback behaviour: the walk stops at the root.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _attribute_has_sessions_provenance
   kind: getattr
   occurrences: 1
