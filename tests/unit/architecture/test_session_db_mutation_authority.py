@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+import sys
 import textwrap
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
@@ -19,8 +20,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+import pytest
+from sqlalchemy import Table
 from tests.helpers.tree_gate import iter_gate_files
 
+from elspeth.web.sessions import models as session_models
 from elspeth.web.sessions.models import metadata as sessions_metadata
 from elspeth_lints.core.ast_dump import stable_ast_dump
 
@@ -148,7 +152,7 @@ _TABLE_POLICIES: tuple[TablePolicy, ...] = (
             ("SessionInterpretationAuthority", frozenset({"insert"})),
         ),
     ),
-    TablePolicy("elspeth_schema_identity", "global", "SessionSchemaBootstrapAuthority"),
+    TablePolicy("elspeth_schema_identity", "global", "SessionSchemaAuthority"),
     TablePolicy(
         "guided_operation_admission_blocks",
         "session",
@@ -734,6 +738,41 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "RepositoryIdentityAuthority.revoke_role",
         "IdentityAuthority",
     ),
+    # ── P4-D6 family S: sessions substrate (elspeth-9ebb0fcf10) ─────────────
+    # The schema-management authority owns every write to the schema-identity
+    # table and the two SQLite header sentinels; nothing else in the tree may.
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority",
+        "SessionSchemaAuthority",
+    ),
+    # Substrate DML bound by symbol to the authority that already owns the
+    # table (hub ruling (ii) 2026-09-07: no move into repository.py).
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/dead_site_supersession.py",
+        "supersede_dead_site_pending_interpretation_events",
+        "SessionInterpretationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/proposal_blob_effects.py",
+        "record_applied_blob_proposal_effect",
+        "SessionBlobMutationAuthority",
+    ),
+    # The module-level session-lock wrapper belongs to SessionOperationAuthority
+    # (hub ruling (i), amended 2026-09-07).  Its acquisition row is an honest
+    # ESCAPE and deliberately NOT admitted: ``_WrapperContainmentProof`` flips
+    # it on its own once every caller proves, and on this tree four do not --
+    # coordination/repository.py ``PostgresSessionOperationRepository._locked_transaction``
+    # and coordination/sqlite_authority.py ``_locked_transaction`` re-yield the
+    # connection to base-class callers (ruling 2 keeps ``mutate``'s constructor
+    # hand-off an escape), and composer/tools/blobs.py ``_execute_update_blob``
+    # / ``_execute_delete_blob_locked`` forward it across the module boundary
+    # into ``record_applied_blob_proposal_effect`` (family B2).
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/locking.py",
+        "locked_session_transaction",
+        "SessionOperationAuthority",
+    ),
 )
 
 # Connection acquisition is a separate capability from table mutation.  A
@@ -955,6 +994,13 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
         "src/elspeth/web/coordination/identity_authority.py",
         "RepositoryIdentityAuthority.revoke_role",
         "IdentityAuthority",
+    ),
+    # P4-D6 family S: the schema authority's one write transaction (proven
+    # contained by the scanner).
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority.stamp_sentinels",
+        "SessionSchemaAuthority",
     ),
 )
 
@@ -3089,6 +3135,71 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionBlobMutationAuthority",
         line=2085,
     ),
+    # ── P4-D6 family S: sessions substrate (elspeth-9ebb0fcf10), rows from
+    # live scanner output ─────────────────────────────────────────────────
+    # src/elspeth/web/sessions/schema.py :: SessionSchemaAuthority
+    WriterIdentity(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority.stamp_sentinels",
+        "<sessions-write-connection>",
+        "write_connection",
+        "730473cf9d5628ab",
+        1,
+        "SessionSchemaAuthority",
+        line=268,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority._stamp_on",
+        "elspeth_schema_identity",
+        "stamp_sqlite_sentinel",
+        "ae6f27adb45e82ea",
+        1,
+        "SessionSchemaAuthority",
+        line=286,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority._stamp_on",
+        "elspeth_schema_identity",
+        "stamp_sqlite_sentinel",
+        "ae6f27adb45e82ea",
+        2,
+        "SessionSchemaAuthority",
+        line=287,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority._stamp_on",
+        "elspeth_schema_identity",
+        "insert",
+        "dc1da0e98009a36e",
+        1,
+        "SessionSchemaAuthority",
+        line=290,
+    ),
+    # src/elspeth/web/sessions/dead_site_supersession.py :: SessionInterpretationAuthority
+    WriterIdentity(
+        "src/elspeth/web/sessions/dead_site_supersession.py",
+        "supersede_dead_site_pending_interpretation_events",
+        "interpretation_events",
+        "update",
+        "4774a95a0073f434",
+        1,
+        "SessionInterpretationAuthority",
+        line=135,
+    ),
+    # src/elspeth/web/sessions/proposal_blob_effects.py :: SessionBlobMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/sessions/proposal_blob_effects.py",
+        "record_applied_blob_proposal_effect",
+        "proposal_blob_effect_receipts",
+        "insert",
+        "d4488e1d873fd3e5",
+        1,
+        "SessionBlobMutationAuthority",
+        line=170,
+    ),
 )
 
 # These exact connection flows are proven read-only but cannot be resolved to
@@ -3420,7 +3531,8 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=420,
     ),
-    # src/elspeth/web/sessions/engine.py (read-only blocks, family R)
+    # src/elspeth/web/sessions/engine.py (read-only blocks, family R): the
+    # factory's startup PRAGMA probe.
     WriterIdentity(
         "src/elspeth/web/sessions/engine.py",
         "create_session_engine",
@@ -3431,16 +3543,30 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=127,
     ),
-    # src/elspeth/web/sessions/schema.py (read-only blocks, family R)
+    # src/elspeth/web/sessions/schema.py: the schema authority's two read-only
+    # operations (sentinel assertion, trigger validation).  Family R reviewed
+    # these as the two module-level entry points; P4-D6 family S moved the
+    # blocks into SessionSchemaAuthority, so the rows are re-derived under the
+    # authority's own symbols and carry its authority name.
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
-        "_validate_required_triggers",
+        "SessionSchemaAuthority.assert_sentinels",
         "<sessions-write-connection>",
         "write_connection",
-        "bbce7dbcfc31f6ec",
+        "d7ac5811a7ee7916",
         1,
-        None,
-        line=515,
+        "SessionSchemaAuthority",
+        line=303,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/schema.py",
+        "SessionSchemaAuthority.validate_required_triggers",
+        "<sessions-write-connection>",
+        "write_connection",
+        "23a842a553f2f5b5",
+        1,
+        "SessionSchemaAuthority",
+        line=416,
     ),
     # src/elspeth/web/sessions/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -4231,7 +4357,17 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
 )
 
 _TABLE_NAMES = frozenset(policy.table for policy in _TABLE_POLICIES)
-_TABLE_IDENTIFIERS = {f"{table}_table": table for table in _TABLE_NAMES}
+# The module-level name each Sessions table is bound to in ``models``, read
+# from the live module rather than spelled ``<table>_table``: the schema
+# identity table is bound as ``schema_identity_table`` while its SQL name is
+# ``elspeth_schema_identity`` (``_PROTECTED_LOGICAL_TABLES``), so the spelled
+# form left ``insert(schema_identity_table)`` unresolvable and the stamp was an
+# opaque row (P4-D6 family S).
+_TABLE_IDENTIFIERS = {
+    name: table.name
+    for name, table in vars(session_models).items()
+    if isinstance(table, Table) and table.metadata is sessions_metadata and table.name in _TABLE_NAMES
+}
 _SESSION_TABLE_MODULE = "elspeth.web.sessions.models"
 _LANDSCAPE_TABLE_MODULE = "elspeth.core.landscape.schema"
 _SESSION_ENGINE_FACTORIES = frozenset({"elspeth.web.sessions.engine.create_session_engine"})
@@ -4324,6 +4460,28 @@ _SQLALCHEMY_ENGINE_TYPES = frozenset({"sqlalchemy.Engine", "sqlalchemy.engine.En
 _SQLALCHEMY_TEXT_CONSTRUCTORS = frozenset({"sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"})
 _TRANSACTION_CONTROL_SQL = frozenset({"BEGIN", "BEGIN IMMEDIATE", "BEGIN DEFERRED", "BEGIN EXCLUSIVE", "COMMIT", "ROLLBACK"})
 _PRAGMA_ASSIGNMENT = re.compile(r"PRAGMA\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+", flags=re.IGNORECASE)
+# The two SQLite header sentinels the session schema stamps (P4-D6 family S):
+# a statement of exactly this shape is a typed write on the schema-identity
+# table (operation ``stamp_sqlite_sentinel``), so it needs an authority and a
+# manifest row like any DML.  Any other PRAGMA assignment stays unresolved
+# outside the engine factory.
+_SQLITE_SENTINEL_STAMP = re.compile(r"PRAGMA\s+(?:APPLICATION_ID|USER_VERSION)\s*=\s*-?[0-9]+\s*;?", flags=re.IGNORECASE)
+_SCHEMA_IDENTITY_TABLE = _PROTECTED_LOGICAL_TABLES["schema_identity"]
+# Reflection entry points: ``inspect(conn)`` returns an ``Inspector`` whose
+# API is catalogue reads only, so a connection handed to it stays contained.
+_SQLALCHEMY_INSPECT = frozenset({"sqlalchemy.inspect", "sqlalchemy.inspection.inspect"})
+# Reviewed lock-holding hops (P4-D6 family S): a connection forwarded to one
+# of these keeps its capability contained by REVIEW, not by proof -- the
+# helper registers commit/rollback listeners that release a process mutex,
+# reads ``in_transaction()`` and executes only the PostgreSQL advisory-lock
+# SELECT, shapes the forwarding proof cannot follow (closure captures, event
+# registration).  The review is pinned to the fingerprint of every same-module
+# definition the forwarded connection reaches from the hop
+# (``_connection_reach_fingerprint``): any edit to any of them re-opens it, and
+# until the pin is re-derived by hand the hop refuses and the row re-escapes.
+_REVIEWED_LOCK_HOLDING_HOPS: dict[str, str] = {
+    "elspeth.web.sessions.locking.transaction_session_lock": "40235a1377ac1002",
+}
 _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
     {
         "elspeth.web.execution.protocol.ExecutionService",
@@ -4425,6 +4583,18 @@ _LOCK_TABLE_STATEMENT = re.compile(
 # max_connections``. One bare, optionally dotted, identifier and nothing
 # else: no second statement, no ``TO``/``=`` (that is ``SET``).
 _SHOW_SETTING_STATEMENT = re.compile(r"SHOW\s+[A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)*\s*;?")
+
+
+def _defined_at_module_level(tree: ast.AST, definition: ast.AST) -> bool:
+    """``definition`` is a direct child of ``tree`` (a module-level ``def``, not a nested or class one)."""
+
+    return any(child is definition for child in ast.iter_child_nodes(tree))
+
+
+def _is_scalar_literal(node: ast.AST | None) -> bool:
+    """An ``int`` or ``str`` constant (``bool`` included: it renders as ``True``, which no grammar here admits)."""
+
+    return isinstance(node, ast.Constant) and isinstance(node.value, (int, str))
 
 
 def _raw_sql_is_obviously_read_only(sql: str) -> bool:
@@ -4571,6 +4741,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         # generator callee, is never followed.
         self.factory_return_calls: dict[int, tuple[ast.FunctionDef | ast.AsyncFunctionDef, list[ast.Call]]] = {}
         self.wrapper_call_nodes: dict[int, ast.Call] = {}
+        self.transaction_factory_hooks: set[int] = set()
         self.method_owners: dict[int, ast.ClassDef] = {}
         self.class_methods: dict[tuple[int, str], ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
         # Unresolved executions whose connection is a parameter of the enclosing
@@ -5141,6 +5312,12 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             and node.target.value.id == positional[0].arg
         ]
         return annotations[0] if len(annotations) == 1 else None
+
+    def _is_sqlite_sentinel_stamp(self, statement: ast.expr | None, *, use: ast.AST) -> bool:
+        """Every text the statement can hold is a ``PRAGMA application_id|user_version = <int>`` stamp."""
+
+        texts = self._literal_statement_texts(statement, use=use)
+        return texts is not None and all(_SQLITE_SENTINEL_STAMP.fullmatch(text.strip()) is not None for text in texts)
 
     def _is_session_engine_configuration(self, execution: ast.Call, statement: ast.expr | None) -> bool:
         """PRAGMA assignments and transaction control inside create_session_engine are engine configuration, not table writes."""
@@ -7117,6 +7294,8 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return None
         if isinstance(expression, ast.Attribute):
             return self._self_attribute_module_constant_texts(expression, use=use)
+        if isinstance(expression, ast.JoinedStr):
+            return self._module_constant_interpolation_texts(expression, use=use)
         if isinstance(expression, ast.Name):
             key = (id(self._lexical_scope(use)), expression.id, id(use))
             if key in visited:
@@ -7132,6 +7311,71 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 texts.extend(bound)
             return texts
         return None
+
+    def _module_constant_interpolation_texts(self, joined: ast.JoinedStr, *, use: ast.AST) -> list[str] | None:
+        """The one text an f-string evaluates to when every interpolation is a module-level int or str constant.
+
+        Admitted shape, and nothing wider: each ``{...}`` is a bare ``NAME``
+        with no conversion and no format spec, every binding of ``NAME``
+        visible from ``use`` is a module-level assignment (this module's own
+        ``NAME = <literal>``, or a plain ``from elspeth.<module> import NAME``
+        resolved to exactly one such assignment in that module) whose value is
+        an ``int`` or ``str`` literal, and ``bool`` is refused (a ``True``
+        interpolates as the word, not a number).  Anything else -- an
+        expression, an attribute, a function-local name, a call, a computed
+        or reassigned constant -- returns ``None`` and the statement stays
+        unresolved.  The sentinel stamps of the session schema are this shape:
+        ``text(f"PRAGMA user_version = {SESSION_SCHEMA_EPOCH}")`` (P4-D6 S).
+        """
+
+        rendered = ""
+        for part in joined.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                rendered += part.value
+                continue
+            if not isinstance(part, ast.FormattedValue) or part.conversion != -1 or part.format_spec is not None:
+                return None
+            if not isinstance(part.value, ast.Name):
+                return None
+            literal = self._module_scalar_constant(part.value, use=use)
+            if literal is None:
+                return None
+            rendered += str(literal)
+        return [rendered]
+
+    def _module_scalar_constant(self, name: ast.Name, *, use: ast.AST) -> int | str | None:
+        """The ``int`` or ``str`` literal ``name`` is bound to at module level, in this module or through one plain import."""
+
+        reaching, complete, scope = self._visible_reaching_bindings(use, name.id)
+        if scope is None or not complete or not reaching or not isinstance(scope, ast.Module):
+            return None
+        values: set[int | str] = set()
+        for binding in reaching:
+            if binding.imported is not None and binding.value is None:
+                if not binding.imported.startswith("elspeth.") or binding.imported.rpartition(".")[2] != name.id:
+                    return None
+                module, _, imported_name = binding.imported.rpartition(".")
+                peer = self._peer_collector(f"src/{module.replace('.', '/')}.py")
+                if peer is None:
+                    return None
+                assignments = [
+                    node.value
+                    for node in ast.iter_child_nodes(peer.tree)
+                    if isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and (
+                        any(isinstance(target, ast.Name) and target.id == imported_name for target in node.targets)
+                        if isinstance(node, ast.Assign)
+                        else isinstance(node.target, ast.Name) and node.target.id == imported_name
+                    )
+                ]
+                if len(assignments) != 1 or not _is_scalar_literal(assignments[0]):
+                    return None
+                values.add(assignments[0].value)
+                continue
+            if not _is_scalar_literal(binding.value):
+                return None
+            values.add(binding.value.value)
+        return values.pop() if len(values) == 1 else None
 
     def _self_attribute_module_constant_texts(self, attribute: ast.Attribute, *, use: ast.AST) -> list[str] | None:
         """The string constants ``self.<attr>`` can hold, when that is provable from this module alone.
@@ -7575,6 +7819,13 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             if parent.attr == "dialect":
                 return True
             if isinstance(grandparent, ast.Call) and grandparent.func is parent:
+                if parent.attr == "execution_options" and not grandparent.args:
+                    # ``Connection.execution_options(...)`` returns the SAME
+                    # connection: a single local name bound to it is an alias
+                    # whose every use is judged exactly as the original's.
+                    return self._alias_uses_are_contained(
+                        use, grandparent, depth=depth, active=active, allow_yield=allow_yield, strict=strict
+                    )
                 if parent.attr in _EXECUTE_RECEIVER_METHODS:
                     if not strict:
                         return True
@@ -7628,6 +7879,49 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             wrapper, parameter, depth=depth, active=active | {key}, allow_yield=True, strict=strict, allow_none_check=True
         )
 
+    def _alias_uses_are_contained(
+        self,
+        use: ast.Name,
+        derivation: ast.Call,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        allow_yield: bool,
+        strict: bool,
+    ) -> bool:
+        """``alias = conn.execution_options(...)``: the alias is the connection; its uses must be contained too."""
+
+        scope = self._enclosing_function(use)
+        if scope is None:
+            return False
+        aliases = [
+            name
+            for (scope_id, name), bindings in self.assignment_bindings.items()
+            if scope_id == id(scope) and len(bindings) == 1 and bindings[0].value is derivation
+        ]
+        if len(aliases) != 1:
+            return False
+        alias = aliases[0]
+        key = (id(scope), alias)
+        if key in active:
+            return False
+        next_active = active | {key}
+        for node in self._scope_nodes(scope):
+            if isinstance(node, _NESTED_SCOPES):
+                if any(isinstance(inner, ast.Name) and inner.id == alias for inner in ast.walk(node)):
+                    return False
+                continue
+            if not (isinstance(node, ast.Name) and node.id == alias):
+                continue
+            if isinstance(node.ctx, ast.Store):
+                # The one assignment that binds the alias; the scope holds
+                # exactly that binding (checked above), so any other store
+                # would have made the lookup ambiguous and refused.
+                continue
+            if not self._connection_use_is_contained(node, depth=depth, active=next_active, allow_yield=allow_yield, strict=strict):
+                return False
+        return True
+
     def _forward_is_contained(
         self,
         call: ast.Call,
@@ -7646,6 +7940,12 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         if self._forward_is_own_wrapper_acquisition(call, argument, depth=depth, active=active, strict=strict):
             return True
         owner: _ProductionWriterCollector = self
+        if self._imported_qualified_name(call.func) in _SQLALCHEMY_INSPECT and call.args == [argument] and not call.keywords:
+            # ``inspect(conn)``: a reflection handle whose API is catalogue
+            # reads only; the connection stays where it is.
+            return True
+        if self._is_reviewed_lock_holding_hop(call, argument):
+            return True
         callee = self._resolvable_private_callee(call)
         if callee is None:
             imported = self._resolvable_imported_callee(call)
@@ -7661,8 +7961,107 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return False
         return owner._connection_uses_are_contained(callee, parameter, depth=depth, active=active | {key}, strict=strict)
 
+    def _is_reviewed_lock_holding_hop(self, call: ast.Call, argument: ast.Name) -> bool:
+        """``call`` forwards ``argument`` to a declared lock-holding hop whose reviewed reach fingerprint still holds."""
+
+        owner: _ProductionWriterCollector = self
+        definition = self._local_callable_definition(call) if isinstance(call.func, ast.Name) else None
+        if definition is not None and _defined_at_module_level(self.tree, definition):
+            qualified = f"{self._module_qualified_name()}.{definition.name}"
+        else:
+            imported = self._resolvable_imported_callee(call)
+            if imported is None:
+                return False
+            owner, definition = imported
+            qualified = f"{owner._module_qualified_name()}.{definition.name}"
+        expected = _REVIEWED_LOCK_HOLDING_HOPS.get(qualified)
+        if expected is None or owner._forwarded_parameter(call, definition, argument) is None:
+            return False
+        return owner._connection_reach_fingerprint(definition) == expected
+
+    def _connection_reach_fingerprint(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        """Fingerprint of ``definition`` and every same-module definition a call inside it can reach, by name, transitively."""
+
+        reached: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        module_definitions = {
+            node.name: node for node in ast.iter_child_nodes(self.tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        pending = [definition]
+        while pending:
+            current = pending.pop()
+            if current.name in reached:
+                continue
+            reached[current.name] = current
+            for node in ast.walk(current):
+                if isinstance(node, ast.Name) and node.id in module_definitions and node.id not in reached:
+                    pending.append(module_definitions[node.id])
+        normalized = "\0".join(stable_ast_dump(reached[name]) for name in sorted(reached))
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
     def _forwarding_is_contained(self, call: ast.Call, argument: ast.Name) -> bool:
         return self._forward_is_contained(call, argument, depth=1, active=frozenset(), strict=False)
+
+    def _contained_transaction_factory_hooks(self) -> set[int]:
+        """Definitions bound as the Sessions engine's ``begin`` inside its factory, when their connection uses are contained.
+
+        Admitted shape, and nothing wider (P4-D6 family S): in
+        ``_SESSION_ENGINE_FACTORY_PATH`` a ``@contextmanager`` function
+        ``hook`` is installed by ``<engine>.begin = MethodType(hook, <engine>)``
+        (``types.MethodType`` by import provenance, both operands plain names,
+        the receiver the assignment's own target); every ``with ... as name``
+        acquisition inside ``hook`` keeps ``name`` contained with the yield as
+        the one permitted release.  Such a hook is the transaction factory
+        itself -- its yield is the acquisition every ``engine.begin()`` caller
+        already reports -- so its acquisition is absorbed into theirs (as a
+        parameter-fed wrapper's is) and its yield is not an escape.  An
+        unbound hook, a bound hook whose connection reaches a store or an
+        unprovable forward, or the same shape outside the factory module keeps
+        its escape row; a statement executed inside a hook is its own row.
+        """
+
+        if self.path != _SESSION_ENGINE_FACTORY_PATH:
+            return set()
+        hooks: set[int] = set()
+        for node in ast.walk(self.tree):
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                continue
+            target = node.targets[0]
+            if not (isinstance(target, ast.Attribute) and target.attr == "begin" and isinstance(target.value, ast.Name)):
+                continue
+            value = node.value
+            if not (isinstance(value, ast.Call) and self._imported_qualified_name(value.func) == "types.MethodType"):
+                continue
+            if len(value.args) != 2 or value.keywords:
+                continue
+            hook, receiver = value.args
+            if not (isinstance(hook, ast.Name) and isinstance(receiver, ast.Name) and receiver.id == target.value.id):
+                continue
+            reaching, complete, _ = self._visible_reaching_bindings(hook, hook.id)
+            definitions = {id(binding.node): binding.node for binding in reaching}
+            if not complete or len(definitions) != 1:
+                continue
+            definition = next(iter(definitions.values()))
+            if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)) or not self._is_contextmanager_definition(definition):
+                continue
+            if self._acquired_names_are_contained(definition, allow_yield=True):
+                hooks.add(id(definition))
+        return hooks
+
+    def _acquired_names_are_contained(self, definition: ast.FunctionDef | ast.AsyncFunctionDef, *, allow_yield: bool) -> bool:
+        """Every ``with <acquisition> as name`` directly inside ``definition`` keeps ``name`` contained."""
+
+        names: list[str] = []
+        for node in self._scope_nodes(definition):
+            if not isinstance(node, (ast.With, ast.AsyncWith)):
+                continue
+            for item in node.items:
+                if not isinstance(item.optional_vars, ast.Name):
+                    continue
+                if self._connection_acquisitions_for_expression(item.context_expr, item.context_expr):
+                    names.append(item.optional_vars.id)
+        return bool(names) and all(
+            self._connection_uses_are_contained(definition, name, depth=0, active=frozenset(), allow_yield=allow_yield) for name in names
+        )
 
     def _collect_unresolved_connection_flows(self) -> None:
         """Fail closed when an acquired connection reaches an unknown write-capable sink."""
@@ -7726,6 +8125,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                     statement,
                     use=call,
                 ):
+                    continue
+                if self._is_sqlite_sentinel_stamp(statement, use=call):
+                    self._emit(call, _SCHEMA_IDENTITY_TABLE, "stamp_sqlite_sentinel")
                     continue
                 if self._is_session_engine_configuration(call, statement):
                     self.classified_execution_calls.add(id(call))
@@ -7879,9 +8281,15 @@ class _ProductionWriterCollector(ast.NodeVisitor):
     def collect(self) -> list[WriterIdentity]:
         self.visit(self.tree)
         self._collect_unresolved_connection_flows()
+        self.transaction_factory_hooks = self._contained_transaction_factory_hooks()
         absorbed = self._absorbed_wrapper_acquisitions()
         for call, escapes in self.write_connection_calls.values():
             if id(call) in absorbed:
+                continue
+            if id(self._enclosing_function(call)) in self.transaction_factory_hooks:
+                # The contained transaction factory hook: its acquisition is
+                # the one every ``engine.begin()`` caller reports, exactly as a
+                # parameter-fed wrapper's is absorbed into its callers' rows.
                 continue
             table = "<sessions-write-connection>"
             if self._connection_database_domain(call) == "non_sessions":
@@ -8232,7 +8640,11 @@ class _WrapperContainmentProof:
 
     def _wrapper_is_contained(self, collector: _ProductionWriterCollector, acquisition: ast.AST) -> bool:
         wrapper = collector._enclosing_function(acquisition)
-        if wrapper is None or id(wrapper) not in collector.method_owners or not collector._is_instance_method(wrapper):
+        if wrapper is None:
+            return False
+        if id(wrapper) not in collector.method_owners:
+            return self._module_wrapper_is_contained(collector, wrapper, acquisition)
+        if not collector._is_instance_method(wrapper):
             return False
         item = getattr(acquisition, "_inventory_parent", None)
         if not (isinstance(item, ast.withitem) and item.context_expr is acquisition and isinstance(item.optional_vars, ast.Name)):
@@ -8281,6 +8693,95 @@ class _WrapperContainmentProof:
             return False
         # The caller's own body is depth 0: its forwards count against the bound.
         return all(collector._connection_uses_are_contained(caller, target, depth=0, active=frozenset()) for caller, target in callers)
+
+    def _module_wrapper_is_contained(
+        self,
+        collector: _ProductionWriterCollector,
+        wrapper: ast.FunctionDef | ast.AsyncFunctionDef,
+        acquisition: ast.AST,
+    ) -> bool:
+        """Module-level, parameter-fed ``@contextmanager`` wrappers (P4-D6 family S).
+
+        ``locked_session_transaction(engine, session_id)`` acquires ``engine.begin()``
+        on a PARAMETER and yields the connection to whoever imported it. It is
+        contained only when: it is a module-level ``@contextmanager`` whose
+        acquisition is ``with <own parameter>.begin() as conn`` directly in its
+        body; it yields exactly ``conn``; its own uses of ``conn`` are contained
+        (the yield permitted, a reviewed lock-holding hop admitted); and
+        tree-wide EVERY reference to its name is either its own definition, an
+        unaliased ``from <its module> import <name>``, or a
+        ``with <name>(...) as target:`` inside a function whose uses of
+        ``target`` are contained -- all call sites, never any. One reference of
+        any other shape (a re-yield, a stored callable, an aliased import, a
+        leaking caller) keeps the wrapper row escaped, so the row names the
+        callers that still have to restructure.
+        """
+
+        if not _defined_at_module_level(collector.tree, wrapper) or not collector._is_contextmanager_definition(wrapper):
+            return False
+        if not (isinstance(acquisition, ast.Call) and isinstance(acquisition.func, ast.Attribute) and acquisition.func.attr == "begin"):
+            return False
+        receiver = acquisition.func.value
+        parameters = {argument.arg for argument in (*wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs)}
+        if not (isinstance(receiver, ast.Name) and receiver.id in parameters):
+            return False
+        targets = [
+            item.optional_vars.id
+            for _, item in self._with_items(wrapper)
+            if item.context_expr is acquisition and isinstance(item.optional_vars, ast.Name)
+        ]
+        if len(targets) != 1:
+            return False
+        name = targets[0]
+        yields = collector._direct_yields(wrapper)
+        if not yields or any(
+            not (isinstance(yielded, ast.Yield) and isinstance(yielded.value, ast.Name) and yielded.value.id == name) for yielded in yields
+        ):
+            return False
+        if not collector._connection_uses_are_contained(wrapper, name, depth=0, active=frozenset(), allow_yield=True):
+            return False
+        qualified = f"{collector._module_qualified_name()}.{wrapper.name}"
+        callers: list[tuple[_ProductionWriterCollector, ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+        for other, _ in self._collected:
+            # Every ``with <wrapper>(...) as target:`` in this module, and the
+            # ``<wrapper>`` name node each one consumes.
+            consumed: set[int] = set()
+            for statement, item in self._with_items(other.tree):
+                call = item.context_expr
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == wrapper.name):
+                    continue
+                if other is collector or not isinstance(item.optional_vars, ast.Name):
+                    return False
+                if other._imported_qualified_name(call.func) != qualified:
+                    return False
+                caller = other._enclosing_function(statement)
+                if caller is None:
+                    return False
+                consumed.add(id(call.func))
+                callers.append((other, caller, item.optional_vars.id))
+            for node in ast.walk(other.tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name == wrapper.name and (alias.asname is not None or f"{node.module}.{alias.name}" != qualified):
+                            return False
+                    continue
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == wrapper.name and node is not wrapper:
+                    return False
+                # Any other mention of the name -- a bare reference, a call
+                # that is not a with-context, an attribute hand-off -- is
+                # unproven use of the wrapper.
+                if isinstance(node, ast.Name) and node.id == wrapper.name and id(node) not in consumed:
+                    return False
+        if not callers:
+            return False
+        return all(other._connection_uses_are_contained(caller, target, depth=0, active=frozenset()) for other, caller, target in callers)
+
+    @staticmethod
+    def _with_items(scope: ast.AST) -> Iterator[tuple[ast.With | ast.AsyncWith, ast.withitem]]:
+        for node in ast.walk(scope):
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    yield node, item
 
 
 class _CallerSideProof:
@@ -9726,11 +10227,15 @@ def test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirecti
     root = _repo_root()
     paths = [
         root / "src/elspeth/web/coordination/repository.py",
+        root / "src/elspeth/web/sessions/proposal_blob_effects.py",
         root / "src/elspeth/web/sessions/service.py",
     ]
     authorities = {
         "_RepositoryBlobMutations._record_applied_blob_proposal_effect": "SessionBlobMutationAuthority",
         "_SessionComposerMutations.accept_pending_ordinary_proposal": "SessionComposerMutationAuthority",
+        # The substrate twin the composer blob tools call inside a
+        # ``locked_session_transaction`` block (P4-D6 family S, ruling (ii)).
+        "record_applied_blob_proposal_effect": "SessionBlobMutationAuthority",
     }
     live = [
         site
@@ -9739,7 +10244,7 @@ def test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirecti
     ]
     reviewed = [site for site in _REVIEWED_WRITERS if site.table == "proposal_blob_effect_receipts"]
 
-    assert len(live) == len(reviewed) == 2
+    assert len(live) == len(reviewed) == 3
     assert {(site.symbol, site.operation, site.authority) for site in live} == {
         (
             "_RepositoryBlobMutations._record_applied_blob_proposal_effect",
@@ -9750,6 +10255,11 @@ def test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirecti
             "_SessionComposerMutations.accept_pending_ordinary_proposal",
             "update",
             "SessionComposerMutationAuthority",
+        ),
+        (
+            "record_applied_blob_proposal_effect",
+            "insert",
+            "SessionBlobMutationAuthority",
         ),
     }
     assert inventory_drift(live, reviewed) == ([], [])
@@ -10681,14 +11191,16 @@ def test_mutating_pragma_is_not_classified_as_an_obvious_read(tmp_path: Path) ->
             """\
             def writer(engine):
                 with engine.begin() as conn:
-                    conn.exec_driver_sql("PRAGMA user_version = 42")
+                    conn.exec_driver_sql("PRAGMA journal_mode = WAL")
             """
         )
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
     # Not a read, so an unresolved write of its own -- since P4-D6 even
-    # inside the acquired block, not only the acquisition row.
+    # inside the acquired block, not only the acquisition row.  (The two
+    # header sentinels are typed ``stamp_sqlite_sentinel`` rows instead;
+    # see the family S test.)
     assert [(site.symbol, site.table, site.operation) for site in sites] == [
         ("writer", "<unresolved-session-write>", "unknown_exec_driver_sql"),
         ("writer", "<sessions-write-connection>", "write_connection"),
@@ -16026,6 +16538,8 @@ def test_live_connection_domain_classification_is_exact() -> None:
             line=249,
             connection_escape=True,
         ),
+        # The session-lock wrapper: an honest escape until every caller proves
+        # (four do not on this tree; see the _NAMED_AUTHORITY_SYMBOLS note).
         WriterIdentity(
             "src/elspeth/web/sessions/locking.py",
             "locked_session_transaction",
@@ -16033,41 +16547,41 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "write_connection",
             "e938e86c91ec013e",
             1,
-            None,
+            "SessionOperationAuthority",
             line=282,
             connection_escape=True,
         ),
+        # SessionSchemaAuthority (P4-D6 family S): one contained write
+        # transaction and two read-only operations, none escaping.
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
-            "_stamp_schema_sentinels",
+            "SessionSchemaAuthority.stamp_sentinels",
             "<sessions-write-connection>",
             "write_connection",
-            "afc7d978d541eadc",
+            "730473cf9d5628ab",
             1,
-            None,
-            line=251,
-            connection_escape=True,
+            "SessionSchemaAuthority",
+            line=268,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
-            "_assert_schema_sentinels",
+            "SessionSchemaAuthority.assert_sentinels",
             "<sessions-write-connection>",
             "write_connection",
-            "883e79c104c66d8f",
+            "d7ac5811a7ee7916",
             1,
-            None,
-            line=308,
-            connection_escape=True,
+            "SessionSchemaAuthority",
+            line=303,
         ),
         WriterIdentity(
             "src/elspeth/web/sessions/schema.py",
-            "_validate_required_triggers",
+            "SessionSchemaAuthority.validate_required_triggers",
             "<sessions-write-connection>",
             "write_connection",
-            "bbce7dbcfc31f6ec",
+            "23a842a553f2f5b5",
             1,
-            None,
-            line=515,
+            "SessionSchemaAuthority",
+            line=416,
         ),
     )
     expected = _REVIEWED_NON_SESSION_CONNECTIONS + expected_session_reachable
@@ -16260,3 +16774,514 @@ def test_all_production_sessions_writers_are_reviewed_typed_authorities() -> Non
         + f"\nInvalid reviewed read connections ({len(reviewed_read_policy_violations)}):\n"
         + "\n".join(f"  {describe(site)}" for site in reviewed_read_policy_violations[:40])
     )
+
+
+# ── P4-D6 family S: sessions substrate (elspeth-9ebb0fcf10) ─────────────────
+
+
+def _s_module(root: Path, relative: str, source: str) -> Path:
+    module = root / relative
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(textwrap.dedent(source), encoding="utf-8")
+    return module
+
+
+def test_table_identifiers_are_read_from_the_live_models_module(tmp_path: Path) -> None:
+    """Every Sessions table maps from the NAME ``models`` binds it to, not from a spelled ``<table>_table``.
+
+    The schema-identity table is bound as ``schema_identity_table`` while its
+    SQL name is ``elspeth_schema_identity``; the spelled derivation left
+    ``insert(schema_identity_table)`` an opaque row.  Mutant: revert to the
+    spelled map and the insert below is ``unknown_execute`` again.
+    """
+
+    assert _TABLE_IDENTIFIERS["schema_identity_table"] == "elspeth_schema_identity"
+    assert Counter(_TABLE_IDENTIFIERS.values()) == Counter(_TABLE_NAMES)
+    source = _s_module(
+        tmp_path,
+        "src/elspeth/web/sessions/stamp.py",
+        """\
+        from sqlalchemy import insert
+
+        from elspeth.web.sessions.models import schema_identity_table
+
+
+        def stamp(connection):
+            connection.execute(insert(schema_identity_table).values(singleton_id=1))
+        """,
+    )
+    assert [(site.symbol, site.table, site.operation) for site in scan_production_writers([source], anchor=tmp_path)] == [
+        ("stamp", "elspeth_schema_identity", "insert")
+    ]
+
+
+def test_sqlite_sentinel_stamps_are_typed_rows_and_every_loosened_form_is_unresolved(tmp_path: Path) -> None:
+    """``PRAGMA application_id|user_version = <int>`` rendered from module constants is a typed write.
+
+    The f-string resolver admits ONE shape: every ``{...}`` a bare name bound
+    at module level (here, or through one plain ``from elspeth.<m> import``)
+    to an ``int`` or ``str`` literal.  Each loosened form below stays
+    ``unknown_execute``; a DML rendered from an f-string is unresolved rather
+    than swallowed into its acquisition.  Mutants: drop the ``JoinedStr`` arm
+    (both typed rows vanish into ``unknown_execute``); accept ``bool``
+    (``flag`` types); accept a format spec (``formatted`` types); drop the
+    ``JoinedStr`` clause in ``_unrecognised_literal_statement`` (``rendered_dml``
+    is swallowed as ``unknown_opaque``).
+    """
+
+    _s_module(
+        tmp_path,
+        "src/elspeth/core/identity_constants.py",
+        """\
+        SCHEMA_EPOCH = 52
+        REBOUND = 1
+        REBOUND = 2
+        """,
+    )
+    source = _s_module(
+        tmp_path,
+        "src/elspeth/web/sessions/sentinels.py",
+        """\
+        from sqlalchemy import text
+
+        from elspeth.core.identity_constants import REBOUND, SCHEMA_EPOCH
+
+        APPLICATION_ID = 0x454C5350
+        TABLE = "sessions"
+        FLAG = True
+
+
+        def stamp_local_constant(engine):
+            with engine.begin() as conn:
+                conn.execute(text(f"PRAGMA application_id = {APPLICATION_ID}"))
+
+
+        def stamp_imported_constant(conn):
+            conn.execute(text(f"PRAGMA user_version = {SCHEMA_EPOCH}"))
+
+
+        def local_name(conn, epoch):
+            conn.execute(text(f"PRAGMA user_version = {epoch}"))
+
+
+        def expression(conn):
+            conn.execute(text(f"PRAGMA user_version = {SCHEMA_EPOCH + 1}"))
+
+
+        def formatted(conn):
+            conn.execute(text(f"PRAGMA user_version = {SCHEMA_EPOCH:d}"))
+
+
+        def flag(conn):
+            conn.execute(text(f"PRAGMA user_version = {FLAG}"))
+
+
+        def rebound(conn):
+            conn.execute(text(f"PRAGMA user_version = {REBOUND}"))
+
+
+        def other_pragma(conn):
+            conn.execute(text(f"PRAGMA foreign_keys = {APPLICATION_ID}"))
+
+
+        def rendered_dml(engine):
+            with engine.begin() as conn:
+                conn.execute(text(f"DELETE FROM {TABLE}"))
+        """,
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("stamp_local_constant", "elspeth_schema_identity", "stamp_sqlite_sentinel"): 1,
+            ("stamp_local_constant", "<sessions-write-connection>", "write_connection"): 1,
+            ("stamp_imported_constant", "elspeth_schema_identity", "stamp_sqlite_sentinel"): 1,
+            ("local_name", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("expression", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("formatted", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("flag", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("rebound", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("other_pragma", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("rendered_dml", "<unresolved-session-write>", "unknown_execute"): 1,
+            ("rendered_dml", "<sessions-write-connection>", "write_connection"): 1,
+        }
+    )
+    assert all(not site.connection_escape for site in sites)
+
+
+def test_inspect_keeps_a_forwarded_connection_contained_and_nothing_looser(tmp_path: Path) -> None:
+    """``sqlalchemy.inspect(conn)`` is a reflection read: the connection stays in its block.
+
+    Only the exact call -- SQLAlchemy's ``inspect`` by import provenance, the
+    connection its sole positional argument, no keywords -- is admitted.  A
+    keyword form, a second argument, or a same-named local ``inspect`` keeps
+    the escape.  Mutant: drop the ``_SQLALCHEMY_INSPECT`` clause and
+    ``reflected`` escapes with the rest.
+    """
+
+    source = _s_module(
+        tmp_path,
+        "src/elspeth/web/sessions/reflect.py",
+        """\
+        from sqlalchemy import inspect
+
+
+        def reflected(engine):
+            with engine.connect() as conn:
+                if "sessions" not in inspect(conn).get_table_names():
+                    raise RuntimeError("missing")
+
+
+        def keyword_form(engine):
+            with engine.connect() as conn:
+                if "sessions" not in inspect(conn, raiseerr=False).get_table_names():
+                    raise RuntimeError("missing")
+
+
+        def second_argument(engine, other):
+            with engine.connect() as conn:
+                if "sessions" not in inspect(conn, other).get_table_names():
+                    raise RuntimeError("missing")
+
+
+        def shadowed(engine):
+            def inspect(target):
+                return target
+
+            with engine.connect() as conn:
+                if "sessions" not in inspect(conn).get_table_names():
+                    raise RuntimeError("missing")
+        """,
+    )
+    connections = [site for site in scan_production_writers([source], anchor=tmp_path) if site.operation == "write_connection"]
+    assert Counter((site.symbol, site.connection_escape) for site in connections) == Counter(
+        {
+            ("reflected", False): 1,
+            ("keyword_form", True): 1,
+            ("second_argument", True): 1,
+            ("shadowed", True): 1,
+        }
+    )
+
+
+_FACTORY_HOOK_FIXTURE = """\
+    from contextlib import contextmanager
+    from types import MethodType
+
+    from sqlalchemy import create_engine
+
+
+    def create_session_engine(url):
+        engine = create_engine(url)
+
+        @contextmanager
+        def _begin_session_write(self):
+            with self.connect() as conn:
+                write_conn = conn.execution_options(intent=True)
+                with write_conn.begin():
+                    yield write_conn
+
+        {binding}
+        return engine
+"""
+
+
+def _factory_hook_escape(
+    tmp_path: Path,
+    label: str,
+    relative: str,
+    *,
+    binding: str,
+    body: str | None = None,
+    derivation: str | None = None,
+) -> bool | None:
+    """The hook's acquisition row's escape flag, or ``None`` when the hook is absorbed (no row)."""
+
+    source = textwrap.dedent(_FACTORY_HOOK_FIXTURE).replace("{binding}", binding)
+    if body is not None:
+        source = source.replace("                yield write_conn\n", body)
+    if derivation is not None:
+        source = source.replace("            write_conn = conn.execution_options(intent=True)\n", derivation)
+    root = tmp_path / label
+    module = _s_module(root, relative, source)
+    connections = [site for site in scan_production_writers([module], anchor=root) if site.operation == "write_connection"]
+    if not connections:
+        return None
+    (connection,) = connections
+    assert connection.symbol == "create_session_engine._begin_session_write"
+    return connection.connection_escape
+
+
+def test_transaction_factory_hook_yield_is_the_factory_product_and_nothing_looser(tmp_path: Path) -> None:
+    """The ``@contextmanager`` bound as the Sessions engine's ``begin`` yields the acquisition its callers report.
+
+    Admitted only as ``engine.begin = MethodType(hook, engine)`` inside the
+    factory module, with the hook's connection contained through the
+    ``execution_options`` alias; then its acquisition is absorbed (no row of
+    its own).  Unbound, bound as ``connect``, bound through a keyword,
+    storing the alias, rebinding it, binding the derivation to a SECOND name
+    in one statement, or the same shape outside the factory module keeps the
+    escape row.  Mutants: drop the absorption clause in ``collect`` (``bound``
+    keeps an escape row); drop the ``execution_options`` alias arm (``bound``
+    refuses on ``write_conn``); admit an ambiguous alias (``second_alias`` is
+    absorbed with its second name unchecked); drop the path check
+    (``elsewhere`` is absorbed).
+    """
+
+    factory = _SESSION_ENGINE_FACTORY_PATH
+    bound = "engine.begin = MethodType(_begin_session_write, engine)"
+    assert _factory_hook_escape(tmp_path, "bound", factory, binding=bound) is None
+    assert _factory_hook_escape(tmp_path, "unbound", factory, binding="pass") is True
+    assert (
+        _factory_hook_escape(tmp_path, "as_connect", factory, binding="engine.connect = MethodType(_begin_session_write, engine)") is True
+    )
+    assert (
+        _factory_hook_escape(tmp_path, "keywords", factory, binding="engine.begin = MethodType(func=_begin_session_write, obj=engine)")
+        is True
+    )
+    assert (
+        _factory_hook_escape(tmp_path, "other_receiver", factory, binding="other.begin = MethodType(_begin_session_write, engine)") is True
+    )
+    assert (
+        _factory_hook_escape(
+            tmp_path, "stored", factory, binding=bound, body="                self._last = write_conn\n                yield write_conn\n"
+        )
+        is True
+    )
+    assert (
+        _factory_hook_escape(
+            tmp_path, "rebound", factory, binding=bound, body="                write_conn = conn\n                yield write_conn\n"
+        )
+        is True
+    )
+    assert (
+        _factory_hook_escape(
+            tmp_path,
+            "second_alias",
+            factory,
+            binding=bound,
+            derivation="            write_conn = held = conn.execution_options(intent=True)\n",
+        )
+        is True
+    )
+    assert _factory_hook_escape(tmp_path, "elsewhere", "src/elspeth/web/sessions/other_engine.py", binding=bound) is True
+
+
+_MODULE_WRAPPER_FIXTURE = """\
+    from contextlib import contextmanager
+
+
+    @contextmanager
+    def locked(engine, session_id):
+        with engine.begin() as conn:
+            yield conn
+"""
+
+_MODULE_WRAPPER_CALLERS = """\
+    from elspeth.web.sessions.locks import locked
+
+
+    def first(engine, session_id):
+        with locked(engine, session_id) as conn:
+            conn.execute("UPDATE sessions SET title = 'x'")
+
+
+    def second(engine, session_id):
+        with locked(engine, session_id) as tx:
+            return tx.execute("SELECT 1").scalar()
+"""
+
+
+def _module_wrapper_escape(tmp_path: Path, label: str, *, wrapper: str = _MODULE_WRAPPER_FIXTURE, extra_callers: str = "") -> bool:
+    root = tmp_path / label
+    definition = _s_module(root, "src/elspeth/web/sessions/locks.py", wrapper)
+    callers = _s_module(root, "src/elspeth/web/coordination/users.py", _MODULE_WRAPPER_CALLERS + extra_callers)
+    (row,) = [site for site in scan_production_writers([definition, callers], anchor=root) if site.path.endswith("locks.py")]
+    assert row.symbol == "locked" and row.operation == "write_connection"
+    return row.connection_escape
+
+
+def test_module_level_wrapper_is_contained_only_when_every_caller_proves(tmp_path: Path) -> None:
+    """A module-level parameter-fed ``@contextmanager`` wrapper flips only when EVERY reference tree-wide proves.
+
+    Two contained ``with locked(...) as target`` callers flip the wrapper's
+    row; one leaking caller, a re-yielding caller, an aliased import, a bare
+    reference, a second definition of the name, or a wrapper acquiring from
+    something other than its own parameter keeps the escape.  Mutant: return
+    ``True`` from the callers loop's first refusal and ``leaking`` flips.
+    """
+
+    assert _module_wrapper_escape(tmp_path, "contained") is False
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "leaking",
+            extra_callers="""\
+
+
+            def leaking(engine, session_id):
+                with locked(engine, session_id) as conn:
+                    return conn
+            """,
+        )
+        is True
+    )
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "reyielding",
+            extra_callers="""\
+
+
+            from contextlib import contextmanager
+
+
+            @contextmanager
+            def reyield(engine, session_id):
+                with locked(engine, session_id) as conn:
+                    yield conn
+            """,
+        )
+        is True
+    )
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "aliased",
+            extra_callers="""\
+
+
+            from elspeth.web.sessions.locks import locked as held
+
+
+            def aliased(engine, session_id):
+                with held(engine, session_id) as conn:
+                    conn.execute("SELECT 1")
+            """,
+        )
+        is True
+    )
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "bare",
+            extra_callers="""\
+
+
+            def bare(engine, session_id):
+                return locked
+            """,
+        )
+        is True
+    )
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "redefined",
+            extra_callers="""\
+
+
+            def locked(engine, session_id):
+                return engine
+            """,
+        )
+        is True
+    )
+    assert (
+        _module_wrapper_escape(
+            tmp_path,
+            "global_engine",
+            wrapper="""\
+            from contextlib import contextmanager
+
+            from elspeth.web.sessions.engine import create_session_engine
+
+            ENGINE = create_session_engine("sqlite://")
+
+
+            @contextmanager
+            def locked(engine, session_id):
+                with ENGINE.begin() as conn:
+                    yield conn
+            """,
+        )
+        is True
+    )
+
+
+def test_reviewed_lock_holding_hops_pin_the_live_lock_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each declared hop resolves to a module-level definition whose connection-reach fingerprint matches the pin.
+
+    The pin is the ONLY thing that admits the hop: with it moved by one
+    character the session-lock wrapper's own body is no longer contained, so
+    an edit anywhere in the reach closure re-escapes the wrapper row until the
+    review is redone by hand.  Mutant: ignore the fingerprint in
+    ``_is_reviewed_lock_holding_hop`` and the mismatched pin still admits.
+    """
+
+    root = _repo_root()
+    path = root / "src/elspeth/web/sessions/locking.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    _attach_parents(tree)
+    collector = _ProductionWriterCollector("src/elspeth/web/sessions/locking.py", tree, anchor=root)
+    definitions = {node.name: node for node in ast.iter_child_nodes(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for qualified, expected in _REVIEWED_LOCK_HOLDING_HOPS.items():
+        module, _, name = qualified.rpartition(".")
+        assert module == collector._module_qualified_name(), qualified
+        assert collector._connection_reach_fingerprint(definitions[name]) == expected, (
+            f"{qualified}: the lock module changed inside the hop's reach; re-review it and re-derive the pin "
+            f"({collector._connection_reach_fingerprint(definitions[name])})"
+        )
+    wrapper = definitions["locked_session_transaction"]
+    assert collector._connection_uses_are_contained(wrapper, "conn", depth=0, active=frozenset(), allow_yield=True)
+    drifted = {qualified: "0" + pin[1:] for qualified, pin in _REVIEWED_LOCK_HOLDING_HOPS.items()}
+    monkeypatch.setattr(sys.modules[__name__], "_REVIEWED_LOCK_HOLDING_HOPS", drifted)
+    assert not collector._connection_uses_are_contained(wrapper, "conn", depth=0, active=frozenset(), allow_yield=True)
+
+
+def test_session_schema_authority_is_exact_contained_and_bidirectional() -> None:
+    """P4-D6 family S: the five substrate modules carry exactly the reviewed rows and one honest escape.
+
+    ``SessionSchemaAuthority`` is the only writer of ``elspeth_schema_identity``
+    and the SQLite header sentinels in the manifest; its write transaction is
+    contained, its two other operations are reviewed reads; the transaction
+    factory hook is absorbed; the two substrate DML rows bind to the
+    authorities that own their tables; ``locked_session_transaction`` is the
+    one remaining escape, named, until its four unproven callers restructure.
+    """
+
+    root = _repo_root()
+    paths = [
+        root / "src/elspeth/web/sessions/dead_site_supersession.py",
+        root / "src/elspeth/web/sessions/engine.py",
+        root / "src/elspeth/web/sessions/locking.py",
+        root / "src/elspeth/web/sessions/proposal_blob_effects.py",
+        root / "src/elspeth/web/sessions/schema.py",
+    ]
+    files = {path.relative_to(root).as_posix() for path in paths}
+    live = scan_production_writers(paths, anchor=root)
+    reviewed = [site for site in _REVIEWED_WRITERS if site.path in files]
+    reads = [site for site in _REVIEWED_READ_CONNECTIONS if site.path in files]
+    escape = WriterIdentity(
+        "src/elspeth/web/sessions/locking.py",
+        "locked_session_transaction",
+        "<sessions-write-connection>",
+        "write_connection",
+        "e938e86c91ec013e",
+        1,
+        "SessionOperationAuthority",
+        line=282,
+        connection_escape=True,
+    )
+
+    assert inventory_drift(live, [*reviewed, *reads, escape]) == ([], [])
+    assert len(reviewed) == 6 and len(reads) == 3
+    assert not any(site.symbol.startswith("create_session_engine.") for site in live), "the factory hook is absorbed"
+    assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
+    writes, stale_reads = subtract_reviewed_read_identities(live, reads)
+    assert stale_reads == []
+    assert connection_authority_violations(writes) == [escape]
+    identity_writers = [site for site in _REVIEWED_WRITERS if site.table == "elspeth_schema_identity"]
+    assert {(site.symbol, site.authority) for site in identity_writers} == {("SessionSchemaAuthority._stamp_on", "SessionSchemaAuthority")}
+    assert Counter(site.operation for site in identity_writers) == Counter({"stamp_sqlite_sentinel": 2, "insert": 1})
+    assert {policy.table: policy.authority for policy in _TABLE_POLICIES}["elspeth_schema_identity"] == "SessionSchemaAuthority"
+    assert reviewed_read_connection_policy_violations(reads) == []

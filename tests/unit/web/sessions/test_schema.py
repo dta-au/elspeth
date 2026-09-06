@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_mock_engine, insert, inspect, text
+from sqlalchemy import create_mock_engine, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import QueuePool
 
@@ -1203,3 +1203,48 @@ def test_validator_accepts_index_unique_true_as_unique_constraint() -> None:
     initialize_session_schema(eng)  # must not raise
 
     del inspector
+
+
+def test_session_schema_authority_stamps_asserts_and_validates_on_an_engine_or_a_connection() -> None:
+    """The schema-management authority behaves identically whether it holds an Engine or a Connection.
+
+    P4-D6 family S moved the three schema-management operations into
+    ``SessionSchemaAuthority`` so the writer inventory can bind them, and the
+    entry points below became thin delegations. The bind arm matters at
+    runtime, not only to the scanner: ``schema_probe`` constructs the
+    authority on a connection it already holds inside a lock, so an
+    Engine-only implementation would deadlock a bounded pool by checking out
+    a second connection. Both arms are exercised here on one database, and
+    the connection arm's stamp is asserted through a SEPARATE connection so
+    it is a committed write rather than a rolled-back one.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from elspeth.web.sessions.engine import create_session_engine
+    from elspeth.web.sessions.models import metadata, schema_identity_table
+    from elspeth.web.sessions.schema import SessionSchemaAuthority
+
+    engine = create_session_engine("sqlite:///:memory:")
+    metadata.create_all(engine)
+
+    SessionSchemaAuthority(engine).stamp_sentinels()
+    SessionSchemaAuthority(engine).assert_sentinels()
+    SessionSchemaAuthority(engine).validate_required_triggers()
+    with engine.connect() as connection:
+        SessionSchemaAuthority(connection).assert_sentinels()
+        SessionSchemaAuthority(connection).validate_required_triggers()
+        assert connection.execute(text("PRAGMA user_version")).scalar_one() == SESSION_SCHEMA_EPOCH
+        identity_rows = connection.execute(select(schema_identity_table)).all()
+    assert len(identity_rows) == 1
+
+    other = create_session_engine("sqlite:///:memory:")
+    metadata.create_all(other)
+    with other.begin() as connection:
+        SessionSchemaAuthority(connection).stamp_sentinels()
+    with other.connect() as connection:
+        assert connection.execute(select(schema_identity_table)).all() == identity_rows
+        assert sa_inspect(connection).get_table_names() == sa_inspect(engine).get_table_names()
+    SessionSchemaAuthority(other).assert_sentinels()
+
+    with pytest.raises(IntegrityError):
+        SessionSchemaAuthority(other).stamp_sentinels()
