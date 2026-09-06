@@ -3227,6 +3227,17 @@ class TestCopyBlobsForFork:
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.blob-fork-custody"),
             )
+            # P4-D6 family A2b: the plan row is a fenced session write, and the
+            # fork CHILD it lands in is archived until settlement — so the
+            # production ``acquire`` path is closed to this scaffold exactly as
+            # it is to the settlement it stands in for. Seed the live fence and
+            # prove it, the same shape the fork settlement holds; the writer's
+            # database-side authority check runs for real against a durable row.
+            child_context = seed_live_compose_context(
+                service._engine,
+                target_session_id,
+                owner_instance_id=session_service.session_operation_owner_instance_id,
+            )
             await session_service.add_message(
                 target_session_id,
                 "audit",
@@ -3250,6 +3261,7 @@ class TestCopyBlobsForFork:
                     separators=(",", ":"),
                 ),
                 writer_principal="session_fork",
+                session_operation_context=child_context,
             )
         with service._engine.begin() as conn:
             conn.execute(sessions_table.update().where(sessions_table.c.id == str(target_session_id)).values(archived_at=now))
@@ -4272,7 +4284,15 @@ class TestCopyBlobsForFork:
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
         )
-        await session_service.add_message(target_session_id, "audit", "{not json", writer_principal="session_fork")
+        # P4-D6 family A2b: the corrupt row still has to be WRITTEN under a
+        # proved operation — the archived fork child forecloses ``acquire``, so
+        # seed the live fence and prove it (see ``_authorize_copy``).
+        corrupt_row_context = seed_live_compose_context(
+            blob_service._engine, target_session_id, owner_instance_id=session_service.session_operation_owner_instance_id
+        )
+        await session_service.add_message(
+            target_session_id, "audit", "{not json", writer_principal="session_fork", session_operation_context=corrupt_row_context
+        )
 
         with pytest.raises(AuditIntegrityError, match="undecodable session_fork audit row"):
             await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
@@ -4296,12 +4316,23 @@ class TestCopyBlobsForFork:
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
         )
+        # P4-D6 family A2b: as above, the archived fork child forecloses
+        # ``acquire``, so these rows prove a seeded live fence.
+        foreign_row_context = seed_live_compose_context(
+            blob_service._engine, target_session_id, owner_instance_id=session_service.session_operation_owner_instance_id
+        )
         for foreign in (
             {"schema": "session-fork-blob-plan.v1"},
             {"schema": "session-fork-blob-plan.v1", "source_session_id": str(session_id), "operation_id": "other"},
             ["session-fork-blob-plan.v1"],
         ):
-            await session_service.add_message(target_session_id, "audit", json.dumps(foreign), writer_principal="session_fork")
+            await session_service.add_message(
+                target_session_id,
+                "audit",
+                json.dumps(foreign),
+                writer_principal="session_fork",
+                session_operation_context=foreign_row_context,
+            )
 
         result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
 

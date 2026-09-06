@@ -3596,6 +3596,7 @@ class _SessionComposerMutations:
             raise ValueError("non-blob ordinary proposal acceptance requires a new state")
 
         service, connection, session_id, transaction_time = self.__state._require_exact()
+        _service, _connection, _session_id, session_context = self.__state._require_active()
         service._assert_session_write_lock_held(
             connection,
             session_id,
@@ -3615,6 +3616,7 @@ class _SessionComposerMutations:
                 ),
                 provenance="tool_call",
                 created_at=transaction_time,
+                session_operation_context=session_context,
             )
 
         connection.execute(
@@ -6016,6 +6018,7 @@ class SessionServiceImpl:
                         audit_rows=bound_audit_rows,
                         sequence_no=sequence_no,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                     conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
                 with self._guided_session_mutation_transaction(
@@ -6105,9 +6108,15 @@ class SessionServiceImpl:
         tool_call_id: str | None,
         parent_assistant_id: str | None,
         created_at: datetime,
+        session_operation_context: SessionOperationContext,
         message_id: str | None = None,
     ) -> str:
         """Single-row insert into ``chat_messages`` with the supplied fields.
+
+        SessionMutationAuthority boundary (P4-D6 family A2b, elspeth-99949c96ca):
+        ``session_operation_context`` is the operation the caller holds over
+        this session (COMPOSE, PROPOSAL or SESSION_FORK) and is proved live on
+        ``conn`` immediately before the INSERT -- there is no unfenced path.
 
         PRECONDITIONS (mechanically enforced — see body):
 
@@ -6152,6 +6161,7 @@ class SessionServiceImpl:
             session_id,
             caller="_insert_chat_message",
         )
+        self._require_session_write_authority_on_connection(conn, session_operation_context, session_id=session_id)
         if role == "tool":
             if parent_assistant_id is None:
                 raise RuntimeError(f"_insert_chat_message: tool row requires parent_assistant_id (session={session_id!r})")
@@ -6218,6 +6228,7 @@ class SessionServiceImpl:
             tool_call_id=None,
             parent_assistant_id=None,
             created_at=created_at,
+            session_operation_context=session_operation_context,
         )
         with self._session_mutations(conn, session_id=session_id, session_operation_context=session_operation_context) as session_mutations:
             session_mutations.mark_session_updated(updated_at=created_at)
@@ -6231,11 +6242,18 @@ class SessionServiceImpl:
         session_id: str,
         payload: StatePayload,
         provenance: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
         state_id: str | None = None,
     ) -> str:
         """Single-row insert into composition_states with per-session
         version allocation under _session_write_lock.
+
+        SessionMutationAuthority boundary (P4-D6 family A2b, elspeth-99949c96ca):
+        ``session_operation_context`` is the operation the caller holds over
+        this session (COMPOSE, PROPOSAL, or SESSION_FORK for the fork child's
+        settlement) and is proved live on ``conn`` immediately before the
+        INSERT -- there is no unfenced path.
 
         Takes a single :class:`StatePayload` carrying
         ``data`` (a :class:`CompositionStateData`) and
@@ -6308,6 +6326,7 @@ class SessionServiceImpl:
             session_id,
             caller="_insert_composition_state",
         )
+        self._require_session_write_authority_on_connection(conn, session_operation_context, session_id=session_id)
         # Unpack the bundled payload once so the rest of the body refers
         # to ``state`` and ``derived_from_state_id`` exactly as it did
         # pre-1B-refactor. This avoids touching the version-allocation
@@ -6565,6 +6584,7 @@ class SessionServiceImpl:
                         tool_call_id=None,
                         parent_assistant_id=None,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
 
                     for offset, tool_row in enumerate(redacted_tool_rows, start=1):
@@ -6588,6 +6608,7 @@ class SessionServiceImpl:
                                 payload=payload,
                                 provenance="tool_call",
                                 created_at=now,
+                                session_operation_context=session_operation_context,
                             )
                             current_state_id = state_id
                         self._insert_chat_message(
@@ -6603,6 +6624,7 @@ class SessionServiceImpl:
                             tool_call_id=tool_row.tool_call_id,
                             parent_assistant_id=assistant_id,
                             created_at=now,
+                            session_operation_context=session_operation_context,
                         )
                         # elspeth-3e28029d2f: a refused mutation's reason
                         # persists unredacted alongside its (redacted) tool
@@ -6872,32 +6894,33 @@ class SessionServiceImpl:
         session_id: UUID,
         title: str,
         *,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> SessionRecord:
-        """Update a session title and return the refreshed record."""
+        """Update a session title under the caller's COMPOSE operation and return the refreshed record."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
         sid = str(session_id)
         now = self._now()
 
         def _write(conn: Connection) -> Any:
-            result = conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(title=title, updated_at=now))
-            if result.rowcount == 0:
+            if conn.execute(select(sessions_table.c.id).where(sessions_table.c.id == sid)).one_or_none() is None:
                 raise SessionNotFoundError(session_id)
+            with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
+                session_mutations.set_title(title=title, updated_at=now)
             return conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
 
         def _sync() -> Any:
-            with self._session_process_locked_begin(sid) as conn:
-                if session_operation_context is None:
-                    return _write(conn)
-                with (
-                    self._session_write_lock(conn, sid),
-                    self._session_composer_mutation_transaction(
-                        conn,
-                        session_id=sid,
-                        session_operation_context=session_operation_context,
-                        expected_kind=SessionOperationKind.COMPOSE,
-                    ),
-                ):
-                    return _write(conn)
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
+                return _write(conn)
 
         row = await self._run_sync(_sync)
         return SessionRecord(
@@ -7825,6 +7848,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=settled_state, derived_from_state_id=derived_from_state_id),
                     provenance="tool_call",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 event_id = str(uuid.uuid4())
                 terminal_payload = _pipeline_accepted_payload(
@@ -8401,6 +8425,7 @@ class SessionServiceImpl:
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution AND patch the affected LLM transform's prompt template.
 
@@ -8456,8 +8481,20 @@ class SessionServiceImpl:
         eid = str(event_id)
         principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
 
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+
         def _sync() -> tuple[InterpretationEventRecord, CompositionStateRecord]:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
                 # Step 1: SELECT pending event, scoped to session.
                 event_row = conn.execute(
                     select(interpretation_events_table)
@@ -8729,23 +8766,23 @@ class SessionServiceImpl:
                 # IntegrityError defensively in case a future refactor
                 # reorders the writes.
                 try:
-                    conn.execute(
-                        update(interpretation_events_table)
-                        .where(interpretation_events_table.c.id == eid)
-                        .where(interpretation_events_table.c.session_id == sid)
-                        .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
-                        .values(
-                            choice=choice.value,
+                    with self._interpretation_mutations(
+                        conn,
+                        session_id=sid,
+                        session_operation_context=session_operation_context,
+                    ) as interpretation_mutations:
+                        interpretation_mutations.resolve_pending_event(
+                            event_id=event_id,
+                            choice=choice,
                             accepted_value=accepted_value,
                             resolved_at=now,
                             actor=actor,
                             arguments_hash=arguments_hash,
                             hash_domain_version="v2",
-                            runtime_model_identifier_at_resolve=runtime_model_identifier,
-                            runtime_model_version_at_resolve=runtime_model_version,
+                            runtime_model_identifier=runtime_model_identifier,
+                            runtime_model_version=runtime_model_version,
                             resolved_prompt_template_hash=resolved_prompt_template_hash,
                         )
-                    )
                 except IntegrityError as exc:
                     # F-28: classify the trigger immutability message
                     # specifically. Any other IntegrityError reraises as-is.
@@ -8779,6 +8816,7 @@ class SessionServiceImpl:
                     ),
                     provenance="interpretation_resolve",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
 
                 resolved_event_row = conn.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == eid)).one()
@@ -9032,7 +9070,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord:
         """Add a chat message and update the session's ``updated_at``.
@@ -9064,8 +9102,8 @@ class SessionServiceImpl:
             raise TypeError("session_operation_kind must be an exact SessionOperationKind")
         if session_operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
             raise ValueError("add_message fenced writes require COMPOSE or PROPOSAL authority")
-        if session_operation_context is None and session_operation_kind is not SessionOperationKind.COMPOSE:
-            raise ValueError("non-COMPOSE add_message writes require exact operation authority")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
         now = self._now()
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
@@ -9106,25 +9144,23 @@ class SessionServiceImpl:
                 tool_call_id=tool_call_id,
                 parent_assistant_id=pid,
                 created_at=now,
+                session_operation_context=session_operation_context,
             )
-            conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+            with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
+                session_mutations.mark_session_updated(updated_at=now)
 
         def _sync() -> None:
-            with self._session_process_locked_begin(sid) as conn:
-                if session_operation_context is None:
-                    with self._session_write_lock(conn, sid):
-                        _write(conn)
-                    return
-                with (
-                    self._session_write_lock(conn, sid),
-                    self._session_composer_mutation_transaction(
-                        conn,
-                        session_id=sid,
-                        session_operation_context=session_operation_context,
-                        expected_kind=session_operation_kind,
-                    ),
-                ):
-                    _write(conn)
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=session_operation_kind,
+                ),
+            ):
+                _write(conn)
 
         await self._run_sync_with_post_commit_projection(
             _sync,
@@ -9260,6 +9296,7 @@ class SessionServiceImpl:
                     tool_call_id=tool_call_id,
                     parent_assistant_id=pid,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._session_mutations(
                     conn, session_id=sid, session_operation_context=session_operation_context
@@ -9724,6 +9761,7 @@ class SessionServiceImpl:
                     provenance=provenance,
                     created_at=now,
                     state_id=str(state_id),
+                    session_operation_context=session_operation_context,
                 )
                 # The prepared packages are executed by the SAME reviewed
                 # interpretation writer the guided settlement uses
@@ -9829,6 +9867,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=state),
                     provenance="post_compose",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 message_record = self._insert_transition_assistant(
                     conn,
@@ -10391,6 +10430,7 @@ class SessionServiceImpl:
                     ),
                     provenance="session_seed",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 state_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == new_state_id)).one()
                 record = self._row_to_state_record(state_row)
@@ -10409,6 +10449,7 @@ class SessionServiceImpl:
                     tool_call_id=None,
                     parent_assistant_id=None,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 response_hash = response_hash_factory(record)
                 with self._guided_session_mutation_transaction(
@@ -10495,6 +10536,7 @@ class SessionServiceImpl:
         audit_rows: tuple[PreparedGuidedAuditRow, ...],
         sequence_no: int | None,
         created_at: datetime,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[ChatMessageRecord, ...]:
         """Insert a prevalidated guided evidence cohort in the caller's transaction."""
 
@@ -10522,6 +10564,7 @@ class SessionServiceImpl:
                 tool_call_id=None,
                 parent_assistant_id=None,
                 created_at=created_at,
+                session_operation_context=session_operation_context,
             )
             records.append(
                 ChatMessageRecord(
@@ -10589,6 +10632,7 @@ class SessionServiceImpl:
                         payload=StatePayload(data=state, derived_from_state_id=None),
                         provenance=provenance,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                     inserted_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                     record = self._row_to_state_record(inserted_row)
@@ -10610,6 +10654,7 @@ class SessionServiceImpl:
                                 parent_assistant_id=None,
                                 created_at=now,
                                 message_id=str(originating_message.message_id),
+                                session_operation_context=session_operation_context,
                             )
                             sequence_no += 1
                         self._insert_prepared_guided_audit_rows_on_connection(
@@ -10619,6 +10664,7 @@ class SessionServiceImpl:
                             audit_rows=audit_rows,
                             sequence_no=sequence_no,
                             created_at=now,
+                            session_operation_context=session_operation_context,
                         )
                         with self._guided_session_mutation_transaction(
                             conn,
@@ -10769,6 +10815,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=state, derived_from_state_id=None),
                     provenance=provenance,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 state_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                 record = self._row_to_state_record(state_row)
@@ -10791,6 +10838,7 @@ class SessionServiceImpl:
                         parent_assistant_id=None,
                         created_at=now,
                         message_id=str(originating_message.message_id),
+                        session_operation_context=session_operation_context,
                     )
                     sequence_no += 1
                 if system_message is not None:
@@ -10809,6 +10857,7 @@ class SessionServiceImpl:
                         tool_call_id=None,
                         parent_assistant_id=None,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                     sequence_no += 1
                 if audit_rows:
@@ -10819,6 +10868,7 @@ class SessionServiceImpl:
                         audit_rows=audit_rows,
                         sequence_no=sequence_no,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                 if row_count:
                     with self._guided_session_mutation_transaction(
@@ -11007,6 +11057,7 @@ class SessionServiceImpl:
                     provenance=command.provenance,
                     created_at=now,
                     state_id=str(command.state_id),
+                    session_operation_context=session_operation_context,
                 )
                 primary_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == inserted_state_id)).one()
                 primary_state = self._row_to_state_record(primary_row)
@@ -11075,6 +11126,7 @@ class SessionServiceImpl:
                         parent_assistant_id=None,
                         created_at=now,
                         message_id=str(originating.message_id),
+                        session_operation_context=session_operation_context,
                     )
                     if retained_deferred_intents:
                         persisted_origin = conn.execute(
@@ -11110,6 +11162,7 @@ class SessionServiceImpl:
                     audit_rows=audit_rows,
                     sequence_no=sequence_no,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
 
                 with self._guided_session_mutation_transaction(
@@ -11345,6 +11398,7 @@ class SessionServiceImpl:
                     provenance="convergence_persist",
                     created_at=now,
                     state_id=str(command.checkpoint_state_id),
+                    session_operation_context=session_operation_context,
                 )
                 checkpoint_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == checkpoint_id)).one()
                 checkpoint = self._row_to_state_record(checkpoint_row)
@@ -11364,6 +11418,7 @@ class SessionServiceImpl:
                     parent_assistant_id=None,
                     created_at=now,
                     message_id=str(command.originating_message.message_id),
+                    session_operation_context=session_operation_context,
                 )
                 originating_message = ChatMessageRecord(
                     id=command.originating_message.message_id,
@@ -11409,6 +11464,7 @@ class SessionServiceImpl:
                     audit_rows=audit_rows,
                     sequence_no=sequence_no + 1,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._guided_session_mutation_transaction(
                     conn,
@@ -11592,6 +11648,7 @@ class SessionServiceImpl:
                     provenance="convergence_persist",
                     created_at=now,
                     state_id=str(command.checkpoint_state_id),
+                    session_operation_context=session_operation_context,
                 )
                 checkpoint_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == checkpoint_id)).one()
                 checkpoint = self._row_to_state_record(checkpoint_row)
@@ -11631,6 +11688,7 @@ class SessionServiceImpl:
                     parent_assistant_id=None,
                     created_at=now,
                     message_id=str(command.originating_message.message_id),
+                    session_operation_context=session_operation_context,
                 )
                 originating_message = ChatMessageRecord(
                     id=command.originating_message.message_id,
@@ -11657,6 +11715,7 @@ class SessionServiceImpl:
                     tool_call_id=None,
                     parent_assistant_id=None,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 decline_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == decline_message_id)).one()
                 decline_message = self._row_to_chat_message_record(decline_row)
@@ -11667,6 +11726,7 @@ class SessionServiceImpl:
                     audit_rows=audit_rows,
                     sequence_no=sequence_no + 2,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 response = project_guided_full_decline(decline_message)
                 projected_json = response_json(response)
@@ -12053,6 +12113,7 @@ class SessionServiceImpl:
                     provenance="convergence_persist",
                     created_at=now,
                     state_id=str(command.checkpoint_state_id),
+                    session_operation_context=session_operation_context,
                 )
                 correction_sequence_no: int | None = None
                 if command.originating_message is not None:
@@ -12071,6 +12132,7 @@ class SessionServiceImpl:
                         parent_assistant_id=None,
                         created_at=now,
                         message_id=str(command.originating_message.message_id),
+                        session_operation_context=session_operation_context,
                     )
                 with self._session_composer_mutation_transaction(
                     conn,
@@ -12111,6 +12173,7 @@ class SessionServiceImpl:
                     audit_rows=audit_rows,
                     sequence_no=sequence_no,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
@@ -12382,6 +12445,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=prepared_state, derived_from_state_id=str(current_record.id)),
                     provenance="convergence_persist",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._guided_session_mutation_transaction(
                     conn,
@@ -12405,6 +12469,7 @@ class SessionServiceImpl:
                     audit_rows=audit_rows,
                     sequence_no=sequence_no,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
@@ -12543,6 +12608,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=state_data, derived_from_state_id=str(current_record.id)),
                     provenance="convergence_persist",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._guided_session_mutation_transaction(
                     conn,
@@ -12772,6 +12838,7 @@ class SessionServiceImpl:
                     audit_rows=prepared,
                     sequence_no=sequence_no,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 with self._guided_session_mutation_transaction(
                     conn,
@@ -12919,6 +12986,7 @@ class SessionServiceImpl:
                     payload=StatePayload(data=prepared_state, derived_from_state_id=str(current_record.id)),
                     provenance="tool_call",
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 result_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                 result_state = self._row_to_state_record(result_row)
@@ -12931,6 +12999,7 @@ class SessionServiceImpl:
                         audit_rows=audit_rows,
                         sequence_no=sequence_no,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                 else:
                     audit_messages = ()
@@ -13707,6 +13776,7 @@ class SessionServiceImpl:
                         provenance="session_fork",
                         created_at=now,
                         state_id=str(command.rewritten_state_id),
+                        session_operation_context=command.authority.child_context,
                     )
                     repointed = conn.execute(
                         update(chat_messages_table)
@@ -13977,7 +14047,7 @@ class SessionServiceImpl:
         *,
         writer_principal: ChatMessageWriterPrincipal,
         composition_state_id: UUID | None = None,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> None:
         """Persist one audit cohort in a single transaction (elspeth-90231248dc).
@@ -14013,8 +14083,8 @@ class SessionServiceImpl:
             raise TypeError("session_operation_kind must be an exact SessionOperationKind")
         if session_operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
             raise ValueError("add_messages_atomic fenced writes require COMPOSE or PROPOSAL authority")
-        if session_operation_context is None and session_operation_kind is not SessionOperationKind.COMPOSE:
-            raise ValueError("non-COMPOSE add_messages_atomic writes require exact operation authority")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
         if not drafts:
             return
         now = self._now()
@@ -14054,25 +14124,23 @@ class SessionServiceImpl:
                     tool_call_id=draft.tool_call_id,
                     parent_assistant_id=draft.parent_assistant_id,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
-            conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+            with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
+                session_mutations.mark_session_updated(updated_at=now)
 
         def _sync() -> None:
-            with self._session_process_locked_begin(sid) as conn:
-                if session_operation_context is None:
-                    with self._session_write_lock(conn, sid):
-                        _write(conn)
-                    return
-                with (
-                    self._session_write_lock(conn, sid),
-                    self._session_composer_mutation_transaction(
-                        conn,
-                        session_id=sid,
-                        session_operation_context=session_operation_context,
-                        expected_kind=session_operation_kind,
-                    ),
-                ):
-                    _write(conn)
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=session_operation_kind,
+                ),
+            ):
+                _write(conn)
 
         def _project(_result: None) -> None:
             for draft in drafts:
@@ -14154,3 +14222,56 @@ class SessionServiceImpl:
             yield _RepositorySessionMutations(state)
         finally:
             state._close()
+
+    @contextlib.contextmanager
+    def _interpretation_mutations(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> Iterator[_RepositoryInterpretationMutations]:
+        """Yield the repository's interpretation facet over the caller's fenced COMPOSE transaction (P4-D6 family A2b)."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        state = _RepositoryMutationState(
+            conn,
+            session_id=session_id,
+            database_now=self._guided_database_now(conn),
+            operation_context=session_operation_context,
+        )
+        try:
+            yield _RepositoryInterpretationMutations(state)
+        finally:
+            state._close()
+
+    def _require_session_write_authority_on_connection(
+        self,
+        conn: Connection,
+        context: SessionOperationContext,
+        *,
+        session_id: str,
+    ) -> None:
+        """Prove, on ``conn``, that ``context`` is a live operation over ``session_id`` that may write its rows.
+
+        The SessionMutationAuthority proof of the two shared row writers
+        (P4-D6 family A2b): an exact COMPOSE, PROPOSAL or SESSION_FORK context
+        whose fence row is live and unreleased for exactly this session. Any
+        other kind, a released or foreign fence, or a non-context raises before
+        a row is written.
+        """
+        if type(context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if context.operation_kind not in {
+            SessionOperationKind.COMPOSE,
+            SessionOperationKind.PROPOSAL,
+            SessionOperationKind.SESSION_FORK,
+        }:
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        self._require_session_operation_context_on_connection(
+            conn,
+            context,
+            session_id=session_id,
+            expected_kind=context.operation_kind,
+            now=self._guided_database_now(conn),
+        )

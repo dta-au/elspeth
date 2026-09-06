@@ -56,26 +56,33 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
     postgres_engine: Engine,
 ) -> None:
     session = await postgres_service.create_session("alice", "PG stale reader", "local")
-    await postgres_service.add_message(
-        session.id,
-        "user",
-        "seed",
-        writer_principal="route_user_message",
-    )
 
     def _count(conn) -> int:
         return conn.execute(
             select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))
         ).scalar_one()
 
-    stale_reader = postgres_engine.connect().execution_options(isolation_level="REPEATABLE READ")
+    # P4-D6 family A2b: the seed row is a fenced session write too, so the
+    # turn's COMPOSE operation is acquired BEFORE it and both writes run under
+    # the one operation, as they do on the live route. The stale reader's
+    # snapshot is pinned by its first read below, not by connecting, so the
+    # earlier acquire does not change what this test measures.
     context = postgres_service.session_operation_authority.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
         owner_instance_id=postgres_service.session_operation_owner_instance_id,
         lease_seconds=postgres_service.session_operation_lease_seconds,
     )
+    stale_reader = postgres_engine.connect().execution_options(isolation_level="REPEATABLE READ")
     try:
+        await postgres_service.add_message(
+            session.id,
+            "user",
+            "seed",
+            writer_principal="route_user_message",
+            session_operation_context=context,
+        )
+
         # First read begins the transaction and pins the snapshot at one
         # seed row — the pooled-stale-reader condition from production.
         assert _count(stale_reader) == 1

@@ -41,8 +41,9 @@ from elspeth.web.composer.tutorial_models import (
     TutorialRunResponse,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
@@ -749,10 +750,33 @@ async def cleanup_tutorial_orphans(
             break
         for session in sessions:
             if session.title == _TUTORIAL_PENDING_SESSION_TITLE and str(session.id) != resumable_session_id:
-                await session_service.update_session_title(
-                    session.id,
-                    abandoned_title,
-                )
+                # The rename is a fenced session write (P4-D6 family A2b):
+                # it holds the same COMPOSE operation the message writers
+                # hold, so a session mid-compose is not renamed underneath
+                # its owner. A session that cannot be claimed is SKIPPED
+                # rather than allowed to abort the sweep: a live operation
+                # means the session is in use, not abandoned, and a fence
+                # that vanished between the listing and the claim means the
+                # session is already gone. Neither is a cleanup failure, and
+                # neither may cost the remaining orphans their sweep --
+                # letting either propagate would turn one busy session into a
+                # 409/404 on fresh tutorial entry.
+                try:
+                    lease = await SessionOperationLease.acquire(
+                        session_service.session_operation_authority,
+                        session_id=session.id,
+                        operation_kind=SessionOperationKind.COMPOSE,
+                        owner_instance_id=session_service.session_operation_owner_instance_id,
+                        lease_seconds=session_service.session_operation_lease_seconds,
+                    )
+                except (SessionOperationConflictError, SessionOperationFenceLost):
+                    continue
+                async with lease as compose_operation_lease:
+                    await session_service.update_session_title(
+                        session.id,
+                        abandoned_title,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 deleted_count += 1
         if len(sessions) < limit:
             break

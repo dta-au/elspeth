@@ -4428,6 +4428,7 @@ class ComposerServiceImpl:
         llm_calls: tuple[ComposerLLMCall, ...],
         planner_attempts: tuple[ComposerPlannerAttempt, ...],
         invocations: tuple[ComposerToolInvocation, ...],
+        session_operation_context: SessionOperationContext | None,
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority.
 
@@ -4473,12 +4474,17 @@ class ComposerServiceImpl:
                     tool_calls=(envelope,),
                 )
             )
+        # Fenced session write (P4-D6 family A2b): the planner evidence carries
+        # the compose operation the staging turn runs under.
+        if session_operation_context is None:
+            raise TypeError("pipeline planner audit requires the turn's session_operation_context")
         try:
             await sessions.add_messages_atomic(
                 session_id,
                 tuple(drafts),
                 composition_state_id=current_state_id,
                 writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
             )
         except SQLAlchemyError as exc:
             raise AuditIntegrityError("pipeline planner audit persistence failed before proposal creation") from exc
@@ -4615,6 +4621,7 @@ class ComposerServiceImpl:
             llm_calls=planner_llm_calls,
             planner_attempts=planner_attempts,
             invocations=planner_invocations,
+            session_operation_context=session_operation_context,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -4884,6 +4891,7 @@ class ComposerServiceImpl:
                 llm_calls=recorder.llm_calls[planner_llm_start:],
                 planner_attempts=recorder.planner_attempts[planner_attempt_start:],
                 invocations=recorder.invocations[planner_invocation_start:],
+                session_operation_context=session_operation_context,
             )
             decline_message = declined.decline_text.strip() or (
                 "I could not find a way to build this pipeline with the available components."
@@ -4908,6 +4916,7 @@ class ComposerServiceImpl:
                     llm_calls=attached_calls,
                     planner_attempts=attached_attempts,
                     invocations=recorder.invocations[planner_invocation_start:],
+                    session_operation_context=session_operation_context,
                 ),
                 deferred=exc if type(exc) is asyncio.CancelledError else None,
             )
@@ -5227,12 +5236,17 @@ class ComposerServiceImpl:
                 # Audit publication is a precondition of the provider-visible
                 # intervention. A storage failure propagates before the hint is
                 # appended, so the model can never act on unrecorded control.
+                # The row is a fenced session write (P4-D6 family A2b): it
+                # carries the compose operation this turn runs under.
+                if session_operation_context is None:
+                    raise TypeError("compose audit hint requires the turn's session_operation_context")
                 await self._require_sessions_service().add_message(
                     UUID(session_id),
                     "audit",
                     hint_text,
                     writer_principal="compose_loop",
                     tool_calls=[anti_anchor_control_envelope(hint_text)],
+                    session_operation_context=session_operation_context,
                 )
             anti_anchor.consume_fire()
             llm_messages.append({"role": "user", "content": hint_text})
@@ -6327,12 +6341,17 @@ class ComposerServiceImpl:
             # hint, audit publication is a precondition of the
             # provider-visible intervention.
             if session_id is not None:
+                # Fenced session write (P4-D6 family A2b): the disclosure row
+                # carries the compose operation this turn runs under.
+                if session_operation_context is None:
+                    raise TypeError("advisor disclosure requires the turn's session_operation_context")
                 await self._require_sessions_service().add_message(
                     UUID(session_id),
                     "audit",
                     _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
                     writer_principal="compose_loop",
                     tool_calls=[advisor_signoff_withheld_control_envelope(_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE)],
+                    session_operation_context=session_operation_context,
                 )
             # R2-F14: ``failure_class`` is READ here rather than every
             # ``ok=False`` being labelled "unavailable". Only the EXACT value

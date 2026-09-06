@@ -60,6 +60,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.execution.schemas import (
     CHECK_ADVISOR_SIGNOFF,
     ValidationError,
@@ -181,6 +182,26 @@ def test_terminal_gate_docstring_scopes_user_constraint_comparison_to_supplied_e
     assert "compare the supplied pipeline evidence" in normalized
     assert "verify the pipeline" not in normalized
     assert "signed off" not in normalized
+
+
+def _compose_context(session_id: str) -> SessionOperationContext:
+    """The COMPOSE operation the turn under test runs under (P4-D6 family A2b).
+
+    A terminal END-gate block persists a durable withheld-turn disclosure, and
+    that row is a fenced session write: the gate carries the turn's operation
+    rather than writing unfenced. Tests that drive the gate WITH a session
+    supply the same pairing production does — a session id and the operation
+    held over it.
+    """
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=session_id,
+            operation_id=f"advisor-checkpoint-{session_id}",
+            lease_token=f"advisor-checkpoint-token-{session_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 def _mock_catalog() -> MagicMock:
@@ -2309,12 +2330,14 @@ async def drive_try_terminate(
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
+    session_id = str(uuid.uuid4())
     return await service._try_terminate_no_tools(
         assistant_message=_AssistantMessage(),
         message=message,
         llm_messages=[] if llm_messages is None else llm_messages,
         state=state,
-        session_id=str(uuid.uuid4()),
+        session_id=session_id,
+        session_operation_context=_compose_context(session_id),
         current_state_id="cs1",
         initial_version=initial_version,
         user_id="alice",
@@ -2503,9 +2526,11 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
 
+    gate_session_id = str(uuid.uuid4())
     outcome = await service._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
-        session_id=str(uuid.uuid4()),
+        session_id=gate_session_id,
+        session_operation_context=_compose_context(gate_session_id),
         current_state_id="cs1",
         assistant_message=_AssistantMessage(),
         llm_messages=[],
@@ -4221,6 +4246,7 @@ async def test_end_gate_terminal_block_persists_withheld_disclosure_before_retur
     outcome = await service._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
         session_id=session_id,
+        session_operation_context=_compose_context(session_id),
         current_state_id="cs1",
         assistant_message=_AssistantMessage(),
         llm_messages=[],
@@ -4341,28 +4367,34 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
         readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
     )
 
-    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
-        state=clean_runnable_state,
-        session_id=str(session.id),
-        current_state_id=None,
-        assistant_message=_AssistantMessage(),
-        llm_messages=[],
-        recorder=make_recorder(),
-        progress=None,
-        advisor_checkpoint_passes_used=0,
-        repair_turns_used=0,
-        persisted_assistant_message_id=None,
-        persisted_assistant_content=None,
-        persisted_tool_call_turn=False,
-        allow_repair_continue=False,
-        runtime_preflight=runtime_preflight,
-        user_message=contradiction,
-        user_id="alice",
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
-        initial_version=1,
-        session_scope="s1",
-        plugin_snapshot=None,
-    )
+    # This harness holds a REAL sessions service, so the disclosure row the
+    # gate persists goes through the live fence: the turn runs under a real
+    # acquired COMPOSE operation, released before the route's own trailing
+    # assistant write below (P4-D6 family A2b).
+    async with sessions._call_context(session.id, SessionOperationKind.COMPOSE) as compose_context:
+        outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+            state=clean_runnable_state,
+            session_id=str(session.id),
+            session_operation_context=compose_context,
+            current_state_id=None,
+            assistant_message=_AssistantMessage(),
+            llm_messages=[],
+            recorder=make_recorder(),
+            progress=None,
+            advisor_checkpoint_passes_used=0,
+            repair_turns_used=0,
+            persisted_assistant_message_id=None,
+            persisted_assistant_content=None,
+            persisted_tool_call_turn=False,
+            allow_repair_continue=False,
+            runtime_preflight=runtime_preflight,
+            user_message=contradiction,
+            user_id="alice",
+            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            initial_version=1,
+            session_scope="s1",
+            plugin_snapshot=None,
+        )
     assert outcome.action == "return"
     result = outcome.result
     # Persist the terminal assistant row exactly as the route does

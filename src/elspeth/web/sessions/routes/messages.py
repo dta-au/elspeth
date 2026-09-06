@@ -418,7 +418,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -450,7 +457,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -477,7 +491,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail=_litellm_error_detail(
@@ -625,6 +646,7 @@ def register_message_routes(router: APIRouter) -> None:
                         service,
                         session.id,
                         compose_base_state_id,
+                        session_operation_context=compose_operation_lease.context,
                     )
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
                 except ComposerServiceError as exc:
@@ -640,7 +662,14 @@ def register_message_routes(router: APIRouter) -> None:
                     )
                     llm_calls = _llm_calls_from_exception(exc)
                     if llm_calls:
-                        await _persist_llm_calls(service, session.id, llm_calls, compose_base_state_id, plugin_crash_pending=True)
+                        await _persist_llm_calls(
+                            service,
+                            session.id,
+                            llm_calls,
+                            compose_base_state_id,
+                            plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
+                        )
                     raise HTTPException(
                         status_code=502,
                         detail={"error_type": "composer_error", "detail": str(exc)},
@@ -666,6 +695,7 @@ def register_message_routes(router: APIRouter) -> None:
                             llm_calls,
                             compose_base_state_id,
                             plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
                         )
                 _compose_result = result
 
@@ -897,6 +927,7 @@ def register_message_routes(router: APIRouter) -> None:
                         composition_state_id=post_compose_state_id,
                         raw_content=_turn_end.raw_content,
                         writer_principal="compose_loop",
+                        session_operation_context=compose_operation_lease.context,
                     )
                 # 6b. Persist per-tool-call audit trail. Each ComposerToolInvocation
                 # lands as one role=tool chat message linked to the post-compose
@@ -914,6 +945,7 @@ def register_message_routes(router: APIRouter) -> None:
                     llm_composition_state_id=compose_base_state_id,
                     parent_assistant_id=assistant_msg.id,
                     plugin_crash_pending=False,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 await _publish_progress(
                     progress_sink,
@@ -1021,6 +1053,7 @@ def register_message_routes(router: APIRouter) -> None:
                                 llm_calls,
                                 compose_base_state_id,
                                 plugin_crash_pending=True,
+                                session_operation_context=compose_operation_lease.context,
                             )
                         )
                 with contextlib.suppress(asyncio.CancelledError):

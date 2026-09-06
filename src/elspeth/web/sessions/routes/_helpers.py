@@ -1701,7 +1701,7 @@ async def _persist_tool_invocations(
     *,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
-    session_operation_context: SessionOperationContext | None = None,
+    session_operation_context: SessionOperationContext,
     session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Persist per-tool-call audit records, splitting role by parent presence.
@@ -1851,7 +1851,7 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
-    session_operation_context: SessionOperationContext | None = None,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
 
@@ -1928,6 +1928,7 @@ async def _persist_turn_audit_cohort(
     llm_composition_state_id: UUID | None,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
+    session_operation_context: SessionOperationContext,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
 
@@ -1995,6 +1996,7 @@ async def _persist_turn_audit_cohort(
             tuple(drafts),
             composition_state_id=None,
             writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
         )
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
@@ -2691,6 +2693,8 @@ async def _handle_planner_failure(
     service: SessionServiceProtocol,
     session_id: UUID,
     llm_composition_state_id: UUID | None,
+    *,
+    session_operation_context: SessionOperationContext,
 ) -> tuple[int, dict[str, object]]:
     """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
 
@@ -2736,6 +2740,7 @@ async def _handle_planner_failure(
         tool_calls=[envelope],
         composition_state_id=llm_composition_state_id,
         writer_principal="compose_loop",
+        session_operation_context=session_operation_context,
     )
     return status_code, {
         "error_type": "composer_planner_failure",
@@ -2920,6 +2925,7 @@ async def _handle_convergence_error(
         tool_composition_state_id=persisted_state_id,
         llm_composition_state_id=llm_composition_state_id,
         plugin_crash_pending=True,
+        session_operation_context=session_operation_context,
     )
     return response_body
 
@@ -3088,6 +3094,7 @@ async def _handle_plugin_crash(
         tool_composition_state_id=persisted_state_id_pc,
         llm_composition_state_id=llm_composition_state_id,
         plugin_crash_pending=True,
+        session_operation_context=session_operation_context,
     )
     return response_body
 
@@ -3328,6 +3335,7 @@ async def _handle_runtime_preflight_failure(
         tool_composition_state_id=persisted_state_id_rpf,
         llm_composition_state_id=llm_composition_state_id,
         plugin_crash_pending=True,
+        session_operation_context=session_operation_context,
     )
     return response_body
 
