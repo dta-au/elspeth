@@ -3032,7 +3032,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2b52f58624e1e33d",
         1,
         None,
-        line=653,
+        line=662,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -3043,7 +3043,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1041,
+        line=1050,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -3054,7 +3054,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1066,
+        line=1075,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
