@@ -15,13 +15,12 @@ from sqlalchemy import delete, event, insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import Executable, Select
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
-from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema_contract import SchemaContract
@@ -382,9 +381,8 @@ def test_postgres_decided_outcome_winning_finalize_race_is_not_abandoned(
             assert outcome_locked.wait(timeout=5), "decided writer never acquired its token lock"
             finalize_future = pool.submit(
                 first_factory.run_lifecycle.finalize_run,
-                run_id,
                 RunStatus.FAILED,
-                token=CoordinationToken(run_id=run_id, worker_id=leader_worker_id, leader_epoch=1),
+                coordination_token=leader_coordination_token(first_factory, run_id),
             )
             assert attempted.wait(timeout=5), "finalizer never attempted its token lock"
             _assert_postgres_backend_waits_on_lock(first_db, backend["pid"])
@@ -464,9 +462,8 @@ def test_postgres_finalize_winning_outcome_race_refuses_late_decision(
         with ThreadPoolExecutor(max_workers=2) as pool:
             finalize_future = pool.submit(
                 first_factory.run_lifecycle.finalize_run,
-                run_id,
                 RunStatus.FAILED,
-                token=CoordinationToken(run_id=run_id, worker_id=leader_worker_id, leader_epoch=1),
+                coordination_token=leader_coordination_token(first_factory, run_id),
             )
             assert abandonment_inserted.wait(timeout=5), "finalizer never inserted ABANDONED"
             outcome_future = pool.submit(attempt_decision)
