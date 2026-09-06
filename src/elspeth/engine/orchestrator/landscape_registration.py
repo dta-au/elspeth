@@ -30,6 +30,7 @@ from elspeth.contracts.types import CollectorName, NodeID, SinkName
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.core.dag import ExecutionGraph
@@ -219,6 +220,7 @@ def record_schema_contract(
     ctx: PluginContext,
     *,
     active_source: SourceProtocol,
+    coordination_token: CoordinationToken,
 ) -> bool:
     """Record source schema contract if available.
 
@@ -238,9 +240,9 @@ def record_schema_contract(
     # the single authoritative writer/reader for resume contracts. Do not also
     # write the legacy run-level singleton surface.
     factory.run_lifecycle.update_run_source_contract(
-        run_id=run_id,
         source_node_id=source_id,
         schema_contract=schema_contract,
+        coordination_token=coordination_token,
     )
     # Update source node's output_contract (was NULL at registration)
     factory.data_flow.update_node_output_contract(run_id, source_id, schema_contract)

@@ -22,6 +22,7 @@ from elspeth.contracts.audit_export import (
     IterableBoundAuditExportContentReader,
     RegisteredAuditExportContent,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -47,7 +48,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import audit_export_snapshots_table, runs_table, sink_effects_table
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
 from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, register_test_node
 
 _COMPLETED_AT = datetime(2026, 7, 16, 7, 8, 9, 123456, tzinfo=UTC)
 
@@ -179,6 +180,9 @@ def _insert_terminal_run(db: LandscapeDB, run_id: str = "run-export") -> None:
                 openrouter_catalog_source="bundled",
             )
         )
+        # A run written by raw SQL has no seat; the export re-drive takes the
+        # lapsed seat a crashed leader leaves (ADR-048 §4), so mint that image.
+        insert_crashed_leader_seat(connection, run_id=run_id)
 
 
 def _config(**overrides: object) -> LandscapeExportSettings:
@@ -1020,7 +1024,17 @@ def test_resume_audit_export_adopts_completion_won_during_admission(
         _set_export_status_row(db, "run-export", "pending")
 
         def complete_during_target_check(*_args: object, **_kwargs: object) -> None:
-            RecorderFactory(db).run_lifecycle.set_export_status("run-export", ExportStatus.COMPLETED)
+            # The peer that wins is an export leader in its own right: it takes
+            # the lapsed seat, completes under it, and vacates it (ADR-048 §4).
+            # The delayed loser then takes the vacant seat and must adopt.
+            repositories = RecorderFactory(db)
+            peer_token = repositories.run_coordination.acquire_export_leadership(
+                run_id="run-export",
+                worker_id="audit-export-peer",
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            )
+            repositories.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=peer_token)
+            repositories.run_coordination.release_seat(token=peer_token)
             return None
 
         monkeypatch.setattr(export_module, "_audit_export_resume_target_refusal", complete_during_target_check)
@@ -1077,7 +1091,9 @@ def test_resume_audit_export_only_adopts_peer_completion_for_lease_contention(
         _set_export_status_row(db, "run-export", "failed", "retry me")
 
         def completed_peer_then_fail(*_args: object, **_kwargs: object) -> None:
-            RecorderFactory(db).run_lifecycle.set_export_status("run-export", ExportStatus.COMPLETED)
+            RecorderFactory(db).run_lifecycle.set_export_status(
+                ExportStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), "run-export")
+            )
             if lease_contention:
                 raise SinkEffectLeaseHeld("peer still owns the sink-effect lease")
             raise RuntimeError("unrelated export corruption")

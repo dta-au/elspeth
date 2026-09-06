@@ -276,7 +276,7 @@ class TestResumeFinalizesAsFailed:
     This blocked future resume attempts since recovery rejects RUNNING status.
 
     Fix: Added `except Exception` handler in resume() that calls
-    recorder.finalize_run(run_id, status=RunStatus.FAILED).
+    recorder.finalize_run(status=RunStatus.FAILED, leader_coordination_token(factory, run_id)).
     """
 
     def test_reconstruct_resume_state_refuses_incompatible_checkpoint_before_snapshot_work(self) -> None:
@@ -396,7 +396,8 @@ class TestResumeFinalizesAsFailed:
         found_failed = False
         for call in finalize_calls:
             args, kwargs = call
-            status = kwargs.get("status", args[1] if len(args) > 1 else None)
+            # finalize_run(status, *, coordination_token) — ADR-048: the run is the token's
+            status = args[0] if args else kwargs.get("status")
             if status == RunStatus.FAILED:
                 found_failed = True
                 break
@@ -1087,6 +1088,7 @@ class TestResumeFinalizesAsFailed:
                 config,
                 MagicMock(spec=ExecutionGraph),
                 payload_store=MagicMock(spec=PayloadStore),
+                coordination_token=CoordinationToken(run_id="run-fresh-preflight-interrupt", worker_id="worker:test", leader_epoch=1),
             )
 
         assert exc_info.value is preflight_error
@@ -1268,6 +1270,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="refunds",
                 active_source=source,
                 flush_end_of_input=True,
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:test", leader_epoch=1),
             )
 
         assert events == ["record:loading", "load", "process"]
@@ -1332,6 +1335,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="rows",
                 active_source=source,
                 shutdown_event=shutdown,
+                coordination_token=CoordinationToken(run_id="run-row-union-boundary", worker_id="worker:test", leader_epoch=1),
             )
 
         assert shutdown.is_set()
@@ -1408,6 +1412,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="rows",
                 active_source=source,
                 shutdown_event=shutdown,
+                coordination_token=CoordinationToken(run_id="run-row-union-idle", worker_id="worker:test", leader_epoch=1),
             )
 
         assert idle_sweep_seen.is_set()
@@ -1547,6 +1552,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="refunds",
                 active_source=source,
                 flush_end_of_input=True,
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:test", leader_epoch=1),
             )
 
         assert events == ["record:loading", "load", "process", "record:exhausted", "eof_flush"]
@@ -1616,6 +1622,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="refunds",
                 active_source=source,
                 flush_end_of_input=True,
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:test", leader_epoch=1),
             )
 
         assert events == ["source_contract", "node_contract", "process"]
@@ -1670,6 +1677,7 @@ class TestResumeFinalizesAsFailed:
                 config,
                 MagicMock(spec=ExecutionGraph),
                 payload_store=MagicMock(spec=PayloadStore),
+                coordination_token=CoordinationToken(run_id="run-stuck-scheduler", worker_id="worker:test", leader_epoch=1),
             )
 
         assert isinstance(exc_info.value.__cause__, OrchestrationInvariantError)
@@ -1907,7 +1915,7 @@ class TestResumeFinalizesAsFailed:
 
         assert result.status == RunStatus.COMPLETED
         assert result.rows_processed == 3
-        mock_factory.run_lifecycle.finalize_run.assert_called_once_with(run_id, status=RunStatus.COMPLETED, token=coordination_token)
+        mock_factory.run_lifecycle.finalize_run.assert_called_once_with(RunStatus.COMPLETED, coordination_token=coordination_token)
 
     def test_resume_with_only_journal_barrier_work_does_not_early_complete(self) -> None:
         """THE F1 TASK 3.2 TRAP: fully-buffered crashed run must not early-complete.

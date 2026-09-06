@@ -15,6 +15,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
@@ -97,6 +98,16 @@ class _LifecycleContext:
     landscape: _LandscapeRecorder = field(default_factory=_LandscapeRecorder)
     telemetry_emit: _TelemetryRecorder = field(default_factory=_TelemetryRecorder)
     rate_limit_registry: object | None = None
+    # Carried by value from the executor (ADR-048 §3); the fake models the real forwarder.
+    coordination_token: CoordinationToken | None = field(
+        default_factory=lambda: CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
+    )
+
+    def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
+        assert self.coordination_token is not None
+        self.landscape.record_readiness_check(
+            name=name, collection=collection, reachable=reachable, count=count, message=message, coordination_token=self.coordination_token
+        )
 
 
 def _mock_ctx(state_id="state-1"):

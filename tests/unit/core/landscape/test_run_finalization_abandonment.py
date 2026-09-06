@@ -31,7 +31,7 @@ from elspeth.contracts.sink_effects import SinkEffectMemberCandidate
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_effect_members
 from elspeth.core.landscape.schema import RunSourceLifecycleState, operations_table, runs_table, token_outcomes_table
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 _TOPOLOGY_HASH = "a" * 64
@@ -57,12 +57,12 @@ def _setup_run_with_tokens(
     """Run + registered source + ``token_count`` undecided tokens."""
     setup = make_recorder_with_run(run_id="run-adr038", leader_worker_id=_LEADER_WORKER_ID)
     setup.factory.run_lifecycle.record_run_source(
-        run_id=setup.run_id,
         source_node_id=setup.source_node_id,
         source_name="primary",
         plugin_name="source",
         config_hash="c" * 64,
         lifecycle_state=lifecycle_state,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
     if with_checkpoint:
         CheckpointManager(setup.db).create_checkpoint(
@@ -125,7 +125,7 @@ class TestAbandonmentSweepFires:
     def test_incomplete_source_arm_abandons_undecided_tokens(self) -> None:
         setup, token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=True)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         rows = _abandoned_rows(setup)
         assert [row.token_id for row in rows] == sorted(token_ids)
@@ -149,7 +149,7 @@ class TestAbandonmentSweepFires:
     def test_no_checkpoint_arm_abandons_despite_complete_sources(self) -> None:
         setup, token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.EXHAUSTED, with_checkpoint=False)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         rows = _abandoned_rows(setup)
         assert len(rows) == len(token_ids)
@@ -163,7 +163,7 @@ class TestAbandonmentSweepFires:
             setup.run_id, setup.source_node_id, 0, {"value": 0}, source_row_index=0, ingest_sequence=0
         )
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         rows = _abandoned_rows(setup)
         assert [row.token_id for row in rows] == [token.token_id]
@@ -173,7 +173,7 @@ class TestAbandonmentSweepFires:
     def test_interrupted_finalize_sweeps_like_failed(self) -> None:
         setup, token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=True)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.INTERRUPTED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.INTERRUPTED, coordination_token=_leader_token(setup))
 
         rows = _abandoned_rows(setup)
         assert len(rows) == len(token_ids)
@@ -190,7 +190,7 @@ class TestAbandonmentSweepFires:
             error_hash="e" * 64,
         )
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         rows = _abandoned_rows(setup)
         assert [row.token_id for row in rows] == [token_ids[1]]
@@ -200,11 +200,13 @@ class TestAbandonmentSweepFires:
         not duplicate abandonment records: the sweep's WHERE excludes tokens
         already bearing one."""
         setup, token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=True)
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
         assert len(_abandoned_rows(setup)) == len(token_ids)
 
-        setup.factory.run_lifecycle.update_run_status(setup.run_id, RunStatus.RUNNING)
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.update_run_status(
+            RunStatus.RUNNING, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+        )
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         assert len(_abandoned_rows(setup)) == len(token_ids)
 
@@ -223,7 +225,7 @@ class TestAbandonmentSweepFires:
         )
         operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="open")
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []
         operation = setup.factory.execution.get_operation(operation_id)
@@ -258,7 +260,7 @@ class TestAbandonmentSweepFires:
                 .values(status="pending", completed_at=pending_at, duration_ms=3.0)
             )
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.INTERRUPTED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.INTERRUPTED, coordination_token=_leader_token(setup))
 
         by_id = {item.operation_id: item for item in setup.factory.execution.get_operations_for_run(setup.run_id)}
         assert by_id[open_id].status == "failed"
@@ -284,7 +286,7 @@ class TestAbandonmentSweepFires:
         monkeypatch.setattr(setup.factory.run_lifecycle._operations_repo, "fail_open_effect_operations_for_run", fail_sweep)
 
         with pytest.raises(RuntimeError, match="injected operation sweep failure"):
-            setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+            setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         with setup.db.read_only_connection() as conn:
             run_row = conn.execute(select(runs_table).where(runs_table.c.run_id == setup.run_id)).one()
@@ -300,7 +302,7 @@ class TestAbandonmentSweepFires:
             with_checkpoint=True,
             token_count=1,
         )
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         with pytest.raises(AuditIntegrityError, match="decided-plus-abandoned history is forbidden"):
             setup.factory.data_flow.record_token_outcome(
@@ -323,7 +325,7 @@ class TestAbandonmentSweepStaysSilent:
         tokens; abandoning them would be a false record."""
         setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.EXHAUSTED, with_checkpoint=True)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []
 
@@ -335,7 +337,7 @@ class TestAbandonmentSweepStaysSilent:
         )
         operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="resumable")
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         operation = setup.factory.execution.get_operation(operation_id)
         assert operation is not None and operation.status == "open"
@@ -343,18 +345,7 @@ class TestAbandonmentSweepStaysSilent:
     def test_loaded_lifecycle_also_counts_complete(self) -> None:
         setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADED, with_checkpoint=True)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
-
-        assert _abandoned_rows(setup) == []
-
-    def test_tokenless_finalize_never_sweeps(self) -> None:
-        """A token-less finalize runs UNFENCED (plain write_connection) —
-        e.g. the web orphan reaper stamping INTERRUPTED over a RUNNING-stale
-        run. An unfenced sweep could abandon tokens of a run a live leader
-        is still driving, so these paths deliberately under-abandon."""
-        setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=True)
-
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.INTERRUPTED)
+        setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []
 
@@ -363,6 +354,6 @@ class TestAbandonmentSweepStaysSilent:
         accounting to surface — sweeping it under ABANDONED would hide it."""
         setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=False)
 
-        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.COMPLETED, token=_leader_token(setup))
+        setup.factory.run_lifecycle.finalize_run(RunStatus.COMPLETED, coordination_token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []

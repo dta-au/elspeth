@@ -57,6 +57,7 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts import Determinism, PipelineRow, RunStatus, SourceRow, TokenInfo
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, OutputMode
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -573,6 +574,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
                 active_source_name="fake",
                 active_source=source,
                 flush_end_of_input=False,
+                coordination_token=CoordinationToken(run_id="run-quarantine-coalesce", worker_id="worker:test", leader_epoch=1),
             )
 
         assert resolutions == [False, True, False], (

@@ -37,7 +37,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.strategies.json import row_data
 
 # =============================================================================
@@ -168,7 +168,9 @@ class TestRunRecordingProperties:
         factory = make_factory(db)
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
-        completed = factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.COMPLETED)
+        completed = factory.run_lifecycle.complete_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         assert completed.status == RunStatus.COMPLETED
         assert completed.completed_at is not None, "completed_at should be set"
@@ -186,7 +188,7 @@ class TestRunRecordingProperties:
         factory = make_factory(db)
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
-        completed = factory.run_lifecycle.complete_run(run.run_id, status=status)
+        completed = factory.run_lifecycle.complete_run(status=status, coordination_token=leader_coordination_token(factory, run.run_id))
 
         assert completed.status == status
         retrieved = factory.run_lifecycle.get_run(run.run_id)

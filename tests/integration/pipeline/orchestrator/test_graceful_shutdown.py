@@ -971,12 +971,12 @@ class TestInterruptAndResume:
         # The source lifecycle is INTERRUPTED — mirroring a shutdown mid-load
         # — making this run structurally non-resumable (ADR-038).
         setup.factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id=setup.source_node_id,
             source_name="primary",
             plugin_name="json",
             config_hash="c" * 64,
             lifecycle_state=RunSourceLifecycleState.INTERRUPTED,
+            coordination_token=leader_coordination_token(setup.factory, run_id),
         )
 
         row, token = setup.factory.data_flow.create_row_with_token(
@@ -1036,9 +1036,8 @@ class TestInterruptAndResume:
         assert path_fork_group_id(lineage) is not None
 
         setup.factory.run_lifecycle.finalize_run(
-            run_id,
             RunStatus.INTERRUPTED,
-            token=leader_coordination_token(setup.factory, run_id),
+            coordination_token=leader_coordination_token(setup.factory, run_id),
         )
 
         # (2) finalize never touches token_work_items — the journal row is

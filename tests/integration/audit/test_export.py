@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from elspeth.contracts import NodeStateStatus, NodeType, RoutingMode, RunStatus
 from elspeth.contracts.schema import SchemaConfig
+from tests.fixtures.landscape import leader_coordination_token
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -328,7 +329,7 @@ class TestSignedExportDeterminism:
                 duration_ms=5.0,
             )
 
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Export the SAME run twice with signing
         signing_key = b"test-determinism-key-12345"

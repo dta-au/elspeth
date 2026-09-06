@@ -66,7 +66,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -1163,7 +1163,7 @@ class TestAggregationRecoveryIntegration:
 
         # Simulate crash during flush
         factory.execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # === PHASE 2: Verify recovery is possible ===
 
@@ -1271,7 +1271,7 @@ class TestAggregationRecoveryIntegration:
             graph=mock_graph,
         )
 
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify recovery
         check = recovery_mgr.can_resume(run.run_id, mock_graph)
@@ -1552,7 +1552,7 @@ class TestAggregationRecoveryIntegration:
                 now=blocked_at,
                 expected_lease_owner="seeder",
             )
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # === PHASE 2: Resume and verify timeout preservation ===
 

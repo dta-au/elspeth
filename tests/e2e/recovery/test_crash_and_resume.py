@@ -73,7 +73,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -819,12 +819,12 @@ class TestResumeIdempotence:
         # from the per-source ``run_sources`` record. Mirror what the
         # production orchestrator writes via ``_emit_source_loading``.
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id="source",
             source_name="source",
             plugin_name="list_source",
             config_hash="crash-and-resume",
             lifecycle_state="loaded",
+            coordination_token=leader_coordination_token(factory, run_id),
             source_schema_json=json.dumps(
                 {
                     "properties": {
@@ -908,7 +908,7 @@ class TestResumeIdempotence:
         )
 
         # Mark run as failed (simulating crash)
-        factory.run_lifecycle.complete_run(run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
 
         # Epoch 21 (ADR-030 §B.4): begin_run minted this run's leader seat
         # (uniformity rule), and a hard-killed leader never releases it — the
@@ -1548,7 +1548,6 @@ class TestAggregationRecovery:
         # path was deleted; readers and writers are now symmetric on
         # ``run_sources``).
         factory.run_lifecycle.record_run_source(
-            run_id=run.run_id,
             source_node_id="source",
             source_name="source",
             plugin_name="test_source",
@@ -1556,6 +1555,7 @@ class TestAggregationRecovery:
             lifecycle_state="loaded",
             source_schema_json='{"properties": {"test_field": {"type": "string"}}, "required": ["test_field"]}',
             schema_contract=test_contract,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create the scalar barrier metadata for the in-flight aggregation —
@@ -1575,7 +1575,7 @@ class TestAggregationRecovery:
         )
 
         # Simulate crash
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify can resume
         check = recovery_mgr.can_resume(run.run_id, mock_graph)

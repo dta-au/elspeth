@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
 
 
 class SourceLifecycleRecorder:
@@ -49,10 +50,10 @@ class SourceLifecycleRecorder:
     def record_field_resolution(
         self,
         factory: RecorderFactory,
-        run_id: str,
         *,
         active_source: SourceProtocol,
         previously_recorded: tuple[Mapping[str, str], str | None] | None = None,
+        coordination_token: CoordinationToken,
     ) -> tuple[Mapping[str, str], str | None] | None:
         """Record the source field-resolution mapping if available.
 
@@ -80,15 +81,15 @@ class SourceLifecycleRecorder:
 
         resolution_mapping, normalization_version = field_resolution
         factory.run_lifecycle.record_source_field_resolution(
-            run_id=run_id,
             resolution_mapping=resolution_mapping,
             normalization_version=normalization_version,
+            coordination_token=coordination_token,
         )
         # Emit telemetry AFTER Landscape succeeds
         self._ceremony.emit_telemetry(
             FieldResolutionApplied(
                 timestamp=datetime.now(UTC),
-                run_id=run_id,
+                run_id=coordination_token.run_id,
                 source_plugin=active_source.name,
                 field_count=len(resolution_mapping),
                 normalization_version=normalization_version,
@@ -100,11 +101,12 @@ class SourceLifecycleRecorder:
     def record_run_source_lifecycle(
         self,
         factory: RecorderFactory,
-        run_id: str,
         source_id: NodeID,
         source_name: str,
         active_source: SourceProtocol,
         lifecycle_state: RunSourceLifecycleState,
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record source lifecycle with the latest source schema evidence."""
 
@@ -115,7 +117,6 @@ class SourceLifecycleRecorder:
             resolution_mapping, normalization_version = field_resolution
 
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id=source_id,
             source_name=source_name,
             plugin_name=active_source.name,
@@ -125,4 +126,5 @@ class SourceLifecycleRecorder:
             field_resolution_mapping=resolution_mapping,
             normalization_version=normalization_version,
             lifecycle_state=lifecycle_state,
+            coordination_token=coordination_token,
         )

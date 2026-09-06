@@ -60,7 +60,7 @@ def test_outcome_reports_group_by_path_not_lifecycle_only() -> None:
         outcome=TerminalOutcome.SUCCESS,
         path=TerminalPath.FILTER_DROPPED,
     )
-    setup.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+    setup.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=setup.coordination_token)
 
     outcome_analysis = get_outcome_analysis(setup.db, setup.factory, setup.run_id)
     run_summary = get_run_summary(setup.db, setup.factory, setup.run_id)
@@ -147,7 +147,7 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
             sink_name="sink-0",
         )
 
-    setup.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+    setup.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=setup.coordination_token)
 
     outcome_analysis = get_outcome_analysis(setup.db, setup.factory, setup.run_id)
     assert "error" not in outcome_analysis

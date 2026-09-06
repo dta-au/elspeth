@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
@@ -228,6 +229,19 @@ class LifecycleContext(Protocol):
 
     @property
     def landscape(self) -> PluginAuditWriter | None: ...
+
+    @property
+    def coordination_token(self) -> CoordinationToken | None: ...
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+    ) -> None: ...
 
     @property
     def payload_store(self) -> PayloadStore | None: ...

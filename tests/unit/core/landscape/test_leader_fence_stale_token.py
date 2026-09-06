@@ -33,17 +33,20 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import event, insert, select, update
 
-from elspeth.contracts import CheckpointDraft, NodeType, RunStatus
+from elspeth.contracts import CheckpointDraft, ExportStatus, NodeType, RunStatus
+from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
 )
+from elspeth.contracts.preflight import CommencementGateResult, PreflightResult
 from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.manager import CheckpointManager
@@ -58,12 +61,15 @@ from elspeth.core.landscape.schema import (
     checkpoints_table,
     group_losses_table,
     nodes_table,
+    preflight_results_table,
     rows_table,
     run_coordination_events_table,
     run_coordination_table,
+    run_sources_table,
     run_workers_table,
     runs_table,
     scheduler_events_table,
+    secret_resolutions_table,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
@@ -138,6 +144,15 @@ def _bump_epoch(db: LandscapeDB) -> None:
             .where(run_coordination_table.c.run_id == RUN_ID)
             .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
         )
+
+
+def _run_lifecycle_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Every table a RunLifecycleRepository writer can touch, as a complete image."""
+    snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
+    with db.engine.connect() as conn:
+        for table in (runs_table, run_sources_table, secret_resolutions_table, preflight_results_table):
+            snapshot[table.name] = tuple(tuple(row) for row in conn.execute(select(table).order_by(*table.primary_key.columns)).all())
+    return snapshot
 
 
 def _fence_refusals(db: LandscapeDB, verb: str) -> list[dict[str, object]]:
@@ -550,7 +565,7 @@ class TestStaleTokenFenceRefusals:
         factory = RecorderFactory(db)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value, "a deposed leader must not stamp a terminal status"
@@ -560,11 +575,104 @@ class TestStaleTokenFenceRefusals:
         factory = RecorderFactory(db)
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            factory.run_lifecycle.update_run_status(RUN_ID, RunStatus.FAILED, token=token)
+            factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value
         assert len(_fence_refusals(db, "update_run_status")) == 1
+
+    @pytest.mark.parametrize(
+        ("verb", "call"),
+        (
+            pytest.param(
+                "record_source_field_resolution",
+                lambda lifecycle, token: lifecycle.record_source_field_resolution({"a": "a"}, "v1", coordination_token=token),
+                id="record_source_field_resolution",
+            ),
+            pytest.param(
+                "record_run_source",
+                lambda lifecycle, token: lifecycle.record_run_source(
+                    source_node_id=SOURCE_NODE_ID,
+                    source_name="source",
+                    plugin_name="test",
+                    config_hash="cfg",
+                    lifecycle_state="ready",
+                    coordination_token=token,
+                ),
+                id="record_run_source",
+            ),
+            pytest.param(
+                "update_run_source_contract",
+                lambda lifecycle, token: lifecycle.update_run_source_contract(
+                    source_node_id=SOURCE_NODE_ID,
+                    schema_contract=SchemaContract(mode="OBSERVED", fields=(), locked=True),
+                    coordination_token=token,
+                ),
+                id="update_run_source_contract",
+            ),
+            pytest.param(
+                "record_secret_resolutions",
+                lambda lifecycle, token: lifecycle.record_secret_resolutions(
+                    [
+                        SecretResolutionInput(
+                            timestamp=NOW.timestamp(),
+                            env_var_name="KEY",
+                            source="env",
+                            vault_url=None,
+                            secret_name=None,
+                            fingerprint="0" * 64,
+                            resolution_latency_ms=1,
+                        )
+                    ],
+                    coordination_token=token,
+                ),
+                id="record_secret_resolutions",
+            ),
+            pytest.param(
+                "record_preflight_results",
+                lambda lifecycle, token: lifecycle.record_preflight_results(
+                    PreflightResult(
+                        dependency_runs=(),
+                        gate_results=(CommencementGateResult(name="gate", condition="x", result=True, context_snapshot={}),),
+                    ),
+                    coordination_token=token,
+                ),
+                id="record_preflight_results",
+            ),
+            pytest.param(
+                "record_readiness_check",
+                lambda lifecycle, token: lifecycle.record_readiness_check(
+                    name="probe", collection="docs", reachable=True, count=1, message="ok", coordination_token=token
+                ),
+                id="record_readiness_check",
+            ),
+            pytest.param(
+                "set_export_status",
+                lambda lifecycle, token: lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=token),
+                id="set_export_status",
+            ),
+            pytest.param(
+                "set_export_failed_unless_completed",
+                lambda lifecycle, token: lifecycle.set_export_failed_unless_completed(error="boom", coordination_token=token),
+                id="set_export_failed_unless_completed",
+            ),
+            pytest.param(
+                "set_export_pending_unless_completed",
+                lambda lifecycle, token: lifecycle.set_export_pending_unless_completed(coordination_token=token),
+                id="set_export_pending_unless_completed",
+            ),
+        ),
+    )
+    def test_run_lifecycle_verb_refused(self, db: LandscapeDB, token: CoordinationToken, verb: str, call: Any) -> None:
+        """ADR-048 D8.1: every RunLifecycleRepository writer fences FIRST — a deposed leader writes nothing."""
+        factory = RecorderFactory(db)
+        before = _run_lifecycle_snapshot(db)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            call(factory.run_lifecycle, token)
+        assert raised.value.verb == verb
+        assert _run_lifecycle_snapshot(db) == before, "a deposed leader must leave every run-lifecycle table untouched"
+        assert len(_fence_refusals(db, verb)) == 1
 
     def test_create_checkpoint_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         manager = CheckpointManager(db)
@@ -962,17 +1070,17 @@ class TestValidTokenFenceSemantics:
         )
         factory = RecorderFactory(db)
         with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):
-            factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one()
         assert status == RunStatus.RUNNING.value
         # FAILED is exempt from quiescence: the journal stays intact for resume.
-        run = factory.run_lifecycle.complete_run(RUN_ID, RunStatus.FAILED, token=token)
+        run = factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=token)
         assert run.status == RunStatus.FAILED
 
     def test_complete_run_writes_finalize_event(self, db: LandscapeDB, token: CoordinationToken) -> None:
         factory = RecorderFactory(db)
-        factory.run_lifecycle.complete_run(RUN_ID, RunStatus.COMPLETED, token=token)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token)
         with db.engine.connect() as conn:
             events = (
                 conn.execute(

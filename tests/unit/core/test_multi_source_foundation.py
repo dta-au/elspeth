@@ -30,7 +30,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now
+from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_coordination_token
 
 # Epoch-1 token for "run-1" — _insert_scheduler_owner_records seeds the matching seat.
 _COORD_TOKEN_RUN1 = CoordinationToken(run_id="run-1", worker_id="test-leader", leader_epoch=1)
@@ -530,12 +530,12 @@ def test_record_run_source_rejects_missing_source_node() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"run_sources.*source_node_id='missing-source'.*does not exist"):
         factory.run_lifecycle.record_run_source(
-            run_id=run.run_id,
             source_node_id="missing-source",
             source_name="missing",
             plugin_name="csv",
             config_hash="cfg",
             lifecycle_state="ready",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
 
@@ -560,12 +560,12 @@ def test_record_run_source_rejects_non_source_node() -> None:
         AuditIntegrityError, match=r"run_sources.*source_node_id='transform-node'.*node_type='transform'.*expected 'source'"
     ):
         factory.run_lifecycle.record_run_source(
-            run_id=run.run_id,
             source_node_id="transform-node",
             source_name="not_a_source",
             plugin_name="csv",
             config_hash="cfg",
             lifecycle_state="ready",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
 
@@ -588,12 +588,12 @@ def test_record_run_source_rejects_unknown_lifecycle_state() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"Invalid run source lifecycle_state='done'"):
         factory.run_lifecycle.record_run_source(
-            run_id=run.run_id,
             source_node_id="source-node",
             source_name="orders",
             plugin_name="csv",
             config_hash="cfg",
             lifecycle_state="done",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
 
@@ -687,7 +687,6 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
     )
 
     factory.run_lifecycle.record_run_source(
-        run_id=run.run_id,
         source_node_id="source_orders",
         source_name="orders",
         plugin_name="csv",
@@ -697,9 +696,9 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
         field_resolution_mapping={"Order ID": "id"},
         normalization_version="v1",
         lifecycle_state="loaded",
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
     factory.run_lifecycle.record_run_source(
-        run_id=run.run_id,
         source_node_id="source_refunds",
         source_name="refunds",
         plugin_name="csv",
@@ -708,6 +707,7 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
         field_resolution_mapping={"Refund ID": "id"},
         normalization_version="v1",
         lifecycle_state="loaded",
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
 
     with db.connection() as conn:

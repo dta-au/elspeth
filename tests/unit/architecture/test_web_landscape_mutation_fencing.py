@@ -316,10 +316,26 @@ _FOLLOWER_MEMBERSHIP_ESTABLISHMENT = AuthorityEstablishmentException(
     sunset=None,
 )
 
+_EXPORT_SEAT_ESTABLISHMENT = AuthorityEstablishmentException(
+    classification="export-seat-claim",
+    caller_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    caller_symbol="RunCoordinationRepository.acquire_export_leadership",
+    callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    callee_symbol="RunCoordinationRepository._acquire_export_leadership_on",
+    write_counts=(
+        ("run_coordination", "update", 1),
+        ("run_coordination_events", "insert", 3),
+        ("run_workers", "insert", 1),
+        ("run_workers", "update", 1),
+    ),
+    temporary=False,
+    sunset=None,
+)
 _AUTHORITY_ESTABLISHMENTS = (
     _FRESH_EPOCH_ONE_EXCEPTION,
     _EXISTING_RUN_LEADERSHIP_ESTABLISHMENT,
     _FOLLOWER_MEMBERSHIP_ESTABLISHMENT,
+    _EXPORT_SEAT_ESTABLISHMENT,
 )
 _AUTHORITY_ESTABLISHMENT_EXCEPTIONS = tuple(item for item in _AUTHORITY_ESTABLISHMENTS if item.temporary)
 _EXACT_BEGIN_RUN_PRODUCTION_CALLERS = frozenset(
@@ -378,8 +394,27 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # (49a7bb16c), _recover_expired_leases (55a8a94f4) and
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
-_EXPECTED_DML_COUNT = 139
-_EXPECTED_DML_INVENTORY_SHA256 = "6ca139a712665371a20fdf03f14597fcd9d9056b7397e316ca228ef235a11b3d"
+_EXPECTED_DML_COUNT = 142
+# D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
+# unchanged; twelve construction FINGERPRINTS moved because the constructions
+# themselves were rewritten to fence first / execute once: the eleven
+# RunLifecycleRepository writers (_complete_run_in update runs; record_preflight_results
+# insert preflight_results; record_run_source insert+update run_sources;
+# record_secret_resolutions insert secret_resolutions; record_source_field_resolution,
+# set_export_failed_unless_completed, set_export_pending_unless_completed,
+# set_export_status, update_run_status update runs; update_run_source_contract update
+# run_sources) and OperationRepository.fail_open_effect_operations_for_run update
+# operations (one executemany UPDATE instead of an UPDATE per locked row). Re-derived
+# from the gate's printed output; no identity added, removed, moved or replaced.
+# Then 139 -> 142 (504d39e2… → d51c3414…), same commit, the cleared run-coordination
+# hunks: record_coordination_events insert run_coordination_events (the ONE
+# executemany ledger write _complete_run_in's follower departures ride on) and
+# _acquire_export_leadership_on update run_coordination + update run_workers (the
+# export seat, the fourth pinned establishment; ADR-048 §4). Write set unchanged.
+# Then d51c3414… → de37c3fe… (count 142, write set unchanged): the two
+# run_coordination_events constructions share one ``_coordination_event_id``
+# recipe and the batch rows carry no soft-mapping annotation (census 2734 held).
+_EXPECTED_DML_INVENTORY_SHA256 = "de37c3fe425aeae2f8c665be0bbbb280675c5a05f9d3c4543fbe7f4430cd0fe7"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -4397,6 +4432,26 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             ),
         }
     ),
+    "export-seat-claim": frozenset(
+        {
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository.acquire_export_leadership",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._acquire_export_leadership_on",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._insert_worker_row",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "record_coordination_event",
+            ),
+        }
+    ),
     "follower-membership-admission": frozenset(
         {
             (
@@ -7082,12 +7137,54 @@ def test_reopen_establishment_model_rejects_dead_and_mapping_rebound_subjects() 
     assert any("subject is rebound" in item for item in _coordination_caller_authority_violations([mapping_rebound]))
 
 
+def test_export_write_without_the_export_seat_is_still_refused() -> None:
+    """ADR-048 §4 control for the export-seat establishment: the seat, not a minted token, is the authority."""
+
+    minted = _parse_source(
+        "src/elspeth/engine/orchestrator/export_shortcut.py",
+        textwrap.dedent(
+            """\
+            from elspeth.contracts import ExportStatus
+            from elspeth.contracts.coordination import CoordinationToken
+            from elspeth.core.landscape.factory import RecorderFactory
+
+            def resume_audit_export(db, run_id, worker_id):
+                factory = RecorderFactory(db)
+                coordination_token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
+                factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=coordination_token)
+            """
+        ),
+    )
+    assert any("set_export_status lacks one exact current token" in item for item in _caller_authority_violations([minted]))
+
+    seated = _parse_source(
+        minted.path,
+        textwrap.dedent(
+            """\
+            from elspeth.contracts import ExportStatus
+            from elspeth.contracts.coordination import CoordinationToken
+            from elspeth.core.landscape.factory import RecorderFactory
+
+            def resume_audit_export(db, run_id, worker_id):
+                factory = RecorderFactory(db)
+                coordination_token = factory.run_coordination.acquire_export_leadership(run_id=run_id, worker_id=worker_id, window_seconds=80.0)
+                _led(factory, coordination_token=coordination_token)
+
+            def _led(factory: RecorderFactory, *, coordination_token: CoordinationToken):
+                factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=coordination_token)
+            """
+        ),
+    )
+    assert not any("set_export_status" in item for item in _caller_authority_violations([seated]))
+
+
 def test_authority_establishment_exception_is_exact_and_non_release() -> None:
     assert _AUTHORITY_ESTABLISHMENT_EXCEPTIONS == (_FRESH_EPOCH_ONE_EXCEPTION,)
     assert tuple(item.classification for item in _AUTHORITY_ESTABLISHMENTS) == (
         "fresh-run-epoch-1-creation",
         "existing-run-leadership-claim",
         "follower-membership-admission",
+        "export-seat-claim",
     )
     assert sum(item.temporary for item in _AUTHORITY_ESTABLISHMENTS) == 1
     exception = _FRESH_EPOCH_ONE_EXCEPTION

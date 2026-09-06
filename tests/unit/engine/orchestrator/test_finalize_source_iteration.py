@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
 from elspeth.engine.orchestrator.core import Orchestrator
@@ -19,6 +20,8 @@ from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
 )
 from tests.fixtures.landscape import make_landscape_db
+
+_TOKEN = CoordinationToken(run_id="test-run", worker_id="worker:test-run:test", leader_epoch=1)
 
 
 def _make_orchestrator() -> Orchestrator:
@@ -186,6 +189,7 @@ class TestFinalizeFieldResolutionRerecord:
             interrupted_by_shutdown=False,
             flush_end_of_input=False,
             active_source=source,
+            coordination_token=_TOKEN,
         )
         return factory
 
@@ -197,9 +201,9 @@ class TestFinalizeFieldResolutionRerecord:
         factory = self._finalize(source, recorded=({"id": "id"}, "v1"))
 
         factory.run_lifecycle.record_source_field_resolution.assert_called_once_with(
-            run_id="test-run",
             resolution_mapping=union,
             normalization_version="v1",
+            coordination_token=_TOKEN,
         )
 
     def test_unchanged_mapping_is_not_rewritten(self) -> None:
@@ -258,6 +262,7 @@ class TestFinalizeSourceIterationContext:
             interrupted_by_shutdown=True,
             flush_end_of_input=False,
             active_source=_make_active_source(),
+            coordination_token=_TOKEN,
         )
 
         assert ctx.node_id == source_id, (
@@ -293,6 +298,7 @@ class TestFinalizeSourceIterationContext:
             interrupted_by_shutdown=False,
             flush_end_of_input=True,
             active_source=_make_active_source(),
+            coordination_token=_TOKEN,
         )
 
         assert ctx.node_id == source_id
@@ -326,6 +332,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=False,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_coalesce.assert_not_called()
@@ -358,6 +365,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=True,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_coalesce.assert_called_once()
@@ -389,6 +397,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=True,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_row_union.assert_called_once()
@@ -428,6 +437,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=False,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_aggregation.assert_not_called()
@@ -461,6 +471,7 @@ class TestFinalizeSourceIterationContext:
                 interrupted_by_shutdown=False,
                 flush_end_of_input=True,
                 active_source=_make_active_source(),
+                coordination_token=_TOKEN,
             )
 
         flush_aggregation.assert_called_once()

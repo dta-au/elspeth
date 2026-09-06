@@ -37,7 +37,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -134,7 +134,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.status == RunStatus.COMPLETED
 
     @given(config=simple_configs)
@@ -145,7 +147,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.completed_at is not None
 
     @given(config=simple_configs)
@@ -156,7 +160,9 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
-            completed = factory.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+            completed = factory.run_lifecycle.complete_run(
+                RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+            )
             assert completed.completed_at is not None
             assert completed.completed_at >= completed.started_at
 
@@ -197,7 +203,7 @@ class TestRunLifecycleProperties:
             factory = make_factory(db)
             factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
             run2 = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
-            factory.run_lifecycle.complete_run(run2.run_id, RunStatus.COMPLETED)
+            factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run2.run_id))
 
             running = factory.run_lifecycle.list_runs(status=RunStatus.RUNNING)
             assert all(r.status == RunStatus.RUNNING for r in running)
@@ -390,13 +396,13 @@ class TestSchemaContractRoundTripProperties:
             schema_config=_make_schema_config(),
         )
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id=source.node_id,
             source_name="primary",
             plugin_name="test",
             config_hash="confighash",
             lifecycle_state="loading",
             source_schema_json='{"mode": "observed"}',
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         return source.node_id
 
@@ -425,9 +431,9 @@ class TestSchemaContractRoundTripProperties:
             source_node_id = self._record_source(factory, run.run_id)
 
             factory.run_lifecycle.update_run_source_contract(
-                run_id=run.run_id,
                 source_node_id=source_node_id,
                 schema_contract=contract,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
             records = factory.run_lifecycle.get_run_source_resume_records(run.run_id)
 
@@ -475,9 +481,9 @@ class TestSchemaContractRoundTripProperties:
             source_node_id = self._record_source(factory, run.run_id)
 
             factory.run_lifecycle.update_run_source_contract(
-                run_id=run.run_id,
                 source_node_id=source_node_id,
                 schema_contract=contract,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
             records = factory.run_lifecycle.get_run_source_resume_records(run.run_id)
 
@@ -735,9 +741,9 @@ class TestFieldResolutionProperties:
             )
 
             factory.run_lifecycle.record_source_field_resolution(
-                run_id=run.run_id,
                 resolution_mapping=mapping,
                 normalization_version="v1",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
 
             retrieved = factory.run_lifecycle.get_source_field_resolution(run.run_id)

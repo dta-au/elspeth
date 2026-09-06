@@ -51,7 +51,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now
+from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_token_for
 from tests.helpers.state_engine import capture_state_engine_image
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
@@ -228,13 +228,12 @@ def _recover_expired_as_registered_leader_process(
     expected_count: int,
 ) -> None:
     """Child action: run the strict leader-fenced production recovery verb."""
-    recovered = RecorderFactory(db).scheduler.recover_expired_leases(
-        coordination_token=CoordinationToken(
-            run_id=run_id,
-            worker_id=leader_id,
-            leader_epoch=leader_epoch,
-        ),
-    )
+    # ADR-048 §5: the child reads the seat back rather than re-minting the
+    # token from its arguments, and pins that the seat still names the leader
+    # the parent acquired it for -- a deposed seat fails here, not silently.
+    coordination_token = leader_token_for(db, run_id)
+    assert (coordination_token.worker_id, coordination_token.leader_epoch) == (leader_id, leader_epoch)
+    recovered = RecorderFactory(db).scheduler.recover_expired_leases(coordination_token=coordination_token)
     assert recovered == expected_count
 
 
@@ -315,8 +314,10 @@ def _evict_follower_process(
     target_worker_id: str,
     now_iso: str,
 ) -> None:
+    coordination_token = leader_token_for(db, run_id)
+    assert (coordination_token.worker_id, coordination_token.leader_epoch) == (leader_id, leader_epoch)
     evicted = RunCoordinationRepository(db.engine).evict_worker(
-        token=CoordinationToken(run_id=run_id, worker_id=leader_id, leader_epoch=leader_epoch),
+        token=coordination_token,
         target_worker_id=target_worker_id,
         grace_seconds=0,
         window_seconds=10**9,

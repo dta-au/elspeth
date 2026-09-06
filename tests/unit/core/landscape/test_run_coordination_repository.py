@@ -383,6 +383,104 @@ class TestAcquireRunLeadershipCAS:
         assert _events(engine) == events_before
 
 
+class TestAcquireExportLeadership:
+    """ADR-048 §4: re-driving a finalized run's audit export takes the seat first — a separate arm from the resume takeover."""
+
+    @pytest.mark.parametrize("terminal_status", ["completed", "completed_with_failures", "empty", "failed", "interrupted"])
+    def test_vacant_seat_on_terminal_run_is_taken_without_a_status_flip(
+        self, engine: Tier1Engine, repo: RunCoordinationRepository, terminal_status: str
+    ) -> None:
+        _seed_run(engine, status=terminal_status)
+        leader_a = mint_worker_id(RUN_ID)
+        token_a = register_run_leader(repo, run_id=RUN_ID, worker_id=leader_a, window_seconds=WINDOW)
+        repo.release_seat(token=token_a)
+        events_before = _events(engine)
+
+        exporter = mint_worker_id(RUN_ID)
+        before = landscape_database_now(engine)
+        token = repo.acquire_export_leadership(run_id=RUN_ID, worker_id=exporter, window_seconds=WINDOW)
+        after = landscape_database_now(engine)
+
+        assert token == CoordinationToken(run_id=RUN_ID, worker_id=exporter, leader_epoch=2)
+        seat = _seat_row(engine)
+        assert seat["leader_worker_id"] == exporter
+        assert seat["leader_epoch"] == 2
+        assert_stamped_between(
+            cast(datetime, seat["leader_heartbeat_expires_at"]), start=before, end=after, offset=timedelta(seconds=WINDOW)
+        )
+        worker = _worker_row(engine, exporter)
+        assert worker["role"] == "leader"
+        assert worker["status"] == "active"
+        assert worker["entry_point"] == "export"
+        new_events = _events(engine)[len(events_before) :]
+        assert [event["event_type"] for event in new_events] == ["worker_register", "leader_acquire"]
+        assert all(event["worker_id"] == exporter and event["leader_epoch"] == 2 for event in new_events)
+        with engine.connect() as conn:
+            run = conn.execute(select(runs_table.c.status, runs_table.c.completed_at).where(runs_table.c.run_id == RUN_ID)).one()
+        assert run.status == terminal_status, "the export seat NEVER touches runs.status"
+
+    def test_running_run_is_refused_with_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        """A RUNNING run belongs to its leader; an export re-drive is not a takeover instrument."""
+        _seed_run(engine, status="running")
+        token_a = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        repo.release_seat(token=token_a)
+        image_before = _coordination_image(engine)
+
+        with pytest.raises(AuditIntegrityError, match="not terminal"):
+            repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+
+        assert _coordination_image(engine) == image_before
+
+    def test_live_seat_is_refused_with_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="completed")
+        holder = mint_worker_id(RUN_ID)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=holder, window_seconds=WINDOW)
+        image_before = _coordination_image(engine)
+
+        with pytest.raises(NonResumableRunError) as excinfo:
+            repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+
+        assert "run leadership is held by" in str(excinfo.value)
+        assert holder in str(excinfo.value)
+        assert _coordination_image(engine) == image_before
+
+    def test_expired_dead_leader_is_evicted_by_the_export_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="failed")
+        dead = mint_worker_id(RUN_ID)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=dead, window_seconds=WINDOW)
+        _expire_seat(engine)
+        events_before = _events(engine)
+
+        exporter = mint_worker_id(RUN_ID)
+        token = repo.acquire_export_leadership(run_id=RUN_ID, worker_id=exporter, window_seconds=WINDOW)
+
+        assert token.leader_epoch == 2
+        assert _worker_row(engine, dead)["status"] == "evicted"
+        new_events = _events(engine)[len(events_before) :]
+        assert [event["event_type"] for event in new_events] == ["worker_evict", "worker_register", "leader_acquire"]
+        with engine.connect() as conn:
+            assert conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == RUN_ID)).scalar_one() == "failed"
+
+    def test_missing_seat_row_is_audit_corruption(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="completed")
+        with pytest.raises(AuditIntegrityError, match="no run_coordination seat row"):
+            repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+
+    def test_export_seat_is_vacated_by_release_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        _seed_run(engine, status="completed")
+        token_a = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        repo.release_seat(token=token_a)
+        exporter = mint_worker_id(RUN_ID)
+        token = repo.acquire_export_leadership(run_id=RUN_ID, worker_id=exporter, window_seconds=WINDOW)
+
+        repo.release_seat(token=token)
+
+        seat = _seat_row(engine)
+        assert seat["leader_worker_id"] is None
+        assert seat["leader_epoch"] == 2
+        assert _worker_row(engine, exporter)["status"] == "departed"
+
+
 class TestIdentityEviction:
     """§B.4 correction 1: the incumbent is evicted by identity, never by liveness."""
 

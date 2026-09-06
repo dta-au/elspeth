@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts.schema import SchemaConfig
 
 if TYPE_CHECKING:
@@ -43,7 +45,9 @@ class TestRecorderFactoryRuns:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        completed = factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.COMPLETED)
+        completed = factory.run_lifecycle.complete_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         assert completed.status == RunStatus.COMPLETED
         assert completed.completed_at is not None
@@ -57,7 +61,9 @@ class TestRecorderFactoryRuns:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        completed = factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        completed = factory.run_lifecycle.complete_run(
+            status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         assert completed.status == RunStatus.FAILED
 
@@ -122,7 +128,9 @@ class TestRecorderFactoryRunStatusValidation:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        completed = factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.COMPLETED)
+        completed = factory.run_lifecycle.complete_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         assert completed.status == RunStatus.COMPLETED
 
@@ -138,7 +146,7 @@ class TestRecorderFactoryRunStatusValidation:
         # Create runs with different statuses
         run1 = factory.run_lifecycle.begin_run(config={"n": 1}, canonical_version="v1")
         run2 = factory.run_lifecycle.begin_run(config={"n": 2}, canonical_version="v1")
-        factory.run_lifecycle.complete_run(run2.run_id, status=RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run2.run_id))
 
         # Filter by enum
         running_runs = factory.run_lifecycle.list_runs(status=RunStatus.RUNNING)
@@ -192,7 +200,9 @@ class TestFieldResolutionTierOneIntegrity:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         mapping = {"User ID": "user_id", "Amount (USD)": "amount_usd"}
-        factory.run_lifecycle.record_source_field_resolution(run.run_id, mapping, "v1")
+        factory.run_lifecycle.record_source_field_resolution(
+            mapping, "v1", coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         result = factory.run_lifecycle.get_source_field_resolution(run.run_id)
         assert result == mapping
@@ -206,7 +216,7 @@ class TestFieldResolutionTierOneIntegrity:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
-        factory.run_lifecycle.record_source_field_resolution(run.run_id, {}, None)
+        factory.run_lifecycle.record_source_field_resolution({}, None, coordination_token=leader_coordination_token(factory, run.run_id))
 
         result = factory.run_lifecycle.get_source_field_resolution(run.run_id)
         assert result == {}

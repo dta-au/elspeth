@@ -134,7 +134,7 @@ def test_resume_finalize_asks_the_backstop_before_deriving_the_terminal_status()
 
     assert order == ["backstop", "derive"], order  # deleting the call: ["derive"]
     assert result.status == RunStatus.COMPLETED
-    harness.factory.run_lifecycle.finalize_run.assert_called_once_with(harness.run_id, status=RunStatus.COMPLETED, token=harness.token)
+    harness.factory.run_lifecycle.finalize_run.assert_called_once_with(RunStatus.COMPLETED, coordination_token=harness.token)
 
 
 def test_resume_finalize_refuses_an_unsettled_bound_group_and_finalizes_failed() -> None:
@@ -153,5 +153,5 @@ def test_resume_finalize_refuses_an_unsettled_bound_group_and_finalizes_failed()
 
     backstop.assert_called_once()
     derive.assert_not_called()  # the verdict pre-empts the terminal-status derivation
-    statuses = [call.kwargs["status"] for call in harness.factory.run_lifecycle.finalize_run.call_args_list]
+    statuses = [call.args[0] for call in harness.factory.run_lifecycle.finalize_run.call_args_list]
     assert statuses == [RunStatus.FAILED], statuses  # the resume failure ceremony, never COMPLETED

@@ -37,8 +37,10 @@ _ROOT = Path(__file__).resolve().parents[4]
 # a harmless audit timestamp.
 _CLOCK_AUTHORITY_VERBS = frozenset(
     {
+        "_acquire_export_leadership_on",
         "_acquire_run_leadership_on",
         "_rotate_expired_leases",
+        "acquire_export_leadership",
         "acquire_lease",
         "acquire_run_leadership",
         "admit_follower",
@@ -122,7 +124,10 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/core/landscape/",
     "src/elspeth/engine/orchestrator/",
 )
-_CLOCK_BOUNDARY_DIGEST = "8ee57c08a577512c4a821bafff79dc6509ebb3cc026e70620fc813ba12076b00"
+# D8.1 (elspeth-43ddb79074): e4471634… → e48a6829…, +2 identities: the export seat
+# (acquire_export_leadership / _acquire_export_leadership_on, ADR-048 §4) reads the
+# Landscape clock to judge the lapsed seat it takes. Re-derived from the printed output.
+_CLOCK_BOUNDARY_DIGEST = "e48a68291a14a54a2290ccc0fef344228d0bc2ea337285902595f29e16f26f06"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -206,8 +211,10 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.takeover_expired"),
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.dead_non_leader_workers"),
@@ -221,6 +228,15 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.complete_run"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.finalize_run"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.update_run_status"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_preflight_results"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_readiness_check"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_run_source"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_secret_resolutions"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_source_field_resolution"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.set_export_failed_unless_completed"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.set_export_pending_unless_completed"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.set_export_status"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.update_run_source_contract"),
         ("src/elspeth/core/landscape/scheduler/fencing.py", "fenced_write"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._terminalize_consumed_barrier_rows"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._transition_passthrough_pending_sink"),
@@ -277,6 +293,7 @@ _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.claim_preparation"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.takeover_expired"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),

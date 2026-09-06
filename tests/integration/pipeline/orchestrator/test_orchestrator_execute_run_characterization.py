@@ -387,6 +387,7 @@ class TestExecuteRunCharacterization:
                 config=config,
                 graph=graph,
                 payload_store=payload_store,
+                coordination_token=leader_coordination_token(factory, run_id),
             )
         assert isinstance(exc_info.value.original_error, RuntimeError)
         assert str(exc_info.value.original_error) == "deliberate error for characterization test"

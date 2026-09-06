@@ -829,7 +829,7 @@ class ResumeCoordinator:
         # failure ceremony like sweep_deferred_invariants_or_crash.
         assert_bound_groups_settled_from_audit(self._db, run_id, graph)
         terminal_status, audit_counters = derive_resume_terminal_status_from_audit(factory, run_id)
-        factory.run_lifecycle.finalize_run(run_id, status=terminal_status, token=coordination_token)
+        factory.run_lifecycle.finalize_run(terminal_status, coordination_token=coordination_token)
         result = audit_counters.to_run_result(run_id, terminal_status)
 
         # Delete checkpoints on successful completion. LEADER WORK: the
@@ -1192,7 +1192,9 @@ class ResumeCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
             with best_effort("Interrupted ceremony on resume graceful shutdown", run_id=run_id):
-                self._ceremony.emit_interrupted_ceremony(run_id, factory, shutdown_exc, resume_start_time, token=coordination_token)
+                self._ceremony.emit_interrupted_ceremony(
+                    run_id, factory, shutdown_exc, resume_start_time, coordination_token=coordination_token
+                )
                 # Seat hygiene: only AFTER the INTERRUPTED finalize succeeded
                 # (same best_effort block); without this a failed resume's
                 # seat wedges retries for the liveness window.
@@ -1213,7 +1215,7 @@ class ResumeCoordinator:
                     factory,
                     resume_start_time,
                     failed_result,
-                    token=coordination_token,
+                    coordination_token=coordination_token,
                 )
                 # Seat hygiene: after the FAILED finalize succeeded.
                 if coordination_token is not None:
@@ -1226,7 +1228,7 @@ class ResumeCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
             with best_effort("Generic failure ceremony on resume", run_id=run_id):
-                self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, token=coordination_token)
+                self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, coordination_token=coordination_token)
                 # Seat hygiene: after the FAILED finalize succeeded.
                 if coordination_token is not None:
                     factory.run_coordination.release_seat(token=coordination_token)

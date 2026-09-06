@@ -39,12 +39,14 @@ from starlette.responses import Response as StarletteResponse
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.contracts import RunStatus
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import (
     FingerprintKeyMissingError,
     SecretDecryptionError,
 )
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.logging import configure_logging
@@ -272,14 +274,32 @@ def _finalize_orphaned_landscape_runs(
         return frozenset(complete_run_ids), frozenset()
 
     with LandscapeDB.from_url(landscape_url, create_tables=create_tables) as landscape_db:
-        lifecycle = RecorderFactory(landscape_db).run_lifecycle
+        repositories = RecorderFactory(landscape_db)
         for landscape_run_id, session_run_ids in by_landscape_id.items():
-            landscape_run = lifecycle.get_run(landscape_run_id)
+            landscape_run = repositories.run_lifecycle.get_run(landscape_run_id)
             if landscape_run is None:
                 absent_run_ids.update(session_run_ids)
                 continue
             if landscape_run.status == RunStatus.RUNNING:
-                lifecycle.complete_run(landscape_run_id, RunStatus.INTERRUPTED)
+                # ADR-048 §4: the web tier is a token boundary, not a token
+                # source. Take the dead leader's seat through the takeover CAS
+                # (epoch+1) and finalize under that token; a seat that is
+                # still live means the run is NOT orphaned and is left alone.
+                try:
+                    coordination_token = repositories.run_coordination.acquire_run_leadership(
+                        run_id=landscape_run_id,
+                        worker_id=mint_worker_id(landscape_run_id),
+                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                        entry_point="orphan-finalize",
+                    )
+                except NonResumableRunError:
+                    structlog.get_logger().warning(
+                        "orphan_landscape_run_leader_live",
+                        landscape_run_id=landscape_run_id,
+                        operator_action="run still led by a live worker; reconciliation deferred",
+                    )
+                    continue
+                _finalize_orphan_as_interrupted(repositories, coordination_token=coordination_token)
             complete_run_ids.update(session_run_ids)
     if absent_run_ids:
         structlog.get_logger().error(
@@ -289,6 +309,12 @@ def _finalize_orphaned_landscape_runs(
             operator_action="investigate audit-row absence",
         )
     return frozenset(complete_run_ids), frozenset(absent_run_ids)
+
+
+def _finalize_orphan_as_interrupted(repositories: RecorderFactory, *, coordination_token: CoordinationToken) -> None:
+    """Stamp INTERRUPTED under the seat just taken, then vacate it (ADR-030 §D seat hygiene)."""
+    repositories.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
+    repositories.run_coordination.release_seat(token=coordination_token)
 
 
 async def _reconcile_pending_landscape_runs(

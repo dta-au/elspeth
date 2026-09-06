@@ -26,12 +26,15 @@ if TYPE_CHECKING:
     from elspeth.contracts import SinkProtocol
     from elspeth.contracts.audit import Run, SinkEffect
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.config import ElspethSettings
     from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.orchestrator.schema_reconstruction import (
     _create_schema_model as _create_schema_model,
 )
@@ -363,7 +366,6 @@ def resume_audit_export(
             is not export-terminal, or its export already completed.
         Exception: Re-raises any export failure after recording FAILED status.
     """
-    from elspeth.contracts import ExportStatus
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.engine._best_effort import best_effort
 
@@ -385,10 +387,51 @@ def resume_audit_export(
     if refusal is not None:
         raise ValueError(refusal)
 
+    # ADR-048 §4: an operator action that cannot take the seat must not write
+    # the row. The export seat is a leader seat on a finalized run — no status
+    # flip, refused while a live leader holds it — vacated after the export.
+    coordination_token = factory.run_coordination.acquire_export_leadership(
+        run_id=run_id,
+        worker_id=worker_id,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    )
+    try:
+        _resume_audit_export_led(
+            db,
+            factory,
+            settings,
+            sink_factory,
+            payload_store=payload_store,
+            audit_export_content_store=audit_export_content_store,
+            audit_export_content_store_resolver=audit_export_content_store_resolver,
+            coordination_token=coordination_token,
+        )
+    finally:
+        with best_effort("Export seat release", run_id=run_id):
+            factory.run_coordination.release_seat(token=coordination_token)
+
+
+def _resume_audit_export_led(
+    db: LandscapeDB,
+    factory: RecorderFactory,
+    settings: ElspethSettings,
+    sink_factory: Callable[[str], SinkEffectRuntimeBinding],
+    *,
+    payload_store: PayloadStore,
+    audit_export_content_store: AuditExportContentStore,
+    audit_export_content_store_resolver: AuditExportContentStoreResolver,
+    coordination_token: CoordinationToken,
+) -> None:
+    """The export-resume body, under the seat ``coordination_token`` proves."""
+    from elspeth.contracts import ExportStatus
+    from elspeth.engine._best_effort import best_effort
+
+    export_config = settings.landscape.export
+    run_id = coordination_token.run_id
     pending_recorded = factory.run_lifecycle.set_export_pending_unless_completed(
-        run_id,
         export_format=export_config.format,
         export_sink=export_config.sink,
+        coordination_token=coordination_token,
     )
     if not pending_recorded:
         return
@@ -401,7 +444,7 @@ def resume_audit_export(
             payload_store=payload_store,
             audit_export_content_store=audit_export_content_store,
             audit_export_content_store_resolver=audit_export_content_store_resolver,
-            worker_id=worker_id,
+            worker_id=coordination_token.worker_id,
         )
     except Exception as export_error:
         from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld
@@ -413,10 +456,10 @@ def resume_audit_export(
             original_error=type(export_error).__name__,
         ):
             failure_recorded = factory.run_lifecycle.set_export_failed_unless_completed(
-                run_id,
                 error=str(export_error),
+                coordination_token=coordination_token,
             )
         if failure_recorded is False and isinstance(export_error, SinkEffectLeaseHeld):
             return
         raise
-    factory.run_lifecycle.set_export_status(run_id, status=ExportStatus.COMPLETED)
+    factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=coordination_token)

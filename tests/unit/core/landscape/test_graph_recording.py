@@ -15,7 +15,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import nodes_table
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -141,7 +141,7 @@ class TestRegisterNodeDsnSanitization:
 
         self._register_database_node(factory, {"url": self._DSN})
 
-        factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         records = list(LandscapeExporter(db).export_run("run-1"))
         node_records = [r for r in records if r["record_type"] == "node"]
         assert node_records, "expected the registered node in the export"

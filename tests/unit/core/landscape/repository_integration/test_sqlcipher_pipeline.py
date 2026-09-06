@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from tests.fixtures.landscape import leader_coordination_token
 
 sqlcipher3 = pytest.importorskip("sqlcipher3", reason="sqlcipher3 not installed (install with: uv pip install 'elspeth[security]')")
 
@@ -61,7 +62,7 @@ class TestPipelineWithSQLCipherLandscape:
             )
 
             # Complete the run
-            factory.run_lifecycle.complete_run(run_id, status=RunStatus.COMPLETED)
+            factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run_id))
 
             # Verify via direct SQL
             with db.connection() as conn:

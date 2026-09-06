@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.payload_store import PayloadStore
@@ -87,6 +88,10 @@ class PluginContext:
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
+    # The run's current leader token, carried BY VALUE from the executor that
+    # built this context (ADR-048 §3). A plugin never constructs one; a
+    # context without one cannot write to the Landscape.
+    coordination_token: CoordinationToken | None = None
     payload_store: PayloadStore | None = None
     rate_limit_registry: RateLimitRegistryProtocol | None = None
     concurrency_config: RuntimeConcurrencyConfig | None = None
@@ -160,6 +165,7 @@ class PluginContext:
         state_id: str | None = None,
         operation_id: str | None = None,
         telemetry_emit: Callable[[Any], None] | None = None,
+        coordination_token: CoordinationToken | None = None,
         _pending_quarantine_validation_errors: list[tuple[str, str]] | None = None,
         _config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -176,6 +182,7 @@ class PluginContext:
         # config must be immutable for audit integrity.
         self._config = deep_freeze(raw_config)
         self.landscape = landscape
+        self.coordination_token = coordination_token
         self.payload_store = payload_store
         self.rate_limit_registry = rate_limit_registry
         self.concurrency_config = concurrency_config
@@ -215,7 +222,42 @@ class PluginContext:
             state_id=self.state_id,
             operation_id=self.operation_id,
             telemetry_emit=self.telemetry_emit,
+            coordination_token=self.coordination_token,
             _pending_quarantine_validation_errors=self._pending_quarantine_validation_errors,
+        )
+
+    def record_readiness_check(
+        self,
+        *,
+        name: str,
+        collection: str,
+        reachable: bool,
+        count: int | None,
+        message: str,
+    ) -> None:
+        """Record a provider readiness check under the run's leader token (ADR-048 §3).
+
+        The token is forwarded by value from the executor that built this
+        context; a context without one cannot write, and that is the intended
+        failure mode — never a silently skipped audit row.
+        """
+        from elspeth.contracts import FrameworkBugError
+
+        if self.landscape is None or self.coordination_token is None:
+            raise FrameworkBugError(
+                f"record_readiness_check() called without landscape or leader token. "
+                f"Context state: run_id={self.run_id}, node_id={self.node_id}, "
+                f"landscape={'set' if self.landscape is not None else 'None'}, "
+                f"coordination_token={'set' if self.coordination_token is not None else 'None'}. "
+                f"This is a framework bug — the executor must inject both before plugin on_start()."
+            )
+        self.landscape.record_readiness_check(
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            coordination_token=self.coordination_token,
         )
 
     @staticmethod

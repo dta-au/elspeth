@@ -21,7 +21,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.testing import make_contract
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 
@@ -173,7 +173,7 @@ class TestResumeSchemaRequired:
         )
 
         # Mark run as failed (so it can be resumed)
-        factory.run_lifecycle.complete_run(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # 3. Test production code: get_source_schema() should raise AuditIntegrityError
         with pytest.raises(AuditIntegrityError) as exc_info:

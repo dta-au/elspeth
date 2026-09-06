@@ -58,6 +58,7 @@ from elspeth.mcp.analyzers.queries import (
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.mcp.types import ErrorResult
 from tests.fixtures.landscape import (
+    leader_coordination_token,
     make_factory,
     make_landscape_db,
     make_recorder_with_run,
@@ -161,7 +162,7 @@ def _build_linear_pipeline(
 
     if complete_run:
         status = RunStatus.FAILED if fail_transform else RunStatus.COMPLETED
-        factory.run_lifecycle.complete_run(run_id, status)
+        factory.run_lifecycle.complete_run(status, coordination_token=leader_coordination_token(factory, run_id))
 
     return {
         "db": db,
@@ -415,7 +416,7 @@ class TestExplainTokenLineage:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="b" * 64,
         )
-        factory.run_lifecycle.complete_run(run_id, RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run_id))
 
         result = explain(factory.query, factory.data_flow, run_id, token_id=token.token_id)
 
@@ -548,7 +549,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="c" * 64,
         )
-        factory.run_lifecycle.complete_run("terr-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "terr-run"))
 
         result = get_failure_context(db, factory, "terr-run")
 
@@ -573,7 +574,7 @@ class TestGetFailureContext:
             "observed",
             "quarantine",
         )
-        factory.run_lifecycle.complete_run("verr-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "verr-run"))
 
         result = get_failure_context(db, factory, "verr-run")
 
@@ -627,7 +628,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="d" * 64,
         )
-        factory.run_lifecycle.complete_run("retry-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "retry-run"))
 
         result = get_failure_context(db, factory, "retry-run")
 
@@ -670,7 +671,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
         )
-        factory.run_lifecycle.complete_run("first-retry-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "first-retry-run"))
 
         result = get_failure_context(db, factory, "first-retry-run")
 
@@ -714,7 +715,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
         )
-        factory.run_lifecycle.complete_run("run-X", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-X"))
 
         # Run Y: same node_id "xform" but different plugin "field_mapper"
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-Y")
@@ -737,7 +738,7 @@ class TestGetFailureContext:
             path=TerminalPath.UNROUTED,
             error_hash="f" * 64,
         )
-        factory.run_lifecycle.complete_run("run-Y", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Y"))
 
         # Query run-X failure context
         result_x = get_failure_context(db, factory, "run-X")
@@ -779,7 +780,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("run-P", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-P"))
 
         # Run Q: same node_id "xform" but "fast_transform"
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-Q")
@@ -801,7 +802,7 @@ class TestGetFailureContext:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="b" * 64,
         )
-        factory.run_lifecycle.complete_run("run-Q", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-Q"))
 
         result_p = get_failure_context(db, factory, "run-P")
         assert len(result_p["transform_errors"]) == 1  # type: ignore[typeddict-item]  # FailureContextReport variant
@@ -836,7 +837,7 @@ class TestGetFailureContext:
                 error_hash="a" * 64,
             )
 
-        factory.run_lifecycle.complete_run("limit-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "limit-run"))
 
         result = get_failure_context(db, factory, "limit-run", limit=2)
 
@@ -886,7 +887,7 @@ class TestGetFailureContext:
             error_hash="b" * 64,
         )
 
-        factory.run_lifecycle.complete_run("pattern-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "pattern-run"))
 
         result = get_failure_context(db, factory, "pattern-run")
 
@@ -1004,7 +1005,7 @@ class TestGetRunSummary:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("err-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "err-run"))
 
         result = get_run_summary(db, factory, "err-run")
 
@@ -1110,7 +1111,7 @@ class TestGetRunSummary:
             error_hash="c" * 64,
         )
 
-        factory.run_lifecycle.complete_run("dist-run", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "dist-run"))
 
         result = get_run_summary(db, factory, "dist-run")
 
@@ -1144,7 +1145,7 @@ class TestListRuns:
         """list_runs returns runs in the database."""
         setup = make_recorder_with_run(run_id="list-run-1")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("list-run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "list-run-1"))
 
         result = list_runs(setup.db, factory)
 
@@ -1156,7 +1157,7 @@ class TestListRuns:
         """list_runs filters by status when provided."""
         setup = make_recorder_with_run(run_id="filter-run")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("filter-run", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "filter-run"))
 
         # Should find it with "failed" filter
         result = list_runs(setup.db, factory, status="failed")
@@ -1243,7 +1244,7 @@ class TestFailureContextCorruptionGuards:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("corrupt-te", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-te"))
 
         _delete_node(db, "corrupt-te", "xform")
 
@@ -1256,7 +1257,7 @@ class TestFailureContextCorruptionGuards:
         db, factory = setup.db, setup.factory
 
         factory.data_flow.record_validation_error("corrupt-ve", "src", {"bad": "data"}, "missing field", "observed", "quarantine")
-        factory.run_lifecycle.complete_run("corrupt-ve", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "corrupt-ve"))
 
         _delete_node(db, "corrupt-ve", "src")
 
@@ -1302,7 +1303,7 @@ class TestErrorAnalysisCorruptionGuard:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("corrupt-ea", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "corrupt-ea"))
 
         _delete_node(db, "corrupt-ea", "xform")
 
@@ -1332,7 +1333,7 @@ class TestErrorAnalysisCorruptionGuard:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="a" * 64,
         )
-        factory.run_lifecycle.complete_run("clean-ea", RunStatus.FAILED)
+        factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "clean-ea"))
 
         result = get_error_analysis(db, factory, "clean-ea")
 
@@ -1351,7 +1352,7 @@ class TestExplainTokenErrorHandling:
         """explain_token returns ErrorResult when neither token_id nor row_id given."""
         setup = make_recorder_with_run(run_id="et-err")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("et-err", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "et-err"))
 
         # Use the analyzer facade directly (not the underlying function)
         analyzer = LandscapeAnalyzer.__new__(LandscapeAnalyzer)
@@ -1387,7 +1388,7 @@ class TestExplainTokenErrorHandling:
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink_b",
         )
-        factory.run_lifecycle.complete_run("et-ambig", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "et-ambig"))
 
         analyzer = LandscapeAnalyzer.__new__(LandscapeAnalyzer)
         analyzer._db = db
@@ -1411,7 +1412,7 @@ class TestQueryDuplicateColumns:
 
         setup = make_recorder_with_run(run_id="dup-col")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("dup-col", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "dup-col"))
 
         # Self-join produces duplicate column names (e.g., run_id, run_id)
         sql = "SELECT a.run_id, b.run_id FROM runs a, runs b WHERE a.run_id = b.run_id"
@@ -1425,7 +1426,7 @@ class TestQueryDuplicateColumns:
 
         setup = make_recorder_with_run(run_id="alias-col")
         factory = setup.factory
-        factory.run_lifecycle.complete_run("alias-col", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "alias-col"))
 
         sql = "SELECT a.run_id AS a_run_id, b.run_id AS b_run_id FROM runs a, runs b WHERE a.run_id = b.run_id"
         results = query(setup.db, factory, sql)

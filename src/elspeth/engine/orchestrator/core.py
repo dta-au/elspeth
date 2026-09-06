@@ -291,9 +291,10 @@ class Orchestrator:
         run_id: str,
         config: PipelineConfig,
         graph: ExecutionGraph,
+        coordination_token: CoordinationToken,
     ) -> GraphArtifacts:
         """GRAPH-phase delegator (test seam — see GraphRegistrationService)."""
-        return self._graph_registration.register_graph_nodes_and_edges(factory, run_id, config, graph)
+        return self._graph_registration.register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
     def _execute_run(
         self,
@@ -305,7 +306,7 @@ class Orchestrator:
         *,
         payload_store: PayloadStore,
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Run-body delegator (test seam — see LeaderDrainCoordinator).
