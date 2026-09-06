@@ -143,6 +143,10 @@ class RecordingScheduler:
     def adopt_group_losses(self, **kwargs: object) -> None:
         self.calls.append("adopt_losses")
 
+    def database_now(self) -> datetime:
+        """The Landscape database clock the engine measures hold ages against (ADR-047): the fake's stamp instant."""
+        return _NOW
+
 
 class RecordingAggregationExecutor:
     def __init__(self, *, should_flush: bool = False) -> None:
@@ -679,6 +683,7 @@ class TestGroupLossReplayAndRestore:
             adopted_epoch=None,
         )
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = []
         scheduler.list_group_losses.return_value = [adopted_loss, unadopted_loss]
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -748,6 +753,7 @@ class TestGroupLossReplayAndRestore:
             adopted_epoch=None,
         )
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = []
         scheduler.list_group_losses.return_value = [second_loss]
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -792,6 +798,7 @@ class TestLineageJournalConsistencyWiring:
     def test_restore_from_journal_calls_the_bidirectional_lineage_check(self) -> None:
         row = _blocked_row(barrier_key="variant_union")
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -825,6 +832,7 @@ class TestLineageJournalConsistencyWiring:
     def test_restore_from_journal_fails_closed_on_lineage_divergence_before_any_mutation(self) -> None:
         row = _blocked_row(barrier_key="variant_union")
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
@@ -859,6 +867,7 @@ class TestLineageJournalConsistencyWiring:
 class TestRowUnionRecovery:
     def test_mixed_topology_scopes_loss_restore_read_to_configured_coalesces(self) -> None:
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = []
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -894,6 +903,7 @@ class TestRowUnionRecovery:
     def test_intake_pending_row_union_group_is_left_for_next_intake(self) -> None:
         row = _blocked_row(barrier_key="variant_union")
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
@@ -926,6 +936,7 @@ class TestRowUnionRecovery:
     def test_adopted_holdless_row_is_reset_for_journal_first_intake(self) -> None:
         row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         scheduler.reset_adoption_marker_to_pending.return_value = 1
@@ -978,6 +989,7 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = []
         scheduler.reset_adoption_marker_to_pending.return_value = 2
@@ -1031,6 +1043,7 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.mark_blocked_barrier_terminal.return_value = 1
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -1082,6 +1095,7 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.mark_blocked_barrier_terminal.return_value = 1
         scheduler.reset_adoption_marker_to_pending.return_value = 1
@@ -1133,6 +1147,7 @@ class TestRowUnionRecovery:
         # only its BLOCKED journal row still needs releasing.
         row = _blocked_row(barrier_key="variant_union", token_id="tok-late", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         scheduler.mark_blocked_barrier_terminal.return_value = 1
@@ -1187,6 +1202,7 @@ class TestRowUnionRecovery:
         # late-arrival arm replay state + outcome + release on re-accept.
         row = _blocked_row(barrier_key="variant_union", token_id="tok-late", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         scheduler.reset_adoption_marker_to_pending.return_value = 1
@@ -1253,6 +1269,7 @@ class TestRowUnionRecovery:
         )
         rows = [*group_rows, residual]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = []
         scheduler.mark_blocked_barrier_terminal.return_value = 1
@@ -1317,6 +1334,7 @@ class TestRowUnionRecovery:
         # into the released group.
         row = _blocked_row(barrier_key="union_b", token_id="tok-chained", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         scheduler.mark_blocked_barrier_terminal.return_value = 1
@@ -1370,6 +1388,7 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -1430,6 +1449,7 @@ class TestRowUnionRecovery:
             _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -1479,6 +1499,7 @@ class TestRowUnionRecovery:
             reason="error_routed",
         )
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = [loss]
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -1532,6 +1553,7 @@ class TestRowUnionRecovery:
     def test_durable_loss_fails_restored_sibling_and_emits_completion(self) -> None:
         row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
@@ -1601,6 +1623,7 @@ class TestRowUnionRecovery:
         # timeout/EOF flush under an untruthful reason.
         row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         reads = Mock(spec=BarrierRestoreReadModel)
         reads.find_duplicate_live_buffered_acceptances.return_value = []
@@ -1668,6 +1691,7 @@ class TestRowUnionRecovery:
             adopted_epoch=1,
         )
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = [row]
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)
@@ -1726,6 +1750,7 @@ class TestRowUnionRecovery:
             ),
         ]
         scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.database_now.return_value = _NOW
         scheduler.list_blocked_barrier_items.return_value = rows
         scheduler.list_group_losses.return_value = []
         reads = Mock(spec=BarrierRestoreReadModel)

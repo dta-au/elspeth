@@ -331,7 +331,7 @@ class BarrierIntakeCoordinator:
         # ADR-047: the hold's age is Landscape database time minus its
         # database-stamped barrier_blocked_at; only the monotonic offset is
         # this process's.
-        now_wall = self._scheduler.barriers.database_now()
+        now_wall = self._scheduler.database_now()
         return self._clock.monotonic() - max(0.0, (now_wall - row.barrier_blocked_at).total_seconds())
 
     def _token_for_intake(self, row: TokenWorkItem) -> TokenInfo:
@@ -1682,7 +1682,7 @@ class BarrierRecoveryCoordinator:
         # so a leader whose process clock has drifted cannot fire or starve a
         # timeout by the size of its drift. The monotonic clock still paces
         # the restored triggers.
-        now = self._scheduler.barriers.database_now()
+        now = self._scheduler.database_now()
         # ADR-030 §E.4 belt: one run-wide duplicate-acceptance sweep at restore
         # entry. token_outcomes has NO non-terminal uniqueness — the adoption
         # CAS is the structural guard; >1 live BUFFERED rows for a token means

@@ -3582,6 +3582,19 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=620,
     ),
+    # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
+    # hold ages; the read connection is handed to read_landscape_transaction_time.
+    WriterIdentity(
+        "src/elspeth/core/landscape/scheduler/barrier.py",
+        "BarrierJournalRepository.database_now",
+        "<non-session-write-connection>",
+        "write_connection",
+        "8979512df427d440",
+        1,
+        None,
+        line=90,
+        connection_escape=True,
+    ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
         "BarrierJournalRepository.list_blocked_barrier_items",
@@ -3590,7 +3603,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "77752b22fc520b7b",
         1,
         None,
-        line=1087,
+        line=1098,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3600,7 +3613,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "89c87457b3d6b1a9",
         1,
         None,
-        line=1106,
+        line=1117,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3610,7 +3623,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c5310a65c3619209",
         1,
         None,
-        line=1120,
+        line=1131,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3620,7 +3633,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3053f6e3f97a64b7",
         1,
         None,
-        line=1144,
+        line=1155,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/group_losses.py",
@@ -3630,7 +3643,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "96de5f8f04d0d42b",
         1,
         None,
-        line=226,
+        line=227,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/group_losses.py",
@@ -3640,7 +3653,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b1352aa1e42a3d57",
         1,
         None,
-        line=261,
+        line=262,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
@@ -13356,7 +13369,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=466,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 54
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 55
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
