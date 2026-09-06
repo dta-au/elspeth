@@ -119,6 +119,43 @@ def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) ->
     return lapsed
 
 
+def expire_sink_effect_lease(engine: Any, effect_id: str, *, seconds_ago: float = 1.0) -> datetime:
+    """Age a sink effect's ``lease_expires_at`` to ``seconds_ago`` seconds before database time.
+
+    The sink-effect lease family (``claim_preparation``, ``acquire_lease``,
+    ``heartbeat_lease``, ``takeover_expired``, member results, finalization)
+    decides liveness against the Landscape database clock (ADR-047, C6 stage
+    4); a test that needs an expired effect lease writes the deadline into the
+    database's past instead of advancing a process clock the repository no
+    longer reads. Refuses (``AssertionError``) unless exactly one row carries
+    ``effect_id`` with a non-NULL deadline: ageing a lease that does not exist
+    would turn the test into a no-op that still passes. Returns the deadline
+    written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import sink_effects_table
+
+    with engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        # ck_sink_effects_lease_window keeps lease_expires_at >= lease_heartbeat_at,
+        # and the executor's wait refuses a non-positive window, so the last
+        # heartbeat moves back with the deadline: a one-second window that
+        # ended ``seconds_ago``.
+        result = conn.execute(
+            update(sink_effects_table)
+            .where(sink_effects_table.c.effect_id == effect_id)
+            .where(sink_effects_table.c.lease_expires_at.is_not(None))
+            .values(lease_heartbeat_at=lapsed - timedelta(seconds=1), lease_expires_at=lapsed)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"expire_sink_effect_lease: expected exactly one leased sink effect for effect_id={effect_id!r}, matched {result.rowcount}"
+            )
+    return lapsed
+
+
 def await_database_time(engine: Any, instant: datetime, *, timeout_seconds: float = 5.0) -> datetime:
     """Block until the Landscape database clock is strictly past ``instant``; return the clock read.
 

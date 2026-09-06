@@ -27,7 +27,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectState,
 )
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_lifecycle import (
     SinkEffectAttemptRequest,
@@ -35,7 +35,7 @@ from elspeth.core.landscape.execution.sink_effect_lifecycle import (
 )
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table, operations_table, sink_effects_table
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import expire_sink_effect_lease, make_factory, make_landscape_db
 from tests.unit.core.landscape.test_sink_effect_finalization import _descriptor, _prepared
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
@@ -221,7 +221,12 @@ def test_expired_preparation_claim_takeover_fences_stale_binder(db_factory: tupl
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
 
-    stale = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=timedelta(microseconds=1))
+    stale = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    with pytest.raises(LandscapeRecordError, match="live claim"):
+        repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+    # The claim lapses the way it does in production: its deadline passes on
+    # the Landscape database clock (ADR-047), written into the past here.
+    expire_sink_effect_lease(_db.engine, effect.effect_id)
     takeover = repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
     assert takeover.generation == stale.generation + 1
 
@@ -256,7 +261,7 @@ def test_lease_takeover_increments_generation_and_fences_stale_results(db_factor
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
     repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    first = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(microseconds=1))
+    first = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
     abandoned = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -267,6 +272,9 @@ def test_lease_takeover_increments_generation_and_fences_stale_results(db_factor
             request_hash="c" * 64,
         )
     )
+    with pytest.raises(LandscapeRecordError, match="has not expired"):
+        repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+    expire_sink_effect_lease(_db.engine, effect.effect_id)
     second = repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
     assert second.generation == first.generation + 1
 
@@ -497,3 +505,55 @@ def test_finalized_member_replay_fails_closed_without_descriptor(db_factory: tup
     )
     with pytest.raises(LandscapeRecordError, match="descriptor"):
         repo.complete_member_result(reconcile.attempt_id, not_applied, lease=lease)
+
+
+def test_lease_decisions_ignore_the_process_clock_and_follow_database_time(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6 stage 4 control (ADR-047): every sink-effect lease decision is made against Landscape database time.
+
+    The process clock is patched a year ahead of the deadline it would have
+    stamped; a repository that still consulted it would stamp the deadline
+    from 2040 and then judge it expired at 2041. Against database time the
+    lease is live, the takeover is refused, and every stamped deadline lands
+    inside the database's own window.
+    """
+    from datetime import UTC, datetime
+
+    from elspeth.core.landscape.execution import sink_effect_lifecycle
+    from tests.fixtures.landscape import assert_deadline_within, landscape_database_now
+
+    db, factory = db_factory
+    effect = _reserved(factory)
+    repo = factory.execution.sink_effects
+    ttl = timedelta(seconds=30)
+
+    monkeypatch.setattr(sink_effect_lifecycle, "now", lambda: datetime(2040, 1, 1, tzinfo=UTC))
+    claim = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=ttl)
+    assert_deadline_within(claim.expires_at, landscape_database_now(db.engine) + ttl)
+    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
+    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=ttl)
+    assert_deadline_within(lease.expires_at, landscape_database_now(db.engine) + ttl)
+
+    monkeypatch.setattr(sink_effect_lifecycle, "now", lambda: datetime(2041, 1, 1, tzinfo=UTC))
+    # The refusal is the typed one the executor's lease wait maps, and it is
+    # still a LandscapeRecordError for every caller that catches that.
+    with pytest.raises(SinkEffectLeaseLiveError, match="has not expired"):
+        repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=ttl)
+    contended = _reserved(factory)
+    repo.claim_preparation(contended.effect_id, owner="worker-a", ttl=ttl)
+    with pytest.raises(SinkEffectLeaseLiveError, match="live claim"):
+        repo.claim_preparation(contended.effect_id, owner="worker-b", ttl=ttl)
+    assert issubclass(SinkEffectLeaseLiveError, LandscapeRecordError)
+    renewed = repo.heartbeat_lease(effect.effect_id, owner="worker-a", generation=lease.generation, ttl=ttl)
+    assert_deadline_within(renewed.expires_at, landscape_database_now(db.engine) + ttl)
+    assert repo.lease_validity_seconds(effect.effect_id) is not None
+
+    # Only the database clock lapses a lease: written into its past, the same
+    # takeover the 2041 process clock could not buy is granted.
+    expire_sink_effect_lease(db.engine, effect.effect_id)
+    assert repo.lease_validity_seconds(effect.effect_id) is None
+    taken = repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=ttl)
+    assert taken.generation == lease.generation + 1
+    assert_deadline_within(taken.expires_at, landscape_database_now(db.engine) + ttl)

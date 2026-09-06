@@ -47,7 +47,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import audit_export_snapshots_table, runs_table, sink_effects_table
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
 from elspeth.engine.orchestrator.audit_export_effects import execute_audit_export_effect, prepare_audit_export_snapshot
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import expire_sink_effect_lease, register_test_node
 
 _COMPLETED_AT = datetime(2026, 7, 16, 7, 8, 9, 123456, tzinfo=UTC)
 
@@ -901,11 +901,18 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         clock = MockClock(start=datetime.now(UTC).timestamp())
         poll_sleeps: list[float] = []
         original_execute = audit_export_effects.execute_audit_export_effect
+        # The crashed attempt's lease lapses on the Landscape database clock
+        # (ADR-047), which the mock clock cannot move: once the resume has
+        # polled for a TTL, the deadline is written into the database's past
+        # exactly where it would have lapsed on the resume's own clock.
+        held_lease: list[str] = []
 
         def advance_clock(seconds: float) -> None:
             assert seconds > 0.0
             poll_sleeps.append(seconds)
             clock.advance(seconds)
+            if held_lease and sum(poll_sleeps) >= lease_ttl.total_seconds():
+                expire_sink_effect_lease(db.engine, held_lease.pop())
 
         def execute_with_deterministic_lease(**kwargs: object):  # type: ignore[no-untyped-def]
             return original_execute(
@@ -950,6 +957,7 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert effect_before.lease_expires_at.replace(tzinfo=UTC) > clock.now_utc()
 
         # Attempt 2: resume reconciles the applied effect without republishing.
+        held_lease.append(effect_before.effect_id)
         republications: list[Path] = []
         monkeypatch.setattr(_local_file_effects, "_after_replace", lambda path: republications.append(path))
         resume_audit_export(

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Final
 
-from sqlalchemy import Row, func, select
+from sqlalchemy import ColumnElement, Row, func, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import CallStatus, CallType
@@ -31,7 +31,8 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
@@ -61,6 +62,24 @@ def _require_positive_ttl(ttl: timedelta) -> None:
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def lease_is_live(conn: Connection, effect_id: str, liveness: ColumnElement[bool]) -> bool:
+    """Decide, in SQL, whether the effect's lease satisfies ``liveness`` right now.
+
+    ADR-047: the caller builds ``liveness`` as ``lease_expires_at >= database_now``
+    from the transaction clock it read under the row lock, so the deadline
+    comparison is a predicate bound to Landscape database time — neither
+    dialect's datetime convention nor a process clock enters the decision. A
+    deadline equal to database time is still live (whole-second SQLite time
+    makes that boundary reachable); a NULL deadline is not live.
+    """
+    return (
+        conn.execute(
+            select(sink_effects_table.c.effect_id).where(sink_effects_table.c.effect_id == effect_id, liveness)
+        ).scalar_one_or_none()
+        is not None
+    )
 
 
 def _descriptor_payload(plan: SinkEffectPlan) -> object:
@@ -129,17 +148,16 @@ class SinkEffectLifecycle:
             row = self._lock_effect(conn, effect_id, include_stream=True)
             if row.state != SinkEffectState.RESERVED.value:
                 raise LandscapeRecordError("sink effect preparation claim requires a reserved effect")
-            timestamp = now()
-            if (
-                row.lease_owner is not None
-                and row.lease_owner != owner
-                and row.lease_expires_at is not None
-                and _utc(row.lease_expires_at) >= timestamp
-            ):
-                raise LandscapeRecordError("sink effect preparation has a live claim owned by another worker")
+            # ADR-047: the claim decides liveness and stamps its deadline from
+            # Landscape database time read under the row lock, never from the
+            # process clock — a drifted worker cannot claim early or long.
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
+            if row.lease_owner is not None and row.lease_owner != owner and lease_live:
+                raise SinkEffectLeaseLiveError("sink effect preparation has a live claim owned by another worker")
             self._require_predecessor_finalized(conn, row)
             generation = int(row.generation) + 1
-            expires_at = timestamp + ttl
+            expires_at = database_now + ttl
             claimed = conn.execute(
                 sink_effects_table.update()
                 .where(
@@ -150,9 +168,9 @@ class SinkEffectLifecycle:
                 .values(
                     lease_owner=owner,
                     generation=generation,
-                    lease_heartbeat_at=timestamp,
+                    lease_heartbeat_at=database_now,
                     lease_expires_at=expires_at,
-                    updated_at=timestamp,
+                    updated_at=database_now,
                 )
             )
             if claimed.rowcount != 1:
@@ -345,13 +363,14 @@ class SinkEffectLifecycle:
             row = self._lock_effect(conn, effect_id, include_stream=True)
             if row.state == SinkEffectState.RESERVED.value:
                 raise LandscapeRecordError("sink effect must be prepared before lease acquisition")
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             if row.state != SinkEffectState.PREPARED.value:
-                if row.state == SinkEffectState.IN_FLIGHT.value and row.lease_owner == owner and _utc(row.lease_expires_at) >= now():
+                if row.state == SinkEffectState.IN_FLIGHT.value and row.lease_owner == owner and lease_live:
                     return SinkEffectLease(row.effect_id, row.lease_owner, row.generation, _utc(row.lease_expires_at))
                 raise LandscapeRecordError(f"sink effect cannot acquire lease from state {row.state!r}")
             self._require_predecessor_finalized(conn, row)
-            timestamp = now()
-            expires_at = timestamp + ttl
+            expires_at = database_now + ttl
             generation = int(row.generation) + 1
             conn.execute(
                 sink_effects_table.update()
@@ -360,9 +379,9 @@ class SinkEffectLifecycle:
                     state=SinkEffectState.IN_FLIGHT.value,
                     lease_owner=owner,
                     generation=generation,
-                    lease_heartbeat_at=timestamp,
+                    lease_heartbeat_at=database_now,
                     lease_expires_at=expires_at,
-                    updated_at=timestamp,
+                    updated_at=database_now,
                 )
             )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
@@ -379,7 +398,8 @@ class SinkEffectLifecycle:
         _require_positive_ttl(ttl)
         with self._db.write_connection() as conn:
             row = self._lock_effect(conn, effect_id, include_stream=False)
-            timestamp = now()
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             # Expiry alone does not depose a RESERVED preparation holder. A
             # competing claim wins by changing owner/generation under this
             # same row lock; an otherwise unchanged claim may revive, matching
@@ -388,14 +408,14 @@ class SinkEffectLifecycle:
                 row.state not in {SinkEffectState.RESERVED.value, SinkEffectState.IN_FLIGHT.value}
                 or row.lease_owner != owner
                 or row.generation != generation
-                or (row.state == SinkEffectState.IN_FLIGHT.value and _utc(row.lease_expires_at) < timestamp)
+                or (row.state == SinkEffectState.IN_FLIGHT.value and not lease_live)
             ):
                 raise LandscapeRecordError("sink effect lease heartbeat has stale owner or generation")
-            expires_at = timestamp + ttl
+            expires_at = database_now + ttl
             conn.execute(
                 sink_effects_table.update()
                 .where(sink_effects_table.c.effect_id == effect_id)
-                .values(lease_heartbeat_at=timestamp, lease_expires_at=expires_at, updated_at=timestamp)
+                .values(lease_heartbeat_at=database_now, lease_expires_at=expires_at, updated_at=database_now)
             )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
 
@@ -404,13 +424,16 @@ class SinkEffectLifecycle:
         _require_positive_ttl(ttl)
         with self._db.write_connection() as conn:
             row = self._lock_effect(conn, effect_id, include_stream=False)
-            timestamp = now()
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             if row.state == SinkEffectState.FINALIZED.value:
                 raise LandscapeRecordError("finalized sink effect cannot be taken over")
-            if row.state != SinkEffectState.IN_FLIGHT.value or _utc(row.lease_expires_at) >= timestamp:
+            if row.state != SinkEffectState.IN_FLIGHT.value:
                 raise LandscapeRecordError("sink effect lease has not expired")
+            if lease_live:
+                raise SinkEffectLeaseLiveError("sink effect lease has not expired")
             generation = int(row.generation) + 1
-            expires_at = timestamp + ttl
+            expires_at = database_now + ttl
             conn.execute(
                 sink_effects_table.update()
                 .where(
@@ -421,12 +444,32 @@ class SinkEffectLifecycle:
                 .values(
                     lease_owner=owner,
                     generation=generation,
-                    lease_heartbeat_at=timestamp,
+                    lease_heartbeat_at=database_now,
                     lease_expires_at=expires_at,
-                    updated_at=timestamp,
+                    updated_at=database_now,
                 )
             )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
+
+    def lease_validity_seconds(self, effect_id: str) -> float | None:
+        """Seconds the effect's lease stays live at Landscape database time; ``None`` once it has lapsed or never existed.
+
+        Both operands come from the database in one read: the stored deadline
+        and the transaction clock (ADR-047). A caller pacing a wait for a
+        foreign lease uses this instead of subtracting the deadline from its
+        own process clock, so its budget and the repository's takeover
+        decision are measured on the same clock.
+        """
+        _require_hash(effect_id, "effect_id")
+        with self._db.read_only_connection() as conn:
+            deadline = conn.execute(
+                select(sink_effects_table.c.lease_expires_at).where(sink_effects_table.c.effect_id == effect_id)
+            ).scalar_one_or_none()
+            if deadline is None:
+                return None
+            database_now = read_landscape_transaction_time(conn)
+        remaining = (_utc(deadline) - database_now).total_seconds()
+        return None if remaining < 0.0 else remaining
 
     def begin_attempt(self, request: SinkEffectAttemptRequest) -> SinkEffectAttempt:
         if type(request) is not SinkEffectAttemptRequest:
@@ -620,13 +663,14 @@ class SinkEffectLifecycle:
                 raise LandscapeRecordError(f"sink effect attempt {attempt_id!r} does not exist")
             effect = self._lock_effect(conn, optimistic.effect_id, include_stream=True)
             attempt = self._lock_attempt(conn, attempt_id)
-            timestamp = now()
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
             if (
                 lease.effect_id != effect.effect_id
                 or effect.state != SinkEffectState.IN_FLIGHT.value
                 or effect.lease_owner != lease.owner
                 or effect.generation != lease.generation
-                or _utc(effect.lease_expires_at) < timestamp
+                or not lease_live
             ):
                 raise LandscapeRecordError("member result has stale lease authority")
             if attempt.member_ordinal is None:
@@ -735,6 +779,8 @@ class SinkEffectLifecycle:
             operation = self._lock_operation(conn, optimistic.effect_id)
             attempt = self._lock_attempt(conn, attempt_id)
             timestamp = now()
+            database_now = read_landscape_transaction_time(conn)
+            lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
             if recovery_lease is None:
                 if effect.generation != attempt.generation:
                     raise LandscapeRecordError("response-lost classification has stale generation")
@@ -743,7 +789,7 @@ class SinkEffectLifecycle:
                 or effect.state != SinkEffectState.IN_FLIGHT.value
                 or effect.lease_owner != recovery_lease.owner
                 or effect.generation != recovery_lease.generation
-                or _utc(effect.lease_expires_at) < timestamp
+                or not lease_live
                 or attempt.generation > recovery_lease.generation
             ):
                 raise LandscapeRecordError("response-lost recovery has stale lease authority")
