@@ -186,6 +186,28 @@ def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
         assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), step.get("name")
 
 
+def test_integration_job_carries_no_marker_expression_of_its_own() -> None:
+    """The Integration job's marker selection is pyproject addopts' too.
+
+    The same defect as the Test job's above, one job over, and still latent
+    when that one was fixed: this job is ``needs: [test]``, so it has been
+    skipped on every run while the Test job is red, and it is the only job in
+    the workflow carrying a provider credential. Its ``-m integration``
+    narrowed nothing — tests/integration/conftest.py auto-marks every node
+    under that path ``integration``, so the flag selected 3153 of 3153 — while
+    replacing the addopts expression and dropping every guard in it: 55
+    live_provider ids were selected, and tests/conftest.py refuses those with a
+    UsageError, which is exit 4. This job tolerates only exit 5, so the first
+    genuinely green Test job would have failed it and taken the run conclusion
+    (and build-push.yaml) with it (elspeth-7103e36698, elspeth-6128fc7f95).
+    """
+    pytest_steps = [step for step in _job("integration")["steps"] if "pytest" in str(step.get("run", ""))]
+    assert len(pytest_steps) == 1, [step.get("name") for step in pytest_steps]
+    tokens = pytest_steps[0]["run"].replace("\\\n", " ").split()
+    assert "-m" not in tokens, pytest_steps[0].get("name")
+    assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), pytest_steps[0].get("name")
+
+
 def test_testcontainer_job_selects_the_postgresql_matrix() -> None:
     """The testcontainer job is the ONLY run of the ``testcontainer`` ids.
 
