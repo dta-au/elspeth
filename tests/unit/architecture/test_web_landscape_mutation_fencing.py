@@ -21,7 +21,7 @@ import hashlib
 import re
 import textwrap
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -4093,7 +4093,218 @@ def _transaction_order_violations(
     edges_by_helper: dict[tuple[str, str], set[tuple[str, str]]] = {}
     for edge in edges:
         edges_by_helper.setdefault((edge.helper_path, edge.helper_symbol), set()).add((edge.caller_path, edge.caller_symbol))
+    helper_keys = _subordinate_helper_keys(index, dml)
+    unit_by_path = {unit.path: unit for unit in unit_list}
     violations: list[str] = list(_subordinate_helper_resolution_violations(unit_list, dml))
+    admitted: dict[tuple[str, str], str | None] = {}
+
+    def helper_calls_in(caller: ast.FunctionDef | ast.AsyncFunctionDef, caller_path: str, helper_key: tuple[str, str]) -> list[ast.Call]:
+        caller_resolver = _resolver_for_unit(unit_by_path[caller_path])
+        return [
+            child
+            for child in _walk_same_scope(caller)
+            if isinstance(child, ast.Call)
+            and _resolve_helper_candidates(child, unit_by_path[caller_path], {helper_key}, caller_resolver) == (helper_key,)
+        ]
+
+    def helper_side_violation(helper_key: tuple[str, str]) -> str | None:
+        """Checks that depend on the helper alone, whoever calls it."""
+
+        path = helper_key[0]
+        helper = index[helper_key]
+        helper_resolver = _resolver_for_unit(unit_by_path[path])
+        if helper_calls_in(helper, path, helper_key):
+            return "subordinate helper recursively invokes itself"
+        if _parameter_rebound(helper, "conn"):
+            return "subordinate conn parameter is rebound"
+        binding_violation = _dml_execution_binding_violation(helper, "conn")
+        if binding_violation is not None:
+            return binding_violation
+        helper_effects = [
+            effect
+            for effect in _database_effect_calls(helper)
+            if _resolved_callable_name(effect.func, helper_resolver, use=effect) in _PAYLOAD_EFFECT_NAMES
+        ]
+        if any(not _payload_uses_exact_connection(effect, "conn") for effect in helper_effects):
+            return "subordinate DML does not use the exact helper connection"
+        return None
+
+    def connection_arguments(call: ast.Call, helper: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr]:
+        positional_parameters = [argument.arg for argument in (*helper.args.posonlyargs, *helper.args.args) if argument.arg != "self"]
+        values: list[ast.expr] = [keyword.value for keyword in call.keywords if keyword.arg == "conn"]
+        if "conn" in positional_parameters and positional_parameters.index("conn") < len(call.args):
+            values.append(call.args[positional_parameters.index("conn")])
+        return values
+
+    def exact_connection_argument(call: ast.Call, helper: ast.FunctionDef | ast.AsyncFunctionDef, connection: str | None) -> bool:
+        values = connection_arguments(call, helper)
+        return (
+            len(values) == 1
+            and isinstance(values[0], ast.Name)
+            and values[0].id == connection
+            and not any(keyword.arg is None for keyword in call.keywords)
+        )
+
+    def run_parameter_values(call: ast.Call, helper: ast.FunctionDef | ast.AsyncFunctionDef, run_parameter: str) -> list[ast.expr]:
+        positional_parameters = [argument.arg for argument in (*helper.args.posonlyargs, *helper.args.args) if argument.arg != "self"]
+        values = [keyword.value for keyword in call.keywords if keyword.arg == run_parameter]
+        if run_parameter in positional_parameters:
+            position = positional_parameters.index(run_parameter)
+            if position < len(call.args):
+                values.append(call.args[position])
+        return values
+
+    def run_subjects_bound(
+        call: ast.Call,
+        helper: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        bound_to: Callable[[ast.expr], bool],
+    ) -> bool:
+        """Every run-named parameter the helper's DML uses must be passed as a proven subject."""
+
+        helper_arguments = [
+            argument.arg for argument in (*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs) if argument.arg != "self"
+        ]
+        for run_parameter in _dml_named_run_subjects(helper):
+            if run_parameter not in helper_arguments or _parameter_rebound(helper, run_parameter):
+                return False
+            values = run_parameter_values(call, helper, run_parameter)
+            if len(values) != 1 or not bound_to(values[0]):
+                return False
+        return True
+
+    def call_site_violation(calls: list[ast.Call], *, transaction_scope: ast.AST, caller: ast.AST) -> str | None:
+        if len(calls) != 1:
+            return f"call sites={len(calls)} expected=1"
+        if any(not _is_descendant(call, transaction_scope) for call in calls):
+            return "subordinate call escapes its caller's fenced transaction"
+        if any(_has_repeating_ancestor(call, stop=transaction_scope) for call in calls):
+            return "subordinate call is nested in a runtime-repeating construct"
+        if any(_is_statically_dead(call, stop=caller) for call in calls):
+            return "subordinate call is statically unreachable"
+        return None
+
+    def evidence_edge_violation(helper_key: tuple[str, str], caller_key: tuple[str, str]) -> str | None:
+        """The pinned unfenced-evidence edge: a proven-deposed writer's refusal row."""
+
+        edge = _FENCE_REFUSAL_EVIDENCE_EDGE
+        if caller_key in dml_symbols:
+            return f"{edge.classification} caller constructs DML of its own"
+        caller = index[caller_key]
+        caller_resolver = _resolver_for_unit(unit_by_path[caller_key[0]])
+        transactions = [
+            (child, item)
+            for child in _walk_same_scope(caller)
+            if isinstance(child, (ast.With, ast.AsyncWith))
+            for item in child.items
+            if isinstance(item.context_expr, ast.Call)
+            and caller_resolver.qualified_name(item.context_expr.func, use=item.context_expr) == _BEGIN_WRITE_QUALIFIED
+        ]
+        if len(transactions) != 1 or not isinstance(transactions[0][1].optional_vars, ast.Name):
+            return f"{edge.classification} caller must open exactly one begin_write transaction bound to a name"
+        transaction, item = transactions[0]
+        connection = item.optional_vars.id
+        calls = helper_calls_in(caller, caller_key[0], helper_key)
+        site_violation = call_site_violation(calls, transaction_scope=transaction, caller=caller)
+        if site_violation is not None:
+            return f"{edge.classification} {site_violation}"
+        if not exact_connection_argument(calls[0], index[helper_key], connection):
+            return f"{edge.classification} subordinate call does not receive the exact begin_write connection"
+        actual = Counter((site.table, site.operation.removeprefix("raw-")) for site in dml if (site.path, site.symbol) == helper_key)
+        expected = Counter({(table, operation): count for table, operation, count in edge.write_counts})
+        if actual != expected:
+            return f"{edge.classification} write counts drifted: expected={sorted(expected.items())!r} actual={sorted(actual.items())!r}"
+        return None
+
+    def fenced_owner_edge_violation(helper_key: tuple[str, str], caller_key: tuple[str, str]) -> str | None:
+        caller = index[caller_key]
+        caller_violation = _function_fence_violation(caller)
+        if caller_violation is not None:
+            return f"is not fenced: {caller_violation}"
+        fenced_context = _fenced_contexts(caller)[0]
+        helper = index[helper_key]
+        calls = helper_calls_in(caller, caller_key[0], helper_key)
+        site_violation = call_site_violation(calls, transaction_scope=fenced_context.owner, caller=caller)
+        if site_violation is not None:
+            return site_violation
+        if any(not exact_connection_argument(call, helper, fenced_context.connection) for call in calls):
+            return "subordinate call does not receive the exact caller-owned conn"
+        caller_token = _authority_parameter(caller)
+
+        def bound_to_caller_token(value: ast.expr) -> bool:
+            return caller_token is not None and _exact_token_run_id_expression(value, caller_token)
+
+        if any(not run_subjects_bound(call, helper, bound_to=bound_to_caller_token) for call in calls):
+            return "subordinate run subject is not exact caller token.run_id"
+        return None
+
+    def helper_caller_edge_violation(
+        helper_key: tuple[str, str], caller_key: tuple[str, str], stack: frozenset[tuple[str, str]]
+    ) -> str | None:
+        """A conn-helper calling another conn-helper: the caller must itself be admitted, on its own conn."""
+
+        caller = index[caller_key]
+        helper = index[helper_key]
+        caller_reason = helper_admission(caller_key, stack)
+        if caller_reason is not None:
+            return f"is reached through an unadmitted subordinate helper: {caller_reason}"
+        calls = helper_calls_in(caller, caller_key[0], helper_key)
+        site_violation = call_site_violation(calls, transaction_scope=caller, caller=caller)
+        if site_violation is not None:
+            return site_violation
+        if any(not exact_connection_argument(call, helper, "conn") for call in calls):
+            return "subordinate call does not receive the exact caller-owned conn"
+        caller_run_parameters = {
+            argument.arg
+            for argument in (*caller.args.posonlyargs, *caller.args.args, *caller.args.kwonlyargs)
+            if argument.arg.endswith("run_id") and not _parameter_rebound(caller, argument.arg)
+        }
+
+        def bound_to_caller_parameter(value: ast.expr) -> bool:
+            return isinstance(value, ast.Name) and value.id in caller_run_parameters
+
+        if any(not run_subjects_bound(call, helper, bound_to=bound_to_caller_parameter) for call in calls):
+            return "subordinate run subject is not exact caller token.run_id"
+        return None
+
+    def edge_violation(helper_key: tuple[str, str], caller_key: tuple[str, str], stack: frozenset[tuple[str, str]]) -> str | None:
+        if caller_key not in index:
+            return "is unresolved"
+        if any(helper_key in family and caller_key in family for family in _ESTABLISHMENT_HELPER_SYMBOLS.values()):
+            # Both endpoints sit inside one authority-establishment helper
+            # graph: every write on the edge is pinned per table by that
+            # establishment's exact write counts (_begin_run_edge_violations).
+            return None
+        if (caller_key, helper_key) == (
+            (_FENCE_REFUSAL_EVIDENCE_EDGE.caller_path, _FENCE_REFUSAL_EVIDENCE_EDGE.caller_symbol),
+            (_FENCE_REFUSAL_EVIDENCE_EDGE.helper_path, _FENCE_REFUSAL_EVIDENCE_EDGE.helper_symbol),
+        ):
+            return evidence_edge_violation(helper_key, caller_key)
+        if caller_key in helper_keys:
+            return helper_caller_edge_violation(helper_key, caller_key, stack)
+        return fenced_owner_edge_violation(helper_key, caller_key)
+
+    def helper_admission(helper_key: tuple[str, str], stack: frozenset[tuple[str, str]]) -> str | None:
+        """None when the helper's DML is proven to execute only inside fenced transactions, else the first reason."""
+
+        if helper_key in admitted:
+            return admitted[helper_key]
+        if helper_key in stack:
+            return "subordinate helper chain is cyclic"
+        reason = helper_side_violation(helper_key)
+        if reason is None:
+            callers = sorted(edges_by_helper.get(helper_key, set()))
+            if not callers:
+                reason = "subordinate raw-Connection helper callers=0 expected>=1"
+            for caller_key in callers:
+                if reason is not None:
+                    break
+                caller_reason = edge_violation(helper_key, caller_key, stack | {helper_key})
+                if caller_reason is not None:
+                    reason = f"subordinate caller {caller_key[0]}:{caller_key[1]} {caller_reason}"
+        admitted[helper_key] = reason
+        return reason
+
     for path, symbol in sorted(dml_symbols):
         if (path, symbol) in exact_establishment_symbols:
             continue
@@ -4101,119 +4312,50 @@ def _transaction_order_violations(
         if node is None:
             violations.append(f"{path}:{symbol} DML owner definition missing")
             continue
-        connection_parameter = any(argument.arg == "conn" for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))
-        if connection_parameter:
-            callers = edges_by_helper.get((path, symbol), set())
-            if len(callers) != 1:
-                violations.append(f"{path}:{symbol} subordinate raw-Connection helper callers={len(callers)} expected=1")
-                continue
-            caller_key = next(iter(callers))
-            caller = index.get(caller_key)
-            if caller is None:
-                violations.append(f"{path}:{symbol} subordinate caller {caller_key!r} is unresolved")
-                continue
-            caller_violation = _function_fence_violation(caller)
-            if caller_violation is not None:
-                violations.append(f"{path}:{symbol} subordinate caller {caller_key[0]}:{caller_key[1]} is not fenced: {caller_violation}")
-                continue
-            fenced_context = _fenced_contexts(caller)[0]
-            fenced_with = fenced_context.owner
-            caller_unit = next(unit for unit in unit_list if unit.path == caller_key[0])
-            caller_resolver = _resolver_for_unit(caller_unit)
-            helper_keys = {(path, symbol)}
-            helper_calls = [
-                child
-                for child in _walk_same_scope(caller)
-                if isinstance(child, ast.Call)
-                and _resolve_helper_candidates(child, caller_unit, helper_keys, caller_resolver) == ((path, symbol),)
-            ]
-            if len(helper_calls) != 1:
-                violations.append(f"{path}:{symbol} subordinate call sites={len(helper_calls)} expected=1")
-                continue
-            if any(not _is_descendant(call, fenced_with) for call in helper_calls):
-                violations.append(f"{path}:{symbol} subordinate call escapes its caller's fenced transaction")
-                continue
-            if any(_has_repeating_ancestor(call, stop=fenced_with) for call in helper_calls):
-                violations.append(f"{path}:{symbol} subordinate call is nested in a runtime-repeating construct")
-                continue
-            if any(_is_statically_dead(call, stop=caller) for call in helper_calls):
-                violations.append(f"{path}:{symbol} subordinate call is statically unreachable")
-                continue
-            helper = index[(path, symbol)]
-            helper_unit = next(unit for unit in unit_list if unit.path == path)
-            helper_resolver = _resolver_for_unit(helper_unit)
-            recursive_calls = [
-                child
-                for child in _walk_same_scope(helper)
-                if isinstance(child, ast.Call)
-                and _resolve_helper_candidates(child, helper_unit, {(path, symbol)}, helper_resolver) == ((path, symbol),)
-            ]
-            if recursive_calls:
-                violations.append(f"{path}:{symbol} subordinate helper recursively invokes itself")
-                continue
-            if _parameter_rebound(helper, "conn"):
-                violations.append(f"{path}:{symbol} subordinate conn parameter is rebound")
-                continue
-            helper_binding_violation = _dml_execution_binding_violation(helper, "conn")
-            if helper_binding_violation is not None:
-                violations.append(f"{path}:{symbol} {helper_binding_violation}")
-                continue
-            positional_parameters = [argument.arg for argument in (*helper.args.posonlyargs, *helper.args.args) if argument.arg != "self"]
-            conn_position = positional_parameters.index("conn") if "conn" in positional_parameters else None
-
-            def exact_helper_connection(
-                call: ast.Call,
-                conn_position: int | None = conn_position,
-                fenced_connection: str | None = fenced_context.connection,
-            ) -> bool:
-                values: list[ast.expr] = [keyword.value for keyword in call.keywords if keyword.arg == "conn"]
-                if conn_position is not None and conn_position < len(call.args):
-                    values.append(call.args[conn_position])
-                return (
-                    len(values) == 1
-                    and isinstance(values[0], ast.Name)
-                    and values[0].id == fenced_connection
-                    and not any(keyword.arg is None for keyword in call.keywords)
-                )
-
-            if any(not exact_helper_connection(call) for call in helper_calls):
-                violations.append(f"{path}:{symbol} subordinate call does not receive the exact caller-owned conn")
-                continue
-            caller_token = _authority_parameter(caller)
-            helper_arguments = [
-                argument.arg
-                for argument in (*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs)
-                if argument.arg != "self"
-            ]
-            helper_run_parameters = _dml_named_run_subjects(helper)
-            helper_subject_invalid = False
-            for call in helper_calls:
-                for run_parameter in helper_run_parameters:
-                    if run_parameter not in helper_arguments or _parameter_rebound(helper, run_parameter):
-                        helper_subject_invalid = True
-                        continue
-                    values = [keyword.value for keyword in call.keywords if keyword.arg == run_parameter]
-                    if run_parameter in positional_parameters:
-                        position = positional_parameters.index(run_parameter)
-                        if position < len(call.args):
-                            values.append(call.args[position])
-                    if caller_token is None or len(values) != 1 or not _exact_token_run_id_expression(values[0], caller_token):
-                        helper_subject_invalid = True
-            if helper_subject_invalid:
-                violations.append(f"{path}:{symbol} subordinate run subject is not exact caller token.run_id")
-                continue
-            helper_effects = [
-                effect
-                for effect in _database_effect_calls(helper)
-                if _resolved_callable_name(effect.func, helper_resolver, use=effect) in _PAYLOAD_EFFECT_NAMES
-            ]
-            if any(not _payload_uses_exact_connection(effect, "conn") for effect in helper_effects):
-                violations.append(f"{path}:{symbol} subordinate DML does not use the exact helper connection")
-        else:
-            violation = _function_fence_violation(node)
-            if violation is not None:
-                violations.append(f"{path}:{symbol} {violation}")
+        if (path, symbol) in helper_keys:
+            # Every caller edge of a raw-Connection helper must be fenced —
+            # a fenced owner passing its exact fenced connection, an admitted
+            # helper passing its own exact ``conn`` (transitively), an
+            # authority-establishment graph whose writes are pinned, or the
+            # one pinned unfenced-evidence edge.  Cardinality is not the
+            # property; every execution being inside a proven fence is.
+            reason = helper_admission((path, symbol), frozenset())
+            if reason is not None:
+                violations.append(f"{path}:{symbol} {reason}")
+            continue
+        violation = _function_fence_violation(node)
+        if violation is not None:
+            violations.append(f"{path}:{symbol} {violation}")
     return tuple(violations)
+
+
+@dataclass(frozen=True, slots=True)
+class UnfencedEvidenceEdge:
+    """One pinned caller->helper edge whose write is EVIDENCE of lost authority, so it cannot be fenced."""
+
+    classification: str
+    caller_path: str
+    caller_symbol: str
+    helper_path: str
+    helper_symbol: str
+    write_counts: tuple[tuple[str, str, int], ...]
+    rationale: str
+
+
+_BEGIN_WRITE_QUALIFIED = "elspeth.core.landscape.database.begin_write"
+_FENCE_REFUSAL_EVIDENCE_EDGE = UnfencedEvidenceEdge(
+    classification="fence-refusal-evidence",
+    caller_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    caller_symbol="_record_best_effort_event",
+    helper_path="src/elspeth/core/landscape/run_coordination_repository.py",
+    helper_symbol="record_coordination_event",
+    write_counts=(("run_coordination_events", "insert", 1),),
+    rationale=(
+        "ADR-030 §A.2: the fence_refusal / heartbeat_degraded row is written by a writer the fence has JUST "
+        "proven holds no authority, on a fresh connection after the refused transaction rolled back; it is "
+        "best-effort by design and is the forensic trace that a fence WAS refused."
+    ),
+)
 
 
 _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
@@ -5941,8 +6083,23 @@ def test_transaction_scanner_rejects_nested_decoy_payload_before_fence_and_multi
         ),
     )
     dml = scan_dml_identities([helpers])
-    violations = _transaction_order_violations([helpers], dml)
-    assert any("helper callers=2 expected=1" in item for item in violations)
+    assert not any("helpers.py:helper" in item for item in _transaction_order_violations([helpers], dml))
+
+    one_unfenced = _parse_source(
+        helpers.path,
+        helpers.source.replace(
+            "def second(*, coordination_token: CoordinationToken):\n    with fenced_leader_transaction(engine, token=coordination_token) as conn:",
+            "def second(*, coordination_token: CoordinationToken):\n    with begin_write(engine) as conn:",
+        ),
+    )
+    one_unfenced_violations = _transaction_order_violations([one_unfenced], scan_dml_identities([one_unfenced]))
+    assert any(
+        "helpers.py:helper subordinate caller src/elspeth/core/landscape/helpers.py:second is not fenced" in item
+        for item in one_unfenced_violations
+    )
+
+    no_callers = _parse_source(helpers.path, helpers.source.split("def first")[0])
+    assert any("callers=0 expected>=1" in item for item in _transaction_order_violations([no_callers], scan_dml_identities([no_callers])))
 
     outside = _parse_source(
         "src/elspeth/core/landscape/outside.py",
@@ -6271,6 +6428,131 @@ def test_transaction_scanner_requires_context_order_exact_connection_and_semanti
     )
     alien_writer = next(node for node in ast.walk(alien_run_subject.tree) if isinstance(node, ast.FunctionDef))
     assert "non-token run-column subject" in (_function_fence_violation(alien_writer) or "")
+
+
+def test_shared_subordinate_helper_is_admitted_only_when_every_caller_edge_is_fenced() -> None:
+    """ADR-048 D8.8 closure: a raw-Connection helper is admitted per EDGE, never by caller count.
+
+    A helper reached through another helper is admitted only when that
+    helper is itself admitted on its own ``conn`` and forwards its own
+    run-named parameter; a cyclic chain, a chain rooted in an unfenced
+    owner, and a run subject that is not the caller's own parameter all
+    stay red.  The one unfenced edge is the pinned fence-refusal evidence
+    row, admitted only in its exact shape.
+    """
+
+    chain = _parse_source(
+        "src/elspeth/core/landscape/chain.py",
+        textwrap.dedent(
+            """\
+            from sqlalchemy import insert, update
+            from elspeth.contracts.coordination import CoordinationToken
+            from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+            from elspeth.core.landscape.schema import runs_table, run_coordination_events_table
+
+            def leaf(conn, *, run_id):
+                conn.execute(insert(run_coordination_events_table).values(run_id=run_id))
+
+            def middle(conn, *, run_id):
+                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="failed"))
+                leaf(conn, run_id=run_id)
+
+            def owner(*, coordination_token: CoordinationToken):
+                with fenced_leader_transaction(engine, token=coordination_token) as conn:
+                    middle(conn, run_id=coordination_token.run_id)
+
+            def sibling(*, coordination_token: CoordinationToken):
+                with fenced_leader_transaction(engine, token=coordination_token) as conn:
+                    leaf(conn, run_id=coordination_token.run_id)
+            """
+        ),
+    )
+    assert _transaction_order_violations([chain], scan_dml_identities([chain])) == ()
+
+    unfenced_root = _parse_source(
+        chain.path,
+        chain.source.replace(
+            "def owner(*, coordination_token: CoordinationToken):\n    with fenced_leader_transaction(engine, token=coordination_token) as conn:",
+            "def owner(*, coordination_token: CoordinationToken):\n    with begin_write(engine) as conn:",
+        ),
+    )
+    unfenced_violations = _transaction_order_violations([unfenced_root], scan_dml_identities([unfenced_root]))
+    assert any(
+        "chain.py:middle subordinate caller src/elspeth/core/landscape/chain.py:owner is not fenced" in item for item in unfenced_violations
+    )
+    assert any(
+        "chain.py:leaf subordinate caller src/elspeth/core/landscape/chain.py:middle is reached through an unadmitted subordinate helper"
+        in item
+        for item in unfenced_violations
+    )
+
+    foreign_subject = _parse_source(
+        chain.path, chain.source.replace("    leaf(conn, run_id=run_id)", "    leaf(conn, run_id=other_run_id)")
+    )
+    foreign_violations = _transaction_order_violations([foreign_subject], scan_dml_identities([foreign_subject]))
+    assert any(
+        "chain.py:leaf subordinate caller src/elspeth/core/landscape/chain.py:middle subordinate run subject" in item
+        for item in foreign_violations
+    )
+
+    cyclic = _parse_source(
+        chain.path,
+        chain.source.replace(
+            "    conn.execute(insert(run_coordination_events_table).values(run_id=run_id))\n",
+            "    conn.execute(insert(run_coordination_events_table).values(run_id=run_id))\n    if again:\n        middle(conn, run_id=run_id)\n",
+        ),
+    )
+    cyclic_violations = _transaction_order_violations([cyclic], scan_dml_identities([cyclic]))
+    assert any("chain is cyclic" in item for item in cyclic_violations)
+
+    evidence = _parse_source(
+        _FENCE_REFUSAL_EVIDENCE_EDGE.caller_path,
+        textwrap.dedent(
+            """\
+            from sqlalchemy import insert
+            from elspeth.core.landscape.database import begin_write
+            from elspeth.core.landscape.schema import run_coordination_events_table
+
+            def record_coordination_event(conn, *, run_id):
+                conn.execute(insert(run_coordination_events_table).values(run_id=run_id))
+
+            def _record_best_effort_event(engine, *, run_id):
+                with begin_write(engine) as conn:
+                    record_coordination_event(conn, run_id=run_id)
+            """
+        ),
+    )
+    assert _transaction_order_violations([evidence], scan_dml_identities([evidence])) == ()
+
+    evidence_with_own_dml = _parse_source(
+        evidence.path,
+        evidence.source.replace(
+            "        record_coordination_event(conn, run_id=run_id)\n",
+            "        record_coordination_event(conn, run_id=run_id)\n        conn.execute(insert(run_coordination_events_table).values(run_id=run_id))\n",
+        ),
+    )
+    assert any(
+        "fence-refusal-evidence caller constructs DML of its own" in item
+        for item in _transaction_order_violations([evidence_with_own_dml], scan_dml_identities([evidence_with_own_dml]))
+    )
+
+    evidence_twice = _parse_source(
+        evidence.path,
+        evidence.source.replace(
+            "        record_coordination_event(conn, run_id=run_id)\n",
+            "        record_coordination_event(conn, run_id=run_id)\n        record_coordination_event(conn, run_id=run_id)\n",
+        ),
+    )
+    assert any(
+        "fence-refusal-evidence call sites=2 expected=1" in item
+        for item in _transaction_order_violations([evidence_twice], scan_dml_identities([evidence_twice]))
+    )
+
+    evidence_elsewhere = _parse_source("src/elspeth/core/landscape/elsewhere.py", evidence.source)
+    assert any(
+        "elsewhere.py:_record_best_effort_event is not fenced" in item
+        for item in _transaction_order_violations([evidence_elsewhere], scan_dml_identities([evidence_elsewhere]))
+    )
 
 
 def test_subordinate_helper_must_use_and_receive_the_exact_guarded_connection() -> None:
