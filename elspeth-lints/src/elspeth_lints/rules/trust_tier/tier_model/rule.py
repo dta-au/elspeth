@@ -512,16 +512,7 @@ class TierModelVisitor(ast.NodeVisitor):
         "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"AzureSearchProvider._parse_response"}),
         "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"ChromaSearchProvider._parse_and_build_chunks"}),
         "plugins/transforms/azure/prompt_shield.py": frozenset({"AzurePromptShield._analyze_prompt"}),
-        "web/auth/oidc.py": frozenset(
-            {
-                "JWKSTokenValidator._get_jwk_algorithm",
-                "JWKSTokenValidator._get_token_algorithm",
-                "JWKSTokenValidator._validate_discovery_document",
-                "JWKSTokenValidator._validate_jwks_document",
-                "OIDCAuthProvider.get_user_info",
-                "optional_profile_claim",
-            }
-        ),
+        "web/auth/oidc.py": frozenset({"OIDCAuthProvider.get_user_info"}),
         "web/composer/audit.py": frozenset(
             {
                 "_normalize_audit_payload",
