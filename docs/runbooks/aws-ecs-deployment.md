@@ -1375,23 +1375,32 @@ completed or an interruption/failure requires Task 6.
 
 ## Authentication and secret injection
 
-Cognito/OIDC is recommended. Configure `auth_provider=oidc`, the user-pool
-`oidc_issuer`, and set both `oidc_audience` and `oidc_client_id` to the public
-app-client ID. Set the hosted/custom-domain
-`oidc_authorization_endpoint` and same-origin `oidc_token_endpoint`, exposed
-as `ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT` and
-`ELSPETH_WEB__OIDC_TOKEN_ENDPOINT`.
+Cognito/OIDC is the target, and it is NOT selected yet. Both deployment
+modes ship `auth_provider=local` until the confidential app client exists:
+since the legacy browser-client path was deleted, every registered profile is
+validated from the profile registry, so `auth_provider=oidc` requires
+`sso_client_secret` — which the public client this package creates cannot
+supply. A task definition selecting `oidc` without it does not report "not
+ready"; it fails at settings load, before readiness runs. That is why the
+provider stays local here rather than being half-configured.
 
-The former browser-origin allowlist and Cognito access-token audience-claim
-settings are deleted; a task definition that still exports either refuses to
-boot on an unknown setting (`tests/unit/deployment/test_web_settings_exports_resolve.py`
-pins that no tracked export or runbook names a setting that does not exist).
-Explicit endpoints on the legacy path must share the issuer's origin, and tokens
-are validated on `aud` only. Cognito's hosted-domain origin is served by the single sign-on profile
-(`sso_endpoint_origins`), which requires the confidential app client and the
-`sso_*` settings that land with the identity cutover; until then the browser
-uses the authorization code flow with S256 PKCE against the public client, which
-has no client secret, and the implicit flow must not be enabled.
+The identity cutover flips it in one change, exporting all eight together:
+`ELSPETH_WEB__SSO_ISSUER` (the user pool), `ELSPETH_WEB__SSO_CLIENT_ID` and
+`ELSPETH_WEB__SSO_CLIENT_SECRET` (the confidential app client, injected from
+Secrets Manager), `ELSPETH_WEB__SSO_ENDPOINT_ORIGINS` (the hosted or custom
+domain, a JSON list), `ELSPETH_WEB__SSO_TRANSACTION_SECRET`,
+`ELSPETH_WEB__PUBLIC_BASE_URL`, `ELSPETH_WEB__COMPARTMENT_ID` and the two
+quota defaults. Fewer than all eight is a task definition that does not
+start, so they land in one revision rather than incrementally. The backend then redeems the authorization code as a
+CONFIDENTIAL client: the browser never holds a client secret and never
+performs the token exchange, and the implicit flow must not be enabled. Until
+that lands, the checks below still verify the PUBLIC client.
+
+The legacy browser-client settings (`oidc_*`), the browser-origin allowlist
+and the Cognito access-token audience-claim mode are deleted; a task
+definition that still exports any of them refuses to boot on an unknown
+setting (`tests/unit/deployment/test_web_settings_exports_resolve.py` pins
+that no tracked export or runbook names a setting that does not exist).
 
 Before browser acceptance, query the one approved pool/client through the
 protected capture wrapper and project only booleans and counts:

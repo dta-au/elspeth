@@ -26,12 +26,24 @@ from elspeth.web.middleware.request_id import RequestIdMiddleware
 
 from .conftest import build_local_auth_provider
 
-_OIDC_FIELDS = {
-    "oidc_issuer": "https://issuer.example.com",
-    "oidc_audience": "test-audience",
-    "oidc_client_id": "test-client-id",
+# What every IdP profile requires of a deployment, whichever one is selected.
+# ``WebSettings`` refuses a non-local provider that is missing any of them, so
+# a test that only wants "some non-local provider" still has to supply the
+# whole set.
+_COMMON_IDP_FIELDS = {
+    "sso_client_id": "elspeth",
+    "sso_client_secret": "s" * 40,
+    "sso_transaction_secret": "t" * 40,
+    "public_base_url": "https://elspeth.example.gov.au",
+    "compartment_id": "example-compartment",
+    "quota_default_tokens_per_day": 100_000,
+    "quota_default_storage_bytes": 1_000_000,
 }
-_ENTRA_FIELDS = {**_OIDC_FIELDS, "entra_tenant_id": "test-tenant-id"}
+# Provider-specific, and NOT interchangeable: each profile forbids the other
+# profiles' settings, so entra must not carry ``sso_issuer`` (it derives its
+# issuer from the tenant) and oidc must not carry ``entra_tenant_id``.
+_OIDC_FIELDS = {**_COMMON_IDP_FIELDS, "sso_issuer": "https://issuer.example.com"}
+_ENTRA_FIELDS = {**_COMMON_IDP_FIELDS, "entra_tenant_id": "test-tenant-id"}
 
 
 class _NoopAuthAuditRecorder:
@@ -120,8 +132,9 @@ def _create_test_app(provider, auth_provider_type: str = "local", **settings_ove
         shareable_link_signing_key=b"\x00" * 32,
         **settings_overrides,
     )
-    app.state.oidc_authorization_endpoint = None
-    app.state.oidc_token_endpoint = None
+    # No ``app.state.sso``: these apps are not wired for SSO, which is the
+    # same fact that makes ``/config`` publish a null start URL and the
+    # ``/sso/*`` routes refuse (tests/unit/web/auth/test_sso_routes.py).
     app.state.auth_audit_recorder = _NoopAuthAuditRecorder()
     # Auth rate limiter — generous limit for tests that aren't testing rate limiting
     app.state.auth_rate_limiter = ComposerRateLimiter(limit=100)
@@ -1083,7 +1096,7 @@ class TestMeEndpoint:
 class TestAuthConfigEndpoint:
     """Tests for GET /api/auth/config (S9/D5)."""
 
-    async def test_local_provider_returns_null_oidc_fields(self, tmp_path) -> None:
+    async def test_local_provider_publishes_no_sso_start_url(self, tmp_path) -> None:
         provider = build_local_auth_provider(tmp_path / "auth.db")
         app = _create_test_app(provider, auth_provider_type="local")
 
@@ -1093,8 +1106,9 @@ class TestAuthConfigEndpoint:
         body = response.json()
         assert body["provider"] == "local"
         assert body["registration_mode"] == "open"
-        assert body["oidc_issuer"] is None
-        assert body["oidc_client_id"] is None
+        # Local auth has no IdP, so the SPA's "Sign in with SSO" button is
+        # hidden by the same null the /sso/* routes refuse on.
+        assert body["sso_start_url"] is None
 
     async def test_registration_mode_closed_is_exposed_to_frontend(self, tmp_path) -> None:
         """The LoginPage gates its "Create an account" affordance on the
@@ -1107,41 +1121,38 @@ class TestAuthConfigEndpoint:
         assert response.status_code == 200
         assert response.json()["registration_mode"] == "closed"
 
-    async def test_oidc_provider_returns_issuer_and_client_id(self) -> None:
+    async def test_oidc_provider_publishes_no_idp_facts_to_the_browser(self) -> None:
+        """The browser learns WHERE to start a login and nothing else.
+
+        The code exchange is the backend's, as a confidential client (spec
+        D2), so the issuer, the client id and the IdP's two browser endpoints
+        are no longer the browser's business — and shipping them was how the
+        deleted browser-client path told the SPA to talk to the IdP directly.
+        """
         provider = _FakeAuthProvider()
-        app = _create_test_app(
-            provider,
-            auth_provider_type="oidc",
-            oidc_issuer="https://login.example.com",
-            oidc_audience="test-audience",
-            oidc_client_id="my-client-id",
-        )
-        app.state.oidc_authorization_endpoint = "https://login.example.com/oauth2/authorize"
-        app.state.oidc_token_endpoint = "https://login.example.com/oauth2/token"
+        app = _create_test_app(provider, auth_provider_type="oidc", **_OIDC_FIELDS)
 
         async with _client_for(app) as client:
             response = await client.get("/api/auth/config")
         assert response.status_code == 200
         body = response.json()
         assert body["provider"] == "oidc"
-        assert body["oidc_issuer"] == "https://login.example.com"
-        assert body["oidc_client_id"] == "my-client-id"
-        assert body["authorization_endpoint"] == "https://login.example.com/oauth2/authorize"
-        assert body["token_endpoint"] == "https://login.example.com/oauth2/token"
         # No app.state.sso on this app: the SPA's SSO button is hidden by the
         # same fact that makes the /sso/* routes refuse (test_sso_routes.py).
         assert body["sso_start_url"] is None
-        assert set(body) == {
-            "provider",
-            "registration_mode",
+        assert set(body) == {"provider", "registration_mode", "sso_start_url"}
+        # Named individually as well as by the exact key set: these are the
+        # fields the response carried, and a reader has to see that their
+        # absence is the point rather than an oversight.
+        for deleted_key in (
             "oidc_issuer",
             "oidc_client_id",
             "authorization_endpoint",
             "token_endpoint",
-            "sso_start_url",
-        }
-        assert "oidc_authorization_allowed_origins" not in body
-        assert "oidc_audience_claim" not in body
+            "oidc_authorization_allowed_origins",
+            "oidc_audience_claim",
+        ):
+            assert deleted_key not in body
 
     async def test_config_endpoint_is_unauthenticated(self) -> None:
         """GET /api/auth/config must not require a Bearer token."""

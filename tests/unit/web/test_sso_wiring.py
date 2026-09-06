@@ -1,10 +1,12 @@
 """The wired / unwired decision, and what a wired deployment binds.
 
 ``build_sso_wiring`` returning ``None`` is the ONE fact both the app factory
-(legacy bearer path, SSO routes refuse) and readiness (missing fields named)
-read. These tests pin that the decision derives from the profile registry's
-required settings and nothing else, and that a wired deployment's runtime is
-built from the profile rather than from a per-provider branch.
+and readiness (missing fields named) read. For ``local`` it is the ordinary
+answer; for a registered IdP profile it is a boot refusal, since step E
+deleted the legacy bearer path and left no half-working alternative. These
+tests pin that the decision derives from the profile registry's required
+settings and nothing else, and that a wired deployment's runtime is built
+from the profile rather than from a per-provider branch.
 """
 
 from __future__ import annotations
@@ -40,10 +42,6 @@ def _oidc_wired(tmp_path: Path, idp: FakeIdP, **overrides: Any) -> WebSettings:
     base: dict[str, Any] = {
         "data_dir": tmp_path,
         "auth_provider": "oidc",
-        # Transitional: the oidc arm still demands the legacy fields (elspeth-2094379035).
-        "oidc_issuer": idp.issuer,
-        "oidc_audience": idp.client_id,
-        "oidc_client_id": idp.client_id,
         "sso_issuer": idp.issuer,
         "sso_client_id": idp.client_id,
         "sso_client_secret": idp.client_secret,
@@ -58,14 +56,29 @@ def _oidc_wired(tmp_path: Path, idp: FakeIdP, **overrides: Any) -> WebSettings:
     return WebSettings(**base)
 
 
-def _oidc_legacy_only(tmp_path: Path) -> WebSettings:
-    return WebSettings(
-        data_dir=tmp_path,
-        auth_provider="oidc",
-        oidc_issuer="https://issuer.example.com",
-        oidc_audience="audience",
-        oidc_client_id="client",
-        **_COMPOSER,
+def _oidc_unconfigured(tmp_path: Path) -> WebSettings:
+    """An ``oidc`` settings object whose required settings are all empty.
+
+    ``WebSettings`` refuses this shape at construction -- ``_validate_auth_fields``
+    raises ``auth_provider='oidc' requires: ...`` before such an object exists --
+    so it is built by blanking a wired one through ``model_copy(update=...)``,
+    which skips validators. That is not a shortcut around the model: it is the
+    only way the object reaches ``sso_missing_settings`` in production too. The
+    ``else`` arm in ``create_app`` that reports the missing names calls itself
+    "the total boundary for a mocked or corrupted settings object" for exactly
+    this reason, and readiness reads the same matrix.
+    """
+    return _oidc_wired(tmp_path, FakeIdP()).model_copy(
+        update={
+            "sso_client_id": None,
+            "sso_client_secret": None,
+            "sso_transaction_secret": None,
+            "public_base_url": None,
+            "compartment_id": None,
+            "quota_default_tokens_per_day": None,
+            "quota_default_storage_bytes": None,
+            "sso_issuer": None,
+        }
     )
 
 
@@ -77,7 +90,7 @@ def substrate(tmp_path: Path):
 
 
 def test_missing_settings_are_the_profiles_required_settings_not_configured(tmp_path: Path) -> None:
-    assert sso_missing_settings(_oidc_legacy_only(tmp_path)) == (
+    assert sso_missing_settings(_oidc_unconfigured(tmp_path)) == (
         "sso_client_id",
         "sso_client_secret",
         "sso_transaction_secret",
@@ -96,7 +109,7 @@ def test_local_and_unwired_deployments_build_nothing(tmp_path: Path, substrate) 
     assert build_sso_wiring(local, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single") is None
     assert (
         build_sso_wiring(
-            _oidc_legacy_only(tmp_path), session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single"
+            _oidc_unconfigured(tmp_path), session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single"
         )
         is None
     )

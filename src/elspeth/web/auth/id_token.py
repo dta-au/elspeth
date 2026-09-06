@@ -2,20 +2,17 @@
 
 Everything here answers ONE question — is this token genuinely from the
 configured issuer, for us, and still valid — and nothing here knows what a
-session is. It is shared by every OIDC-family provider and by the SSO login
-walk in ``auth/sso.py``.
-
-It lives in its own module because ``auth/oidc.py`` is scheduled for deletion
-with the legacy provider. The validation is not legacy; only its old housing
-was.
+session is. Its one caller is the SSO login walk in ``auth/sso.py``, through
+``sso_wiring``; the legacy bearer providers that once housed it were deleted
+in identity sprint step E.
 
 ONE DECODE PATH. The accepted signature algorithms are fixed when the
-validator is built, from the IdP profile, and every token -- an SSO ID token
-or a legacy bearer token -- is checked against that same list. There is no
-path that reads the algorithm out of the token's own header: that shape let
-the attacker nominate which check their forgery faced (elspeth-e8a9973c37),
-and it survived here as the bearer path for a while after the pinned path was
-written beside it. Now there is nothing to survive as.
+validator is built, from the IdP profile, and every token is checked against
+that same list. There is no path that reads the algorithm out of the token's
+own header: that shape let the attacker nominate which check their forgery
+faced (elspeth-e8a9973c37), and it survived here as the bearer path for a
+while after the pinned path was written beside it. Now there is nothing to
+survive as.
 """
 
 from __future__ import annotations
@@ -37,7 +34,6 @@ from elspeth.web.auth.claims import (
     claim_is_exactly_true,
     optional_string_claim,
     required_string_claim,
-    string_list_claim,
 )
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
 from elspeth.web.auth.urls import validate_oidc_issuer
@@ -161,7 +157,6 @@ def parse_id_token_claims(payload: dict[str, Any]) -> IdTokenClaims:
     else:
         raise AuthenticationError("Invalid token: aud claim is not a string or a list of strings")
 
-    claim_names = claim("_claim_names")
     return IdTokenClaims(
         issuer=required_string_claim(claim("iss"), name="iss", document="ID token"),
         subject=required_string_claim(claim("sub"), name="sub", document="ID token"),
@@ -180,9 +175,6 @@ def parse_id_token_claims(payload: dict[str, Any]) -> IdTokenClaims:
         given_name=optional_string_claim(claim("given_name")),
         family_name=optional_string_claim(claim("family_name")),
         abn=optional_string_claim(claim("abn")),
-        groups=string_list_claim(claim("groups"), name="groups"),
-        roles=string_list_claim(claim("roles"), name="roles"),
-        groups_overage=claim_is_exactly_true(claim("hasgroups")) or (type(claim_names) is dict and "groups" in claim_names),
     )
 
 
@@ -191,7 +183,7 @@ class _UnknownSigningKeyError(AuthenticationError):
 
 
 class JWKSTokenValidator:
-    """JWKS discovery, caching, and JWT decode -- shared by OIDC and Entra."""
+    """JWKS caching and JWT decode for every IdP profile."""
 
     def __init__(
         self,
@@ -202,7 +194,7 @@ class JWKSTokenValidator:
         jwks_max_stale_seconds: int = 86_400,
         *,
         algorithms: tuple[str, ...],
-        jwks_uri: str | None = None,
+        jwks_uri: str,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._issuer = validate_oidc_issuer(issuer)
@@ -212,17 +204,15 @@ class JWKSTokenValidator:
         # required, not defaulted: a validator built without saying what it
         # accepts is the shape this module exists to refuse.
         self._algorithms = _pinned_algorithms(algorithms)
-        # WHERE THE KEYS COME FROM. With ``jwks_uri`` given, every fetch and
-        # every key-miss refresh goes to exactly that URL — the one the
-        # generalised endpoint policy already validated against the profile's
-        # expected origins when the endpoints were resolved. That is what
-        # makes "applied on every JWKS refresh" (spec §Endpoint policy) true:
-        # the refresh cannot fetch a URL the check never saw.
-        #
-        # ``None`` selects the legacy self-discovery path, which re-reads the
-        # discovery document under its own same-origin rule. It exists only
-        # for ``OIDCAuthProvider`` and ``EntraAuthProvider`` and is deleted
-        # with them (identity sprint step E); no new caller may rely on it.
+        # WHERE THE KEYS COME FROM. Every fetch and every key-miss refresh
+        # goes to exactly ``jwks_uri`` — the one the generalised endpoint
+        # policy already validated against the profile's expected origins
+        # when the endpoints were resolved. That is what makes "applied on
+        # every JWKS refresh" (spec §Endpoint policy) true: the refresh
+        # cannot fetch a URL the check never saw. It is required: the
+        # validator never re-reads the discovery document for itself (the
+        # legacy self-discovery path went with the legacy providers in
+        # identity sprint step E).
         #
         # ``transport`` lets a test stand a fake provider in front of the
         # validator without patching ``httpx``. Production passes nothing.
@@ -265,53 +255,6 @@ class JWKSTokenValidator:
     def _raise_max_stale_age_exceeded() -> NoReturn:
         """Fail closed without exposing IdP payloads or cache timestamps."""
         raise AuthProviderUnavailable("JWKS unavailable (cached keys exceeded maximum stale age)")
-
-    @trust_boundary(
-        tier=3,
-        source="OIDC discovery document JSON fetched from the IdP's .well-known/openid-configuration endpoint",
-        source_param="discovery",
-        suppresses=("R1",),
-        invariant="raises AuthenticationError on non-dict or missing/blank 'jwks_uri'; never coerces a malformed document",
-        test_ref="tests/unit/web/auth/test_id_token_decode.py::TestJWKSValidatorBoundaryRaises::test_validate_discovery_document_non_dict_raises",
-        test_fingerprint="4f5119780912c2aede7e67abeea5e6401c5b76d3eccfcd68798ea773105c812e",
-    )
-    def _validate_discovery_document(self, discovery: Any) -> str:
-        """Shape-validate the OIDC discovery document and return jwks_uri.
-
-        Tier 3 boundary: an IdP (or a misbehaving proxy in front of one)
-        can return JSON-valid payloads with the wrong top-level shape.
-        Reject them at the boundary as ``AuthenticationError`` rather
-        than letting ``TypeError``/``KeyError`` escape as HTTP 500.
-        """
-        if type(discovery) is not dict:
-            raise AuthenticationError(f"OIDC discovery document is not a JSON object (got {type(discovery).__name__})")
-        discovery_issuer = discovery["issuer"] if "issuer" in discovery else None
-        if type(discovery_issuer) is not str or discovery_issuer != self._issuer:
-            raise AuthenticationError("OIDC discovery document failed exact issuer check")
-        jwks_uri = discovery["jwks_uri"] if "jwks_uri" in discovery else None
-        if type(jwks_uri) is not str or not jwks_uri.strip():
-            raise AuthenticationError("OIDC discovery document missing non-empty string 'jwks_uri'")
-        return self._validate_jwks_uri_policy(jwks_uri)
-
-    def _validate_jwks_uri_policy(self, jwks_uri: str) -> str:
-        """Validate discovery-provided JWKS URL before fetching it."""
-        try:
-            issuer_url = httpx.URL(self._issuer)
-            jwks_url = httpx.URL(jwks_uri)
-        except httpx.InvalidURL as exc:
-            raise AuthenticationError("OIDC discovery document 'jwks_uri' must be a valid URL") from exc
-
-        if jwks_url.scheme != "https":
-            raise AuthenticationError("OIDC discovery document 'jwks_uri' must be an HTTPS URL")
-        if jwks_url.userinfo:
-            raise AuthenticationError("OIDC discovery document 'jwks_uri' must not include embedded credentials")
-
-        issuer_origin = (issuer_url.scheme, issuer_url.host, issuer_url.port)
-        jwks_origin = (jwks_url.scheme, jwks_url.host, jwks_url.port)
-        if jwks_origin != issuer_origin:
-            raise AuthenticationError("OIDC discovery document 'jwks_uri' must use the same origin as issuer")
-
-        return jwks_uri
 
     @staticmethod
     @trust_boundary(
@@ -476,15 +419,7 @@ class JWKSTokenValidator:
                     follow_redirects=False,
                     transport=self._transport,
                 ) as client:
-                    jwks_uri = self._jwks_uri
-                    if jwks_uri is None:
-                        # Legacy self-discovery; see __init__. Dies in step E.
-                        discovery_url = f"{self._issuer}/.well-known/openid-configuration"
-                        discovery_resp = await client.get(discovery_url)
-                        discovery_resp.raise_for_status()
-                        jwks_uri = self._validate_discovery_document(discovery_resp.json())
-
-                    jwks_resp = await client.get(jwks_uri)
+                    jwks_resp = await client.get(self._jwks_uri)
                     jwks_resp.raise_for_status()
                     # Shape-validate BEFORE assigning to cache: a wrong-shaped
                     # response must not poison self._jwks.
@@ -550,9 +485,9 @@ class JWKSTokenValidator:
                 # TypeError, AttributeError) catch so that programmer-bug
                 # exceptions no longer launder into a stale-cache fallback.
                 #
-                # After the shape validators (_validate_discovery_document,
-                # _validate_jwks_document) were added, IdP payload access at
-                # this Tier 3 boundary cannot produce KeyError / TypeError /
+                # With the JWKS document parsed through its shape validator
+                # (_validate_jwks_document), IdP payload access at this
+                # Tier 3 boundary cannot produce KeyError / TypeError /
                 # AttributeError on the happy path — those shapes are
                 # rejected upstream as AuthenticationError. Anything in
                 # those classes reaching this catch would therefore be a
@@ -625,21 +560,6 @@ class JWKSTokenValidator:
                 raise AuthProviderUnavailable(f"JWKS unavailable: {type(exc).__name__}") from exc
 
         return self._jwks
-
-    def decode_token(self, token: str, jwks: JwkSet) -> IdTokenClaims:
-        """Decode a bearer token presented on an API call (legacy providers).
-
-        Same core as :meth:`decode_id_token`; the difference is the caller's
-        situation, not the checks. A bearer token arrives on a request the
-        server did not start: there was no authorization redirect from here,
-        so there is no server-held nonce for the token to be bound to.
-        ``nonce=None`` states that fact at the call site rather than hiding
-        it in a default -- the core has no default, so every caller says
-        which case it is in. Audience and authorized party are the
-        configured audience: for these providers the audience IS our client
-        id, which is what ``azp`` must name on a multi-audience token.
-        """
-        return self._decode(token, jwks, audience=self._audience, nonce=None, client_id=self._audience)
 
     @staticmethod
     @trust_boundary(
@@ -754,9 +674,10 @@ class JWKSTokenValidator:
         listed as a required claim; a second check that the first makes
         unreachable is a check nobody can see fail.
 
-        ``nonce`` has no default on purpose: ``None`` is a fact only the
-        caller knows (see :meth:`decode_token`), and a core that defaulted
-        it would let a new SSO caller forget the binding silently.
+        ``nonce`` has no default on purpose: whether a server-held nonce
+        exists is a fact only the caller knows, and a core that defaulted it
+        would let a new caller forget the binding silently. Every live caller
+        arrives through :meth:`decode_id_token`, which always holds one.
         """
         try:
             header = jwt.get_unverified_header(token)
@@ -803,12 +724,3 @@ class JWKSTokenValidator:
         except _UnknownSigningKeyError:
             refreshed_jwks = await self.ensure_jwks(refresh_if_unchanged=jwks)
             return self.decode_id_token(token, refreshed_jwks, audience=audience, nonce=nonce, client_id=client_id)
-
-    async def decode_token_with_refresh(self, token: str) -> IdTokenClaims:
-        """Decode a token, refreshing JWKS once if its signing key is unknown."""
-        jwks = await self.ensure_jwks()
-        try:
-            return self.decode_token(token, jwks)
-        except _UnknownSigningKeyError:
-            refreshed_jwks = await self.ensure_jwks(refresh_if_unchanged=jwks)
-            return self.decode_token(token, refreshed_jwks)

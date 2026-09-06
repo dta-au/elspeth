@@ -502,7 +502,18 @@ locals {
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
     { name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model },
     { name = "ELSPETH_WEB__REGISTRATION_MODE", value = "open" },
-    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = local.deployment_mode == "first" ? "local" : "oidc" },
+    # Local in BOTH modes until the confidential Cognito client exists.
+    # Selecting a non-local provider now would render a task definition that
+    # cannot start: since identity sprint step E every registered profile is
+    # validated from the registry, so `oidc` requires sso_client_secret --
+    # which no resource here can supply, because the client this module
+    # creates is public. Spec phase 5 registers the confidential client and
+    # flips this to "oidc" together with sso_issuer, sso_client_id,
+    # sso_client_secret (Secrets Manager valueFrom), sso_endpoint_origins,
+    # sso_transaction_secret, public_base_url, compartment_id and the two
+    # quota defaults, in one commit. The user pool, its client and the
+    # OIDC_EXPECTED_* acceptance outputs are already provisioned for it.
+    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = "local" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY", value = "aws-otlp" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_SERVICE_NAME", value = local.telemetry_service_name },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_ENVIRONMENT", value = "production" },
@@ -516,16 +527,6 @@ locals {
     { name = "ELSPETH_ACCEPTANCE_SCENARIO_ID", value = var.scenario_id },
     { name = "ELSPETH_ACCEPTANCE_S3_BUCKET", value = local.s3_bucket_name },
     { name = "ELSPETH_ACCEPTANCE_S3_PREFIX", value = local.s3_prefix },
-    ], local.deployment_mode == "first" ? [] : [
-    { name = "ELSPETH_WEB__OIDC_ISSUER", value = local.oidc_issuer },
-    { name = "ELSPETH_WEB__OIDC_AUDIENCE", value = aws_cognito_user_pool_client.web[0].id },
-    { name = "ELSPETH_WEB__OIDC_CLIENT_ID", value = aws_cognito_user_pool_client.web[0].id },
-    { name = "ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT", value = "${local.oidc_authorization_origin}/oauth2/authorize" },
-    { name = "ELSPETH_WEB__OIDC_TOKEN_ENDPOINT", value = "${local.oidc_authorization_origin}/oauth2/token" },
-    # The browser-origin allowlist and the Cognito access-token audience mode
-    # are deleted settings (identity sprint step C); exporting either refuses
-    # to boot. Cognito's hosted-domain origin belongs in sso_endpoint_origins
-    # once the confidential client and the sso_* settings land (cutover).
     ], local.bedrock_backend ? [] : [
     # Both Composer roles target the loopback gateway sidecar. The paired
     # API keys arrive via runtime_secrets, never as environment literals.

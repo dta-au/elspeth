@@ -92,6 +92,13 @@ class TestAuthHappyPath:
         assert resp.groups == ["admin", "auditor"]
 
     def test_auth_config_local_defaults(self) -> None:
+        """A local deployment advertises no SSO handoff.
+
+        ``sso_start_url`` is the only IdP-shaped field left on this response:
+        the browser never learns the issuer, the client id, or the
+        authorization and token endpoints, because the code exchange is the
+        backend's as a confidential client (spec D2). ``None`` is what hides
+        the SPA's "Sign in with SSO" button, so the default has to be closed.
+        """
         resp = AuthConfigResponse(provider="local", registration_mode="open")
-        assert resp.oidc_issuer is None
-        assert resp.authorization_endpoint is None
+        assert resp.sso_start_url is None

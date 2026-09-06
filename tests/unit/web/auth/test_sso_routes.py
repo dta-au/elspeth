@@ -4,8 +4,17 @@ Spec §2. The service (``web/auth/sso.py``) is tested on its own; this file
 is about the ROUTE layer's obligations: reading the request, clearing the
 cookie on every callback outcome, ``no-store`` on the sensitive responses,
 the audit rows the service leaves to the route, and — first — refusing
-cleanly when ``app.state.sso`` is absent, which is the state every build
-carries until the app factory's wiring lands (identity sprint step C-wiring).
+cleanly when ``app.state.sso`` is absent or is not an ``SsoRuntime``.
+
+That last obligation outlived the config-shaped route to it. Since step E an
+under-configured IdP deployment cannot exist: ``WebSettings`` refuses the
+shape, and ``build_sso_wiring`` returning ``None`` raises in the factory. What
+still reaches the routes unwired is the LIFECYCLE gap — ``app.state.sso`` is
+bound in the lifespan (``app.py``, ``resolve_sso_runtime``), not in
+``create_app``, so it is absent for every request served against an app whose
+startup has not run, which is exactly what ``ASGITransport`` does here. The
+routes must never assume a caller did the wiring, and must refuse closed
+rather than ``AttributeError`` when one did not.
 
 The walk runs through the real router against the in-process fake IdP, the
 real SQLite handoff store and the real session-token issuer. The audit
@@ -146,12 +155,8 @@ def _settings(provider: str) -> WebSettings:
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
-        # The "oidc" arm in config.py is still the hand-written one and demands
-        # the pre-sprint oidc_* fields (elspeth-2094379035); they and the arm
-        # go with step E. The sso_* fields below are the ones that matter.
-        oidc_issuer="https://idp.example.gov.au",
-        oidc_audience="elspeth-test-client",
-        oidc_client_id="elspeth-test-client",
+        # Every setting the profile registry requires of an ``oidc`` deployment:
+        # ``WebSettings`` refuses a partial one, so there is no lighter shape.
         sso_issuer="https://idp.example.gov.au",
         sso_client_id="elspeth-test-client",
         sso_client_secret="s" * 40,
@@ -210,8 +215,6 @@ def _app(*, provider: str = "oidc", sso: object | None = None, recorder: _Record
     app.add_middleware(RequestIdMiddleware)
     app.state.auth_provider = object()  # the SSO routes never touch it
     app.state.settings = _settings(provider)
-    app.state.oidc_authorization_endpoint = None
-    app.state.oidc_token_endpoint = None
     app.state.auth_audit_recorder = recorder or _RecordingRecorder()
     app.state.auth_rate_limiter = ComposerRateLimiter(limit=100)
     if sso is not None:
@@ -265,12 +268,18 @@ def idp() -> FakeIdP:
 
 
 # ==========================================================================
-# Unwired: the state every build carries until C-wiring lands.
+# Unwired: the router mounted without a runtime behind it.
 # ==========================================================================
 
 
 class TestUnwired:
-    """No ``app.state.sso``. The routes must refuse closed, never AttributeError."""
+    """No ``app.state.sso``. The routes must refuse closed, never AttributeError.
+
+    The settings here are a fully wired ``oidc`` deployment — the unwiredness
+    is the missing runtime alone, which is the only half that remains
+    reachable. That is not a contrived state: the attribute is bound during
+    lifespan startup, so the window exists in the real app too.
+    """
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

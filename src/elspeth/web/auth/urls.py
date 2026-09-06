@@ -1,4 +1,4 @@
-"""URL validation helpers for browser-facing OIDC auth flows."""
+"""URL validation helpers for the OIDC endpoints ELSPETH itself contacts."""
 
 from __future__ import annotations
 
@@ -142,55 +142,21 @@ def _canonical_origin(origin: _Origin) -> str:
     return f"https://{host}{port}"
 
 
-def oidc_browser_endpoint_origin(endpoint: str) -> str:
-    """Return the canonical origin of an already validated browser endpoint."""
-    _value, origin = _parse_browser_endpoint(endpoint, field_name="browser_endpoint")
-    return _canonical_origin(origin)
-
-
 def https_url_origin(value: str, *, field_name: str = "issuer") -> str:
     """Return the canonical origin of any HTTPS URL, path or no path.
 
-    An ISSUER is not a browser endpoint: ``https://accounts.google.com`` is a
-    perfectly good issuer and has no path, while
-    ``oidc_browser_endpoint_origin`` deliberately refuses a root path because
-    an endpoint with no path is a misconfiguration. Per-profile origin policy
-    needs the origin of the issuer itself, so it needs this instead — running
-    the SAME parse, so the control-character, backslash, percent-encoding,
-    embedded-credential, scheme and host canonicalisation checks all still
-    apply. Extracting the origin with ``urlsplit`` at the call site would
-    have skipped every one of them.
+    An ISSUER is not an endpoint: ``https://accounts.google.com`` is a
+    perfectly good issuer and has no path, while ``_parse_browser_endpoint``
+    deliberately refuses a root path because an endpoint with no path is a
+    misconfiguration. Per-profile origin policy needs the origin of the
+    issuer itself, so it needs this instead — running the SAME parse, so the
+    control-character, backslash, percent-encoding, embedded-credential,
+    scheme and host canonicalisation checks all still apply. Extracting the
+    origin with ``urlsplit`` at the call site would have skipped every one of
+    them.
     """
     _value, _parsed, origin = _parse_https_url(value, field_name=field_name)
     return _canonical_origin(origin)
-
-
-def validate_oidc_browser_endpoints(
-    authorization_endpoint: str,
-    token_endpoint: str,
-    *,
-    issuer: str,
-) -> tuple[str, str]:
-    """Return a validated authorization/token pair on the issuer's exact origin.
-
-    Legacy browser-client path only (deleted with it in identity sprint step
-    E). The per-deployment origin allowlist it used to accept is gone: an IdP
-    whose endpoints live off the issuer's origin -- Cognito's hosted domain --
-    is served by the SSO profile, whose ``sso_endpoint_origins`` is checked
-    per profile at discovery, never by a browser-facing allowlist.
-    """
-    authorization_value, authorization_origin = _parse_browser_endpoint(
-        authorization_endpoint,
-        field_name="authorization_endpoint",
-    )
-    token_value, token_origin = _parse_browser_endpoint(token_endpoint, field_name="token_endpoint")
-    _issuer_value, _issuer_parsed, issuer_origin = _parse_https_url(issuer, field_name="issuer")
-
-    if authorization_origin != token_origin:
-        raise ValueError("authorization_endpoint and token_endpoint must use the same origin")
-    if authorization_origin != issuer_origin:
-        raise ValueError("browser endpoint origin is not allowed")
-    return authorization_value, token_value
 
 
 class DiscoveredEndpoints(NamedTuple):

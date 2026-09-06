@@ -21,9 +21,14 @@ Two phases, because the app factory is synchronous and discovery is not:
   that cannot reach its IdP cannot log anyone in, and saying so at startup
   is better than saying it to every user at the callback.
 
-An ``oidc`` or ``entra`` deployment that is NOT wired keeps the legacy bearer
-path for now (identity sprint step E deletes it); its SSO routes refuse and
-``/api/auth/config`` reports no start URL, which is the same fact.
+``None`` from :func:`build_sso_wiring` means two different things, and both
+are deliberate. For a ``local`` deployment it is the ordinary answer: there
+is no IdP to wire. For a registered profile it is a boot refusal, because
+since identity sprint step E deleted the legacy bearer path there is no
+second way to authenticate anyone -- ``create_app`` raises and names the
+missing settings. ``WebSettings`` refuses that shape first, so the refusal
+here is the total boundary for a settings object that skipped validation,
+not the message an operator is expected to read.
 """
 
 from __future__ import annotations

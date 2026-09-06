@@ -54,18 +54,14 @@ def _settings(**overrides: object) -> WebSettings:
     )
 
 
-# TRANSITIONAL. The old browser path's oidc/entra validator arms still
-# require these, so a settings object for those two providers cannot be built
-# without them yet. They are deleted together with that path
-# (elspeth-e385ed06e1), and this dict goes with them; vanguard and google
-# never needed it because they never had a hand-written arm.
-_LEGACY_OLD_PATH_FIELDS: dict[str, dict[str, object]] = {
-    "oidc": {"oidc_issuer": "https://issuer.example.gov.au", "oidc_audience": "aud", "oidc_client_id": "client"},
-    "entra": {"oidc_audience": "aud", "oidc_client_id": "client"},
-}
-
-
 def _idp_settings(provider: str, **overrides: object) -> WebSettings:
+    """The seven settings every IdP profile requires, plus this profile's own.
+
+    Exactly ``_COMMON_IDP_REQUIRED`` from the profile registry: since step E
+    the settings validator is registry-driven for every non-local provider,
+    so the same seven build a startable deployment for all four and the
+    caller supplies only what its own profile additionally requires.
+    """
     return _settings(
         auth_provider=provider,
         sso_client_id="client",
@@ -75,7 +71,6 @@ def _idp_settings(provider: str, **overrides: object) -> WebSettings:
         compartment_id="compartment-a",
         quota_default_tokens_per_day=100_000,
         quota_default_storage_bytes=1_000_000,
-        **_LEGACY_OLD_PATH_FIELDS.get(provider, {}),
         **overrides,
     )
 
@@ -200,17 +195,39 @@ class TestIdentityMapping:
         bare = profile.map_identity(_id_claims(), None)
         assert bare.username == "s"
 
-    def test_entra_collects_no_groups(self) -> None:
-        """D17: IdP groups are organisation facts, never compartment facts."""
-        claims = _id_claims(preferred_username="ada", groups=("admins", "everyone"))
+    def test_entra_falls_back_to_the_subject_when_it_sends_no_username(self) -> None:
+        """Carried from the deleted Entra provider's tests (step E).
+
+        Entra omits ``preferred_username`` for some account types, and a
+        blank one reads as absent at the token boundary. The identity must
+        still be nameable, so the mapping falls back to ``sub`` rather than
+        producing an identity with no username.
+        """
+        profile = get_profile("entra")
+        named = profile.map_identity(_id_claims(preferred_username="ada"), None)
+        assert named.username == "ada"
+        unnamed = profile.map_identity(_id_claims(), None)
+        assert unnamed.username == "s"
+
+    def test_idp_groups_reach_neither_the_claims_nor_the_identity(self) -> None:
+        """D17: IdP groups are organisation facts, never compartment facts.
+
+        The rule used to be "the mapping does not read ``groups``", with the
+        claim still parsed and carried. Step E deleted the legacy bearer path
+        that consumed it and the claim fields with it, so the rule is now
+        pinned at BOTH ends: the token boundary has nowhere to put a group
+        claim, and the identity a profile maps has no field to carry one.
+
+        Asserted against the DECLARED fields, not probed with hasattr. Both
+        are types we own, so their shapes are knowable statically; probing
+        would be attribute masquerading, and it would pass vacuously if
+        either class were renamed out from under this test.
+        """
+        claims = _id_claims(preferred_username="ada")
         mapped = get_profile("entra").map_identity(claims, None)
-        # Asserted against the DECLARED fields, not probed with hasattr.
-        # IdentityClaims is a type we own, so its shape is knowable
-        # statically; probing it would be attribute masquerading, and it
-        # would also pass vacuously if the class were ever renamed out from
-        # under this test.
-        assert "groups" not in {declared.name for declared in dataclasses.fields(mapped)}
-        assert claims.groups == ("admins", "everyone")  # untouched, just unread
+        group_fields = {"groups", "roles", "groups_overage"}
+        assert group_fields.isdisjoint({declared.name for declared in dataclasses.fields(claims)})
+        assert group_fields.isdisjoint({declared.name for declared in dataclasses.fields(mapped)})
 
     def test_vanguard_assembles_a_display_name_and_carries_the_abn(self) -> None:
         mapped = get_profile("vanguard").map_identity(
