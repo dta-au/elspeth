@@ -205,8 +205,10 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   Ubuntu VM, and Kubernetes BYO. A new AWS stack comes from the tracked AWS ECS
   Terraform cold-install package, while the separate release acceptance
   controller and the existing-service redeploy path use operator-supplied
-  task-definition ARNs; Azure Container Apps remains deferred pending
-  cross-instance fencing, and its bundle is not shipped.
+  task-definition ARNs; the Azure Container Apps Bicep bundle ships in
+  `deploy/azure-container-apps/` with provider-scoped receipts, replica > 1
+  probes and runbooks, and its live acceptance on dev hardware is an
+  operator-run step (elspeth-5ec3befc1a) that the support claim waits on.
 - **AWS and PostgreSQL paths align with their production contracts** — Composer
   can use Bedrock through the AWS default credential chain, the packaged
   PostgreSQL extra supports both locked SQLAlchemy driver paths, and acceptance
