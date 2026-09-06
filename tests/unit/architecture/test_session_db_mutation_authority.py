@@ -3030,7 +3030,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "175d222f809ec084",
         1,
         None,
-        line=3284,
+        line=3170,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -3040,7 +3040,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4536b6d6104a3575",
         1,
         None,
-        line=3398,
+        line=3284,
     ),
     WriterIdentity(
         "src/elspeth/web/preferences/service.py",
@@ -3062,6 +3062,19 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=5421,
     ),
+    # Restored on 282936e27: the reader's forward into a same-class helper
+    # resolves through the verb's ``_sync`` closure (family H slice 3), so the
+    # block is a non-escaping read again -- the symbol's only row.
+    WriterIdentity(
+        "src/elspeth/web/sessions/service.py",
+        "SessionServiceImpl.get_guided_start_reconciliation._sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "12be925744d987c0",
+        1,
+        None,
+        line=5473,
+    ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
         "SessionServiceImpl.get_pipeline_dispatch_recovery._sync",
@@ -3072,26 +3085,11 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=7920,
     ),
-    WriterIdentity(
-        "src/elspeth/web/sessions/service.py",
-        "SessionServiceImpl.get_authoritative_composition_proposal._sync",
-        "<sessions-write-connection>",
-        "write_connection",
-        "4cfe2dd7bf8391d1",
-        1,
-        None,
-        line=7556,
-    ),
-    WriterIdentity(
-        "src/elspeth/web/sessions/service.py",
-        "SessionServiceImpl.list_composition_proposals._sync",
-        "<sessions-write-connection>",
-        "write_connection",
-        "ec6d5b3014c58a86",
-        1,
-        None,
-        line=8073,
-    ),
+    # get_authoritative_composition_proposal / list_composition_proposals were
+    # reviewed reads until each gained an escaping forward (the conn is handed
+    # to a helper the scanner cannot prove contained); family A4 of the D6
+    # burn-down restores them once the helper is bound. A stale read row is
+    # not a review (elspeth-e483fe7f85 family R, re-derived on 282936e27).
     # ── identity substrate (P4-D6 elspeth-e483fe7f85): RepositoryIdentityAuthority,
     # method-exact; every acquisition stays inside its method ─────────────
     WriterIdentity(
@@ -3211,7 +3209,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b50078a98f79748e",
         1,
         None,
-        line=3849,
+        line=4002,
     ),
     # src/elspeth/web/blobs/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -3222,7 +3220,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4fa518a6c8ccdf63",
         1,
         None,
-        line=2580,
+        line=2399,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -3232,7 +3230,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "14f118ad6f043836",
         1,
         None,
-        line=2794,
+        line=2633,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -3242,17 +3240,17 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "793b2531e21a4ec2",
         1,
         None,
-        line=3073,
+        line=2910,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
         "BlobServiceImpl.finalize_run_output_blobs._sync",
         "<sessions-write-connection>",
         "write_connection",
-        "f449df3562f331ee",
+        "23c3ac881893d28d",
         1,
         None,
-        line=3126,
+        line=2955,
     ),
     # src/elspeth/web/composer/reviewed_source_authority.py (read-only blocks, family R)
     WriterIdentity(
@@ -3274,7 +3272,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "6d19cc377aa5042b",
         1,
         None,
-        line=233,
+        line=234,
     ),
     WriterIdentity(
         "src/elspeth/web/composer/tools/blobs.py",
@@ -3284,7 +3282,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5f7102fe3d0e987b",
         1,
         None,
-        line=281,
+        line=282,
     ),
     WriterIdentity(
         "src/elspeth/web/composer/tools/blobs.py",
@@ -3294,7 +3292,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2dac8ba6fa9884b5",
         1,
         None,
-        line=303,
+        line=304,
     ),
     WriterIdentity(
         "src/elspeth/web/composer/tools/blobs.py",
@@ -3304,7 +3302,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2b9fd2f757703766",
         1,
         None,
-        line=313,
+        line=314,
     ),
     WriterIdentity(
         "src/elspeth/web/composer/tools/blobs.py",
@@ -3314,7 +3312,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2d7dc6143b2e6154",
         1,
         None,
-        line=338,
+        line=339,
     ),
     # src/elspeth/web/composer/tools/sources.py (read-only blocks, family R)
     WriterIdentity(
@@ -3368,7 +3366,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bbce7dbcfc31f6ec",
         1,
         None,
-        line=471,
+        line=515,
     ),
     # src/elspeth/web/sessions/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -3379,7 +3377,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3082b284dcdde398",
         1,
         None,
-        line=6662,
+        line=6857,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3389,7 +3387,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "734dc503cf1adb8b",
         1,
         None,
-        line=6728,
+        line=6923,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3399,7 +3397,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b96528533c8ce4fd",
         1,
         None,
-        line=7060,
+        line=7255,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3409,7 +3407,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7017fa5ec317a4b4",
         1,
         None,
-        line=8040,
+        line=8235,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3419,7 +3417,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "68b7373dab65abcf",
         1,
         None,
-        line=8634,
+        line=8829,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3429,7 +3427,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1bfef5906a786d9e",
         1,
         None,
-        line=9211,
+        line=9406,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3439,7 +3437,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "adeaa7cfa27f4b34",
         1,
         None,
-        line=9260,
+        line=9455,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3449,7 +3447,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "397c36aee21eb535",
         1,
         None,
-        line=9281,
+        line=9476,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3459,7 +3457,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b29bb527f2da6ec",
         1,
         None,
-        line=9379,
+        line=9574,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3469,7 +3467,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "8a380455a32a960b",
         1,
         None,
-        line=9658,
+        line=9853,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3479,7 +3477,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "227880bc8eb4fb5a",
         1,
         None,
-        line=9682,
+        line=9877,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3489,7 +3487,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "5bc478ef3c0f3159",
         1,
         None,
-        line=9768,
+        line=9963,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3499,7 +3497,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "0b7e7759f27b0141",
         1,
         None,
-        line=9783,
+        line=9978,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3509,7 +3507,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3d5bacc9c0cc086c",
         1,
         None,
-        line=9832,
+        line=10027,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3519,7 +3517,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e2674828bb9717c7",
         1,
         None,
-        line=9927,
+        line=10122,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3529,7 +3527,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "48cf615d2b446722",
         1,
         None,
-        line=9946,
+        line=10141,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3539,7 +3537,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "af0aa9fb126f5b07",
         1,
         None,
-        line=12972,
+        line=13088,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3549,7 +3547,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3a0d4f58a95545b6",
         1,
         None,
-        line=13754,
+        line=13870,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -3559,7 +3557,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "79cbcb06fa877308",
         1,
         None,
-        line=13994,
+        line=14110,
     ),
     # src/elspeth/web/shareable_reviews/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -4618,6 +4616,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         path: str,
         *,
         instance_method: bool | None = None,
+        signature_known: bool | None = None,
     ) -> bool | None:
         """True/False when this call provably does/does not target ``definition``; ``None`` when unknowable.
 
@@ -4637,7 +4636,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             if qualified is not None:
                 module, _, name = qualified.rpartition(".")
                 return name == definition.name and f"src/{module.replace('.', '/')}.py" == path and _symbol(definition) == definition.name
-        if not self._call_shape_binds(call, definition, instance_method=instance_method):
+        if not self._call_shape_binds(call, definition, instance_method=instance_method, signature_known=signature_known):
             return False
         return None
 
@@ -4647,19 +4646,24 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         definition: ast.FunctionDef | ast.AsyncFunctionDef,
         *,
         instance_method: bool | None,
+        signature_known: bool | None = None,
     ) -> bool:
         """False only when this call's arguments provably cannot bind ``definition``'s parameters.
 
         Star arguments, a decorator that may rewrite the signature, and a
         bare-name call of an instance method (a bound method held in a
-        variable) are unknowable and bind.
+        variable) are unknowable and bind. ``signature_known`` is the CALLEE
+        collector's verdict on the definition's decorators (its imports
+        resolve them); computed here only for a same-file definition.
         """
 
         if instance_method is None:
             instance_method = self._is_instance_method(definition)
+        if signature_known is None:
+            signature_known = self._decorators_preserve_signature(definition)
         if any(isinstance(argument, ast.Starred) for argument in call.args) or any(keyword.arg is None for keyword in call.keywords):
             return True
-        if not all(self._decorator_preserves_signature(decorator) for decorator in definition.decorator_list):
+        if not signature_known:
             return True
         positional = [*definition.args.posonlyargs, *definition.args.args]
         defaults = definition.args.defaults
@@ -4681,6 +4685,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         if any(name not in supplied for name in required):
             return False
         return all(default is not None or name in supplied for name, default in zip(kwonly, definition.args.kw_defaults, strict=True))
+
+    def _decorators_preserve_signature(self, definition: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return all(self._decorator_preserves_signature(decorator) for decorator in definition.decorator_list)
 
     def _decorator_preserves_signature(self, decorator: ast.expr) -> bool:
         """``staticmethod``/``classmethod``, a contextmanager, or the passthrough ``trust_boundary(...)`` keep the signature."""
@@ -8306,8 +8313,11 @@ class _CallerSideProof:
         call_sites = 0
         neutral_sites = 0
         instance_method = collector._is_instance_method(definition)
+        signature_known = collector._decorators_preserve_signature(definition)
         for caller, call in self._calls_by_name.get(definition.name, ()):
-            targets = caller._call_targets_definition(call, definition, collector.path, instance_method=instance_method)
+            targets = caller._call_targets_definition(
+                call, definition, collector.path, instance_method=instance_method, signature_known=signature_known
+            )
             if targets is False:
                 continue
             if targets is None and self._receiver_cannot_hold(caller, call, collector, definition):
