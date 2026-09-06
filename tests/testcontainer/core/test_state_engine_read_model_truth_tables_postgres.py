@@ -24,6 +24,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -97,7 +98,6 @@ def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) ->
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=PAYLOAD,
     )
     return item.work_item_id
@@ -127,6 +127,9 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
     ids["foreign-ready"] = _enqueue(factory, OTHER_RUN_ID, "foreign-ready", 100)
 
     with db.engine.begin() as conn:
+        # Liveness and lease expiry are judged against the Landscape database
+        # clock (ADR-047; PostgreSQL transaction time inside this seed).
+        database_now = read_landscape_transaction_time(conn)
         for owner in (PEER_A, PEER_B):
             conn.execute(
                 insert(run_workers_table).values(
@@ -135,7 +138,7 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
                     role="follower",
                     status="active",
                     registered_at=NOW,
-                    heartbeat_expires_at=NOW + timedelta(minutes=5),
+                    heartbeat_expires_at=database_now + timedelta(minutes=5),
                 )
             )
 
@@ -146,26 +149,26 @@ def _seed_scheduler_image(db: LandscapeDB) -> tuple[RecorderFactory, dict[str, s
             "leased-self",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=LEADER,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=database_now + timedelta(seconds=10),
         )
         for name, owner in (("leased-peer-a", PEER_A), ("leased-peer-b", PEER_B)):
             set_item(
                 name,
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=owner,
-                lease_expires_at=NOW + timedelta(seconds=10),
+                lease_expires_at=database_now + timedelta(seconds=10),
             )
         set_item(
             "leased-peer-equality",
             status=TokenWorkStatus.LEASED.value,
             lease_owner="worker:rm-postgresql-run:equality",
-            lease_expires_at=NOW,
+            lease_expires_at=database_now,
         )
         set_item(
             "leased-sink-redrive",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=PEER_A,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=database_now + timedelta(seconds=10),
             pending_sink_name="sink-a",
             pending_outcome=TerminalOutcome.SUCCESS.value,
             pending_path=TerminalPath.DEFAULT_FLOW.value,
@@ -259,7 +262,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
     )
 
     # RM-06: duplicate owners collapse and exact expiry equality is inactive.
-    assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER, now=NOW) == (PEER_A, PEER_B)
+    assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER) == (PEER_A, PEER_B)
 
     # RM-09..RM-13: active identities, barrier subtype partition, and order.
     assert repository.active_row_ids(run_id=RUN_ID) == frozenset(
