@@ -133,12 +133,7 @@ from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.identity_repository import (
-    EnsureIdentityOutcome,
-    ensure_identity,
-    local_identity_retirer,
-    read_identity,
-)
+from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     AuditAccessLogWriteError,
@@ -560,7 +555,9 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     # discovery) and binds the runtime the three /api/auth/sso routes read.
     # Discovery is a hard IdP dependency at startup, which is why the
     # override exists: the moment rollback is forbidden is the moment an IdP
-    # outage must not stop the service from booting.
+    # outage must not stop the service from booting. It runs BEFORE this
+    # process joins the deployment below: a boot that is going to fail here
+    # must not first announce itself to peers as a live owner.
     sso_wiring: SsoWiring | None = app.state.sso_wiring
     if sso_wiring is not None:
         try:
@@ -570,6 +567,12 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 f"FATAL: SSO discovery failed ({type(exc).__name__}). "
                 "Configure the sso_authorization_endpoint/sso_token_endpoint/sso_jwks_uri override or fix discovery."
             ) from None
+
+    # Join the deployment only after the startup sweeps have settled: from
+    # here on peers see this process as a live owner. A registration failure
+    # (a live process already holds this instance id, or the database is
+    # unreachable) fails boot, exactly like the sweeps above.
+    await app.state.web_instance_membership.start()
 
     # Resolve the paired browser endpoints from discovery or explicit config.
     # LEGACY browser-client path: served only while an oidc/entra deployment
@@ -1117,10 +1120,10 @@ def _build_local_auth_provider(
         db_path=settings.data_dir / "auth.db",
         token_issuer=issuer,
         admit_identity=_admit_identity,
-        # The same authority the CLI's ``composer users remove`` uses, so a
-        # local credential deleted from either surface retires its identity
-        # the same way.
-        retire_identity=local_identity_retirer(session_engine),
+        # The same retirement collaborator every surface that deletes a local
+        # credential binds, so the provider, subject and reason are decided
+        # in exactly one place.
+        retire_identity=local_identity_retirer(identity_authority, _record_retirement),
     )
 
 
