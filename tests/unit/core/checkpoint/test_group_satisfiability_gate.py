@@ -64,7 +64,6 @@ def _enqueue_journal_row(db: LandscapeDB, *, token_id: str, node_id: str) -> Non
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload_json(),
-        available_at=NOW,
     )
 
 

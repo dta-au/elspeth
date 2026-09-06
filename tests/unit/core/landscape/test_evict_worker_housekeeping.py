@@ -37,6 +37,7 @@ from elspeth.contracts.coordination import (
     CoordinationToken,
 )
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -233,9 +234,8 @@ def _seed_leased_item(
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=now,
     )
-    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds, now=now)
+    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds)
     assert item is not None
     return item.work_item_id
 
@@ -483,14 +483,13 @@ class TestEvictionBeforeReapOrdering:
         from sqlalchemy import update
 
         _seed_leased_item(engine, token_id="token-dead-owned", lease_owner=dead_member, now=NOW, lease_seconds=10)
-        # Force-expire the lease.
-        sweep_at = NOW + timedelta(seconds=200)
+        # Force-expire the lease one second into the database's past (ADR-047).
         with engine.begin() as conn:
             conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.run_id == RUN_ID)
                 .where(token_work_items_table.c.lease_owner == dead_member)
-                .values(lease_expires_at=NOW - timedelta(seconds=1))
+                .values(lease_expires_at=read_landscape_transaction_time(conn) - timedelta(seconds=1))
             )
 
         # Step 1: evict before reap.
@@ -505,7 +504,6 @@ class TestEvictionBeforeReapOrdering:
 
         # Step 2: reap. The owner is now status='evicted' → owner_registry_dead (arm b).
         reaped = scheduler.recover_expired_leases(
-            now=sweep_at,
             coordination_token=token,
             grace_seconds=GRACE,
             stall_budget_seconds=1.0,  # very short budget to force reap regardless

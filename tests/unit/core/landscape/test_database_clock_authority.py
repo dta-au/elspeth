@@ -5668,7 +5668,6 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             node_id=source_node_id,
             step_index=0,
             ingest_sequence=0,
-            available_at=database_now() - timedelta(seconds=1),
             row_payload_json=row_payload,
         )
         landscape_before = database_now()

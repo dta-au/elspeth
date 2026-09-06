@@ -30,6 +30,7 @@ import pytest
 # For node registration
 from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
 from elspeth.contracts.engine import CommittedAggregationOutputReceipt
@@ -98,7 +99,7 @@ from elspeth.plugins.infrastructure.clients.llm import LLMClientError
 from elspeth.plugins.transforms.batch_replicate import BatchReplicateConfig
 from elspeth.testing import make_contract, make_pipeline_row, make_row, make_source_row, make_token_info
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
+from tests.fixtures.landscape import await_database_time, landscape_database_now, leader_coordination_token, make_recorder_with_run
 
 # =============================================================================
 # Helpers
@@ -223,10 +224,8 @@ def _persist_blocked_scheduler_work(
         step_index=processor.resolve_node_step(node_id),
         ingest_sequence=factory.data_flow.resolve_row_ingest_sequence(token.row_id),
         row_payload_json=processor._scheduler.serialize_row_payload(token.row_data),
-        available_at=now,
         lease_owner="test-harness",
         lease_seconds=60,
-        now=now,
         lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
         collector_name=collector_name,
@@ -873,9 +872,8 @@ class TestConstructorErrorEdgeMap:
                 step_index=1,
                 ingest_sequence=ordinal,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
-                available_at=now,
             )
-            claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+            claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
             assert claimed is not None and claimed.token_id == token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
@@ -939,10 +937,8 @@ class TestConstructorErrorEdgeMap:
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=ghost_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=ghost_now,
         )
         factory.scheduler.mark_blocked(
             work_item_id=ghost_item.work_item_id,
@@ -987,9 +983,8 @@ class TestConstructorErrorEdgeMap:
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
@@ -1085,9 +1080,8 @@ class TestConstructorErrorEdgeMap:
             step_index=1,
             ingest_sequence=ordinal,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None and claimed.token_id == token_id
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
@@ -1510,7 +1504,6 @@ class TestProcessRowNoTransforms:
 
         _row, _token, work_item = factory.scheduler.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=observed_at,
             insert_row_and_token=insert_pre_fix_ingress,
             token_id=token_id,
             row_id=row_id,
@@ -1727,7 +1720,6 @@ class TestProcessRowNoTransforms:
 
         factory.scheduler.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=observed_at,
             insert_row_and_token=insert_pre_fix_ingress,
             token_id="token-conflicting-source-state",
             row_id="row-conflicting-source-state",
@@ -4439,7 +4431,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -4514,10 +4505,9 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         _register_test_worker(factory, "crashed-worker")
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="crashed-worker", lease_seconds=300, now=datetime.now(UTC))
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="crashed-worker", lease_seconds=300)
         assert claimed is not None
         persisted_error_hash = error_hash if error_hash is not None else "valid-before-corruption"
         factory.scheduler.mark_pending_sink(
@@ -4626,7 +4616,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4700,7 +4689,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4778,7 +4766,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         first_processor = _make_processor(
@@ -4865,7 +4852,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         crashed_processor = _make_processor(
@@ -4973,7 +4959,6 @@ class TestDurableSchedulerResumeDrain:
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-                available_at=datetime.now(UTC),
             )
 
         # Stage 1: fabricate the durable image left by a leader that drove the
@@ -5094,7 +5079,6 @@ class TestDurableSchedulerResumeDrain:
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-                available_at=datetime.now(UTC),
             )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5146,7 +5130,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(fresh_payload),
-            available_at=datetime.now(UTC),
         )
 
         # Stage 3: a fresh recovery processor drains everything in one call.
@@ -5232,7 +5215,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=clock.now_utc(),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5293,7 +5275,6 @@ class TestDurableSchedulerResumeDrain:
             data=source_payload.to_dict(),
         )
         token = factory.data_flow.create_token(row.row_id, token_id="token-expired")
-        past = datetime.now(UTC) - timedelta(hours=1)
         factory.scheduler.enqueue_ready(
             run_id="test-run",
             token_id=token.token_id,
@@ -5302,16 +5283,26 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=past,
         )
-        _register_test_worker(factory, "dead-worker")
+        # The owner is registry-DEAD on the Landscape database clock (ADR-047):
+        # its heartbeat lapsed more than the liveness grace window ago, so the
+        # sweep's dead-owner arm reaps its lease once that lease has expired
+        # on the same clock.
+        _register_test_worker(
+            factory,
+            "dead-worker",
+            heartbeat_expires_at=landscape_database_now(db.engine) - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1),
+        )
         claimed = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="dead-worker",
             lease_seconds=1,
-            now=past,
         )
-        assert claimed is not None
+        assert claimed is not None and claimed.lease_expires_at is not None
+        # The drain reconciles the row against its CLAIM_READY witness, so the
+        # one-second lease must expire the way it does in production: by
+        # database time passing.
+        await_database_time(db.engine, claimed.lease_expires_at)
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5379,7 +5370,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5434,7 +5424,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=99,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
             on_success_sink="source_sink",
             lineage_path=token.lineage_path,
         )
@@ -5486,7 +5475,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5555,7 +5543,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default", on_error="errors")
         processor = _make_processor(
@@ -5638,7 +5625,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5708,7 +5694,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5784,7 +5769,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5845,7 +5829,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
             lineage_path=token.lineage_path,
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
@@ -5941,7 +5924,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
@@ -6068,7 +6050,7 @@ class TestDurableSchedulerResumeDrain:
         # Block the row through the production claim path WITHOUT the
         # accept()-written hold node_state (simulates a crash between adoption
         # CAS commit and accept() in _intake_adopt_coalesce_row).
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
@@ -6229,7 +6211,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(stray_payload),
-            available_at=datetime.now(UTC),
             barrier_key=str(agg_node),
         )
         _register_test_worker(factory, "test-worker")
@@ -6237,7 +6218,6 @@ class TestDurableSchedulerResumeDrain:
             run_id="test-run",
             lease_owner="test-worker",
             lease_seconds=30,
-            now=datetime.now(UTC),
         )
         assert stray_claim is not None
         assert stray_claim.work_item_id == stray_work.work_item_id
@@ -6497,18 +6477,15 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         # Peer worker A claims the row under its own lease_owner. Lease window
         # is wide enough that ``peer_active_leases`` sees it as unexpired.
-        peer_claim_now = datetime.now(UTC)
         _register_test_worker(factory, "peer-worker-A")
         peer_claim = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="peer-worker-A",
             lease_seconds=600,
-            now=peer_claim_now,
         )
         assert peer_claim is not None
         assert peer_claim.lease_owner == "peer-worker-A"
@@ -6582,17 +6559,21 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=clock.now_utc(),
         )
 
         # Crashed peer A held a short lease that has since expired.
         _register_test_worker(factory, "crashed-peer", heartbeat_expires_at=clock.now_utc() - timedelta(seconds=120))
-        factory.scheduler.claim_ready(
+        crashed_claim = factory.scheduler.claim_ready(
             run_id="test-run",
             lease_owner="crashed-peer",
-            lease_seconds=30,
-            now=clock.now_utc(),
+            lease_seconds=1,
         )
+        assert crashed_claim is not None and crashed_claim.lease_expires_at is not None
+        # The drain reconciles the row against its CLAIM_READY witness, so the
+        # one-second lease must expire the way it does in production: on the
+        # Landscape database clock (ADR-047). Advancing the process MockClock
+        # cannot expire a database-time lease.
+        await_database_time(_db.engine, crashed_claim.lease_expires_at)
         clock.advance(60.0)
 
         success_result = TransformResult.success(
@@ -6656,7 +6637,6 @@ class TestDurableSchedulerResumeDrain:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
-            available_at=datetime.now(UTC),
         )
 
         # The caller's lease_owner pre-claims the row before the drain entry.
@@ -6664,7 +6644,6 @@ class TestDurableSchedulerResumeDrain:
             run_id="test-run",
             lease_owner=_TEST_LEADER_WORKER_ID,
             lease_seconds=600,
-            now=datetime.now(UTC),
         )
 
         worker_processor = _make_processor(
@@ -8548,12 +8527,11 @@ class TestCompleteCoalesceMerge:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            available_at=now,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60, now=now)
+        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
         assert claimed is not None and claimed.token_id == "token-held-a"
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,

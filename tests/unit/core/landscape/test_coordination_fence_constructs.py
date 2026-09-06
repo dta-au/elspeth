@@ -53,7 +53,14 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import assert_deadline_within, assert_stamped_between, expire_lease, landscape_database_now, make_landscape_db
+from tests.fixtures.landscape import (
+    assert_deadline_within,
+    assert_stamped_between,
+    expire_lease,
+    landscape_database_now,
+    make_landscape_db,
+    reschedule_work_item,
+)
 from tests.helpers.run_coordination import register_run_leader
 
 # Forensic seed instant (rows, tokens, registrations). Never a lease decision
@@ -144,7 +151,6 @@ def _seed_ready_item(db: LandscapeDB, run_id: str, *, sequence: int = 0) -> str:
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(
             PipelineRow({"id": sequence}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         ),
-        available_at=NOW,
     )
     with db.engine.connect() as conn:
         return str(
@@ -201,7 +207,6 @@ def _seed_unscheduled_item(db: LandscapeDB, run_id: str, *, sequence: int) -> di
         "row_payload_json": TokenSchedulerRepository.serialize_row_payload(
             PipelineRow({"id": sequence}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         ),
-        "available_at": NOW,
         "lease_seconds": 60,
     }
 
@@ -391,7 +396,6 @@ class TestClaimVerbFenceClause:
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(
                     PipelineRow({"id": 99}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
                 ),
-                available_at=NOW,
                 worker_id="worker-evicted",
             )
 
@@ -408,7 +412,6 @@ class TestClaimVerbFenceClause:
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(
                     PipelineRow({"id": 100}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
                 ),
-                available_at=NOW,
                 worker_id="worker-absent",
             )
         assert exc_info2.value.worker_id == "worker-absent"
@@ -462,12 +465,15 @@ class TestEnqueueReadyClaimedMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-active", run_id=RUN_1, status="active")
         enqueue = _seed_unscheduled_item(db, RUN_1, sequence=15)
-        # Parked one minute into the DATABASE's future: the claim CAS admits a
-        # row only once available_at <= database time (ADR-047).
-        future = landscape_database_now(db.engine) + timedelta(seconds=60)
-        enqueue["available_at"] = future
+        repo = TokenSchedulerRepository(db.engine)
+        # Enqueue stamps available_at from database time; park the READY row
+        # one minute into the DATABASE's future, then replay the idempotent
+        # enqueue-and-claim: the claim CAS admits a row only once
+        # available_at <= database time (ADR-047).
+        ready = repo.enqueue_ready(**{key: value for key, value in enqueue.items() if key != "lease_seconds"})
+        future = reschedule_work_item(db.engine, ready.work_item_id, seconds_from_now=60)
 
-        scheduled = TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
+        scheduled = repo.enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
 
         assert scheduled.status is TokenWorkStatus.READY
         assert scheduled.lease_owner is None

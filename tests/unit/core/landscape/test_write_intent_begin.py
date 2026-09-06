@@ -244,12 +244,11 @@ class TestBeginMode:
                 node_id="normalize",
                 step_index=1,
                 ingest_sequence=0,
-                available_at=BASE,
                 row_payload_json=payload,
             )
 
             trace = _attach_trace(db.engine)
-            claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-1", lease_seconds=30, now=BASE)
+            claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-1", lease_seconds=30)
             assert claimed is not None
             assert "BEGIN IMMEDIATE" in _begin_statements(trace)
 
@@ -260,7 +259,6 @@ class TestBeginMode:
                 work_item_id=claimed.work_item_id,
                 lease_owner="worker-1",
                 lease_seconds=30,
-                now=BASE,
                 membership_fenced=False,
             )
             assert "BEGIN IMMEDIATE" in _begin_statements(trace2)

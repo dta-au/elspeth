@@ -157,7 +157,6 @@ def _enqueue_ready_item(engine: Tier1Engine, *, token_id: str = "tok-1") -> str:
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=NOW,
     )
     return row_id
 

@@ -277,7 +277,6 @@ def _seed_pending_sink(repo: TokenSchedulerRepository, *, payload: str) -> str:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=NOW,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="producer-worker", lease_seconds=30)

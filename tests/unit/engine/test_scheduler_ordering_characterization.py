@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, insert, select, text
+from sqlalchemy import create_engine, insert, select, text, update
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
@@ -203,7 +203,6 @@ def test_claim_ready_order_is_global_ingest_sequence_not_enqueue_order() -> None
             node_id="normalize",
             step_index=1,
             ingest_sequence=ingest_sequence,
-            available_at=now,
             row_payload_json=payload,
         )
 
@@ -236,10 +235,12 @@ def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_i
     # token-w: later step_index, earliest created_at — must claim LAST.
     # token-x: step 1 but later created_at — claims after the step-1/t0 pair.
     # token-y / token-z: exact (step_index, created_at) collision — tiebreak on work_item_id.
-    # Every available_at sits in the database's past so the claim CAS admits
-    # all four at once and only the ORDER is under test (ADR-047).
+    # enqueue_ready stamps created_at (and available_at) from database time,
+    # so all four rows are claimable at once and would tie on created_at;
+    # the forensic created_at is then set directly so only the ORDER is
+    # under test (ADR-047).
     t0 = now - timedelta(seconds=10)
-    for token_id, step_index, available_at in (
+    for token_id, step_index, created_at in (
         ("token-w", 2, t0),
         ("token-x", 1, t0 + timedelta(seconds=5)),
         ("token-y", 1, t0),
@@ -252,9 +253,14 @@ def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_i
             node_id="normalize",
             step_index=step_index,
             ingest_sequence=0,
-            available_at=available_at,
             row_payload_json=payload,
         )
+        with engine.begin() as conn:
+            conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == items[token_id].work_item_id)
+                .values(created_at=created_at)
+            )
 
     claimed = _claim_tokens_in_order(repo, lease_owner="worker-a", now=now + timedelta(seconds=10))
 
@@ -287,7 +293,6 @@ def test_live_lease_is_not_reclaimable_and_expired_lease_recovers_exactly_once()
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -350,7 +355,6 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
             node_id="normalize",
             step_index=1,
             ingest_sequence=ingest_sequence,
-            available_at=now,
             row_payload_json=payload,
         )
 

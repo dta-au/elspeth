@@ -166,9 +166,8 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
         step_index=1,
         ingest_sequence=10,
         row_payload_json=_payload_json(),
-        available_at=_NOW,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60, now=_NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None
     return db, repo, claimed
 

@@ -295,7 +295,6 @@ def _seed_other_run_expired_lease(db: LandscapeDB, repo: TokenSchedulerRepositor
         step_index=1,
         ingest_sequence=0,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
     claimed = repo.claim_ready(run_id=OTHER_RUN_ID, lease_owner="other-run-crashed-worker", lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
@@ -314,7 +313,6 @@ def _enqueue_and_claim(db: LandscapeDB, repo: TokenSchedulerRepository, *, seque
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
     _ensure_active_worker(db, owner)
     claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60)
@@ -961,7 +959,6 @@ class TestValidTokenFenceSemantics:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=_payload_json(),
-            available_at=NOW,
         )
         factory = RecorderFactory(db)
         with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):

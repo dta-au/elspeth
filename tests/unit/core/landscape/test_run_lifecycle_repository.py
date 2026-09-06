@@ -1704,7 +1704,6 @@ class TestCompleteRunDiagnosisOrder:
     def test_residual_work_with_valid_token_is_orchestration_invariant(self) -> None:
         """One READY journal row + a SUCCESS finalize under a VALID token ⇒
         the in-statement §D quiescence arm refuses (OrchestrationInvariantError)."""
-        from datetime import UTC, datetime
 
         from elspeth.contracts.errors import OrchestrationInvariantError
         from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -1733,7 +1732,6 @@ class TestCompleteRunDiagnosisOrder:
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(
                 PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
             ),
-            available_at=datetime.now(UTC),
         )
 
         with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):

@@ -1388,7 +1388,6 @@ def test_scheduler_claims_ready_work_and_recovers_expired_leases() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     contract = SchemaContract(
         mode="OBSERVED",
         fields=(
@@ -1424,7 +1423,6 @@ def test_scheduler_claims_ready_work_and_recovers_expired_leases() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
         on_success_sink="default",
     )
@@ -1477,7 +1475,6 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, contract))
     _insert_scheduler_owner_records(
@@ -1496,7 +1493,6 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     prior_item = repo.enqueue_ready(
@@ -1506,7 +1502,6 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -1596,7 +1591,6 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
@@ -1606,7 +1600,6 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     # Worker-a leases the row, then its lease expires.
@@ -1686,7 +1679,6 @@ def test_scheduler_recover_expired_leases_reaps_null_owner_wedged_row() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
@@ -1696,7 +1688,6 @@ def test_scheduler_recover_expired_leases_reaps_null_owner_wedged_row() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     # Forge an invariant-violating wedge: status=LEASED but lease_owner=NULL.
@@ -1753,7 +1744,6 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     first_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -1826,7 +1816,6 @@ def test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_pee
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     raced = False
@@ -1881,7 +1870,6 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     first_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -1944,7 +1932,6 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(
         engine,
@@ -1959,7 +1946,6 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
@@ -1969,7 +1955,6 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2204,7 +2189,6 @@ def _enqueue_scheduler_test_item(repo, *, engine, now: datetime, token_id: str =
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2218,7 +2202,6 @@ def test_scheduler_repository_rejects_token_from_other_run() -> None:
     _insert_scheduler_owner_records(engine, run_id="run-A", token_specs=(), node_ids=("normalize",))
     _insert_scheduler_owner_records(engine, run_id="run-B", token_specs=(("token-cross", "row-cross", 0),), node_ids=())
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     with pytest.raises(AuditIntegrityError, match=r"token_id='token-cross'.*run_id='run-A'"):
@@ -2229,7 +2212,6 @@ def test_scheduler_repository_rejects_token_from_other_run() -> None:
             node_id="normalize",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
 
@@ -2243,7 +2225,6 @@ def test_scheduler_repository_rejects_node_from_other_run() -> None:
     _insert_scheduler_owner_records(engine, run_id="run-A", token_specs=(("token-1", "row-1", 0),), node_ids=())
     _insert_scheduler_owner_records(engine, run_id="run-B", token_specs=(), node_ids=("normalize",))
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     with pytest.raises(AuditIntegrityError, match=r"node_id='normalize'.*run_id='run-A'"):
@@ -2254,7 +2235,6 @@ def test_scheduler_repository_rejects_node_from_other_run() -> None:
             node_id="normalize",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
 
@@ -2267,7 +2247,6 @@ def test_scheduler_repository_rejects_ready_work_with_wrong_ingest_sequence() ->
     metadata.create_all(engine)
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 7),), node_ids=("normalize",))
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     with pytest.raises(AuditIntegrityError, match=r"row_id='row-1'.*ingest_sequence=7.*not scheduled ingest_sequence=8"):
@@ -2278,7 +2257,6 @@ def test_scheduler_repository_rejects_ready_work_with_wrong_ingest_sequence() ->
             node_id="normalize",
             step_index=1,
             ingest_sequence=8,
-            available_at=now,
             row_payload_json=payload,
         )
 
@@ -2291,7 +2269,6 @@ def test_scheduler_repository_allows_terminal_cursor_without_fake_node() -> None
     metadata.create_all(engine)
     _insert_scheduler_owner_records(engine, token_specs=(("token-terminal", "row-terminal", 0),), node_ids=())
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     item = repo.enqueue_ready(
@@ -2301,7 +2278,6 @@ def test_scheduler_repository_allows_terminal_cursor_without_fake_node() -> None
         node_id=None,
         step_index=99,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2320,7 +2296,6 @@ def test_scheduler_repository_idempotently_accepts_duplicate_enqueue_with_identi
     metadata.create_all(engine)
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(
         PipelineRow({"id": 1, "secret": "do-not-leak"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
@@ -2332,7 +2307,6 @@ def test_scheduler_repository_idempotently_accepts_duplicate_enqueue_with_identi
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2345,7 +2319,6 @@ def test_scheduler_repository_idempotently_accepts_duplicate_enqueue_with_identi
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2361,7 +2334,6 @@ def test_scheduler_repository_rejects_duplicate_enqueue_with_incompatible_cursor
     metadata.create_all(engine)
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
     payload = repo.serialize_row_payload(
         PipelineRow({"id": 1, "secret": "do-not-leak"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
@@ -2372,7 +2344,6 @@ def test_scheduler_repository_rejects_duplicate_enqueue_with_incompatible_cursor
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -2384,7 +2355,6 @@ def test_scheduler_repository_rejects_duplicate_enqueue_with_incompatible_cursor
             node_id="normalize",
             step_index=2,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=payload,
         )
 
@@ -2489,7 +2459,6 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -2530,7 +2499,6 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
         node_id="normalize",
         step_index=1,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed_second = repo.claim_ready(run_id="run-1", lease_owner="worker-d", lease_seconds=30)
@@ -2569,7 +2537,6 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         node_id="coalesce_merge",
         step_index=3,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
@@ -2579,7 +2546,6 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         node_id="coalesce_merge",
         step_index=3,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload,
     )
     first_claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -2692,7 +2658,6 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -2974,7 +2939,6 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
             node_id="coalesce_merge",
             step_index=3,
             ingest_sequence=index,
-            available_at=now,
             row_payload_json=payload,
         )
         claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)
@@ -3032,7 +2996,6 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
             node_id="coalesce_merge",
             step_index=3,
             ingest_sequence=index,
-            available_at=now,
             row_payload_json=payload,
         )
         claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)
@@ -3091,7 +3054,6 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
             node_id="coalesce_merge",
             step_index=3,
             ingest_sequence=index,
-            available_at=now,
             row_payload_json=payload,
         )
         claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)

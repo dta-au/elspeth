@@ -197,7 +197,6 @@ def _enqueue_tokens(repo: TokenSchedulerRepository, token_ids: tuple[str, ...]) 
             node_id="normalize",
             step_index=1,
             ingest_sequence=ingest_sequence,
-            available_at=BASE,
             row_payload_json=payload,
         )
         for ingest_sequence, token_id in enumerate(token_ids)

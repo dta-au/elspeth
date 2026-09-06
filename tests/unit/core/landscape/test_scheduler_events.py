@@ -34,6 +34,7 @@ from elspeth.core.landscape.schema import (
 )
 from tests.fixtures.landscape import (
     assert_stamped_between,
+    await_database_time,
     expire_lease,
     landscape_database_now,
     make_recorder_with_run,
@@ -135,7 +136,6 @@ def test_enqueue_ready_records_single_idempotent_scheduler_event() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     duplicate = repo.enqueue_ready(
@@ -145,7 +145,6 @@ def test_enqueue_ready_records_single_idempotent_scheduler_event() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -184,7 +183,6 @@ def test_enqueue_ready_mismatch_diagnostics_redact_row_payload_values() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
@@ -196,7 +194,6 @@ def test_enqueue_ready_mismatch_diagnostics_redact_row_payload_values() -> None:
             node_id="normalize",
             step_index=1,
             ingest_sequence=0,
-            available_at=now,
             row_payload_json=alternate_payload,
         )
 
@@ -225,7 +222,6 @@ def test_enqueue_ready_claimed_records_enqueue_and_claim_events_in_one_operation
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
         lease_owner="worker-a",
         lease_seconds=30,
@@ -277,7 +273,6 @@ def test_claim_and_terminal_events_record_status_and_lease_ownership() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     before_claim = landscape_database_now(engine)
@@ -331,7 +326,6 @@ def test_recover_expired_leases_records_attempt_bump_and_previous_work_item() ->
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -377,7 +371,6 @@ def test_heartbeat_lease_lost_records_event_when_current_row_is_peer_owned() -> 
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -432,7 +425,6 @@ def test_heartbeat_lease_lost_records_event_when_expired_lease_was_recovered() -
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -490,7 +482,6 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -523,7 +514,6 @@ def test_mark_blocked_and_mark_failed_record_transition_events() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -555,7 +545,6 @@ def test_pending_sink_claim_and_terminalization_record_transition_events() -> No
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -961,7 +950,6 @@ def test_mark_pending_sink_rejects_incomplete_bundle_without_mutation(bundle_ove
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is not None
@@ -1049,7 +1037,6 @@ def test_normal_disposition_rolls_back_when_scheduler_event_insert_fails(monkeyp
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -1257,7 +1244,6 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
@@ -1267,7 +1253,6 @@ def test_pending_sink_batch_terminalization_records_per_token_events() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -1669,7 +1654,6 @@ def test_blocked_barrier_terminalization_records_transition_event() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -1717,7 +1701,6 @@ def test_blocked_barrier_pending_sink_handoff_records_state_and_event() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30) is not None
@@ -1797,7 +1780,6 @@ def test_claim_ready_rolls_back_work_item_update_when_scheduler_event_insert_fai
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     original_record_scheduler_event = repo.events.record
@@ -1842,9 +1824,7 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
         ingest_sequence=0,
     )
     factory.data_flow.create_token("row-1", token_id="token-1")
-    # The production reader orders by (recorded_at, event_id); the enqueue is
-    # stamped one database second before the claim so that key is total here.
-    now = landscape_database_now(db.engine) - timedelta(seconds=1)
+    now = landscape_database_now(db.engine)
     payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     factory.scheduler.enqueue_ready(
@@ -1854,7 +1834,6 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     with db.engine.begin() as conn:
@@ -1868,6 +1847,10 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
                 heartbeat_expires_at=now + timedelta(hours=1),
             )
         )
+    # The production reader orders by (recorded_at, event_id) and the enqueue
+    # and the claim are both stamped from whole-second database time, so the
+    # claim waits for the next database second to keep that key total.
+    await_database_time(db.engine, landscape_database_now(db.engine))
     factory.scheduler.claim_ready(
         run_id="run-1",
         lease_owner="worker-a",
@@ -2241,7 +2224,6 @@ def _make_pending_sink(
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
     assert repo.claim_ready(run_id=run_id, lease_owner="worker-a", lease_seconds=30) is not None
@@ -2267,7 +2249,6 @@ def _make_transform_lease(repo, *, payload: str, now: datetime):
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(

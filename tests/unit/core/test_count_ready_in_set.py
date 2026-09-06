@@ -59,7 +59,6 @@ def _enqueue_ready(setup: RecorderSetup, scheduler: TokenSchedulerRepository, *,
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=_PAYLOAD,
     )
     return item.work_item_id
@@ -222,7 +221,6 @@ def test_cross_run_isolation_shared_db_run_id_predicate() -> None:
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=sequence,
-            available_at=NOW,
             row_payload_json=_PAYLOAD,
         )
         return item.work_item_id
@@ -343,7 +341,6 @@ def test_count_failed_is_run_scoped() -> None:
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=sequence,
-            available_at=NOW,
             row_payload_json=_PAYLOAD,
         )
         claimed = scheduler.claim_ready(run_id=run.run_id, lease_owner=lease_owner, lease_seconds=300)
@@ -470,7 +467,6 @@ def test_has_peer_owned_work_is_run_scoped() -> None:
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=0,
-        available_at=NOW,
         row_payload_json=_PAYLOAD,
     )
     with db.engine.begin() as conn:

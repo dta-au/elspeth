@@ -234,7 +234,6 @@ def _enqueue_and_block(
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
     claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30)
@@ -416,7 +415,6 @@ def test_complete_barrier_crash_atomicity() -> None:
         node_id=None,
         step_index=4,
         ingest_sequence=3,
-        available_at=NOW,
         row_payload_json=payload,
     )
     events_before = len(_events(engine))

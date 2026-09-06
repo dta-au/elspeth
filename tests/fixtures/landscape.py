@@ -119,6 +119,29 @@ def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) ->
     return lapsed
 
 
+def await_database_time(engine: Any, instant: datetime, *, timeout_seconds: float = 5.0) -> datetime:
+    """Block until the Landscape database clock is strictly past ``instant``; return the clock read.
+
+    For the few tests whose audit witness must stay intact — source-completion
+    reconciliation compares the row's ``lease_expires_at`` with the CLAIM_READY
+    event's ``to_lease_expires_at`` — a lease can only expire the way it does
+    in production: by database time passing. Pair with a one-second lease so
+    the wait is bounded by two whole SQLite seconds.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        database_now = landscape_database_now(engine)
+        if database_now > instant:
+            return database_now
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"Landscape database time {database_now.isoformat()} did not pass {instant.isoformat()} within {timeout_seconds} s"
+            )
+        time.sleep(0.05)
+
+
 def reschedule_work_item(engine: Any, work_item_id: str, *, seconds_from_now: float) -> datetime:
     """Move a work item's ``available_at`` to ``seconds_from_now`` seconds from database time.
 

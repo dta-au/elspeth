@@ -113,7 +113,6 @@ def _enqueue(harness: _Harness, name: str, sequence: int) -> tuple[str, str, str
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=PAYLOAD,
     )
     return row.row_id, token.token_id, item.work_item_id

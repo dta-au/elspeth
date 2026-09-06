@@ -132,7 +132,6 @@ def _enqueue_one_ready(repo: TokenSchedulerRepository, *, now: datetime) -> Toke
         step_index=0,
         ingest_sequence=0,
         row_payload_json=_row_payload_json(),
-        available_at=now,
     )
 
 

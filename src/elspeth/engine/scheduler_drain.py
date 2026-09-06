@@ -505,10 +505,9 @@ class SchedulerDrainCoordinator:
             for intake_child in intake_child_items:
                 self.enqueue_work_item(intake_child, pending_items)
 
-            # The claim timestamp is read AFTER intake: rows the intake just
-            # emitted carry available_at stamps later than an iteration-top
-            # reading, and claim_ready's available_at <= now predicate must
-            # see them.
+            # ``now`` feeds maintenance scheduling and disposition stamps only;
+            # claim_ready decides availability on Landscape database time
+            # (ADR-047), which is also what the intake's enqueues stamp.
             now = self._clock.now_utc()
             if iterations - maintenance_iteration >= SCHEDULER_MAINTENANCE_INTERVAL:
                 self.run_maintenance(now)
@@ -1144,8 +1143,14 @@ class SchedulerDrainCoordinator:
         *,
         claim_immediately: bool = False,
     ) -> TokenWorkItem:
-        """Persist a READY scheduler item and retain the live token payload."""
-        available_at = self._clock.now_utc()
+        """Persist a READY scheduler item and retain the live token payload.
+
+        The row's ``available_at`` is stamped by the repository from Landscape
+        database time (ADR-047), never from this drain's process clock: a
+        process instant with microseconds is later than SQLite's whole-second
+        database time, so a same-second continuation would be invisible to
+        the very next ``claim_ready`` and trip the stranded-work invariant.
+        """
         fields = self._work_codec.ready_fields(item)
         if claim_immediately:
             enqueue_claimed = (
@@ -1161,7 +1166,6 @@ class SchedulerDrainCoordinator:
                 step_index=fields.step_index,
                 ingest_sequence=fields.ingest_sequence,
                 row_payload_json=fields.row_payload_json,
-                available_at=available_at,
                 queue_key=fields.queue_key,
                 barrier_key=fields.barrier_key,
                 on_success_sink=fields.on_success_sink,
@@ -1183,7 +1187,6 @@ class SchedulerDrainCoordinator:
                 step_index=fields.step_index,
                 ingest_sequence=fields.ingest_sequence,
                 row_payload_json=fields.row_payload_json,
-                available_at=available_at,
                 queue_key=fields.queue_key,
                 barrier_key=fields.barrier_key,
                 on_success_sink=fields.on_success_sink,
