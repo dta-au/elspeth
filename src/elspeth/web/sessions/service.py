@@ -3338,6 +3338,75 @@ class _SessionComposerMutations:
         )
         return replace(record, pipeline_metadata=_pipeline_public_metadata(authority))
 
+    def create_guided_pipeline_proposal(
+        self,
+        *,
+        proposal_id: str,
+        event_id: str,
+        tool_call_id: str,
+        user_message_id: UUID | None,
+        summary: str,
+        rationale: str,
+        affects: Sequence[str],
+        arguments_json: Mapping[str, Any],
+        arguments_redacted_json: Mapping[str, Any],
+        base_state_id: str,
+        actor: str,
+        normalized_provenance: Mapping[str, str | None],
+        payload: Mapping[str, Any],
+        created_at: datetime,
+    ) -> CompositionProposalRecord:
+        """Create the pending proposal a guided settlement stages in its own transaction.
+
+        Unlike ``create_pipeline_composition_proposal`` the base is the
+        checkpoint the caller inserted moments ago in this same transaction,
+        so there is no current-head comparison here: the guided ``_sync``
+        proved the checkpoint chain, validated blob references, and re-checks
+        the guided fence when it binds and completes the operation. Every row
+        of one settlement carries the caller's ``created_at``.
+        """
+        _service, connection, session_id, _now = self.__state._require_exact()
+        if type(created_at) is not datetime:
+            raise TypeError("created_at must be an exact datetime")
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=session_id,
+                proposal_id=proposal_id,
+                event_type="proposal.created",
+                actor=actor,
+                payload=payload,
+                created_at=created_at,
+            )
+        )
+        connection.execute(
+            insert(composition_proposals_table).values(
+                id=proposal_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                user_message_id=str(user_message_id) if user_message_id is not None else None,
+                composer_model_identifier=normalized_provenance["composer_model_identifier"],
+                composer_model_version=normalized_provenance["composer_model_version"],
+                composer_provider=normalized_provenance["composer_provider"],
+                composer_skill_hash=normalized_provenance["composer_skill_hash"],
+                tool_arguments_hash=normalized_provenance["tool_arguments_hash"],
+                tool_name="set_pipeline",
+                status="pending",
+                summary=summary,
+                rationale=rationale,
+                affects=list(affects),
+                arguments_json=deep_thaw(arguments_json),
+                arguments_redacted_json=deep_thaw(arguments_redacted_json),
+                base_state_id=base_state_id,
+                committed_state_id=None,
+                audit_event_id=event_id,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        row = connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == proposal_id)).one()
+        return _proposal_record_from_row(row)
+
     def _validated_blob_effect_receipt(self, proposal_row: Any) -> Any | None:
         """Read one receipt and prove its proposal and committed-result binding."""
         _service, connection, session_id, _now = self.__state._require_exact()
@@ -4006,6 +4075,23 @@ class _GuidedSessionMutations:
             unproducible_output_fields=unproducible_output_fields,
         )
 
+    def mark_session_updated(self, *, updated_at: datetime) -> None:
+        """Bump ``sessions.updated_at`` after this operation appended rows to its session.
+
+        Every guided settlement stamps the rows of one cohort with one caller
+        clock, so the stamp is a parameter; the dual fence is re-checked
+        immediately before the UPDATE.
+        """
+        _service, connection, fence, _row, _now = self.__state._require_exact()
+        if type(updated_at) is not datetime:
+            raise TypeError("updated_at must be an exact datetime")
+        changed = connection.execute(
+            update(sessions_table).where(sessions_table.c.id == str(fence.session_id)).values(updated_at=updated_at)
+        ).rowcount
+        if changed != 1:
+            self.__state._close()
+            raise AuditIntegrityError("guided session touch did not find exactly one session row")
+
 
 @final
 class _GuidedComposerMutations:
@@ -4063,6 +4149,115 @@ class _GuidedComposerMutations:
         )
         if updated.rowcount != 1:
             raise AuditIntegrityError("guided proposal invalidation lost the pending proposal CAS")
+
+    def record_pending_proposal_rejection(
+        self,
+        *,
+        authority: AuthoritativePipelineProposal,
+        actor: str,
+        created_at: datetime,
+        reason: PipelineProposalRejectionReason,
+    ) -> str:
+        """Terminal ``proposal.rejected`` event and pending->rejected CAS for the proposal this operation holds.
+
+        Unlike ``reject_pending_proposal`` there is no confirmation sweep: the
+        caller's own guided operation legitimately holds the proposal it is
+        settling (rejection, back-edit supersession). Returns the event id.
+        """
+        _service, connection, fence, _row, _database_now = self.__state._require_exact()
+        if type(authority) is not AuthoritativePipelineProposal:
+            raise TypeError("authority must be an exact AuthoritativePipelineProposal")
+        if authority.row.session_id != fence.session_id or authority.row.status != "pending":
+            raise AuditIntegrityError("guided pending proposal authority is not exact for this session")
+        if type(created_at) is not datetime:
+            raise TypeError("created_at must be an exact datetime")
+        proposal_id = str(authority.row.id)
+        event_id = str(uuid.uuid4())
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=str(fence.session_id),
+                proposal_id=proposal_id,
+                event_type="proposal.rejected",
+                actor=actor,
+                payload=_pipeline_rejected_payload(authority=authority, reason=reason, dispatch=None),
+                created_at=created_at,
+            )
+        )
+        updated = connection.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.session_id == str(fence.session_id))
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.status == "pending")
+            .values(
+                status="rejected",
+                committed_state_id=None,
+                audit_event_id=event_id,
+                updated_at=created_at,
+            )
+        )
+        if updated.rowcount != 1:
+            raise AuditIntegrityError("guided proposal rejection lost the pending proposal CAS")
+        return event_id
+
+    def record_pending_proposal_acceptance(
+        self,
+        *,
+        authority: AuthoritativePipelineProposal,
+        actor: str,
+        created_at: datetime,
+        committed_state_id: str,
+        state_content_hash: str,
+        final_composer_metadata: Mapping[str, Any] | None,
+        dispatch: PipelineDispatchAuditBinding,
+    ) -> str:
+        """Terminal ``proposal.accepted`` event and pending->committed CAS for the proposal this operation holds.
+
+        The caller has already proved the durable dispatch and inserted the
+        committed state in this transaction. Returns the event id.
+        """
+        _service, connection, fence, _row, _database_now = self.__state._require_exact()
+        if type(authority) is not AuthoritativePipelineProposal:
+            raise TypeError("authority must be an exact AuthoritativePipelineProposal")
+        if authority.row.session_id != fence.session_id or authority.row.status != "pending":
+            raise AuditIntegrityError("guided pending proposal authority is not exact for this session")
+        if type(created_at) is not datetime:
+            raise TypeError("created_at must be an exact datetime")
+        proposal_id = str(authority.row.id)
+        event_id = str(uuid.uuid4())
+        terminal_payload = _pipeline_accepted_payload(
+            authority=authority,
+            state_id=committed_state_id,
+            state_content_hash=state_content_hash,
+            final_composer_metadata=final_composer_metadata,
+            dispatch=dispatch,
+        )
+        connection.execute(
+            insert(proposal_events_table).values(
+                id=event_id,
+                session_id=str(fence.session_id),
+                proposal_id=proposal_id,
+                event_type="proposal.accepted",
+                actor=actor,
+                payload=terminal_payload,
+                created_at=created_at,
+            )
+        )
+        updated = connection.execute(
+            update(composition_proposals_table)
+            .where(composition_proposals_table.c.session_id == str(fence.session_id))
+            .where(composition_proposals_table.c.id == proposal_id)
+            .where(composition_proposals_table.c.status == "pending")
+            .values(
+                status="committed",
+                committed_state_id=committed_state_id,
+                audit_event_id=event_id,
+                updated_at=created_at,
+            )
+        )
+        if updated.rowcount != 1:
+            raise AuditIntegrityError("guided proposal acceptance lost the pending proposal CAS")
+        return event_id
 
 
 @final
@@ -10206,14 +10401,13 @@ class SessionServiceImpl:
                     parent_assistant_id=None,
                     created_at=now,
                 )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
                 response_hash = response_hash_factory(record)
                 with self._guided_session_mutation_transaction(
                     conn,
                     guided_fence=fence,
                     session_operation_context=session_operation_context,
                 ) as mutation:
+                    mutation.guided.mark_session_updated(updated_at=now)
                     mutation.guided.bind(result_state_id=record.id)
                     mutation.guided.complete(
                         result=GuidedCompositionStateResult(state_id=record.id),
@@ -10417,7 +10611,12 @@ class SessionServiceImpl:
                             sequence_no=sequence_no,
                             created_at=now,
                         )
-                        conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                        with self._guided_session_mutation_transaction(
+                            conn,
+                            guided_fence=fence,
+                            session_operation_context=session_operation_context,
+                        ) as mutation:
+                            mutation.guided.mark_session_updated(updated_at=now)
                     outcome: GuidedStartStateOutcome = GuidedStartStateSeeded(state=record)
                 else:
                     record = self._row_to_state_record(current_row)
@@ -10613,7 +10812,12 @@ class SessionServiceImpl:
                         created_at=now,
                     )
                 if row_count:
-                    conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                    with self._guided_session_mutation_transaction(
+                        conn,
+                        guided_fence=fence,
+                        session_operation_context=session_operation_context,
+                    ) as mutation:
+                        mutation.guided.mark_session_updated(updated_at=now)
                 if originating_message is not None:
                     # Same binding check the start settlement performs: the
                     # checkpoint being persisted must NAME this root row, and
@@ -10899,14 +11103,13 @@ class SessionServiceImpl:
                     created_at=now,
                 )
 
-                if row_count:
-                    conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
                 with self._guided_session_mutation_transaction(
                     conn,
                     guided_fence=command.fence,
                     session_operation_context=session_operation_context,
                 ) as mutation:
+                    if row_count:
+                        mutation.guided.mark_session_updated(updated_at=now)
                     interpretation_records = tuple(
                         mutation.interpretations.create_or_reconcile_pending(prepared.command, prepared.validator)
                         for prepared in interpretation_commands
@@ -11199,46 +11402,35 @@ class SessionServiceImpl:
                     sequence_no=sequence_no + 1,
                     created_at=now,
                 )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.mark_session_updated(updated_at=now)
 
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
+                with self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ) as composer_transaction:
+                    stored = composer_transaction.composer.create_guided_pipeline_proposal(
                         proposal_id=pid,
-                        event_type="proposal.created",
+                        event_id=event_id,
+                        tool_call_id=command.plan.tool_call_id,
+                        user_message_id=command.originating_message.message_id,
+                        summary=command.summary,
+                        rationale=command.rationale,
+                        affects=command.affects,
+                        arguments_json=proposal.pipeline,
+                        arguments_redacted_json=command.arguments_redacted_json,
+                        base_state_id=checkpoint_id,
                         actor=command.actor,
+                        normalized_provenance=normalized,
                         payload=creation_payload,
                         created_at=now,
                     )
-                )
-                conn.execute(
-                    insert(composition_proposals_table).values(
-                        id=pid,
-                        session_id=sid,
-                        tool_call_id=command.plan.tool_call_id,
-                        user_message_id=str(command.originating_message.message_id),
-                        composer_model_identifier=normalized["composer_model_identifier"],
-                        composer_model_version=normalized["composer_model_version"],
-                        composer_provider=normalized["composer_provider"],
-                        composer_skill_hash=normalized["composer_skill_hash"],
-                        tool_arguments_hash=normalized["tool_arguments_hash"],
-                        tool_name="set_pipeline",
-                        status="pending",
-                        summary=command.summary,
-                        rationale=command.rationale,
-                        affects=list(command.affects),
-                        arguments_json=deep_thaw(proposal.pipeline),
-                        arguments_redacted_json=deep_thaw(command.arguments_redacted_json),
-                        base_state_id=checkpoint_id,
-                        committed_state_id=None,
-                        audit_event_id=event_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                proposal_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
-                stored = _proposal_record_from_row(proposal_row)
                 authority = AuthoritativePipelineProposal(
                     row=stored,
                     proposal=proposal,
@@ -11475,8 +11667,6 @@ class SessionServiceImpl:
                     sequence_no=sequence_no + 2,
                     created_at=now,
                 )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
                 response = project_guided_full_decline(decline_message)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
@@ -11485,6 +11675,7 @@ class SessionServiceImpl:
                     guided_fence=command.fence,
                     session_operation_context=session_operation_context,
                 ) as mutation:
+                    mutation.guided.mark_session_updated(updated_at=now)
                     mutation.guided.bind(originating_message_id=command.originating_message.message_id)
                     mutation.guided.complete(
                         result=GuidedDeclinedResult(
@@ -11881,46 +12072,30 @@ class SessionServiceImpl:
                         created_at=now,
                         message_id=str(command.originating_message.message_id),
                     )
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
+                with self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ) as composer_transaction:
+                    record = composer_transaction.composer.create_guided_pipeline_proposal(
                         proposal_id=pid,
-                        event_type="proposal.created",
+                        event_id=event_id,
+                        tool_call_id=command.plan.tool_call_id,
+                        user_message_id=command.user_message_id,
+                        summary=command.summary,
+                        rationale=command.rationale,
+                        affects=command.affects,
+                        arguments_json=proposal.pipeline,
+                        arguments_redacted_json=command.arguments_redacted_json,
+                        base_state_id=checkpoint_id,
                         actor=command.actor,
+                        normalized_provenance=normalized,
                         payload=creation_payload,
                         created_at=now,
                     )
-                )
-                conn.execute(
-                    insert(composition_proposals_table).values(
-                        id=pid,
-                        session_id=sid,
-                        tool_call_id=command.plan.tool_call_id,
-                        user_message_id=str(command.user_message_id) if command.user_message_id is not None else None,
-                        composer_model_identifier=normalized["composer_model_identifier"],
-                        composer_model_version=normalized["composer_model_version"],
-                        composer_provider=normalized["composer_provider"],
-                        composer_skill_hash=normalized["composer_skill_hash"],
-                        tool_arguments_hash=normalized["tool_arguments_hash"],
-                        tool_name="set_pipeline",
-                        status="pending",
-                        summary=command.summary,
-                        rationale=command.rationale,
-                        affects=list(command.affects),
-                        arguments_json=deep_thaw(proposal.pipeline),
-                        arguments_redacted_json=deep_thaw(command.arguments_redacted_json),
-                        base_state_id=checkpoint_id,
-                        committed_state_id=None,
-                        audit_event_id=event_id,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
                 state_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == checkpoint_id)).one()
                 result_state = self._row_to_state_record(state_row)
-                proposal_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
-                record = _proposal_record_from_row(proposal_row)
                 authority = AuthoritativePipelineProposal(
                     row=record,
                     proposal=proposal,
@@ -11944,9 +12119,6 @@ class SessionServiceImpl:
                     sequence_no=sequence_no,
                     created_at=now,
                 )
-                if audit_rows or command.originating_message is not None:
-                    conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
@@ -11955,6 +12127,8 @@ class SessionServiceImpl:
                     guided_fence=command.fence,
                     session_operation_context=session_operation_context,
                 ) as mutation:
+                    if audit_rows or command.originating_message is not None:
+                        mutation.guided.mark_session_updated(updated_at=now)
                     mutation.guided.bind(
                         originating_message_id=(
                             command.originating_message.message_id if command.originating_message is not None else None
@@ -12216,36 +12390,17 @@ class SessionServiceImpl:
                     provenance="convergence_persist",
                     created_at=now,
                 )
-                event_id = str(uuid.uuid4())
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="proposal.rejected",
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.composer.record_pending_proposal_rejection(
+                        authority=authority,
                         actor=command.actor,
-                        payload=_pipeline_rejected_payload(
-                            authority=authority,
-                            reason="superseded",
-                            dispatch=None,
-                        ),
                         created_at=now,
+                        reason="superseded",
                     )
-                )
-                updated = conn.execute(
-                    update(composition_proposals_table)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.status == "pending")
-                    .values(
-                        status="rejected",
-                        committed_state_id=None,
-                        audit_event_id=event_id,
-                        updated_at=now,
-                    )
-                )
-                if updated.rowcount != 1:
-                    raise AuditIntegrityError("guided back-edit proposal changed during settlement")
 
                 result_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                 result_state = self._row_to_state_record(result_row)
@@ -12258,9 +12413,6 @@ class SessionServiceImpl:
                     sequence_no=sequence_no,
                     created_at=now,
                 )
-                if audit_rows:
-                    conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
                 response = project_guided_response(result_state, payloads=command.payloads)
                 projected_json = response_json(response)
                 response_hash = guided_response_projection_hash(response)
@@ -12269,6 +12421,8 @@ class SessionServiceImpl:
                     guided_fence=command.fence,
                     session_operation_context=session_operation_context,
                 ) as mutation:
+                    if audit_rows:
+                        mutation.guided.mark_session_updated(updated_at=now)
                     mutation.guided.bind(proposal_id=command.proposal_id, result_state_id=result_state.id)
                     mutation.guided.complete(
                         result=GuidedCompositionStateResult(state_id=result_state.id, proposal_id=command.proposal_id),
@@ -12397,30 +12551,17 @@ class SessionServiceImpl:
                     provenance="convergence_persist",
                     created_at=now,
                 )
-                event_id = str(uuid.uuid4())
-                terminal_payload = _pipeline_rejected_payload(
-                    authority=authority,
-                    reason="operator_rejected",
-                    dispatch=None,
-                )
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="proposal.rejected",
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.composer.record_pending_proposal_rejection(
+                        authority=authority,
                         actor=command.actor,
-                        payload=terminal_payload,
                         created_at=now,
+                        reason="operator_rejected",
                     )
-                )
-                conn.execute(
-                    update(composition_proposals_table)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.status == "pending")
-                    .values(status="rejected", committed_state_id=None, audit_event_id=event_id, updated_at=now)
-                )
                 result_row = conn.execute(select(composition_states_table).where(composition_states_table.c.id == state_id)).one()
                 result_state = self._row_to_state_record(result_row)
                 updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
@@ -12639,7 +12780,12 @@ class SessionServiceImpl:
                     sequence_no=sequence_no,
                     created_at=now,
                 )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.guided.mark_session_updated(updated_at=now)
                 recovery = self._pipeline_dispatch_recovery_on_connection(conn, authority=authority)
                 if recovery is None or recovery.binding != expected_binding:
                     raise AuditIntegrityError("guided dispatch did not become durably recoverable")
@@ -12801,34 +12947,20 @@ class SessionServiceImpl:
                     dispatch=dispatch,
                 ) != (command.executor_content_hash,):
                     raise AuditIntegrityError("guided proposal acceptance requires one durable exact dispatch")
-                event_id = str(uuid.uuid4())
-                terminal_payload = _pipeline_accepted_payload(
-                    authority=authority,
-                    state_id=state_id,
-                    state_content_hash=command.executor_content_hash,
-                    final_composer_metadata=prepared_state.composer_meta,
-                    dispatch=dispatch,
-                )
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="proposal.accepted",
+                with self._guided_session_mutation_transaction(
+                    conn,
+                    guided_fence=command.fence,
+                    session_operation_context=session_operation_context,
+                ) as mutation:
+                    mutation.composer.record_pending_proposal_acceptance(
+                        authority=authority,
                         actor=command.actor,
-                        payload=terminal_payload,
                         created_at=now,
+                        committed_state_id=state_id,
+                        state_content_hash=command.executor_content_hash,
+                        final_composer_metadata=prepared_state.composer_meta,
+                        dispatch=dispatch,
                     )
-                )
-                updated = conn.execute(
-                    update(composition_proposals_table)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .where(composition_proposals_table.c.id == pid)
-                    .where(composition_proposals_table.c.status == "pending")
-                    .values(status="committed", committed_state_id=state_id, audit_event_id=event_id, updated_at=now)
-                )
-                if updated.rowcount != 1:
-                    raise AuditIntegrityError("guided proposal acceptance lost the pending proposal CAS")
                 updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
                 proposal_record = replace(
                     _proposal_record_from_row(updated_row),
