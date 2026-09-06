@@ -64,6 +64,11 @@ from elspeth.engine.clock import DEFAULT_CLOCK, SystemClock
 
 logger = logging.getLogger(__name__)
 
+# Resolution of the clock the repository measures lease validity against:
+# SQLite's CURRENT_TIMESTAMP is whole-second (ADR-047), so a reported
+# remaining validity of N seconds means the lease lapses inside [N, N + 1).
+_LANDSCAPE_CLOCK_RESOLUTION_SECONDS = 1.0
+
 
 class SinkEffectExecutionSeam(StrEnum):
     """Deterministic crash seams at durable coordinator boundaries."""
@@ -437,7 +442,15 @@ class SinkEffectCoordinator:
 
             monotonic_now = self._clock.monotonic()
             if deadline is None:
-                initial_budget = min(self._lease_ttl.total_seconds(), remaining_validity)
+                # The repository reports validity against Landscape database
+                # time, whole-second on SQLite (ADR-047): "N seconds remain"
+                # means [N, N + 1), so the budget covers that resolution or the
+                # wait could give up inside the lease's last second. The TTL
+                # still caps it.
+                initial_budget = min(
+                    self._lease_ttl.total_seconds(),
+                    remaining_validity + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS,
+                )
                 # Repository takeover is deliberately strict (expires_at < now).
                 # One bounded poll interval permits the final authority check to
                 # cross an exact equality without introducing an open-ended wait.

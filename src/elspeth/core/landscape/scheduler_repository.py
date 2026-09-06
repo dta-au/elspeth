@@ -802,6 +802,15 @@ class TokenSchedulerRepository:
     # Read models (SchedulerReadModel)
     # ------------------------------------------------------------------
 
+    def database_now(self) -> datetime:
+        """Landscape database time, read once outside any decision transaction (ADR-047).
+
+        The engine measures a barrier hold's age as this instant minus the
+        row's database-stamped ``barrier_blocked_at``; both operands come from
+        the database, never from a process clock.
+        """
+        return self.barriers.database_now()
+
     def count_ready_in_set(self, *, run_id: str, work_item_ids: Sequence[str]) -> int:
         """Count how many of the given work item IDs are in READY status."""
         return self.reads.count_ready_in_set(run_id=run_id, work_item_ids=work_item_ids)

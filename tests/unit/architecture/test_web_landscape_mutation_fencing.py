@@ -378,8 +378,8 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # (49a7bb16c), _recover_expired_leases (55a8a94f4) and
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
-_EXPECTED_DML_COUNT = 139
-_EXPECTED_DML_INVENTORY_SHA256 = "6ca139a712665371a20fdf03f14597fcd9d9056b7397e316ca228ef235a11b3d"
+_EXPECTED_DML_COUNT = 141
+_EXPECTED_DML_INVENTORY_SHA256 = "aeaf9a110addc6cc59ae421eef4c7822ba18713319c0732009f335f1f585993d"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
