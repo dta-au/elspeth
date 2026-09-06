@@ -4165,6 +4165,13 @@ _NON_SESSION_ENGINE_FACTORIES = frozenset(
         # One leader-fenced begin_write on a Tier1Engine (ADR-030); yields the
         # Landscape connection it opened.
         "elspeth.core.landscape.run_coordination_repository.fenced_leader_transaction",
+        # The scheduler's two named transaction factories over a Tier1Engine:
+        # ``fenced_write`` returns ``fenced_leader_transaction(engine, ...)``
+        # after refusing a missing token, ``legacy_unfenced_recover_expired_
+        # leases_write`` returns ``begin_write(engine)``. Each returns one of
+        # the factories above and nothing else (elspeth-e483fe7f85 family H).
+        "elspeth.core.landscape.scheduler.fencing.fenced_write",
+        "elspeth.core.landscape.scheduler.fencing.legacy_unfenced_recover_expired_leases_write",
         # The web tier's accessor for the Landscape store; yields a LandscapeDB.
         "elspeth.web.landscape_access.open_landscape_db",
     }
@@ -4477,22 +4484,86 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return None
         parameters = {argument.arg for argument in (*owner.args.posonlyargs, *owner.args.args, *owner.args.kwonlyargs)}
         if receiver.id not in parameters or self._name_reassigned_in(owner, receiver.id):
-            return None
+            behind = self._parameter_behind_name(execution, receiver.id)
+            return (owner, behind) if behind is not None else None
         reaching, complete, scope = self._visible_reaching_bindings(execution, receiver.id)
         if not complete or scope is not owner or any(binding.value is not None or binding.node is not owner for binding in reaching):
             return None
         return owner, receiver.id
+
+    def _parameter_behind_name(self, use: ast.AST, name: str) -> str | None:
+        """The enclosing function's parameter that ``name`` is a fixed derivation of, else ``None``.
+
+        Two shapes, each requiring ``name`` to have exactly one reaching
+        binding in the enclosing function and the parameter to be unreassigned:
+        ``with <parameter> as name`` (a caller-owned transaction context such as
+        ``write_ctx``) and ``name = <parameter>.cursor()`` (the DBAPI cursor of
+        a connection handed to an engine event hook). The connection's
+        provenance is then the parameter's, and the caller-side proof settles
+        it (elspeth-e483fe7f85 family H).
+        """
+
+        owner = self._enclosing_function(use)
+        if owner is None:
+            return None
+        parameters = {argument.arg for argument in (*owner.args.posonlyargs, *owner.args.args, *owner.args.kwonlyargs)}
+        reaching, complete, scope = self._visible_reaching_bindings(use, name)
+        if not complete or scope is not owner or len(reaching) != 1:
+            return None
+        binding = reaching[0]
+        node = binding.node
+        source: ast.expr | None = None
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            items = [item for item in node.items if isinstance(item.optional_vars, ast.Name) and item.optional_vars.id == name]
+            if len(items) != 1:
+                return None
+            source = items[0].context_expr
+            # ``with db.write_connection() as conn`` over a parameter ``db``:
+            # the connection is the parameter's, through one of the handle
+            # verbs a database object exposes.
+            if (
+                isinstance(source, ast.Call)
+                and not source.args
+                and not source.keywords
+                and isinstance(source.func, ast.Attribute)
+                and source.func.attr in _LANDSCAPE_CONNECTION_VERBS | {"begin", "connect"}
+            ):
+                source = source.func.value
+        elif isinstance(node, ast.Assign) and binding.value is not None:
+            value = binding.value
+            if (
+                isinstance(value, ast.Call)
+                and not value.args
+                and not value.keywords
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr in {"cursor", "raw_connection"}
+            ):
+                source = value.func.value
+        if not isinstance(source, ast.Name) or source.id not in parameters or self._name_reassigned_in(owner, source.id):
+            return None
+        return source.id
 
     def _call_argument_for_parameter(
         self,
         call: ast.Call,
         definition: ast.FunctionDef | ast.AsyncFunctionDef,
         name: str,
+        *,
+        instance_method: bool | None = None,
     ) -> ast.expr | None:
         """The caller's expression bound to ``name`` at this call, or ``None`` when it cannot be known exactly."""
 
+        if instance_method is None:
+            instance_method = self._is_instance_method(definition)
+
         positional = [*definition.args.posonlyargs, *definition.args.args]
-        if id(definition) in self.method_owners and self._is_instance_method(definition) and positional:
+        # ``definition`` may live in another module (the caller-side proof
+        # walks the whole tree), so whether it is an instance method is the
+        # CALLEE collector's verdict, passed in -- this module's method table
+        # used to decide it, which left ``self`` in the positional list for
+        # every cross-module ``repo.method(conn, ...)`` call and bound the
+        # parameter one slot off (elspeth-e483fe7f85 family H).
+        if instance_method and positional:
             if isinstance(call.func, ast.Attribute):
                 positional = positional[1:]
             else:
@@ -4574,16 +4645,71 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             node = binding.node
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 items = [item for item in node.items if isinstance(item.optional_vars, ast.Name) and item.optional_vars.id == name]
-                if len(items) != 1 or not isinstance(items[0].context_expr, ast.Call):
-                    return False
-                if not self._call_roots_in_module(items[0].context_expr, use=node, depth=depth):
+                if len(items) != 1 or not self._context_roots_in_module(items[0].context_expr, use=node, depth=depth):
                     return False
                 continue
-            if binding.value is None or not isinstance(binding.value, ast.Call):
-                return False
-            if not self._call_roots_in_module(binding.value, use=node, depth=depth):
+            if binding.value is None or not self._context_roots_in_module(binding.value, use=node, depth=depth):
                 return False
         return True
+
+    def _context_roots_in_module(self, expression: ast.expr, *, use: ast.AST, depth: int) -> bool:
+        """The transaction-context shapes a module binds itself (elspeth-e483fe7f85 family H).
+
+        A call rooted in the module (``_call_roots_in_module``); a call to a
+        declared non-Sessions factory whatever its arguments (``fenced_leader_
+        transaction(self._db.engine, token=token, ...)`` -- the token is a
+        fence, the engine is the module's); a conditional choosing between
+        such shapes (``self._db.write_connection() if token is None else
+        fenced_leader_transaction(...)``); a name bound only to such shapes
+        (``with write_ctx as conn`` over that conditional); and, inside a
+        class that IS a declared engine type, any call at all -- the type
+        constructs only its own engine (``engine = create_engine(url)`` in
+        ``LandscapeDB.from_url``).
+        """
+
+        if isinstance(expression, ast.IfExp):
+            return self._context_roots_in_module(expression.body, use=use, depth=depth) and self._context_roots_in_module(
+                expression.orelse, use=use, depth=depth
+            )
+        if isinstance(expression, ast.Name):
+            return depth <= 3 and self._name_is_module_bound(use, expression.id, depth=depth + 1)
+        if not isinstance(expression, ast.Call):
+            return False
+        if self._qualified_database_domain(self._declared_factory_qualified_name(expression.func, use=use)) == "non_sessions":
+            return True
+        if self._enclosing_declared_engine_type(use) is not None:
+            return True
+        return self._call_roots_in_module(expression, use=use, depth=depth)
+
+    def _declared_factory_qualified_name(self, func: ast.expr, *, use: ast.AST) -> str | None:
+        """``func``'s qualified name, whether imported or the one top-level definition of this module.
+
+        ``fenced_leader_transaction`` is declared by its qualified name and
+        used inside the module that defines it, where no import binds it.
+        """
+
+        qualified = self._imported_qualified_name(func)
+        if qualified is not None or not isinstance(func, ast.Name):
+            return qualified
+        reaching, complete, scope = self._visible_reaching_bindings(use, func.id)
+        if not complete or scope is not self.tree or len(reaching) != 1:
+            return None
+        definition = reaching[0].node
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)) or self._next_lexical_scope(definition) is not self.tree:
+            return None
+        return f"{self._module_qualified_name()}.{definition.name}"
+
+    def _enclosing_declared_engine_type(self, node: ast.AST) -> ast.ClassDef | None:
+        """The declared non-Sessions engine type whose body encloses ``node``, else ``None``."""
+
+        scope: ast.AST | None = self._enclosing_function(node)
+        while scope is not None and not isinstance(scope, ast.Module):
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                klass = self.method_owners.get(id(scope))
+                if klass is not None and f"{self._module_qualified_name()}.{klass.name}" in _NON_SESSION_ENGINE_TYPES:
+                    return klass
+            scope = self._next_lexical_scope(scope)
+        return None
 
     def _call_roots_in_module(self, call: ast.Call, *, use: ast.AST, depth: int) -> bool:
         """No Name leaf of the call (receiver chain or arguments) is a parameter of the enclosing function except ``self``."""
@@ -4665,6 +4791,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return None if left is None or right is None else left | right
         if isinstance(annotation, ast.Constant) and annotation.value is None:
             return frozenset()
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            parsed = self._parsed_annotation_string(annotation)
+            return None if parsed is None else self._annotation_type_qualified_names(parsed)
         if isinstance(annotation, (ast.Name, ast.Attribute)):
             qualified = self._imported_qualified_name(annotation)
             if qualified is not None:
@@ -4673,8 +4802,52 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 bindings = self.definition_bindings.get((id(self.tree), annotation.id), [])
                 if len(bindings) == 1 and isinstance(bindings[0].node, ast.ClassDef):
                     return frozenset({f"{self._module_qualified_name()}.{annotation.id}"})
+                guarded = self._type_checking_imported_qualified_name(annotation.id)
+                if guarded is not None:
+                    return frozenset({guarded})
             return None
         return None
+
+    @staticmethod
+    def _parsed_annotation_string(annotation: ast.Constant) -> ast.expr | None:
+        """A forward-reference string parsed as the annotation it names, parented where the string sits.
+
+        ``db: "LandscapeDB"`` names the same type as ``db: LandscapeDB``; the
+        parsed tree hangs off the string constant so every scope lookup walks
+        the enclosing definition exactly as it would for the bare name.
+        """
+
+        try:
+            expression = ast.parse(str(annotation.value), mode="eval")
+        except SyntaxError:
+            return None
+        parsed = expression.body
+        parsed._inventory_parent = annotation  # type: ignore[attr-defined]
+        _attach_parents(parsed)
+        return parsed
+
+    def _type_checking_imported_qualified_name(self, name: str) -> str | None:
+        """The one module-level ``if TYPE_CHECKING:`` import binding ``name``, else ``None``.
+
+        Such an import exists only for annotations, which is the one place
+        this lookup is consulted; the general reaching-bindings walk rightly
+        sees it as a conditional binding.
+        """
+
+        found: list[str] = []
+        for statement in ast.iter_child_nodes(self.tree):
+            if not isinstance(statement, ast.If):
+                continue
+            test = statement.test
+            guarded = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+            )
+            if not guarded:
+                continue
+            for node in statement.body:
+                if isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+                    found.extend(f"{node.module}.{alias.name}" for alias in node.names if (alias.asname or alias.name) == name)
+        return found[0] if len(found) == 1 else None
 
     def _self_attribute_annotation(self, execution: ast.Call, attribute: ast.Attribute) -> ast.expr | None:
         """The one ``self.<attr>: T`` annotation in the enclosing class, when exactly one exists."""
@@ -5660,11 +5833,17 @@ class _ProductionWriterCollector(ast.NodeVisitor):
     ) -> DatabaseDomain | None:
         if expression is None or (isinstance(expression, ast.Constant) and expression.value is None):
             return None
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            parsed = self._parsed_annotation_string(expression)
+            return None if parsed is None else self._annotation_database_domain(parsed, definition=definition, scope=scope)
         qualified = self._annotation_imported_qualified_name(
             expression,
             definition=definition,
             scope=scope,
         )
+        if qualified is None and isinstance(expression, ast.Name):
+            # Bound only under ``if TYPE_CHECKING:``: an annotation-only import.
+            qualified = self._type_checking_imported_qualified_name(expression.id)
         direct = self._qualified_database_domain(qualified)
         if direct is not None:
             return direct
@@ -7262,12 +7441,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                         f"unknown_{func.attr}",
                     )
                     received = self._receiver_parameter(call)
-                    if (
-                        received is not None
-                        and not acquisitions
-                        and not force_unresolved
-                        and not self._raw_sql_names_sessions_table(statement, use=call)
-                    ):
+                    # Opaque syntax (``force_unresolved``) no longer bars the
+                    # caller-side proof: the proof settles the CONNECTION's
+                    # database, and a statement executed on a proven
+                    # non-Sessions connection cannot write a Sessions table,
+                    # exactly as the package premise already holds for a
+                    # module-bound receiver. Raw text naming a Sessions table
+                    # keeps its veto (elspeth-e483fe7f85 family H).
+                    if received is not None and not acquisitions and not self._raw_sql_names_sessions_table(statement, use=call):
                         self.parameter_received.append((len(self.sites) - 1, *received))
                 elif acquisitions and id(call) not in self.classified_execution_calls:
                     # Every statement executed inside an acquired block is its
@@ -7823,7 +8004,12 @@ class _CallerSideProof:
             targets = caller._call_targets_definition(call, definition, collector.path)
             if targets is False:
                 continue
-            argument = caller._call_argument_for_parameter(call, definition, parameter)
+            argument = caller._call_argument_for_parameter(
+                call,
+                definition,
+                parameter,
+                instance_method=collector._is_instance_method(definition),
+            )
             if argument is None:
                 return False
             if isinstance(argument, ast.Constant) and argument.value is None:
@@ -7834,12 +8020,16 @@ class _CallerSideProof:
             call_sites += 1
             if not self._argument_proves_non_session(caller, call, argument, depth=depth, active=active):
                 return False
+        for caller, registration, target in self._listener_sites(collector, definition, parameter):
+            call_sites += 1
+            if not self._argument_proves_non_session(caller, registration, target, depth=depth, active=active):
+                return False
         return call_sites > 0
 
     def _argument_proves_non_session(
         self,
         caller: _ProductionWriterCollector,
-        call: ast.Call,
+        call: ast.AST,
         argument: ast.expr,
         *,
         depth: int,
@@ -7863,8 +8053,70 @@ class _CallerSideProof:
             return False
         parameters = {item.arg for item in (*received.args.posonlyargs, *received.args.args, *received.args.kwonlyargs)}
         if argument.id not in parameters or caller._name_reassigned_in(received, argument.id):
-            return False
+            behind = caller._parameter_behind_name(call, argument.id)
+            if behind is None:
+                return False
+            return self._parameter_proves_non_session(caller, received, behind, depth=depth + 1, active=active)
         return self._parameter_proves_non_session(caller, received, argument.id, depth=depth + 1, active=active)
+
+    def _listener_sites(
+        self,
+        collector: _ProductionWriterCollector,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        parameter: str,
+    ) -> list[tuple[_ProductionWriterCollector, ast.AST, ast.expr]]:
+        """Engine event registrations that hand ``definition`` its FIRST positional parameter.
+
+        ``@event.listens_for(target, ...)`` on the definition and every
+        ``event.listen(target, ..., <definition by name>)`` call in the tree
+        bind the hook's first parameter (the DBAPI connection or Connection
+        the engine passes) to ``target``'s database, so each is a call site
+        whose argument is ``target``. Any other parameter has no site here.
+        """
+
+        positional = [*definition.args.posonlyargs, *definition.args.args]
+        if collector._is_instance_method(definition):
+            positional = positional[1:]
+        if not positional or positional[0].arg != parameter:
+            return []
+        sites: list[tuple[_ProductionWriterCollector, ast.AST, ast.expr]] = []
+        # A decorator's target is evaluated in the scope that DEFINES the hook
+        # (``engine`` of ``_configure_sqlite`` for its nested listeners), so
+        # the site's position is the enclosing scope, never the hook.
+        defining_scope = collector._next_lexical_scope(definition) or definition
+        for decorator in definition.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and decorator.args
+                and collector._imported_qualified_name(decorator.func) == "sqlalchemy.event.listens_for"
+            ):
+                sites.append((collector, defining_scope, decorator.args[0]))
+        for caller in self._collectors:
+            for node in ast.walk(caller.tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and len(node.args) >= 3
+                    and caller._imported_qualified_name(node.func) == "sqlalchemy.event.listen"
+                ):
+                    target = node.args[2]
+                    named = target.id if isinstance(target, ast.Name) else target.attr if isinstance(target, ast.Attribute) else None
+                    if named == definition.name:
+                        sites.append((caller, node, node.args[0]))
+                    continue
+                # ``engine.dialect.do_commit = hook``: the dialect calls the hook
+                # with that engine's DBAPI connection (the journal's commit seam).
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Attribute)
+                    and isinstance(node.targets[0].value, ast.Attribute)
+                    and node.targets[0].value.attr == "dialect"
+                ):
+                    value = node.value
+                    named = value.id if isinstance(value, ast.Name) else value.attr if isinstance(value, ast.Attribute) else None
+                    if named == definition.name:
+                        sites.append((caller, node, node.targets[0].value.value))
+        return sites
 
 
 def _identity_key(site: WriterIdentity) -> tuple[str, str, str, str, str, int, str | None, int, bool]:
@@ -11886,6 +12138,356 @@ def test_caller_side_proof_refuses_a_cycle_and_a_helper_nobody_calls(tmp_path: P
     findings = _caller_side_findings(tmp_path, {"src/elspeth/core/landscape/cycle.py": cyclic})
     assert findings[("src/elspeth/core/landscape/cycle.py", "pong", "<unresolved-session-write>")] == 1
     assert findings[("src/elspeth/core/landscape/cycle.py", "orphan", "<unresolved-session-write>")] == 1
+
+
+def test_caller_side_proof_binds_the_parameter_of_an_imported_method_after_self(tmp_path: Path) -> None:
+    """A cross-module ``repo.method(conn, ...)`` call binds ``conn`` to the FIRST parameter after ``self``.
+
+    The proof used to consult the caller's own method table to decide whether
+    the callee was an instance method, so a callee defined in another module
+    kept ``self`` in its positional list and every such call site bound the
+    connection one slot off (unknowable, refused). The engine's
+    ``self._data_flow.insert_row_with_token_on(conn, ...)`` shape.  A static
+    method keeps its unshifted binding, and a caller handing a Sessions
+    connection still refuses.
+    """
+
+    declared = """\
+        class Tokens:
+            def insert_on(self, conn, *, run_id):
+                conn.execute(run_id)
+
+            @staticmethod
+            def insert_static(conn, run_id):
+                conn.execute(run_id)
+        """
+    engine_module = """\
+        from elspeth.core.landscape.database import begin_write
+        from elspeth.core.landscape.repo import Tokens
+
+        class Processor:
+            def __init__(self, engine, tokens):
+                self._engine = engine
+                self._tokens = tokens
+
+            def run(self):
+                with begin_write(self._engine) as conn:
+                    self._tokens.insert_on(conn, run_id="r")
+                    Tokens.insert_static(conn, "r")
+        """
+    sessions_caller = """\
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.core.landscape.repo import Tokens
+
+        def leak(url, tokens):
+            engine = create_session_engine(url)
+            with engine.begin() as conn:
+                tokens.insert_on(conn, run_id="r")
+        """
+    tmp = tmp_path / "proven"
+    repo = tmp / "src/elspeth/core/landscape/repo.py"
+    repo.parent.mkdir(parents=True)
+    repo.write_text(textwrap.dedent(declared))
+    driver = tmp / "src/elspeth/engine/driver.py"
+    driver.parent.mkdir(parents=True)
+    driver.write_text(textwrap.dedent(engine_module))
+    unresolved = Counter(
+        (site.symbol, site.table)
+        for site in scan_production_writers([repo, driver], anchor=tmp)
+        if site.table == "<unresolved-session-write>"
+    )
+    assert unresolved == Counter()
+
+    tmp = tmp_path / "refused"
+    repo = tmp / "src/elspeth/core/landscape/repo.py"
+    repo.parent.mkdir(parents=True)
+    repo.write_text(textwrap.dedent(declared))
+    driver = tmp / "src/elspeth/engine/driver.py"
+    driver.parent.mkdir(parents=True)
+    driver.write_text(textwrap.dedent(engine_module))
+    leak = tmp / "src/elspeth/web/leak.py"
+    leak.parent.mkdir(parents=True)
+    leak.write_text(textwrap.dedent(sessions_caller))
+    unresolved = Counter(
+        (site.symbol, site.table)
+        for site in scan_production_writers([repo, driver, leak], anchor=tmp)
+        if site.table == "<unresolved-session-write>"
+    )
+    assert unresolved == Counter({("Tokens.insert_on", "<unresolved-session-write>"): 1})
+
+
+def test_scheduler_fencing_factories_are_declared_landscape_acquisitions(tmp_path: Path) -> None:
+    """``fenced_write`` and ``legacy_unfenced_recover_expired_leases_write`` return the declared factories' transactions.
+
+    Placed outside the declared packages so the package premise cannot
+    classify anything: the two factories alone make the acquisition a
+    Landscape one, and an undeclared wrapper of the same shape does not.
+    """
+
+    source = tmp_path / "src/elspeth/engine/scheduler_client.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import update
+            from elspeth.core.landscape.scheduler.fencing import fenced_write, legacy_unfenced_recover_expired_leases_write
+            from elspeth.core.landscape.scheduler.other import undeclared_write
+            from elspeth.core.landscape.schema import token_work_items_table
+
+            class Leases:
+                def __init__(self, engine):
+                    self._engine = engine
+
+                def rotate(self, token):
+                    with fenced_write(self._engine, coordination_token=token, verb="rotate") as conn:
+                        conn.execute(update(token_work_items_table).values(status="ready"))
+
+                def rotate_legacy(self):
+                    with legacy_unfenced_recover_expired_leases_write(self._engine) as conn:
+                        conn.execute(update(token_work_items_table).values(status="ready"))
+
+                def rotate_undeclared(self):
+                    with undeclared_write(self._engine) as conn:
+                        conn.execute(update(token_work_items_table).values(status="ready"))
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    # A proven non-Sessions execution leaves no row anywhere; an undeclared
+    # wrapper of the same shape is not an acquisition and its execution is
+    # unresolved. Reverting the two factory declarations adds two such rows.
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("Leases.rotate_undeclared", "<unresolved-session-write>", "unknown_execute"): 1,
+        }
+    )
+
+
+def test_caller_side_proof_reaches_with_targets_cursors_and_event_listeners(tmp_path: Path) -> None:
+    """Three parameter derivations the proof follows, each with its refusing twin (elspeth-e483fe7f85 family H).
+
+    ``with write_ctx as conn`` executes on the caller-owned transaction the
+    parameter carries; ``cursor = dbapi_connection.cursor()`` executes on the
+    connection an engine hook was handed; ``@event.listens_for(engine, ...)``
+    and ``event.listen(engine, ..., hook)`` are the hook's call sites, binding
+    its first parameter to ``engine``. A derivation from an unknown provider,
+    a listener on a generic engine, and a hook registered on nothing stay
+    unresolved.
+    """
+
+    declared = """\
+        from sqlalchemy import event, update
+        from elspeth.core.landscape.database import Tier1Engine, begin_write
+        from elspeth.core.landscape.schema import runs_table
+
+        def complete_in(write_ctx, run_id):
+            with write_ctx as conn:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="completed"))
+
+        def complete(engine: Tier1Engine, run_id):
+            complete_in(begin_write(engine), run_id)
+
+        def complete_unknown_in(write_ctx, run_id):
+            with write_ctx as conn:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="completed"))
+
+        def complete_unknown(provider, run_id):
+            complete_unknown_in(provider.begin(), run_id)
+
+        def configure(engine: Tier1Engine):
+            @event.listens_for(engine, "connect")
+            def set_pragma(dbapi_connection, record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+
+            @event.listens_for(engine, "begin")
+            def emit_begin(conn):
+                conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+        def configure_generic(engine):
+            @event.listens_for(engine, "connect")
+            def set_generic_pragma(dbapi_connection, record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+
+        def unregistered_hook(dbapi_connection, record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+
+        class Journal:
+            def attach(self, engine: Tier1Engine):
+                event.listen(engine, "commit", self._before_commit)
+
+            def _before_commit(self, conn):
+                conn.execute(update(runs_table).values(status="journaled"))
+        """
+    source = tmp_path / "src/elspeth/core/landscape/repo.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(textwrap.dedent(declared))
+    unresolved = Counter(
+        site.symbol for site in scan_production_writers([source], anchor=tmp_path) if site.table == "<unresolved-session-write>"
+    )
+    assert unresolved == Counter(
+        {
+            "complete_unknown_in": 1,
+            "configure_generic.set_generic_pragma": 1,
+            "unregistered_hook": 1,
+        }
+    )
+
+
+def test_module_rooted_contexts_follow_conditionals_declared_factories_and_the_engine_type_itself(tmp_path: Path) -> None:
+    """The transaction-context shapes the package premise binds itself (elspeth-e483fe7f85 family H).
+
+    ``write_ctx = self._db.write_connection() if token is None else
+    fenced_leader_transaction(self._db.engine, token=token, ...)`` followed by
+    ``with write_ctx as conn`` is the repository's own transaction, token
+    parameter and all; inside the class that IS ``LandscapeDB`` the engine
+    it builds from a parameter is its own; and a hook installed as
+    ``engine.dialect.do_commit`` is called with that engine's connection.
+    A conditional with an unknown arm, a parameter-derived call outside the
+    engine type, and a hook installed on nothing stay unresolved.
+    """
+
+    repo = """\
+        from sqlalchemy import update
+        from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+        from elspeth.core.landscape.schema import runs_table
+
+        class Runs:
+            def __init__(self, db):
+                self._db = db
+
+            def complete(self, token, run_id):
+                write_ctx = self._db.write_connection() if token is None else fenced_leader_transaction(self._db.engine, token=token, verb="c")
+                with write_ctx as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="completed"))
+
+            def complete_unknown_arm(self, token, provider, run_id):
+                write_ctx = self._db.write_connection() if token is None else provider.begin()
+                with write_ctx as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="completed"))
+        """
+    database = """\
+        from sqlalchemy import create_engine
+
+        class LandscapeDB:
+            @classmethod
+            def from_url(cls, url):
+                engine = create_engine(url)
+                with engine.connect() as conn:
+                    conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                return cls(engine)
+
+        class NotTheEngineType:
+            @classmethod
+            def from_url(cls, url):
+                engine = create_engine(url)
+                with engine.connect() as conn:
+                    conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+                return cls(engine)
+        """
+    journal = """\
+        from elspeth.core.landscape.database import Tier1Engine
+
+        class Journal:
+            def attach(self, engine: Tier1Engine):
+                engine.dialect.do_commit = self.committed
+
+            def committed(self, dbapi_connection):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+
+            def orphaned(self, dbapi_connection):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+        """
+    # The module that DEFINES a declared factory uses it without an import;
+    # the fence token is a parameter and the engine is the module's.
+    coordination = """\
+        from sqlalchemy import update
+        from elspeth.core.landscape.schema import run_workers_table
+
+        def fenced_leader_transaction(engine, *, token, verb):
+            return engine.begin()
+
+        class Workers:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def evict(self, token, worker_id):
+                with fenced_leader_transaction(self._engine, token=token, verb="evict") as conn:
+                    conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(status="evicted"))
+        """
+    # A declared helper executing on ``with db.write_connection() as conn``
+    # over its ``db`` parameter is proven by its callers; an undeclared
+    # caller proves it only through the handle's annotation, and a
+    # forward-reference string bound under ``if TYPE_CHECKING:`` names the
+    # same type as the bare name would.
+    grades = """\
+        from sqlalchemy import update
+        from elspeth.core.landscape.schema import runs_table
+
+        def update_grade(db, run_id):
+            with db.write_connection() as conn:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(reproducibility_grade="attributable_only"))
+
+        def update_grade_unannotated(db, run_id):
+            with db.write_connection() as conn:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(reproducibility_grade="attributable_only"))
+
+        def verify_pragma(db, pragma):
+            with db.connection() as conn:
+                conn.exec_driver_sql(f"PRAGMA {pragma}").scalar_one()
+        """
+    purger = """\
+        from typing import TYPE_CHECKING
+        from elspeth.core.landscape.grades import update_grade, update_grade_unannotated, verify_pragma
+
+        if TYPE_CHECKING:
+            from elspeth.core.landscape.database import LandscapeDB
+
+        class Purger:
+            def __init__(self, db: "LandscapeDB"):
+                self._db = db
+
+            def purge(self, run_id):
+                update_grade(self._db, run_id)
+                # Opaque syntax on a connection the callers prove is not a
+                # Sessions write; the proof settles the connection.
+                verify_pragma(self._db, "journal_mode")
+
+        class Unannotated:
+            def __init__(self, db):
+                self._db = db
+
+            def purge(self, run_id):
+                update_grade_unannotated(self._db, run_id)
+        """
+    files = []
+    for relative, body in (
+        ("src/elspeth/core/landscape/runs.py", repo),
+        ("src/elspeth/core/landscape/database.py", database),
+        ("src/elspeth/core/landscape/journal.py", journal),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", coordination),
+        ("src/elspeth/core/landscape/grades.py", grades),
+        ("src/elspeth/engine/purger.py", purger),
+    ):
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(textwrap.dedent(body))
+        files.append(source)
+    unresolved = Counter(
+        site.symbol for site in scan_production_writers(files, anchor=tmp_path) if site.table == "<unresolved-session-write>"
+    )
+    assert unresolved == Counter(
+        {
+            "Runs.complete_unknown_arm": 1,
+            "NotTheEngineType.from_url": 1,
+            "Journal.orphaned": 1,
+            "update_grade_unannotated": 1,
+        }
+    )
 
 
 _CONTAINED_FORWARDING_MODULE = """\
