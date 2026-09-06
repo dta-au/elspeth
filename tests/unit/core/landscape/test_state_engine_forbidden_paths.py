@@ -496,9 +496,8 @@ def test_f10_stale_leader_refusal_adds_only_fence_refusal_event(harness: _Harnes
 
     with pytest.raises(RunLeadershipLostError) as raised:
         harness.factory.run_lifecycle.update_run_status(
-            RUN_ID,
             RunStatus.FAILED,
-            token=harness.coordination_token,
+            coordination_token=harness.coordination_token,
         )
 
     assert raised.value.verb == "update_run_status"
@@ -541,9 +540,18 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "mark_pending_sink_terminal",
         "mark_pending_sink_terminal_many",
         "reconcile_source_completions_from_scheduler",
+        "record_preflight_results",
+        "record_readiness_check",
+        "record_run_source",
+        "record_secret_resolutions",
+        "record_source_field_resolution",
         "recover_expired_leases",
+        "set_export_failed_unless_completed",
+        "set_export_pending_unless_completed",
+        "set_export_status",
         "stage_escalation_loss",
         "terminalize_pending_sinks_with_terminal_outcomes",
+        "update_run_source_contract",
         "update_run_status",
     }
     actual: set[str] = set()
@@ -616,6 +624,42 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "update_run_status": (
             "tests/unit/core/landscape/test_state_engine_forbidden_paths.py",
             "test_f10_stale_leader_refusal_adds_only_fence_refusal_event",
+        ),
+        "record_preflight_results": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "record_readiness_check": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "record_run_source": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "record_secret_resolutions": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "record_source_field_resolution": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "set_export_failed_unless_completed": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "set_export_pending_unless_completed": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "set_export_status": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
+        ),
+        "update_run_source_contract": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_run_lifecycle_verb_refused",
         ),
     }
     assert set(retained_tests) == expected

@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     )
 
     RegisterGraphNodesAndEdges = Callable[
-        [RecorderFactory, str, PipelineConfig, ExecutionGraph],
+        [RecorderFactory, str, PipelineConfig, ExecutionGraph, CoordinationToken],
         GraphArtifacts,
     ]
 
@@ -108,7 +108,7 @@ class LeaderDrainCoordinator:
         *,
         payload_store: PayloadStore,
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
         register_graph_nodes_and_edges: RegisterGraphNodesAndEdges,
     ) -> RunResult:
@@ -145,7 +145,7 @@ class LeaderDrainCoordinator:
         self._checkpoints.checkpoint_run_start(run_id)
 
         # 1. Register graph nodes and edges
-        artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph)
+        artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
 
         # 2. Initialize context + processor
         run_ctx = self._context_factory.initialize_run_context(
@@ -220,6 +220,7 @@ class LeaderDrainCoordinator:
                     shutdown_event=shutdown_event,
                     flush_end_of_input=source_ordinal == len(source_items) - 1,
                     check_coordination_latch=check_coordination_latch,
+                    coordination_token=coordination_token,
                 )
                 if loop_result.interrupted:
                     break

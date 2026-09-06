@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     import threading
     from collections.abc import Callable
 
+    from elspeth.contracts import RunStatus
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -118,7 +119,7 @@ class ExecuteRun(Protocol):
         *,
         payload_store: PayloadStore,
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult: ...
 
@@ -222,11 +223,7 @@ class RunLifecycleCoordinator:
 
             # Record secret resolutions in audit trail (deferred from pre-run loading)
             # Resolutions already contain pre-computed fingerprints (no plaintext values)
-            if secret_resolutions:
-                factory.run_lifecycle.record_secret_resolutions(
-                    run_id=run.run_id,
-                    resolutions=secret_resolutions,
-                )
+            self._record_deferred_secret_resolutions(factory, secret_resolutions, coordination_token=coordination_token)
 
             # Emit telemetry AFTER Landscape succeeds - Landscape is the legal record
             self._ceremony.emit_telemetry(
@@ -247,6 +244,38 @@ class RunLifecycleCoordinator:
 
         return factory, run, coordination_token
 
+    @staticmethod
+    def _record_deferred_secret_resolutions(
+        factory: RecorderFactory,
+        secret_resolutions: list[SecretResolutionInput] | None,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Forward the epoch-1 leader token by value into the deferred secret-resolution write (ADR-048 §3)."""
+        if secret_resolutions:
+            factory.run_lifecycle.record_secret_resolutions(secret_resolutions, coordination_token=coordination_token)
+
+    @staticmethod
+    def _record_preflight_results(
+        factory: RecorderFactory,
+        preflight_results: PreflightResult | None,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Forward the leader token by value into the deferred pre-flight write (ADR-048 §3)."""
+        if preflight_results is not None:
+            factory.run_lifecycle.record_preflight_results(preflight_results, coordination_token=coordination_token)
+
+    @staticmethod
+    def _finalize_led_run(
+        factory: RecorderFactory,
+        terminal_status: RunStatus,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> None:
+        """Finalize the run the token leads; the epoch fence is the terminal transaction's first statement."""
+        factory.run_lifecycle.finalize_run(terminal_status, coordination_token=coordination_token)
+
     def execute_export_phase(
         self,
         factory: RecorderFactory,
@@ -258,6 +287,7 @@ class RunLifecycleCoordinator:
         audit_export_content_store: AuditExportContentStore,
         audit_export_content_store_resolver: AuditExportContentStoreResolver,
         worker_id: str,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Execute the EXPORT phase: export Landscape data to configured sink.
 
@@ -275,10 +305,10 @@ class RunLifecycleCoordinator:
         binding, sink_effect_admission = prepare_audit_export_binding(settings, sink_factory)
         _validate_audit_export_binding_provenance(settings, binding)
         factory.run_lifecycle.set_export_status(
-            run_id,
             status=ExportStatus.PENDING,
             export_format=export_config.format,
             export_sink=export_config.sink,
+            coordination_token=coordination_token,
         )
 
         phase_start = time.perf_counter()
@@ -308,7 +338,7 @@ class RunLifecycleCoordinator:
                 worker_id=worker_id,
             )
 
-            factory.run_lifecycle.set_export_status(run_id, status=ExportStatus.COMPLETED)
+            factory.run_lifecycle.set_export_status(status=ExportStatus.COMPLETED, coordination_token=coordination_token)
             self._events.emit(PhaseCompleted(phase=PipelinePhase.EXPORT, duration_seconds=time.perf_counter() - phase_start))
         except Exception as export_error:
             self._ceremony.emit_phase_error(PipelinePhase.EXPORT, export_error, target=export_config.sink)
@@ -318,9 +348,9 @@ class RunLifecycleCoordinator:
                 original_error=type(export_error).__name__,
             ):
                 factory.run_lifecycle.set_export_status(
-                    run_id,
                     status=ExportStatus.FAILED,
                     error=str(export_error),
+                    coordination_token=coordination_token,
                 )
             # Re-raise so caller knows export failed
             # (run is still "completed" in Landscape)
@@ -429,11 +459,7 @@ class RunLifecycleCoordinator:
         )
 
         # Record pre-flight results (deferred from bootstrap_and_run)
-        if preflight_results is not None:
-            factory.run_lifecycle.record_preflight_results(
-                run_id=run.run_id,
-                preflight=preflight_results,
-            )
+        self._record_preflight_results(factory, preflight_results, coordination_token=coordination_token)
 
         # Thread the coordination token to the collaborators that step 4 of
         # slice 2 fences (checkpoint writes, finalize, ceremonies): the
@@ -519,7 +545,7 @@ class RunLifecycleCoordinator:
 
             # Complete run with reproducibility grade computation
             _check_combined_coordination_latch()
-            factory.run_lifecycle.finalize_run(run.run_id, status=terminal_status, token=coordination_token)
+            self._finalize_led_run(factory, terminal_status, coordination_token=coordination_token)
             result = audit_counters.to_run_result(run.run_id, terminal_status)
             run_completed = True
 
@@ -529,17 +555,6 @@ class RunLifecycleCoordinator:
             # BEFORE the seat release vacates the fence's CAS target.
             _check_combined_coordination_latch()
             self._checkpoints.delete_checkpoints(run.run_id)
-
-            # ADR-030 §A.3: stop the heartbeat thread BEFORE releasing the
-            # seat — the thread must not beat the seat after it is vacated.
-            _heartbeat.stop()
-
-            # Seat hygiene (ADR-030 §D): the leader releases its seat AFTER
-            # the terminal finalize succeeds. Best-effort — a failed release
-            # leaves the seat to lapse on its liveness window; it must never
-            # un-complete a completed run.
-            with best_effort("Seat release after finalize", run_id=run.run_id):
-                factory.run_coordination.release_seat(token=coordination_token)
 
             # Emit telemetry AFTER Landscape finalize succeeds
             run_duration = time.perf_counter() - run_start_time
@@ -578,7 +593,20 @@ class RunLifecycleCoordinator:
                     audit_export_content_store=audit_export_content_store,
                     audit_export_content_store_resolver=audit_export_content_store_resolver,
                     worker_id=coordination_token.worker_id,
+                    coordination_token=coordination_token,
                 )
+
+            # ADR-030 §A.3: stop the heartbeat thread BEFORE releasing the
+            # seat — the thread must not beat the seat after it is vacated.
+            _heartbeat.stop()
+
+            # Seat hygiene (ADR-030 §D): the leader releases its seat AFTER
+            # the terminal finalize succeeds AND after the export phase, whose
+            # status writes are leader-fenced (ADR-048): a vacated seat would
+            # refuse them. Best-effort — a failed release leaves the seat to
+            # lapse on its liveness window; it must never un-complete a run.
+            with best_effort("Seat release after finalize", run_id=run.run_id):
+                factory.run_coordination.release_seat(token=coordination_token)
 
             # Emit RunSummary event with final metrics.  Map the new
             # terminal status onto the CLI exit-code taxonomy via
@@ -606,7 +634,9 @@ class RunLifecycleCoordinator:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
             _heartbeat.stop()
             with best_effort("Interrupted ceremony on graceful shutdown", run_id=run.run_id):
-                self._ceremony.emit_interrupted_ceremony(run.run_id, factory, shutdown_exc, run_start_time, token=coordination_token)
+                self._ceremony.emit_interrupted_ceremony(
+                    run.run_id, factory, shutdown_exc, run_start_time, coordination_token=coordination_token
+                )
                 # Seat hygiene: released only AFTER the INTERRUPTED finalize
                 # succeeded (same best_effort block), so a finalize failure
                 # leaves the seat to lapse rather than vacating a run whose
@@ -624,15 +654,17 @@ class RunLifecycleCoordinator:
                 if run_completed:
                     # Export failed after successful run — emit PARTIAL status.
                     # RunFinished was already emitted before the export attempt,
-                    # so only emit the EventBus RunSummary here.
+                    # so only emit the EventBus RunSummary here. The seat was
+                    # still held for the fenced export writes: vacate it now.
                     self._ceremony.emit_partial_summary(run_id=run.run_id, result=result, start_time=run_start_time)
+                    factory.run_coordination.release_seat(token=coordination_token)
                 else:
                     self._ceremony.emit_failed_ceremony(
                         run.run_id,
                         factory,
                         run_start_time,
                         failed_exc.partial_result,
-                        token=coordination_token,
+                        coordination_token=coordination_token,
                     )
                     # Seat hygiene: after the FAILED finalize succeeded.
                     factory.run_coordination.release_seat(token=coordination_token)
@@ -651,10 +683,12 @@ class RunLifecycleCoordinator:
                 if run_completed:
                     # Export failed after successful run — emit PARTIAL status.
                     # RunFinished was already emitted before the export attempt,
-                    # so only emit the EventBus RunSummary here.
+                    # so only emit the EventBus RunSummary here. The seat was
+                    # still held for the fenced export writes: vacate it now.
                     self._ceremony.emit_partial_summary(run_id=run.run_id, result=result, start_time=run_start_time)
+                    factory.run_coordination.release_seat(token=coordination_token)
                 else:
-                    self._ceremony.emit_failed_ceremony(run.run_id, factory, run_start_time, token=coordination_token)
+                    self._ceremony.emit_failed_ceremony(run.run_id, factory, run_start_time, coordination_token=coordination_token)
                     # Seat hygiene: after the FAILED finalize succeeded.
                     factory.run_coordination.release_seat(token=coordination_token)
             raise  # CRITICAL: Always re-raise - observability doesn't suppress errors

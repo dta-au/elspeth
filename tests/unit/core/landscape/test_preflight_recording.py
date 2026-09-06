@@ -13,6 +13,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import preflight_results_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.commencement import evaluate_commencement_gates
+from tests.fixtures.landscape import leader_coordination_token
 
 
 @pytest.fixture()
@@ -42,7 +43,7 @@ class TestRecordPreflightResults:
             gate_results=(),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         # Read back from database
         with db.connection() as conn:
@@ -75,7 +76,7 @@ class TestRecordPreflightResults:
             ),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -107,7 +108,7 @@ class TestRecordPreflightResults:
         )
         preflight = PreflightResult(dependency_runs=(), gate_results=tuple(gate_results))
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             row = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).one()
@@ -119,7 +120,7 @@ class TestRecordPreflightResults:
         fac, run_id, db = factory
         preflight = PreflightResult(dependency_runs=(), gate_results=())
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -139,7 +140,7 @@ class TestRecordPreflightResults:
             gate_results=(),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(preflight_results_table.select().where(preflight_results_table.c.run_id == run_id)).fetchall()
@@ -158,7 +159,7 @@ class TestRecordPreflightResults:
             gate_results=(CommencementGateResult(name="gate1", condition="True", result=True, context_snapshot={}),),
         )
 
-        fac.run_lifecycle.record_preflight_results(run_id=run_id, preflight=preflight)
+        fac.run_lifecycle.record_preflight_results(preflight, coordination_token=leader_coordination_token(fac, run_id))
 
         with db.connection() as conn:
             rows = conn.execute(
@@ -180,12 +181,12 @@ class TestRecordReadinessCheck:
         fac, run_id, db = factory
 
         fac.run_lifecycle.record_readiness_check(
-            run_id=run_id,
             name="rag_retrieval",
             collection="test-index",
             reachable=True,
             count=42,
             message="Collection 'test-index' has 42 documents",
+            coordination_token=leader_coordination_token(fac, run_id),
         )
 
         with db.connection() as conn:
@@ -206,12 +207,12 @@ class TestRecordReadinessCheck:
         fac, run_id, db = factory
 
         fac.run_lifecycle.record_readiness_check(
-            run_id=run_id,
             name="rag",
             collection="c",
             reachable=True,
             count=1,
             message="m",
+            coordination_token=leader_coordination_token(fac, run_id),
         )
 
         with db.connection() as conn:

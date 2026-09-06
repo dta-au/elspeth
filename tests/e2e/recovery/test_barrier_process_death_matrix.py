@@ -81,6 +81,7 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
 )
 from tests.fixtures.dag_scenario_corpus.plugins import CorpusBranchLossTransform
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_coordination_token
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
@@ -376,7 +377,9 @@ def _exercise_aggregation(tmp_path: Path) -> LandscapeDB:
     # supervisor's classification is represented through the production
     # lifecycle writer; barrier recovery itself begins only after this point.
     with LandscapeDB.from_url(database_url, create_tables=False) as killed_db:
-        RecorderFactory(killed_db).run_lifecycle.update_run_status(run_id, RunStatus.FAILED)
+        RecorderFactory(killed_db).run_lifecycle.update_run_status(
+            RunStatus.FAILED, coordination_token=leader_coordination_token(RecorderFactory(killed_db), run_id)
+        )
         with killed_db.write_connection() as conn:
             conn.execute(
                 update(run_coordination_table)

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
@@ -103,23 +104,26 @@ class _TelemetrySinkFake:
         self.payloads.append(payload)
 
 
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
+
+
 @dataclass
 class _LandscapeRecorderFake:
     readiness_checks: list[dict[str, Any]] = field(default_factory=list)
 
     def record_readiness_check(
         self,
-        run_id: str,
         *,
         name: str,
         collection: str,
         reachable: bool,
         count: int | None,
         message: str,
+        coordination_token: CoordinationToken,
     ) -> None:
         self.readiness_checks.append(
             {
-                "run_id": run_id,
+                "run_id": coordination_token.run_id,
                 "name": name,
                 "collection": collection,
                 "reachable": reachable,
@@ -133,6 +137,9 @@ class _LandscapeRecorderFake:
 class _LifecycleContextFake:
     run_id: str = "run-1"
     landscape: _LandscapeRecorderFake | None = field(default_factory=_LandscapeRecorderFake)
+    # Carried BY VALUE from the executor (ADR-048 §3); the fake models the
+    # real PluginContext forwarder, so the transform never sees the token.
+    coordination_token: CoordinationToken | None = field(default_factory=lambda: _LEADER_TOKEN)
     telemetry_emit: _TelemetrySinkFake = field(default_factory=_TelemetrySinkFake)
     rate_limit_registry: None = None
     node_id: str | None = None
@@ -140,6 +147,18 @@ class _LifecycleContextFake:
     payload_store: None = None
     concurrency_config: None = None
     shutdown_event: None = None
+
+    def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
+        if self.landscape is None or self.coordination_token is None:
+            raise FrameworkBugError("record_readiness_check() called without landscape or leader token")
+        self.landscape.record_readiness_check(
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            coordination_token=self.coordination_token,
+        )
 
 
 @dataclass

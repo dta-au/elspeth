@@ -31,6 +31,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.query_repository import QueryRepository
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 from elspeth.core.landscape.schema import run_workers_table
 from tests.fixtures.stores import MockPayloadStore
@@ -273,15 +274,31 @@ def insert_crashed_leader_seat(conn: Any, *, run_id: str) -> None:
     )
 
 
+def leader_token_for(db: LandscapeDB, run_id: str) -> CoordinationToken:
+    """The run's OWN leader token, read back from its ``run_coordination`` seat.
+
+    ADR-048 §5: this is the one sanctioned way for a test to obtain a token
+    for a run it did not mint through the production path. ``begin_run``
+    always mints the seat (self-minted worker identity at epoch 1); reading
+    it back proves the seat exists, so a threading defect that deposed the
+    writer fails the test instead of being papered over by a self-minted
+    token. The fence predicate is identity+epoch only — an expired seat still
+    passes its own leader's fence.
+    """
+
+    leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+    if leader is None:
+        raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
+    return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
+
+
 def leader_coordination_token(factory: RecorderFactory, run_id: str) -> CoordinationToken:
-    """The run's OWN leader token (the epoch-1 seat ``begin_run`` minted).
+    """The run's OWN leader token through the factory (see :func:`leader_token_for`).
 
     ADR-030 slice 3: the journal-first barrier intake's adoption verbs are
     leader-fenced with NO unfenced arm, so any test that drives barrier work
     through a directly-constructed ``RowProcessor`` must bind the coordination
-    token. ``begin_run`` always mints the seat (self-minted worker identity at
-    epoch 1); this helper reads it back. The fence predicate is identity+epoch
-    only — an expired seat still passes its own leader's fence.
+    token.
     """
 
     leader = factory.run_coordination.live_leader(run_id=run_id)
@@ -352,6 +369,9 @@ class RecorderSetup:
     factory: RecorderFactory
     run_id: str
     source_node_id: str
+    # The run's epoch-1 leader token, read back from the seat begin_run
+    # minted (ADR-048 §5) — what every fenced verb under test presents.
+    coordination_token: CoordinationToken
 
     @property
     def run_lifecycle(self) -> RunLifecycleRepository:
@@ -435,6 +455,7 @@ def make_recorder_with_run(
         factory=factory,
         run_id=run.run_id,
         source_node_id=node.node_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
 
     # Offensive programming: verify round-trip invariant.

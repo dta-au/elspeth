@@ -22,6 +22,7 @@ from elspeth.cli import (
 )
 from elspeth.contracts import CallType
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     AuditExportFormat,
@@ -1562,6 +1563,7 @@ def test_export_admission_precedes_pending_events_telemetry_and_signing_key_read
             audit_export_content_store=_AUDIT_CONTENT_STORE,  # type: ignore[arg-type]
             audit_export_content_store_resolver=_AUDIT_CONTENT_STORE_RESOLVER,
             worker_id="worker:run-1:test",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
         )
 
     factory.run_lifecycle.set_export_status.assert_not_called()
@@ -1612,6 +1614,7 @@ def test_prepared_export_binding_provenance_precedes_pending_status(monkeypatch:
             audit_export_content_store=_AUDIT_CONTENT_STORE,  # type: ignore[arg-type]
             audit_export_content_store_resolver=_AUDIT_CONTENT_STORE_RESOLVER,
             worker_id="worker:run-1:test",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
         )
 
     factory.run_lifecycle.set_export_status.assert_not_called()
@@ -1688,6 +1691,7 @@ def test_prepared_export_binding_rejects_claimed_mode_before_pending_or_receipt(
             audit_export_content_store=_AUDIT_CONTENT_STORE,  # type: ignore[arg-type]
             audit_export_content_store_resolver=_AUDIT_CONTENT_STORE_RESOLVER,
             worker_id="worker:run-1:test",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
         )
 
     factory.run_lifecycle.set_export_status.assert_not_called()

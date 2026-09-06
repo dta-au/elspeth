@@ -26,7 +26,7 @@ def test_diagnose_counts_quarantined_under_new_path() -> None:
             error_hash=f"{row_index:064x}",
         )
 
-    setup.run_lifecycle.complete_run(setup.run_id, RunStatus.COMPLETED)
+    setup.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=setup.coordination_token)
 
     result = diagnose(setup.db, setup.factory)
 

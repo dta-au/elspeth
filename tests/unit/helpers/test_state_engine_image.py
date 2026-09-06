@@ -9,7 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import pytest
-from tests.fixtures.landscape import landscape_database_now
+from tests.fixtures.landscape import landscape_database_now, leader_coordination_token
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
     STATE_ENGINE_TABLES,
@@ -78,12 +78,12 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         schema_config=_OBSERVED_SCHEMA,
     )
     factory.run_lifecycle.record_run_source(
-        run_id=run.run_id,
         source_node_id=source.node_id,
         source_name="primary",
         plugin_name="test_source",
         config_hash="source-config",
         lifecycle_state="loaded",
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
     row = factory.data_flow.create_row(
         run_id=run.run_id,

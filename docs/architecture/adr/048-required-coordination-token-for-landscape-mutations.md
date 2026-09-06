@@ -369,3 +369,41 @@ Task 8B (separate ticket) removes the epoch-one exception per §6.
 
 Estimate: 60–120 h as planned. D8.3 and D8.4 carry most of the caller surface
 (the 278 caller findings concentrate in the executors and the scheduler).
+
+### Amendments recorded while threading (D8THREAD, 2026-09-06)
+
+- **D8.8 helper admission, as implemented (ruling 2026-09-06).** Gate id 3 no
+  longer requires a raw-`Connection` DML helper to have exactly one fenced
+  caller. Cardinality was a proxy: the property the rule protects is that
+  every execution of the helper's DML sits inside a proven fenced transaction
+  on the fenced connection, and a shared ledger writer
+  (`record_coordination_event`, 9 callers; `SchedulerEventStore.record`, 15)
+  can only reach cardinality one by duplicating its row construction into
+  every owner. A helper is now admitted when it has at least one caller and
+  **every caller edge** is fenced: a fenced DML owner passing its exact fenced
+  connection inside its fenced `with`; a transitively admitted helper passing
+  its own exact `conn` (cycle-guarded); both endpoints inside one
+  authority-establishment helper graph, whose writes the establishment's
+  per-table counts already pin; or the one pinned unfenced-evidence edge,
+  `_record_best_effort_event -> record_coordination_event` (ADR-030 §A.2: the
+  refusal row is written by a writer the fence has just proven holds no
+  authority), admitted only in its exact shape. Zero callers, one unfenced
+  caller among many, a cyclic chain, a foreign run subject and two call sites
+  stay red; the helper-side checks now run for every helper.
+- **Export seat.** `RunCoordinationRepository.acquire_export_leadership(run_id,
+  worker_id, window_seconds)` is the authority for re-driving a finalized
+  run's audit export (§4). It is a separate verb from the resume takeover:
+  admissible only on a terminal run whose seat is vacant or expired, it never
+  touches `runs.status`, mints epoch+1 with the same worker row and
+  `worker_register` / `leader_acquire` events, and is vacated by
+  `release_seat`. Its write set is the fourth pinned establishment entry.
+- **Web tier.** The orphan finaliser takes a dead leader's seat through the
+  resume takeover (`entry_point="orphan-finalize"`) before stamping
+  INTERRUPTED; a live seat means the run is not orphaned and reconciliation
+  is deferred to the next sweep.
+- **Plugin contexts.** A plugin never presents a token. `PluginContext` carries
+  the executor's token by value; the gate admits `ctx.<forwarder>()` on a
+  parameter annotated with an owned context type, and the context's own
+  forwarding call only when the attribute is bound solely in `__init__` from
+  an exact token parameter and the call sits below a fail-closed `is None`
+  guard.

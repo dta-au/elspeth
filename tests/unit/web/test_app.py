@@ -81,6 +81,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from elspeth.web.sso_wiring import SsoWiring
+from tests.fixtures.landscape import expire_leader_seat
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -1800,6 +1801,9 @@ class TestLifespanShutdown:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            # The dead leader's seat has lapsed: the orphan finaliser takes it
+            # through the takeover CAS before stamping INTERRUPTED (ADR-048 §4).
+            expire_leader_seat(db, landscape_run_id)
 
         with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
@@ -1949,6 +1953,7 @@ class TestLifespanShutdown:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            expire_leader_seat(db, landscape_run_id)
         await service.cancel_all_orphaned_run_records(reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}")
         service_type = type(service)
         original_mark = service_type.mark_landscape_reconciliation_outcomes
@@ -2895,6 +2900,7 @@ class TestOrphanLandscapeReconciliation:
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
             )
+            expire_leader_seat(db, landscape_run_id)
 
         cancelled_run = RunRecord(
             id=uuid4(),
@@ -2925,6 +2931,51 @@ class TestOrphanLandscapeReconciliation:
         assert run is not None
         assert run.status == RunStatus.INTERRUPTED
         assert run.completed_at is not None
+
+    def test_live_leader_seat_defers_reconciliation_and_leaves_the_run_running(self, tmp_path: Path) -> None:
+        """ADR-048 §4: a run whose seat is still live is NOT orphaned — no write, no outcome, retried next sweep."""
+        settings = _settings(tmp_path)
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        (settings.data_dir / "runs").mkdir(exist_ok=True)
+        landscape_url = settings.get_landscape_url()
+        landscape_run_id = "lscp-live-leader"
+        with LandscapeDB.from_url(landscape_url) as db:
+            RecorderFactory(db).run_lifecycle.begin_run(
+                config={},
+                canonical_version="v1",
+                run_id=landscape_run_id,
+                openrouter_catalog_sha256="0" * 64,
+                openrouter_catalog_source="bundled",
+            )
+        cancelled_run = RunRecord(
+            id=uuid4(),
+            session_id=uuid4(),
+            state_id=uuid4(),
+            status="cancelled",
+            started_at=datetime.now(tz=UTC),
+            finished_at=datetime.now(tz=UTC),
+            rows_processed=0,
+            rows_succeeded=0,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+            error="Orphaned by server restart - no active process",
+            landscape_run_id=landscape_run_id,
+            pipeline_yaml=None,
+        )
+
+        with capture_logs() as logs:
+            complete, absent = app_module._finalize_orphaned_landscape_runs(landscape_url, [cancelled_run])
+
+        assert complete == frozenset()
+        assert absent == frozenset()
+        assert any(entry.get("event") == "orphan_landscape_run_leader_live" for entry in logs), logs
+        with LandscapeDB.from_url(landscape_url) as db:
+            run = RecorderFactory(db).run_lifecycle.get_run(landscape_run_id)
+        assert run is not None
+        assert run.status == RunStatus.RUNNING
+        assert run.completed_at is None
 
     def test_missing_landscape_row_returns_absent_outcome_without_identifier_log(self, tmp_path: Path) -> None:
         settings = _settings(tmp_path)

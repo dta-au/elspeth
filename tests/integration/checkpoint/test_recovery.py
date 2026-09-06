@@ -27,7 +27,7 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import checkpoint_draft
 
 
@@ -629,7 +629,6 @@ class TestResumeCheckpointCleanup:
 
         # Call delete_checkpoints() via _checkpoints coordinator (this is what Bug #8 fix added to early-exit path)
         from elspeth.engine.orchestrator import Orchestrator
-        from tests.fixtures.landscape import leader_coordination_token
 
         orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr)
         # Checkpoint deletes fail closed without the run's leader token
@@ -725,7 +724,7 @@ class TestCanResumeErrorHandling:
         factory.data_flow.create_token(row_id=row.row_id)
 
         # Mark run as failed
-        factory.run_lifecycle.update_run_status(run.run_id, status=RunStatus.FAILED)
+        factory.run_lifecycle.update_run_status(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Create checkpoint
         _create_checkpoint(

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import bindparam, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import FrameworkBugError, Operation, OperationType
@@ -225,24 +225,40 @@ class OperationRepository:
             .order_by(operations_table.c.operation_id)
             .with_for_update()
         ).fetchall()
-        failed: list[Operation] = []
-        for candidate in candidates:
-            result = conn.execute(
-                operations_table.update()
-                .where(operations_table.c.operation_id == candidate.operation_id)
-                .where(operations_table.c.status == "open")
-                .values(
-                    status="failed",
-                    completed_at=completed_at,
-                    duration_ms=_elapsed_milliseconds(started_at=candidate.started_at, completed_at=completed_at),
-                    error_message=error_message,
-                )
+        if not candidates:
+            return ()
+        # ONE statement executed once over every locked row (ADR-048: a DML
+        # construction executes exactly once inside its fence, never per
+        # iteration); the per-row duration rides in as a bound parameter.
+        rows = [
+            {
+                "failed_operation_id": candidate.operation_id,
+                "failed_duration_ms": _elapsed_milliseconds(started_at=candidate.started_at, completed_at=completed_at),
+            }
+            for candidate in candidates
+        ]
+        result = conn.execute(
+            operations_table.update()
+            .where(operations_table.c.operation_id == bindparam("failed_operation_id"))
+            .where(operations_table.c.status == "open")
+            .values(
+                status="failed",
+                completed_at=completed_at,
+                duration_ms=bindparam("failed_duration_ms"),
+                error_message=error_message,
+            ),
+            rows,
+        )
+        if result.rowcount != len(rows):
+            raise AuditIntegrityError(
+                f"effect-operation finalization lost locked open rows: expected {len(rows)} updates, affected {result.rowcount}"
             )
-            if result.rowcount != 1:
-                raise AuditIntegrityError(f"effect-operation finalization lost the locked open row {candidate.operation_id!r}")
-            updated = conn.execute(select(operations_table).where(operations_table.c.operation_id == candidate.operation_id)).one()
-            failed.append(self._operation_loader.load(updated))
-        return tuple(failed)
+        updated = conn.execute(
+            select(operations_table)
+            .where(operations_table.c.operation_id.in_([candidate.operation_id for candidate in candidates]))
+            .order_by(operations_table.c.operation_id)
+        ).fetchall()
+        return tuple(self._operation_loader.load(row) for row in updated)
 
     def get_operation(self, operation_id: str) -> Operation | None:
         """Get an operation by ID.

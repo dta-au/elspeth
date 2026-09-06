@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
@@ -228,7 +229,9 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        completed_run = factory.run_lifecycle.finalize_run(run.run_id, status=RunStatus.COMPLETED)
+        completed_run = factory.run_lifecycle.finalize_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         assert completed_run.status == RunStatus.COMPLETED
         assert completed_run.completed_at is not None
@@ -264,7 +267,9 @@ class TestReproducibilityGradeComputation:
         )
 
         # Finalize with REPLAY_REPRODUCIBLE grade
-        completed_run = factory.run_lifecycle.finalize_run(run.run_id, status=RunStatus.COMPLETED)
+        completed_run = factory.run_lifecycle.finalize_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         assert completed_run.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
 
         # Simulate a purged response: insert a call with response_hash set but
@@ -305,7 +310,9 @@ class TestReproducibilityGradeComputation:
         )
 
         # Finalize with FULL_REPRODUCIBLE grade
-        completed_run = factory.run_lifecycle.finalize_run(run.run_id, status=RunStatus.COMPLETED)
+        completed_run = factory.run_lifecycle.finalize_run(
+            status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         assert completed_run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
         # Simulate purge - grade should NOT degrade
@@ -371,7 +378,7 @@ class TestReproducibilityGradeComputation:
         )
 
         # Finalize with REPLAY_REPRODUCIBLE grade
-        factory.run_lifecycle.finalize_run(run.run_id, status=RunStatus.COMPLETED)
+        factory.run_lifecycle.finalize_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Insert a purged call record — evidence that a replay-critical payload was deleted
         _insert_purged_call(db, run.run_id, node_id=node.node_id)

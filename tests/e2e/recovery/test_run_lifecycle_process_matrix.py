@@ -12,7 +12,6 @@ from sqlalchemy import select
 
 from elspeth.contracts import FrameworkBugError, NodeType, RunStatus
 from elspeth.contracts.checkpoint import CheckpointDraft, ResumePoint
-from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError
 from elspeth.contracts.sink_effects import SinkEffectMemberCandidate
@@ -23,7 +22,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import RunSourceLifecycleState, operations_table, run_sources_table, runs_table
 from elspeth.engine.clock import MockClock
 from tests.e2e.recovery.harness import _SOURCE_ROWS, _T0, _build_pipeline, _run_to_interrupted_checkpoint, spawn_database_process_at_seam
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.helpers.state_engine import capture_state_engine_image
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
@@ -43,11 +42,11 @@ def _finalize_in_child(
     leader_epoch: int,
 ) -> None:
     factory = RecorderFactory(db)
-    factory.run_lifecycle.finalize_run(
-        run_id,
-        RunStatus(status_value),
-        token=CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=leader_epoch),
-    )
+    # ADR-048 §5: read the seat back instead of re-minting from the arguments,
+    # and pin that it still names the leader the parent handed over.
+    coordination_token = leader_coordination_token(factory, run_id)
+    assert (coordination_token.worker_id, coordination_token.leader_epoch) == (worker_id, leader_epoch)
+    factory.run_lifecycle.finalize_run(RunStatus(status_value), coordination_token=coordination_token)
 
 
 def _build_open_effect_run(
@@ -80,12 +79,12 @@ def _build_open_effect_run(
             plugin_name="sink",
         )
         factory.run_lifecycle.record_run_source(
-            run_id=run_id,
             source_node_id=source_id,
             source_name="primary",
             plugin_name="source",
             config_hash="c" * 64,
             lifecycle_state=source_state,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         if with_checkpoint:
             CheckpointManager(db).create_checkpoint(
@@ -248,7 +247,7 @@ def test_public_resume_refuses_non_resumable_failed_effect_without_reopening_or_
         item for item in crashed.factory.execution.get_operations_for_run(crashed.run_id) if item.sink_effect_id == effect.effect_id
     )
 
-    crashed.factory.run_lifecycle.finalize_run(crashed.run_id, RunStatus.FAILED, token=leader_token)
+    crashed.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=leader_token)
     with crashed.db.engine.connect() as conn:
         run_before = dict(conn.execute(select(runs_table).where(runs_table.c.run_id == crashed.run_id)).mappings().one())
         operation_before = dict(

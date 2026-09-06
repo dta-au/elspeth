@@ -17,12 +17,17 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.events import FieldResolutionApplied
 from elspeth.contracts.types import NodeID
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import RunSourceLifecycleState
 from elspeth.engine.orchestrator.ceremony import RunCeremony
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
+
+# The recorder forwards the token BY VALUE (ADR-048 §3); it is the test's subject, so a
+# direct construction is honest here — nothing below reads a seat.
+_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
 
 
 def _make_source(*, field_resolution: tuple[dict[str, str], str | None] | None = None) -> SimpleNamespace:
@@ -41,7 +46,7 @@ class TestRecordFieldResolution:
         recorder = SourceLifecycleRecorder(ceremony=ceremony)
         factory = MagicMock(spec=RecorderFactory)
 
-        result = recorder.record_field_resolution(factory, "run-1", active_source=_make_source(field_resolution=None))
+        result = recorder.record_field_resolution(factory, active_source=_make_source(field_resolution=None), coordination_token=_TOKEN)
 
         assert result is None
         factory.run_lifecycle.record_source_field_resolution.assert_not_called()
@@ -55,9 +60,9 @@ class TestRecordFieldResolution:
 
         result = recorder.record_field_resolution(
             factory,
-            "run-1",
             active_source=_make_source(field_resolution=snapshot),
             previously_recorded=snapshot,
+            coordination_token=_TOKEN,
         )
 
         assert result == snapshot
@@ -72,16 +77,16 @@ class TestRecordFieldResolution:
 
         result = recorder.record_field_resolution(
             factory,
-            "run-1",
             active_source=_make_source(field_resolution=(union, "v1")),
             previously_recorded=({"id": "id"}, "v1"),
+            coordination_token=_TOKEN,
         )
 
         assert result == (union, "v1")
         factory.run_lifecycle.record_source_field_resolution.assert_called_once_with(
-            run_id="run-1",
             resolution_mapping=union,
             normalization_version="v1",
+            coordination_token=_TOKEN,
         )
         (event,), _ = ceremony.emit_telemetry.call_args
         assert isinstance(event, FieldResolutionApplied)
@@ -97,15 +102,16 @@ class TestRecordRunSourceLifecycle:
 
         recorder.record_run_source_lifecycle(
             factory,
-            "run-1",
             NodeID("source-node"),
             "rows",
             source,
             RunSourceLifecycleState.EXHAUSTED,
+            coordination_token=_TOKEN,
         )
 
         kwargs = factory.run_lifecycle.record_run_source.call_args.kwargs
-        assert kwargs["run_id"] == "run-1"
+        assert kwargs["coordination_token"] is _TOKEN
+        assert "run_id" not in kwargs
         assert kwargs["source_node_id"] == NodeID("source-node")
         assert kwargs["field_resolution_mapping"] == {"id": "id"}
         assert kwargs["normalization_version"] == "v1"
@@ -118,11 +124,11 @@ class TestRecordRunSourceLifecycle:
 
         recorder.record_run_source_lifecycle(
             factory,
-            "run-1",
             NodeID("source-node"),
             "rows",
             source,
             RunSourceLifecycleState.INTERRUPTED,
+            coordination_token=_TOKEN,
         )
 
         kwargs = factory.run_lifecycle.record_run_source.call_args.kwargs

@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from tests.fixtures.landscape import leader_coordination_token
+
 runner = CliRunner()
 
 
@@ -286,7 +288,7 @@ class TestExplainPassphraseResolution:
         db = LandscapeDB.from_url(f"sqlite:///{db_path}")
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
-        factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         db.close()
 
         # Create a malformed YAML settings file
@@ -328,7 +330,7 @@ class TestExplainPassphraseResolution:
         db = LandscapeDB.from_url(f"sqlite:///{db_path}")
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
-        factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         db.close()
 
         result = runner.invoke(
@@ -368,7 +370,7 @@ class TestExplainSecretLoading:
         db = LandscapeDB.from_url(f"sqlite:///{db_path}")
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
-        factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         db.close()
 
         # Create a valid settings file

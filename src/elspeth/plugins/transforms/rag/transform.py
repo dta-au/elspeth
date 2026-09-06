@@ -56,7 +56,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a1b9824abb66dd99"
+    source_file_hash: str | None = "sha256:0996eb17570dff7a"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -466,10 +466,15 @@ class RAGRetrievalTransform(BaseTransform):
         count: int | None,
         message: str,
     ) -> None:
-        """Persist retrieval readiness facts when the audit writer is available."""
-        if ctx.landscape is not None:
-            ctx.landscape.record_readiness_check(
-                run_id=ctx.run_id,
+        """Persist retrieval readiness facts when the context can write them.
+
+        The write goes through the context, which forwards the run's leader
+        token by value (ADR-048 §3); a plugin never holds a token itself. A
+        context with no audit writer or no token (a follower, a probe) records
+        nothing — the same skip the writer-less arm has always taken.
+        """
+        if ctx.landscape is not None and ctx.coordination_token is not None:
+            ctx.record_readiness_check(
                 name=self.name,
                 collection=collection,
                 reachable=reachable,

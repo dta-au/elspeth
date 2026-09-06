@@ -680,7 +680,7 @@ class TestTwoResumesSameRunId:
         )
         assert claimed is not None and claimed.token_id == crashed_token and claimed.attempt == 2
         crashed.repo.mark_terminal(work_item_id=claimed.work_item_id, now=clock.now_utc(), expected_lease_owner=winner_id)
-        crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=winner_token)
+        crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=winner_token)
         coord.release_seat(token=winner_token)
 
         with crashed.db.engine.connect() as conn:
@@ -1417,7 +1417,7 @@ class TestTwoResumesSameRunId:
         assert follower_row_departed["status"] == "departed"
 
         # Now finalize: complete_run with §D quiescence (all items TERMINAL).
-        crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=leader_token)
+        crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_token)
 
         # Exactly one finalize event with status=completed.
         finalize_events = _coordination_events(crashed.db, crashed.run_id, "finalize")

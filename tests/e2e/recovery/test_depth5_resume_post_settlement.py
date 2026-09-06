@@ -101,6 +101,7 @@ from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_f
 from elspeth.plugins.transforms.llm.model_catalog import read_openrouter_catalog_snapshot_id
 from tests.e2e.recovery.harness import spawn_database_process_with_pause
 from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
+from tests.fixtures.landscape import leader_coordination_token
 from tests.integration.pipeline.test_depth5_group_unwrap import DEPTH, _nested_settings, _substitute_paths
 
 _PROCESS_TIMEOUT_SECONDS = 60.0
@@ -385,7 +386,9 @@ def test_depth5_process_death_after_settlement_resumes_to_the_baseline_outcome(
     # seat and worker heartbeats are expired so the resume takeover can seize.
     expired_at = datetime.now(UTC) - timedelta(seconds=1)
     with LandscapeDB.from_url(database_url, create_tables=False) as killed_db:
-        RecorderFactory(killed_db).run_lifecycle.update_run_status(run_id, RunStatus.FAILED)
+        RecorderFactory(killed_db).run_lifecycle.update_run_status(
+            RunStatus.FAILED, coordination_token=leader_coordination_token(RecorderFactory(killed_db), run_id)
+        )
         with killed_db.write_connection() as conn:
             conn.execute(
                 update(run_coordination_table)

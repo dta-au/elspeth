@@ -25,6 +25,7 @@ from elspeth.contracts import (
     SinkEffectRuntimeBinding,
 )
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.events import (
     PhaseCompleted,
     PhaseError,
@@ -178,21 +179,21 @@ class TestExportFailurePartialRunSemantics:
 
         def record_export_status(
             self: RunLifecycleRepository,
-            run_id: str,
             status: ExportStatus,
             *,
             error: str | None = None,
             export_format: str | None = None,
             export_sink: str | None = None,
+            coordination_token: CoordinationToken,
         ) -> None:
-            export_status_calls.append((run_id, status))
+            export_status_calls.append((coordination_token.run_id, status))
             original_set_export_status(
                 self,
-                run_id,
                 status,
                 error=error,
                 export_format=export_format,
                 export_sink=export_sink,
+                coordination_token=coordination_token,
             )
 
         with (
@@ -282,21 +283,21 @@ class TestExportFailurePartialRunSemantics:
 
         def record_export_status(
             self: RunLifecycleRepository,
-            run_id: str,
             status: ExportStatus,
             *,
             error: str | None = None,
             export_format: str | None = None,
             export_sink: str | None = None,
+            coordination_token: CoordinationToken,
         ) -> None:
-            export_status_calls.append((run_id, status))
+            export_status_calls.append((coordination_token.run_id, status))
             original_set_export_status(
                 self,
-                run_id,
                 status,
                 error=error,
                 export_format=export_format,
                 export_sink=export_sink,
+                coordination_token=coordination_token,
             )
 
         with (

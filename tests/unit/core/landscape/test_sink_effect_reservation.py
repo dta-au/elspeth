@@ -138,9 +138,8 @@ def test_pipeline_reservation_refuses_terminal_run_before_effect_mutation(
     db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory, 1)
     factory.run_lifecycle.finalize_run(
-        run_id,
         RunStatus.FAILED,
-        token=leader_coordination_token(factory, run_id),
+        coordination_token=leader_coordination_token(factory, run_id),
     )
 
     with pytest.raises(ValueError, match="terminal run status"):

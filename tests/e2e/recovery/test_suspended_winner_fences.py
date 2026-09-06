@@ -260,7 +260,7 @@ class TestSuspendedWinnerFences:
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=token_old)
+            crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=token_old)
         assert not isinstance(exc_info.value, AuditIntegrityError)
 
         status, completed_at = _run_status_and_completed_at(crashed.db, crashed.run_id)
@@ -276,7 +276,7 @@ class TestSuspendedWinnerFences:
 
         # Positive control: the current leader finalizes; expiry extends;
         # the seeded follower is departed by the §D hygiene arm.
-        crashed.factory.run_lifecycle.complete_run(crashed.run_id, RunStatus.COMPLETED, token=current)
+        crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=current)
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
         assert status == RunStatus.COMPLETED.value
         _assert_seat_extended(crashed, seat_before)
@@ -292,7 +292,7 @@ class TestSuspendedWinnerFences:
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
-            crashed.factory.run_lifecycle.update_run_status(crashed.run_id, RunStatus.FAILED, token=token_old)
+            crashed.factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=token_old)
         assert not isinstance(exc_info.value, AuditIntegrityError)
 
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
@@ -300,7 +300,7 @@ class TestSuspendedWinnerFences:
         _assert_refusal_contract(crashed, verb="update_run_status", stale_epoch=token_old.leader_epoch, seat_before=seat_before)
 
         # Positive control.
-        crashed.factory.run_lifecycle.update_run_status(crashed.run_id, RunStatus.FAILED, token=current)
+        crashed.factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=current)
         status, _ = _run_status_and_completed_at(crashed.db, crashed.run_id)
         assert status == RunStatus.FAILED.value
         _assert_seat_extended(crashed, seat_before)

@@ -28,6 +28,7 @@ from elspeth.contracts import (
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.config.runtime import RuntimeTelemetryConfig
+from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import ExecutionError
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -716,14 +717,19 @@ def run_bedrock_guardrails_live(
             ) as database:
                 repositories = RecorderFactory.writable(database)
                 run_id = str(uuid.uuid4())
+                worker_id = mint_worker_id(run_id)
                 run = repositories.run_lifecycle.begin_run(
                     config={"acceptance": "bedrock-guardrails"},
                     canonical_version="v1",
                     run_id=run_id,
                     openrouter_catalog_sha256=catalog_sha,
                     openrouter_catalog_source=catalog_source,
+                    leader_worker_id=worker_id,
                     web_plugin_policy_evidence=policy_evidence,
                 )
+                # The epoch-1 seat begin_run minted for this worker (ADR-030
+                # uniformity rule); every Landscape write below presents it.
+                coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
                 node = repositories.data_flow.register_node(
                     run.run_id,
                     "aws_bedrock_guardrails_acceptance",
@@ -790,7 +796,7 @@ def run_bedrock_guardrails_live(
                         TerminalPath.UNROUTED,
                         error_hash=error_hash,
                     )
-                    repositories.run_lifecycle.complete_run(run.run_id, RunStatus.FAILED)
+                    repositories.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=coordination_token)
 
                 try:
                     guardrail_result = verify_bedrock_guardrails(
@@ -841,7 +847,7 @@ def run_bedrock_guardrails_live(
                     TerminalPath.DEFAULT_FLOW,
                     sink_name="acceptance",
                 )
-                repositories.run_lifecycle.complete_run(run.run_id, RunStatus.COMPLETED)
+                repositories.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=coordination_token)
         except AcceptanceCheckError:
             raise
         except Exception:

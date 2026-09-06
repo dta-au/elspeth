@@ -66,6 +66,7 @@ from elspeth.engine.spans import SpanFactory
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.core.events import EventBusProtocol
 
 
@@ -152,6 +153,7 @@ class SourceIterationDriver:
             shutdown_event=source_ctx.shutdown_event,
             contract=source_ctx.contract,
             telemetry_emit=source_ctx.telemetry_emit,
+            coordination_token=source_ctx.coordination_token,
         )
 
     def _process_idle_timeout_flushes(
@@ -342,6 +344,7 @@ class SourceIterationDriver:
         interrupted_by_shutdown: bool,
         flush_end_of_input: bool,
         active_source: SourceProtocol,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Post-loop work after source iteration completes or is interrupted.
 
@@ -389,22 +392,22 @@ class SourceIterationDriver:
         # fixed-header sources see no second write or telemetry event.
         self._lifecycle_recorder.record_field_resolution(
             factory,
-            run_id,
             active_source=active_source,
             previously_recorded=recorded_field_resolution,
+            coordination_token=coordination_token,
         )
 
         if not schema_contract_recorded:
-            record_schema_contract(factory, run_id, source_id, ctx, active_source=active_source)
+            record_schema_contract(factory, run_id, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
 
         if source_exhausted and not interrupted_by_shutdown:
             self._lifecycle_recorder.record_run_source_lifecycle(
                 factory,
-                run_id,
                 source_id,
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.EXHAUSTED,
+                coordination_token=coordination_token,
             )
 
         if not interrupted_by_shutdown and flush_end_of_input:
@@ -489,6 +492,7 @@ class SourceIterationDriver:
         shutdown_event: threading.Event | None = None,
         flush_end_of_input: bool = True,
         check_coordination_latch: Callable[[], None] | None = None,
+        coordination_token: CoordinationToken,
     ) -> LoopResult:
         """Run the main processing loop: source iteration, quarantine, transform, flush.
 
@@ -549,11 +553,11 @@ class SourceIterationDriver:
             )
             self._lifecycle_recorder.record_run_source_lifecycle(
                 factory,
-                run_id,
                 source_id,
                 active_source_name,
                 active_source,
                 RunSourceLifecycleState.LOADING,
+                coordination_token=coordination_token,
             )
 
             source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source)
@@ -659,7 +663,7 @@ class SourceIterationDriver:
                         if not field_resolution_recorded:
                             field_resolution_recorded = True
                             recorded_field_resolution = self._lifecycle_recorder.record_field_resolution(
-                                factory, run_id, active_source=active_source
+                                factory, active_source=active_source, coordination_token=coordination_token
                             )
 
                         # Quarantine path — route directly to sink, skip normal processing
@@ -738,6 +742,7 @@ class SourceIterationDriver:
                             source_id,
                             ctx,
                             active_source=active_source,
+                            coordination_token=coordination_token,
                         ):
                             schema_contract_recorded = True
 
@@ -829,24 +834,25 @@ class SourceIterationDriver:
                         interrupted_by_shutdown=interrupted_by_shutdown,
                         flush_end_of_input=flush_end_of_input,
                         active_source=active_source,
+                        coordination_token=coordination_token,
                     )
                     if interrupted_by_shutdown:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
-                            run_id,
                             source_id,
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.INTERRUPTED,
+                            coordination_token=coordination_token,
                         )
                     elif not source_exhausted:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
-                            run_id,
                             source_id,
                             active_source_name,
                             active_source,
                             RunSourceLifecycleState.LOADED,
+                            coordination_token=coordination_token,
                         )
 
                 except Exception as e:

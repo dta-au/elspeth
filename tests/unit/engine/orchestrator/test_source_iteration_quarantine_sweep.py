@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol
 from elspeth.contracts.types import CoalesceName, NodeID
@@ -39,6 +40,8 @@ from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_source_row, make_source_row_quarantined
+
+_TOKEN = CoordinationToken(run_id="run-quarantine-sweep", worker_id="worker:run-quarantine-sweep:test", leader_epoch=1)
 
 
 @contextmanager
@@ -114,6 +117,7 @@ def _drive_quarantined_stream(
             active_source_name="fake",
             active_source=source,
             flush_end_of_input=False,
+            coordination_token=_TOKEN,
         )
 
     return driver
@@ -219,6 +223,7 @@ def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_f
             active_source=source,
             shutdown_event=shutdown_event,
             flush_end_of_input=True,
+            coordination_token=_TOKEN,
         )
 
     assert result.interrupted is True

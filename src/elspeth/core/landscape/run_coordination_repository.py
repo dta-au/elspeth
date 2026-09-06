@@ -48,8 +48,9 @@ import hashlib
 import logging
 import os
 import socket
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
@@ -109,6 +110,8 @@ _IMMUTABLE_SUCCESS_RUN_STATUSES = (
     RunStatus.COMPLETED_WITH_FAILURES.value,
     RunStatus.EMPTY.value,
 )
+# Every terminal status: the only runs whose seat an audit-export re-drive may take (ADR-048 §4).
+_EXPORT_SEAT_RUN_STATUSES = (*_TAKEOVER_FLIPPABLE_RUN_STATUSES, *_IMMUTABLE_SUCCESS_RUN_STATUSES)
 
 
 class _ReleaseMembershipMiss(Exception):
@@ -147,6 +150,36 @@ def record_coordination_event(
     ``recorded_at`` is forensic wall-clock only.
     """
     context_json = canonical_json({} if context is None else dict(context))
+    conn.execute(
+        insert(run_coordination_events_table).values(
+            event_id=_coordination_event_id(
+                run_id=run_id,
+                event_type=event_type,
+                worker_id=worker_id,
+                leader_epoch=leader_epoch,
+                recorded_at=recorded_at,
+                context_json=context_json,
+            ),
+            run_id=run_id,
+            event_type=event_type,
+            worker_id=worker_id,
+            leader_epoch=leader_epoch,
+            recorded_at=recorded_at,
+            context_json=context_json,
+        )
+    )
+
+
+def _coordination_event_id(
+    *,
+    run_id: str,
+    event_type: str,
+    worker_id: str,
+    leader_epoch: int | None,
+    recorded_at: datetime,
+    context_json: str,
+) -> str:
+    """The ledger row's ``event_id``: ``sha256(canonical_json(identity))``, one recipe for every writer."""
     identity = canonical_json(
         {
             "context_json": context_json,
@@ -157,17 +190,55 @@ def record_coordination_event(
             "worker_id": worker_id,
         }
     )
-    conn.execute(
-        insert(run_coordination_events_table).values(
-            event_id=hashlib.sha256(identity.encode()).hexdigest(),
-            run_id=run_id,
-            event_type=event_type,
-            worker_id=worker_id,
-            leader_epoch=leader_epoch,
-            recorded_at=recorded_at,
-            context_json=context_json,
-        )
-    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinationEventRow:
+    """One ledger row for :func:`record_coordination_events` (same identity recipe as the single-row writer).
+
+    ``context`` is the small string-valued label set the lifecycle writers
+    attach (``{"reason": ...}``, ``{"status": ...}``); it is canonicalised
+    exactly like the single-row writer's context.
+    """
+
+    event_type: str
+    worker_id: str
+    leader_epoch: int | None
+    recorded_at: datetime
+    context: Mapping[str, str] | None = None
+
+
+def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
+    """Append N ledger rows in ONE statement inside the caller's transaction.
+
+    ADR-048: a DML construction executes exactly once inside its fence, never
+    per iteration — a fenced owner that must record one event per follower
+    builds the rows and calls this once. Identity, ``event_id`` and ordering
+    are exactly :func:`record_coordination_event`'s (:func:`_coordination_event_id`).
+    """
+    if not events:
+        return
+    rows = [
+        {
+            "event_id": _coordination_event_id(
+                run_id=run_id,
+                event_type=event.event_type,
+                worker_id=event.worker_id,
+                leader_epoch=event.leader_epoch,
+                recorded_at=event.recorded_at,
+                context_json=context_json,
+            ),
+            "run_id": run_id,
+            "event_type": event.event_type,
+            "worker_id": event.worker_id,
+            "leader_epoch": event.leader_epoch,
+            "recorded_at": event.recorded_at,
+            "context_json": context_json,
+        }
+        for event, context_json in ((event, canonical_json({} if event.context is None else dict(event.context))) for event in events)
+    ]
+    conn.execute(insert(run_coordination_events_table), rows)
 
 
 class BestEffortEventOutcome(Enum):
@@ -601,6 +672,139 @@ class RunCoordinationRepository:
             leader_epoch=new_epoch,
             recorded_at=database_now,
             context={"entry_point": entry_point, "deposed_leader_worker_id": prior_worker},
+        )
+        return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+
+    def acquire_export_leadership(
+        self,
+        *,
+        run_id: str,
+        worker_id: str,
+        window_seconds: float,
+    ) -> CoordinationToken:
+        """Take the seat of a FINALIZED run to re-drive its audit export (ADR-048 §4).
+
+        The resume takeover (:meth:`acquire_run_leadership`) is the wrong
+        instrument for an export: it refuses a terminally-successful run and
+        flips FAILED/INTERRUPTED back to RUNNING. This verb is the other arm:
+        admissible ONLY on a terminal run whose seat is vacant or expired,
+        NEVER touches ``runs.status``, and otherwise mints exactly what the
+        takeover mints — epoch+1, the worker's ``run_workers`` row, the
+        ``worker_register`` / ``leader_acquire`` events (and the deposed
+        worker's eviction when a dead leader still sits there). The caller
+        vacates the seat with :meth:`release_seat` when the export is done.
+        """
+        try:
+            with begin_write(self._engine) as conn:
+                return self._acquire_export_leadership_on(
+                    conn,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    window_seconds=window_seconds,
+                )
+        except OperationalError as exc:
+            if not _is_database_locked(exc):
+                raise
+            raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+
+    def _acquire_export_leadership_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        worker_id: str,
+        window_seconds: float,
+    ) -> CoordinationToken:
+        database_now = read_landscape_transaction_time(conn)
+        seat = conn.execute(
+            select(
+                run_coordination_table.c.leader_worker_id,
+                run_coordination_table.c.leader_epoch,
+                run_coordination_table.c.leader_heartbeat_expires_at,
+            ).where(run_coordination_table.c.run_id == run_id)
+        ).one_or_none()
+        if seat is None:
+            raise AuditIntegrityError(
+                f"Run {run_id!r} has no run_coordination seat row; at schema epoch 21 "
+                "begin_run creates it atomically with the run. The audit DB is corrupt "
+                "or was written by incompatible code."
+            )
+        run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+        if run_status not in _EXPORT_SEAT_RUN_STATUSES:
+            raise AuditIntegrityError(
+                f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. "
+                "An audit export is re-driven only for a finalized run; a RUNNING run is its leader's."
+            )
+        prior_worker: str | None = seat.leader_worker_id
+        expires = database_now + timedelta(seconds=window_seconds)
+        cas = conn.execute(
+            update(run_coordination_table)
+            .where(
+                run_coordination_table.c.run_id == run_id,
+                (run_coordination_table.c.leader_worker_id.is_(None))
+                | (run_coordination_table.c.leader_heartbeat_expires_at < database_now),
+            )
+            .values(
+                leader_worker_id=worker_id,
+                leader_epoch=run_coordination_table.c.leader_epoch + 1,
+                leader_heartbeat_expires_at=expires,
+                updated_at=database_now,
+            )
+        )
+        if cas.rowcount != 1:
+            from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+            held_expiry = seat.leader_heartbeat_expires_at
+            expiry_text = "unknown" if held_expiry is None else _utc(held_expiry).isoformat()
+            raise NonResumableRunError(
+                run_id,
+                f"run leadership is held by {prior_worker!r} (seat expires {expiry_text})",
+            )
+        new_epoch = int(seat.leader_epoch) + 1
+        if prior_worker is not None and prior_worker != worker_id:
+            evicted = conn.execute(
+                update(run_workers_table)
+                .where(
+                    run_workers_table.c.worker_id == prior_worker,
+                    run_workers_table.c.status == "active",
+                )
+                .values(status="evicted", evicted_at=database_now, evicted_by_worker_id=worker_id)
+            )
+            if evicted.rowcount == 1:
+                record_coordination_event(
+                    conn,
+                    run_id=run_id,
+                    event_type="worker_evict",
+                    worker_id=prior_worker,
+                    leader_epoch=new_epoch,
+                    recorded_at=database_now,
+                    context={"evicted_by_worker_id": worker_id, "reason": "deposed_leader_export_takeover"},
+                )
+        self._insert_worker_row(
+            conn,
+            run_id=run_id,
+            worker_id=worker_id,
+            role="leader",
+            window_seconds=window_seconds,
+            entry_point="export",
+        )
+        record_coordination_event(
+            conn,
+            run_id=run_id,
+            event_type="worker_register",
+            worker_id=worker_id,
+            leader_epoch=new_epoch,
+            recorded_at=database_now,
+            context={"role": "leader", "entry_point": "export"},
+        )
+        record_coordination_event(
+            conn,
+            run_id=run_id,
+            event_type="leader_acquire",
+            worker_id=worker_id,
+            leader_epoch=new_epoch,
+            recorded_at=database_now,
+            context={"entry_point": "export", "deposed_leader_worker_id": prior_worker},
         )
         return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
 

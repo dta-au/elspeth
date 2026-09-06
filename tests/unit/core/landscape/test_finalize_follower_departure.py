@@ -39,7 +39,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_landscape_db
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -220,7 +220,7 @@ class TestFinalizeFollowerDeparture:
         follower_id = _seed_follower(db)
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)  # FAILED: no quiescence check
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))  # FAILED: no quiescence check
 
         workers = _get_workers(db)
         by_id = {w["worker_id"]: w for w in workers}
@@ -236,7 +236,7 @@ class TestFinalizeFollowerDeparture:
         _seed_follower(db)
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))
 
         workers = _get_workers(db)
         by_id = {w["worker_id"]: w for w in workers}
@@ -252,7 +252,7 @@ class TestFinalizeFollowerDeparture:
         follower_id = _seed_follower(db)
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))
 
         events = _get_coord_events(db)
         depart_events = [e for e in events if e["event_type"] == "worker_depart"]
@@ -273,7 +273,7 @@ class TestFinalizeFollowerDeparture:
         fid2 = _seed_follower(db)
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))
 
         workers = _get_workers(db)
         by_id = {w["worker_id"]: w for w in workers}
@@ -291,7 +291,7 @@ class TestFinalizeFollowerDeparture:
         _seed_running_run(db)
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))
 
         events = _get_coord_events(db)
         depart_events = [e for e in events if e["event_type"] == "worker_depart"]
@@ -310,7 +310,7 @@ class TestFinalizeFollowerDeparture:
             )
 
         lifecycle = _make_lifecycle(db)
-        lifecycle.complete_run(RUN_ID, RunStatus.FAILED)
+        lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_token_for(db, RUN_ID))
 
         # The §D WHERE status='active' filter excludes already-departed rows.
         events = _get_coord_events(db)

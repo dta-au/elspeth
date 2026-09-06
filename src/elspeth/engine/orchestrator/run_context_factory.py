@@ -152,6 +152,7 @@ class RunContextFactory:
             concurrency_config=self._concurrency_config,
             telemetry_emit=self._ceremony.emit_telemetry,
             shutdown_event=shutdown_event,
+            coordination_token=coordination_token,
         )
 
         # Set node_id on context for source validation error attribution

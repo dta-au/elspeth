@@ -59,6 +59,7 @@ from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
 from tests.e2e.recovery.harness import spawn_database_process_at_seam, spawn_database_process_with_pause
+from tests.fixtures.landscape import leader_coordination_token
 
 _RUN_ID = "row-union-released-token-resume"
 _CRASH_SEAM = "after-union-release-before-sink-write"
@@ -246,7 +247,9 @@ def test_released_row_union_tokens_resume_from_the_journal_not_mint_frames(tmp_p
             assert {row.lineage_path_json for row in post_union_rows} == {"[]"}
 
         # Supervisor classification, as production would record it.
-        RecorderFactory(killed_db).run_lifecycle.update_run_status(_RUN_ID, RunStatus.FAILED)
+        RecorderFactory(killed_db).run_lifecycle.update_run_status(
+            RunStatus.FAILED, coordination_token=leader_coordination_token(RecorderFactory(killed_db), _RUN_ID)
+        )
         with killed_db.write_connection() as conn:
             conn.execute(
                 update(run_coordination_table)

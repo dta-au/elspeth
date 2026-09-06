@@ -25,7 +25,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.reproducibility import ReproducibilityGrade
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -104,44 +104,44 @@ class TestCompleteRun:
 
     def test_sets_completed_status(self) -> None:
         _db, factory = _setup()
-        run = factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        run = factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.COMPLETED
         assert run.completed_at is not None
 
     def test_sets_failed_status(self) -> None:
         _db, factory = _setup()
-        run = factory.run_lifecycle.complete_run("run-1", RunStatus.FAILED)
+        run = factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.FAILED
 
     def test_stores_reproducibility_grade(self) -> None:
         _db, factory = _setup()
         run = factory.run_lifecycle.complete_run(
-            "run-1",
             RunStatus.COMPLETED,
             reproducibility_grade=ReproducibilityGrade.FULL_REPRODUCIBLE,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
     def test_rejects_non_terminal_status_running(self) -> None:
         _db, factory = _setup()
         with pytest.raises(AuditIntegrityError, match="terminal status"):
-            factory.run_lifecycle.complete_run("run-1", RunStatus.RUNNING)
+            factory.run_lifecycle.complete_run(RunStatus.RUNNING, coordination_token=leader_coordination_token(factory, "run-1"))
 
     def test_accepts_interrupted_status(self) -> None:
         _db, factory = _setup()
-        run = factory.run_lifecycle.complete_run("run-1", RunStatus.INTERRUPTED)
+        run = factory.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.INTERRUPTED
         assert run.completed_at is not None
 
     def test_accepts_completed_status(self) -> None:
         _db, factory = _setup()
-        run = factory.run_lifecycle.complete_run("run-1", RunStatus.COMPLETED)
+        run = factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.COMPLETED
         assert run.completed_at is not None
 
     def test_accepts_failed_status(self) -> None:
         _db, factory = _setup()
-        run = factory.run_lifecycle.complete_run("run-1", RunStatus.FAILED)
+        run = factory.run_lifecycle.complete_run(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.FAILED
         assert run.completed_at is not None
 
@@ -179,7 +179,9 @@ class TestSourceFieldResolution:
     def test_roundtrip(self) -> None:
         _db, factory = _setup()
         mapping = {"Customer ID": "customer_id", "Amount ($)": "amount"}
-        factory.run_lifecycle.record_source_field_resolution("run-1", mapping, normalization_version="v1")
+        factory.run_lifecycle.record_source_field_resolution(
+            mapping, normalization_version="v1", coordination_token=leader_coordination_token(factory, "run-1")
+        )
         result = factory.run_lifecycle.get_source_field_resolution("run-1")
         assert result == mapping
 
@@ -199,14 +201,14 @@ class TestUpdateRunStatus:
 
     def test_updates_status(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.update_run_status("run-1", RunStatus.FAILED)
+        factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.status == RunStatus.FAILED
 
     def test_does_not_set_completed_at(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.update_run_status("run-1", RunStatus.FAILED)
+        factory.run_lifecycle.update_run_status(RunStatus.FAILED, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.completed_at is None
@@ -228,7 +230,7 @@ class TestSecretResolutions:
                 fingerprint="a" * 64,
             ),
         ]
-        factory.run_lifecycle.record_secret_resolutions("run-1", resolutions)
+        factory.run_lifecycle.record_secret_resolutions(resolutions, coordination_token=leader_coordination_token(factory, "run-1"))
         results = factory.run_lifecycle.get_secret_resolutions_for_run("run-1")
         assert len(results) == 1
         assert results[0].env_var_name == "API_KEY"
@@ -257,7 +259,7 @@ class TestListRuns:
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="r1")
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="r2")
-        factory.run_lifecycle.complete_run("r1", RunStatus.COMPLETED)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "r1"))
         running = factory.run_lifecycle.list_runs(status=RunStatus.RUNNING)
         assert len(running) == 1
         assert running[0].run_id == "r2"
@@ -268,7 +270,9 @@ class TestSetExportStatus:
 
     def test_sets_completed_status(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.COMPLETED, export_format="json")
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.COMPLETED, export_format="json", coordination_token=leader_coordination_token(factory, "run-1")
+        )
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.export_status == ExportStatus.COMPLETED
@@ -277,7 +281,9 @@ class TestSetExportStatus:
 
     def test_sets_failed_with_error(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.FAILED, error="disk full")
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.FAILED, error="disk full", coordination_token=leader_coordination_token(factory, "run-1")
+        )
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.export_status == ExportStatus.FAILED
@@ -285,8 +291,10 @@ class TestSetExportStatus:
 
     def test_completed_clears_stale_error(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.FAILED, error="first attempt failed")
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.COMPLETED)
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.FAILED, error="first attempt failed", coordination_token=leader_coordination_token(factory, "run-1")
+        )
+        factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.export_status == ExportStatus.COMPLETED
@@ -294,8 +302,10 @@ class TestSetExportStatus:
 
     def test_pending_clears_stale_error(self) -> None:
         _db, factory = _setup()
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.FAILED, error="old error")
-        factory.run_lifecycle.set_export_status("run-1", ExportStatus.PENDING)
+        factory.run_lifecycle.set_export_status(
+            ExportStatus.FAILED, error="old error", coordination_token=leader_coordination_token(factory, "run-1")
+        )
+        factory.run_lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=leader_coordination_token(factory, "run-1"))
         run = factory.run_lifecycle.get_run("run-1")
         assert run is not None
         assert run.export_error is None
@@ -315,7 +325,7 @@ class TestFinalizeRun:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
         )
-        run = factory.run_lifecycle.finalize_run("run-1", RunStatus.COMPLETED)
+        run = factory.run_lifecycle.finalize_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.COMPLETED
         assert run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
         assert run.completed_at is not None

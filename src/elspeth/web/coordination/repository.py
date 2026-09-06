@@ -3998,10 +3998,15 @@ class _SessionOperationAuthorityRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    @contextmanager
-    def _locked_transaction(self, _session_id: str) -> Iterator[Connection]:
-        with self._engine.begin() as conn:
-            yield conn
+    def _locked_transaction(self, session_id: str) -> AbstractContextManager[Connection]:
+        """The dialect's same-session locked transaction (process + transaction lock).
+
+        Every mutation verb of this repository opens its transaction here. The
+        dialect subclasses provide it through ``locked_session_transaction``;
+        the base class has no unlocked default, so a session write can never
+        run without the session lock.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must provide a locked same-session transaction")
 
     def _select_fence(self, conn: Connection, *, session_id: str) -> Row[Any] | None:
         return conn.execute(
