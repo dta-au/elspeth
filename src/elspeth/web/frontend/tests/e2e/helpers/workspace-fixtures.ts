@@ -87,7 +87,17 @@ interface InstallWorkspaceScenarioOptions {
 const INSTALLED_SCENARIOS = new WeakMap<Page, InstalledScenario>();
 const SOURCE_FILENAME = "workspace-geometry.csv";
 const FIXED_TIME = "2026-08-11T08:00:00.000Z";
-const TALL_DIALOG_NODE_COUNT = 80;
+// The smallest count at which the Run dialog's body overflows by >= 1.2x at
+// every viewport the tall scenario runs at (DESKTOP_VIEWPORTS minus
+// 2560x1280 and 2048x1050 — see the geometry spec's loop) with in-domain
+// (38-character) stage ids. The dialog widens with the viewport and its
+// body grows with content up to calc(100dvh - 32px), so the binding case is
+// 1920x900, where 80 stages measured 812/705 = 1.15x (2026-09-06). The seed
+// route's cost grows roughly quadratically with stages, so the count stays
+// as small as the geometry allows (the ratios and the seed time at this
+// count are recorded in the commit that set it). Exported so the visual
+// spec's graph node count derives from it.
+export const TALL_DIALOG_NODE_COUNT = 88;
 const TALL_DIALOG_PROMPT_TEMPLATE =
   "Review category {{ row.category }} and return a concise classification.";
 // elspeth.core.canonical.stable_hash(TALL_DIALOG_PROMPT_TEMPLATE), 2026-09-05,
@@ -126,17 +136,29 @@ async function seedCanonicalComposition(
       SOURCE_FILENAME,
       "id,category\n1,alpha\n2,beta\n",
     );
+    // Each id is exactly 38 characters — the longest node name the engine
+    // admits (core/config.py _MAX_NODE_NAME_LENGTH, a Landscape column
+    // bound). The Run dialog lists every stage id verbatim, so
+    // TALL_DIALOG_NODE_COUNT ids at the admitted maximum are what make its
+    // body scroll at every desktop viewport. The previous 147-character ids
+    // exercised wrapping the
+    // product can never reach: settings_load rejects them (name > 38,
+    // connection > 64), which the old pending-review pin masked.
     const tallDialogNodeIds = scenario === "tall-confirmation-dialog"
       ? Array.from({ length: TALL_DIALOG_NODE_COUNT }, (_, index) => {
           const stage = String(index + 1).padStart(3, "0");
-          return `llm_stage_${stage}_${"deterministic_review_".repeat(6)}fixture`;
+          return `llm_stage_${stage}_deterministic_llm_review`;
         })
       : [];
     const tallDialogNodes: NodeSpec[] = tallDialogNodeIds.map((id, index) => ({
       id,
       node_type: "transform",
       plugin: "llm",
-      input: index === 0 ? "source" : tallDialogNodeIds[index - 1]!,
+      // Connections are named by the producer's on_success (source ->
+      // stage 1 below, stage k -> stage k+1 here), and a consumer's input
+      // must name that connection: each stage reads the connection that
+      // carries its own id. `input: "source"` named no producer.
+      input: id,
       on_success:
         index === tallDialogNodeIds.length - 1
           ? "results"
@@ -150,15 +172,18 @@ async function seedCanonicalComposition(
         profile: "e2e-bedrock",
         prompt_template: TALL_DIALOG_PROMPT_TEMPLATE,
         required_input_fields: ["category"],
-        response_field: "review",
+        // One output field per stage: graph_structure rejects a transform
+        // whose output fields an upstream stage already guarantees (it
+        // would overwrite row data at run time).
+        response_field: `review_${String(index + 1).padStart(3, "0")}`,
         schema: { mode: "observed" },
         // Since b3ca8d7fb (2026-09-01, "surface YAML source review debt") a
         // seeded llm node with a prompt_template must carry its
         // prompt-template review requirement or the seed is rejected as
         // review debt the backend cannot surface. The fixture's intent is a
         // validated pipeline, so the review is RESOLVED against the prompt's
-        // own hash rather than left pending (which would gate Run behind 80
-        // interpretation cards). The hash is stable_hash(prompt_template) —
+        // own hash rather than left pending (which would gate Run behind
+        // TALL_DIALOG_NODE_COUNT interpretation cards). The hash is stable_hash(prompt_template) —
         // interpretation_state._validate_prompt_template_review — computed
         // in the worktree venv for the exact prompt above; change both or
         // neither.
@@ -194,7 +219,19 @@ async function seedCanonicalComposition(
             options: {
               path: sourcePath(sessionId, blob.id),
               blob_ref: blob.id,
-              schema: { mode: "observed" },
+              // The tall-dialog stages demand `category` from this source
+              // (required_input_fields below). Since d7ffd7930 (2026-08-27)
+              // an observed-mode source that guarantees nothing raises a
+              // pending source_data_contract review for such a demand
+              // (backtraced_source_demand finds the edge miss), which would
+              // leave the live preflight blocked. The sample CSV genuinely
+              // carries `category`, so the fixture declares the guarantee and
+              // the demand has no miss to backtrace. Scenarios without
+              // stages have no demand and keep the bare observed schema.
+              schema:
+                tallDialogNodes.length > 0
+                  ? { mode: "observed", guaranteed_fields: ["category"] }
+                  : { mode: "observed" },
             },
             on_validation_failure: "discard",
           },
@@ -539,26 +576,28 @@ async function assertTallDialogLivePreflight(
       );
     }
     const result = (await response.json()) as ValidationResult;
-    const nodeIds = new Set(compositionState.nodes.map((node) => node.id));
-    const errorNodeIds = new Set(result.errors.map((error) => error.component_id));
-    const unexpectedErrors = result.errors.filter(
-      (error) => error.error_code !== "interpretation_review_pending",
-    );
-    const unexpectedBlockers = result.readiness.blockers.filter(
-      (blocker) => blocker.code !== "interpretation_review_pending",
-    );
-    const allNodesCovered =
-      errorNodeIds.size === nodeIds.size &&
-      [...nodeIds].every((nodeId) => errorNodeIds.has(nodeId));
-    if (
-      result.is_valid ||
-      result.errors.length !== compositionState.nodes.length ||
-      unexpectedErrors.length > 0 ||
-      unexpectedBlockers.length > 0 ||
-      !allNodesCovered
-    ) {
+    // Exact pin of a VALIDATED pipeline. The fixture seeds every llm stage
+    // with its prompt-template review RESOLVED (see the node options above)
+    // and the source with the guarantee its stages demand, so the live
+    // preflight must report nothing pending and nothing blocking — the
+    // same shape the page-side tallDialogAcceptedValidation() mock shows.
+    // Until 2026-09-06 this pinned the pre-b3ca8d7fb truth (one pending
+    // prompt review per node); that shape is no longer seedable.
+    const expected = {
+      is_valid: true,
+      errors: [] as ValidationResult["errors"],
+      blockers: [] as ValidationResult["readiness"]["blockers"],
+      execution_ready: true,
+    };
+    const actual = {
+      is_valid: result.is_valid,
+      errors: result.errors,
+      blockers: result.readiness.blockers,
+      execution_ready: result.readiness.execution_ready,
+    };
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       throw new Error(
-        `tall-dialog live preflight must have only one pending prompt review per node: ${JSON.stringify(result)}`,
+        `tall-dialog live preflight must be a validated pipeline (${compositionState.nodes.length} resolved stages, no pending reviews, no blockers): ${JSON.stringify(result)}`,
       );
     }
   } finally {

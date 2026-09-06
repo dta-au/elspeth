@@ -128,6 +128,7 @@ _TOKEN = Token(
 )
 
 _SCHEDULER_EVENT = SchedulerEvent(
+    seq=1,
     event_id="sched-evt-1",
     run_id="run-1",
     token_id="tok-1",
@@ -1706,6 +1707,7 @@ class TestSchedulerEventRecords:
         events = [r for r in records if r["record_type"] == "scheduler_event"]
         assert len(events) == 1
         e = events[0]
+        assert e["seq"] == 1
         assert e["event_id"] == "sched-evt-1"
         assert e["run_id"] == "run-1"
         assert e["token_id"] == "tok-1"

@@ -1032,7 +1032,11 @@ def test_preferences_upsert_round_trips_on_postgres(postgres_engine: Engine) -> 
         )
     )
 
-    assert transition.prior is None
+    # No row existed, and on PostgreSQL the prior read is a READ COMMITTED
+    # snapshot (plain BEGIN, no advisory lock), never a serialised read
+    # (elspeth-d336060892).
+    assert transition.prior.value is None
+    assert transition.prior.serialised is False
     assert transition.current.default_mode == "guided"
     assert transition.current.tutorial_completed_at is None
     assert asyncio.run(service.get_composer_preferences("postgres-preferences-user")) == transition.current

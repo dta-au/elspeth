@@ -4,6 +4,7 @@ import { expectDialogGeometry } from "./helpers/workspace-assertions";
 import {
   deleteWorkspaceScenario,
   installWorkspaceScenario,
+  TALL_DIALOG_NODE_COUNT,
   type WorkspaceScenario,
 } from "./helpers/workspace-fixtures";
 import { ComposerPage } from "./page-objects/composer-page";
@@ -264,7 +265,8 @@ test.describe("Composer workspace visual baselines", () => {
       page,
       "tall-confirmation-dialog",
       { width: 1280, height: 720 },
-      82,
+      // stages + the source node + the output node
+      TALL_DIALOG_NODE_COUNT + 2,
     );
     try {
       await expect(composer.runPipeline()).toBeEnabled();

@@ -37,7 +37,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, insert, select, text, update
+from sqlalchemy import create_engine, insert, select, update
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import (
@@ -197,7 +197,7 @@ def _recovery_events(engine: Tier1Engine) -> list[dict[str, object]]:
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == RUN_ID)
                 .where(scheduler_events_table.c.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value)
-                .order_by(text("rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 

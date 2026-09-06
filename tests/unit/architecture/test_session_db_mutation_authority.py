@@ -2727,7 +2727,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "1084a431b73718a3",
         1,
         None,
-        line=817,
+        line=819,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): the connection is handed
     # to ``read_schema_identities`` behind a plain import, whose body executes
@@ -2740,7 +2740,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "54f25c9b2650a66b",
         1,
         None,
-        line=842,
+        line=844,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2750,7 +2750,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "f95bb339c5816e92",
         1,
         None,
-        line=940,
+        line=942,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2760,7 +2760,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "7b14f45607d6611f",
         1,
         None,
-        line=1159,
+        line=1161,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2770,7 +2770,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1279,
+        line=1281,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -2783,7 +2783,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1300,
+        line=1302,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -2796,7 +2796,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "91a7ddcfb7d2279c",
         1,
         None,
-        line=1313,
+        line=1315,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -2807,7 +2807,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1340,
+        line=1342,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2817,7 +2817,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "026fc33c365235c4",
         1,
         None,
-        line=1599,
+        line=1601,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -2827,7 +2827,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2059,
+        line=2061,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -2838,7 +2838,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2041,
+        line=2043,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -11773,7 +11773,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1352,
+            line=1354,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",

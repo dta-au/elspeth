@@ -54,7 +54,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
@@ -204,7 +204,7 @@ class TestMidClaimCrashResume:
                             scheduler_events_table.c.run_id == crashed.run_id,
                             scheduler_events_table.c.token_id == token_id,
                         )
-                        .order_by(text("rowid"))
+                        .order_by(scheduler_events_table.c.seq)
                     ).all()
                 ]
 

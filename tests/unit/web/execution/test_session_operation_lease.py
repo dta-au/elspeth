@@ -45,6 +45,7 @@ from starlette.requests import Request
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.events import EventBus
 from elspeth.engine.orchestrator.core import Orchestrator
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.contracts import (
@@ -1131,6 +1132,86 @@ def _is_exact_progress_callback_edge(call: ast.Call, callback: ast.AST) -> bool:
     )
 
 
+# Callback-delegation edges (elspeth-01e919e13e). Each admits ONE exact shape
+# through which a local function is invoked by a consumer the service does not
+# call directly. Admission makes the local function LIVE: its body is walked
+# and every effect inside it is held to the same context/receiver rules as a
+# direct call. Nothing else about the shape is admitted — a different keyword,
+# callee, member, or binding is still an escape.
+_VALIDATE_PIPELINE_MODULE = "elspeth.web.execution.validation"
+_PROOF_DIAGNOSTICS_MODULE = "elspeth.web.composer.tools.generation"
+_PROOF_RESOLVER_MEMBER = "_authoritative_proof_blob_resolver"
+
+
+def _is_exact_worker_delegation_edge(call: ast.Call, callback: ast.AST) -> bool:
+    """``run_sync_in_worker(<local def>)``: the sole argument runs, once, on the worker pool."""
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "run_sync_in_worker"
+        and len(call.args) == 1
+        and not call.keywords
+        and call.args[0] is callback
+    )
+
+
+def _is_exact_blob_metadata_callback_edge(call: ast.Call, keyword: ast.keyword) -> bool:
+    """``validate_pipeline(..., blob_get_metadata=<local def>)``: the validator's per-ref metadata lookup."""
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "validate_pipeline"
+        and keyword.arg == "blob_get_metadata"
+        and any(candidate is keyword for candidate in call.keywords)
+        and isinstance(keyword.value, ast.Name)
+    )
+
+
+def _is_exact_proof_resolver_consumer_call(call: ast.Call) -> bool:
+    """``compute_proof_diagnostics(..., blob_resolver=self._authoritative_proof_blob_resolver(...))``."""
+    if not (isinstance(call.func, ast.Name) and call.func.id == "compute_proof_diagnostics"):
+        return False
+    resolver_keywords = [keyword for keyword in call.keywords if keyword.arg == "blob_resolver"]
+    if len(resolver_keywords) != 1:
+        return False
+    resolver = resolver_keywords[0].value
+    return (
+        isinstance(resolver, ast.Call)
+        and isinstance(resolver.func, ast.Attribute)
+        and isinstance(resolver.func.value, ast.Name)
+        and resolver.func.value.id == "self"
+        and resolver.func.attr == _PROOF_RESOLVER_MEMBER
+    )
+
+
+def _is_exact_proof_resolver_return_edge(
+    function: _FunctionNode,
+    statement: ast.Return,
+    *,
+    exact_consumer_calls: tuple[ast.Call, ...],
+) -> bool:
+    """``return <local def>`` from the proof resolver member, consumed live as ``blob_resolver=``."""
+    return function.name == _PROOF_RESOLVER_MEMBER and isinstance(statement.value, ast.Name) and bool(exact_consumer_calls)
+
+
+def _has_unique_exact_import_binding(
+    function: _FunctionNode,
+    live_nodes: tuple[ast.AST, ...],
+    *,
+    name: str,
+    module: str,
+) -> bool:
+    """``name`` is bound exactly once in ``function``, by ``from <module> import <name>``."""
+    bindings = _binding_nodes(function, live_nodes, name=name)
+    exact_imports = [
+        node
+        for node in live_nodes
+        if isinstance(node, ast.ImportFrom)
+        and node.module == module
+        and node.level == 0
+        and any(alias.name == name and alias.asname is None for alias in node.names)
+    ]
+    return len(bindings) == 1 and len(exact_imports) == 1
+
+
 def _binding_nodes(
     function: _FunctionNode,
     live_nodes: tuple[ast.AST, ...],
@@ -1238,7 +1319,16 @@ def _is_unique_exact_blob_service_alias(
     return len(bindings) == 1 and len(exact_assignments) == 1
 
 
-def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, ...]:
+@dataclass(frozen=True)
+class _ExecutionReachability:
+    """Functions on the execution call graph plus the local-callable edges that put them there."""
+
+    reachable: tuple[_FunctionNode, ...]
+    admitted_callback_edges: frozenset[int]
+    """``id()`` of every ``ast.Name`` load admitted as a callback-delegation edge (not a direct call)."""
+
+
+def _execution_reachability(owner: ast.ClassDef) -> _ExecutionReachability:
     members = {member.name: member for member in owner.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
     local_functions = {
         nested.name: nested
@@ -1249,6 +1339,8 @@ def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, 
     pending: list[_FunctionNode] = [members[name] for name in ("_execute_locked", "_run_pipeline", "_handle_pipeline_submission_failure")]
     reached: set[int] = set()
     result: list[_FunctionNode] = []
+    admitted: set[int] = set()
+    exact_consumer_calls: list[ast.Call] = []
     while pending:
         function = pending.pop()
         if id(function) in reached:
@@ -1257,6 +1349,13 @@ def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, 
         result.append(function)
         live_nodes = _reachable_function_nodes(function)
         exact_event_bus_bound = _has_unique_exact_event_bus_binding(function, live_nodes)
+        exact_validator_bound = _has_unique_exact_import_binding(
+            function, live_nodes, name="validate_pipeline", module=_VALIDATE_PIPELINE_MODULE
+        )
+        exact_diagnostics_bound = _has_unique_exact_import_binding(
+            function, live_nodes, name="compute_proof_diagnostics", module=_PROOF_DIAGNOSTICS_MODULE
+        )
+        exact_worker_bound = _binding_nodes(function, live_nodes, name="run_sync_in_worker") == ()
         for call in (candidate for candidate in live_nodes if isinstance(candidate, ast.Call)):
             if (
                 isinstance(call.func, ast.Attribute)
@@ -1265,22 +1364,47 @@ def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, 
                 and call.func.attr in members
             ):
                 pending.append(members[call.func.attr])
+            if exact_diagnostics_bound and _is_exact_proof_resolver_consumer_call(call):
+                exact_consumer_calls.append(call)
             callable_edges: list[ast.expr] = []
             if isinstance(call.func, ast.Name):
                 callable_edges.append(call.func)
-            callable_edges.extend(
+            delegated_edges: list[ast.expr] = []
+            delegated_edges.extend(
                 edge
                 for edge in call.args
                 if exact_event_bus_bound and isinstance(edge, ast.Name) and _is_exact_progress_callback_edge(call, edge)
             )
+            delegated_edges.extend(
+                edge
+                for edge in call.args
+                if exact_worker_bound and isinstance(edge, ast.Name) and _is_exact_worker_delegation_edge(call, edge)
+            )
+            delegated_edges.extend(
+                keyword.value
+                for keyword in call.keywords
+                if exact_validator_bound and isinstance(keyword.value, ast.Name) and _is_exact_blob_metadata_callback_edge(call, keyword)
+            )
+            admitted.update(id(edge) for edge in delegated_edges)
+            callable_edges.extend(delegated_edges)
             pending.extend(local_functions[edge.id] for edge in callable_edges if isinstance(edge, ast.Name) and edge.id in local_functions)
-    return tuple(result)
+        for statement in (candidate for candidate in live_nodes if isinstance(candidate, ast.Return)):
+            if (
+                isinstance(statement.value, ast.Name)
+                and statement.value.id in local_functions
+                and _is_exact_proof_resolver_return_edge(function, statement, exact_consumer_calls=tuple(exact_consumer_calls))
+            ):
+                admitted.add(id(statement.value))
+                pending.append(local_functions[statement.value.id])
+    return _ExecutionReachability(reachable=tuple(result), admitted_callback_edges=frozenset(admitted))
 
 
-def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_context() -> None:
-    """No helper may mint a context or silently fall back to legacy writers."""
-    owner = _class_node(ExecutionServiceImpl)
-    effect_names = {
+def _reachable_execution_functions(owner: ast.ClassDef) -> tuple[_FunctionNode, ...]:
+    return _execution_reachability(owner).reachable
+
+
+_EXECUTION_EFFECT_NAMES = frozenset(
+    {
         "create_run",
         "create_pending_run",
         "update_run_status",
@@ -1296,47 +1420,70 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
         "_fetch_blob_contents",
         "finalize_run_output_blobs",
     }
-    reachable = _reachable_execution_functions(owner)
+)
+_EXECUTION_GATE_CALL_NAMES = _EXECUTION_EFFECT_NAMES | {"_persist_and_broadcast_run_event", "_finalize_output_blobs"}
+_SESSION_SERVICE_EFFECTS = frozenset({"create_run", "update_run_status", "append_run_event", "record_blob_inline_resolutions"})
+_BLOB_SERVICE_EFFECTS = frozenset({"get_blob", "link_blob_to_run", "read_blob_content", "finalize_run_output_blobs"})
+
+
+@dataclass(frozen=True)
+class _ExecutionEffectFindings:
+    """Structural findings of the session-operation-lease gate over one class body.
+
+    Every ``*_offenders``/``escaped_*``/``unreachable_*`` field is empty for a
+    class that passes; the production gate asserts each is empty, and the
+    callback-edge control tests assert exactly which finding a near-miss shape
+    produces.
+    """
+
+    reachable: tuple[_FunctionNode, ...]
+    live_nodes: tuple[ast.AST, ...]
+    live_calls: tuple[ast.Call, ...]
+    effect_calls: tuple[ast.Call, ...]
+    parent: dict[ast.AST, ast.AST]
+    unreachable_decoys: tuple[ast.Call, ...]
+    unresolved_receivers: tuple[str, ...]
+    context_offenders: tuple[str, ...]
+    escaped_effects: tuple[str, ...]
+    escaped_local_helpers: tuple[str, ...]
+    escaped_class_helpers: tuple[str, ...]
+
+
+def _execution_effect_findings(owner: ast.ClassDef) -> _ExecutionEffectFindings:
+    reachability = _execution_reachability(owner)
+    reachable = reachability.reachable
     function_live_nodes = {id(function): _reachable_function_nodes(function) for function in reachable}
     live_nodes = tuple(node for function in reachable for node in function_live_nodes[id(function)])
     call_owner = {id(node): function for function in reachable for node in function_live_nodes[id(function)] if isinstance(node, ast.Call)}
     enclosing_functions = _enclosing_function_map(owner)
     live_calls = tuple(node for node in live_nodes if isinstance(node, ast.Call))
-    calls = [call for call in live_calls if _call_name(call) in effect_names]
-    gate_call_names = effect_names | {"_persist_and_broadcast_run_event", "_finalize_output_blobs"}
+    calls = tuple(call for call in live_calls if _call_name(call) in _EXECUTION_EFFECT_NAMES)
     all_gate_calls = {
         id(call): call
         for function in reachable
         for call in ast.walk(function)
-        if isinstance(call, ast.Call) and _call_name(call) in gate_call_names
+        if isinstance(call, ast.Call) and _call_name(call) in _EXECUTION_GATE_CALL_NAMES
     }
-    live_gate_call_ids = {id(call) for call in live_calls if _call_name(call) in gate_call_names}
-    unreachable_decoys = [call for call_id, call in all_gate_calls.items() if call_id not in live_gate_call_ids]
-    assert unreachable_decoys == [], (
-        "execution effects cannot hide in dead tails, false branches, or uncalled local functions: "
-        f"{[(call.lineno, _call_name(call), ast.unparse(call)) for call in unreachable_decoys]}"
-    )
+    live_gate_call_ids = {id(call) for call in live_calls if _call_name(call) in _EXECUTION_GATE_CALL_NAMES}
+    unreachable_decoys = tuple(call for call_id, call in all_gate_calls.items() if call_id not in live_gate_call_ids)
 
+    unresolved_receivers: list[str] = []
     for call in calls:
         if _call_name(call) == "_fetch_blob_contents":
-            assert isinstance(call.func, ast.Name)
+            if not isinstance(call.func, ast.Name):
+                unresolved_receivers.append(f"line {call.lineno}: {ast.unparse(call)} is not the bare module-level inline read")
             continue
-        assert isinstance(call.func, ast.Attribute)
+        if not isinstance(call.func, ast.Attribute):
+            unresolved_receivers.append(f"line {call.lineno}: {ast.unparse(call)} is not an attribute call on an owned service")
+            continue
         receiver = ast.unparse(call.func.value)
-        if call.func.attr in {
-            "create_run",
-            "update_run_status",
-            "append_run_event",
-            "record_blob_inline_resolutions",
-        }:
-            assert receiver == "self._session_service"
-        elif call.func.attr in {
-            "get_blob",
-            "link_blob_to_run",
-            "read_blob_content",
-            "finalize_run_output_blobs",
-        }:
-            assert receiver == "self._blob_service" or (
+        if call.func.attr in _SESSION_SERVICE_EFFECTS and receiver != "self._session_service":
+            unresolved_receivers.append(
+                f"line {call.lineno}: {ast.unparse(call)} reaches the session service through an unresolved receiver {receiver!r}"
+            )
+        elif call.func.attr in _BLOB_SERVICE_EFFECTS and not (
+            receiver == "self._blob_service"
+            or (
                 isinstance(call.func.value, ast.Name)
                 and _is_unique_exact_blob_service_alias(
                     call_owner[id(call)],
@@ -1344,7 +1491,92 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
                     live_nodes_of=function_live_nodes,
                     enclosing=enclosing_functions,
                 )
-            ), f"line {call.lineno}: {ast.unparse(call)} reaches the blob service through an unresolved receiver {receiver!r}"
+            )
+        ):
+            unresolved_receivers.append(
+                f"line {call.lineno}: {ast.unparse(call)} reaches the blob service through an unresolved receiver {receiver!r}"
+            )
+    context_offenders = tuple(sorted({_call_name(call) or "" for call in calls if not _exact_context_keyword(call)}))
+
+    parent = {child: node for function in reachable for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
+    escaped_effects = tuple(
+        sorted(
+            {
+                node.attr
+                for node in live_nodes
+                if isinstance(node, ast.Attribute)
+                and node.attr in _EXECUTION_EFFECT_NAMES
+                and not (isinstance(parent.get(node), ast.Call) and cast(ast.Call, parent[node]).func is node)
+            }
+        )
+    )
+
+    local_function_names = {
+        nested.name
+        for member in owner.body
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for nested in ast.walk(member)
+        if isinstance(nested, (ast.FunctionDef, ast.AsyncFunctionDef)) and nested is not member
+    }
+
+    def is_direct_callable_edge(node: ast.AST) -> bool:
+        container = parent.get(node)
+        if isinstance(container, ast.Call) and container.func is node:
+            return True
+        return id(node) in reachability.admitted_callback_edges
+
+    escaped_local_helpers = tuple(
+        node.id
+        for node in live_nodes
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in local_function_names
+        and not is_direct_callable_edge(node)
+    )
+
+    class_member_names = {member.name for member in owner.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    escaped_class_helpers = tuple(
+        node.attr
+        for node in live_nodes
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr in class_member_names
+        and not (isinstance(parent.get(node), ast.Call) and cast(ast.Call, parent[node]).func is node)
+    )
+    return _ExecutionEffectFindings(
+        reachable=reachable,
+        live_nodes=live_nodes,
+        live_calls=live_calls,
+        effect_calls=calls,
+        parent=parent,
+        unreachable_decoys=unreachable_decoys,
+        unresolved_receivers=tuple(unresolved_receivers),
+        context_offenders=context_offenders,
+        escaped_effects=escaped_effects,
+        escaped_local_helpers=escaped_local_helpers,
+        escaped_class_helpers=escaped_class_helpers,
+    )
+
+
+def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_context() -> None:
+    """No helper may mint a context or silently fall back to legacy writers."""
+    owner = _class_node(ExecutionServiceImpl)
+    effect_names = _EXECUTION_EFFECT_NAMES
+    gate_call_names = _EXECUTION_GATE_CALL_NAMES
+    findings = _execution_effect_findings(owner)
+    reachable = findings.reachable
+    live_nodes = findings.live_nodes
+    live_calls = findings.live_calls
+    calls = findings.effect_calls
+    parent = findings.parent
+    assert findings.unreachable_decoys == (), (
+        "execution effects cannot hide in dead tails, false branches, or uncalled local functions: "
+        f"{[(call.lineno, _call_name(call), ast.unparse(call)) for call in findings.unreachable_decoys]}"
+    )
+    assert findings.unresolved_receivers == (), (
+        f"execution effects reach services through unresolved receivers: {findings.unresolved_receivers}"
+    )
     observed = {_call_name(call) for call in calls}
     assert observed & {"create_run", "create_pending_run"}, "run creation effect disappeared from execution"
     assert observed & {"update_run_status", "transition_run_status"}, "run status effects disappeared from execution"
@@ -1357,61 +1589,21 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
         "insert_blob_inline_resolutions",
     }, "inline-resolution audit effect disappeared"
     assert "finalize_run_output_blobs" in observed, "output finalization effect disappeared"
-    offenders = sorted({_call_name(call) for call in calls if not _exact_context_keyword(call)})
-    assert offenders == [], f"execution effects omit the exact transferred context: {offenders}"
+    assert findings.context_offenders == (), f"execution effects omit the exact transferred context: {findings.context_offenders}"
+    assert findings.escaped_effects == (), f"execution effect callable is aliased or escapes direct inspection: {findings.escaped_effects}"
 
-    parent = {child: node for function in reachable for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
-    escaped = sorted(
-        {
-            node.attr
-            for node in live_nodes
-            if isinstance(node, ast.Attribute)
-            and node.attr in effect_names
-            and not (isinstance(parent.get(node), ast.Call) and cast(ast.Call, parent[node]).func is node)
-        }
-    )
-    assert escaped == [], f"execution effect callable is aliased or escapes direct inspection: {escaped}"
-
-    local_function_names = {
-        nested.name
-        for member in owner.body
-        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-        for nested in ast.walk(member)
-        if isinstance(nested, (ast.FunctionDef, ast.AsyncFunctionDef)) and nested is not member
-    }
     exact_event_bus_functions = [
         function for function in reachable if _has_unique_exact_event_bus_binding(function, _reachable_function_nodes(function))
     ]
     assert execution_service_module.EventBus is EventBus, "execution callback bus constructor provenance changed"
+    assert execution_service_module.run_sync_in_worker is run_sync_in_worker, "execution worker delegation provenance changed"
     assert [function.name for function in exact_event_bus_functions] == ["_run_pipeline"]
-
-    def is_direct_callable_edge(node: ast.AST) -> bool:
-        container = parent.get(node)
-        if isinstance(container, ast.Call):
-            return container.func is node or (bool(exact_event_bus_functions) and _is_exact_progress_callback_edge(container, node))
-        return False
-
-    escaped_local_helpers = [
-        node.id
-        for node in live_nodes
-        if isinstance(node, ast.Name)
-        and isinstance(node.ctx, ast.Load)
-        and node.id in local_function_names
-        and not is_direct_callable_edge(node)
-    ]
-    assert escaped_local_helpers == [], f"local execution helper callable escapes direct analysis: {escaped_local_helpers}"
+    assert findings.escaped_local_helpers == (), (
+        f"local execution helper callable escapes direct analysis: {findings.escaped_local_helpers}"
+    )
 
     class_member_names = {member.name for member in owner.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    escaped_class_helpers = [
-        node.attr
-        for node in live_nodes
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
-        and node.attr in class_member_names
-        and not (isinstance(parent.get(node), ast.Call) and cast(ast.Call, parent[node]).func is node)
-    ]
-    assert escaped_class_helpers == [], f"class execution helper callable is aliased or escapes: {escaped_class_helpers}"
+    assert findings.escaped_class_helpers == (), f"class execution helper callable is aliased or escapes: {findings.escaped_class_helpers}"
 
     forbidden_dynamic_symbols = {
         "attrgetter",
@@ -1566,6 +1758,256 @@ def test_every_worker_run_blob_progress_output_and_terminal_effect_uses_same_con
         for call in live_calls
         for keyword in call.keywords
     ), "failure/cancellation compensation must be a live output-finalization effect under the exact lease"
+
+
+# ── Callback-delegation edge controls (elspeth-01e919e13e) ──────────────────
+# Each edge is admitted for ONE exact shape. The controls below run the same
+# structural findings the production gate asserts on, over synthetic class
+# sources: (i) the exact shape admits the closure as live — its effect is a
+# live effect call, held to the exact context and receiver; (ii) the same
+# closure passed under any other keyword, callee, member, binding, or
+# alias is still an escape (and its read a decoy); (iii) a read inside an
+# admitted closure with the wrong context or receiver is still an offender.
+
+_EDGE_CONTROL_HEAD = """
+class Service:
+    async def _execute_locked(self, state, *, session_operation_lease):
+        session_operation_context = session_operation_lease.context
+        other_context = session_operation_lease.context
+        await self._entry(state, session_id=None, session_operation_context=session_operation_context)
+
+    async def _run_pipeline(self, *, session_operation_lease):
+        return None
+
+    async def _handle_pipeline_submission_failure(self, *, session_operation_lease):
+        return None
+"""
+
+
+@dataclass(frozen=True)
+class _EdgeControlCase:
+    body: str
+    closure: str
+    admitted: bool
+    context_offenders: tuple[str, ...] = ()
+    unresolved_receiver_count: int = 0
+    escaped_class_helpers: tuple[str, ...] = ()
+    escaped_decoys: tuple[str, ...] = ("get_blob",)
+    """Gate calls left unreachable when the closure escapes; empty when the read lives in a member reached only through it."""
+
+
+def _synthetic_owner(body: str) -> ast.ClassDef:
+    tree = ast.parse(_EDGE_CONTROL_HEAD + textwrap.indent(textwrap.dedent(body), "    "))
+    return next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "Service")
+
+
+def _assert_edge_control(case: _EdgeControlCase) -> None:
+    findings = _execution_effect_findings(_synthetic_owner(case.body))
+    reachable_names = [function.name for function in findings.reachable]
+    decoy_names = sorted(_call_name(call) or "" for call in findings.unreachable_decoys)
+    live_effects = sorted(_call_name(call) or "" for call in findings.effect_calls)
+    if case.admitted:
+        assert case.closure in reachable_names, f"{case.closure} was not admitted as live: {reachable_names}"
+        assert findings.escaped_local_helpers == (), findings.escaped_local_helpers
+        assert decoy_names == [], decoy_names
+        assert live_effects == ["get_blob"], live_effects
+    else:
+        assert case.closure not in reachable_names, f"{case.closure} was admitted through a non-exact shape: {reachable_names}"
+        assert findings.escaped_local_helpers == (case.closure,), findings.escaped_local_helpers
+        assert decoy_names == list(case.escaped_decoys), decoy_names
+        assert live_effects == [], live_effects
+    assert findings.context_offenders == case.context_offenders, findings.context_offenders
+    assert len(findings.unresolved_receivers) == case.unresolved_receiver_count, findings.unresolved_receivers
+    assert findings.escaped_class_helpers == case.escaped_class_helpers, findings.escaped_class_helpers
+
+
+_BLOB_METADATA_EDGE = """
+    def _entry(self, state, *, session_id, session_operation_context):
+        from {module} import {validator}
+
+        def _blob_get_metadata(blob_id):
+            return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
+
+        return {validator}(state, session_id=session_id, {keyword}=_blob_get_metadata)
+"""
+
+
+def _blob_metadata_case(
+    *,
+    module: str = _VALIDATE_PIPELINE_MODULE,
+    validator: str = "validate_pipeline",
+    keyword: str = "blob_get_metadata",
+    receiver: str = "self._blob_service",
+    context: str = "session_operation_context",
+    admitted: bool,
+    context_offenders: tuple[str, ...] = (),
+    unresolved_receiver_count: int = 0,
+) -> _EdgeControlCase:
+    return _EdgeControlCase(
+        body=_BLOB_METADATA_EDGE.format(module=module, validator=validator, keyword=keyword, receiver=receiver, context=context),
+        closure="_blob_get_metadata",
+        admitted=admitted,
+        context_offenders=context_offenders,
+        unresolved_receiver_count=unresolved_receiver_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "case"),
+    [
+        ("exact-shape-admitted", _blob_metadata_case(admitted=True)),
+        ("other-keyword-escapes", _blob_metadata_case(keyword="blob_metadata", admitted=False)),
+        ("other-callee-escapes", _blob_metadata_case(validator="check_pipeline", admitted=False)),
+        ("other-module-binding-escapes", _blob_metadata_case(module="elspeth.web.execution.staging", admitted=False)),
+        ("admitted-wrong-context-flagged", _blob_metadata_case(admitted=True, context="other_context", context_offenders=("get_blob",))),
+        ("admitted-wrong-receiver-flagged", _blob_metadata_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
+    ],
+)
+def test_blob_metadata_callback_edge_admits_only_the_exact_validate_pipeline_keyword(case_id: str, case: _EdgeControlCase) -> None:
+    _assert_edge_control(case)
+
+
+_PROOF_RESOLVER_EDGE = """
+    def _entry(self, state, *, session_id, session_operation_context):
+        from {module} import {consumer}
+
+        {consumption}
+
+    def {member}(self, state, *, session_id, session_operation_context):
+        def _resolve(blob_id):
+            return self._call_async({receiver}.get_blob(blob_id, session_operation_context={context}))
+
+        return _resolve
+"""
+_DIRECT_CONSUMPTION = (
+    "return {consumer}(state, {keyword}=self.{member}(state, session_id=session_id, session_operation_context=session_operation_context))"
+)
+_ALIASED_CONSUMPTION = (
+    "resolver = self.{member}(state, session_id=session_id, session_operation_context=session_operation_context)\n"
+    "        return {consumer}(state, {keyword}=resolver)"
+)
+
+
+def _proof_resolver_case(
+    *,
+    module: str = _PROOF_DIAGNOSTICS_MODULE,
+    consumer: str = "compute_proof_diagnostics",
+    keyword: str = "blob_resolver",
+    member: str = _PROOF_RESOLVER_MEMBER,
+    consumption: str = _DIRECT_CONSUMPTION,
+    receiver: str = "self._blob_service",
+    context: str = "session_operation_context",
+    admitted: bool,
+    context_offenders: tuple[str, ...] = (),
+    unresolved_receiver_count: int = 0,
+) -> _EdgeControlCase:
+    body = _PROOF_RESOLVER_EDGE.format(
+        module=module,
+        consumer=consumer,
+        member=member,
+        receiver=receiver,
+        context=context,
+        consumption=consumption.format(consumer=consumer, keyword=keyword, member=member),
+    )
+    return _EdgeControlCase(
+        body=body,
+        closure="_resolve",
+        admitted=admitted,
+        context_offenders=context_offenders,
+        unresolved_receiver_count=unresolved_receiver_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "case"),
+    [
+        ("exact-shape-admitted", _proof_resolver_case(admitted=True)),
+        ("other-member-escapes", _proof_resolver_case(member="_staging_blob_resolver", admitted=False)),
+        ("other-callee-escapes", _proof_resolver_case(consumer="score_proof", admitted=False)),
+        ("other-keyword-escapes", _proof_resolver_case(keyword="resolver", admitted=False)),
+        ("aliased-consumption-escapes", _proof_resolver_case(consumption=_ALIASED_CONSUMPTION, admitted=False)),
+        ("other-module-binding-escapes", _proof_resolver_case(module="elspeth.web.composer.tools.staging", admitted=False)),
+        ("admitted-wrong-context-flagged", _proof_resolver_case(admitted=True, context="other_context", context_offenders=("get_blob",))),
+        ("admitted-wrong-receiver-flagged", _proof_resolver_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
+    ],
+)
+def test_proof_resolver_return_edge_admits_only_the_exact_blob_resolver_consumption(case_id: str, case: _EdgeControlCase) -> None:
+    _assert_edge_control(case)
+
+
+_WORKER_DELEGATION_EDGE = """
+    async def _entry(self, state, *, session_id, session_operation_context):
+        {rebinding}
+        def _preflight():
+            return self._preflight_sync(state, session_operation_context=session_operation_context)
+
+        return await {handoff}
+
+    def _preflight_sync(self, state, *, session_operation_context):
+        return self._call_async({receiver}.get_blob(state.blob_id, session_operation_context={context}))
+"""
+
+
+def _worker_delegation_case(
+    *,
+    handoff: str = "run_sync_in_worker(_preflight)",
+    rebinding: str = "",
+    receiver: str = "self._blob_service",
+    context: str = "session_operation_context",
+    admitted: bool,
+    context_offenders: tuple[str, ...] = (),
+    unresolved_receiver_count: int = 0,
+    escaped_class_helpers: tuple[str, ...] = (),
+) -> _EdgeControlCase:
+    return _EdgeControlCase(
+        body=_WORKER_DELEGATION_EDGE.format(handoff=handoff, rebinding=rebinding, receiver=receiver, context=context),
+        closure="_preflight",
+        admitted=admitted,
+        context_offenders=context_offenders,
+        unresolved_receiver_count=unresolved_receiver_count,
+        escaped_class_helpers=escaped_class_helpers,
+        # The read sits in ``_preflight_sync``, a member reached only through
+        # the closure: an unadmitted handoff leaves it unreached (the pre-fix
+        # invisibility), and the escape is what the gate flags.
+        escaped_decoys=(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "case"),
+    [
+        ("exact-shape-admitted", _worker_delegation_case(admitted=True)),
+        ("extra-argument-escapes", _worker_delegation_case(handoff="run_sync_in_worker(_preflight, state)", admitted=False)),
+        ("keyword-handoff-escapes", _worker_delegation_case(handoff="run_sync_in_worker(func=_preflight)", admitted=False)),
+        ("other-callee-escapes", _worker_delegation_case(handoff="run_in_thread(_preflight)", admitted=False)),
+        (
+            "local-rebinding-escapes",
+            _worker_delegation_case(rebinding="run_sync_in_worker = self._runner", admitted=False),
+        ),
+        (
+            "admitted-wrong-context-flagged",
+            _worker_delegation_case(admitted=True, context="other_context", context_offenders=("get_blob",)),
+        ),
+        ("admitted-wrong-receiver-flagged", _worker_delegation_case(admitted=True, receiver="self._staging", unresolved_receiver_count=1)),
+    ],
+)
+def test_worker_delegation_edge_admits_only_the_sole_local_callable(case_id: str, case: _EdgeControlCase) -> None:
+    _assert_edge_control(case)
+
+
+def test_worker_delegation_edge_does_not_admit_a_partial_over_a_class_member() -> None:
+    """The withdrawn shape: ``run_sync_in_worker(partial(self.<member>, ...))`` hides the member from the walk."""
+    body = """
+    async def _entry(self, state, *, session_id, session_operation_context):
+        return await run_sync_in_worker(partial(self._preflight_sync, state, session_operation_context=session_operation_context))
+
+    def _preflight_sync(self, state, *, session_operation_context):
+        return self._call_async(self._blob_service.get_blob(state.blob_id, session_operation_context=session_operation_context))
+    """
+    findings = _execution_effect_findings(_synthetic_owner(body))
+    assert "_preflight_sync" not in [function.name for function in findings.reachable]
+    assert findings.escaped_class_helpers == ("_preflight_sync",)
+    assert [_call_name(call) for call in findings.effect_calls] == []
 
 
 def test_loss_watcher_signals_shutdown_without_becoming_a_lease_owned_task() -> None:

@@ -71,8 +71,6 @@ _STALL_BUDGET = DEFAULT_ITEM_STALL_BUDGET_SECONDS
 
 
 def _scheduler_events_of_type(db, run_id: str, event_type: str) -> list[dict[str, object]]:
-    from sqlalchemy import text
-
     with db.engine.connect() as conn:
         return [
             dict(row)
@@ -80,7 +78,7 @@ def _scheduler_events_of_type(db, run_id: str, event_type: str) -> list[dict[str
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == run_id)
                 .where(scheduler_events_table.c.event_type == event_type)
-                .order_by(text("rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 

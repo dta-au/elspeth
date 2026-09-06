@@ -125,13 +125,13 @@ def instantiate_plugins_from_config(
         aggregations = {}
         for agg_config in config.aggregations:
             transform_cls = manager.get_transform_by_name(agg_config.plugin)
-            transform = transform_cls(dict(agg_config.options))
-            transform.on_success = agg_config.on_success
-            transform.on_error = agg_config.on_error
-
             # Aggregations require transforms that can consume multiple rows.
             # A non-batch-aware transform would silently ignore the trigger.
-            if not transform.is_batch_aware:
+            # Decided on the CLASS, before construction: is_batch_aware is a
+            # class attribute, and a plugin that is illegal for this node kind
+            # must be refused for THAT reason, not for whatever its own config
+            # validator happens to reject first (elspeth-98a0a9e732).
+            if not transform_cls.is_batch_aware:
                 raise ValueError(
                     f"Aggregation '{agg_config.name}' uses transform '{agg_config.plugin}' "
                     f"which has is_batch_aware=False. Aggregations require batch-aware "
@@ -139,20 +139,26 @@ def instantiate_plugins_from_config(
                     f"Use a batch-aware transform like 'batch_stats' or 'batch_replicate', "
                     f"or set is_batch_aware=True on your custom transform."
                 )
+            transform = transform_cls(dict(agg_config.options))
+            transform.on_success = agg_config.on_success
+            transform.on_error = agg_config.on_error
 
             aggregations[agg_config.name] = (transform, agg_config)
 
         collectors = {}
         for collector_config in config.collectors:
             transform_cls = manager.get_transform_by_name(collector_config.plugin)
-            transform = transform_cls(dict(collector_config.options))
-            transform.on_success = collector_config.on_success
-            if not transform.is_batch_aware:
+            # Same ordering as the aggregation arm: the kind verdict comes
+            # from the class, before the plugin's own constructor can fail on
+            # its config and hide the real problem (elspeth-98a0a9e732).
+            if not transform_cls.is_batch_aware:
                 raise ValueError(
                     f"Collector '{collector_config.name}' uses transform '{collector_config.plugin}' "
                     f"which has is_batch_aware=False. Collectors reuse the batch-transform plugin "
                     f"contract and require batch-aware plugins."
                 )
+            transform = transform_cls(dict(collector_config.options))
+            transform.on_success = collector_config.on_success
             collectors[collector_config.name] = (transform, collector_config)
 
         from elspeth.plugins.infrastructure.base import BaseSink

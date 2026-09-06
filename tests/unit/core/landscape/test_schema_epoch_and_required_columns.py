@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.schema import CreateIndex
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from elspeth.contracts.scheduler import SchedulerEventType
 from elspeth.core.landscape.database import (
@@ -36,15 +36,30 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_seven() -> None:
-    # Epoch 36 (elspeth-8655045f98) added coalesce_effects.group_id. Epoch 37
-    # (elspeth-07cd19ba73, pluggable SSO): ck_auth_events_provider and
-    # ck_run_attributions_auth_provider_type both widen from three provider
-    # values to five. Landscape compares declared CHECK text against the
-    # reflected constraint structurally, so a widening is a schema change
-    # even though every previously admitted value is still admitted. Cut
-    # over in the same window as sessions epoch 50.
-    assert SQLITE_SCHEMA_EPOCH == 37
+def test_epoch_is_thirty_eight() -> None:
+    # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
+    # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
+    # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
+    # and event_id becomes a non-unique content digest without recorded_at.
+    # Database time ties inside a SQLite second and inside a PostgreSQL
+    # transaction, so (recorded_at, event_id) replayed in hash order and two
+    # identical same-second transitions collided on the old primary key.
+    assert SQLITE_SCHEMA_EPOCH == 38
+
+
+def test_epoch_38_scheduler_events_seq_is_the_autoincrement_primary_key() -> None:
+    from elspeth.core.landscape.schema import scheduler_events_table
+
+    assert [c.name for c in scheduler_events_table.primary_key.columns] == ["seq"]
+    assert ("scheduler_events", "seq") in set(_REQUIRED_COLUMNS)
+    assert ("scheduler_events", "ix_scheduler_events_run_token_seq") in set(_REQUIRED_INDEXES)
+    sqlite_ddl = str(CreateTable(scheduler_events_table).compile(dialect=sqlite.dialect()))
+    assert "seq INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT" in sqlite_ddl, sqlite_ddl
+    assert "event_id VARCHAR(64) NOT NULL" in sqlite_ddl, sqlite_ddl
+    assert "UNIQUE (event_id)" not in sqlite_ddl, sqlite_ddl
+    postgres_ddl = str(CreateTable(scheduler_events_table).compile(dialect=postgresql.dialect()))
+    assert "seq SERIAL NOT NULL" in postgres_ddl, postgres_ddl
+    assert "PRIMARY KEY (seq)" in postgres_ddl, postgres_ddl
 
 
 def test_unified_lineage_tables_exist_with_exact_keys() -> None:

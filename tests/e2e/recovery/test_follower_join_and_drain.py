@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import CoordinationToken
@@ -1403,9 +1403,7 @@ transforms:
                     select(scheduler_events_table.c.event_type)
                     .where(scheduler_events_table.c.run_id == run_id)
                     .where(scheduler_events_table.c.token_id == token_id)
-                    # Recording order (SQLite rowid): the production key
-                    # (recorded_at, event_id) ties inside one database second.
-                    .order_by(text("rowid"))
+                    .order_by(scheduler_events_table.c.seq)
                 )
                 .scalars()
                 .all()
