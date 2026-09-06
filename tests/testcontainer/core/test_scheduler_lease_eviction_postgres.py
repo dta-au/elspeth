@@ -32,7 +32,13 @@ import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import event, func, insert, select, update
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, stamp_inside_next_transaction
+from tests.fixtures.landscape import (
+    assert_stamped_between,
+    expire_lease,
+    landscape_database_now,
+    make_factory,
+    stamp_inside_next_transaction,
+)
 from tests.helpers.state_engine import capture_state_engine_image
 
 from elspeth.contracts import TerminalOutcome, TerminalPath
@@ -186,7 +192,7 @@ def _scheduler_event_types(db: LandscapeDB, *, run_id: str) -> list[str]:
             conn.execute(
                 select(scheduler_events_table.c.event_type)
                 .where(scheduler_events_table.c.run_id == run_id)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                .order_by(scheduler_events_table.c.seq)
             ).scalars()
         )
 
@@ -195,9 +201,7 @@ def _scheduler_events(db: LandscapeDB, *, run_id: str) -> list[dict[str, object]
     with db.read_only_connection() as conn:
         rows = (
             conn.execute(
-                select(scheduler_events_table)
-                .where(scheduler_events_table.c.run_id == run_id)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                select(scheduler_events_table).where(scheduler_events_table.c.run_id == run_id).order_by(scheduler_events_table.c.seq)
             )
             .mappings()
             .all()
@@ -469,6 +473,71 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
         expected["updated_at"] = after["updated_at"]
         assert after == expected
         assert _scheduler_events(db, run_id=run_id) == events_before
+    finally:
+        db.close()
+
+
+def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_claim(postgres_url: str) -> None:
+    """Epoch 38 (elspeth-2d436dd6e8): one transaction, one timestamp, ``seq`` still orders.
+
+    ``enqueue_ready_claimed`` writes ENQUEUE and CLAIM_READY inside one
+    transaction, so on PostgreSQL both carry the identical transaction
+    timestamp; a ``(recorded_at, event_id)`` key then replays them in hash
+    order. Eight tokens make a hash-order pass a 1-in-256 accident.
+    """
+    now = datetime(2026, 8, 12, 2, 45, tzinfo=UTC)
+    run_id = "run-postgresql-enqueue-claimed-order"
+    owner = "leader-enqueue-claimed-order"
+    db = LandscapeDB.from_url(postgres_url)
+    try:
+        _seed(
+            db.engine,
+            run_id=run_id,
+            leader_id=owner,
+            worker_id=None,
+            worker_heartbeat_expires_at=None,
+            now=now,
+            leader_window_seconds=30,
+        )
+        repo = TokenSchedulerRepository(db.engine)
+        payload = TokenSchedulerRepository.serialize_row_payload(
+            PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        )
+        token_ids = [f"tok-claimed-{index}" for index in range(8)]
+        for index, token_id in enumerate(token_ids):
+            row_id = f"row-{token_id}"
+            with db.engine.begin() as conn:
+                conn.execute(
+                    insert(rows_table).values(
+                        row_id=row_id,
+                        run_id=run_id,
+                        source_node_id="source-a",
+                        row_index=index,
+                        source_row_index=index,
+                        ingest_sequence=index,
+                        source_data_hash=f"hash-{token_id}",
+                        created_at=now,
+                    )
+                )
+                conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=run_id, created_at=now))
+            repo.enqueue_ready_claimed(
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                node_id="transform-1",
+                step_index=1,
+                ingest_sequence=index,
+                row_payload_json=payload,
+                lease_owner=owner,
+                lease_seconds=30,
+            )
+
+        query = make_factory(db).query
+        for token_id in token_ids:
+            events = query.get_scheduler_events(run_id=run_id, token_id=token_id)
+            assert [event.event_type for event in events] == [SchedulerEventType.ENQUEUE, SchedulerEventType.CLAIM_READY], token_id
+            assert events[0].recorded_at == events[1].recorded_at, token_id
+            assert events[0].seq < events[1].seq, token_id
     finally:
         db.close()
 

@@ -40,10 +40,12 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # a change that moved only one of them would be a deployment with two
     # stores disagreeing about which release they belong to.
     # Session epoch 53 (elspeth-f98e0ae8b2) adds the per-admission read
-    # records on the session side only; Landscape stays at 37, so the pair
-    # is (53, 37) and both stores still name the same release.
+    # records on the session side only. Landscape epoch 38 (elspeth-2d436dd6e8,
+    # elspeth-5d66fc5ed1) adds the scheduler_events ``seq`` replay key on the
+    # Landscape side only, so the pair is (53, 38) and both stores still name
+    # the same release.
     assert SESSION_SCHEMA_EPOCH == 53
-    assert SQLITE_SCHEMA_EPOCH == 37
+    assert SQLITE_SCHEMA_EPOCH == 38
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

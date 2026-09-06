@@ -361,7 +361,21 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        admitted. Cut over in the SAME service-stop window as sessions
 #        epoch 50 (one window, two stores). Pre-1.0 delete-and-recreate
 #        boundary; no migration, rollback_permitted: false.
-SQLITE_SCHEMA_EPOCH = 37
+#   38 → scheduler_events replay order (elspeth-2d436dd6e8,
+#        elspeth-5d66fc5ed1): scheduler_events gains an AUTOINCREMENT ``seq``
+#        primary key in the run_coordination_events shape and every reader
+#        orders by it; event_id is demoted to a non-unique content digest of
+#        the transition that no longer covers recorded_at. Under ADR-047
+#        database time (whole-second on SQLite, one shared transaction
+#        timestamp on PostgreSQL) events tie on recorded_at and replayed in
+#        hash order — a caller-stamped mark_terminal at S.4 sorted AFTER the
+#        database-stamped claim at S.0 that followed it — and two identical
+#        transitions of one work item inside one second collided on the
+#        event_id primary key. The two supporting indexes follow the key
+#        (ix_scheduler_events_run_token_time is replaced by
+#        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
+#        boundary; no migration, rollback_permitted: false.
+SQLITE_SCHEMA_EPOCH = 38
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -929,7 +943,22 @@ def blocked_barrier_hold_clause() -> ColumnElement[bool]:
 scheduler_events_table = Table(
     "scheduler_events",
     metadata,
-    Column("event_id", String(64), primary_key=True),
+    # Authoritative replay order and row identity (epoch 38). AUTOINCREMENT
+    # (not bare rowid) so seq values are never reused after deletion and are
+    # strictly monotonic for the life of the ledger. recorded_at is database
+    # time (ADR-047): whole-second on SQLite and one shared transaction
+    # timestamp on PostgreSQL, so it ties inside a second and inside a
+    # transaction and cannot order; seq can. Same shape as
+    # run_coordination_events.seq.
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    # sha256(canonical_json(transition content)) — the identity of WHAT
+    # happened (run, token, work item, from/to status, owners, attempts,
+    # deadlines, caller, context), deliberately NOT of when: recorded_at is
+    # excluded, and two content-identical transitions inside one database
+    # second are two rows that share an event_id and differ by seq. Not
+    # unique by design (elspeth-5d66fc5ed1) — the tickets forbid a nonce or
+    # process-clock microseconds in the hash, and seq is the occurrence.
+    Column("event_id", String(64), nullable=False),
     Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
     Column("token_id", String(64), nullable=False),
     # ``work_item_id`` is a forensic scheduler identity, not a foreign key:
@@ -966,19 +995,21 @@ scheduler_events_table = Table(
     CheckConstraint("to_attempt >= 0", name="ck_scheduler_events_to_attempt_non_negative"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
+    # Mandatory for the AUTOINCREMENT DDL on SQLite (see run_coordination_events);
+    # inert on PostgreSQL, where the Integer PK becomes IDENTITY.
+    sqlite_autoincrement=True,
 )
 Index(
-    "ix_scheduler_events_run_token_time",
+    "ix_scheduler_events_run_token_seq",
     scheduler_events_table.c.run_id,
     scheduler_events_table.c.token_id,
-    scheduler_events_table.c.recorded_at,
-    scheduler_events_table.c.event_id,
+    scheduler_events_table.c.seq,
 )
 Index(
     "ix_scheduler_events_work_item",
     scheduler_events_table.c.run_id,
     scheduler_events_table.c.work_item_id,
-    scheduler_events_table.c.recorded_at,
+    scheduler_events_table.c.seq,
 )
 
 # === Multi-worker run coordination (epoch 21, ADR-030) ===

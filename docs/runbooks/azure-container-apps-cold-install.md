@@ -53,7 +53,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 53 and Landscape epoch 37 initialized;
+  session epoch 53 and Landscape epoch 38 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**

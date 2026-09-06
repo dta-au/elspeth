@@ -373,14 +373,7 @@ class QueryRepository:
             predicates.append(scheduler_events_table.c.token_id == token_id)
         if work_item_id is not None:
             predicates.append(scheduler_events_table.c.work_item_id == work_item_id)
-        query = (
-            select(scheduler_events_table)
-            .where(*predicates)
-            .order_by(
-                scheduler_events_table.c.recorded_at,
-                scheduler_events_table.c.event_id,
-            )
-        )
+        query = select(scheduler_events_table).where(*predicates).order_by(scheduler_events_table.c.seq)
         db_rows = self._ops.execute_fetchall(query)
         return [self._scheduler_event_loader.load(r) for r in db_rows]
 
@@ -891,10 +884,7 @@ class QueryRepository:
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == run_id)
                 .where(scheduler_events_table.c.token_id.in_(chunk))
-                .order_by(
-                    scheduler_events_table.c.recorded_at,
-                    scheduler_events_table.c.event_id,
-                )
+                .order_by(scheduler_events_table.c.seq)
             )
             events.extend(self._scheduler_event_loader.load(r) for r in self._ops.execute_fetchall(query))
         return events

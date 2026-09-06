@@ -5,6 +5,13 @@ caller's connection. Every scheduler component records through ONE shared
 ``SchedulerEventStore`` instance (composed by the facade), so a test can
 intercept the whole event plane at a single seam. Extracted from
 ``TokenSchedulerRepository`` (filigree elspeth-ef9c36d767).
+
+Row identity and replay order are the database-assigned ``seq`` (epoch 38);
+``event_id`` is a content digest of the transition that excludes
+``recorded_at`` and is not unique — two identical transitions of one work
+item inside one database second are two rows with one ``event_id``
+(elspeth-5d66fc5ed1). Readers order by ``seq``, never by ``recorded_at``
+(elspeth-2d436dd6e8).
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ class SchedulerEventStore:
         context: Mapping[str, object] | None = None,
     ) -> None:
         context_json = canonical_json({} if context is None else dict(context))
+        # Content identity only: recorded_at is deliberately absent (epoch 38).
         event_identity = canonical_json(
             {
                 "caller_owner": caller_owner,
@@ -60,7 +68,6 @@ class SchedulerEventStore:
                 "from_lease_owner": from_lease_owner,
                 "from_status": None if from_status is None else from_status.value,
                 "node_id": node_id,
-                "recorded_at": recorded_at.isoformat(),
                 "run_id": run_id,
                 "to_attempt": to_attempt,
                 "to_lease_expires_at": None if to_lease_expires_at is None else to_lease_expires_at.isoformat(),
@@ -91,18 +98,18 @@ class SchedulerEventStore:
             "context_json": context_json,
         }
         try:
-            inserted_event_id = conn.execute(
-                scheduler_events_table.insert().values(**values).returning(scheduler_events_table.c.event_id)
+            inserted_seq = conn.execute(
+                scheduler_events_table.insert().values(**values).returning(scheduler_events_table.c.seq)
             ).scalar_one()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"Scheduler event {event_type.value!r} failed for run_id={run_id!r} "
                 f"work_item_id={work_item_id!r} — database rejected audit write: {type(exc).__name__}"
             ) from exc
-        if inserted_event_id != event_id:
+        if type(inserted_seq) is not int or inserted_seq < 1:
             raise LandscapeRecordError(
-                f"Scheduler event {event_type.value!r} returned unexpected event_id={inserted_event_id!r} for "
-                f"run_id={run_id!r} work_item_id={work_item_id!r}; expected {event_id!r}."
+                f"Scheduler event {event_type.value!r} returned unexpected seq={inserted_seq!r} for "
+                f"run_id={run_id!r} work_item_id={work_item_id!r} event_id={event_id!r}; expected a positive integer."
             )
 
     @staticmethod
@@ -117,10 +124,7 @@ class SchedulerEventStore:
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == run_id)
                 .where(scheduler_events_table.c.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value)
-                .order_by(
-                    scheduler_events_table.c.recorded_at.desc(),
-                    scheduler_events_table.c.event_id.desc(),
-                )
+                .order_by(scheduler_events_table.c.seq.desc())
             )
             .mappings()
             .all()
