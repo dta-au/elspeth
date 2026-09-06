@@ -27,7 +27,7 @@ True, pinning that the refinement is "active but resolved", not "gone".
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -99,7 +99,6 @@ def _mark_pending_sink(scheduler: TokenSchedulerRepository, work_item_id: str) -
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=LEASE_OWNER,
     )
 
@@ -138,7 +137,6 @@ def test_fires_for_blocked_work() -> None:
         work_item_id=claimed.work_item_id,
         queue_key=None,
         barrier_key="barrier-1",
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=LEASE_OWNER,
     )
     assert blocked.status is TokenWorkStatus.BLOCKED
@@ -179,8 +177,8 @@ def test_passes_after_terminal_and_failed_work() -> None:
     _enqueue_ready_token(setup, scheduler, sequence=0)
     _enqueue_ready_token(setup, scheduler, sequence=1)
     first = _claim(scheduler, setup.run_id)
-    scheduler.mark_terminal(work_item_id=first.work_item_id, now=NOW + timedelta(seconds=1), expected_lease_owner=LEASE_OWNER)
+    scheduler.mark_terminal(work_item_id=first.work_item_id, expected_lease_owner=LEASE_OWNER)
     second = _claim(scheduler, setup.run_id)
-    scheduler.mark_failed(work_item_id=second.work_item_id, now=NOW + timedelta(seconds=2), expected_lease_owner=LEASE_OWNER)
+    scheduler.mark_failed(work_item_id=second.work_item_id, expected_lease_owner=LEASE_OWNER)
     assert processor.has_unresolved_scheduler_work() is False
     assert processor.has_scheduled_work() is False

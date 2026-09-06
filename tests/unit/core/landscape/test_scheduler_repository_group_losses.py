@@ -206,7 +206,7 @@ def test_takeover_read_returns_full_table_regardless_of_adopted_epoch(seeded_run
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_a"), recorded_by="w1", now=_NOW)
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_b", token_id="tok_b"), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
-    repo.adopt_group_losses(run_id=run_id, loss_ids=[unadopted[0].loss_id], now=_NOW, coordination_token=seat_token)
+    repo.adopt_group_losses(run_id=run_id, loss_ids=[unadopted[0].loss_id], coordination_token=seat_token)
     assert len(repo.list_unadopted_group_losses(run_id=run_id)) == 1
     assert len(repo.list_group_losses(run_id=run_id)) == 2  # FULL table
 
@@ -225,18 +225,18 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
         record_group_loss(conn, run_id=run_id, spec=_spec(), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
     loss_id = unadopted[0].loss_id
-    marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=_NOW, coordination_token=seat_token)
+    marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=seat_token)
     assert marked_first == 1
 
     # The adopt refreshed the seat from the DATABASE clock (ADR-047), so the
     # window lapses through the database too, not through a future ``now``.
     expire_leader_seat(db, run_id)
-    later = datetime.now(UTC)
+    datetime.now(UTC)
     new_epoch_token = RunCoordinationRepository(db.engine).acquire_run_leadership(
         run_id=run_id, worker_id=f"{WORKER}-takeover", window_seconds=80.0
     )
     assert new_epoch_token.leader_epoch != seat_token.leader_epoch
-    marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], now=later, coordination_token=new_epoch_token)
+    marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=new_epoch_token)
     assert marked_second == 0
 
 
@@ -296,7 +296,6 @@ def test_mark_failed_records_every_staged_group_loss_in_one_transaction(seeded_c
     )
     repo.mark_failed(
         work_item_id=claimed.work_item_id,
-        now=_NOW,
         expected_lease_owner=claimed.lease_owner,
         group_losses=losses,
     )

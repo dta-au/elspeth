@@ -157,6 +157,38 @@ def expire_sink_effect_lease(engine: Any, effect_id: str, *, seconds_ago: float 
     return lapsed
 
 
+def age_barrier_hold(engine: Any, work_item_id: str, *, seconds_ago: float) -> datetime:
+    """Move a BLOCKED work item's ``barrier_blocked_at`` to ``seconds_ago`` seconds before database time.
+
+    Barrier and coalesce restores anchor a hold's age at its durable
+    ``barrier_blocked_at`` measured against the Landscape database clock
+    (ADR-047, C6 stage 3); ``mark_blocked`` stamps that column from the
+    database, so a test that needs an older hold writes the instant into the
+    database's past instead of handing the disposition a clock. Refuses
+    (``AssertionError``) unless exactly one BLOCKED row carries
+    ``work_item_id``. Returns the instant written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.contracts.scheduler import TokenWorkStatus
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        blocked_at = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+            .values(barrier_blocked_at=blocked_at)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"age_barrier_hold: expected exactly one BLOCKED row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return blocked_at
+
+
 def await_database_time(engine: Any, instant: datetime, *, timeout_seconds: float = 5.0) -> datetime:
     """Block until the Landscape database clock is strictly past ``instant``; return the clock read.
 

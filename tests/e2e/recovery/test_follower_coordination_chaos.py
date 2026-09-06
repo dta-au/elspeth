@@ -368,12 +368,10 @@ class TestFollowerIsolation:
         # Mark both terminal.
         crashed.repo.mark_terminal(
             work_item_id=claimed_a.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_a,
         )
         crashed.repo.mark_terminal(
             work_item_id=claimed_b.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_b,
         )
 
@@ -458,12 +456,10 @@ class TestFollowerChaos:
         # Mark both terminal.
         crashed.repo.mark_terminal(
             work_item_id=leader_claim.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=leader_id,
         )
         crashed.repo.mark_terminal(
             work_item_id=follower_claim.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
         )
 

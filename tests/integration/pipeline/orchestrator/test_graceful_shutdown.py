@@ -983,7 +983,7 @@ class TestInterruptAndResume:
             run_id, setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0
         )
 
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         scheduler = TokenSchedulerRepository(setup.db.engine)
         payload_contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
         payload_json = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"value": 10}, payload_contract))
@@ -1006,7 +1006,6 @@ class TestInterruptAndResume:
             work_item_id=work_item.work_item_id,
             queue_key=None,
             barrier_key="merge_paths",
-            now=now,
             expected_lease_owner=leader_worker_id,
         )
 

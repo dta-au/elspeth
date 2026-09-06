@@ -2109,7 +2109,7 @@ class TestForkRecoveryInvariant:
         # row carries the branch's row payload — resume restores _pending from it
         # (BarrierRecoveryCoordinator.restore_from_journal ← list_blocked_barrier_items).
         held_first_node = str(graph.get_transform_id_map()[branch_index_by_name[held_branch_name]])
-        seed_now = datetime.now(UTC)
+        datetime.now(UTC)
         held_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
             run_id=run_id,
             token_id=held_branch.token_id,
@@ -2128,7 +2128,6 @@ class TestForkRecoveryInvariant:
             work_item_id=held_item.work_item_id,
             queue_key=None,
             barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
-            now=seed_now,
             expected_lease_owner="test-harness",
         )
 
@@ -3613,7 +3612,7 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        seed_now = datetime.now(UTC)
+        datetime.now(UTC)
         seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
             run_id=run_id,
             token_id=buffered_child.token_id,
@@ -3630,7 +3629,6 @@ class TestForkRecoveryInvariant:
             work_item_id=seeded_item.work_item_id,
             queue_key=None,
             barrier_key=barrier_key_for_seed,
-            now=seed_now,
             expected_lease_owner="test-harness",
         )
 
@@ -3922,7 +3920,7 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        seed_now = datetime.datetime.now(datetime.UTC)
+        datetime.datetime.now(datetime.UTC)
         for c in children:
             env = _envelope(c.token_data_ref)
             leaf_payload = _PipelineRow(dict(env["data"]), _SchemaContract.from_checkpoint(dict(env["contract"])))
@@ -3942,7 +3940,6 @@ class TestForkRecoveryInvariant:
                 work_item_id=seeded_item.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node_id),
-                now=seed_now,
                 expected_lease_owner="test-harness",
             )
 

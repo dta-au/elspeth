@@ -151,7 +151,6 @@ def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierE
         work_item_id=work_item_id,
         queue_key="queue-a",
         barrier_key=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -159,7 +158,6 @@ def _mark_blocked(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierE
 def _mark_terminal(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_terminal(
         work_item_id=work_item_id,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -167,7 +165,6 @@ def _mark_terminal(repo: TokenSchedulerRepository, work_item_id: str, _: Barrier
 def _mark_failed(repo: TokenSchedulerRepository, work_item_id: str, _: BarrierEmission | None) -> object:
     return repo.mark_failed(
         work_item_id=work_item_id,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -181,7 +178,6 @@ def _mark_pending_sink(repo: TokenSchedulerRepository, work_item_id: str, _: Bar
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -195,7 +191,6 @@ def _mark_terminal_with_ready_children(
     return repo.mark_terminal_with_ready_children(
         work_item_id=work_item_id,
         emitted_ready=(child,),
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -209,7 +204,6 @@ def _mark_failed_with_ready_children(
     return repo.mark_failed_with_ready_children(
         work_item_id=work_item_id,
         emitted_ready=(child,),
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -229,7 +223,6 @@ def _mark_pending_sink_with_ready_children(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=WRONG_OWNER,
     )
 
@@ -278,7 +271,6 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=LEADER,
     )
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)
@@ -288,7 +280,6 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
             harness.repo.mark_pending_sink_terminal_many(
                 run_id=RUN_ID,
                 token_ids=(token_id,),
-                now=NOW + timedelta(seconds=2),
                 expected_lease_owner=WRONG_OWNER,
                 coordination_token=harness.coordination_token,
             )
@@ -297,7 +288,6 @@ def test_f04_wrong_owner_cannot_terminalize_pending_sink_debt_without_mutation(
             harness.repo.mark_pending_sink_terminal(
                 run_id=RUN_ID,
                 token_id=token_id,
-                now=NOW + timedelta(seconds=2),
                 expected_lease_owner=WRONG_OWNER,
                 coordination_token=harness.coordination_token,
             )
@@ -326,7 +316,6 @@ def test_f06_inactive_registered_worker_cannot_claim(
             path=TerminalPath.DEFAULT_FLOW.value,
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=LEADER,
         )
     inactive = f"worker:{RUN_ID}:{status}"
@@ -368,7 +357,6 @@ def test_f06_absent_worker_claim_is_a_zero_mutation_none(subtype: str, harness: 
             path=TerminalPath.DEFAULT_FLOW.value,
             error_hash=None,
             error_message=None,
-            now=NOW,
             expected_lease_owner=LEADER,
         )
     before = capture_state_engine_image(harness.db, run_id=RUN_ID)

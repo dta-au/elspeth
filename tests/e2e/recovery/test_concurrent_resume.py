@@ -679,7 +679,7 @@ class TestTwoResumesSameRunId:
             lease_seconds=_DEFAULT_LEASE_SECONDS,
         )
         assert claimed is not None and claimed.token_id == crashed_token and claimed.attempt == 2
-        crashed.repo.mark_terminal(work_item_id=claimed.work_item_id, now=clock.now_utc(), expected_lease_owner=winner_id)
+        crashed.repo.mark_terminal(work_item_id=claimed.work_item_id, expected_lease_owner=winner_id)
         crashed.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=winner_token)
         coord.release_seat(token=winner_token)
 
@@ -1367,7 +1367,6 @@ class TestTwoResumesSameRunId:
         # Mark the fresh token terminal (follower completed it).
         crashed.repo.mark_terminal(
             work_item_id=follower_claimed.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
         )
 
@@ -1405,7 +1404,6 @@ class TestTwoResumesSameRunId:
         assert recovered_claim is not None and recovered_claim.token_id == crashed_token
         crashed.repo.mark_terminal(
             work_item_id=recovered_claim.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=leader_id,
         )
 

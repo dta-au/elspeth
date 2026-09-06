@@ -403,7 +403,6 @@ class TestFollowerDispositions:
 
         crashed.repo.mark_terminal(
             work_item_id=claimed.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
         )
 
@@ -445,7 +444,6 @@ class TestFollowerDispositions:
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key=barrier_key,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
         )
 
@@ -498,7 +496,6 @@ class TestFollowerDispositions:
         )
         crashed.repo.mark_failed(
             work_item_id=claimed.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
             group_losses=(group_loss,),
         )
@@ -538,7 +535,6 @@ class TestFollowerDispositions:
         )
         crashed.repo.mark_failed(
             work_item_id=claimed2.work_item_id,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
             group_losses=(group_loss_dup,),
         )
@@ -598,7 +594,6 @@ class TestFollowerDispositions:
             path="default_flow",
             error_hash=None,
             error_message=None,
-            now=clock.now_utc(),
             expected_lease_owner=follower_id,
         )
 
