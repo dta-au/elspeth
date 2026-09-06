@@ -251,7 +251,7 @@ def _scheduler_events(engine: Tier1Engine, token_id: str) -> tuple[dict[str, obj
             conn.execute(
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == RUN_ID, scheduler_events_table.c.token_id == token_id)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                .order_by(scheduler_events_table.c.seq)
             )
             .mappings()
             .all()
