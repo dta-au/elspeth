@@ -1182,6 +1182,10 @@ def _constant_string_candidates(
     if isinstance(node, ast.IfExp):
         branches = [_constant_string_candidates(branch, resolver, use=node, seen=next_seen) for branch in (node.body, node.orelse)]
         return None if any(branch is None for branch in branches) else frozenset().union(*(branch or () for branch in branches))
+    if isinstance(node, ast.Subscript):
+        return _subscript_string_candidates(node, resolver, use=use, seen=next_seen)
+    if isinstance(node, ast.Attribute):
+        return _receiver_attribute_string_candidates(node, resolver, use=use, seen=next_seen)
     if not isinstance(node, ast.Name):
         return None
     if resolver.parameter(node.id, use) is not None:
@@ -1241,6 +1245,121 @@ def _literal_container_candidates(
     return None
 
 
+def _subscript_string_candidates(
+    node: ast.Subscript,
+    resolver: _Resolver,
+    *,
+    use: ast.AST,
+    seen: frozenset[int],
+) -> frozenset[str] | None:
+    """Every string a subscript can select: the exact member for a constant key, else EVERY member.
+
+    ``_DATABASE_CLOCK_SQL[engine.dialect.name]`` is admitted as the union of
+    the dictionary's values, so one write value anywhere in the container
+    keeps the site reported.  A non-literal container or a member that does
+    not resolve returns ``None``.
+    """
+
+    exact = resolver.resolve_value(node, use=use)
+    if exact is not node:
+        return _constant_string_candidates(exact, resolver, use=exact, seen=seen)
+    container = resolver.resolve_value(node.value, use=node)
+    if isinstance(container, ast.Dict):
+        # A ``**`` splat member is a Dict node, which the candidate resolver
+        # refuses, so a splatted container fails closed without a guard here.
+        members: Sequence[ast.expr] = container.values
+    elif isinstance(container, (ast.Tuple, ast.List)):
+        members = container.elts
+    else:
+        return None
+    candidates: set[str] = set()
+    for member in members:
+        values = _constant_string_candidates(member, resolver, use=member, seen=seen)
+        if values is None:
+            return None
+        candidates.update(values)
+    return frozenset(candidates) if candidates else None
+
+
+def _method_receiver(node: ast.AST) -> tuple[ast.ClassDef, str] | None:
+    """Return ``(class, receiver name)`` when ``node`` sits directly in an instance method of a class."""
+
+    owner = _owner_function(node)
+    if owner is None:
+        return None
+    for ancestor in _ancestors(owner):
+        if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return None
+        if isinstance(ancestor, ast.ClassDef):
+            break
+    else:
+        return None
+    if any(_dotted_name(decorator) in {"staticmethod", "classmethod"} for decorator in owner.decorator_list):
+        return None
+    positional = (*owner.args.posonlyargs, *owner.args.args)
+    return None if not positional else (ancestor, positional[0].arg)
+
+
+def _receiver_attribute_string_candidates(
+    node: ast.Attribute,
+    resolver: _Resolver,
+    *,
+    use: ast.AST,
+    seen: frozenset[int],
+) -> frozenset[str] | None:
+    """Every string ``self.<attr>`` can hold, when EVERY binding of it in the enclosing class is finite and static.
+
+    The receiver must be the enclosing method's own instance parameter and
+    the class must bind the attribute at least once; each binding must be a
+    plain ``self.<attr> = …`` whose value resolves to constant candidates.  A
+    tuple-unpacked or augmented binding, a binding on any other receiver, or
+    a ``setattr`` call anywhere in the class returns ``None``: nothing is
+    inferred from the attribute's name.
+    """
+
+    if not isinstance(node.value, ast.Name):
+        return None
+    located = _method_receiver(use)
+    if located is None or node.value.id != located[1]:
+        return None
+    owner_class = located[0]
+    candidates: set[str] = set()
+    bindings = 0
+    for member in ast.walk(owner_class):
+        if isinstance(member, ast.Call) and _call_name(member) == "setattr":
+            return None
+        if isinstance(member, (ast.AugAssign, ast.AnnAssign)):
+            targets: list[ast.expr] = [member.target]
+        elif isinstance(member, ast.Assign):
+            targets = list(member.targets)
+        else:
+            continue
+        for target in targets:
+            matches = [
+                child
+                for child in ast.walk(target)
+                if isinstance(child, ast.Attribute) and child.attr == node.attr and isinstance(child.value, ast.Name)
+            ]
+            if not matches:
+                continue
+            binder = _method_receiver(member)
+            if (
+                not isinstance(member, ast.Assign)
+                or target is not matches[0]
+                or len(matches) != 1
+                or binder is None
+                or binder[0] is not owner_class
+                or matches[0].value.id != binder[1]
+            ):
+                return None
+            values = _constant_string_candidates(member.value, resolver, use=member.value, seen=seen)
+            if values is None:
+                return None
+            candidates.update(values)
+            bindings += 1
+    return frozenset(candidates) if bindings else None
+
+
 def _raw_sql_exact_texts(node: ast.expr, resolver: _Resolver, *, use: ast.AST) -> frozenset[str] | None:
     """Return every SQL text the statement can carry, when each is statically known in full.
 
@@ -1257,7 +1376,7 @@ def _raw_sql_exact_texts(node: ast.expr, resolver: _Resolver, *, use: ast.AST) -
     if direct is not None:
         return frozenset({direct})
     if not isinstance(node, ast.JoinedStr):
-        return None
+        return _constant_string_candidates(node, resolver, use=use)
     texts: frozenset[str] = frozenset({""})
     for part in node.values:
         if isinstance(part, ast.Constant) and isinstance(part.value, str):
@@ -2934,7 +3053,14 @@ def _raw_write_surface_violations(units: Iterable[SourceUnit]) -> tuple[str, ...
             shape = _raw_dml_shape(node, resolver)
             raw_sql = _raw_sql_literal(node, resolver)
             if execution_name == "exec_driver_sql" and raw_sql is None:
-                violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside unknown raw SQL effect")
+                # A text carried by a name, a subscript of a literal container,
+                # or the method's own instance attribute is admitted only when
+                # EVERY candidate resolves and every one is a proven read.
+                exact = _raw_sql_exact_texts(node.args[0], resolver, use=node)
+                if any(_raw_sql_is_write(text) for text in (exact or ())):
+                    violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside raw SQL write/DDL")
+                elif exact is None or not all(_raw_sql_is_proven_read(text) for text in exact):
+                    violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside unknown raw SQL effect")
                 continue
             if shape is None and raw_sql is not None and _raw_sql_is_write(raw_sql):
                 violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} outside raw SQL write/DDL")
@@ -5661,6 +5787,110 @@ def test_raw_execution_scanner_rejects_alias_dynamic_explain_write_pragma_and_ou
     assert any("write/DDL" in item for item in future_violations)
     assert sum("raw .write_connection" in item for item in future_violations) == 2
     assert sum("outside raw SQL write/DDL" in item for item in future_violations) >= 2
+
+
+def test_raw_execution_admits_a_self_attribute_bound_to_a_constant_read_dictionary() -> None:
+    """ADR-047 clock idiom: ``conn.exec_driver_sql(self._clock_sql)`` is admitted by resolution, never by name.
+
+    The attribute is admitted only when EVERY binding of it in the enclosing
+    class resolves to a finite set of constant texts and every text is a
+    proven read.  One write candidate, one parameter-fed binding, a rebinding
+    in another method, a ``setattr`` anywhere in the class, a tuple-unpacked
+    binding, a foreign receiver, or a class that never binds the attribute
+    keeps the site reported.
+    """
+
+    def clock_authority(*, values: str, init_binding: str, read_receiver: str = "self", extra_member: str = "") -> SourceUnit:
+        body = (
+            "_DATABASE_CLOCK_SQL = {\n"
+            f"    {values}\n"
+            "}\n"
+            "\n"
+            "class Authority:\n"
+            "    def __init__(self, engine, clock_sql):\n"
+            "        self._engine = engine\n"
+            f"        {init_binding}\n"
+            "\n"
+            "    def now(self, other):\n"
+            "        with self._engine.begin() as conn:\n"
+            f"            return conn.exec_driver_sql({read_receiver}._clock_sql).scalar_one()\n"
+            f"{extra_member}"
+        )
+        return _parse_source("src/elspeth/web/coordination/clock_authority.py", body)
+
+    read_values = "'postgresql': 'SELECT clock_timestamp()', 'sqlite': 'SELECT CURRENT_TIMESTAMP',"
+    dialect_binding = "self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]"
+
+    admitted = clock_authority(values=read_values, init_binding=dialect_binding)
+    assert _raw_write_surface_violations([admitted]) == ()
+
+    constant_key = clock_authority(
+        values="'postgresql': 'DELETE FROM identities', 'sqlite': 'SELECT CURRENT_TIMESTAMP',",
+        init_binding="self._clock_sql = _DATABASE_CLOCK_SQL['sqlite']",
+    )
+    assert _raw_write_surface_violations([constant_key]) == ()
+
+    write_candidate = clock_authority(
+        values="'postgresql': 'SELECT clock_timestamp()', 'sqlite': 'DELETE FROM identities',",
+        init_binding=dialect_binding,
+    )
+    write_violations = _raw_write_surface_violations([write_candidate])
+    assert len(write_violations) == 1
+    assert "outside raw SQL write/DDL" in write_violations[0]
+
+    def unknown_rows(unit: SourceUnit) -> list[str]:
+        violations = _raw_write_surface_violations([unit])
+        return [item for item in violations if "outside unknown raw SQL effect" in item]
+
+    parameter_fed = clock_authority(values=read_values, init_binding="self._clock_sql = clock_sql")
+    assert len(unknown_rows(parameter_fed)) == 1
+
+    rebound_elsewhere = clock_authority(
+        values=read_values,
+        init_binding=dialect_binding,
+        extra_member="\n    def retarget(self, sql):\n        self._clock_sql = sql\n",
+    )
+    assert len(unknown_rows(rebound_elsewhere)) == 1
+
+    setattr_in_class = clock_authority(
+        values=read_values,
+        init_binding=dialect_binding,
+        extra_member="\n    def retarget(self, name, sql):\n        setattr(self, name, sql)\n",
+    )
+    assert len(unknown_rows(setattr_in_class)) == 1
+
+    tuple_unpacked = clock_authority(
+        values=read_values,
+        init_binding="self._engine, self._clock_sql = engine, _DATABASE_CLOCK_SQL[engine.dialect.name]",
+    )
+    assert len(unknown_rows(tuple_unpacked)) == 1
+
+    foreign_receiver = clock_authority(values=read_values, init_binding=dialect_binding, read_receiver="other")
+    assert len(unknown_rows(foreign_receiver)) == 1
+
+    never_bound = clock_authority(values=read_values, init_binding="self._other = _DATABASE_CLOCK_SQL[engine.dialect.name]")
+    assert len(unknown_rows(never_bound)) == 1
+
+    transaction_control = clock_authority(
+        values="'postgresql': 'SELECT clock_timestamp()', 'sqlite': 'BEGIN IMMEDIATE',",
+        init_binding=dialect_binding,
+    )
+    assert _raw_write_surface_violations([transaction_control]) == tuple(unknown_rows(transaction_control))
+    assert len(unknown_rows(transaction_control)) == 1
+
+    splat_dictionary = _parse_source(
+        "src/elspeth/web/coordination/splat_clock_authority.py",
+        "_BASE = {'sqlite': 'SELECT CURRENT_TIMESTAMP'}\n"
+        "_DATABASE_CLOCK_SQL = {**_BASE, 'postgresql': 'SELECT clock_timestamp()'}\n"
+        "class Authority:\n"
+        "    def __init__(self, engine):\n"
+        "        self._engine = engine\n"
+        "        self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]\n"
+        "    def now(self):\n"
+        "        with self._engine.begin() as conn:\n"
+        "            return conn.exec_driver_sql(self._clock_sql).scalar_one()\n",
+    )
+    assert len(unknown_rows(splat_dictionary)) == 1
 
 
 def test_transaction_scanner_rejects_nested_decoy_payload_before_fence_and_multi_caller_helper() -> None:
