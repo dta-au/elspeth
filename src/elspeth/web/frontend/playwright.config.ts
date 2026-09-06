@@ -86,6 +86,34 @@ const composerSettingsEnv: Record<string, string> = {
   ELSPETH_WEB__shareable_link_signing_key: "ZWxzcGV0aC1lMmUtc2hhcmUta2V5LTAwMDAwMDAwMDA=", // secret-scan: allow-this-line
 
   ELSPETH_WEB__cors_origins: JSON.stringify([FRONTEND_URL]),
+  // Hermetic composer availability (elspeth-e425a36805). litellm runs
+  // python-dotenv's load_dotenv() at import unless LITELLM_MODE is
+  // "PRODUCTION", and find_dotenv walks UP from the package, so on a
+  // developer box the Playwright-managed backend picked up the checkout's
+  // .env (a worktree sits beneath it too): the developer's provider key,
+  // composer models and turn/timeout limits — the .env's upper-case keys
+  // beat the lower-case pins above — and litellm logged completion() calls
+  // against those models at boot. CI has no .env anywhere above its
+  // checkout, so it booted without any of that. The tall-dialog full-page
+  // baseline captured the split: green locally with an empty notice band,
+  // red on CI where the band carried "Service unavailable: … missing
+  // OPENAI_API_KEY." This pin is a no-op on CI and makes the local backend
+  // boot the same way. It is litellm's only use of LITELLM_MODE.
+  LITELLM_MODE: "PRODUCTION",
+  // No ambient provider credential reaches the backend from the developer's
+  // shell either: every key in PROVIDER_REQUIRED_ENV_KEYS
+  // (src/elspeth/web/composer/provider_config.py) is blanked, and an empty
+  // value counts as missing (_missing_required_env_keys in
+  // src/elspeth/web/composer/availability.py). The composer is therefore
+  // unavailable in every E2E run — the state CI has always tested — and the
+  // model names are pinned so the notice copy the tall-dialog baseline
+  // carries does not move with the product default.
+  OPENAI_API_KEY: "",
+  ANTHROPIC_API_KEY: "",
+  AZURE_API_KEY: "",
+  OPENROUTER_API_KEY: "",
+  ELSPETH_WEB__composer_model: "gpt-5.5",
+  ELSPETH_WEB__composer_advisor_model: "anthropic/claude-sonnet-4-6",
 };
 
 export default defineConfig({
