@@ -30,7 +30,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.coordination import mint_worker_id
 from elspeth.contracts.errors import JoinRefusedError
@@ -43,7 +43,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.core import Orchestrator
-from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, make_landscape_db, on_fresh_database_second
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -444,3 +444,42 @@ class TestJoinAdmissionAtomicity:
         assert len(workers) == 1
         assert workers[0]["role"] == "leader"
         assert _coord_events(db) == events_before
+
+
+class TestSeatLivenessBoundary:
+    """ADR-047: admission decides ``leader_heartbeat_expires_at >= database_now`` on the Landscape clock.
+
+    The comparison moved from ``> now`` (process clock) to ``>= database_now``,
+    which changes admission AT exact equality. Both sides of the boundary are
+    pinned here: a seat whose deadline EQUALS database time is still live and
+    admits the follower; one second past it is refused.
+    """
+
+    def test_seat_deadline_equal_to_database_time_admits_and_one_second_past_refuses(self) -> None:
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        fake_settings = types.SimpleNamespace()
+
+        def stamp_seat_at_database_now_and_join(database_now: datetime) -> str:
+            with db.write_connection() as conn:
+                stamped = read_landscape_transaction_time(conn)
+                assert stamped == database_now
+                conn.execute(
+                    update(run_coordination_table)
+                    .where(run_coordination_table.c.run_id == RUN_ID)
+                    .values(leader_heartbeat_expires_at=stamped)
+                )
+            with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
+                return _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings)
+
+        # Equality arm, inside one whole SQLite database second.
+        worker_id = on_fresh_database_second(db.engine, stamp_seat_at_database_now_and_join)
+        assert worker_id.startswith(f"worker:{RUN_ID}:")
+        assert [w["status"] for w in _worker_rows(db) if w["worker_id"] == worker_id] == ["active"]
+
+        # Strictly-past arm: the seat lapsed one database second ago.
+        expire_leader_seat(db, RUN_ID)
+        with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings)
+        assert "no live leader" in str(exc_info.value).lower()
+        assert len([w for w in _worker_rows(db) if w["role"] == "follower"]) == 1, "the refused join registered no second follower"

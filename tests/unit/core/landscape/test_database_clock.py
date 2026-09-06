@@ -34,7 +34,7 @@ from elspeth.core.landscape.database import LandscapeDB, begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, verify_and_extend_leader_fence
 from elspeth.core.landscape.schema import run_coordination_table, runs_table
-from tests.fixtures.landscape import assert_deadline_within, landscape_database_now, make_landscape_db
+from tests.fixtures.landscape import assert_deadline_within, make_landscape_db, within_one_database_second
 from tests.helpers.run_coordination import register_run_leader
 from tests.unit.core.landscape.test_database_clock_authority import _clock_returning_references, _scan_sources
 
@@ -203,7 +203,8 @@ class TestFirstFenceDatabaseDeadline:
         )
         return run_id, token
 
-    def test_sqlite_fence_deadline_is_database_time_plus_window_as_whole_second_text(self) -> None:
+    def test_sqlite_fence_deadline_is_database_time_plus_window_in_canonical_storage_text(self) -> None:
+        """The fence writes its deadline and stamp in the ``.ffffff`` storage format, exactly window apart."""
         db = make_landscape_db()
         try:
             run_id, token = self._seated_run(db)
@@ -211,30 +212,56 @@ class TestFirstFenceDatabaseDeadline:
                 database_now = read_landscape_transaction_time(conn)
                 verify_and_extend_leader_fence(conn, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="unit-test")
             with db.engine.connect() as conn:
-                raw = conn.execute(
-                    text("SELECT leader_heartbeat_expires_at FROM run_coordination WHERE run_id = :run_id"), {"run_id": run_id}
-                ).scalar_one()
+                raw_deadline, raw_stamp = conn.execute(
+                    text("SELECT leader_heartbeat_expires_at, updated_at FROM run_coordination WHERE run_id = :run_id"),
+                    {"run_id": run_id},
+                ).one()
                 stamped = conn.execute(
-                    select(run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id)
-                ).scalar_one()
+                    select(run_coordination_table.c.leader_heartbeat_expires_at, run_coordination_table.c.updated_at).where(
+                        run_coordination_table.c.run_id == run_id
+                    )
+                ).one()
         finally:
             db.close()
-        assert isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw), raw
-        assert_deadline_within(stamped, database_now + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS))
+        canonical = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000000"
+        assert isinstance(raw_deadline, str) and re.fullmatch(canonical, raw_deadline), raw_deadline
+        assert isinstance(raw_stamp, str) and re.fullmatch(canonical, raw_stamp), raw_stamp
+        assert stamped[0] - stamped[1] == timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
+        assert_deadline_within(stamped[0], database_now + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS))
 
-    def test_fence_text_artefact_is_under_one_second_against_a_fractional_bound(self) -> None:
-        """A ``.ffffff`` bound for the same instant differs from the fence text by less than the window floor."""
+    def test_sqlite_fence_deadline_compares_exactly_against_a_bound_value_below_the_ten_second_floor(self) -> None:
+        """A five-second window is safe: the fence text equals the bound text for the same instant byte for byte.
+
+        This is the guard the ten-second floor used to stand in for. The
+        sub-floor deployment-profile suites rebind the liveness window to
+        5.0 s; a fractionless fence text would have sorted before a bound
+        ``.ffffff`` value of the same second and expired the seat up to a
+        second early — 20 % of that window.
+        """
         db = make_landscape_db()
         try:
-            _run_id, token = self._seated_run(db)
-            with begin_write(db.engine) as conn:
-                verify_and_extend_leader_fence(conn, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="unit-test")
-            bound = datetime.now(UTC) + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
-            stamped = landscape_database_now(db.engine)  # a whole-second read of the same clock
+            run_id, token = self._seated_run(db)
+
+            def fence_and_compare(database_now: datetime) -> tuple[str, bool, bool]:
+                bound = database_now + timedelta(seconds=5)
+                with begin_write(db.engine) as conn:
+                    verify_and_extend_leader_fence(conn, token=token, window_seconds=5.0, verb="unit-test")
+                    raw = conn.execute(
+                        text("SELECT leader_heartbeat_expires_at FROM run_coordination WHERE run_id = :run_id"), {"run_id": run_id}
+                    ).scalar_one()
+                    seat = run_coordination_table.c.leader_heartbeat_expires_at
+                    # The comparisons the fence readers make, against a bound
+                    # ``datetime`` of the same instant: not-expired at equality
+                    # and not a microsecond later than the bound either.
+                    not_expired = conn.execute(select(seat >= bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
+                    later_than_bound = conn.execute(select(seat > bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
+                return str(raw), bool(not_expired), bool(later_than_bound), bound
+
+            raw, not_expired, later_than_bound, bound = within_one_database_second(db.engine, fence_and_compare)
         finally:
             db.close()
-        assert stamped.microsecond == 0
-        assert abs((bound - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)) - stamped) < timedelta(seconds=1)
+        assert raw == bound.strftime("%Y-%m-%d %H:%M:%S.%f"), (raw, bound)
+        assert not_expired is True and later_than_bound is False
 
     def test_every_production_window_is_at_least_ten_seconds(self) -> None:
         assert DEFAULT_RUN_HEARTBEAT_SECONDS >= 10
