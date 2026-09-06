@@ -394,7 +394,7 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # (49a7bb16c), _recover_expired_leases (55a8a94f4) and
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
-_EXPECTED_DML_COUNT = 142
+_EXPECTED_DML_COUNT = 144
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -414,7 +414,12 @@ _EXPECTED_DML_COUNT = 142
 # Then d51c3414… → de37c3fe… (count 142, write set unchanged): the two
 # run_coordination_events constructions share one ``_coordination_event_id``
 # recipe and the batch rows carry no soft-mapping annotation (census 2734 held).
-_EXPECTED_DML_INVENTORY_SHA256 = "de37c3fe425aeae2f8c665be0bbbb280675c5a05f9d3c4543fbe7f4430cd0fe7"
+# Then 142 -> 144 (de37c3fe… → b8797993…, C6 stages 3-4 elspeth-0ff11aa42e,
+# rebased onto 282936e27): SchedulerDispositionRepository._transition_on
+# executes one inline UPDATE per owned disposition image (three sites) in
+# place of the one mapping-driven UPDATE. Write set unchanged; re-derived from
+# the gate's printed output on the rebased tree.
+_EXPECTED_DML_INVENTORY_SHA256 = "b8797993bf0a7bdbd851b0798055a3bbb2560281ebcfe70d4a2c52fdf780abde"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -497,8 +502,13 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # 266 -> 267: SinkEffectCoordinator._lease takeover_expired#2 — the own-lease
 # path falls back to takeover_expired when the repository, deciding against
 # Landscape database time (ADR-047), reports the worker's own lease lapsed.
-_EXPECTED_CALL_COUNT = 267
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "2a5896a85214bc7acb757fdd08bfd7b94bbc7219c5b2560ed9cc79e2db3c13a8"
+# 267 -> 269 on the rebase onto 282936e27: release/0.8.0@282936e27 itself
+# scans 268 callers against its pinned 266 (measured on a git archive of that
+# tip; the two un-pinned callers arrived with the ADR-048 run-coordination
+# work), plus this lane's takeover_expired#2 above. Re-derived from the gate's
+# printed output on the rebased tree; no caller of this lane's was removed.
+_EXPECTED_CALL_COUNT = 269
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "4abf5f610cef539417cbbb143c9dfd720b424c8a55d3dd8b9e971d440673a184"
 # Subordinate edges 70 -> 80 (-5 +15): create_row_with_token's second
 # insert_row_with_token_on edge and record_coalesce_branch_loss's two edges
 # retired; _transition_on's two edges rotated with the group_losses
