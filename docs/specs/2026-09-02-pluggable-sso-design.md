@@ -76,9 +76,24 @@ The tech-debt-free window is weeks, not months.
 | D32 **[rev2.8]** | Does R3 disable the identity | Yes: `disabled`, `disable_reason='rebound'`, actor `system`, audit row. It honours R5 on the last active human admin rather than bricking the container, and it does **not** run the edge-revocation cascade, which is unrecoverable and fires most often on a marriage or a rename. |
 | D34 **[rev2.8]** | Dormancy versus the last admin | R9 carries R5's last-admin exemption. Otherwise a single-admin container reaches zero active admins at day 91 by doing nothing, and the first-login-only seed cannot re-fire. |
 
+**[rev2.11] D10's narration, not its ruling.** D10 says "the VANguard
+**spike**". rev2.11 renamed that section to §VANguard live confirmation, so
+the word now names nothing; read it as pointing there. Its conditional has
+also moved: the profile is written and keys on `sub` either way
+(`map_vanguard`), and the detection columns `subject_email_at_first_seen`
+and `rebound_at` are on `identities`. What a live token pair still settles
+is whether that `sub` is stable and non-email — the subject is an email
+today — which is exactly why those columns exist. **The R3 refusal itself is
+specified (§Refusals R3, D32) and is not yet implemented:** `rebound_at` is
+only ever written `NULL`, `subject_email_at_first_seen` is written at first
+sight and compared nowhere, and no `disable_reason='rebound'` exists in the
+tree. D10's ruling — no `principals` table, identity merge an unbuilt admin
+action — is unchanged and correct.
+
 ## Architecture
 
-Four units replace the three provider classes and the browser exchange.
+Five units replace the three provider classes and the browser exchange
+[rev2.11: the count read "Four" and omitted §5].
 
 ### 1. IdP profile registry — `src/elspeth/web/auth/providers/`
 
@@ -149,9 +164,23 @@ that profile's configuration for this container. The build carries no
 credentials; the profile carries no deployment facts. The settings
 validator rejects a value with no registered profile by naming the
 registered profiles in the error, readiness reports the active profile
-name and each missing `required_settings` field by name, and
-`GET /api/auth/config` returns the active `provider`. Switching a container
-from one IdP to another is a config change and a restart, never a build.
+name, and `GET /api/auth/config` returns the active `provider`. Switching a
+container from one IdP to another is a config change and a restart, never a
+build.
+
+**A partial identity configuration fails at settings load [rev2.11]. The
+container does not start.** It does not come up and report itself unready:
+`WebSettings` refuses the shape and names every missing `required_settings`
+field, and for a registered profile it cannot wire, `create_app` raises and
+names them again (§5). Earlier revisions of this paragraph said readiness
+would name the missing fields. Readiness still holds that arm as a total
+boundary, and its "no registered profile" arm is live, but no ordinary
+deployment reaches it with an incomplete configuration — it exited before the
+application existed. What an operator sees is a task that starts, exits
+immediately, and restarts, with the reason in the exit log rather than a
+readiness response; see
+[docs/guides/identity-providers.md](../guides/identity-providers.md)
+§The failure mode operators get wrong.
 
 `EntraAuthProvider`
 is deleted; its tenant check moves into the Entra profile and is re-declared
@@ -298,6 +327,29 @@ variant is a recorded future option.
 
 See §Data model.
 
+### 5. Startup wiring — `src/elspeth/web/sso_wiring.py` [rev2.11]
+
+The one place that knows the registry, the login walk, the identity
+substrate and the settings, so the app factory binds one object
+(`app.state.sso`) and the three `/sso/*` routes read that and nothing else.
+Two phases, because the factory is synchronous and discovery is not:
+`build_sso_wiring` runs in the factory and assembles everything needing no
+network (token issuer, handoff store, admission and read callables, the
+profile's claim checks), deciding by the same rule readiness reports on
+whether the deployment is wired at all; `resolve_sso_runtime` runs in
+lifespan and resolves the IdP endpoints — the operator's break-glass
+override, else discovery under the profile's origin policy. Discovery
+failing is a boot failure by choice: a deployment that cannot reach its IdP
+cannot log anyone in, and saying so at startup beats saying it to every user
+at the callback. `build_sso_wiring` returning `None` deliberately means two
+different things — for `local` it is the ordinary answer, there being no IdP
+to wire; for a registered profile it is a boot refusal, because with the
+legacy bearer path deleted (§Deleted outright) there is no second way to
+authenticate anyone. The invariant underneath is that a
+partially configured profile must never produce a partially working login,
+and it is the mechanism behind the boot failure described under §Operator
+selection.
+
 ### ID-token validation [rev2]
 
 A dedicated ID-token decode path on `JWKSTokenValidator` (the Cognito
@@ -435,7 +487,13 @@ Cutover by deployment:
 
 - **ECS (Postgres, both stores):** archive/export required evidence, drop,
   recreate, `--init-schema`, compatibility record updated with
-  `session_epoch: 50`, `landscape_epoch: 37`, `rollback_permitted: false`.
+  `rollback_permitted: false` and this delivery's two epochs — **copy those
+  two numbers from the worked compatibility record in
+  [docs/runbooks/aws-ecs-deployment.md](../runbooks/aws-ecs-deployment.md)
+  (§Bound release/schema compatibility record), never from this spec
+  [rev2.11].** That record is the artefact the acceptance gate re-reads and
+  asserts against; epoch literals pinned here have drifted from
+  `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` before.
   In-place changes are forbidden by the pre-1.0 gate. All live SSO sessions
   are invalidated at this deploy; users log in again. This is stated in the
   operator notice for the window.
@@ -911,8 +969,9 @@ errand; the profile and its tests do not wait for one [rev2.11].
   caller identity it accepts — a capability, not an authorization. The read
   writes an `audit_access_log` row under a new `writer_principal` value,
   added **in this epoch**: one identity reading another's work is the
-  disclosure an auditor will ask about, and adding the value after epoch 50
-  costs exactly the window this spec is structured to take only once.
+  disclosure an auditor will ask about, and adding the value after this
+  delivery's epoch cut costs exactly the window this spec is structured to
+  take only once.
   *Sent*: my own requests with their state, the decider, the decision
   note, and when; opening one sets `decision_seen_at`. A badge on the
   navigation shows unread counts from one summary endpoint. It needs its own
@@ -1062,7 +1121,7 @@ the bullet, not the heading.
   *export* half of this bullet was stale — it is owned in the plan already
   [rev2.8].
 
-## Workflow tables (sessions store, epoch 50) — "for but not with" [rev2.1, D13]
+## Workflow tables (sessions store, this delivery's epoch) — "for but not with" [rev2.1, D13]
 
 Basic columns only. Every table keys on `identity_id`. Every mutation writes
 its `auth_events` row before responding. Fleshed out later without a new
@@ -1191,8 +1250,15 @@ and each one is supplied by whoever deploys ELSPETH, for their own
 environment. This repository is public and stores no provider credential, so a
 registration is configuration a deployment brings — `sso_client_id`,
 `sso_client_secret`, and the profile's issuer, tenant or hosted domain — not a
-dependency the project waits on. No source file and no test needs one, and
-`auth_provider=local` needs no registration at all. **[rev2.11 replaces
+dependency the project waits on. No source file, and no unit or integration
+test, needs one: every profile is proved against the in-process fake IdP
+(`tests/helpers/fake_idp.py`), which signs with a real RSA key and serves
+discovery, JWKS, token and the userinfo leg VANguard alone calls. The live
+acceptance layer needs one by definition (§Testing, the **Live** bullet) —
+`tests/e2e/aws-ecs-oidc.staging.spec.ts` is a checked-in test whose
+`playwright.oidc.config.ts` refuses to start without `STAGING_BASE_URL`, and
+it drives a deployed stack, not a fixture. And `auth_provider=local` needs no
+registration at all. **[rev2.11 replaces
 "External dependencies", which read these as work owed to the project before
 it could proceed; that framing produced a ruling that had to be reversed, see
 §Rollout order step 1.]**

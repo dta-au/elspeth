@@ -374,8 +374,8 @@ consulted.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `sso_client_id` | string | Yes (every IdP) | - | The client identifier issued when you registered ELSPETH with your provider |
-| `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser |
-| `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` |
+| `sso_client_secret` | secret | Yes (every IdP) | - | The client secret for that registration. Held server-side only; never sent to the browser. Supply by reference from a secret store, never as an environment literal |
+| `sso_transaction_secret` | secret | Yes (every IdP) | - | Seals the login transaction cookie carrying the PKCE verifier, state, and nonce. Independent of `secret_key`, so rotating one does not invalidate the other. Generate with `openssl rand -base64 32` and place the value in a secret store; supply by reference, never as an environment literal |
 | `public_base_url` | string | Yes (every IdP) | - | This deployment's externally visible origin. Must be a bare origin — scheme, host, and optional port, with no path, query, or fragment — and must be public HTTPS unless it is an HTTP loopback address for local development. A trailing slash is stripped |
 | `compartment_id` | string | Yes (every IdP) | - | Operator-declared marking for this container's identities and artifacts. Validated non-blank; no runtime path reads it in this release |
 | `quota_default_tokens_per_day` | int | Yes (every IdP) | - | Daily LLM token allowance written into each identity's quota policy row at activation. Must be greater than 0 |
@@ -434,14 +434,30 @@ the token header.
 Normal operation is discovery: ELSPETH fetches the provider's discovery
 document and validates the endpoints it names against the profile's origin
 policy. The four overrides below exist for the case where that document is
-wrong or unreachable. They skip **discovery**, not validation — whatever you
+wrong or unreachable. They skip **discovery**, and with it two things that
+only discovery does — see below — but not endpoint validation: whatever you
 supply is still held to the same origin policy, and an endpoint outside it is
 refused with `authorization_endpoint failed expected-origin check`.
 
 Discovery is a hard dependency at startup. When it is not overridden and the
 provider cannot be reached, the process exits with `FATAL: SSO discovery
-failed`. That is what these overrides are for: the moment a rollback is
-forbidden is the moment a provider outage must not stop the service booting.
+failed`.
+
+**What skipping discovery costs, and why these are not for permanent use.**
+The exact-issuer check lives inside the discovery path: it is the comparison
+that produces `discovery document failed the exact issuer check`. With the
+trio configured, the provider's document is never fetched, so that check never
+runs, and the origin policy is the only remaining tie between the configured
+issuer and the endpoints in use. Second, `sso_jwks_uri` becomes a fixed
+address rather than one the provider publishes, so a provider that relocates
+its JWKS endpoint breaks every login until the setting is edited by hand. ID
+token validation is unaffected — issuer, audience, expiry and nonce are
+checked on every token regardless.
+
+Set them to survive a broken or unreachable document, then remove them. A
+deployment that carries them permanently has traded a startup dependency it
+can observe for two guarantees it no longer has, which is a worse trade than
+the boot failure it avoids.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -468,11 +484,11 @@ sso_userinfo_endpoint requires the other sso endpoint overrides:
 sso_authorization_endpoint, sso_token_endpoint, sso_jwks_uri
 ```
 
-The overrides apply to `oidc` and `vanguard`. `entra` derives its issuer from
-the tenant and `google` fixes its own, so neither carries the `sso_issuer` the
-override validation reads. Supplying the trio under either one currently fails
-with a bare `Assertion failed` carrying no diagnostic text, including when the
-endpoints you supply are on the origins that profile expects.
+The overrides apply to every profile. Each is validated against the origin
+policy of the profile in use — the issuer's origin for `oidc` and `vanguard`,
+`https://login.microsoftonline.com` for `entra`, and Google's four published
+origins for `google` — so a profile that derives its issuer rather than
+stating it can still break the glass.
 
 ### Bootstrap, quotas, and identity lifecycle
 
@@ -492,10 +508,16 @@ has an active human admin follows the ordinary pending path.
 
 That exception is scoped to the count, not to time: should the container fall
 back to zero active human admins, a listed subject seeds themselves again on
-their next login. Remove the setting once the first administrator exists, and
-use `elspeth composer users bootstrap-admin` for a later lockout — it applies
-the same refusal and writes the same audit rows without leaving a standing
-entry in the configuration.
+their next login. Remove the setting once the first administrator exists.
+
+`elspeth composer users bootstrap-admin` does the same job from the operator's
+side and leaves no standing entry in the configuration, which makes it the
+better of the two. It is not, however, a general recovery path: it calls the
+same guarded method, so it is refused under the identical condition, and it
+recovers only the zero-admin case — the same case in which the seed re-arms. A
+deployment whose administrator row is active but whose administrator can no
+longer authenticate is recoverable by neither, and needs direct work against
+the sessions store. Keep more than one administrator activated.
 
 ### JWKS cache tuning
 

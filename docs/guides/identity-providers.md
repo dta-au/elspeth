@@ -200,16 +200,21 @@ Two optional settings are worth knowing about from the start:
 > listed self-grants `admin` at their next login, bypassing the
 > pending-by-default admission entirely. Someone who has since left the
 > organisation is still on that list. Treat it as a one-shot seed you delete,
-> not a standing configuration entry. If you are ever locked out, the
-> recovery path is the operator command
-> `elspeth composer users bootstrap-admin <provider> <subject> --note "<why>"`,
-> which is refused while an active human administrator exists and writes its
-> own audit row. That command exists precisely so the list does not have to
-> stay behind.
+> not a standing configuration entry — `elspeth composer users bootstrap-admin`
+> does the same job without leaving anything behind, and
+> [Admitting the first person](#admitting-the-first-person) covers both paths
+> and what neither of them recovers.
 
 Every setting is supplied as an environment variable named `ELSPETH_WEB__`
 followed by the setting name in upper case. Collection-valued settings
 (`sso_endpoint_origins`, `sso_admin_subjects`) take a JSON array.
+
+**The two secrets are the exception to how you supply them.**
+`sso_client_secret` and `sso_transaction_secret` must arrive by reference from
+a secret store — never as a literal in a task definition, a values file, a
+compose file, or anything committed to a repository. See
+[Keeping the client secret out of the repository](#keeping-the-client-secret-out-of-the-repository)
+below for the worked AWS example.
 
 A deployment also needs the settings every ELSPETH web service needs, such as
 `secret_key`, `shareable_link_signing_key`, the database URLs, and the composer
@@ -264,6 +269,13 @@ The `oidc` profile targets any standards-compliant provider. AWS Cognito is
 used here as the worked example because this repository ships Terraform that
 registers exactly this client, in
 `deploy/aws-ecs/terraform/modules/scenario/storage_identity.tf`.
+
+Read that as a worked reference rather than something every deployment gets:
+the pool, its domain and the client are each gated on
+`deployment_mode == "upgrade"`, and a `first`-mode cold install creates none of
+them and comes up on local authentication. Two of the three shipped scenario
+roots are `first`. If you are deploying elsewhere, the steps below are yours to
+perform in your own tenant.
 
 Create a user pool, a pool domain, and an **app client with a secret**. For
 Cognito that is `generate_secret = true`; in other providers it is usually the
@@ -393,6 +405,62 @@ Where your provider requires a human to copy a secret out of a console — Entra
 and Google both do — paste it directly into your secret store, and reference it
 from there. Record the expiry date somewhere you will see it before it passes.
 
+One custody note that is easy to miss: when Terraform generates or reads a
+secret, that value is stored in plaintext in Terraform **state**. The secret is
+absent from the repository, but the state file now holds it and needs the same
+protection as the secret store itself — a remote backend with encryption and
+restricted access, never a state file committed or left on a workstation.
+
+---
+
+## Admitting the first person
+
+**A working SSO deployment admits nobody until you do this.** It is the step
+most likely to be missed, because nothing fails: the container starts, health
+and readiness pass, the login page appears, and the provider authenticates
+people correctly. They simply cannot get in.
+
+The reason is that a first SSO login lands **pending** by design. The provider
+established who someone is; it did not decide that this deployment admits them.
+An administrator activates them. On a new deployment there is no administrator
+to do it, and no amount of successful authentication creates one.
+
+Two ways to make the first administrator. Both are refused once an active human
+administrator exists, so neither is a way to escalate later.
+
+**The operator command, and the one to prefer.** With access to the deployment's
+sessions store, run:
+
+```bash
+elspeth composer users bootstrap-admin <provider> <subject> \
+  --note "why this bootstrap is happening"
+```
+
+`<subject>` is the person's `sub` claim at your provider — the same value the
+identity is keyed on, not their email address. The command creates or binds the
+identity row, activates it, grants a deployment-wide `admin`, writes its quota
+row, and records an audit row, all in one transaction. Prefer this: it leaves
+nothing behind in your configuration.
+
+**The seed list.** Set `sso_admin_subjects` to a JSON array containing that same
+subject, deploy, and have that person log in. They are activated as `admin` on
+that login. **Then remove the setting and redeploy** — see the warning under
+[Settings every non-local provider needs](#settings-every-non-local-provider-needs)
+for why leaving it in place is not safe.
+
+Neither path recovers a deployment whose administrator row is still active but
+whose administrator can no longer authenticate — a person who has lost their
+account at the provider, say. Both are gated on there being *zero* active human
+administrators. Keep more than one administrator activated once you can.
+
+If your provider is a Cognito user pool created by this repository's Terraform,
+note that the pool is created with administrator-creation only and ships with no
+users at all. You create the first user yourself with `aws cognito-idp
+admin-create-user`, that person signs in, and you then bootstrap them by one of
+the two paths above. There is no local-login fallback on a deployment configured
+for a provider: the local route is not served, and `dev_admin_user` is refused
+outright on any non-local `auth_provider`.
+
 ---
 
 ## Quotas and the compartment marking
@@ -410,8 +478,13 @@ quota row an activated identity would hold unbounded spend on it. There is no
 sensible default for a number that depends on your provider contract, so the
 deployment refuses to start rather than inventing one.
 
-Both must be greater than zero. Container-wide ceilings can be set separately
-with `quota_container_tokens_per_day` and `quota_container_storage_bytes`.
+Both must be greater than zero.
+
+Two further settings, `quota_container_tokens_per_day` and
+`quota_container_storage_bytes`, are accepted and validated but **not yet
+enforced**: no runtime path reads either in this release. Do not treat them as
+a container-wide spend ceiling — setting them changes nothing today. The
+per-identity defaults above are the control that exists.
 
 ### The compartment marking
 
@@ -454,19 +527,16 @@ You would use them for one reason: to keep a deployment working when the
 provider's published metadata is at fault and you cannot get it fixed quickly.
 They are a last resort, not a tuning knob.
 
-Three rules apply, in this order.
+Two rules apply, and there is a third thing you should understand about what
+an override costs you.
 
-**Available on `oidc` and `vanguard` only.** These are the two profiles where
-you state the issuer yourself. Entra derives its issuer from its tenant and
-Google's is fixed, so neither profile can bypass discovery: a deployment that
-sets the overrides on `entra` or `google` will not start. Be aware that this
-particular refusal is currently an internal assertion, so it reports
-`Assertion failed` with no message naming a setting. It is the one startup
-refusal you cannot diagnose from its text — if you see it, the cause is
-override settings on a profile that does not accept them.
+**Available on every profile.** Each profile's own origin policy is what your
+URLs are checked against: the issuer's origin for `oidc` and `vanguard`,
+`https://login.microsoftonline.com` for `entra`, and Google's four published
+origins for `google`. A deployment that derives its issuer rather than stating
+it can still break the glass.
 
-**All or none.** On the two profiles that do accept them, the first three must
-be set together. A partial override would silently mix operator-supplied
+**All or none.** The first three must be set together. A partial override would silently mix operator-supplied
 endpoints with discovered ones, leaving which origin policy applied to which
 URL dependent on which variables happened to be set. Setting some and not
 others is refused:
@@ -481,9 +551,8 @@ it alone is refused too.
 
 **Still origin-checked.** An override lets you name a *different URL* on an
 origin the provider is expected to serve from. It is not a way to leave those
-origins. On `oidc` and `vanguard`, each URL is validated at settings load
-against the same origin policy that profile applies to discovery, and an
-off-origin URL is refused:
+origins. Each URL is validated at settings load against the same origin policy
+that profile applies to discovery, and an off-origin URL is refused:
 
 ```text
 authorization_endpoint failed expected-origin check
@@ -492,6 +561,22 @@ authorization_endpoint failed expected-origin check
 For a generic OIDC deployment whose endpoints legitimately sit elsewhere, the
 correct move is to declare that origin in `sso_endpoint_origins`, not to
 override past the check.
+
+**What you give up, and why these are not a tuning knob.** Setting the trio
+does not merely skip a fetch. Discovery is where the provider's document is
+checked to declare the issuer you configured — the `discovery document failed
+the exact issuer check` refusal described above. With the overrides set, that
+document is never fetched, so that check never runs, and the only remaining
+tie between your configured issuer and the endpoints in use is the origin
+policy. The pinned `sso_jwks_uri` is the sharper cost: signing keys are then
+reached at an address fixed in your configuration rather than one the provider
+publishes, so if the provider moves its JWKS endpoint, logins fail until you
+change the setting by hand. Token validation itself is unaffected — issuer,
+audience, expiry and nonce are still checked on every ID token.
+
+Use the overrides to get through an outage or a broken document, and take them
+back out afterwards. Leaving them configured permanently trades a fetch you
+control for two guarantees you no longer have.
 
 ---
 
@@ -556,7 +641,7 @@ These are settings-load refusals. The message names the setting.
 | 503, `Single sign-on is not configured on this deployment` | A provider is selected but the runtime was not built. The deployment fails closed rather than half-way. |
 | The provider refuses before ELSPETH is reached, citing the redirect URI | The registered URI is not exactly `https://<public_base_url>/api/auth/sso/callback`. |
 | `discovery document failed the exact issuer check` | `sso_issuer` does not exactly match the `issuer` in the provider's discovery document. Trailing slashes matter. |
-| `This account is awaiting approval` | Expected on a first login. The identity is pending until an administrator **activates** it, through the admin API. That is the design, not a fault. `sso_admin_subjects` is not the remedy here: it grants `admin`, the highest role, and only applies to the very first administrator on a deployment that has none. |
+| `This account is awaiting approval` | Expected on a first login. The identity is pending until an administrator **activates** it, through the admin API. That is the design, not a fault. If this is the first person on a new deployment and there is no administrator yet to activate them, see [Admitting the first person](#admitting-the-first-person) — that is the step, and it is the one most often missed. |
 | `This account has been disabled` | The person authenticated; an administrator disabled the identity here. |
 | `This sign-in link has already been used or has expired` | The handoff code is single-use and short-lived. Start the login again. |
 | `Entra ID token was issued by a different tenant`, or `is missing the required claim 'tid'` | The sign-in came from a directory other than `entra_tenant_id`. |
