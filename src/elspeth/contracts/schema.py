@@ -978,11 +978,12 @@ def get_aggregation_contract_options(
     produces the identical nested shape for both. This helper is the single
     source of truth for that alias resolution.
 
-    Gate the call on ``node_type_nests_contract_options``. Six composer sites
-    (``web/composer/state.py`` 1556 / 3474 / 4359 / 5276 / 5389 / 6046) still
-    gate on the ``node_type == "aggregation"`` literal and have NOT been
-    widened; they are correct for today's composer collector NodeSpecs, whose
-    options are flat.
+    Gate the call on ``node_type_nests_contract_options``, never on a node-kind
+    literal: the six composer consumer-side sites in ``web/composer/state.py``
+    that once gated on ``node_type == "aggregation"`` were widened to the
+    predicate in elspeth-9d17af642e, so a third nesting kind added to
+    ``NESTED_CONTRACT_OPTIONS_NODE_TYPES`` inherits them. The producer-side
+    guarantee readers still read raw options (elspeth-94959b2d9a).
 
     Raises ``ValueError`` when ``options["options"]`` exists but is not a
     ``Mapping`` — that is a misconfiguration, not a recoverable shape.
