@@ -494,8 +494,11 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # record_validation_error calls, bedrock's record_guardrails_failure closure
 # (the same three calls, now ordinal 1 inside the closure), and
 # _replay_group_losses -> adopt_group_losses.
-_EXPECTED_CALL_COUNT = 266
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "0ab9f676d17ec706d2e4027440197bdc9aa87d31c7eb237b5cc8bb0d536d591f"
+# 266 -> 267: SinkEffectCoordinator._lease takeover_expired#2 — the own-lease
+# path falls back to takeover_expired when the repository, deciding against
+# Landscape database time (ADR-047), reports the worker's own lease lapsed.
+_EXPECTED_CALL_COUNT = 267
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "2a5896a85214bc7acb757fdd08bfd7b94bbc7219c5b2560ed9cc79e2db3c13a8"
 # Subordinate edges 70 -> 80 (-5 +15): create_row_with_token's second
 # insert_row_with_token_on edge and record_coalesce_branch_loss's two edges
 # retired; _transition_on's two edges rotated with the group_losses
