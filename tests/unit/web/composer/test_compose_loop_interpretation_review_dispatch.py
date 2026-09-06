@@ -4066,6 +4066,56 @@ async def test_stranded_prompt_template_requirements_surface_via_backstop(
     assert not isinstance(materialized, InterpretationReviewPending), materialized
 
 
+@pytest.mark.asyncio
+async def test_repair_pass_with_nothing_to_repair_acquires_no_writer_lease(
+    tmp_path: Path,
+    engine,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """elspeth-86866d4b92: the /validate repair pass runs under the route's
+    shareable BLOB_READ admission. When it finds debt it must escalate to its
+    own COMPOSE lease for the write (the interpretation writer refuses a read
+    admission), but the common page load — every site already carrying
+    evidence — must take NO lease at all, or a live compose elsewhere would turn
+    every validate into a 409. The recording authority sees every acquire, so
+    ``calls == []`` is the direct zero-acquisition pin; an unconditional
+    escalation records an ``acquire`` here and fails."""
+    from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_blob_read_context
+
+    # Seed through the REAL authority: the one site on this state gets its evidence row.
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_prompt_template_review_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+    async with acquire_compose_context(sessions_service, session_id) as compose_ctx:
+        await composer.surface_pending_interpretation_reviews(
+            state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            only_missing_evidence=True,
+            session_operation_context=compose_ctx,
+        )
+    assert len(await sessions_service.list_interpretation_events(session_id, status="all")) == 1
+
+    # The route's shape: a BLOB_READ admission over a service whose authority records every call.
+    authority = RecordingSessionOperationAuthority()
+    reading_service = DualFencedSessionServiceHarness(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.sessions.reading"),
+        session_operation_authority=authority,
+    )
+    await _build_composer(tmp_path, reading_service).surface_pending_interpretation_reviews(
+        state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        only_missing_evidence=True,
+        session_operation_context=make_blob_read_context(session_id),
+    )
+
+    assert authority.calls == []
+    assert len(await sessions_service.list_interpretation_events(session_id, status="all")) == 1
+
+
 # ---------------------------------------------------------------------------
 # elspeth-d581b3da7f — which mechanism duplicates the planner's turn text?
 # ---------------------------------------------------------------------------
