@@ -9,7 +9,7 @@ import sqlite3
 import time
 from collections.abc import Coroutine
 from concurrent.futures import Future
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -22,6 +22,7 @@ from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.coordination import DEFAULT_RUN_HEARTBEAT_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
@@ -29,11 +30,13 @@ from elspeth.core.checkpoint import manager as checkpoint_manager_module
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
 from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
 from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
+    run_coordination_table,
     run_workers_table,
     scheduler_events_table,
     token_work_items_table,
@@ -41,6 +44,7 @@ from elspeth.core.landscape.schema import (
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.engine.orchestrator import Orchestrator
+from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 from elspeth.engine.processor import RowProcessor
 from elspeth.plugins.sinks import _local_file_effects
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -71,6 +75,14 @@ from tests.helpers.session_fences import RecordingSessionOperationAuthority
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
 _PROFILE_RUN_LIVENESS_SECONDS = 5.0
+# The leader's run heartbeat must beat INSIDE the shrunken window, at the
+# product's own beat:window ratio (DEFAULT_RUN_HEARTBEAT_SECONDS over
+# DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 15 s : 80 s). A window shrunk without
+# its cadence leaves the seat dead from the leader's last fenced write until
+# the thread's first product-cadence beat — exactly where the leader parks in
+# ``wait_for_follower_handoff`` — and a follower whose spawn outlasts the
+# window under load is refused ``no live leader``.
+_PROFILE_RUN_HEARTBEAT_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS * (DEFAULT_RUN_HEARTBEAT_SECONDS / DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
 _PROFILE_SCHEDULER_LEASE_SECONDS = 2
 
 if TYPE_CHECKING:
@@ -201,12 +213,29 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
 
 
 def _install_profile_run_liveness() -> None:
+    """Install ONE coherent liveness profile: the window at every fenced consumer AND the leader's beat cadence.
+
+    The run lifecycle builds its ``RunHeartbeatThread`` with no arguments, so
+    the thread's cadence and window are the product defaults bound at import
+    (15 s first beat, 80 s window) whatever the module constants below say.
+    Shrinking the window without the cadence leaves the seat dead between the
+    leader's last fenced write and the thread's first beat.
+    """
     run_lifecycle_repository.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     checkpoint_manager_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     token_repository_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+
+    real_heartbeat_init = RunHeartbeatThread.__init__
+
+    def profile_heartbeat_init(self: RunHeartbeatThread, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("heartbeat_seconds", _PROFILE_RUN_HEARTBEAT_SECONDS)
+        kwargs.setdefault("window_seconds", _PROFILE_RUN_LIVENESS_SECONDS)
+        real_heartbeat_init(self, *args, **kwargs)
+
+    RunHeartbeatThread.__init__ = profile_heartbeat_init  # type: ignore[method-assign]
 
 
 def _install_short_scheduler_lease() -> None:
@@ -733,6 +762,64 @@ def _exercise_worker_profile(
     finally:
         if follower_child is not None:
             follower_child.close()
+
+
+def _seat_liveness(database_url: str, run_id: str) -> tuple[bool, datetime | None, datetime]:
+    """The follower admission predicate itself: seat deadline against Landscape database time."""
+    with LandscapeDB.from_url(database_url, create_tables=False) as db, db.engine.connect() as conn:
+        database_now = read_landscape_transaction_time(conn)
+        seat = conn.execute(
+            select(
+                run_coordination_table.c.leader_heartbeat_expires_at,
+                (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
+            ).where(run_coordination_table.c.run_id == run_id)
+        ).one()
+    return bool(seat.seat_live), seat.leader_heartbeat_expires_at, database_now
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+def test_profile_leader_parked_at_the_follower_handoff_hook_stays_live_past_its_minted_seat_deadline(tmp_path: Path) -> None:
+    """Control for the load-sensitive profile ids: the seat must not lapse while the leader waits for a follower.
+
+    Once the leader parks in ``wait_for_follower_handoff`` it issues no fenced
+    write, so only its run heartbeat thread can renew the seat. Observe the
+    seat through the follower admission predicate from fork-ready until half a
+    liveness window past the deadline that was minted before the leader
+    parked: a follower whose spawn lands anywhere in that span must be
+    admitted, whatever the box load.
+    """
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(_profile_settings_text(tmp_path), encoding="utf-8")
+    database_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    run_id = str(uuid4())
+    with LandscapeDB(database_url):
+        pass
+    seam_value = SinkEffectExecutionSeam.BEFORE_RESERVATION.value
+    with spawn_database_process_with_pause(
+        database_url=database_url,
+        seam=seam_value,
+        action=_run_same_host_leader_to_sink_seam,
+        action_args=(run_id, str(settings_path), seam_value),
+    ) as child:
+        _wait_for_fork_ready(database_url, run_id, lambda: child.is_alive)
+        live, minted_deadline, database_now = _seat_liveness(database_url, run_id)
+        assert live and minted_deadline is not None, f"seat not live at fork-ready: deadline={minted_deadline} now={database_now}"
+        # The deadline minted before the leader parked is at most one window
+        # past this database time; observe until half a window past that.
+        observation_end = database_now + timedelta(seconds=1.5 * _PROFILE_RUN_LIVENESS_SECONDS)
+        observations: list[tuple[datetime, datetime | None]] = [(database_now, minted_deadline)]
+        while database_now < observation_end:
+            assert child.is_alive, f"leader exited while parked at the follower-handoff hook; observations={observations}"
+            time.sleep(0.05)
+            live, deadline, database_now = _seat_liveness(database_url, run_id)
+            observations.append((database_now, deadline))
+            assert live, (
+                f"leader seat lapsed while the leader was parked at the follower-handoff hook "
+                f"(minted deadline {minted_deadline}, observed deadline {deadline} < database now {database_now}); "
+                f"observations={observations}"
+            )
+        child.kill()
+        assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).was_killed
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")

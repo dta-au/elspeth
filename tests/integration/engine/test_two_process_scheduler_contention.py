@@ -199,15 +199,23 @@ def _spawn_children(
     *,
     duration_seconds: float,
     hammer_owners: tuple[str, ...],
+    held_back_owner: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run N hammers + 1 reader concurrently; return (hammer_artifacts, reader_artifact)."""
+    """Run N hammers + 1 reader concurrently; return (hammer_artifacts, reader_artifact).
+
+    ``held_back_owner`` names one hammer whose go-signal is withheld until the
+    others' measurement window has elapsed — the deterministic image of a
+    lock-starved peer whose first claim lands after its rival's last sweep.
+    """
     src_dir = Path(elspeth.__file__).resolve().parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(src_dir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
     go_file = tmp_path / "go"
+    held_back_go_file = tmp_path / "go-held-back"
     specs: list[tuple[str, str]] = [(worker.ROLE_HAMMER, owner) for owner in hammer_owners]
     specs.append((worker.ROLE_READER, "dashboard-reader"))
+    assert held_back_owner is None or held_back_owner in hammer_owners
 
     procs: list[subprocess.Popen[bytes]] = []
     ready_files: list[Path] = []
@@ -221,6 +229,7 @@ def _spawn_children(
             ready_files.append(ready)
             metric_files.append(metrics)
             log_files.append(log)
+            own_go_file = held_back_go_file if owner == held_back_owner else go_file
             with open(log, "wb") as log_handle:
                 procs.append(
                     subprocess.Popen(
@@ -238,11 +247,13 @@ def _spawn_children(
                             "--ready-file",
                             str(ready),
                             "--go-file",
-                            str(go_file),
+                            str(own_go_file),
                             "--duration-seconds",
                             str(duration_seconds),
                             "--metrics-out",
                             str(metrics),
+                            "--min-recovered",
+                            str(MIN_RECOVERED_PER_HAMMER),
                         ],
                         env=env,
                         stdout=log_handle,
@@ -260,9 +271,21 @@ def _spawn_children(
                 raise AssertionError(f"children not ready within {READY_DEADLINE_SECONDS}s")
             time.sleep(0.01)
         go_file.touch()
+        if held_back_owner is not None:
+            released_at = time.monotonic()
+            while time.monotonic() - released_at < duration_seconds:
+                time.sleep(0.01)
+            held_back_go_file.touch()
 
-        for proc, log in zip(procs, log_files, strict=True):
-            rc = proc.wait(timeout=JOIN_TIMEOUT_SECONDS)
+        for (role, owner), proc, log in zip(specs, procs, log_files, strict=True):
+            try:
+                rc = proc.wait(timeout=JOIN_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(
+                    f"{role} {owner} did not finish within {JOIN_TIMEOUT_SECONDS}s: "
+                    f"a hammer stops only once it has reaped {MIN_RECOVERED_PER_HAMMER} peer lease(s), "
+                    f"so its peer never claimed:\n{log.read_text()}"
+                ) from None
             # A1 (exit codes): exit 1 is harness-internal failure, never a
             # recorded contention error — those land in the artifact.
             assert rc == 0, f"child exited rc={rc}:\n{log.read_text()}"
@@ -289,12 +312,19 @@ def _run_contention_scenario(
     *,
     duration_seconds: float,
     hammer_owners: tuple[str, ...],
+    held_back_owner: str | None = None,
 ) -> None:
     db_path = tmp_path / "audit.db"
     _seed_database(db_path, now=datetime.now(UTC))
     db_url = f"sqlite:///{db_path}"
 
-    hammers, reader = _spawn_children(tmp_path, db_url, duration_seconds=duration_seconds, hammer_owners=hammer_owners)
+    hammers, reader = _spawn_children(
+        tmp_path,
+        db_url,
+        duration_seconds=duration_seconds,
+        hammer_owners=hammer_owners,
+        held_back_owner=held_back_owner,
+    )
 
     # ---- Aggregate ----------------------------------------------------------
     write_txns = [rec for hammer in hammers for rec in hammer["write_txns"]]
@@ -324,8 +354,9 @@ def _run_contention_scenario(
     # deliverable that ADR-030 risk 2 and the slice-4 rerun depend on). -------
     claims_by_owner = " ".join(f"claims_{h['owner']}={h['claims']}" for h in hammers)
     recovered_by_owner = " ".join(f"recovered_{h['owner']}={h['recovered_total']}" for h in hammers)
+    elapsed_by_owner = " ".join(f"elapsed_{h['owner']}={h['elapsed_seconds']:.2f}s" for h in hammers)
     print(
-        f"SLICE1-CONTENTION hammers={len(hammers)} duration_s={duration_seconds} "
+        f"SLICE1-CONTENTION hammers={len(hammers)} duration_s={duration_seconds} {elapsed_by_owner} "
         f"max_hold_ms={max_hold:.2f} p95_hold_ms={p95_hold:.2f} "
         f"max_lock_wait_ms={max_lock_wait:.2f} max_beat_rt_ms={max_beat_rt:.2f} "
         f"max_write_rt_ms={max_write_rt:.2f} p99_write_rt_ms={p99_write_rt:.2f} "
@@ -431,6 +462,23 @@ def test_two_process_claim_hammer_with_dashboard_reads(tmp_path: Path) -> None:
         tmp_path,
         duration_seconds=3.0,
         hammer_owners=("contender-a", "contender-b"),
+    )
+
+
+@pytest.mark.timeout(120)
+def test_two_process_claim_hammer_reaps_a_peer_whose_first_claim_lands_after_its_window(tmp_path: Path) -> None:
+    """Control for the load-sensitive default gate: A9's cross-owner reap is an event, not a clock.
+
+    contender-b's go-signal is withheld until contender-a's whole measurement
+    window has elapsed — the deterministic image of a lock-starved peer whose
+    first claim lands after its rival's last sweep. contender-a must still
+    reap at least one of contender-b's lapsed leases before it stops.
+    """
+    _run_contention_scenario(
+        tmp_path,
+        duration_seconds=3.0,
+        hammer_owners=("contender-a", "contender-b"),
+        held_back_owner="contender-b",
     )
 
 
