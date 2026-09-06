@@ -899,6 +899,15 @@ def _deferred_intent_teaching_block() -> str:
     in the assembled payload, while the surrounding prose pushes hard toward
     retention: the per-reply cap, the responsible-stage rule, and the
     message-level stated-fact requirement (filigree elspeth-1ebf08f8ec).
+    A fourth was added by elspeth-6155f11add (Option 2, brief-side, ruled
+    2026-09-06): the stated fact is proven from the USER's message, and only
+    when it spells the condition as a comparison literal in the closed
+    affirmative shape ``deferred_intents`` grounds. Literal-free routing
+    prose admits no stated constraint, so the derived demand is silent and a
+    weaker kind is ACCEPTED — a silent downgrade, not a rejection. The block
+    therefore teaches the literal form as the sentence to hand BACK to the
+    user, and a clarification when no comparable column is named; it does not
+    widen what the server accepts.
 
     The two enumerable facts are DERIVED from the authorities that enforce
     them — ``_DEFERRED_CONSTRAINT_SCHEMA`` for the kind union and
@@ -935,9 +944,23 @@ def _deferred_intent_teaching_block() -> str:
         "go to one output, everything else to another), the intent must carry `stated_gate_routing`, "
         "or `stated_predicate` when they name a condition but no destination. For such a message a "
         "`component_count` or `subject_presence` constraint is not enough ON ITS OWN, because a "
-        "pipeline containing no gate at all would satisfy it. The server enforces this: a retain that "
-        "omits the stated constraint is REJECTED, not quietly accepted. Include it alongside whatever "
-        "else you record.\n"
+        "pipeline containing no gate at all would satisfy it. Include the stated constraint alongside "
+        "whatever else you record.\n"
+        "The server proves a stated constraint from the user's OWN words, never from yours, and it reads "
+        "a condition only when it is written as a comparison literal — `column equals value` (also "
+        "`does not equal`, `greater than`, `less than`, `at least`, `at most`), the value bare, never "
+        "quoted: `flagged equals true`, `email equals null`, `status equals cancelled` — with the two "
+        "destinations joined as `to <a>, and everything else to <b>` (the comma before `and` is "
+        "required). A message carrying such a literal REJECTS a retain that omits the stated "
+        "constraint. A message that describes the same rule without one (`flagged rows`, `approved "
+        "records`, `the urgent flag is set`, `a missing email`) cannot ground it, and the server does "
+        "NOT reject the weaker kind there: it accepts it, and the routing rule is lost with nothing "
+        "left pending. So do not encode a routing rule from such a message under any kind. Restate it "
+        "in the literal form and ask the user to send that sentence back as their whole message, "
+        "naming the source plugin before `rows` — for example `Route csv rows with flagged equals true "
+        "to review, and everything else to standard.` A `yes,` or `confirmed:` in front of it breaks "
+        "the proof. When the prose names no column you could compare, or no value for it, ask which "
+        "column and which value rather than guessing either.\n"
         "A collector's scope binding — its scope name, opener and policy — cannot be expressed by any "
         "constraint kind here. Ask the user to settle it at the topology stage rather than "
         "approximating it with a `component_count`.\n"

@@ -20,6 +20,7 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentManagementActionShapeError,
     DeferredIntentRejected,
     DeferredIntentUnsupported,
+    DeferredIntentValidation,
     _message_requires_stated_constraint,
     create_deferred_stage_intent,
     deferred_intent_action_from_dict,
@@ -1535,6 +1536,106 @@ _ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS = (
     "route rows where status equals cancelled to review and everything else to main",
     "route rows where amount is greater than 500 to high_value and the rest to standard",
 )
+
+
+def _restated_routing_action(column: str, value: object, *, true_target: str, false_target: str) -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=_CSV_SOURCE_SUBJECT,
+                column=column,
+                operator="equals",
+                value=value,
+                true_target=true_target,
+                false_target=false_target,
+            ),
+        ),
+    )
+
+
+# elspeth-6155f11add Option 2 (brief-side, ruled 2026-09-06): the four
+# literal-free prompts above, each paired with the working-skeleton
+# restatement the guided brief now teaches the planner to hand back to the
+# user (comment 7916's A/B), and the routing constraint that restatement
+# grounds. The raw prompt is the SAME rule in prose the closed grammar cannot
+# bind: a boolean flag, a categorical membership, a boolean phrased as "is
+# set", a null check.
+_LITERAL_FREE_ROUTING_RESTATEMENTS: tuple[tuple[str, str, DeferredIntentAction], ...] = (
+    (
+        "route flagged rows to review and everything else to standard",
+        "Route csv rows with flagged equals true to review, and everything else to standard.",
+        _restated_routing_action("flagged", True, true_target="review", false_target="standard"),
+    ),
+    (
+        "a gate that sends approved records to approved and the rest to rejected",
+        "Route csv rows with approved equals true to approved, and everything else to rejected.",
+        _restated_routing_action("approved", True, true_target="approved", false_target="rejected"),
+    ),
+    (
+        "send rows where the urgent flag is set to fast, otherwise to slow",
+        "Route csv rows with urgent equals true to fast, and everything else to slow.",
+        _restated_routing_action("urgent", True, true_target="fast", false_target="slow"),
+    ),
+    (
+        "route records with a missing email to quarantine and the rest to main",
+        "Route csv rows with email equals null to quarantine, and everything else to main.",
+        _restated_routing_action("email", None, true_target="quarantine", false_target="main"),
+    ),
+)
+
+
+def test_literal_free_routing_prompts_are_exactly_the_first_four_adversarial_prompts() -> None:
+    """The A/B below is over the four prompts the ticket calls p1-p4; keep it
+    bound to the adversarial tuple so a reworded fixture cannot drift the two
+    apart silently."""
+
+    assert tuple(raw for raw, _, _ in _LITERAL_FREE_ROUTING_RESTATEMENTS) == _ADVERSARIAL_NO_COMPARISON_ROUTING_PROMPTS[:4]
+
+
+@pytest.mark.parametrize(("raw", "restated", "routing_action"), _LITERAL_FREE_ROUTING_RESTATEMENTS, ids=("p1", "p2", "p3", "p4"))
+def test_the_literal_restatement_the_brief_teaches_grounds_where_the_raw_prompt_silently_downgrades(
+    raw: str, restated: str, routing_action: DeferredIntentAction
+) -> None:
+    """Offline, zero-provider A/B behind the Option 2 ruling on elspeth-6155f11add.
+
+    RAW: the routing rule in the user's own literal-free prose. No closed
+    tuple grounds, so the derived demand is silent, the routing constraint is
+    rejected ``stated_fact_unproven`` — and the weaker kind is ACCEPTED. That
+    acceptance is the silent downgrade: a gate-free pipeline can claim it and
+    the routing rule is banked as delivered. The brief now tells the planner
+    not to encode the rule from such a message at all.
+
+    RESTATED: the same rule as the comparison literal the brief teaches, in
+    the sentence it tells the planner to hand back to the user. The demand is
+    raised, the routing constraint is accepted, and the weaker kind is now
+    refused. Nothing in ``deferred_intents`` changed for this: the A/B is the
+    evidence that the brief-side fix targets the shape that grounds today,
+    and it turns red the day the grammar stops binding one of these classes.
+    """
+
+    catalog = _view((("source", "csv"), ("transform", "passthrough")))
+
+    def verdict(action: DeferredIntentAction, message: str) -> DeferredIntentValidation:
+        return validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=catalog,
+            guided=GuidedSession.initial(),
+            originating_message_content=message,
+        )
+
+    assert _message_requires_stated_constraint(raw) is None
+    assert verdict(routing_action, raw) == DeferredIntentRejected(reason="stated_fact_unproven")
+    assert verdict(_WEAKER_KIND_ACTION, raw) == DeferredIntentAccepted(action=_WEAKER_KIND_ACTION)
+
+    assert _message_requires_stated_constraint(restated) == "routing"
+    assert verdict(routing_action, restated) == DeferredIntentAccepted(action=routing_action)
+    assert verdict(_WEAKER_KIND_ACTION, restated) == DeferredIntentRejected(reason="stated_fact_unproven")
 
 
 @pytest.mark.parametrize(

@@ -6615,6 +6615,47 @@ def test_retain_tool_description_states_the_node_kind_partition() -> None:
     assert "transform, aggregation, and collector are node types that each REQUIRE a transform plugin," in description
 
 
+def test_teaching_block_teaches_the_literal_routing_form_and_the_clarification_turn() -> None:
+    """elspeth-6155f11add, Option 2 (brief-side, ruled 2026-09-06).
+
+    The server grounds a `stated_gate_routing` constraint in the USER's own
+    message, and only when that message spells the condition as a comparison
+    literal in the closed affirmative shape. Routing prose without a literal
+    ("route flagged rows to review and everything else to standard") admits
+    no stated constraint, so the derived demand stays silent and the weaker
+    kind is ACCEPTED — the silent downgrade this ticket carries. The brief
+    must therefore teach three things the planner cannot infer from the tool
+    schema: the literal form that grounds, that the restatement goes back to
+    the user as the sentence to send (the planner's own words prove nothing),
+    and that a message naming no comparable column is a clarification, not a
+    guess. Each is restated here by hand; the offline A/B that proves the
+    literal form is what grounds lives in test_deferred_intents.py.
+    """
+
+    block = chat_solver._deferred_intent_teaching_block()
+
+    # (a) the literal form, with the three classes the falsification pass
+    # proved ground today, and the destination join that grounds.
+    assert "`column equals value`" in block
+    assert "`flagged equals true`, `email equals null`, `status equals cancelled`" in block
+    assert "`to <a>, and everything else to <b>`" in block
+    assert "the comma before `and` is required" in block
+    # the proof is over the user's words, so the restatement is a reply, not
+    # a retain — and the reply names the exact sentence to send back.
+    assert "from the user's OWN words, never from yours" in block
+    assert "ask the user to send that sentence back as their whole message" in block
+    assert "`Route csv rows with flagged equals true to review, and everything else to standard.`" in block
+    # the downgrade is named as accepted, not rejected — the old sentence
+    # claimed the server rejects every omission, which stopped being true when
+    # the demand was derived from grounding (elspeth-3d392c04ca).
+    assert "the server does NOT reject the weaker kind there: it accepts it" in block
+    assert "a retain that omits the stated constraint is REJECTED, not quietly accepted" not in block
+    # (b) no comparable column → clarification, never a guessed literal.
+    assert "ask which column and which value rather than guessing either" in block
+    # ADR-031: no tutorial-special prose rides in on this.
+    assert "tutorial" not in block.casefold()
+
+
 class TestStep1SourceToolSchema:
     """elspeth-79e66ff613 Stage 1: the unhinted first turn constrains `plugin`.
 
