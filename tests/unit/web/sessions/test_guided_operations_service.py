@@ -81,8 +81,13 @@ class _StrictRequest(BaseModel):
 def test_guided_composite_authority_has_only_narrow_domain_mutations() -> None:
     assert not hasattr(sessions_service_module, "_reject_guided_pending_proposal")
     assert not hasattr(sessions_service_module, "_require_no_active_guided_confirmation_admission")
-    assert {"require_no_active_confirmation", "claim_confirmation"} <= set(dir(sessions_service_module._GuidedSessionMutations))
-    assert {"reject_pending_proposal"} <= set(dir(sessions_service_module._GuidedComposerMutations))
+    assert {"require_no_active_confirmation", "claim_confirmation", "mark_session_updated"} <= set(
+        dir(sessions_service_module._GuidedSessionMutations)
+    )
+    assert {"reject_pending_proposal", "record_pending_proposal_rejection", "record_pending_proposal_acceptance"} <= set(
+        dir(sessions_service_module._GuidedComposerMutations)
+    )
+    assert {"create_guided_pipeline_proposal"} <= set(dir(sessions_service_module._SessionComposerMutations))
 
 
 def test_guided_database_clock_maps_malformed_sqlite_text_to_audit_integrity_error() -> None:
@@ -751,6 +756,76 @@ async def test_guided_mutation_facet_revalidates_at_dml_and_dies_with_transactio
         )
     assert operation.result_state_id is None
     assert events == ["claimed"]
+
+
+@pytest.mark.asyncio
+async def test_guided_session_touch_facet_revalidates_fence_before_dml(file_engine) -> None:
+    """``mark_session_updated`` is the guided ``updated_at`` bump every
+    settlement makes after appending rows (P4-D6 family A1). It re-checks the
+    dual fence immediately before its UPDATE: with the session authority intact
+    the stamp lands; once that authority is released the same call raises and
+    ``sessions.updated_at`` keeps the earlier stamp."""
+
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    context = await _acquire_compose_context(service, session_id)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="touch-fence",
+        kind="guided_chat",
+        request_hash="f" * 64,
+        actor="worker-a",
+        lease_seconds=30,
+        session_operation_context=context,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+    sid = str(session_id)
+    landed = datetime(2031, 1, 2, 3, 4, 5, tzinfo=UTC)
+    refused = datetime(2032, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    def _updated_at() -> datetime:
+        with file_engine.connect() as conn:
+            value = conn.execute(select(sessions_table.c.updated_at).where(sessions_table.c.id == sid)).scalar_one()
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    def _touch_with_live_authority() -> None:
+        with (
+            service._session_process_locked_begin(sid) as conn,
+            service._session_write_lock(conn, sid),
+            service._guided_session_mutation_transaction(
+                conn,
+                guided_fence=claimed.fence,
+                session_operation_context=context,
+            ) as mutation,
+        ):
+            mutation.guided.mark_session_updated(updated_at=landed)
+
+    await service._run_sync(_touch_with_live_authority)
+    assert _updated_at() == landed
+
+    def _touch_after_losing_session_authority() -> None:
+        with (
+            service._session_process_locked_begin(sid) as conn,
+            service._session_write_lock(conn, sid),
+            service._guided_session_mutation_transaction(
+                conn,
+                guided_fence=claimed.fence,
+                session_operation_context=context,
+            ) as mutation,
+        ):
+            conn.execute(
+                update(session_operation_fences_table)
+                .where(
+                    session_operation_fences_table.c.session_id == sid,
+                    session_operation_fences_table.c.operation_id == context.fence.operation_id,
+                )
+                .values(released_at=datetime.now(UTC))
+            )
+            with pytest.raises(GuidedOperationFenceLostError):
+                mutation.guided.mark_session_updated(updated_at=refused)
+
+    await service._run_sync(_touch_after_losing_session_authority)
+    assert _updated_at() == landed
 
 
 @pytest.mark.asyncio
