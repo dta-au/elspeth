@@ -669,8 +669,6 @@ files:
     Mapping[str, object]: 2
   src/elspeth/web/auth/session_token.py:
     dict[str, object]: 3
-  src/elspeth/web/blobs/service.py:
-    dict[str, Any]: 2
   src/elspeth/web/catalog/knob_schema.py:
     Mapping[str, Any]: 1
     dict[str, object]: 1
@@ -1013,6 +1011,6 @@ totals:
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
   boundary: 63
-  dict[str, Any]: 1143
+  dict[str, Any]: 1141
   dict[str, object]: 389
-  soft: 2696
+  soft: 2694

@@ -51,6 +51,7 @@ from elspeth.web.blobs.protocol import (
     BlobNotFoundError,
     BlobPendingProposalError,
     BlobQuotaExceededError,
+    BlobRecord,
     fork_blob_id,
 )
 from elspeth.web.blobs.service import (
@@ -194,6 +195,100 @@ async def _seed_active_run(
             )
         )
     return run_id
+
+
+_RUN_SOURCE: dict[str, Any] = {
+    "plugin": "csv",
+    "on_success": "output",
+    "on_validation_failure": "quarantine",
+    "options": {"path": "/data/external/input.csv"},
+}
+
+
+def _pending_output_record(blob_service: BlobServiceImpl, session_id: UUID, filename: str) -> BlobRecord:
+    """The record a producer hands the facet to reserve a run output: pending, zero size, no hash."""
+    blob_id = uuid4()
+    storage = blob_service._storage_path(str(session_id), str(blob_id), filename)
+    storage.parent.mkdir(parents=True, exist_ok=True)
+    return BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename=filename,
+        mime_type="text/csv",
+        size_bytes=0,
+        content_hash=None,
+        storage_path=str(storage),
+        created_at=datetime.now(UTC),
+        created_by="pipeline",
+        source_description=None,
+        status="pending",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+
+
+def reserve_output_blob(
+    blob_service: BlobServiceImpl,
+    session_id: UUID,
+    run_id: UUID,
+    execute_context: SessionOperationContext,
+    *,
+    filename: str = "output.csv",
+) -> BlobRecord:
+    """Reserve one pending output blob for ``run_id`` the way a producer would: through the facet, under the run's EXECUTE fence.
+
+    The facet binds the reservation to ``execute_context``'s operation, so
+    finalize it under the SAME context (a fresh ``_execute_context`` seed
+    is a different operation and the facet refuses it as an anomaly).
+    """
+    record = _pending_output_record(blob_service, session_id, filename)
+
+    def _reserve(transaction) -> BlobRecord:
+        reserved = transaction.blobs.reserve_pending_output_blob(record=record)
+        transaction.blobs.insert_blob_run_link(blob_id=record.id, run_id=run_id, direction="output")
+        return reserved
+
+    return blob_service._session_operation_authority.mutate(execute_context, _reserve)
+
+
+def _seed_pending_blob(db_engine, blob_service: BlobServiceImpl, session_id: UUID, filename: str = "output.csv") -> BlobRecord:
+    """Insert the row ``create_blob``'s reservation phase leaves before finalization.
+
+    Pending, zero size, no hash, no custody columns — the exact column set of
+    ``_insert_pending_blob_row`` — for tests of what a not-yet-ready row must
+    refuse (reads, copies). Run outputs are reserved through
+    :func:`reserve_output_blob` instead, as production would.
+    """
+    record = _pending_output_record(blob_service, session_id, filename)
+    with db_engine.begin() as conn:
+        conn.execute(
+            blobs_table.insert().values(
+                id=str(record.id),
+                session_id=str(session_id),
+                filename=record.filename,
+                mime_type=record.mime_type,
+                size_bytes=0,
+                content_hash=None,
+                storage_path=record.storage_path,
+                created_at=record.created_at,
+                created_by=record.created_by,
+                source_description=None,
+                status="pending",
+                creation_modality=record.creation_modality.value,
+                created_from_message_id=None,
+                creating_model_identifier=None,
+                creating_model_version=None,
+                creating_provider=None,
+                creating_composer_skill_hash=None,
+                creating_arguments_hash=None,
+            )
+        )
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -811,13 +906,14 @@ class TestDeleteBlob:
             await blob_service.get_blob(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_pending_proposal_retention_does_not_block_blob_finalization(self, blob_service, session_id, db_engine) -> None:
-        record = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pending-output.csv",
-            mime_type="text/csv",
-            created_by="assistant",
+    async def test_pending_proposal_retention_does_not_block_blob_finalization(
+        self, blob_service, session_id, db_engine, compose_context
+    ) -> None:
+        run_id = UUID(
+            await _seed_active_run(db_engine, session_id, session_operation_context=compose_context, source=_RUN_SOURCE, status="running")
         )
+        execute = _execute_context(db_engine, session_id)
+        record = reserve_output_blob(blob_service, session_id, run_id, execute, filename="pending-output.csv")
         content = b"ready\n1\n"
         Path(record.storage_path).write_bytes(content)
         now = datetime.now(UTC)
@@ -842,13 +938,9 @@ class TestDeleteBlob:
                 )
             )
 
-        finalized = await blob_service.finalize_blob(
-            record.id,
-            "ready",
-            size_bytes=len(content),
-            content_hash=content_hash(content),
-        )
-        assert finalized.status == "ready"
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        assert [(finalized.id, finalized.status) for finalized in result.finalized] == [(record.id, "ready")]
+        assert list(result.errors) == []
 
     @pytest.mark.asyncio
     async def test_delete_blob_rejects_when_active_run_linked(self, blob_service, session_id, db_engine, compose_context) -> None:
@@ -1446,226 +1538,6 @@ class TestDeleteBlob:
 # ---------------------------------------------------------------------------
 
 
-class TestCreatePendingBlob:
-    """Pending blob reservation must enforce the same literal guards as ready writes."""
-
-    @pytest.mark.asyncio
-    async def test_create_pending_blob_rejects_disallowed_mime_type(self, blob_service, session_id) -> None:
-        """Pending rows must not persist MIME values that read guards classify as corruption."""
-        with pytest.raises(RuntimeError, match="Invalid mime_type"):
-            await blob_service.create_pending_blob(
-                session_id=session_id,
-                filename="output.png",
-                mime_type="image/png",  # type: ignore[arg-type]
-                created_by="pipeline",
-            )
-
-
-class TestFinalizeBlob:
-    """Pending -> ready/error lifecycle: only valid transitions allowed."""
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_transitions_pending_to_ready(self, blob_service, session_id) -> None:
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-        assert pending.status == "pending"
-
-        # Valid SHA-256 hex is required when transitioning to 'ready' —
-        # see _validate_finalize_hash().  Using content_hash() here
-        # anchors the test to the same helper production code uses.
-        valid_hash = content_hash(b"pretend-output-bytes")
-        finalized = await blob_service.finalize_blob(
-            blob_id=pending.id,
-            status="ready",
-            size_bytes=42,
-            content_hash=valid_hash,
-        )
-        assert finalized.status == "ready"
-        assert finalized.size_bytes == 42
-        assert finalized.content_hash == valid_hash
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_missing_hash_for_ready(self, blob_service, session_id) -> None:
-        """Tier 1 invariant: finalizing as 'ready' without a hash is refused."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="content_hash"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=42,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_non_sha256_hash(self, blob_service, session_id) -> None:
-        """Tier 1 invariant: content_hash must be 64 lowercase hex chars."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=42,
-                content_hash="abc123",  # too short, not SHA-256
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_uppercase_hex_hash(self, blob_service, session_id) -> None:
-        """Canonical form is lowercase — uppercase hex is a bifurcation risk.
-
-        FilesystemPayloadStore writes the lowercase form, and
-        read_blob_content compares via hmac.compare_digest byte-for-byte.
-        Admitting uppercase at the write side would silently create
-        blobs whose hash does not match the stored form anywhere else
-        in the audit trail.  Mirrors the same assertion on the sync
-        path (TestFinalizeBlobSyncHashValidation) so both entry points
-        are pinned.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        uppercase_hash = content_hash(b"real-bytes").upper()
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=10,
-                content_hash=uppercase_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_trailing_newline_hash(self, blob_service, session_id) -> None:
-        """``^[a-f0-9]{64}$`` + ``re.match`` accepts trailing ``\\n``; fullmatch rejects it.
-
-        Python's ``$`` anchor matches either end-of-string OR just
-        before a final newline.  A 64-hex hash followed by a single
-        ``\\n`` therefore slipped through the service-layer pre-check
-        under the old regex and landed at the DB, where the CHECK
-        constraint rejected it as an IntegrityError — the wrong failure
-        surface (opaque DB error rather than the clean BlobStateError
-        this validator is supposed to raise, and coverage on the
-        DB-authoritative guard only).  The service pre-check uses
-        ``fullmatch`` so the error path is always the structured
-        BlobStateError, and the DB CHECK remains the belt for any
-        writer that bypasses the service entirely.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        trailing_newline_hash = content_hash(b"real-bytes") + "\n"
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=10,
-                content_hash=trailing_newline_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_as_error_without_hash_succeeds(self, blob_service, session_id) -> None:
-        """The hash invariant applies only to 'ready' — 'error' needs no hash.
-
-        Pins the ``status != 'ready'`` exemption branch of
-        _validate_finalize_hash.  A regression that tightened the
-        invariant to require hashes for error blobs would break every
-        failed-run cleanup path, and the failure mode would be
-        non-obvious (pipeline-level errors finalizing per-blob errors).
-        This positive test keeps the exemption honest.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="failed-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        record = await blob_service.finalize_blob(
-            blob_id=pending.id,
-            status="error",
-            # deliberately no content_hash, no size_bytes
-        )
-        assert record.status == "error"
-        assert record.content_hash is None
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_non_pending(self, blob_service, session_id, compose_context) -> None:
-        """Cannot finalize a blob that is already ready — status rollback is forbidden."""
-        record = await blob_service.create_blob(
-            session_id=session_id,
-            filename="already-ready.csv",
-            content=b"done",
-            mime_type="text/csv",
-            created_by="user",
-            session_operation_context=compose_context,
-        )
-        assert record.status == "ready"
-
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        with pytest.raises(BlobStateError, match="expected 'pending'"):
-            await blob_service.finalize_blob(
-                blob_id=record.id,
-                status="ready",
-                size_bytes=4,
-            )
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_invalid_status(self, blob_service, session_id) -> None:
-        """Only 'ready' and 'error' are valid finalize targets."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        # Deliberate type-contract violation: we're exercising the
-        # runtime guard for dynamic callers that bypass static typing.
-        # `blob_service` is a pytest fixture whose type mypy treats as
-        # Any, so no `# type: ignore` is needed here to suppress the
-        # arg-type error.
-        with pytest.raises(RuntimeError, match="Invalid finalize status"):
-            await blob_service.finalize_blob(
-                blob_id=pending.id,
-                status="deleted",
-            )
-
-
-# ---------------------------------------------------------------------------
-# Blob quota — per-session storage limit (AD-10)
-# ---------------------------------------------------------------------------
-
-
 class TestBlobQuota:
     """Per-session cumulative storage quota prevents unbounded disk growth."""
 
@@ -1699,34 +1571,6 @@ class TestBlobQuota:
             mime_type="text/csv",
             created_by="user",
             session_operation_context=compose_context,
-        )
-
-        assert locked_sessions == [str(session_id)]
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_locks_session_before_quota_sum(self, db_engine, session_id, tmp_path, monkeypatch) -> None:
-        """finalize_blob must serialize same-session quota writers before SUM+update."""
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=200)
-        pending = await service.create_pending_blob(
-            session_id=session_id,
-            filename="serialized-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-        locked_sessions: list[str] = []
-        original_lock = blob_service_module._lock_session_for_blob_quota
-
-        def recording_lock(conn, session_id_str: str) -> None:
-            locked_sessions.append(session_id_str)
-            original_lock(conn, session_id_str)
-
-        monkeypatch.setattr(blob_service_module, "_lock_session_for_blob_quota", recording_lock)
-
-        await service.finalize_blob(
-            blob_id=pending.id,
-            status="ready",
-            size_bytes=50,
-            content_hash=content_hash(b"finalized"),
         )
 
         assert locked_sessions == [str(session_id)]
@@ -1782,32 +1626,6 @@ class TestBlobQuota:
             session_operation_context=compose_context,
         )
         assert record.status == "ready"
-
-    @pytest.mark.asyncio
-    async def test_finalize_blob_rejects_ready_size_that_exceeds_quota(self, db_engine, session_id, tmp_path, compose_context) -> None:
-        """Public finalize_blob must enforce quota when pending output size becomes known."""
-        from elspeth.web.blobs.protocol import BlobQuotaExceededError
-
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=10)
-        pending = await service.create_pending_blob(
-            session_id=session_id,
-            filename="oversized-output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobQuotaExceededError):
-            await service.finalize_blob(
-                blob_id=pending.id,
-                status="ready",
-                size_bytes=100,
-                content_hash=content_hash(b"oversized-output"),
-            )
-
-        record = await service.get_blob(pending.id, session_operation_context=compose_context)
-        assert record.status == "pending"
-        assert record.size_bytes == 0
-        assert record.content_hash is None
 
 
 # ---------------------------------------------------------------------------
@@ -4075,9 +3893,10 @@ class TestCopyBlobsForFork:
         session_id: UUID,
         target_session_id: UUID,
         compose_context,
+        db_engine,
     ) -> None:
         ready = await blob_service.create_blob(session_id, "ready.csv", b"ready", "text/csv", session_operation_context=compose_context)
-        await blob_service.create_pending_blob(session_id, "pending.csv", "text/csv")
+        _seed_pending_blob(db_engine, blob_service, session_id, "pending.csv")
 
         result = await self._copy(blob_service, session_id, target_session_id)
 
@@ -4852,16 +4671,10 @@ class TestFinalizeRunOutputBlobs:
     @pytest.mark.asyncio
     async def test_success_path_sets_ready_with_size_and_hash(self, blob_service, session_id, db_engine, run_env) -> None:
         """Pending blob with file written -> ready with size_bytes and content_hash."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
         assert pending.status == "pending"
 
         # Write content to the storage path (simulating sink output)
@@ -4871,18 +4684,8 @@ class TestFinalizeRunOutputBlobs:
         _Path(pending.storage_path).write_bytes(file_content)
 
         # Link blob to run as output
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
 
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
         assert result.finalized[0].status == "ready"
@@ -4892,33 +4695,17 @@ class TestFinalizeRunOutputBlobs:
     @pytest.mark.asyncio
     async def test_file_not_written_sets_error(self, blob_service, session_id, db_engine, run_env) -> None:
         """Pending blob without file on disk -> error status on success=True."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="missing.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="missing.csv")
 
         # Do NOT write any file — simulate sink that didn't produce output
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
+        assert result.finalized[0].id == pending.id
         assert result.finalized[0].status == "error"
 
     @pytest.mark.asyncio
@@ -4926,32 +4713,15 @@ class TestFinalizeRunOutputBlobs:
         """Pending blob with success=False -> error regardless of file state."""
         from pathlib import Path as _Path
 
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
 
         # Write file — but the run failed, so it should still be marked error
         _Path(pending.storage_path).write_bytes(b"partial-output")
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=False, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
         assert len(result.errors) == 0
         assert result.finalized[0].status == "error"
@@ -5015,32 +4785,14 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         blob_service,
         session_id: UUID,
         run_id: UUID,
-        db_engine,
+        execute: SessionOperationContext,
         filename: str,
         content: bytes | None = None,
     ):
-        """Create a pending blob, optionally write content, and link to run."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename=filename,
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        """Reserve a run output through the facet under ``execute`` and optionally write its content."""
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename=filename)
         if content is not None:
-            from pathlib import Path as _Path
-
-            _Path(pending.storage_path).write_bytes(content)
-
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
+            Path(pending.storage_path).write_bytes(content)
         return pending
 
     @staticmethod
@@ -5064,35 +4816,36 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """When blob 2 of 3 is concurrently deleted (between initial query
         and per-blob finalize), blobs 1 and 3 still finalize."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        from elspeth.web.sessions.models import blob_run_links_table
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        b1 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
-        b3 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b3.csv", b"data3")
+        b1 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
+        b3 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b3.csv", b"data3")
 
-        # Patch _finalize_blob_sync to simulate concurrent deletion of b2
-        # in the window between the initial SELECT and per-blob finalize.
-        original = blob_service._finalize_blob_sync
+        # Delete b2 for real in the window between the initial SELECT and its
+        # per-blob write, so the refusal is the facet's own custody error.
+        original = blob_service._mark_run_output_ready
 
-        def _patched(blob_id, *args, **kwargs):
+        def _patched(context, *, run_id, blob_id, size_bytes, content_hash_val):
             if blob_id == b2.id:
-                raise BlobNotFoundError(str(blob_id))
-            return original(blob_id, *args, **kwargs)
+                with db_engine.begin() as conn:
+                    conn.execute(delete(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(b2.id)))
+                    conn.execute(delete(blobs_table).where(blobs_table.c.id == str(b2.id)))
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _patched
+        blob_service._mark_run_output_ready = _patched
         try:
-            result = await blob_service.finalize_run_output_blobs(
-                run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-            )
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 2, f"Expected 2 finalized, got {len(result.finalized)}"
         assert len(result.errors) == 1, f"Expected 1 error, got {len(result.errors)}"
         assert result.errors[0].blob_id == b2.id
-        assert result.errors[0].exc_type == "BlobNotFoundError"
+        assert result.errors[0].exc_type == "SessionDerivedCustodyError"
         finalized_ids = {r.id for r in result.finalized}
         assert b1.id in finalized_ids
         assert b3.id in finalized_ids
@@ -5106,29 +4859,27 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         run_env,
     ) -> None:
         """When blob 2 raises BlobStateError (already finalized), loop continues."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b3.csv", b"data3")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b3.csv", b"data3")
 
-        # Patch _finalize_blob_sync to simulate b2 already finalized
-        original = blob_service._finalize_blob_sync
+        # Finalize b2 for real just before its own per-blob write, so the
+        # second write meets the facet's own "expected 'pending'" refusal.
+        original = blob_service._mark_run_output_ready
 
-        def _patched(blob_id, *args, **kwargs):
+        def _patched(context, *, run_id, blob_id, size_bytes, content_hash_val):
             if blob_id == b2.id:
-                raise BlobStateError(str(blob_id), message="Cannot finalize — status is 'ready', expected 'pending'")
-            return original(blob_id, *args, **kwargs)
+                original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _patched
+        blob_service._mark_run_output_ready = _patched
         try:
-            result = await blob_service.finalize_run_output_blobs(
-                run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-            )
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 2
         assert len(result.errors) == 1
@@ -5146,14 +4897,13 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """When file read raises OSError, loop continues to next blob."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
         self._deny_read_bytes(monkeypatch, Path(b2.storage_path))
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         assert len(result.finalized) == 1
         assert len(result.errors) == 1
@@ -5170,23 +4920,22 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """Programmer bugs (TypeError) must crash, not be caught."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
 
-        # Inject a TypeError via patching _finalize_blob_sync
-        original = blob_service._finalize_blob_sync
+        # Inject a TypeError via patching the per-blob write seam
+        original = blob_service._mark_run_output_ready
 
         def _broken_finalize(*args, **kwargs):
             raise TypeError("unexpected keyword argument")
 
-        blob_service._finalize_blob_sync = _broken_finalize
+        blob_service._mark_run_output_ready = _broken_finalize
         try:
             with pytest.raises(TypeError, match="unexpected keyword argument"):
-                await blob_service.finalize_run_output_blobs(
-                    run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-                )
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
     @pytest.mark.asyncio
     async def test_all_blobs_fail_returns_empty_finalized_with_errors(
@@ -5197,26 +4946,29 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         run_env,
     ) -> None:
         """When all blobs fail, result has empty finalized and N errors."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        from elspeth.web.sessions.models import blob_run_links_table
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
-        # Patch to simulate all blobs concurrently deleted
-        original = blob_service._finalize_blob_sync
+        # Delete every row for real before its per-blob write: all refusals
+        # are the facet's own custody error.
+        original = blob_service._mark_run_output_ready
 
-        def _all_missing(blob_id, *args, **kwargs):
-            raise BlobNotFoundError(str(blob_id))
+        def _all_missing(context, *, run_id, blob_id, size_bytes, content_hash_val):
+            with db_engine.begin() as conn:
+                conn.execute(delete(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(blob_id)))
+                conn.execute(delete(blobs_table).where(blobs_table.c.id == str(blob_id)))
+            return original(context, run_id=run_id, blob_id=blob_id, size_bytes=size_bytes, content_hash_val=content_hash_val)
 
-        blob_service._finalize_blob_sync = _all_missing
+        blob_service._mark_run_output_ready = _all_missing
         try:
-            result = await blob_service.finalize_run_output_blobs(
-                run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-            )
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
 
         assert len(result.finalized) == 0
         assert len(result.errors) == 2
@@ -5231,10 +4983,9 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """Run with no pending output blobs returns empty result."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         assert len(result.finalized) == 0
         assert len(result.errors) == 0
@@ -5252,14 +5003,13 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         from elspeth.web.sessions.models import blobs_table as bt
 
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        b1 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
-        b2 = await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b2.csv", b"data2")
+        b1 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+        b2 = await self._create_linked_blob(blob_service, session_id, run_id, execute, "b2.csv", b"data2")
 
         self._deny_read_bytes(monkeypatch, Path(b1.storage_path))
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
         # b1 should have been moved to "error" by the best-effort recovery
         with db_engine.connect() as conn:
@@ -5281,22 +5031,62 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         """RuntimeError (Tier 1 anomaly: blob vanished mid-transaction) propagates."""
         run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
 
-        await self._create_linked_blob(blob_service, session_id, run_id, db_engine, "b1.csv", b"data1")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
 
-        original = blob_service._finalize_blob_sync
+        original = blob_service._mark_run_output_ready
 
         def _vanishing_finalize(*args, **kwargs):
             raise RuntimeError("Blob abc vanished during finalize — concurrent deletion?")
 
-        blob_service._finalize_blob_sync = _vanishing_finalize
+        blob_service._mark_run_output_ready = _vanishing_finalize
         try:
             with pytest.raises(RuntimeError, match="vanished during finalize"):
-                await blob_service.finalize_run_output_blobs(
-                    run_id, success=True, session_operation_context=_execute_context(db_engine, session_id)
-                )
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
         finally:
-            blob_service._finalize_blob_sync = original
+            blob_service._mark_run_output_ready = original
+
+    @pytest.mark.asyncio
+    async def test_custody_refusal_during_recovery_mark_propagates(
+        self,
+        blob_service,
+        session_id,
+        db_engine,
+        run_env,
+    ) -> None:
+        """A custody refusal while marking ``error`` after a DB fault is a Tier-1 anomaly, not a swallowed no-op.
+
+        The recovery mark runs only after an I/O or DB fault left the row
+        pending under this operation's EXECUTE fence; the facet refusing it
+        means the row changed under the fence, so the refusal propagates.
+        """
+        from sqlalchemy.exc import OperationalError
+
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        run_id, _ = run_env
+        execute = _execute_context(db_engine, session_id)
+
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "b1.csv", b"data1")
+
+        original_ready = blob_service._mark_run_output_ready
+        original_error = blob_service._mark_run_output_error
+
+        def _db_fault(*args, **kwargs):
+            raise OperationalError("UPDATE blobs", {}, Exception("connection reset"))
+
+        def _refused(*args, **kwargs):
+            raise SessionDerivedCustodyError()
+
+        blob_service._mark_run_output_ready = _db_fault
+        blob_service._mark_run_output_error = _refused
+        try:
+            with pytest.raises(SessionDerivedCustodyError):
+                await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        finally:
+            blob_service._mark_run_output_ready = original_ready
+            blob_service._mark_run_output_error = original_error
 
 
 # ---------------------------------------------------------------------------
@@ -5312,18 +5102,13 @@ class TestReadBlobContentLifecycleGuard:
     """
 
     @pytest.mark.asyncio
-    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context) -> None:
+    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Pending blobs have no finalized content — reading must fail."""
         from pathlib import Path as _Path
 
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
         # Write a file so the only guard is status, not file existence
         _Path(pending.storage_path).write_bytes(b"partial-content")
 
@@ -5331,20 +5116,16 @@ class TestReadBlobContentLifecycleGuard:
             await blob_service.read_blob_content(pending.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_rejects_error_blob(self, blob_service, session_id, compose_context) -> None:
+    async def test_rejects_error_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Error blobs represent failed runs — content must not be served."""
         from pathlib import Path as _Path
 
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
         _Path(pending.storage_path).write_bytes(b"partial-content")
-        await blob_service.finalize_blob(pending.id, status="error")
+        with db_engine.begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == str(pending.id)).values(status="error"))
 
         with pytest.raises(BlobStateError):
             await blob_service.read_blob_content(pending.id, session_operation_context=compose_context)
@@ -5433,7 +5214,7 @@ class TestReadBlobContentLifecycleGuard:
             await blob_service.read_blob_content(record.id, session_operation_context=compose_context)
 
     @pytest.mark.asyncio
-    async def test_rejects_pending_blob_without_file(self, blob_service, session_id, compose_context) -> None:
+    async def test_rejects_pending_blob_without_file(self, blob_service, session_id, compose_context, db_engine) -> None:
         """Pending blob with no file must raise BlobStateError, not BlobNotFoundError.
 
         Guards exception ordering: the status check must fire before
@@ -5442,12 +5223,7 @@ class TestReadBlobContentLifecycleGuard:
         """
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="no-file.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "no-file.csv")
         # Deliberately do NOT write a file
 
         with pytest.raises(BlobStateError, match="expected 'ready'"):
@@ -5554,15 +5330,10 @@ class TestReadBlobContentPrefixVerifiedStreaming:
         assert all(size <= 4096 for size in sizes)
 
     @pytest.mark.asyncio
-    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context) -> None:
+    async def test_rejects_pending_blob(self, blob_service, session_id, compose_context, db_engine) -> None:
         from elspeth.web.blobs.protocol import BlobStateError
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        pending = _seed_pending_blob(db_engine, blob_service, session_id, "output.csv")
         Path(pending.storage_path).write_bytes(b"partial-content")
 
         with pytest.raises(BlobStateError):
@@ -5790,34 +5561,17 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
         """When run fails, backing file must be deleted — not left orphaned."""
         from pathlib import Path as _Path
 
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="output.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="output.csv")
 
         # Simulate sink writing partial output before run failure
         storage = _Path(pending.storage_path)
         storage.write_bytes(b"partial-output-before-crash")
         assert storage.exists()
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=False, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
         blob_result = result.finalized[0]
         assert blob_result.status == "error"
@@ -5833,30 +5587,14 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
     @pytest.mark.asyncio
     async def test_failure_without_file_still_sets_error(self, blob_service, session_id, db_engine, run_env) -> None:
         """When run fails and no file was written, status is still error (no crash)."""
-        from elspeth.web.sessions.models import blob_run_links_table
-
         run_id, _ = run_env
 
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="never-written.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
+        execute = _execute_context(db_engine, session_id)
+        pending = reserve_output_blob(blob_service, session_id, run_id, execute, filename="never-written.csv")
 
-        with db_engine.begin() as conn:
-            conn.execute(
-                blob_run_links_table.insert().values(
-                    blob_id=str(pending.id),
-                    run_id=str(run_id),
-                    direction="output",
-                )
-            )
-
-        result = await blob_service.finalize_run_output_blobs(
-            run_id, success=False, session_operation_context=_execute_context(db_engine, session_id)
-        )
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=execute)
         assert len(result.finalized) == 1
+        assert result.finalized[0].id == pending.id
         assert result.finalized[0].status == "error"
 
 
@@ -5868,8 +5606,10 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
 class TestBlobsReadyHashDBConstraint:
     """The DB refuses status='ready' rows without a content_hash.
 
-    Service-level validation in _validate_finalize_hash is the first line
-    of defence, but the CHECK constraint in the current schema is the belt:
+    Service-level validation (``_finalize_reserved_blob`` on the upload path,
+    the authority facet's ``mark_run_output_blob_ready`` on the run-output
+    path) is the first line of defence, but the CHECK constraint in the
+    current schema is the belt:
     even raw SQL / direct ORM writes that bypass the service cannot
     commit a violating row.
     """
@@ -5961,8 +5701,9 @@ class TestBlobsReadyHashDBConstraint:
     ) -> None:
         """Updating a ready row's hash to a malformed value is rejected.
 
-        The service-level write path goes through ``_validate_finalize_hash``
-        which rejects malformed hashes before SQL.  This test bypasses the
+        Both service-level write paths (``_finalize_reserved_blob`` and the
+        authority facet's ``mark_run_output_blob_ready``) reject a malformed
+        hash before SQL.  This test bypasses the
         service entirely and asserts the database CHECK is the second wall
         — so a future caller that builds an UPDATE statement directly (or
         a migration script that touches content_hash) cannot leave the row
@@ -5984,132 +5725,6 @@ class TestBlobsReadyHashDBConstraint:
 
         with pytest.raises(IntegrityError), db_engine.begin() as conn:
             conn.execute(update(blobs_table).where(blobs_table.c.id == str(record.id)).values(content_hash=bad_hash))
-
-
-# ---------------------------------------------------------------------------
-# _finalize_blob_sync — mirrors finalize_blob's hash validation but on the
-# path actually used by the pipeline output finalizer.  Coverage asymmetry
-# between the two entry points would let a regression strip validation
-# from the pipeline path while the REST path stayed healthy — the worst
-# kind of bifurcation for audit integrity.
-# ---------------------------------------------------------------------------
-
-
-class TestFinalizeBlobSyncHashValidation:
-    """_validate_finalize_hash must engage on the sync pipeline path too."""
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_missing_hash_for_ready(self, blob_service, session_id) -> None:
-        """Invoking _finalize_blob_sync with ready+None hash raises BlobStateError."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobStateError, match="content_hash"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=42,
-                content_hash_val=None,
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_non_sha256_hash(self, blob_service, session_id) -> None:
-        """Invoking _finalize_blob_sync with a malformed hash raises BlobStateError."""
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=42,
-                content_hash_val="abc123",  # too short
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_rejects_uppercase_hex_hash(self, blob_service, session_id) -> None:
-        """The canonical form is lowercase; uppercase hex is a bifurcation risk.
-
-        FilesystemPayloadStore writes lowercase, and read_blob_content
-        compares via hmac.compare_digest — byte-for-byte.  If the
-        write-side validator silently admitted uppercase, a pipeline
-        could commit a blob whose hash does not match the stored form
-        anywhere else in the audit trail.
-        """
-        from elspeth.web.blobs.protocol import BlobStateError
-
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        uppercase_hash = content_hash(b"real-bytes").upper()
-
-        with pytest.raises(BlobStateError, match="64 lowercase hex"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "ready",
-                size_bytes=10,
-                content_hash_val=uppercase_hash,
-            )
-
-    @pytest.mark.asyncio
-    async def test_sync_path_allows_error_status_without_hash(self, blob_service, session_id) -> None:
-        """The hash invariant applies only to 'ready'; 'error' requires nothing."""
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        record = blob_service._finalize_blob_sync(
-            pending.id,
-            "error",
-            size_bytes=None,
-            content_hash_val=None,
-        )
-        assert record.status == "error"
-        assert record.content_hash is None
-
-    @pytest.mark.asyncio
-    async def test_sync_path_invalid_status_raises_runtime_error(self, blob_service, session_id) -> None:
-        """Invalid status on the sync path must propagate as RuntimeError.
-
-        _PER_BLOB_SUPPRESSED deliberately excludes RuntimeError so a
-        programmer bug (typo'd status literal) crashes the pipeline
-        finalization loop rather than being converted silently into a
-        per-blob 'error' record.  BlobStateError would have been
-        suppressed — so this test pins the crash-not-suppress contract.
-        """
-        pending = await blob_service.create_pending_blob(
-            session_id=session_id,
-            filename="pipe.csv",
-            mime_type="text/csv",
-            created_by="pipeline",
-        )
-
-        with pytest.raises(RuntimeError, match="Invalid finalize status"):
-            blob_service._finalize_blob_sync(
-                pending.id,
-                "deleted",
-                size_bytes=None,
-                content_hash_val=None,
-            )
 
 
 # ---------------------------------------------------------------------------

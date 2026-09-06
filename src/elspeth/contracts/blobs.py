@@ -484,31 +484,6 @@ class BlobServiceProtocol(Protocol):
         """Idempotently materialize one deterministic inline-source blob."""
         ...
 
-    async def create_pending_blob(
-        self,
-        session_id: UUID,
-        filename: str,
-        mime_type: AllowedMimeType,
-        created_by: BlobCreator = "pipeline",
-        source_description: str | None = None,
-    ) -> BlobRecord:
-        """Reserve a pending output blob.
-
-        The backing file does not exist yet; a pipeline sink writes it
-        before ``finalize_blob`` marks the record ready or error.
-        """
-        ...
-
-    async def finalize_blob(
-        self,
-        blob_id: UUID,
-        status: FinalizeBlobStatus,
-        size_bytes: int | None = None,
-        content_hash: str | None = None,
-    ) -> BlobRecord:
-        """Update a pending blob to ready or error after execution."""
-        ...
-
     async def get_blob(
         self,
         blob_id: UUID,

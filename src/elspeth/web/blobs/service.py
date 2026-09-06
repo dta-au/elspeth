@@ -34,7 +34,6 @@ from elspeth.web.blobs.protocol import (
     BLOB_CREATORS,
     BLOB_RUN_LINK_DIRECTIONS,
     BLOB_STATUSES,
-    FINALIZE_BLOB_STATUSES,
     STORAGE_MIME_TYPES,
     AllowedMimeType,
     BlobActiveRunError,
@@ -59,7 +58,6 @@ from elspeth.web.blobs.protocol import (
     BlobRunLinkDirection,
     BlobRunLinkRecord,
     BlobStateError,
-    FinalizeBlobStatus,
     InlineCustodyRequest,
     StorageMimeType,
     fork_blob_id,
@@ -85,7 +83,11 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
-from elspeth.web.sessions.protocol import CompositionStateRecord, SessionOperationAuthority
+from elspeth.web.sessions.protocol import (
+    CompositionStateRecord,
+    SessionOperationAuthority,
+    SessionOperationMutationTransaction,
+)
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 
 _T = TypeVar("_T")
@@ -275,9 +277,9 @@ def content_hash(data: bytes) -> str:
     When a pipeline reads from a blob, the engine records the raw data
     hash in PayloadStore. Using the same algorithm here guarantees the
     hashes match when the bytes match. Output is SHA-256 hex, 64
-    lowercase characters — the canonical form validated by
-    ``_validate_finalize_hash`` at the write side and compared via
-    ``hmac.compare_digest`` at the read side.
+    lowercase characters — the canonical form the authority facet
+    validates at the write side and ``hmac.compare_digest`` compares at
+    the read side.
     """
     return hashlib.sha256(data).hexdigest()
 
@@ -1961,35 +1963,6 @@ def _composition_references_blob(
     return False
 
 
-def _assert_blob_run_same_session(
-    conn: Connection,
-    *,
-    blob_id: str,
-    run_id: str,
-    caller: str,
-) -> None:
-    """Offensive guard: blob and run must belong to the same session.
-
-    ``link_blob_to_run()`` is an internal write boundary. A cross-session
-    linkage is a caller bug, not user input, so crash with RuntimeError
-    before persisting contradictory ownership into ``blob_run_links``.
-    """
-    blob_session_id = conn.execute(select(blobs_table.c.session_id).where(blobs_table.c.id == blob_id)).scalar()
-    if blob_session_id is None:
-        raise RuntimeError(f"{caller}: blob_id={blob_id!r} does not exist")
-
-    run_session_id = conn.execute(select(runs_table.c.session_id).where(runs_table.c.id == run_id)).scalar()
-    if run_session_id is None:
-        raise RuntimeError(f"{caller}: run_id={run_id!r} does not exist")
-
-    if blob_session_id != run_session_id:
-        raise RuntimeError(
-            f"{caller}: blob_id={blob_id!r} belongs to session "
-            f"{blob_session_id!r}, run_id={run_id!r} belongs to session "
-            f"{run_session_id!r} — cross-session reference is a contract violation"
-        )
-
-
 def _session_quota_lock_statement(session_id_str: str) -> Any:
     """Build the per-session row lock used to serialize quota writers."""
     return select(sessions_table.c.id).where(sessions_table.c.id == session_id_str).with_for_update()
@@ -2307,27 +2280,6 @@ class BlobServiceImpl:
             direction=row.direction,
         )
 
-    def _enforce_ready_finalize_quota(
-        self,
-        conn: Connection,
-        *,
-        blob_id_str: str,
-        session_id_str: str,
-        status: FinalizeBlobStatus,
-        size_bytes: int | None,
-    ) -> None:
-        """Enforce session storage quota when a pending blob becomes ready."""
-        if status != "ready" or size_bytes is None or size_bytes <= 0:
-            return
-        _lock_session_for_blob_quota(conn, session_id_str)
-        _enforce_session_blob_quota(
-            conn,
-            session_id_str,
-            additional_bytes=size_bytes,
-            max_storage_per_session=self._max_storage_per_session,
-            exclude_blob_id=blob_id_str,
-        )
-
     async def create_blob(
         self,
         session_id: UUID,
@@ -2423,139 +2375,6 @@ class BlobServiceImpl:
             )
         )
         return _row_to_blob_record(row)
-
-    async def create_pending_blob(
-        self,
-        session_id: UUID,
-        filename: str,
-        mime_type: AllowedMimeType,
-        created_by: BlobCreator = "pipeline",
-        source_description: str | None = None,
-    ) -> BlobRecord:
-        """Reserve a pending output blob."""
-        # Programmer-bug guard on Literal-typed parameter.  Explicit raise
-        # so the check survives ``python -O`` (mirrors create_blob()).
-        if created_by not in BLOB_CREATORS:
-            raise RuntimeError(f"Invalid created_by {created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
-        if mime_type not in ALLOWED_MIME_TYPES:
-            raise RuntimeError(f"Invalid mime_type {mime_type!r} — not in the allowed MIME set")
-        safe_filename = sanitize_filename(filename)
-        blob_id = str(uuid4())
-        session_id_str = str(session_id)
-        storage = self._storage_path(session_id_str, blob_id, safe_filename)
-
-        def _sync() -> BlobRecord:
-            # Ensure directory exists (file will be written by sink later)
-            storage.parent.mkdir(parents=True, exist_ok=True)
-
-            now = self._now()
-            with self._engine.begin() as conn:
-                conn.execute(
-                    blobs_table.insert().values(
-                        id=blob_id,
-                        session_id=session_id_str,
-                        filename=safe_filename,
-                        mime_type=mime_type,
-                        size_bytes=0,
-                        content_hash=None,
-                        storage_path=str(storage),
-                        created_at=now,
-                        created_by=created_by,
-                        source_description=source_description,
-                        status="pending",
-                        # Pending output blobs (pipeline-produced): the
-                        # content is filled in later by the sink writer;
-                        # provenance for these is the pipeline run, not
-                        # a chat message, so the chat-message FK is NULL
-                        # and the modality is VERBATIM (the run wrote
-                        # exactly the bytes the sink emitted; no LLM
-                        # authored them).  Phase 5a Task 2.5.
-                        creation_modality=CreationModality.VERBATIM.value,
-                        created_from_message_id=None,
-                        creating_model_identifier=None,
-                        creating_model_version=None,
-                        creating_provider=None,
-                        creating_composer_skill_hash=None,
-                        creating_arguments_hash=None,
-                    )
-                )
-
-            return BlobRecord(
-                id=UUID(blob_id),
-                session_id=session_id,
-                filename=safe_filename,
-                mime_type=mime_type,
-                size_bytes=0,
-                content_hash=None,
-                storage_path=str(storage),
-                created_at=now,
-                created_by=created_by,
-                source_description=source_description,
-                status="pending",
-                creation_modality=CreationModality.VERBATIM,
-                created_from_message_id=None,
-                creating_model_identifier=None,
-                creating_model_version=None,
-                creating_provider=None,
-                creating_composer_skill_hash=None,
-                creating_arguments_hash=None,
-            )
-
-        return await self._run_sync(_sync)
-
-    async def finalize_blob(
-        self,
-        blob_id: UUID,
-        status: FinalizeBlobStatus,
-        size_bytes: int | None = None,
-        content_hash: str | None = None,
-    ) -> BlobRecord:
-        """Update a pending blob to ready or error after execution."""
-        blob_id_str = str(blob_id)
-        # Runtime guard for dynamic callers — the Literal narrowing gives
-        # static callers the correct shape, but the Protocol boundary is
-        # still called by code that mypy may not fully verify (tests,
-        # factory-constructed services).  Keep the check as a belt.
-        if status not in FINALIZE_BLOB_STATUSES:
-            raise RuntimeError(f"Invalid finalize status '{status}' — must be one of {sorted(FINALIZE_BLOB_STATUSES)}")
-
-        def _sync() -> BlobRecord:
-            with self._engine.begin() as conn:
-                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if row is None:
-                    raise BlobNotFoundError(blob_id_str)
-
-                if row.status != "pending":
-                    raise BlobStateError(
-                        blob_id_str,
-                        message=f"Cannot finalize blob {blob_id_str} — status is '{row.status}', expected 'pending'",
-                    )
-                # Hash-format validation runs after the state check so a
-                # callers confused by a stale blob hear about the lifecycle
-                # problem first.  See _validate_finalize_hash() docstring.
-                _validate_finalize_hash(blob_id_str, status, content_hash)
-                self._enforce_ready_finalize_quota(
-                    conn,
-                    blob_id_str=blob_id_str,
-                    session_id_str=row.session_id,
-                    status=status,
-                    size_bytes=size_bytes,
-                )
-
-                updates: dict[str, Any] = {"status": status}
-                if size_bytes is not None:
-                    updates["size_bytes"] = size_bytes
-                if content_hash is not None:
-                    updates["content_hash"] = content_hash
-
-                conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id_str).values(**updates))
-
-                updated = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if updated is None:
-                    raise RuntimeError(f"Blob {blob_id_str} vanished during finalize — concurrent deletion?")
-                return self._row_to_record(updated)
-
-        return await self._run_sync(_sync)
 
     async def get_blob(
         self,
@@ -2714,66 +2533,86 @@ class BlobServiceImpl:
         blob_id_str = str(blob_id)
         fence_session_id = session_operation_context.fence.session_id
 
-        def _sync() -> None:
-            self._session_operation_authority.compare_and_swap(session_operation_context)
-            with self._engine.connect() as lookup_conn:
-                blob_session_id = lookup_conn.execute(
-                    select(blobs_table.c.session_id).where(blobs_table.c.id == blob_id_str)
-                ).scalar_one_or_none()
-                cleanup_session_id = lookup_conn.execute(
-                    select(blob_deletion_cleanups_table.c.session_id).where(blob_deletion_cleanups_table.c.blob_id == blob_id_str)
-                ).scalar_one_or_none()
-            if blob_session_id is not None and cleanup_session_id is not None:
-                raise AuditIntegrityError(f"blob {blob_id_str} has both live metadata and committed deletion cleanup state")
-            session_id = blob_session_id if blob_session_id is not None else cleanup_session_id
-            if session_id is None or session_id != fence_session_id:
-                raise BlobNotFoundError(blob_id_str)
-            stage: _StagedBlobDeletion | None = None
-            restore_uncommitted_stage = False
-            # Keep the process/session lock across transaction commit and the
-            # corresponding restore-or-purge filesystem phase.
-            with _blob_custody_session_lock(self._engine, session_id) as held_connection:
-                try:
-                    with _blob_phase_transaction(self._engine, held_connection) as conn:
-                        _acquire_blob_phase_lock(conn, session_id)
-                        # Re-read only after the shared lock: custody/proposal/
-                        # delete decisions must observe one serial order.
-                        row = conn.execute(
-                            select(blobs_table).where(blobs_table.c.id == blob_id_str).where(blobs_table.c.session_id == session_id)
-                        ).one_or_none()
-                        cleanup_row = conn.execute(
-                            select(blob_deletion_cleanups_table)
-                            .where(blob_deletion_cleanups_table.c.blob_id == blob_id_str)
-                            .where(blob_deletion_cleanups_table.c.session_id == session_id)
-                            .with_for_update()
-                        ).one_or_none()
-                        if row is not None and cleanup_row is not None:
-                            raise AuditIntegrityError(f"blob {blob_id_str} has overlapping live and deletion cleanup state")
-                        if cleanup_row is not None:
-                            stage = _registered_blob_deletion_stage(
-                                cleanup_row,
-                                data_dir=self._data_dir,
-                                blob_id=blob_id_str,
-                                session_id=session_id,
-                            )
-                        elif row is None:
-                            raise BlobNotFoundError(blob_id_str)
-                        else:
-                            stage = self._delete_blob_row_locked(conn, row=row, blob_id_str=blob_id_str)
-                            restore_uncommitted_stage = True
-                except BaseException as primary_exc:
-                    if restore_uncommitted_stage and stage is not None:
-                        _restore_staged_blob_deletion(stage, primary_exc)
-                    raise
-                if stage is not None:
-                    self._finalize_registered_blob_deletion(
-                        held_connection=held_connection,
-                        blob_id_str=blob_id_str,
-                        session_id_str=session_id,
-                        stage=stage,
-                    )
+        await self._run_sync(
+            lambda: self._delete_blob_sync(
+                blob_id_str,
+                fence_session_id=fence_session_id,
+                session_operation_context=session_operation_context,
+            )
+        )
 
-        await self._run_sync(_sync)
+    def _delete_blob_sync(
+        self,
+        blob_id_str: str,
+        *,
+        fence_session_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> None:
+        """The synchronous body of ``delete_blob``, as an instance method.
+
+        A method rather than a closure so the writer inventory can follow the
+        connection it hands to ``_delete_blob_row_locked`` and
+        ``_finalize_registered_blob_deletion``: the scanner resolves
+        ``self.<method>(conn)`` only from a call made lexically inside a method
+        (D6 family B, elspeth-af0fdc3cc6).
+        """
+        self._session_operation_authority.compare_and_swap(session_operation_context)
+        with self._engine.connect() as lookup_conn:
+            blob_session_id = lookup_conn.execute(
+                select(blobs_table.c.session_id).where(blobs_table.c.id == blob_id_str)
+            ).scalar_one_or_none()
+            cleanup_session_id = lookup_conn.execute(
+                select(blob_deletion_cleanups_table.c.session_id).where(blob_deletion_cleanups_table.c.blob_id == blob_id_str)
+            ).scalar_one_or_none()
+        if blob_session_id is not None and cleanup_session_id is not None:
+            raise AuditIntegrityError(f"blob {blob_id_str} has both live metadata and committed deletion cleanup state")
+        session_id = blob_session_id if blob_session_id is not None else cleanup_session_id
+        if session_id is None or session_id != fence_session_id:
+            raise BlobNotFoundError(blob_id_str)
+        stage: _StagedBlobDeletion | None = None
+        restore_uncommitted_stage = False
+        # Keep the process/session lock across transaction commit and the
+        # corresponding restore-or-purge filesystem phase.
+        with _blob_custody_session_lock(self._engine, session_id) as held_connection:
+            try:
+                with _blob_phase_transaction(self._engine, held_connection) as conn:
+                    _acquire_blob_phase_lock(conn, session_id)
+                    # Re-read only after the shared lock: custody/proposal/
+                    # delete decisions must observe one serial order.
+                    row = conn.execute(
+                        select(blobs_table).where(blobs_table.c.id == blob_id_str).where(blobs_table.c.session_id == session_id)
+                    ).one_or_none()
+                    cleanup_row = conn.execute(
+                        select(blob_deletion_cleanups_table)
+                        .where(blob_deletion_cleanups_table.c.blob_id == blob_id_str)
+                        .where(blob_deletion_cleanups_table.c.session_id == session_id)
+                        .with_for_update()
+                    ).one_or_none()
+                    if row is not None and cleanup_row is not None:
+                        raise AuditIntegrityError(f"blob {blob_id_str} has overlapping live and deletion cleanup state")
+                    if cleanup_row is not None:
+                        stage = _registered_blob_deletion_stage(
+                            cleanup_row,
+                            data_dir=self._data_dir,
+                            blob_id=blob_id_str,
+                            session_id=session_id,
+                        )
+                    elif row is None:
+                        raise BlobNotFoundError(blob_id_str)
+                    else:
+                        stage = self._delete_blob_row_locked(conn, row=row, blob_id_str=blob_id_str)
+                        restore_uncommitted_stage = True
+            except BaseException as primary_exc:
+                if restore_uncommitted_stage and stage is not None:
+                    _restore_staged_blob_deletion(stage, primary_exc)
+                raise
+            if stage is not None:
+                self._finalize_registered_blob_deletion(
+                    held_connection=held_connection,
+                    blob_id_str=blob_id_str,
+                    session_id_str=session_id,
+                    stage=stage,
+                )
 
     @contextmanager
     def _locked_blob_row_for_read(self, blob_id_str: str) -> Iterator[Row[Any]]:
@@ -2859,8 +2698,9 @@ class BlobServiceImpl:
 
                 # Integrity verification — Tier 1: our data must be pristine.
                 # A ready blob must always have a content_hash — it is set
-                # by create_blob() and required by _finalize_blob_sync()
-                # when transitioning to ready.  NULL here is a DB anomaly.
+                # by create_blob() and required by the authority facet's
+                # mark_run_output_blob_ready when transitioning to ready.
+                # NULL here is a DB anomaly.
                 # Explicit raise so the guard survives ``python -O``.
                 if row.content_hash is None:
                     raise AuditIntegrityError(
@@ -2918,8 +2758,9 @@ class BlobServiceImpl:
 
                 # Integrity verification — Tier 1: our data must be pristine.
                 # A ready blob must always have a content_hash — it is set
-                # by create_blob() and required by _finalize_blob_sync()
-                # when transitioning to ready. NULL here is a DB anomaly.
+                # by create_blob() and required by the authority facet's
+                # mark_run_output_blob_ready when transitioning to ready.
+                # NULL here is a DB anomaly.
                 if row.content_hash is None:
                     raise AuditIntegrityError(
                         f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify"
@@ -3020,10 +2861,11 @@ class BlobServiceImpl:
     ) -> None:
         """Record a blob-to-run linkage under the run's EXECUTE fence.
 
-        The fence is compare-and-swapped first; inside the link transaction
+        One authority mutation: the fence is compare-and-swapped inside it,
         the blob must be in the custody of the fence's session (a foreign
-        blob links like a missing one) and, as before, the blob and the run
-        must share a session.
+        blob links like a missing one), and the run must be too — a run
+        outside the session is a caller bug, named as such. The link itself
+        is the facet's ``insert_blob_run_link``, idempotent per direction.
         """
         _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
         if direction not in BLOB_RUN_LINK_DIRECTIONS:
@@ -3031,34 +2873,29 @@ class BlobServiceImpl:
         fence_session_id = session_operation_context.fence.session_id
 
         def _sync() -> None:
-            self._session_operation_authority.compare_and_swap(session_operation_context)
-            with self._engine.begin() as conn:
-                blob_session_id = conn.execute(
-                    select(blobs_table.c.session_id).where(blobs_table.c.id == str(blob_id))
-                ).scalar_one_or_none()
-                if blob_session_id != fence_session_id:
-                    raise BlobNotFoundError(str(blob_id))
-                _assert_blob_run_same_session(
-                    conn,
-                    blob_id=str(blob_id),
-                    run_id=str(run_id),
-                    caller="BlobServiceImpl.link_blob_to_run",
-                )
-                existing = conn.execute(
-                    select(blob_run_links_table.c.blob_id)
-                    .where(blob_run_links_table.c.blob_id == str(blob_id))
-                    .where(blob_run_links_table.c.run_id == str(run_id))
-                    .where(blob_run_links_table.c.direction == direction)
-                ).first()
-                if existing is not None:
-                    return
-                conn.execute(
-                    blob_run_links_table.insert().values(
-                        blob_id=str(blob_id),
-                        run_id=str(run_id),
-                        direction=direction,
-                    )
-                )
+            # Local import: coordination.repository imports the blob contracts
+            # at module scope (see _fenced_blob_record).
+            from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+            def _link(transaction: SessionOperationMutationTransaction) -> None:
+                try:
+                    transaction.blobs.read_blob(blob_id=blob_id)
+                except SessionDerivedCustodyError:
+                    # Custody is decided inside the fenced transaction: a blob
+                    # outside the fence's session links exactly like a missing one.
+                    raise BlobNotFoundError(str(blob_id)) from None
+                try:
+                    transaction.blobs.insert_blob_run_link(blob_id=blob_id, run_id=run_id, direction=direction)
+                except SessionDerivedCustodyError:
+                    # The blob was just read under this fence, so this refusal
+                    # names the run: a run outside the session is a contract
+                    # violation by the caller, never user input.
+                    raise RuntimeError(
+                        f"BlobServiceImpl.link_blob_to_run: run_id={str(run_id)!r} is not in the custody of "
+                        f"session {fence_session_id!r} — cross-session reference is a contract violation"
+                    ) from None
+
+            self._session_operation_authority.mutate(session_operation_context, _link)
 
         await self._run_sync(_sync)
 
@@ -3075,20 +2912,6 @@ class BlobServiceImpl:
                 return [self._row_to_link_record(r) for r in rows]
 
         return await self._run_sync(_sync)
-
-    # Per-blob operational errors that should not abort the finalization
-    # loop.  BlobStateError covers status-guard conditions (blob already
-    # finalized by a concurrent call).  RuntimeError is deliberately
-    # excluded — it covers the Tier 1 "blob vanished mid-transaction"
-    # anomaly, which must propagate.  Programmer bugs (TypeError,
-    # AttributeError, AssertionError) also propagate per offensive
-    # programming policy.
-    _PER_BLOB_SUPPRESSED: tuple[type[BaseException], ...] = (
-        BlobNotFoundError,
-        BlobStateError,
-        OSError,
-        SQLAlchemyError,
-    )
 
     async def finalize_run_output_blobs(
         self,
@@ -3116,6 +2939,12 @@ class BlobServiceImpl:
 
         Runs under the run's EXECUTE fence: the fence is compare-and-swapped
         first and the run must be in the custody of the fence's session.
+        Every per-blob write is one authority mutation
+        (``mark_run_output_blob_ready`` / ``mark_run_output_blob_error``): the
+        facet binds a reservation to the EXECUTE operation that made it, so
+        an output another operation reserved is a Tier-1 anomaly
+        (``AuditIntegrityError``, which aborts the batch) rather than a row
+        finalized out from under that operation.
         """
         _require_blob_operation_context(session_operation_context, allowed_kinds=_EXECUTE_BLOB_OPERATION_KINDS)
         run_id_str = str(run_id)
@@ -3141,7 +2970,13 @@ class BlobServiceImpl:
             finalized: list[BlobRecord] = []
             errors: list[BlobFinalizationError] = []
             for row in rows:
-                outcome = self._finalize_one_output_blob(UUID(row.id), Path(row.storage_path), success=success)
+                outcome = self._finalize_one_output_blob(
+                    session_operation_context,
+                    run_id=run_id,
+                    blob_id=UUID(row.id),
+                    storage=Path(row.storage_path),
+                    success=success,
+                )
                 if isinstance(outcome, BlobRecord):
                     finalized.append(outcome)
                 else:
@@ -3150,11 +2985,42 @@ class BlobServiceImpl:
 
         return await self._run_sync(_sync)
 
+    def _mark_run_output_ready(
+        self,
+        context: SessionOperationContext,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+        size_bytes: int,
+        content_hash_val: str,
+    ) -> BlobRecord:
+        """Mark one of the run's pending outputs ``ready``: one authority mutation, quota enforced by the facet."""
+        max_storage_per_session = self._max_storage_per_session
+        return self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.mark_run_output_blob_ready(
+                run_id=run_id,
+                blob_id=blob_id,
+                size_bytes=size_bytes,
+                content_hash=content_hash_val,
+                max_storage_per_session=max_storage_per_session,
+            ),
+        )
+
+    def _mark_run_output_error(self, context: SessionOperationContext, *, run_id: UUID, blob_id: UUID) -> BlobRecord:
+        """Mark one of the run's pending outputs ``error`` (zero size, no hash): one authority mutation."""
+        return self._session_operation_authority.mutate(
+            context,
+            lambda transaction: transaction.blobs.mark_run_output_blob_error(run_id=run_id, blob_id=blob_id),
+        )
+
     def _finalize_one_output_blob(
         self,
+        context: SessionOperationContext,
+        *,
+        run_id: UUID,
         blob_id: UUID,
         storage: Path,
-        *,
         success: bool,
     ) -> BlobRecord | list[BlobFinalizationError]:
         """Finalize a single output blob, returning an explicit per-blob outcome.
@@ -3165,18 +3031,30 @@ class BlobServiceImpl:
         values).  Rather than swallow such a fault, this method **returns** an
         explicit list of :class:`BlobFinalizationError` records so the batch
         caller can record them in ``BlobFinalizationResult.errors`` and proceed
-        to the next blob.  Programmer bugs (TypeError, AttributeError,
-        AssertionError) and the Tier 1 "blob vanished mid-transaction"
-        RuntimeError are NOT in ``_PER_BLOB_SUPPRESSED`` and so propagate.
+        to the next blob.  The suppressed set is exact: the facet's typed
+        custody refusal ``SessionDerivedCustodyError`` (the row is gone, or is
+        not an output of this run in the fence's session) and
+        ``BlobStateError`` (already finalized) are recorded as the whole
+        outcome — there is nothing left to transition; ``OSError`` and
+        ``SQLAlchemyError`` are recorded and followed by one best-effort
+        ``error`` mark.  Programmer bugs (TypeError, AttributeError,
+        AssertionError), any other RuntimeError, and the facet's
+        ``AuditIntegrityError`` for a row another EXECUTE operation reserved
+        all propagate.
         """
+        # Local import: coordination.repository imports the blob contracts at
+        # module scope (see _fenced_blob_record).
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
         try:
             if success:
                 if storage.exists():
                     file_bytes = storage.read_bytes()
                     try:
-                        record = self._finalize_blob_sync(
-                            blob_id,
-                            "ready",
+                        record = self._mark_run_output_ready(
+                            context,
+                            run_id=run_id,
+                            blob_id=blob_id,
                             size_bytes=len(file_bytes),
                             content_hash_val=content_hash(file_bytes),
                         )
@@ -3188,9 +3066,9 @@ class BlobServiceImpl:
                         # disk growth from repeated over-quota outputs.
                         if storage.exists():
                             storage.unlink()
-                        record = self._finalize_blob_sync(blob_id, "error")
+                        record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
                 else:
-                    record = self._finalize_blob_sync(blob_id, "error")
+                    record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
             else:
                 # Run failed — delete the backing file so the
                 # filesystem matches the DB metadata (size_bytes=0,
@@ -3200,9 +3078,14 @@ class BlobServiceImpl:
                 # error rows.
                 if storage.exists():
                     storage.unlink()
-                record = self._finalize_blob_sync(blob_id, "error")
+                record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
             return record
-        except self._PER_BLOB_SUPPRESSED as exc:
+        except (SessionDerivedCustodyError, BlobStateError) as exc:
+            # The row is gone, is not this run's output, or is already
+            # finalized: there is nothing left to transition, so the facet's
+            # refusal is the whole per-blob outcome.
+            return [BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc))]
+        except (OSError, SQLAlchemyError) as exc:
             # Best-effort: transition the failed blob to "error" so it does
             # not remain permanently pending.  Return explicit error records
             # (never a silent swallow) describing the primary fault and any
@@ -3214,7 +3097,7 @@ class BlobServiceImpl:
                     detail=str(exc),
                 )
             ]
-            recovery_exc = self._best_effort_mark_blob_error(blob_id)
+            recovery_exc = self._best_effort_mark_blob_error(context, run_id=run_id, blob_id=blob_id)
             if recovery_exc is not None:
                 blob_errors.append(
                     BlobFinalizationError(
@@ -3225,24 +3108,27 @@ class BlobServiceImpl:
                 )
             return blob_errors
 
-    def _best_effort_mark_blob_error(self, blob_id: UUID) -> SQLAlchemyError | OSError | None:
-        """Transition a still-pending blob to ``error`` status, best effort.
+    def _best_effort_mark_blob_error(
+        self,
+        context: SessionOperationContext,
+        *,
+        run_id: UUID,
+        blob_id: UUID,
+    ) -> SQLAlchemyError | OSError | None:
+        """Transition a still-pending output of this operation to ``error``, best effort.
 
-        The ``WHERE status='pending'`` makes this a no-op if the blob was
-        already finalized or deleted.  Returns the DB/IO fault if the update
-        itself failed (so the caller records a ``RecoveryFailed[...]`` audit
-        entry) or ``None`` on success.  Narrow to DB/IO faults — programmer
-        bugs (TypeError, AttributeError, AssertionError) must propagate per
-        offensive-programming policy.
+        Reached only after an I/O or DB fault left the row pending, so the
+        row is still this operation's pending output: the caller holds the
+        session's EXECUTE fence and the facet finalizes under that fence's
+        exact custody.  Returns the DB/IO fault if the mutation itself
+        failed (so the caller records a ``RecoveryFailed[...]`` audit entry)
+        or ``None`` otherwise.  Narrow to DB/IO faults — the facet's custody
+        or state refusal here means the row changed under the fence, a Tier-1
+        anomaly that propagates, as do programmer bugs (TypeError,
+        AttributeError, AssertionError) per offensive-programming policy.
         """
         try:
-            with self._engine.begin() as err_conn:
-                err_conn.execute(
-                    blobs_table.update()
-                    .where(blobs_table.c.id == str(blob_id))
-                    .where(blobs_table.c.status == "pending")
-                    .values(status="error")
-                )
+            self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
         except (SQLAlchemyError, OSError) as rec_exc:
             return rec_exc
         return None
@@ -3433,256 +3319,161 @@ class BlobServiceImpl:
             ):
                 raise AuditIntegrityError("Fork blob cleanup write fence does not match its source, target, and operation")
 
-        def _sync() -> BlobForkCleanupResult:
-            deleted_ids: list[UUID] = []
-            errors: list[BlobForkCleanupError] = []
-            with _blob_custody_session_lock(self._engine, target_session_id_str) as held_connection:
-                with _blob_phase_transaction(self._engine, held_connection) as conn:
-                    _acquire_blob_phase_lock(conn, target_session_id_str)
-                    _verify_fork_child_custody(
-                        conn,
-                        source_session_id=source_session_id_str,
-                        target_session_id=target_session_id_str,
+        return await self._run_sync(
+            lambda: self._cleanup_blobs_for_fork_sync(
+                source_session_id_str=source_session_id_str,
+                target_session_id_str=target_session_id_str,
+                operation_id=operation_id,
+                live_write_fence=live_write_fence,
+            )
+        )
+
+    def _cleanup_blobs_for_fork_sync(
+        self,
+        *,
+        source_session_id_str: str,
+        target_session_id_str: str,
+        operation_id: str,
+        live_write_fence: BlobForkWriteFence | None,
+    ) -> BlobForkCleanupResult:
+        """The synchronous body of ``cleanup_blobs_for_fork``, as an instance method.
+
+        A method rather than a closure for the same reason as ``_delete_blob_sync``:
+        the writer inventory follows ``self._delete_blob_row_locked(conn, ...)``
+        only from a call made lexically inside a method (D6 family B,
+        elspeth-af0fdc3cc6).
+        """
+        deleted_ids: list[UUID] = []
+        errors: list[BlobForkCleanupError] = []
+        with _blob_custody_session_lock(self._engine, target_session_id_str) as held_connection:
+            with _blob_phase_transaction(self._engine, held_connection) as conn:
+                _acquire_blob_phase_lock(conn, target_session_id_str)
+                _verify_fork_child_custody(
+                    conn,
+                    source_session_id=source_session_id_str,
+                    target_session_id=target_session_id_str,
+                )
+                _require_fork_cleanup_authorization(
+                    conn,
+                    source_session_id=source_session_id_str,
+                    target_session_id=target_session_id_str,
+                    operation_id=operation_id,
+                    live_write_fence=live_write_fence,
+                )
+                snapshot_ids = tuple(
+                    sorted(
+                        {
+                            *(
+                                UUID(row.id)
+                                for row in conn.execute(
+                                    select(blobs_table.c.id).where(blobs_table.c.session_id == target_session_id_str)
+                                ).all()
+                            ),
+                            *(
+                                UUID(row.blob_id)
+                                for row in conn.execute(
+                                    select(blob_deletion_cleanups_table.c.blob_id).where(
+                                        blob_deletion_cleanups_table.c.session_id == target_session_id_str
+                                    )
+                                ).all()
+                            ),
+                        },
+                        key=str,
                     )
-                    _require_fork_cleanup_authorization(
-                        conn,
-                        source_session_id=source_session_id_str,
-                        target_session_id=target_session_id_str,
-                        operation_id=operation_id,
-                        live_write_fence=live_write_fence,
-                    )
-                    snapshot_ids = tuple(
-                        sorted(
-                            {
-                                *(
-                                    UUID(row.id)
-                                    for row in conn.execute(
-                                        select(blobs_table.c.id).where(blobs_table.c.session_id == target_session_id_str)
-                                    ).all()
-                                ),
-                                *(
-                                    UUID(row.blob_id)
-                                    for row in conn.execute(
-                                        select(blob_deletion_cleanups_table.c.blob_id).where(
-                                            blob_deletion_cleanups_table.c.session_id == target_session_id_str
-                                        )
-                                    ).all()
-                                ),
-                            },
-                            key=str,
+                )
+
+            for blob_id in snapshot_ids:
+                stage: _StagedBlobDeletion | None = None
+                restore_uncommitted_stage = False
+                try:
+                    try:
+                        with _blob_phase_transaction(self._engine, held_connection) as conn:
+                            _acquire_blob_phase_lock(conn, target_session_id_str)
+                            _verify_fork_child_custody(
+                                conn,
+                                source_session_id=source_session_id_str,
+                                target_session_id=target_session_id_str,
+                            )
+                            _require_fork_cleanup_authorization(
+                                conn,
+                                source_session_id=source_session_id_str,
+                                target_session_id=target_session_id_str,
+                                operation_id=operation_id,
+                                live_write_fence=live_write_fence,
+                            )
+                            row = conn.execute(
+                                select(blobs_table)
+                                .where(blobs_table.c.id == str(blob_id))
+                                .where(blobs_table.c.session_id == target_session_id_str)
+                                .with_for_update()
+                            ).one_or_none()
+                            cleanup_row = conn.execute(
+                                select(blob_deletion_cleanups_table)
+                                .where(blob_deletion_cleanups_table.c.blob_id == str(blob_id))
+                                .where(blob_deletion_cleanups_table.c.session_id == target_session_id_str)
+                                .with_for_update()
+                            ).one_or_none()
+                            if row is not None and cleanup_row is not None:
+                                raise AuditIntegrityError(f"blob {blob_id} has overlapping live and deletion cleanup state")
+                            if cleanup_row is not None:
+                                stage = _registered_blob_deletion_stage(
+                                    cleanup_row,
+                                    data_dir=self._data_dir,
+                                    blob_id=str(blob_id),
+                                    session_id=target_session_id_str,
+                                )
+                            elif row is not None:
+                                stage = self._delete_blob_row_locked(conn, row=row, blob_id_str=str(blob_id))
+                                restore_uncommitted_stage = True
+                    except BaseException as primary_exc:
+                        if restore_uncommitted_stage and stage is not None:
+                            _restore_staged_blob_deletion(stage, primary_exc)
+                        raise
+                    if stage is not None:
+                        self._finalize_registered_blob_deletion(
+                            held_connection=held_connection,
+                            blob_id_str=str(blob_id),
+                            session_id_str=target_session_id_str,
+                            stage=stage,
+                        )
+                except (BlobForkFenceLostError, BlobContentMissingError, BlobIntegrityError):
+                    raise
+                except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
+                    errors.append(
+                        BlobForkCleanupError(
+                            blob_id=blob_id,
+                            exc_type=type(cleanup_exc).__name__,
+                            detail=str(cleanup_exc),
                         )
                     )
-
-                for blob_id in snapshot_ids:
-                    stage: _StagedBlobDeletion | None = None
-                    restore_uncommitted_stage = False
                     try:
-                        try:
-                            with _blob_phase_transaction(self._engine, held_connection) as conn:
-                                _acquire_blob_phase_lock(conn, target_session_id_str)
-                                _verify_fork_child_custody(
-                                    conn,
-                                    source_session_id=source_session_id_str,
-                                    target_session_id=target_session_id_str,
-                                )
-                                _require_fork_cleanup_authorization(
-                                    conn,
-                                    source_session_id=source_session_id_str,
-                                    target_session_id=target_session_id_str,
-                                    operation_id=operation_id,
-                                    live_write_fence=live_write_fence,
-                                )
-                                row = conn.execute(
-                                    select(blobs_table)
+                        with _blob_phase_transaction(self._engine, held_connection) as conn:
+                            residual_row_exists = (
+                                conn.execute(
+                                    select(blobs_table.c.id)
                                     .where(blobs_table.c.id == str(blob_id))
                                     .where(blobs_table.c.session_id == target_session_id_str)
-                                    .with_for_update()
-                                ).one_or_none()
-                                cleanup_row = conn.execute(
-                                    select(blob_deletion_cleanups_table)
-                                    .where(blob_deletion_cleanups_table.c.blob_id == str(blob_id))
-                                    .where(blob_deletion_cleanups_table.c.session_id == target_session_id_str)
-                                    .with_for_update()
-                                ).one_or_none()
-                                if row is not None and cleanup_row is not None:
-                                    raise AuditIntegrityError(f"blob {blob_id} has overlapping live and deletion cleanup state")
-                                if cleanup_row is not None:
-                                    stage = _registered_blob_deletion_stage(
-                                        cleanup_row,
-                                        data_dir=self._data_dir,
-                                        blob_id=str(blob_id),
-                                        session_id=target_session_id_str,
-                                    )
-                                elif row is not None:
-                                    stage = self._delete_blob_row_locked(conn, row=row, blob_id_str=str(blob_id))
-                                    restore_uncommitted_stage = True
-                        except BaseException as primary_exc:
-                            if restore_uncommitted_stage and stage is not None:
-                                _restore_staged_blob_deletion(stage, primary_exc)
-                            raise
-                        if stage is not None:
-                            self._finalize_registered_blob_deletion(
-                                held_connection=held_connection,
-                                blob_id_str=str(blob_id),
-                                session_id_str=target_session_id_str,
-                                stage=stage,
+                                ).first()
+                                is not None
                             )
-                    except (BlobForkFenceLostError, BlobContentMissingError, BlobIntegrityError):
-                        raise
-                    except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
+                    except (SQLAlchemyError, OSError) as residual_check_exc:
                         errors.append(
                             BlobForkCleanupError(
                                 blob_id=blob_id,
-                                exc_type=type(cleanup_exc).__name__,
-                                detail=str(cleanup_exc),
+                                exc_type=f"RecoveryFailed[{type(residual_check_exc).__name__}]",
+                                detail=str(residual_check_exc),
                             )
                         )
-                        try:
-                            with _blob_phase_transaction(self._engine, held_connection) as conn:
-                                residual_row_exists = (
-                                    conn.execute(
-                                        select(blobs_table.c.id)
-                                        .where(blobs_table.c.id == str(blob_id))
-                                        .where(blobs_table.c.session_id == target_session_id_str)
-                                    ).first()
-                                    is not None
-                                )
-                        except (SQLAlchemyError, OSError) as residual_check_exc:
-                            errors.append(
-                                BlobForkCleanupError(
-                                    blob_id=blob_id,
-                                    exc_type=f"RecoveryFailed[{type(residual_check_exc).__name__}]",
-                                    detail=str(residual_check_exc),
-                                )
-                            )
-                            continue
-                        if residual_row_exists:
-                            _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER.add(
-                                1,
-                                {
-                                    "orphan_blob_id": str(blob_id),
-                                    "target_session_id": target_session_id_str,
-                                    "exc_type": type(cleanup_exc).__name__,
-                                },
-                            )
                         continue
-                    deleted_ids.append(blob_id)
-            return BlobForkCleanupResult(deleted_ids=deleted_ids, errors=errors)
-
-        return cast("BlobForkCleanupResult", await self._run_sync(_sync))
-
-    def _finalize_blob_sync(
-        self,
-        blob_id: UUID,
-        status: FinalizeBlobStatus,
-        size_bytes: int | None = None,
-        content_hash_val: str | None = None,
-    ) -> BlobRecord:
-        """Synchronous single-blob finalize for use inside _run_sync closures."""
-        blob_id_str = str(blob_id)
-        # Invalid status is a programmer bug at a Protocol boundary, not a
-        # per-blob operational condition.  RuntimeError propagates past
-        # _PER_BLOB_SUPPRESSED so the loop in finalize_run_output_blobs
-        # crashes loudly instead of silently converting the caller's typo
-        # into an "error" record the auditor cannot distinguish from a
-        # genuine run failure.  Mirrors the RuntimeError in finalize_blob().
-        if status not in FINALIZE_BLOB_STATUSES:
-            raise RuntimeError(f"Invalid finalize status '{status}' — must be one of {sorted(FINALIZE_BLOB_STATUSES)}")
-        # Single source of truth for the ready-requires-valid-hash rule.
-        # See _validate_finalize_hash() docstring.
-        _validate_finalize_hash(blob_id_str, status, content_hash_val)
-
-        with self._engine.begin() as conn:
-            row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-            if row is None:
-                raise BlobNotFoundError(blob_id_str)
-            if row.status != "pending":
-                raise BlobStateError(
-                    blob_id_str,
-                    message=f"Cannot finalize blob {blob_id_str} — status is '{row.status}', expected 'pending'",
-                )
-
-            self._enforce_ready_finalize_quota(
-                conn,
-                blob_id_str=blob_id_str,
-                session_id_str=row.session_id,
-                status=status,
-                size_bytes=size_bytes,
-            )
-
-            updates: dict[str, Any] = {"status": status}
-            if size_bytes is not None:
-                updates["size_bytes"] = size_bytes
-            if content_hash_val is not None:
-                updates["content_hash"] = content_hash_val
-
-            conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id_str).values(**updates))
-            updated = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-            if updated is None:
-                raise RuntimeError(f"Blob {blob_id_str} vanished during finalize — concurrent deletion?")
-            return self._row_to_record(updated)
-
-
-# SHA-256 hex digest: exactly 64 lowercase hex characters.  Must match
-# FilesystemPayloadStore's validator (core/payload_store.py) — a blob
-# whose content_hash round-trips through the audit trail must use the
-# same canonical form everywhere.  Used with ``fullmatch`` (NOT
-# ``match``) because Python's ``$`` anchor matches at end-of-string OR
-# just before a final ``\n``, so the naive ``^[a-f0-9]{64}$`` pattern
-# would accept ``"a" * 64 + "\n"`` — letting a newline-terminated hash
-# slip past the pre-check and land at the DB CHECK as an opaque
-# IntegrityError rather than the structured BlobStateError this
-# validator is supposed to raise.
-_SHA256_HEX_PATTERN = re.compile(r"[a-f0-9]{64}")
-
-
-def _validate_finalize_hash(
-    blob_id_str: str,
-    status: FinalizeBlobStatus,
-    content_hash_val: str | None,
-) -> None:
-    """Service-layer pre-check for the ``ready`` content_hash invariant.
-
-    This is the FIRST of two walls enforcing the Tier-1 integrity
-    contract that makes ``read_blob_content`` verifiable (AD-5/AD-7 in
-    docs/plans/rc4.2-ux-remediation/2026-03-30-02-blob-manager-subplan.md).
-    A ``ready`` blob MUST carry a SHA-256 hex digest; before this
-    pre-check existed, a caller could finalize with a bogus string like
-    ``"abc123"`` and the DB would happily store it, leaving a ``ready``
-    row whose hash cannot be produced by any real bytes on disk.
-
-    Division of responsibility
-    --------------------------
-    This function is the SERVICE-LAYER pre-check. It runs on every
-    ``finalize_blob`` / ``_finalize_blob_sync`` write-path call and
-    raises :class:`BlobStateError` — a structured, caller-friendly
-    diagnostic — before any SQL is issued. The DB-level CHECK
-    constraint ``ck_blobs_ready_hash`` is the AUTHORITATIVE guard: it
-    closes the same invariant for any writer that bypasses this service
-    (direct SQL or an ORM call path that skips finalize). If these two
-    guards disagree, the DB CHECK wins and the service pre-check is the
-    bug.
-
-    Keeping both guards means a service regression surfaces as a clean
-    BlobStateError at the write-path entry point (easy to debug),
-    while a writer that skips the service still cannot corrupt the
-    audit trail. The shape rule is kept in agreement between the two
-    sites by design — the current session schema declares the DB-side
-    guard, and the tests in
-    ``tests/unit/web/blobs/test_service.py::TestBlobsReadyHashDBConstraint``
-    pin the DB guard independently of this one.
-    """
-    if status != "ready":
-        return
-    if content_hash_val is None:
-        raise BlobStateError(
-            blob_id_str,
-            message=f"Tier 1: cannot finalize blob {blob_id_str} as 'ready' without content_hash — audit integrity requires a hash",
-        )
-    # ``fullmatch`` (not ``match``) — see the _SHA256_HEX_PATTERN comment
-    # above for why ``^...$`` + ``match`` admits trailing newlines.
-    if not _SHA256_HEX_PATTERN.fullmatch(content_hash_val):
-        raise BlobStateError(
-            blob_id_str,
-            message=f"Tier 1: content_hash must be 64 lowercase hex characters (SHA-256), got {content_hash_val!r}",
-        )
+                    if residual_row_exists:
+                        _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER.add(
+                            1,
+                            {
+                                "orphan_blob_id": str(blob_id),
+                                "target_session_id": target_session_id_str,
+                                "exc_type": type(cleanup_exc).__name__,
+                            },
+                        )
+                    continue
+                deleted_ids.append(blob_id)
+        return BlobForkCleanupResult(deleted_ids=deleted_ids, errors=errors)

@@ -563,34 +563,74 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "_finalize_reserved_blob",
         "SessionBlobMutationAuthority",
     ),
+    # ── blob service transaction boundaries (D6 family B, elspeth-af0fdc3cc6):
+    # the DML helpers that execute on the connection a registered boundary
+    # passes in, and the phase helpers whose ``with`` block IS the blob
+    # transaction. Method-exact; a replacement or sibling symbol is not bound ──
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._fork_cleanup_transaction",
+        "_insert_pending_blob_row",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._prepare_fork_deletion",
+        "_discard_nonidempotent_reservation",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._mark_fork_deletion_staged",
+        "publish_inline_custody_publication",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._commit_fork_deletion",
+        "reconcile_inline_custody_publications",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._retire_fork_deletion",
+        "persist_inline_custody_blob_on_connection",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
-        "BlobServiceImpl._abort_fork_deletion",
+        "BlobServiceImpl._delete_blob_row_locked",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_sync",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        "SessionBlobMutationAuthority",
+    ),
+    # ── composer blob tool handlers (D6 family B, elspeth-af0fdc3cc6, ruling
+    # Q2): each handler's ``with locked_session_transaction(...)`` block IS
+    # its transaction — the row lock, the retention guards, the staged bytes
+    # and the DML commit together — so the handler is the boundary. The
+    # session lock wrapper is imported, so no acquisition row is reported for
+    # these; the writer rows below are the whole inventory ───────────────
+    AuthoritySymbol(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_execute_update_blob",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_execute_delete_blob_locked",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_purge_blob_deletion_journal_row",
         "SessionBlobMutationAuthority",
     ),
     # ── web_instances membership writer (6b-2, elspeth-66a19780b1): one
@@ -764,6 +804,40 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
     AuthoritySymbol(
         "src/elspeth/web/blobs/service.py",
         "_finalize_reserved_blob",
+        "SessionBlobMutationAuthority",
+    ),
+    # D6 family B (elspeth-af0fdc3cc6): the phase helpers whose non-escaping
+    # acquisitions the forward proof contains. Four of them also carry ONE
+    # custody-lock forward the proof refuses (finding F1); that row stays a
+    # violation in the drift counters regardless of this registration.
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "_discard_nonidempotent_reservation",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "publish_inline_custody_publication",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "reconcile_inline_custody_publications",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_sync",
+        "SessionBlobMutationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
         "SessionBlobMutationAuthority",
     ),
     AuthoritySymbol(
@@ -2693,6 +2767,143 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         line=4906,
     ),
     # src/elspeth/web/blobs/service.py :: SessionBlobMutationAuthority
+    #
+    # D6 family B (elspeth-af0fdc3cc6): the blob service's own transaction
+    # boundaries, admitted method-exact from live scanner output. Each of
+    # these symbols opens a phase transaction on the custody-locked
+    # connection (or executes on the connection its caller's registered
+    # boundary passes in) and commits its DML inside that block; the
+    # symbols are named authority boundaries AND contained acquisitions.
+    # The run-link insert and the per-output ready/error marks are NOT here
+    # any more: link_blob_to_run and finalize_run_output_blobs route them
+    # through SessionOperationAuthority.mutate into the _RepositoryBlobMutations
+    # facet (insert_blob_run_link / mark_run_output_blob_ready /
+    # mark_run_output_blob_error), and the caller-less create_pending_blob /
+    # finalize_blob verbs were deleted (ruling Q1).
+    #
+    # Five custody-lock acquisitions remain ESCAPES by the scanner's forward
+    # rule and are deliberately NOT admitted (ruling Q3 on elspeth-af0fdc3cc6;
+    # finding F1): _persist_blob_content, publish_inline_custody_publication,
+    # reconcile_inline_custody_publications, BlobServiceImpl._delete_blob_sync
+    # and BlobServiceImpl._cleanup_blobs_for_fork_sync each forward the
+    # advisory-lock connection into ``_blob_phase_transaction``, a
+    # contextmanager that yields its own parameter (the PostgreSQL
+    # pool-exhaustion guard: one pooled connection across reservation, file
+    # write and finalize). The forward walk refuses at the helper's
+    # ``held_connection is None`` arm; the honest fix is a scanner rule for a
+    # wrapper the scanner already records as the caller's own
+    # parameter-fed acquisition, which belongs to DLINEAGE, not this family.
+    # Until it lands the five rows stay in the drift counters.
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "12c8ea3131981744",
+        2,
+        "SessionBlobMutationAuthority",
+        line=3349,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "12c8ea3131981744",
+        3,
+        "SessionBlobMutationAuthority",
+        line=3390,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "12c8ea3131981744",
+        4,
+        "SessionBlobMutationAuthority",
+        line=3450,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_row_locked",
+        "blob_deletion_cleanups",
+        "insert",
+        "16da07b191192600",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2465,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_row_locked",
+        "blobs",
+        "delete",
+        "16da07b191192600",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2480,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "8b70fe5db76b0870",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2560,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._delete_blob_sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "e75089e65b6e9654",
+        2,
+        "SessionBlobMutationAuthority",
+        line=2578,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "<sessions-write-connection>",
+        "write_connection",
+        "efc69a8cceab1c8f",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2503,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "blob_deletion_cleanups",
+        "delete",
+        "9adc75e8d72e71ad",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2506,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_discard_nonidempotent_reservation",
+        "<sessions-write-connection>",
+        "write_connection",
+        "726caad0e48b0bcc",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1321,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_discard_nonidempotent_reservation",
+        "blobs",
+        "delete",
+        "dfb9e7995e5fc483",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1323,
+    ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
         "_finalize_reserved_blob",
@@ -2701,7 +2912,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "5fcbd10db9a8bb6a",
         1,
         "SessionBlobMutationAuthority",
-        line=1291,
+        line=1293,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -2711,7 +2922,17 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "38de196d17740a2c",
         1,
         "SessionBlobMutationAuthority",
-        line=1302,
+        line=1304,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "_insert_pending_blob_row",
+        "blobs",
+        "insert",
+        "bb9d60d5e991d99d",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1184,
     ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
@@ -2721,7 +2942,78 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ed8bc9f6e94ae399",
         1,
         "SessionBlobMutationAuthority",
-        line=1218,
+        line=1220,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "persist_inline_custody_blob_on_connection",
+        "blobs",
+        "update",
+        "da54c4429e8d7aef",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1831,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "publish_inline_custody_publication",
+        "<sessions-write-connection>",
+        "write_connection",
+        "60a1a4d583a6ae84",
+        2,
+        "SessionBlobMutationAuthority",
+        line=1606,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/blobs/service.py",
+        "reconcile_inline_custody_publications",
+        "<sessions-write-connection>",
+        "write_connection",
+        "34265085cd2f92dc",
+        2,
+        "SessionBlobMutationAuthority",
+        line=1677,
+    ),
+    # src/elspeth/web/composer/tools/blobs.py :: SessionBlobMutationAuthority
+    WriterIdentity(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_execute_delete_blob_locked",
+        "blob_deletion_cleanups",
+        "insert",
+        "c4473183080d01ec",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2033,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_execute_delete_blob_locked",
+        "blobs",
+        "delete",
+        "c4473183080d01ec",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2048,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_execute_update_blob",
+        "blobs",
+        "update",
+        "ed74c0f2bbd31393",
+        1,
+        "SessionBlobMutationAuthority",
+        line=1693,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/composer/tools/blobs.py",
+        "_purge_blob_deletion_journal_row",
+        "blob_deletion_cleanups",
+        "delete",
+        "393301abd25af7fe",
+        1,
+        "SessionBlobMutationAuthority",
+        line=2085,
     ),
 )
 
@@ -7638,6 +7930,125 @@ def test_blob_replacement_facet_writer_identities_are_exact_and_bidirectional() 
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
 
 
+def test_blob_service_writers_are_exactly_bound_to_the_blob_mutation_authority() -> None:
+    """Family B (elspeth-af0fdc3cc6): the blob service's own transaction boundaries.
+
+    Every sessions-table DML left in ``web/blobs/service.py`` and
+    ``web/composer/tools/blobs.py`` executes inside a block that is itself the
+    blob transaction (a custody-locked phase, a deletion journal step, or a
+    composer handler's locked session transaction), so the symbol that owns
+    the block is the boundary. The writers that had an EXECUTE context and no
+    custody lock -- the run link and the per-output ready/error marks -- are
+    gone from this inventory: they now go through the authority facet. The
+    five custody-lock forwards the scanner's proof refuses (finding F1) are
+    pinned here by symbol as the family's documented residue, not admitted.
+    """
+    root = _repo_root()
+    service_path = "src/elspeth/web/blobs/service.py"
+    composer_path = "src/elspeth/web/composer/tools/blobs.py"
+    service_symbols = {
+        "_insert_pending_blob_row",
+        "_reserve_pending_blob",
+        "_finalize_reserved_blob",
+        "_discard_nonidempotent_reservation",
+        "publish_inline_custody_publication",
+        "reconcile_inline_custody_publications",
+        "persist_inline_custody_blob_on_connection",
+        "BlobServiceImpl._delete_blob_row_locked",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "BlobServiceImpl._delete_blob_sync",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+    }
+    composer_symbols = {"_execute_update_blob", "_execute_delete_blob_locked", "_purge_blob_deletion_journal_row"}
+    contained_symbols = {
+        "_reserve_pending_blob",
+        "_finalize_reserved_blob",
+        "_discard_nonidempotent_reservation",
+        "publish_inline_custody_publication",
+        "reconcile_inline_custody_publications",
+        "BlobServiceImpl._finalize_registered_blob_deletion",
+        "BlobServiceImpl._delete_blob_sync",
+        "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+    }
+    for path, symbols in ((service_path, service_symbols), (composer_path, composer_symbols)):
+        for symbol in symbols:
+            assert _authority_for(path, symbol) == "SessionBlobMutationAuthority"
+            assert _authority_for(path, f"{symbol}_replacement") is None
+            expected_contained = "SessionBlobMutationAuthority" if symbol in contained_symbols else None
+            assert _contained_connection_authority_for(path, symbol) == expected_contained
+    # The routed and deleted writers are not boundaries and must not resurface as raw writers.
+    retired = {
+        "BlobServiceImpl.create_pending_blob._sync",
+        "BlobServiceImpl.finalize_blob._sync",
+        "BlobServiceImpl._finalize_blob_sync",
+        "BlobServiceImpl.link_blob_to_run._sync",
+        "BlobServiceImpl._best_effort_mark_blob_error",
+        "BlobServiceImpl._mark_run_output_ready",
+        "BlobServiceImpl._mark_run_output_error",
+        "BlobServiceImpl._finalize_one_output_blob",
+        "_persist_blob_content",
+    }
+    for symbol in retired:
+        assert _authority_for(service_path, symbol) is None
+        assert _contained_connection_authority_for(service_path, symbol) is None
+
+    scanned = scan_production_writers([root / service_path, root / composer_path], anchor=root)
+    assert not [site for site in scanned if site.symbol in retired and site.table != "<sessions-write-connection>"]
+    assert not [site for site in scanned if site.table == "<unresolved-session-write>"]
+
+    blob_tables = {"blobs", "blob_deletion_cleanups", "blob_run_links", "blob_inline_resolutions", "blob_replacement_cleanups"}
+    writes = [site for site in scanned if site.table in blob_tables]
+    reviewed_writes = [site for site in _REVIEWED_WRITERS if site.path in {service_path, composer_path} and site.table in blob_tables]
+    assert len(writes) == len(reviewed_writes) == 11
+    assert {(site.path, site.symbol, site.table, site.operation) for site in writes} == {
+        (service_path, "_insert_pending_blob_row", "blobs", "insert"),
+        (service_path, "_finalize_reserved_blob", "blobs", "update"),
+        (service_path, "_discard_nonidempotent_reservation", "blobs", "delete"),
+        (service_path, "persist_inline_custody_blob_on_connection", "blobs", "update"),
+        (service_path, "BlobServiceImpl._delete_blob_row_locked", "blob_deletion_cleanups", "insert"),
+        (service_path, "BlobServiceImpl._delete_blob_row_locked", "blobs", "delete"),
+        (service_path, "BlobServiceImpl._finalize_registered_blob_deletion", "blob_deletion_cleanups", "delete"),
+        (composer_path, "_execute_update_blob", "blobs", "update"),
+        (composer_path, "_execute_delete_blob_locked", "blob_deletion_cleanups", "insert"),
+        (composer_path, "_execute_delete_blob_locked", "blobs", "delete"),
+        (composer_path, "_purge_blob_deletion_journal_row", "blob_deletion_cleanups", "delete"),
+    }
+    assert {site.authority for site in writes} == {"SessionBlobMutationAuthority"}
+    assert inventory_drift(writes, reviewed_writes) == ([], [])
+    assert authority_policy_violations(writes, _TABLE_POLICIES) == ([], [])
+
+    acquisitions = [
+        site
+        for site in scanned
+        if site.operation == "write_connection" and _authority_for(site.path, site.symbol) == "SessionBlobMutationAuthority"
+    ]
+    contained = [site for site in acquisitions if not site.connection_escape]
+    escaped = [site for site in acquisitions if site.connection_escape]
+    assert len(contained) == 11
+    assert {site.symbol for site in contained} == contained_symbols
+    assert connection_authority_violations(contained) == []
+    reviewed_acquisitions = [
+        site for site in _REVIEWED_WRITERS if site.path in {service_path, composer_path} and site.operation == "write_connection"
+    ]
+    assert inventory_drift(contained, reviewed_acquisitions) == ([], [])
+    assert not any(site.connection_escape for site in reviewed_acquisitions)
+
+    # Finding F1: the custody-lock forward into ``_blob_phase_transaction``,
+    # one per phase helper, refused by the forward proof and NOT admitted.
+    residue = [site for site in scanned if site.operation == "write_connection" and site.connection_escape]
+    assert sorted(site.symbol for site in residue) == sorted(
+        [
+            "_persist_blob_content",
+            "publish_inline_custody_publication",
+            "reconcile_inline_custody_publications",
+            "BlobServiceImpl._delete_blob_sync",
+            "BlobServiceImpl._cleanup_blobs_for_fork_sync",
+        ]
+    )
+    assert [site.symbol for site in escaped] == [site.symbol for site in residue if site.symbol != "_persist_blob_content"]
+    assert connection_authority_violations(residue) == residue
+
+
 def test_plugin_crash_breadcrumb_facet_identity_is_exact_and_bidirectional() -> None:
     root = _repo_root()
     repository_path = root / "src/elspeth/web/coordination/repository.py"
@@ -8176,15 +8587,18 @@ def test_guided_lifecycle_facets_replace_every_raw_sync_writer_exactly() -> None
 
 
 def test_named_table_authority_cannot_authorize_a_raw_connection(tmp_path: Path) -> None:
-    source = tmp_path / "src/elspeth/web/blobs/service.py"
+    # ``_execute_update_blob`` is a LIVE named symbol (a composer blob tool
+    # handler under SessionBlobMutationAuthority) with no contained-connection
+    # entry: the probe below opens a raw connection under that name and must
+    # still be reported as a violation.
+    source = tmp_path / "src/elspeth/web/composer/tools/blobs.py"
     source.parent.mkdir(parents=True)
     source.write_text(
         textwrap.dedent(
             """\
-            class BlobServiceImpl:
-                def _fork_cleanup_transaction(self, engine, statement):
-                    with engine.begin() as conn:
-                        conn.execute(statement)
+            def _execute_update_blob(engine, statement):
+                with engine.begin() as conn:
+                    conn.execute(statement)
             """
         )
     )
@@ -8192,9 +8606,9 @@ def test_named_table_authority_cannot_authorize_a_raw_connection(tmp_path: Path)
     sites = scan_production_writers([source], anchor=tmp_path)
     assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
         {
-            ("BlobServiceImpl._fork_cleanup_transaction", "<sessions-write-connection>", "write_connection"): 1,
+            ("_execute_update_blob", "<sessions-write-connection>", "write_connection"): 1,
             # The parameter statement is its own opaque row (elspeth-a85fb1555b).
-            ("BlobServiceImpl._fork_cleanup_transaction", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("_execute_update_blob", "<unresolved-session-write>", "unknown_opaque"): 1,
         }
     )
 
