@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import make_url
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.helpers.postgres_target import postgres_test_target, provisioned_postgres_url
 from xdist import is_xdist_worker
 
 from elspeth.web import aws_rds_trust
@@ -41,8 +41,21 @@ def external_deployment_postgres_url(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[str]:
-    """Provide one authenticated-TLS PostgreSQL container for the acceptance suite."""
+    """Provide one authenticated-TLS PostgreSQL for the acceptance suite.
+
+    With ``ELSPETH_TEST_POSTGRES_URL`` set (an acceptance driver running the
+    selection against the PostgreSQL it provisioned) the URL comes from
+    ``tests.helpers.postgres_target`` and must already carry
+    ``sslmode=verify-full`` + ``sslrootcert=<file>``: the RDS-trust fixtures
+    below stat that file and hash it, so the libpq ``system`` keyword is not
+    accepted here. Otherwise one TLS-enabled container is built with a
+    throwaway self-signed CA, exactly as before the seam existed.
+    """
     _require_sequential_postgres_acceptance(request)
+    if provisioned_postgres_url(require_tls=True) is not None:
+        with postgres_test_target(driver="psycopg", require_tls=True) as provisioned_url:
+            yield provisioned_url
+        return
     tls_dir = tmp_path_factory.mktemp("external-postgres-tls")
     certificate = tls_dir / "server.crt"
     private_key = tls_dir / "server.key"
@@ -103,8 +116,7 @@ exec /usr/local/bin/docker-entrypoint.sh "$@"
     admin_username = f"elspeth_admin_{uuid.uuid4().hex}"
     admin_password = uuid.uuid4().hex
     admin_dbname = f"elspeth_admin_{uuid.uuid4().hex}"
-    with PostgresContainer(
-        "postgres:16-alpine",
+    with postgres_test_target(
         driver="psycopg",
         username=admin_username,
         password=admin_password,
@@ -112,9 +124,14 @@ exec /usr/local/bin/docker-entrypoint.sh "$@"
         command=command,
         entrypoint=["/bin/sh", "/tls-source/tls-entrypoint.sh"],
         volumes=volumes,
-    ) as postgres:
-        tls_url = make_url(postgres.get_connection_url()).update_query_dict({"sslmode": "verify-full", "sslrootcert": str(certificate)})
+    ) as container_url:
+        tls_url = make_url(container_url).update_query_dict({"sslmode": "verify-full", "sslrootcert": str(certificate)})
         yield tls_url.render_as_string(hide_password=False)
+
+
+def _certificate_count(bundle: Path) -> int:
+    """The CA count the trust check will find: 1 for the throwaway container CA, the bundle's own for a provisioned server."""
+    return bundle.read_bytes().count(b"-----BEGIN CERTIFICATE-----")
 
 
 @pytest.fixture
@@ -136,7 +153,7 @@ def aws_rds_trust_test_override(
     monkeypatch.setattr(
         aws_rds_trust,
         "AWS_RDS_GLOBAL_BUNDLE_CERTIFICATE_COUNT",
-        1,
+        _certificate_count(path),
     )
     monkeypatch.setattr(
         aws_rds_trust,
@@ -193,7 +210,7 @@ def aws_rds_trust_subprocess_env(
         "PYTHONPATH": str(shim_dir),
         "ELSPETH_TEST_RDS_TRUST_PATH": str(path),
         "ELSPETH_TEST_RDS_TRUST_SHA256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "ELSPETH_TEST_RDS_TRUST_COUNT": "1",
+        "ELSPETH_TEST_RDS_TRUST_COUNT": str(_certificate_count(path)),
         "ELSPETH_TEST_RDS_TRUST_UID": str(file_stat.st_uid),
         "ELSPETH_TEST_RDS_TRUST_MODE": str(stat.S_IMODE(file_stat.st_mode)),
     }

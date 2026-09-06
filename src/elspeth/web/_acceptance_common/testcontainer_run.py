@@ -11,6 +11,14 @@ the run wrote. The receipt is a record of what ran, not a verdict: a failing
 run is recorded with its exit code, and whether that blocks the gate is the
 evidence ledger's decision (its ``tests`` stage), never this module's.
 
+The receipt also says WHICH PostgreSQL the selection ran against
+(``database``): the suites obtain their server through one seam,
+``tests/helpers/postgres_target.py``, which honours
+:data:`PROVISIONED_POSTGRES_URL_ENV`; the driver's receipt derives the field
+from the same variable (:func:`resolve_testcontainer_run_target`), so it
+cannot claim a provisioned run the suites did not make. The identity hash
+covers host, port and database name only — never credentials.
+
 One validator and ONE gate predicate (:func:`testcontainer_run_gate`) serve both
 providers; each binds its own schema id
 (:data:`TESTCONTAINER_RUN_SCHEMAS`). The kind is NEW in 0.8.0 — no existing
@@ -27,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -36,6 +45,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
 from xml.etree import ElementTree
+
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from elspeth.contracts.trust_boundary import trust_boundary
 
@@ -65,6 +77,16 @@ TESTCONTAINER_RUN_SCHEMAS: Final[Mapping[Provider, str]] = MappingProxyType(
 )
 """Provider-scoped schema ids: one validator, two bindings, neither accepts the other's receipt."""
 
+PROVISIONED_POSTGRES_URL_ENV: Final = "ELSPETH_TEST_POSTGRES_URL"
+"""The variable the suites' seam and this receipt both read: set, the selection ran against that server."""
+
+TestcontainerRunDatabase = Literal["testcontainers-docker", "provisioned"]
+TESTCONTAINER_RUN_DATABASES: Final[frozenset[str]] = frozenset({"testcontainers-docker", "provisioned"})
+"""``testcontainers-docker``: each suite provisioned its own container on the driver host; ``provisioned``: the named server."""
+
+TESTCONTAINERS_DOCKER_IDENTITY_SHA256: Final = _sha256(b"testcontainers-docker")
+"""The one identity a ``testcontainers-docker`` receipt may carry: there is no server to name, so the literal is hashed."""
+
 MAX_JUNIT_BYTES: Final = 16 * 1024 * 1024
 """Upper bound on a junit report the driver will read (CI's whole-tree run is well under 1 MiB)."""
 
@@ -86,6 +108,8 @@ class TestcontainerRunReceipt(TypedDict):
     candidate_sha: str
     scenario_id: str
     selection: list[str]
+    database: str
+    database_identity_sha256: str
     exit_code: int
     collected: int
     passed: int
@@ -131,8 +155,58 @@ class TestcontainerRunRecord:
             raise ValueError("junit_sha256 must be a lowercase hex sha256")
 
 
+@dataclass(frozen=True)
+class TestcontainerRunTarget:
+    """Which PostgreSQL the selection ran against, as the seam variable said."""
+
+    database: TestcontainerRunDatabase
+    database_identity_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.database not in TESTCONTAINER_RUN_DATABASES:
+            raise ValueError("database must be testcontainers-docker or provisioned")
+        if not _is_hex_sha256(self.database_identity_sha256):
+            raise ValueError("database_identity_sha256 must be a lowercase hex sha256")
+        if (self.database == "testcontainers-docker") != (self.database_identity_sha256 == TESTCONTAINERS_DOCKER_IDENTITY_SHA256):
+            raise ValueError("a testcontainers-docker target carries the fixed identity and a provisioned one never does")
+
+
 def _is_int(value: object) -> bool:
     return type(value) is int
+
+
+def _is_hex_sha256(value: object) -> bool:
+    return type(value) is str and len(value) == 64 and not (set(value) - set("0123456789abcdef"))
+
+
+@trust_boundary(
+    tier=3,
+    source="the acceptance driver's process environment, the same ELSPETH_TEST_POSTGRES_URL the suites' seam reads",
+    source_param="environ",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns the owned testcontainers-docker target when the variable is unset or blank; otherwise raises "
+        "AcceptanceInputError before use unless the value is a PostgreSQL URL naming host, role, password and database, "
+        "and then returns the owned provisioned target whose identity hashes host, port and database only"
+    ),
+    test_ref="tests/unit/web/acceptance_common/test_testcontainer_run.py::test_resolve_target_reads_only_the_seam_variable_and_never_hashes_credentials",
+    test_fingerprint="d1dc52429f853811c82bbd6d8966ea9da3f15578c14d8deadae36e31a4430fc8",
+)
+def resolve_testcontainer_run_target(environ: Mapping[str, str]) -> TestcontainerRunTarget:
+    """Derive the receipt's ``database`` fields from the seam variable, never from a flag."""
+
+    raw = environ.get(PROVISIONED_POSTGRES_URL_ENV)
+    if raw is None or raw.strip() == "":
+        return TestcontainerRunTarget(database="testcontainers-docker", database_identity_sha256=TESTCONTAINERS_DOCKER_IDENTITY_SHA256)
+    try:
+        url = make_url(raw)
+    except ArgumentError:
+        raise AcceptanceInputError(f"{PROVISIONED_POSTGRES_URL_ENV} is not a SQLAlchemy URL") from None
+    if url.get_backend_name() != "postgresql" or not url.host or not url.username or url.password is None or not url.database:
+        raise AcceptanceInputError(f"{PROVISIONED_POSTGRES_URL_ENV} must be a postgresql URL naming host, role, password and database")
+    port = 5432 if url.port is None else url.port
+    identity = f"{url.host}:{port}/{url.database}".encode()
+    return TestcontainerRunTarget(database="provisioned", database_identity_sha256=_sha256(identity))
 
 
 @trust_boundary(
@@ -212,6 +286,7 @@ def build_testcontainer_run_receipt(
     scenario_id: str,
     exit_code: int,
     record: TestcontainerRunRecord,
+    target: TestcontainerRunTarget,
     recorded_at: datetime,
 ) -> TestcontainerRunReceipt:
     """The receipt the driver stores; refuses inputs the validator would refuse."""
@@ -224,8 +299,8 @@ def build_testcontainer_run_receipt(
         raise AcceptanceInputError("scenario_id must be a bounded identifier")
     if not _is_int(exit_code) or not 0 <= exit_code <= 255:
         raise AcceptanceInputError("exit_code must be a process exit status")
-    # ``record`` is the owned TestcontainerRunRecord (nominally typed; mypy
-    # holds the caller to it); only the clock needs a runtime check.
+    # ``record`` and ``target`` are the owned types (nominally typed; mypy
+    # holds the caller to them); only the clock needs a runtime check.
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
         raise AcceptanceInputError("recorded_at must be an aware datetime")
     receipt: TestcontainerRunReceipt = {
@@ -234,6 +309,8 @@ def build_testcontainer_run_receipt(
         "candidate_sha": candidate_sha,
         "scenario_id": scenario_id,
         "selection": list(TESTCONTAINER_SELECTION),
+        "database": target.database,
+        "database_identity_sha256": target.database_identity_sha256,
         "exit_code": exit_code,
         "collected": record.collected,
         "passed": record.passed,
@@ -260,11 +337,12 @@ def build_testcontainer_run_receipt(
     invariant=(
         "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
         "is a dict with exactly the testcontainer-run fields, the provider's own schema id, the pinned selection, a "
+        "database of testcontainers-docker (with its fixed identity) or provisioned (with any other sha256 identity), a "
         "process exit code and bounded counts that partition the collected ids and agree with the exit code, bound "
         "to the caller's candidate sha, scenario and junit subject hash"
     ),
     test_ref="tests/unit/web/acceptance_common/test_testcontainer_run.py::test_validate_testcontainer_run_receipt_rejects_open_or_inconsistent_receipts",
-    test_fingerprint="7bceaf94a4cedf6f67c106a3de9b0f81856b692f5eaf578e17b45b2d1c5077eb",
+    test_fingerprint="aacce4e4ab930363d63e7afef5a013abd26bab59891c676b517f537fec218d6e",
 )
 def validate_testcontainer_run_receipt(
     payload: object,
@@ -288,6 +366,8 @@ def validate_testcontainer_run_receipt(
     schema = payload["schema"]
     kind = payload["kind"]
     selection = payload["selection"]
+    database = payload["database"]
+    database_identity_sha256 = payload["database_identity_sha256"]
     exit_code = payload["exit_code"]
     counts = {name: payload[name] for name in ("collected", "passed", "failed", "errors", "skipped")}
     junit_sha256 = payload["junit_sha256"]
@@ -297,12 +377,13 @@ def validate_testcontainer_run_receipt(
         or kind != TESTCONTAINER_RUN_RECEIPT_KIND
         or not isinstance(selection, list)
         or tuple(selection) != TESTCONTAINER_SELECTION
+        or database not in TESTCONTAINER_RUN_DATABASES
+        or not _is_hex_sha256(database_identity_sha256)
+        or (database == "testcontainers-docker") != (database_identity_sha256 == TESTCONTAINERS_DOCKER_IDENTITY_SHA256)
         or not _is_int(exit_code)
         or not 0 <= exit_code <= 255
         or any(not _is_int(count) or not 0 <= count <= _MAX_COUNT for count in counts.values())
-        or type(junit_sha256) is not str
-        or len(junit_sha256) != 64
-        or set(junit_sha256) - set("0123456789abcdef")
+        or not _is_hex_sha256(junit_sha256)
         or type(recorded_at) is not str
     ):
         raise AcceptanceCheckError("receipt_store_schema")
@@ -328,6 +409,8 @@ def validate_testcontainer_run_receipt(
         candidate_sha=candidate_sha,
         scenario_id=scenario_id,
         selection=list(TESTCONTAINER_SELECTION),
+        database=database,
+        database_identity_sha256=database_identity_sha256,
         exit_code=exit_code,
         collected=counts["collected"],
         passed=counts["passed"],
@@ -454,6 +537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenario_id=args.scenario_id,
             exit_code=args.exit_code,
             record=record,
+            target=resolve_testcontainer_run_target(os.environ),
             recorded_at=datetime.now(UTC),
         )
     except AcceptanceCheckError as exc:

@@ -570,11 +570,30 @@ sha. The shared gate (`testcontainer_run_gate`, provider `azure`) REFUSES the
 bundle unless exactly one passing run is on record — absence is
 `testcontainer_run_missing`, a failing run `testcontainer_run_failed`, two
 passing runs `testcontainer_run_ambiguous`; a failed run is kept as evidence
-and superseded by a later passing one, never deleted. The suites provision
-their own PostgreSQL through testcontainers on the acceptance host (no
-external-DSN seam exists in the tree), so Docker must be available there.
+and superseded by a later passing one, never deleted. The receipt also
+records which database ran (`database`, `database_identity_sha256`): every
+suite obtains its PostgreSQL through one seam
+(`tests/helpers/postgres_target.py`) that honours `ELSPETH_TEST_POSTGRES_URL`,
+and the receipt derives the two fields from the same variable, so it can say
+`provisioned` only when the suites ran there. Export it as the Flexible
+Server admin URL — the suites create and drop throwaway databases and roles
+and terminate other roles' backends, so a right the admin lacks (facts §4.1)
+fails the suite that needs it and is recorded as such — with
+`sslmode=verify-full` and `sslrootcert` naming a readable PEM file holding
+the Azure Database for PostgreSQL roots (facts §4.4): the deployment-
+acceptance suites stat and hash that file, so the libpq `system` keyword the
+driver uses elsewhere is not accepted here. The step refuses to run without
+the variable so the acceptance record never describes a run on the host's
+Docker; unset, the seam provisions a container per suite (what CI does).
 
 ```bash
+: "${PGHOST:?the Flexible Server FQDN}"
+: "${PG_ADMIN_USER:?the Flexible Server admin role}"
+: "${AZURE_PG_ROOTS_PEM:?path to a PEM file holding the Azure Database for PostgreSQL root CAs}"
+PGPASSWORD=$(az_capture keyvault secret show --vault-name "$KEY_VAULT_NAME" \
+  --name elspeth-admin-password --query value --output tsv)
+export ELSPETH_TEST_POSTGRES_URL="postgresql+psycopg://${PG_ADMIN_USER}:${PGPASSWORD}@${PGHOST}:5432/postgres?sslmode=verify-full&sslrootcert=${AZURE_PG_ROOTS_PEM}"
+unset PGPASSWORD
 exit_status=0
 rm -f testcontainer-junit.xml
 uv run --frozen pytest tests/ -m testcontainer -n 0 --junitxml=testcontainer-junit.xml || exit_status=$?
@@ -582,6 +601,7 @@ uv run --frozen python -m elspeth.web._acceptance_common.testcontainer_run \
   --provider azure --junit testcontainer-junit.xml --exit-code "$exit_status" \
   --candidate-sha "$CANDIDATE_SHA" --scenario-id A >"$EVIDENCE_DIR/testcontainer-run.json"
 rm -f testcontainer-junit.xml
+unset ELSPETH_TEST_POSTGRES_URL
 ```
 
 ---

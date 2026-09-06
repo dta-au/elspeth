@@ -18,7 +18,7 @@ from sqlalchemy import Connection, Engine, create_engine, event, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.core.test_schema_shape import _static_check_issues
 
 from elspeth.contracts import Artifact
@@ -73,8 +73,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture
@@ -1419,6 +1419,11 @@ def test_landscape_runtime_role_has_dml_but_no_ddl(postgres_engine: Engine) -> N
     assert re.fullmatch(r"[a-z0-9_]+", role)
     with postgres_engine.begin() as conn:
         conn.exec_driver_sql(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+        # The cleanup's DROP OWNED BY needs the role's own privileges. A superuser
+        # (the testcontainers admin) has them implicitly; a provisioned server's
+        # non-superuser admin (Flexible Server, RDS master) holds only ADMIN
+        # OPTION on a role it creates, so it grants itself membership explicitly.
+        conn.exec_driver_sql(f'GRANT "{role}" TO CURRENT_USER')
         conn.exec_driver_sql(f'GRANT CONNECT ON DATABASE "{database_name}" TO "{role}"')
         conn.exec_driver_sql(f'GRANT USAGE ON SCHEMA public TO "{role}"')
         conn.exec_driver_sql(f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{role}"')

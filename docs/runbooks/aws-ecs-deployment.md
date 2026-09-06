@@ -683,12 +683,23 @@ persist_sanitized_receipt() {
 record_testcontainer_run() {
   # The PostgreSQL contention proofs (`-m testcontainer`) are the SAME
   # selection CI's required testcontainer job runs; the receipt records the
-  # selection, pytest's exit code and the junit id counts. Evidence export
-  # REFUSES a candidate without exactly one passing run bound to the gate
-  # ledger's `tests` stage. The suites provision their own PostgreSQL through
-  # testcontainers on this host (no external-DSN seam exists in the tree), so
-  # Docker must be available here.
+  # selection, pytest's exit code, the junit id counts and WHICH database ran
+  # (`database`, `database_identity_sha256`). Evidence export REFUSES a
+  # candidate without exactly one passing run bound to the gate ledger's
+  # `tests` stage. Every suite obtains its server through one seam
+  # (tests/helpers/postgres_target.py) that honours ELSPETH_TEST_POSTGRES_URL:
+  # export it as the approved RDS instance's admin URL (the master user or a
+  # role holding CREATEDB, CREATEROLE and rds_superuser: the suites create and
+  # drop throwaway databases and roles and terminate other roles' backends),
+  # `postgresql+psycopg://<role>:<password>@<endpoint>:5432/<admin db>?sslmode=verify-full&sslrootcert=<bundle file>`,
+  # with `sslrootcert` a readable copy of the RDS global bundle (the
+  # deployment-acceptance suites stat and hash that file). The receipt derives
+  # its database fields from the same variable, so it can only say
+  # `provisioned` when the suites ran there; this function refuses to run
+  # without it so the acceptance record never describes a run on this host's
+  # Docker. Unset, the seam provisions a container per suite (what CI does).
   local exit_status=0 receipt_file receipt_hash
+  : "${ELSPETH_TEST_POSTGRES_URL:?record_testcontainer_run needs the provisioned RDS admin URL in ELSPETH_TEST_POSTGRES_URL}"
   rm -f testcontainer-junit.xml
   uv run --frozen pytest tests/ -m testcontainer -n 0 --junitxml=testcontainer-junit.xml || exit_status=$?
   receipt_file=$(mktemp -p /tmp elspeth-testcontainer-receipt.XXXXXX)

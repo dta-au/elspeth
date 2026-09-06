@@ -11,8 +11,8 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import make_factory, register_test_node
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.errors import AuditIntegrityError
@@ -25,8 +25,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        yield postgres.get_connection_url()
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        yield postgres_url
 
 
 @pytest.fixture

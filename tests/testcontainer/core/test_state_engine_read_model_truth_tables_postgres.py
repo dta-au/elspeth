@@ -13,8 +13,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
-from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
 from tests.fixtures.landscape import make_factory, register_test_node, stamp_inside_next_transaction
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
@@ -51,8 +51,8 @@ PAYLOAD = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"value": 1
 @pytest.fixture(scope="module")
 def postgres_db() -> Iterator[LandscapeDB]:
     """A real local PostgreSQL 16 backend, not an AWS profile surrogate."""
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        db = LandscapeDB.from_url(postgres.get_connection_url())
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        db = LandscapeDB.from_url(postgres_url)
         try:
             yield db
         finally:
