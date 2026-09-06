@@ -2324,6 +2324,7 @@ class TestInstanceId:
         with pytest.raises(ValidationError, match="instance_id"):
             _settings(instance_id=value)
 
+    @pytest.mark.usefixtures("required_web_env")
     def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__INSTANCE_ID", "rA--pinned.01")
         assert web_config.settings_from_env().instance_id == "rA--pinned.01"
