@@ -3426,6 +3426,32 @@ _DECLARED_NON_SESSION_PACKAGES = (
 )
 _SESSION_SHAPED_IMPORT_ROOT = "elspeth.web"
 _SESSION_ENGINE_FACTORY_PATH = "src/elspeth/web/sessions/engine.py"
+# Acceptance probe seam (P4-D6 family J, ruling 2026-09-07): the deployment
+# acceptance drivers execute the controller's probe SQL against the
+# DEPLOYMENT's databases through one live seam per protocol -- a class in an
+# acceptance module implementing ``SqlSession`` / ``SqlReader`` whose every
+# execution is ``text(<its own statement parameter>)`` on a connection it
+# took from the ``Engine`` it was constructed with. The scanner admits such a
+# class as a whole (``_ProbeSeamProof``) and NOTHING looser: a literal or
+# module-built statement, a second base, a decorator, a stored connection
+# that reaches any call but ``execute``/``close``, a connection returned or
+# forwarded, a shadowed ``text``, or a definition outside these modules keeps
+# every row of the class. The seam is admitted, not its callers: the SQL the
+# controller pushes through it is typed there, not here.
+_ACCEPTANCE_PROBE_MODULES = (
+    "src/elspeth/web/azure_container_apps_acceptance.py",
+    "src/elspeth/web/_azure_container_apps_acceptance/",
+    "src/elspeth/web/aws_ecs_acceptance.py",
+    "src/elspeth/web/_aws_ecs_acceptance/",
+)
+_PROBE_SEAM_PROTOCOLS = frozenset(
+    {
+        "elspeth.web._azure_container_apps_acceptance.controller.SqlSession",
+        "elspeth.web._azure_container_apps_acceptance.controller.SqlReader",
+    }
+)
+_SQLALCHEMY_ENGINE_TYPES = frozenset({"sqlalchemy.Engine", "sqlalchemy.engine.Engine", "sqlalchemy.engine.base.Engine"})
+_SQLALCHEMY_TEXT_CONSTRUCTORS = frozenset({"sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"})
 _TRANSACTION_CONTROL_SQL = frozenset({"BEGIN", "BEGIN IMMEDIATE", "BEGIN DEFERRED", "BEGIN EXCLUSIVE", "COMMIT", "ROLLBACK"})
 _PRAGMA_ASSIGNMENT = re.compile(r"PRAGMA\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+", flags=re.IGNORECASE)
 _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
@@ -3524,6 +3550,12 @@ _LOCK_TABLE_STATEMENT = re.compile(
     + r")\s+MODE\s*;?"
 )
 
+# ``SHOW <run-time setting>``: PostgreSQL's (and MySQL's) read of one server
+# or session setting, e.g. the acceptance connection-budget probe's ``SHOW
+# max_connections``. One bare, optionally dotted, identifier and nothing
+# else: no second statement, no ``TO``/``=`` (that is ``SET``).
+_SHOW_SETTING_STATEMENT = re.compile(r"SHOW\s+[A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)*\s*;?")
+
 
 def _raw_sql_is_obviously_read_only(sql: str) -> bool:
     normalized = sql.strip().upper()
@@ -3531,6 +3563,8 @@ def _raw_sql_is_obviously_read_only(sql: str) -> bool:
         return True
     if normalized.startswith("LOCK"):
         return _LOCK_TABLE_STATEMENT.fullmatch(normalized) is not None
+    if normalized.startswith("SHOW"):
+        return _SHOW_SETTING_STATEMENT.fullmatch(normalized) is not None
     if not normalized.startswith("PRAGMA"):
         return False
 
@@ -6596,15 +6630,264 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
     collected = [(collector, collector.collect()) for collector, _ in collected]
     proven = _CallerSideProof(collected).proven_site_indexes()
     contained = _WrapperContainmentProof(collected).contained_site_indexes()
+    seams = _ProbeSeamProof(collected).seam_site_indexes()
     sites: list[WriterIdentity] = []
     for collector, collector_sites in collected:
-        dropped = proven.get(id(collector), set())
+        dropped = proven.get(id(collector), set()) | seams.get(id(collector), set())
         flipped = contained.get(id(collector), set())
         for index, site in enumerate(collector_sites):
             if index in dropped:
                 continue
             sites.append(replace(site, connection_escape=False) if index in flipped else site)
     return sites
+
+
+class _ProbeSeamProof:
+    """Tree-wide admission of acceptance probe seams (P4-D6 family J).
+
+    A class is a probe seam only when EVERY clause below holds; one miss
+    keeps every site of the class in the inventory (fail closed):
+
+    * defined in an ``_ACCEPTANCE_PROBE_MODULES`` module with exactly one
+      base that resolves, through import provenance, to a
+      ``_PROBE_SEAM_PROTOCOLS`` port;
+    * its members are undecorated instance methods (a docstring aside);
+    * ``__init__(self, engine: Engine)`` binds exactly one attribute: the
+      engine itself, or a ``engine.connect()`` chain with constant-only
+      keyword options (the autocommit session);
+    * every other method executes only ``text(<own positional parameter>)``
+      -- optionally followed by the method's own ``**parameters`` -- on the
+      bound connection (or on a ``with self.<engine>.connect() as conn``
+      target of that method), with ``text`` resolving to SQLAlchemy;
+    * the bound attribute and any such ``conn`` reach nothing but those
+      executions, that ``connect()``, and ``close()``; no method returns,
+      forwards, yields or nests them.
+    """
+
+    _CONNECT_CHAIN = frozenset({"connect", "execution_options"})
+
+    def __init__(self, collected: Sequence[tuple[_ProductionWriterCollector, list[WriterIdentity]]]) -> None:
+        self._collected = collected
+
+    def seam_site_indexes(self) -> dict[int, set[int]]:
+        admitted: dict[int, set[int]] = {}
+        for collector, sites in self._collected:
+            if not collector.path.startswith(_ACCEPTANCE_PROBE_MODULES):
+                continue
+            seam_classes = [node for node in ast.walk(collector.tree) if isinstance(node, ast.ClassDef) and self._is_seam(collector, node)]
+            if not seam_classes:
+                continue
+            for index in range(len(sites)):
+                method = collector._enclosing_function(collector.site_nodes[index])
+                owner = collector.method_owners.get(id(method)) if method is not None else None
+                if owner is not None and any(owner is seam for seam in seam_classes):
+                    admitted.setdefault(id(collector), set()).add(index)
+        return admitted
+
+    def _is_seam(self, collector: _ProductionWriterCollector, cls: ast.ClassDef) -> bool:
+        if len(cls.bases) != 1 or cls.keywords or cls.decorator_list:
+            return False
+        if collector._imported_qualified_name(cls.bases[0]) not in _PROBE_SEAM_PROTOCOLS:
+            return False
+        methods: list[ast.FunctionDef] = []
+        for index, member in enumerate(cls.body):
+            if (
+                index == 0
+                and isinstance(member, ast.Expr)
+                and isinstance(member.value, ast.Constant)
+                and isinstance(member.value.value, str)
+            ):
+                continue
+            if not isinstance(member, ast.FunctionDef) or member.decorator_list:
+                return False
+            methods.append(member)
+        init = next((method for method in methods if method.name == "__init__"), None)
+        if init is None:
+            return False
+        bound = self._bound_attribute(collector, cls, init)
+        if bound is None:
+            return False
+        attribute, kind = bound
+        return all(self._method_is_probe(collector, method, attribute, kind) for method in methods if method is not init)
+
+    def _bound_attribute(self, collector: _ProductionWriterCollector, cls: ast.ClassDef, init: ast.FunctionDef) -> tuple[str, str] | None:
+        """``(attribute, "engine" | "connection")`` for ``__init__(self, engine: Engine)`` binding exactly one attribute."""
+
+        arguments = init.args
+        if (
+            arguments.posonlyargs
+            or arguments.kwonlyargs
+            or arguments.vararg
+            or arguments.kwarg
+            or len(arguments.args) != 2
+            or arguments.defaults
+        ):
+            return None
+        self_name, engine = arguments.args[0].arg, arguments.args[1]
+        if collector._annotation_imported_qualified_name(engine.annotation, definition=init, scope=cls) not in _SQLALCHEMY_ENGINE_TYPES:
+            return None
+        body = [statement for statement in init.body if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))]
+        if len(body) != 1 or not isinstance(body[0], ast.Assign) or len(body[0].targets) != 1:
+            return None
+        target, value = body[0].targets[0], body[0].value
+        if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == self_name):
+            return None
+        if isinstance(value, ast.Name) and value.id == engine.arg:
+            return target.attr, "engine"
+        if self._is_connect_chain(value, engine.arg):
+            return target.attr, "connection"
+        return None
+
+    def _is_connect_chain(self, value: ast.expr, engine_name: str) -> bool:
+        """``engine.connect()`` optionally followed by ``.execution_options(<constant keywords>)``."""
+
+        seen_connect = False
+        current = value
+        while isinstance(current, ast.Call):
+            if not isinstance(current.func, ast.Attribute) or current.func.attr not in self._CONNECT_CHAIN:
+                return False
+            if current.args or any(keyword.arg is None or not isinstance(keyword.value, ast.Constant) for keyword in current.keywords):
+                return False
+            if current.func.attr == "connect":
+                if current.keywords or seen_connect:
+                    return False
+                seen_connect = True
+            current = current.func.value
+        return seen_connect and isinstance(current, ast.Name) and current.id == engine_name
+
+    def _method_is_probe(self, collector: _ProductionWriterCollector, method: ast.FunctionDef, attribute: str, kind: str) -> bool:
+        arguments = method.args
+        if arguments.posonlyargs or arguments.kwonlyargs or arguments.vararg or arguments.defaults or not arguments.args:
+            return False
+        self_name = arguments.args[0].arg
+        statement_parameters = {argument.arg for argument in arguments.args[1:]}
+        bind_parameter = arguments.kwarg.arg if arguments.kwarg is not None else None
+        if method.name == "close":
+            return self._is_close(method, self_name, attribute, kind)
+        # The connections this method may execute on: the bound one, or the
+        # targets of ``with self.<engine>.connect() as conn`` items.
+        connection_names: set[str] = set()
+        # The nodes through which the bound attribute / a with-bound
+        # connection may be reached: the ``connect()`` receivers here and the
+        # execution receivers below. Any other reach refuses the class.
+        admitted_receivers: set[int] = set()
+        for node in ast.walk(method):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.Yield, ast.YieldFrom, ast.Await))
+                and node is not method
+            ):
+                return False
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    if kind != "engine" or not isinstance(item.optional_vars, ast.Name):
+                        return False
+                    context = item.context_expr
+                    if not (
+                        isinstance(context, ast.Call)
+                        and not context.args
+                        and not context.keywords
+                        and isinstance(context.func, ast.Attribute)
+                        and context.func.attr == "connect"
+                        and self._is_self_attribute(context.func.value, self_name, attribute)
+                    ):
+                        return False
+                    connection_names.add(item.optional_vars.id)
+                    admitted_receivers.add(id(context.func.value))
+        if kind == "connection":
+            receivers = [lambda node: self._is_self_attribute(node, self_name, attribute)]
+        else:
+            receivers = [lambda node: isinstance(node, ast.Name) and node.id in connection_names]
+        # Executions on an admitted receiver; a zero-argument result accessor
+        # chained on one (``execute(...).scalar()``) is the result, not a
+        # second execution, even though ``scalar`` is an execute verb.
+        executions: list[ast.Call] = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _EXECUTE_RECEIVER_METHODS
+            and any(receiver(node.func.value) for receiver in receivers)
+        ]
+        if not executions:
+            return False
+        for node in ast.walk(method):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _EXECUTE_RECEIVER_METHODS):
+                continue
+            if node in executions:
+                if not self._is_parameter_text_execution(collector, node, statement_parameters, bind_parameter):
+                    return False
+                admitted_receivers.add(id(node.func.value))
+            elif node.args or node.keywords or node.func.value not in executions:
+                return False
+        # Every reach of the bound attribute / the with-bound connection IS
+        # one of the admitted receiver nodes (by identity): nothing else --
+        # no ``commit()``, no return, no forward.
+        for node in ast.walk(method):
+            reaches = self._is_self_attribute(node, self_name, attribute) or (
+                isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in connection_names
+            )
+            if reaches and id(node) not in admitted_receivers:
+                return False
+        # ``self.<anything else>`` is a second binding the seam does not declare.
+        for node in ast.walk(method):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == self_name
+                and node.attr != attribute
+            ):
+                return False
+        return True
+
+    def _is_close(self, method: ast.FunctionDef, self_name: str, attribute: str, kind: str) -> bool:
+        if kind != "connection" or len(method.args.args) != 1 or method.args.kwarg is not None:
+            return False
+        body = [
+            statement for statement in method.body if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
+        ]
+        if len(body) != 1 or not isinstance(body[0], ast.Expr) or not isinstance(body[0].value, ast.Call):
+            return False
+        call = body[0].value
+        return (
+            not call.args
+            and not call.keywords
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "close"
+            and self._is_self_attribute(call.func.value, self_name, attribute)
+        )
+
+    @staticmethod
+    def _is_self_attribute(node: ast.AST, self_name: str, attribute: str) -> bool:
+        return (
+            isinstance(node, ast.Attribute) and node.attr == attribute and isinstance(node.value, ast.Name) and node.value.id == self_name
+        )
+
+    def _is_parameter_text_execution(
+        self,
+        collector: _ProductionWriterCollector,
+        execution: ast.Call,
+        statement_parameters: set[str],
+        bind_parameter: str | None,
+    ) -> bool:
+        """``<conn>.execute(text(<statement parameter>)[, <**parameters>])`` and nothing else."""
+
+        if execution.keywords or not 1 <= len(execution.args) <= 2:
+            return False
+        statement = execution.args[0]
+        if not (
+            isinstance(statement, ast.Call)
+            and len(statement.args) == 1
+            and not statement.keywords
+            and isinstance(statement.args[0], ast.Name)
+            and statement.args[0].id in statement_parameters
+            and collector._imported_qualified_name(statement.func) in _SQLALCHEMY_TEXT_CONSTRUCTORS
+        ):
+            return False
+        if len(execution.args) == 2:
+            binds = execution.args[1]
+            if bind_parameter is None or not (isinstance(binds, ast.Name) and binds.id == bind_parameter):
+                return False
+        return True
 
 
 class _WrapperContainmentProof:
@@ -7855,6 +8138,241 @@ def test_explicit_non_sql_execute_receiver_types_are_not_database_writers(tmp_pa
     ]
 
 
+_PROBE_SEAM_FIXTURE = """\
+from sqlalchemy import Engine, text
+
+from elspeth.web._azure_container_apps_acceptance.controller import SqlReader, SqlSession
+
+
+class Session(SqlSession):
+    def __init__(self, engine: Engine) -> None:
+        self._connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+    def execute_scalar(self, statement: str) -> object:
+        return self._connection.execute(text(statement)).scalar()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class Reader(SqlReader):
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def scalar(self, statement: str, **parameters: object) -> object:
+        with self._engine.connect() as connection:
+            return connection.execute(text(statement), parameters).scalar()
+
+    def rows(self, statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]:
+        with self._engine.connect() as connection:
+            return tuple(tuple(row) for row in connection.execute(text(statement), parameters).all())
+"""
+
+
+def _probe_seam_module(root: Path, relative: str, source: str) -> Path:
+    module = root / relative
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(source, encoding="utf-8")
+    return module
+
+
+def test_acceptance_probe_seam_classes_are_admitted_whole_and_nothing_looser(tmp_path: Path) -> None:
+    """P4-D6 family J: the acceptance drivers' ``SqlSession``/``SqlReader`` seams leave the inventory as a class.
+
+    Red-first against ``_ProbeSeamProof``: without it the seam module keeps
+    its acquisition, execute and opaque rows. Every loosened form in the
+    second module keeps every row of ITS class -- the admission is whole or
+    nothing.
+    """
+
+    seam = _probe_seam_module(tmp_path, "src/elspeth/web/_azure_container_apps_acceptance/seam.py", _PROBE_SEAM_FIXTURE)
+    assert scan_production_writers([seam], anchor=tmp_path) == []
+
+    loosened = _probe_seam_module(
+        tmp_path,
+        "src/elspeth/web/_azure_container_apps_acceptance/loosened.py",
+        textwrap.dedent(
+            """\
+            from sqlalchemy import Engine, text
+
+            from elspeth.web._azure_container_apps_acceptance.controller import SqlReader, SqlSession
+
+
+            class LiteralReader(SqlReader):
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def scalar(self, statement: str, **parameters: object) -> object:
+                    with self._engine.connect() as connection:
+                        return connection.execute(text("SELECT 1")).scalar()
+
+                def rows(self, statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]:
+                    with self._engine.connect() as connection:
+                        return tuple(tuple(row) for row in connection.execute(text(statement), parameters).all())
+
+
+            class LeakingSession(SqlSession):
+                def __init__(self, engine: Engine) -> None:
+                    self._connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+                def execute_scalar(self, statement: str) -> object:
+                    return self._connection.execute(text(statement)).scalar()
+
+                def connection(self):
+                    return self._connection
+
+                def close(self) -> None:
+                    self._connection.close()
+
+
+            class CommittingSession(SqlSession):
+                def __init__(self, engine: Engine) -> None:
+                    self._connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+                def execute_scalar(self, statement: str) -> object:
+                    value = self._connection.execute(text(statement)).scalar()
+                    self._connection.commit()
+                    return value
+
+                def close(self) -> None:
+                    self._connection.close()
+
+
+            class LeakingCloseSession(SqlSession):
+                def __init__(self, engine: Engine) -> None:
+                    self._connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+                def execute_scalar(self, statement: str) -> object:
+                    return self._connection.execute(text(statement)).scalar()
+
+                def close(self):
+                    return self._connection
+
+
+            class UntypedEngineSession(SqlSession):
+                def __init__(self, engine) -> None:
+                    self._connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+                def execute_scalar(self, statement: str) -> object:
+                    return self._connection.execute(text(statement)).scalar()
+
+                def close(self) -> None:
+                    self._connection.close()
+
+
+            class PlainReader:
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def scalar(self, statement: str, **parameters: object) -> object:
+                    with self._engine.connect() as connection:
+                        return connection.execute(text(statement), parameters).scalar()
+
+
+            class ForeignBaseReader(ABC):
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def scalar(self, statement: str, **parameters: object) -> object:
+                    with self._engine.connect() as connection:
+                        return connection.execute(text(statement), parameters).scalar()
+
+                def rows(self, statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]:
+                    with self._engine.connect() as connection:
+                        return tuple(tuple(row) for row in connection.execute(text(statement), parameters).all())
+            """
+        ).replace("from sqlalchemy import Engine, text\n", "from abc import ABC\n\nfrom sqlalchemy import Engine, text\n"),
+    )
+    loosened_sites = scan_production_writers([loosened], anchor=tmp_path)
+    assert Counter((site.symbol, site.operation) for site in loosened_sites) == Counter(
+        {
+            ("LiteralReader.scalar", "write_connection"): 1,
+            ("LiteralReader.rows", "write_connection"): 1,
+            ("LiteralReader.rows", "unknown_opaque"): 1,
+            ("LeakingSession.__init__", "write_connection"): 1,
+            ("LeakingSession.execute_scalar", "unknown_execute"): 1,
+            ("CommittingSession.__init__", "write_connection"): 1,
+            ("CommittingSession.execute_scalar", "unknown_execute"): 1,
+            ("LeakingCloseSession.__init__", "write_connection"): 1,
+            ("LeakingCloseSession.execute_scalar", "unknown_execute"): 1,
+            ("UntypedEngineSession.__init__", "write_connection"): 1,
+            ("UntypedEngineSession.execute_scalar", "unknown_execute"): 1,
+            ("PlainReader.scalar", "write_connection"): 1,
+            ("PlainReader.scalar", "unknown_opaque"): 1,
+            ("ForeignBaseReader.scalar", "write_connection"): 1,
+            ("ForeignBaseReader.scalar", "unknown_opaque"): 1,
+            ("ForeignBaseReader.rows", "write_connection"): 1,
+            ("ForeignBaseReader.rows", "unknown_opaque"): 1,
+        }
+    )
+
+    # A module-level ``text`` shadowing SQLAlchemy's breaks the provenance the
+    # seam rests on: the otherwise-exact seam keeps its rows.
+    shadowed = _probe_seam_module(
+        tmp_path,
+        "src/elspeth/web/_azure_container_apps_acceptance/shadowed.py",
+        _PROBE_SEAM_FIXTURE + "\n\ndef text(statement):\n    return statement\n",
+    )
+    assert {site.symbol for site in scan_production_writers([shadowed], anchor=tmp_path)} == {
+        "Session.__init__",
+        "Session.execute_scalar",
+        "Reader.scalar",
+        "Reader.rows",
+    }
+
+    # The same seam outside an acceptance module is no seam.
+    elsewhere = _probe_seam_module(tmp_path, "src/elspeth/web/sessions/seam.py", _PROBE_SEAM_FIXTURE)
+    assert Counter((site.symbol, site.operation) for site in scan_production_writers([elsewhere], anchor=tmp_path)) == Counter(
+        {
+            ("Session.__init__", "write_connection"): 1,
+            ("Session.execute_scalar", "unknown_execute"): 1,
+            ("Reader.scalar", "write_connection"): 1,
+            ("Reader.scalar", "unknown_opaque"): 1,
+            ("Reader.rows", "write_connection"): 1,
+            ("Reader.rows", "unknown_opaque"): 1,
+        }
+    )
+
+
+def test_show_setting_reads_use_a_closed_grammar_and_every_loosened_form_is_unresolved(tmp_path: Path) -> None:
+    """``SHOW <setting>`` is a read of one server setting (the connection-budget probe); anything more is unresolved."""
+
+    source = tmp_path / "show_grammar.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def setting(conn):
+                conn.exec_driver_sql("SHOW max_connections")
+
+            def dotted_setting(conn):
+                conn.exec_driver_sql("show pg_catalog.max_connections;")
+
+            def bare(conn):
+                conn.exec_driver_sql("SHOW")
+
+            def second_statement(conn):
+                conn.exec_driver_sql("SHOW max_connections; DROP TABLE sessions")
+
+            def assignment(conn):
+                conn.exec_driver_sql("SHOW max_connections = 5")
+
+            def set_not_show(conn):
+                conn.exec_driver_sql("SET max_connections TO 5")
+            """
+        )
+    )
+
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
+        {
+            ("bare", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("second_statement", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("assignment", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+            ("set_not_show", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
+        }
+    )
+
+
 def test_chained_and_container_escaped_connections_fail_closed(tmp_path: Path) -> None:
     source = tmp_path / "chained_and_container_connections.py"
     source.write_text(
@@ -8246,7 +8764,7 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
                         conn.execute(text("SET LOCAL statement_timeout = '1000ms'"))
 
                 def bound_name(self):
-                    statement = "SHOW max_connections"
+                    statement = "RESET max_connections"
                     with self._engine.begin() as conn:
                         conn.exec_driver_sql(statement).scalar_one()
 
