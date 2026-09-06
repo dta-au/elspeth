@@ -3228,6 +3228,20 @@ class SessionOperationSessionMutations(Protocol):
 
     def record_plugin_crash_breadcrumb(self) -> None: ...
 
+    def mark_session_updated(self, *, updated_at: datetime) -> None: ...
+
+    def record_composition_rejection(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        error_code: str | None,
+        message: str,
+        planner_payload: str,
+        composition_state_id: str | None,
+        created_at: datetime,
+    ) -> None: ...
+
     def decide_and_soft_archive(
         self,
         *,

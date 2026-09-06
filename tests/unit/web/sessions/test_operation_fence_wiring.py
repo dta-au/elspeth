@@ -387,6 +387,24 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     (("archived_at", inspect.Parameter.KEYWORD_ONLY, datetime),),
                     archive_disposition,
                 ),
+                # P4-D6 family A2a (elspeth-99949c96ca): the two session-row
+                # writes the service's message/state paths used to run raw.
+                "mark_session_updated": (
+                    (("updated_at", inspect.Parameter.KEYWORD_ONLY, datetime),),
+                    type(None),
+                ),
+                "record_composition_rejection": (
+                    (
+                        ("tool_call_id", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("tool_name", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("error_code", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("message", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("planner_payload", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("composition_state_id", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("created_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    type(None),
+                ),
             },
         ),
         (
