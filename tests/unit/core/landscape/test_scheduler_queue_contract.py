@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Generator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -26,6 +26,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 from tests.helpers.state_engine import capture_state_engine_image
 
 
@@ -39,7 +40,7 @@ class _QueueHarness:
 
 def _make_repository() -> _QueueHarness:
     db = LandscapeDB("sqlite:///:memory:")
-    now = datetime.now(UTC)
+    now = landscape_database_now(db.engine)
 
     with db.engine.begin() as conn:
         for run_id in ("run-a", "run-b"):
@@ -136,7 +137,6 @@ def _enqueue_ready(
     repo: TokenSchedulerRepository,
     *,
     payload: str,
-    available_at: datetime,
     token_id: str = "token-a",
     row_id: str = "row-a",
     node_id: str = "normalize-a",
@@ -151,7 +151,6 @@ def _enqueue_ready(
         step_index=step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=payload,
-        available_at=available_at,
     )
 
 
@@ -159,8 +158,6 @@ def _enqueue_ready_claimed(
     repo: TokenSchedulerRepository,
     *,
     payload: str,
-    available_at: datetime,
-    now: datetime,
 ) -> TokenWorkItem:
     return repo.enqueue_ready_claimed(
         run_id="run-a",
@@ -170,10 +167,8 @@ def _enqueue_ready_claimed(
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload,
-        available_at=available_at,
         lease_owner="worker-a",
         lease_seconds=30,
-        now=now,
     )
 
 
@@ -197,10 +192,10 @@ def test_exact_ready_replay_preserves_complete_state_engine_image(
     queue_harness: _QueueHarness,
     request: pytest.FixtureRequest,
 ) -> None:
-    first = _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now)
+    first = _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
     before = capture_state_engine_image(queue_harness.db, run_id="run-a")
 
-    replayed = _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now)
+    replayed = _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
 
     assert replayed == first
     assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before
@@ -214,11 +209,11 @@ def test_exact_ready_replay_preserves_complete_state_engine_image(
 
 
 def test_incompatible_ready_replay_preserves_complete_state_engine_image(queue_harness: _QueueHarness) -> None:
-    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now)
+    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
     before = capture_state_engine_image(queue_harness.db, run_id="run-a")
 
     with pytest.raises(LandscapeRecordError, match="incompatible existing work item"):
-        _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now, step_index=2)
+        _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, step_index=2)
 
     assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before
 
@@ -245,7 +240,6 @@ def test_reference_validation_refusal_preserves_complete_state_engine_image(
         _enqueue_ready(
             queue_harness.repo,
             payload=queue_harness.payload,
-            available_at=queue_harness.now,
             token_id=token_id,
             row_id=row_id,
             node_id=node_id,
@@ -256,15 +250,15 @@ def test_reference_validation_refusal_preserves_complete_state_engine_image(
 
 
 def test_existing_ready_replay_emits_claim_only_and_preserves_every_other_field(queue_harness: _QueueHarness) -> None:
-    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now)
+    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
     before = capture_state_engine_image(queue_harness.db, run_id="run-a")
 
+    before_claim = landscape_database_now(queue_harness.db.engine)
     claimed = _enqueue_ready_claimed(
         queue_harness.repo,
         payload=queue_harness.payload,
-        available_at=queue_harness.now,
-        now=queue_harness.now + timedelta(seconds=1),
     )
+    after_claim = landscape_database_now(queue_harness.db.engine)
     after = capture_state_engine_image(queue_harness.db, run_id="run-a")
 
     assert claimed.status is TokenWorkStatus.LEASED
@@ -281,8 +275,12 @@ def test_existing_ready_replay_emits_claim_only_and_preserves_every_other_field(
     work_item = after.tables["token_work_items"][0]
     assert work_item["status"] == TokenWorkStatus.LEASED.value
     assert work_item["lease_owner"] == "worker-a"
-    assert work_item["lease_expires_at"] == (queue_harness.now + timedelta(seconds=31)).isoformat().replace("+00:00", "Z")
-    assert work_item["updated_at"] == (queue_harness.now + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    # The claim stamps updated_at from database time and the deadline is that
+    # instant + lease_seconds (ADR-047).
+    updated_at = datetime.fromisoformat(cast(str, work_item["updated_at"]).replace("Z", "+00:00"))
+    assert_stamped_between(updated_at, start=before_claim, end=after_claim)
+    lease_expires_at = datetime.fromisoformat(cast(str, work_item["lease_expires_at"]).replace("Z", "+00:00"))
+    assert lease_expires_at == updated_at + timedelta(seconds=30)
     assert all(event in after.tables["scheduler_events"] for event in before.tables["scheduler_events"])
     assert added_events[0]["event_type"] == SchedulerEventType.CLAIM_READY.value
     event_types = tuple(cast(str, event["event_type"]) for event in after.tables["scheduler_events"])
@@ -302,8 +300,6 @@ def test_new_enqueue_and_claim_event_failure_rolls_back_complete_state_engine_im
         _enqueue_ready_claimed(
             queue_harness.repo,
             payload=queue_harness.payload,
-            available_at=queue_harness.now,
-            now=queue_harness.now + timedelta(seconds=1),
         )
 
     assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before
@@ -313,7 +309,7 @@ def test_existing_ready_claim_event_failure_rolls_back_complete_state_engine_ima
     monkeypatch: pytest.MonkeyPatch,
     queue_harness: _QueueHarness,
 ) -> None:
-    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload, available_at=queue_harness.now)
+    _enqueue_ready(queue_harness.repo, payload=queue_harness.payload)
     before = capture_state_engine_image(queue_harness.db, run_id="run-a")
     _inject_event_failure(queue_harness.repo, monkeypatch, failed_event=SchedulerEventType.CLAIM_READY)
 
@@ -321,8 +317,6 @@ def test_existing_ready_claim_event_failure_rolls_back_complete_state_engine_ima
         _enqueue_ready_claimed(
             queue_harness.repo,
             payload=queue_harness.payload,
-            available_at=queue_harness.now,
-            now=queue_harness.now + timedelta(seconds=1),
         )
 
     assert capture_state_engine_image(queue_harness.db, run_id="run-a") == before

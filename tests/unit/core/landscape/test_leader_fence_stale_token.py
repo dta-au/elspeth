@@ -48,6 +48,7 @@ from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStat
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.manager import CheckpointManager
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -67,7 +68,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import expire_lease, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-fence-1"
@@ -190,7 +191,7 @@ def _ensure_active_worker(db: LandscapeDB, worker_id: str) -> None:
                 role="follower",
                 status="active",
                 registered_at=NOW,
-                heartbeat_expires_at=NOW + timedelta(hours=1),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
             )
         )
 
@@ -294,10 +295,10 @@ def _seed_other_run_expired_lease(db: LandscapeDB, repo: TokenSchedulerRepositor
         step_index=1,
         ingest_sequence=0,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
-    claimed = repo.claim_ready(run_id=OTHER_RUN_ID, lease_owner="other-run-crashed-worker", lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=OTHER_RUN_ID, lease_owner="other-run-crashed-worker", lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
+    expire_lease(db.engine, claimed.work_item_id)
     return token_id
 
 
@@ -312,10 +313,9 @@ def _enqueue_and_claim(db: LandscapeDB, repo: TokenSchedulerRepository, *, seque
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_payload_json(),
-        available_at=NOW,
     )
     _ensure_active_worker(db, owner)
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60, now=NOW)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=60)
     assert claimed is not None and claimed.token_id == token_id
     return token_id, row_id, claimed.work_item_id
 
@@ -368,7 +368,6 @@ class TestMissingTokenBarrierRefusals:
         try:
             with pytest.raises(TypeError, match="coordination_token"):
                 repo.recover_expired_leases(
-                    now=NOW + timedelta(seconds=120),
                     coordination_token=None,  # type: ignore[arg-type]  # runtime trust-boundary regression
                 )
         finally:
@@ -383,11 +382,11 @@ class TestMissingTokenBarrierRefusals:
         token: CoordinationToken,
     ) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="direct-harness")
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="direct-harness")
+        expire_lease(db.engine, work_item_id)
 
         recovered = repo.recover_expired_leases_legacy_unfenced(
             run_id=RUN_ID,
-            now=NOW + timedelta(seconds=120),
             caller_owner=WORKER,
         )
 
@@ -461,7 +460,8 @@ class TestStrictRecoveryScopeBinding:
 
     def test_supported_call_only_recovers_token_run(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        run_token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        run_token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        expire_lease(db.engine, work_item_id)
         with db.engine.begin() as conn:
             conn.execute(
                 update(run_workers_table)
@@ -473,7 +473,6 @@ class TestStrictRecoveryScopeBinding:
         other_run_before = _lease_recovery_run_snapshot(db, OTHER_RUN_ID)
 
         recovered = repo.recover_expired_leases(
-            now=NOW + timedelta(seconds=61),
             coordination_token=token,
         )
 
@@ -505,7 +504,6 @@ class TestStrictRecoveryScopeBinding:
             with pytest.raises(TypeError, match="run_id"):
                 repo.recover_expired_leases(
                     run_id=OTHER_RUN_ID,
-                    now=NOW + timedelta(seconds=61),
                     caller_owner=WORKER,
                     coordination_token=token,
                 )
@@ -535,7 +533,6 @@ class TestStrictRecoveryScopeBinding:
         try:
             with pytest.raises(TypeError, match="caller_owner"):
                 repo.recover_expired_leases(
-                    now=NOW + timedelta(seconds=61),
                     caller_owner="different-leader-identity",
                     coordination_token=token,
                 )
@@ -657,12 +654,11 @@ class TestStaleTokenFenceRefusals:
 
     def test_recover_expired_leases_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
-        token_id, _row_id, _work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
+        expire_lease(db.engine, work_item_id)  # the peer lease is expired: only the fence can refuse
         _bump_epoch(db)
-        sweep_time = NOW + timedelta(seconds=120)  # the peer lease (60 s) is expired
         with pytest.raises(RunLeadershipLostError):
             repo.recover_expired_leases(
-                now=sweep_time,
                 coordination_token=token,
             )
         row = _work_item_row(db, token_id)
@@ -786,7 +782,6 @@ class TestStaleTokenFenceRefusals:
         with pytest.raises(RunLeadershipLostError):
             repo.ingest_row_with_initial_claim(
                 coordination_token=token,
-                now=NOW,
                 insert_row_and_token=insert_row_and_token,
                 token_id="token-ingest",
                 row_id="row-ingest",
@@ -920,7 +915,7 @@ class TestStrictPendingSinkOwnerCAS:
         with db.engine.begin() as conn:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.token_id == token_id).values(lease_owner=None))
         _ensure_active_worker(db, "resume-worker")
-        reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="resume-worker", lease_seconds=60, now=NOW)
+        reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="resume-worker", lease_seconds=60)
         assert reclaimed is not None and reclaimed.token_id == token_id
         terminalized = repo.mark_pending_sink_terminal(
             run_id=RUN_ID, token_id=token_id, now=NOW, expected_lease_owner="resume-worker", coordination_token=token
@@ -964,7 +959,6 @@ class TestValidTokenFenceSemantics:
             step_index=1,
             ingest_sequence=0,
             row_payload_json=_payload_json(),
-            available_at=NOW,
         )
         factory = RecorderFactory(db)
         with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):

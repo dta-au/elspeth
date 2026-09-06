@@ -320,10 +320,8 @@ class TestGroupLossHandOff:
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            available_at=processor._clock.now_utc(),
             lease_owner="test-harness",
             lease_seconds=60,
-            now=processor._clock.now_utc(),
         )
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
@@ -397,10 +395,8 @@ class TestGroupLossHandOff:
             step_index=2,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(losing_token.row_data),
-            available_at=bootstrap._clock.now_utc(),
             lease_owner="dead-leader",
             lease_seconds=60,
-            now=bootstrap._clock.now_utc(),
         )
         from elspeth.core.landscape.scheduler_repository import GroupLossSpec
 
@@ -463,7 +459,6 @@ class TestEofGating:
             step_index=1,
             ingest_sequence=3,
             row_payload_json=factory.scheduler.serialize_row_payload(slow_token.row_data),
-            available_at=processor._clock.now_utc(),
         )
 
         config = MagicMock(spec=PipelineConfig)

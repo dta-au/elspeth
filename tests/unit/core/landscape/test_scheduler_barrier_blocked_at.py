@@ -139,10 +139,9 @@ def _enqueue_and_block(
         node_id="normalize",
         step_index=1,
         ingest_sequence=ingest_sequence,
-        available_at=now,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=run_id, lease_owner="w1", lease_seconds=30, now=now + timedelta(seconds=1))
+    claimed = repo.claim_ready(run_id=run_id, lease_owner="w1", lease_seconds=30)
     assert claimed is not None
     assert claimed.work_item_id == item.work_item_id
     return cast(
@@ -171,10 +170,9 @@ def test_mark_blocked_stamps_barrier_blocked_at() -> None:
         node_id="normalize",
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
-    assert repo.claim_ready(run_id="run-1", lease_owner="w1", lease_seconds=30, now=now) is not None
+    assert repo.claim_ready(run_id="run-1", lease_owner="w1", lease_seconds=30) is not None
 
     blocked = repo.mark_blocked(
         work_item_id=item.work_item_id,
@@ -277,7 +275,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
         node_id="normalize",
         step_index=1,
         ingest_sequence=1,
-        available_at=now,
         row_payload_json=payload_a,
     )
 

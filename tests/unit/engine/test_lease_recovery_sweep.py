@@ -34,7 +34,7 @@ Slice-4 liveness-aware reap tests (§A.5/§C.1, design :140/221-224):
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, insert, select, text, update
@@ -60,6 +60,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import expire_lease, landscape_database_now
 
 RUN_ID = "run-lease-sweep"
 
@@ -161,7 +162,6 @@ def _enqueue_single_token_rows(
             node_id="normalize",
             step_index=1,
             ingest_sequence=ingest_sequence,
-            available_at=now,
             row_payload_json=payload,
         )
     return items
@@ -209,7 +209,7 @@ def test_sweep_recovers_every_expired_lease_exactly_once_and_never_live_leases()
     idempotent across repeated calls."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     _insert_run_and_nodes(engine, now=now)
 
     token_ids = ("token-0", "token-1", "token-2", "token-3", "token-4")
@@ -222,12 +222,13 @@ def test_sweep_recovers_every_expired_lease_exactly_once_and_never_live_leases()
     live_tokens = ("token-1", "token-3")
     lease_seconds_by_token = {"token-0": 30, "token-1": 3600, "token-2": 30, "token-3": 3600, "token-4": 30}
     for token_id in token_ids:
-        claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=lease_seconds_by_token[token_id], now=now)
+        claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=lease_seconds_by_token[token_id])
         assert claimed is not None
         assert claimed.token_id == token_id
+        if token_id in expired_tokens:
+            expire_lease(engine, claimed.work_item_id)
 
-    sweep_at = now + timedelta(seconds=60)
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="resume-sweeper") == 3
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper") == 3
 
     states = _work_item_states(engine)
     for token_id in expired_tokens:
@@ -248,14 +249,14 @@ def test_sweep_recovers_every_expired_lease_exactly_once_and_never_live_leases()
     assert all(event["caller_owner"] == "resume-sweeper" for event in events)
 
     # Idempotent: a second sweep finds nothing left to recover.
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="resume-sweeper") == 0
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper") == 0
     assert len(_recovery_events(engine)) == 3
 
     # The recovered continuations are claimable in ingest order; the live
     # leases still block their own tokens.
     reclaimed: list[str] = []
     while True:
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner="resume-sweeper", lease_seconds=300, now=sweep_at)
+        item = repo.claim_ready(run_id=RUN_ID, lease_owner="resume-sweeper", lease_seconds=300)
         if item is None:
             break
         assert item.attempt == 2
@@ -270,7 +271,7 @@ def test_sweep_recovery_order_is_ingest_sequence_then_step_index_then_work_item_
     claim_ready determinism contract (elspeth-6cb89db535)."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     payload = _row_payload_json()
     _insert_run_and_nodes(engine, now=now)
 
@@ -293,15 +294,15 @@ def test_sweep_recovery_order_is_ingest_sequence_then_step_index_then_work_item_
             node_id="normalize",
             step_index=step_index,
             ingest_sequence=ingest_sequence,
-            available_at=now,
             row_payload_json=payload,
         )
 
     for _ in range(4):
-        assert repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30, now=now) is not None
+        claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30)
+        assert claimed is not None
+        expire_lease(engine, claimed.work_item_id)
 
-    sweep_at = now + timedelta(seconds=60)
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="resume-sweeper") == 4
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper") == 4
 
     tied_pair = sorted(("token-y", "token-z"), key=lambda token_id: items[token_id].work_item_id)
     recovery_order = [event["token_id"] for event in _recovery_events(engine)]
@@ -315,23 +316,23 @@ def test_expired_lease_is_invisible_to_its_own_holders_sweep() -> None:
     lease_owner (the resume-sweep path) runs the sweep."""
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     _insert_run_and_nodes(engine, now=now)
 
     _enqueue_single_token_rows(repo, engine, ("token-0", "token-1"), now=now)
 
     # claim_ready admits in ingest order: worker-a leases token-0, worker-b
     # leases token-1. Both leases expire before the sweep.
-    claimed_a = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30, now=now)
-    claimed_b = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30, now=now)
+    claimed_a = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30)
+    claimed_b = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=30)
     assert claimed_a is not None and claimed_a.token_id == "token-0"
     assert claimed_b is not None and claimed_b.token_id == "token-1"
-
-    sweep_at = now + timedelta(seconds=60)
+    expire_lease(engine, claimed_a.work_item_id)
+    expire_lease(engine, claimed_b.work_item_id)
 
     # worker-a's sweep recovers ONLY worker-b's expired lease; its own expired
     # lease stays LEASED under worker-a (invisible to its own holder).
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="worker-a") == 1
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-a") == 1
     states = _work_item_states(engine)
     assert states["token-1"]["status"] == TokenWorkStatus.READY.value
     assert states["token-1"]["attempt"] == 2
@@ -340,10 +341,10 @@ def test_expired_lease_is_invisible_to_its_own_holders_sweep() -> None:
     assert states["token-0"]["lease_owner"] == "worker-a"
 
     # Repeating its own sweep never reaps it.
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="worker-a") == 0
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-a") == 0
 
     # A different lease_owner — the resume-sweep identity — recovers it.
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=sweep_at, caller_owner="resume-sweeper") == 1
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper") == 1
     states = _work_item_states(engine)
     assert states["token-0"]["status"] == TokenWorkStatus.READY.value
     assert states["token-0"]["attempt"] == 2
@@ -422,18 +423,12 @@ def _claim_and_expire(
     *,
     run_id: str,
     lease_owner: str,
-    now: datetime,
+    expired_seconds_ago: float = 1.0,
 ) -> str:
-    """Claim the first READY item and expire its lease; return token_id."""
-    item = repo.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=_LEASE_SECONDS, now=now)
+    """Claim the first READY item and age its lease ``expired_seconds_ago`` into the database's past; return token_id."""
+    item = repo.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=_LEASE_SECONDS)
     assert item is not None
-    # Force-expire the lease by back-dating lease_expires_at on the DB row.
-    with engine.begin() as conn:
-        conn.execute(
-            update(token_work_items_table)
-            .where(token_work_items_table.c.work_item_id == item.work_item_id)
-            .values(lease_expires_at=now - timedelta(seconds=1))
-        )
+    expire_lease(engine, item.work_item_id, seconds_ago=expired_seconds_ago)
     return item.token_id
 
 
@@ -458,8 +453,8 @@ def test_live_registered_owner_expired_lease_is_revived_not_reaped() -> None:
     Item is leased under worker-alive with an expired lease_expires_at.
     Sweep by leader must return 0 (not reaped).
     """
-    now = datetime.now(UTC)
     engine = _make_scheduler_engine()
+    now = landscape_database_now(engine)
     repo = TokenSchedulerRepository(engine)
     _insert_run_and_nodes(engine, now=now)
 
@@ -481,15 +476,12 @@ def test_live_registered_owner_expired_lease_is_revived_not_reaped() -> None:
 
     # Enqueue and have live_owner claim the item.
     _enqueue_single_token_rows(repo, engine, ("token-live",), now=now)
-    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=live_owner, now=now)
-
-    sweep_at = now + timedelta(seconds=_LEASE_SECONDS + 10)
+    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=live_owner)
 
     # Leader's sweep: recover_expired_leases should NOT reap the item because
     # live_owner's heartbeat is fresh (owner_registry_dead is False) and the
     # lease has NOT passed the stall budget (only 40 s past lease_expires_at).
     reaped = repo.recover_expired_leases(
-        now=sweep_at,
         coordination_token=token,
         grace_seconds=_SWEEP_GRACE,
         stall_budget_seconds=_STALL_BUDGET,
@@ -517,8 +509,8 @@ def test_dead_registered_owner_expired_lease_is_reaped(owner_status: str, heartb
     (c) active-but-stale heartbeat. All three are reaped by a leader sweep.
     Attempt rotation is pinned (attempt 1 → 2, work_item_id rotated for READY).
     """
-    now = datetime.now(UTC)
     engine = _make_scheduler_engine()
+    now = landscape_database_now(engine)
     repo = TokenSchedulerRepository(engine)
     _insert_run_and_nodes(engine, now=now)
 
@@ -554,7 +546,7 @@ def test_dead_registered_owner_expired_lease_is_reaped(owner_status: str, heartb
     # absent: no run_workers row at all
 
     _enqueue_single_token_rows(repo, engine, ("token-dead",), now=now)
-    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=dead_owner, now=now)
+    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=dead_owner)
 
     # For evicted/departed: transition the worker to the final dead state AFTER
     # claiming. This mirrors the real lifecycle where eviction happens post-claim.
@@ -570,10 +562,7 @@ def test_dead_registered_owner_expired_lease_is_reaped(owner_status: str, heartb
                 )
             )
 
-    sweep_at = now + timedelta(seconds=_LEASE_SECONDS + 10)
-
     reaped = repo.recover_expired_leases(
-        now=sweep_at,
         coordination_token=token,
         grace_seconds=_SWEEP_GRACE,
         stall_budget_seconds=_STALL_BUDGET,
@@ -595,8 +584,8 @@ def test_stall_budget_reaps_live_owner_and_emits_worker_stalled() -> None:
     loop is wedged. The item has been expired past stall_budget_seconds.
     The reap must succeed AND emit worker_stalled in the same transaction.
     """
-    now = datetime.now(UTC)
     engine = _make_scheduler_engine()
+    now = landscape_database_now(engine)
     repo = TokenSchedulerRepository(engine)
     _insert_run_and_nodes(engine, now=now)
 
@@ -616,14 +605,12 @@ def test_stall_budget_reaps_live_owner_and_emits_worker_stalled() -> None:
     )
 
     _enqueue_single_token_rows(repo, engine, ("token-stalled",), now=now)
-    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=live_but_wedged, now=now)
-
-    # Advance past stall_budget_seconds so the stall arm triggers.
+    # The lease has been expired for longer than stall_budget_seconds on the
+    # database clock, so the stall arm triggers.
     stall_budget = 60.0  # short custom budget for the test
-    sweep_at = now + timedelta(seconds=_LEASE_SECONDS + stall_budget + 10)
+    token_id = _claim_and_expire(repo, engine, run_id=RUN_ID, lease_owner=live_but_wedged, expired_seconds_ago=stall_budget + 10)
 
     reaped = repo.recover_expired_leases(
-        now=sweep_at,
         coordination_token=token,
         grace_seconds=_SWEEP_GRACE,
         stall_budget_seconds=stall_budget,
@@ -652,7 +639,7 @@ def test_named_legacy_adapter_without_registry_preserves_reap_semantics() -> Non
     """
     engine = _make_scheduler_engine()
     repo = TokenSchedulerRepository(engine)
-    now = datetime.now(UTC)
+    now = landscape_database_now(engine)
     _insert_run_and_nodes(engine, now=now)
 
     token_ids = ("token-u0", "token-u1", "token-u2")
@@ -660,15 +647,13 @@ def test_named_legacy_adapter_without_registry_preserves_reap_semantics() -> Non
 
     # Claim all three under three different owners — NO run_workers rows.
     for token_id, owner in zip(token_ids, ("owner-a", "owner-b", "owner-c"), strict=True):
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=_LEASE_SECONDS, now=now)
+        item = repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=_LEASE_SECONDS)
         assert item is not None and item.token_id == token_id
-
-    sweep_at = now + timedelta(seconds=60)
+        expire_lease(engine, item.work_item_id)
 
     # Explicit legacy sweep: all three must be reaped.
     reaped = repo.recover_expired_leases_legacy_unfenced(
         run_id=RUN_ID,
-        now=sweep_at,
         caller_owner="resume-sweeper",
     )
     assert reaped == 3, "named legacy adapter must reap all expired items not owned by its explicit caller"

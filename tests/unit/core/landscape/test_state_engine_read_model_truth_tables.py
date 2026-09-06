@@ -82,7 +82,6 @@ def _enqueue(factory: Any, run_id: str, name: str, sequence: int) -> str:
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=NOW,
         row_payload_json=PAYLOAD,
     )
     return str(item.work_item_id)
@@ -131,35 +130,38 @@ def _seed_scheduler_image() -> tuple[Any, TokenSchedulerRepository, dict[str, st
         def set_item(name: str, **values: object) -> None:
             conn.execute(update(token_work_items_table).where(token_work_items_table.c.work_item_id == ids[name]).values(**values))
 
+        # Lease deadlines are judged against the Landscape database clock
+        # (ADR-047): live leases sit 10 s past it, the equality row ON it.
+        lease_live_until = live_until - timedelta(minutes=5) + timedelta(seconds=10)
         set_item(
             "leased-self",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=LEADER,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=lease_live_until,
         )
         set_item(
             "leased-peer-a",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=PEER_A,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=lease_live_until,
         )
         set_item(
             "leased-peer-b",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=PEER_B,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=lease_live_until,
         )
         set_item(
             "leased-peer-equality",
             status=TokenWorkStatus.LEASED.value,
             lease_owner="worker:rm-truth-run:equality",
-            lease_expires_at=NOW,
+            lease_expires_at=live_until - timedelta(minutes=5),
         )
         set_item(
             "leased-sink-redrive",
             status=TokenWorkStatus.LEASED.value,
             lease_owner=PEER_A,
-            lease_expires_at=NOW + timedelta(seconds=10),
+            lease_expires_at=lease_live_until,
             pending_sink_name="sink-a",
             pending_outcome=TerminalOutcome.SUCCESS.value,
             pending_path=TerminalPath.DEFAULT_FLOW.value,
@@ -241,7 +243,7 @@ def _seed_scheduler_image() -> tuple[Any, TokenSchedulerRepository, dict[str, st
         ),
         pytest.param(
             TokenSchedulerRepository.peer_active_leases,
-            {"run_id": RUN_ID, "caller_owner": LEADER, "now": NOW},
+            {"run_id": RUN_ID, "caller_owner": LEADER},
             (PEER_A, PEER_B),
             id="RM-06-active-peer-lease-strict-expiry-and-dedup",
         ),

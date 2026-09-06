@@ -2095,7 +2095,6 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=sibling_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            available_at=datetime.now(UTC),
             lineage_path=(
                 LineageFrame(kind=FrameKind.FORK, group_id=incomplete_branch.fork_group_id, member_key=incomplete_branch.branch_name),
             ),
@@ -2119,10 +2118,8 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=sibling_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 1}, contract=source_contract)),
-            available_at=seed_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=seed_now,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=held_branch.fork_group_id, member_key=held_branch_name),),
             coalesce_node_id=coalesce_node_id,
             coalesce_name="merge",
@@ -3625,10 +3622,8 @@ class TestForkRecoveryInvariant:
             step_index=1,
             ingest_sequence=row_ingest_sequence,
             row_payload_json=scheduler_repo.serialize_row_payload(PipelineRow(data={"value": 0}, contract=source_contract)),
-            available_at=seed_now,
             lease_owner="test-harness",
             lease_seconds=60,
-            now=seed_now,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=buffered_child.fork_group_id, member_key="sink_a"),),
         )
         scheduler_repo.mark_blocked(
@@ -3939,10 +3934,8 @@ class TestForkRecoveryInvariant:
                 step_index=2,
                 ingest_sequence=row_ingest_sequence,
                 row_payload_json=scheduler_repo.serialize_row_payload(leaf_payload),
-                available_at=seed_now,
                 lease_owner="test-harness",
                 lease_seconds=60,
-                now=seed_now,
                 lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=c.expand_group_id, member_key=c.token_id),),
             )
             scheduler_repo.mark_blocked(

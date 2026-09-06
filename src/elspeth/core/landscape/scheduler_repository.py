@@ -123,7 +123,6 @@ class TokenSchedulerRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -145,7 +144,6 @@ class TokenSchedulerRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -169,10 +167,8 @@ class TokenSchedulerRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -193,10 +189,8 @@ class TokenSchedulerRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -219,10 +213,8 @@ class TokenSchedulerRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -243,10 +235,8 @@ class TokenSchedulerRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -263,7 +253,6 @@ class TokenSchedulerRepository:
         self,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         insert_row_and_token: Callable[[Connection], tuple[Row, Token]],
         token_id: str,
         row_id: str,
@@ -286,7 +275,6 @@ class TokenSchedulerRepository:
         """Fenced leader INGEST (see :meth:`SchedulerQueueRepository.ingest_row_with_initial_claim`)."""
         return self.queue.ingest_row_with_initial_claim(
             coordination_token=coordination_token,
-            now=now,
             insert_row_and_token=insert_row_and_token,
             token_id=token_id,
             row_id=row_id,
@@ -375,10 +363,9 @@ class TokenSchedulerRepository:
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
     ) -> TokenWorkItem | None:
         """Claim the next available READY work item for a bounded lease."""
-        return self.leases.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds, now=now)
+        return self.leases.claim_ready(run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds)
 
     def claim_pending_sink(
         self,
@@ -386,22 +373,19 @@ class TokenSchedulerRepository:
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
     ) -> TokenWorkItem | None:
         """Claim a sink-bound token whose transform work is already durable."""
-        return self.leases.claim_pending_sink(run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds, now=now)
+        return self.leases.claim_pending_sink(run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds)
 
     def recover_expired_leases(
         self,
         *,
-        now: datetime,
         coordination_token: CoordinationToken,
         grace_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         stall_budget_seconds: float = DEFAULT_ITEM_STALL_BUDGET_SECONDS,
     ) -> int:
         """Return expired LEASED work to READY (see :meth:`SchedulerLeaseRepository.recover_expired_leases`)."""
         return self.leases.recover_expired_leases(
-            now=now,
             coordination_token=coordination_token,
             grace_seconds=grace_seconds,
             stall_budget_seconds=stall_budget_seconds,
@@ -411,13 +395,11 @@ class TokenSchedulerRepository:
         self,
         *,
         run_id: str,
-        now: datetime,
         caller_owner: str,
     ) -> int:
         """Recover expired leases for pre-coordination direct harnesses only."""
         return self.leases.recover_expired_leases_legacy_unfenced(
             run_id=run_id,
-            now=now,
             caller_owner=caller_owner,
         )
 
@@ -428,7 +410,6 @@ class TokenSchedulerRepository:
         work_item_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         membership_fenced: bool,
     ) -> datetime:
         """Extend a held lease (see :meth:`SchedulerLeaseRepository.heartbeat_lease`)."""
@@ -437,7 +418,6 @@ class TokenSchedulerRepository:
             work_item_id=work_item_id,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             membership_fenced=membership_fenced,
         )
 
@@ -446,10 +426,9 @@ class TokenSchedulerRepository:
         *,
         run_id: str,
         caller_owner: str,
-        now: datetime,
     ) -> tuple[str, ...]:
         """Distinct lease_owners of unexpired LEASED rows held by peers."""
-        return self.leases.peer_active_leases(run_id=run_id, caller_owner=caller_owner, now=now)
+        return self.leases.peer_active_leases(run_id=run_id, caller_owner=caller_owner)
 
     # ------------------------------------------------------------------
     # Dispositions (SchedulerDispositionRepository)

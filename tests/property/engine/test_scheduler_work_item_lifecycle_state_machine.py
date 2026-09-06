@@ -66,6 +66,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import expire_lease
 
 RUN_ID = "run-rc6-scheduler-property"
 NODE_ID = "normalize"
@@ -249,7 +250,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=sequence,
-            available_at=now,
             row_payload_json=self.payload,
         )
         assert item.status is TokenWorkStatus.READY
@@ -269,7 +269,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.READY or model.attempt != 1:
             return
-        now = self._tick()
         item = self.repo.enqueue_ready(
             run_id=RUN_ID,
             token_id=token_id,
@@ -277,7 +276,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=model.ingest_sequence,
-            available_at=now,
             row_payload_json=self.payload,
         )
         assert item.work_item_id == model.work_item_id
@@ -293,7 +291,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         """claim_ready returns exactly the next READY item — never a leased one."""
         now = self._tick()
         expected = self._next_claimable(TokenWorkStatus.READY)
-        item = self.repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=LEASE_SECONDS, now=now)
+        item = self.repo.claim_ready(run_id=RUN_ID, lease_owner=owner, lease_seconds=LEASE_SECONDS)
         if expected is None:
             assert item is None
             return
@@ -312,7 +310,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         """claim_pending_sink re-leases the next sink handoff, preserving identity."""
         now = self._tick()
         expected = self._next_claimable(TokenWorkStatus.PENDING_SINK)
-        item = self.repo.claim_pending_sink(run_id=RUN_ID, lease_owner=owner, lease_seconds=LEASE_SECONDS, now=now)
+        item = self.repo.claim_pending_sink(run_id=RUN_ID, lease_owner=owner, lease_seconds=LEASE_SECONDS)
         if expected is None:
             assert item is None
             return
@@ -625,7 +623,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             and item.lease_expires_at < now
             and item.lease_owner != caller_owner
         ]
-        recovered = self.repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=now, caller_owner=caller_owner)
+        recovered = self.repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner=caller_owner)
         assert recovered == len(expected)
         if not expected:
             return
@@ -791,11 +789,10 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=0,
-        available_at=now,
         row_payload_json=payload,
     )
 
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=LEASE_SECONDS, now=now)
+    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=LEASE_SECONDS)
     assert claimed is not None
     repo.mark_pending_sink(
         work_item_id=claimed.work_item_id,
@@ -808,14 +805,15 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
         now=now + timedelta(seconds=1),
         expected_lease_owner="worker-a",
     )
-    reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=LEASE_SECONDS, now=now + timedelta(seconds=2))
+    reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=LEASE_SECONDS)
     assert reclaimed is not None
     assert reclaimed.work_item_id == claimed.work_item_id
     assert reclaimed.pending_sink_name == SINK_NAME
     assert reclaimed.attempt == 1
 
     expired_at = now + timedelta(seconds=LEASE_SECONDS + 3)
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, now=expired_at, caller_owner="worker-b") == 1
+    expire_lease(engine, reclaimed.work_item_id)
+    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-b") == 1
 
     with engine.connect() as conn:
         row = (
@@ -834,7 +832,7 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
     assert row["lease_expires_at"] is None
 
     # The preserved handoff is claimable and terminalizable exactly as before.
-    drained = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=LEASE_SECONDS, now=expired_at)
+    drained = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-b", lease_seconds=LEASE_SECONDS)
     assert drained is not None
     assert drained.work_item_id == claimed.work_item_id
     assert (

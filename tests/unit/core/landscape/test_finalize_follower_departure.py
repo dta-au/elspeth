@@ -352,7 +352,6 @@ class TestEnqueueReadyMembershipFenceRoles:
             step_index=1,
             ingest_sequence=ingest_sequence,
             row_payload_json=_row_payload(),
-            available_at=NOW,
             worker_id=worker_id,
         )
 

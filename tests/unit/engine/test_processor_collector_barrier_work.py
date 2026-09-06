@@ -78,7 +78,6 @@ def _member_token(ordinal: int) -> Any:
 def _enqueue_claimed(factory: RecorderFactory, processor: RowProcessor, token: Any, *, ordinal: int, collector_name: str | None) -> Any:
     """Enqueue+claim one member at the collector node via the production journal verbs."""
     _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-    now = processor._clock.now_utc()
     return processor._scheduler.enqueue_ready_claimed_legacy_unfenced(
         run_id=processor.run_id,
         token_id=token.token_id,
@@ -87,10 +86,8 @@ def _enqueue_claimed(factory: RecorderFactory, processor: RowProcessor, token: A
         step_index=processor.resolve_node_step(_COLLECTOR_NODE),
         ingest_sequence=ordinal,
         row_payload_json=processor._scheduler.serialize_row_payload(token.row_data),
-        available_at=now,
         lease_owner=_LEASE_OWNER,
         lease_seconds=60,
-        now=now,
         lineage_path=token.lineage_path,
         collector_name=collector_name,
     )

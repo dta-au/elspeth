@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import and_, select
@@ -309,7 +308,6 @@ def test_source_a_oversize_row_does_not_starve_source_b_claim_ordering() -> None
     token_a = factory.data_flow.create_token(row_a.row_id, token_id="token-a")
     token_b = factory.data_flow.create_token(row_b.row_id, token_id="token-b")
     contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
-    now = datetime.now(UTC)
     assert row_a.ingest_sequence is not None
     assert row_b.ingest_sequence is not None
     item_a = factory.scheduler.enqueue_ready(
@@ -319,7 +317,6 @@ def test_source_a_oversize_row_does_not_starve_source_b_claim_ordering() -> None
         node_id=transform.node_id,
         step_index=1,
         ingest_sequence=row_a.ingest_sequence,
-        available_at=now,
         row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"payload": "x" * 8192}, contract)),
     )
     item_b = factory.scheduler.enqueue_ready(
@@ -329,14 +326,13 @@ def test_source_a_oversize_row_does_not_starve_source_b_claim_ordering() -> None
         node_id=transform.node_id,
         step_index=1,
         ingest_sequence=row_b.ingest_sequence,
-        available_at=now,
         row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"payload": "ok"}, contract)),
     )
 
     register_test_worker(db, run_id=run.run_id, worker_id="worker-a")
     register_test_worker(db, run_id=run.run_id, worker_id="worker-b")
-    claimed_a = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-a", lease_seconds=30, now=now)
-    claimed_b = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-b", lease_seconds=30, now=now)
+    claimed_a = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-a", lease_seconds=30)
+    claimed_b = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="worker-b", lease_seconds=30)
 
     assert claimed_a is not None
     assert claimed_b is not None

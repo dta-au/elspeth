@@ -9,7 +9,6 @@ in-transaction claim CAS. Extracted from ``TokenSchedulerRepository``
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -20,6 +19,7 @@ from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
@@ -56,7 +56,6 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -90,27 +89,32 @@ class SchedulerQueueRepository:
         fenced transaction) and tests — legitimately have no registry row.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
-        values = ready_work_item_values(
-            run_id=run_id,
-            token_id=token_id,
-            row_id=row_id,
-            node_id=node_id,
-            step_index=step_index,
-            ingest_sequence=ingest_sequence,
-            row_payload_json=row_payload_json,
-            available_at=available_at,
-            attempt=attempt,
-            queue_key=queue_key,
-            barrier_key=barrier_key,
-            on_success_sink=on_success_sink,
-            join_group_id=join_group_id,
-            lineage_path=lineage_path,
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name=coalesce_name,
-            row_union_name=row_union_name,
-            collector_name=collector_name,
-        )
         with begin_write(self._engine) as conn:
+            # The row becomes available at Landscape database time (ADR-047):
+            # claim_ready admits it against that same clock, so a caller clock
+            # — whole seconds behind or microseconds ahead of the database —
+            # can neither park the row nor make it claimable early.
+            available_at = read_landscape_transaction_time(conn)
+            values = ready_work_item_values(
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                node_id=node_id,
+                step_index=step_index,
+                ingest_sequence=ingest_sequence,
+                row_payload_json=row_payload_json,
+                available_at=available_at,
+                attempt=attempt,
+                queue_key=queue_key,
+                barrier_key=barrier_key,
+                on_success_sink=on_success_sink,
+                join_group_id=join_group_id,
+                lineage_path=lineage_path,
+                coalesce_node_id=coalesce_node_id,
+                coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
+                collector_name=collector_name,
+            )
             # Membership fence (ADR-030 §G, slice 4): checked BEFORE the INSERT
             # and BEFORE the reference validation — an evicted caller must not
             # leave a READY orphan, and the fence is the outer guard (reference
@@ -160,10 +164,8 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -193,10 +195,8 @@ class SchedulerQueueRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -220,10 +220,8 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -249,10 +247,8 @@ class SchedulerQueueRepository:
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            available_at=available_at,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
             attempt=attempt,
             queue_key=queue_key,
             barrier_key=barrier_key,
@@ -276,10 +272,8 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int,
         queue_key: str | None,
         barrier_key: str | None,
@@ -302,10 +296,8 @@ class SchedulerQueueRepository:
                 step_index=step_index,
                 ingest_sequence=ingest_sequence,
                 row_payload_json=row_payload_json,
-                available_at=available_at,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 attempt=attempt,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
@@ -331,10 +323,8 @@ class SchedulerQueueRepository:
         step_index: int,
         ingest_sequence: int,
         row_payload_json: str,
-        available_at: datetime,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
         attempt: int = 1,
         queue_key: str | None = None,
         barrier_key: str | None = None,
@@ -359,6 +349,9 @@ class SchedulerQueueRepository:
         helper and for ingest, whose leader-epoch CAS is the outer fence.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
+        # Available at the caller transaction's database time (ADR-047); the
+        # claim CAS below reads the same clock on the same connection.
+        available_at = read_landscape_transaction_time(conn)
         values = ready_work_item_values(
             run_id=run_id,
             token_id=token_id,
@@ -417,7 +410,6 @@ class SchedulerQueueRepository:
                 run_id=run_id,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 strict_membership_fenced=worker_id is not None,
             )
             if claimed is not None:
@@ -428,7 +420,6 @@ class SchedulerQueueRepository:
         self,
         *,
         coordination_token: CoordinationToken,
-        now: datetime,
         insert_row_and_token: Callable[[Connection], tuple[Row, Token]],
         token_id: str,
         row_id: str,
@@ -462,6 +453,12 @@ class SchedulerQueueRepository:
         ``coordination_token`` is REQUIRED — this verb has no legacy callers.
         Raises :class:`~elspeth.contracts.errors.RunLeadershipLostError` on a
         fence miss (``fence_refusal`` evented on a fresh connection).
+
+        Ingested work is available immediately, and "immediately" is Landscape
+        database time read inside the fenced transaction (ADR-047), not the
+        leader's process clock. ``available_at`` is compared against that same
+        clock by ``claim_ready``, so a leader whose clock ran fast can no
+        longer enqueue work that its own next claim refuses as not-yet-due.
         """
         run_id = coordination_token.run_id
         with fenced_leader_transaction(
@@ -487,10 +484,8 @@ class SchedulerQueueRepository:
                 step_index=step_index,
                 ingest_sequence=ingest_sequence,
                 row_payload_json=row_payload_json,
-                available_at=now,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,
-                now=now,
                 queue_key=queue_key,
                 barrier_key=barrier_key,
                 on_success_sink=on_success_sink,

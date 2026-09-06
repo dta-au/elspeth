@@ -150,10 +150,9 @@ class _PeerSimulatingSource(_TestSourceBase):
             step_index=int(sample["step_index"]),
             ingest_sequence=PEER_INGEST_SEQUENCE,
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-            available_at=now,
         )
         register_test_worker(self._db, run_id=run_id, worker_id=PEER_OWNER)
-        claimed = repo.claim_ready(run_id=run_id, lease_owner=PEER_OWNER, lease_seconds=3600, now=now)
+        claimed = repo.claim_ready(run_id=run_id, lease_owner=PEER_OWNER, lease_seconds=3600)
         assert claimed is not None and claimed.token_id == token.token_id
         if self._peer_completes_into_barrier:
             repo.mark_blocked(

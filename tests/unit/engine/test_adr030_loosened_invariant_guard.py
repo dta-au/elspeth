@@ -60,13 +60,14 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import token_work_items_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node, reschedule_work_item
 
 NODE_ID = "normalize"
 LEADER_OWNER = "leader-a"
@@ -127,9 +128,13 @@ def _enqueue_ready(
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
-        available_at=clock.now_utc() + timedelta(seconds=available_at_offset),
         row_payload_json=_PAYLOAD,
     )
+    if available_at_offset:
+        # Availability is decided on the Landscape database clock (ADR-047):
+        # the enqueue stamped available_at from it, so the offset is applied
+        # to it too (the MockClock instant is years in its past).
+        reschedule_work_item(setup.db.engine, item.work_item_id, seconds_from_now=available_at_offset)
     token_info = TokenInfo(row_id=row.row_id, token_id=token.token_id, row_data=PipelineRow({"id": sequence}, _CONTRACT))
     return item.work_item_id, token_info
 
@@ -152,7 +157,9 @@ def _seed_peer_leased_row(setup: RecorderSetup, scheduler: TokenSchedulerReposit
             .values(
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=PEER_OWNER,
-                lease_expires_at=clock.now_utc() + timedelta(seconds=300),
+                # A live peer lease is live on the DATABASE clock (ADR-047); the
+                # MockClock instant is years in its past.
+                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
             )
         )
 
@@ -192,7 +199,7 @@ def test_n1_self_failed_still_raises() -> None:
     processor, scheduler, setup, clock = _build_processor(scheduler_lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
     # Claim under the leader, then mark FAILED under the leader's OWN owner.
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300, now=clock.now_utc())
+    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_failed(work_item_id=work_item_id, now=clock.now_utc(), expected_lease_owner=LEADER_OWNER)
 
@@ -222,7 +229,7 @@ def test_n1_self_blocked_still_raises_and_backstop_counts_blocked() -> None:
     """
     processor, scheduler, setup, clock = _build_processor(scheduler_lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300, now=clock.now_utc())
+    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_blocked(
         work_item_id=work_item_id,
@@ -300,7 +307,9 @@ def test_n2_peer_claim_handoff_clears_and_breaks_without_raising(caplog: pytest.
             .values(
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=PEER_OWNER,
-                lease_expires_at=clock.now_utc() + timedelta(seconds=300),
+                # A live peer lease is live on the DATABASE clock (ADR-047); the
+                # MockClock instant is years in its past.
+                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
             )
         )
     pending = _pending_work_item(work_item_id, token)
@@ -357,14 +366,16 @@ def test_mixed_self_failed_and_peer_still_raises() -> None:
             .values(
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=PEER_OWNER,
-                lease_expires_at=clock.now_utc() + timedelta(seconds=300),
+                # A live peer lease is live on the DATABASE clock (ADR-047); the
+                # MockClock instant is years in its past.
+                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
             )
         )
 
     # Item B: the leader's OWN self-FAILED stray (claimed by the leader, marked
     # FAILED under the leader's own owner — NO peer owns it).
     self_item_id, self_token = _enqueue_ready(setup, scheduler, clock, sequence=1)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300, now=clock.now_utc())
+    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
     assert claimed is not None and claimed.work_item_id == self_item_id
     scheduler.mark_failed(work_item_id=self_item_id, now=clock.now_utc(), expected_lease_owner=LEADER_OWNER)
 

@@ -19,6 +19,7 @@ from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.contracts.scheduler import BarrierEmission, GroupLossSpec, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.fencing import fenced_write
@@ -573,7 +574,7 @@ class SchedulerDispositionRepository:
             .exists()
         )
         with fenced_write(
-            self._engine, coordination_token=coordination_token, now=now, verb="terminalize_pending_sinks_with_terminal_outcomes"
+            self._engine, coordination_token=coordination_token, verb="terminalize_pending_sinks_with_terminal_outcomes"
         ) as conn:
             rows = (
                 conn.execute(
@@ -726,6 +727,11 @@ class SchedulerDispositionRepository:
             node_id=emission.node_id,
             coalesce_node_id=emission.coalesce_node_id,
         )
+        # The child becomes available at Landscape database time (ADR-047):
+        # claim_ready admits it against that clock, so the caller's
+        # disposition instant — a process clock that may sit microseconds
+        # ahead of whole-second SQLite database time — must not park it.
+        available_at = read_landscape_transaction_time(conn)
         values = ready_work_item_values(
             run_id=run_id,
             token_id=emission.token_id,
@@ -734,7 +740,7 @@ class SchedulerDispositionRepository:
             step_index=emission.step_index,
             ingest_sequence=emission.ingest_sequence,
             row_payload_json=emission.row_payload_json,
-            available_at=now,
+            available_at=available_at,
             attempt=emission.attempt,
             queue_key=emission.queue_key,
             barrier_key=emission.barrier_key,

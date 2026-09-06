@@ -97,7 +97,7 @@ from tests.e2e.recovery.harness import (
     _run_workers,
     _work_items_by_token,
 )
-from tests.fixtures.landscape import expire_leader_seat
+from tests.fixtures.landscape import await_database_time, expire_leader_seat, expire_lease
 
 # The resume() entry guard and can_resume() evaluate seat liveness with the
 # WALL clock (datetime.now(UTC)), while the harness MockClock lives at the
@@ -146,7 +146,6 @@ class TestMidClaimCrashResume:
 
         _row, _token, admitted = crashed.repo.ingest_row_with_initial_claim(
             coordination_token=old_token,
-            now=clock.now_utc(),
             insert_row_and_token=insert_pre_fix_ingress,
             token_id=token_id,
             row_id=row_id,
@@ -155,10 +154,14 @@ class TestMidClaimCrashResume:
             ingest_sequence=3,
             row_payload_json=crashed.repo.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
             lease_owner=old_leader,
-            lease_seconds=_DEFAULT_LEASE_SECONDS,
+            lease_seconds=1,
         )
-        assert admitted.status is TokenWorkStatus.LEASED
+        assert admitted.status is TokenWorkStatus.LEASED and admitted.lease_expires_at is not None
         assert admitted.attempt == 1
+        # The resume reconciles this initial claim against its CLAIM_READY
+        # witness, so the one-second lease must lapse the way it does in
+        # production: by Landscape database time passing (ADR-047).
+        await_database_time(crashed.db.engine, admitted.lease_expires_at)
 
         def crash_token_counts() -> tuple[int, int, int]:
             with crashed.db.engine.connect() as conn:
@@ -442,6 +445,7 @@ class TestExpiredLeaseReclaimUnderContention:
             ingest_sequence=3,
             lease_owner="crashed-worker-a",
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            expired=False,  # token-3's 300 s lease is still live at this point
         )
         token_4 = _craft_crashed_lease(
             crashed,
@@ -454,11 +458,10 @@ class TestExpiredLeaseReclaimUnderContention:
         # the prior process's own maintenance sweep (a different owner — the
         # G1 self-steal guard requires it) recovers it, then worker-b
         # re-claims at attempt=2 with a long lease... and dies holding it.
-        clock.advance(120)  # token-4's 60s lease is expired; token-3's 300s is not
+        clock.advance(120)  # token-4's 60s lease is expired (aged on the database clock); token-3's 300s is not
         assert (
             crashed.repo.recover_expired_leases_legacy_unfenced(
                 run_id=crashed.run_id,
-                now=clock.now_utc(),
                 caller_owner="row-processor:prior-attempt-sweeper",
             )
             == 1
@@ -467,7 +470,6 @@ class TestExpiredLeaseReclaimUnderContention:
             run_id=crashed.run_id,
             lease_owner="crashed-worker-b",
             lease_seconds=7200,
-            now=clock.now_utc(),
         )
         assert reclaimed is not None and reclaimed.token_id == token_4 and reclaimed.attempt == 2
 
@@ -477,7 +479,10 @@ class TestExpiredLeaseReclaimUnderContention:
         # (journal TERMINAL, outcome written to audit trail). Then
         # has_unresolved_scheduler_work() sees token-4 still LEASED → raises
         # OrchestrationInvariantError BEFORE flush_and_write_sinks is called.
+        # Token-3's lease lapses on the database clock before resume #1;
+        # token-4's fresh 7200 s lease does not.
         clock.advance(3600)
+        expire_lease(crashed.db.engine, _work_items_by_token(crashed.db, crashed.run_id)[token_3]["work_item_id"])
         resume_point = _resume_point(crashed)
         assert resume_point is not None
         config_1, graph_1, sink_1, _source_1 = _build_pipeline(_SOURCE_ROWS)
@@ -508,8 +513,9 @@ class TestExpiredLeaseReclaimUnderContention:
             status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == crashed.run_id)).scalar_one()
         assert status == RunStatus.FAILED.value
 
-        # ---- Resume #2: token-4's 7200s lease has aged out (T+120+7200=T+7320) ----
+        # ---- Resume #2: token-4's 7200s lease has aged out on the database clock ----
         clock.advance(7200)
+        expire_lease(crashed.db.engine, reclaimed.work_item_id)
         result, resume_sink, _resume_source = _resume(crashed)
 
         assert result.status == RunStatus.COMPLETED
@@ -663,7 +669,6 @@ class TestTwoResumesSameRunId:
         # ---- the winner completes normally under its token ----
         assert (
             crashed.repo.recover_expired_leases(
-                now=clock.now_utc(),
                 coordination_token=winner_token,
             )
             == 1
@@ -672,7 +677,6 @@ class TestTwoResumesSameRunId:
             run_id=crashed.run_id,
             lease_owner=winner_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == crashed_token and claimed.attempt == 2
         crashed.repo.mark_terminal(work_item_id=claimed.work_item_id, now=clock.now_utc(), expected_lease_owner=winner_id)
@@ -1344,12 +1348,10 @@ class TestTwoResumesSameRunId:
         # ── A2: follower claims the READY row under its own worker_id ─────
         # Simulate the follower claiming via claim_ready (the production verb).
         # The follower is ACTIVE in run_workers, so the membership fence admits it.
-        now = clock.now_utc()
         follower_claimed = crashed.repo.claim_ready(
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=now,
         )
         assert follower_claimed is not None, "follower must claim the READY row"
         assert follower_claimed.token_id == fresh_token, "follower claims the seq=5 token only"
@@ -1390,7 +1392,6 @@ class TestTwoResumesSameRunId:
         # finalizes.  The D quiescence predicate (no READY/LEASED/PENDING_SINK
         # rows except the crashed one recovered first) must be satisfied.
         recovered = crashed.repo.recover_expired_leases(
-            now=clock.now_utc(),
             coordination_token=leader_token,
         )
         assert recovered == 1, "exactly one expired lease recovered (crashed-worker-1)"
@@ -1400,7 +1401,6 @@ class TestTwoResumesSameRunId:
             run_id=crashed.run_id,
             lease_owner=leader_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert recovered_claim is not None and recovered_claim.token_id == crashed_token
         crashed.repo.mark_terminal(

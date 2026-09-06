@@ -261,10 +261,12 @@ def verify_and_extend_leader_fence(
     The new deadline is written from the database's own clock, in SQL, so no
     process clock and no caller-supplied ``now`` reaches the seat (ADR-047):
     SQLite has no interval arithmetic, so its deadline is
-    ``datetime(CURRENT_TIMESTAMP, '+N seconds')`` (whole-second UTC text, no
-    fraction — a fence-written expiry compares as expired up to one second
-    early against a ``.ffffff`` bound, inside every production window);
-    PostgreSQL adds an interval to the transaction timestamp.
+    ``strftime('%Y-%m-%d %H:%M:%S.000000', CURRENT_TIMESTAMP, '+N seconds')``
+    — the DateTime storage format every bound ``datetime`` is written in,
+    fraction included, so the in-SQL deadline compares byte-for-byte against
+    a bound value of the same instant and no liveness window has to absorb a
+    sub-second artefact; PostgreSQL adds an interval to the transaction
+    timestamp.
 
     On rowcount 0 raises :class:`RunLeadershipLostError`. The caller (or
     :func:`fenced_leader_transaction`) records the ``fence_refusal`` event on
@@ -280,11 +282,18 @@ def verify_and_extend_leader_fence(
         )
         .values(
             leader_heartbeat_expires_at=(
-                func.datetime(func.current_timestamp(), f"+{window_seconds} seconds")
+                # SQLAlchemy's SQLite DateTime storage format, fraction included:
+                # CURRENT_TIMESTAMP alone is fractionless text and would sort
+                # before a bound value of the same second.
+                func.strftime("%Y-%m-%d %H:%M:%S.000000", func.current_timestamp(), f"+{window_seconds} seconds")
                 if conn.dialect.name == "sqlite"
                 else func.current_timestamp() + timedelta(seconds=window_seconds)
             ),
-            updated_at=func.current_timestamp(),
+            updated_at=(
+                func.strftime("%Y-%m-%d %H:%M:%S.000000", func.current_timestamp())
+                if conn.dialect.name == "sqlite"
+                else func.current_timestamp()
+            ),
         )
     )
     if result.rowcount != 1:

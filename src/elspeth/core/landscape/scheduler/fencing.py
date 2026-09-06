@@ -14,7 +14,6 @@ independent APIs.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from datetime import datetime
 
 from sqlalchemy.engine import Connection
 
@@ -38,7 +37,6 @@ def fenced_write(
     engine: Tier1Engine,
     *,
     coordination_token: CoordinationToken,
-    now: datetime,
     verb: str,
 ) -> AbstractContextManager[Connection]:
     """Return a leader-fenced write transaction; missing authority refuses.
@@ -46,6 +44,10 @@ def fenced_write(
     The non-optional annotation prevents new Optional-authority call sites,
     while the runtime check protects Python callers that bypass static typing.
     Both contracts reject ``None`` before ``BEGIN IMMEDIATE`` is opened.
+
+    Takes no clock (ADR-047): the fence statement writes its own deadline from
+    ``CURRENT_TIMESTAMP`` inside the transaction it opens, so a caller clock
+    could only have been recorded, never obeyed.
     """
     coordination_token = require_coordination_token(coordination_token, verb=verb)
     return fenced_leader_transaction(

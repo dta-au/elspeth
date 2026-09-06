@@ -2848,10 +2848,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "SchedulerLeaseRepository.heartbeat_lease",
         "<non-session-write-connection>",
         "write_connection",
-        "f38cd0992716f10c",
+        "fd990256930fd02c",
         1,
         None,
-        line=780,
+        line=819,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -2859,10 +2859,11 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "SchedulerLeaseRepository.peer_active_leases",
         "<non-session-write-connection>",
         "write_connection",
-        "d14e0f51a84f117b",
+        "791b6fe94ec7c970",
         1,
         None,
-        line=931,
+        line=974,
+        connection_escape=True,
     ),
     WriterIdentity(
         "src/elspeth/plugins/sinks/database_sink.py",
@@ -3032,7 +3033,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2b52f58624e1e33d",
         1,
         None,
-        line=653,
+        line=662,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -3043,7 +3044,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1041,
+        line=1050,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -3054,7 +3055,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1066,
+        line=1075,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
@@ -3074,7 +3075,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "77752b22fc520b7b",
         1,
         None,
-        line=1083,
+        line=1087,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3084,7 +3085,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "89c87457b3d6b1a9",
         1,
         None,
-        line=1102,
+        line=1106,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3094,7 +3095,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c5310a65c3619209",
         1,
         None,
-        line=1116,
+        line=1120,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -3104,7 +3105,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3053f6e3f97a64b7",
         1,
         None,
-        line=1140,
+        line=1144,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/group_losses.py",

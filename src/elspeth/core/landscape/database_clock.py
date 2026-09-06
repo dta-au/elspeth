@@ -28,11 +28,11 @@ Contract (rulings 9425/9444 on elspeth-0ff11aa42e):
   (``clock_timestamp()``) is a distinct authority with the same contract, and
   the two domains never cross.
 
-SQLite's ``CURRENT_TIMESTAMP`` has whole-second resolution and no fraction;
-a fence deadline written from it compares as expired up to one second early
-against a ``.ffffff`` bound value. Every production liveness window is at
-least ten seconds, so the artefact is inside every window's tolerance; the
-pin that keeps it so lands with the first fence (C6.1).
+SQLite's ``CURRENT_TIMESTAMP`` has whole-second resolution and no fraction.
+The in-SQL fence deadline (``run_coordination_repository``) is therefore
+written in the DateTime storage format with the ``.000000`` fraction appended,
+so it compares byte-for-byte against a bound value of the same instant; no
+liveness window, production or test, has to absorb a sub-second artefact.
 """
 
 from __future__ import annotations
