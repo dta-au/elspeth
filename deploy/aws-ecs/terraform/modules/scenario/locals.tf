@@ -502,18 +502,14 @@ locals {
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
     { name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model },
     { name = "ELSPETH_WEB__REGISTRATION_MODE", value = "open" },
-    # Local in BOTH modes until the confidential Cognito client exists.
-    # Selecting a non-local provider now would render a task definition that
-    # cannot start: since identity sprint step E every registered profile is
-    # validated from the registry, so `oidc` requires sso_client_secret --
-    # which no resource here can supply, because the client this module
-    # creates is public. Spec phase 5 registers the confidential client and
-    # flips this to "oidc" together with sso_issuer, sso_client_id,
-    # sso_client_secret (Secrets Manager valueFrom), sso_endpoint_origins,
-    # sso_transaction_secret, public_base_url, compartment_id and the two
-    # quota defaults, in one commit. The user pool, its client and the
-    # OIDC_EXPECTED_* acceptance outputs are already provisioned for it.
-    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = "local" },
+    # A cold install has no identity provider yet, so it comes up on local
+    # auth and an operator signs in to it directly. The upgrade deployment
+    # is the one that carries a Cognito user pool, so it selects `oidc`.
+    # Local auth is not a fallback for the upgrade mode: since the identity
+    # sprint deleted the legacy browser path, a provider selected without
+    # its full settings fails at settings load rather than degrading, which
+    # is why every setting the profile requires is exported below.
+    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = local.deployment_mode == "first" ? "local" : "oidc" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY", value = "aws-otlp" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_SERVICE_NAME", value = local.telemetry_service_name },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_ENVIRONMENT", value = "production" },
@@ -527,6 +523,27 @@ locals {
     { name = "ELSPETH_ACCEPTANCE_SCENARIO_ID", value = var.scenario_id },
     { name = "ELSPETH_ACCEPTANCE_S3_BUCKET", value = local.s3_bucket_name },
     { name = "ELSPETH_ACCEPTANCE_S3_PREFIX", value = local.s3_prefix },
+    ], local.deployment_mode == "first" ? [] : [
+    # Everything `oidc` requires, exported together. The profile registry
+    # validates the whole set at settings load, so a partial export is a task
+    # that does not start; there is no half-configured identity provider.
+    # The two secrets arrive by ARN reference in runtime_secrets below, never
+    # as literals here.
+    { name = "ELSPETH_WEB__SSO_ISSUER", value = local.oidc_issuer },
+    { name = "ELSPETH_WEB__SSO_CLIENT_ID", value = aws_cognito_user_pool_client.web[0].id },
+    # Cognito serves authorize and token from the hosted domain, which is a
+    # different origin from the pool issuer. The generic profile is the one
+    # allowed to widen beyond same-origin, and this is the exact origin it
+    # may widen to.
+    { name = "ELSPETH_WEB__SSO_ENDPOINT_ORIGINS", value = jsonencode([local.oidc_authorization_origin]) },
+    # The redirect URI is built from this, and Cognito matches it exactly
+    # against the client's callback_urls.
+    { name = "ELSPETH_WEB__PUBLIC_BASE_URL", value = "https://${aws_lb.web.dns_name}" },
+    # Stamped into exports, library rows and audit metadata. The scenario is
+    # the compartment for a disposable acceptance environment.
+    { name = "ELSPETH_WEB__COMPARTMENT_ID", value = var.scenario_id },
+    { name = "ELSPETH_WEB__QUOTA_DEFAULT_TOKENS_PER_DAY", value = tostring(var.quota_default_tokens_per_day) },
+    { name = "ELSPETH_WEB__QUOTA_DEFAULT_STORAGE_BYTES", value = tostring(var.quota_default_storage_bytes) },
     ], local.bedrock_backend ? [] : [
     # Both Composer roles target the loopback gateway sidecar. The paired
     # API keys arrive via runtime_secrets, never as environment literals.
@@ -550,6 +567,13 @@ locals {
   runtime_secrets = concat(local.application_secrets, [
     { name = "ELSPETH_WEB__SESSION_DB_URL", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:session_url::" },
     { name = "ELSPETH_WEB__LANDSCAPE_URL", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:landscape_url::" },
+    ], local.deployment_mode == "first" ? [] : [
+    # The confidential client's secret, minted by Cognito, and the key that
+    # seals the login transaction cookie. Both by ARN reference: the task
+    # reads them at start, and neither value exists in this repository or in
+    # any rendered task definition.
+    { name = "ELSPETH_WEB__SSO_CLIENT_SECRET", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:sso_client_secret::" },
+    { name = "ELSPETH_WEB__SSO_TRANSACTION_SECRET", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:sso_transaction_secret::" },
     ], local.bedrock_backend ? [] : [
     # Web receives ONLY the shared bearer (both roles pair with the loopback
     # endpoint above); the OAuth client credentials go to the gateway

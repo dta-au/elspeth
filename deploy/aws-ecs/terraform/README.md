@@ -160,15 +160,21 @@ loader rejects unknown `ELSPETH_WEB__` keys, so an image older than the
 package's settings contract fails every task at settings load (observed as
 `{"check": "storage_settings", ...}` from `provision-storage` on a cold
 install). The supported pairing is a package and image cut from the same
-commit. Concretely for 0.8.0: the image must include commit `25f3440f5`
-(`ELSPETH_WEB__LOG_JSON`), the earliest revision whose `WebSettings` defines
-every name this package ships. Any image whose revision does not contain it
-fails to boot under this package — this is ancestry, not chronology, so an
-image built later on a branch without the commit fails the same way. Check a
-candidate against the revision label described below:
+commit. Concretely for 0.8.0: the image must include commit `12db0f26d`, the
+earliest revision whose `WebSettings` defines every name this package ships.
+That revision is what added the identity settings this package now exports
+for an upgrade deployment — `ELSPETH_WEB__SSO_ISSUER`,
+`ELSPETH_WEB__SSO_CLIENT_ID`, `ELSPETH_WEB__SSO_CLIENT_SECRET`,
+`ELSPETH_WEB__SSO_ENDPOINT_ORIGINS`, `ELSPETH_WEB__SSO_TRANSACTION_SECRET`,
+`ELSPETH_WEB__COMPARTMENT_ID` and the two quota defaults — all eight in one
+commit, which is why the floor moves in one step rather than eight. Any image
+whose revision does not contain it fails to boot under this package — this is
+ancestry, not chronology, so an image built later on a branch without the
+commit fails the same way. Check a candidate against the revision label
+described below:
 
 ```bash
-git merge-base --is-ancestor 25f3440f5 <image revision label>
+git merge-base --is-ancestor 12db0f26d <image revision label>
 ```
 
 Do not edit this number on its own. It is re-derived from the tree on every

@@ -929,3 +929,37 @@ variable "gateway_model_mappings_json" {
     error_message = "under custom_gateway both composer_model and composer_advisor_model must be aliases present in gateway_model_mappings_json."
   }
 }
+
+variable "quota_default_tokens_per_day" {
+  type        = number
+  default     = 200000
+  description = <<-EOT
+    Daily LLM token allowance written into every identity's quota row at
+    activation. Required for any non-local provider, so it is exported with
+    the rest of the identity settings. The default is an acceptance-sized
+    ceiling: high enough that a scenario run never trips it, low enough that
+    a runaway loop stops inside a day rather than billing until someone
+    notices. A real deployment sets its own.
+  EOT
+
+  validation {
+    condition     = var.quota_default_tokens_per_day > 0
+    error_message = "quota_default_tokens_per_day must be positive; the settings loader rejects zero or negative."
+  }
+}
+
+variable "quota_default_storage_bytes" {
+  type        = number
+  default     = 5368709120
+  description = <<-EOT
+    Per-identity payload storage ceiling written into the same quota row.
+    5 GiB by default, an acceptance-sized figure on the same reasoning as
+    the token allowance. This is the OUTER bound; max_upload_bytes and the
+    per-session limit remain the inner ones.
+  EOT
+
+  validation {
+    condition     = var.quota_default_storage_bytes > 0
+    error_message = "quota_default_storage_bytes must be positive; the settings loader rejects zero or negative."
+  }
+}

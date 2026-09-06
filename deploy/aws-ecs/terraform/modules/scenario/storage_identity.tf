@@ -23,6 +23,15 @@ resource "random_password" "shareable_link" {
   special = false
 }
 
+# Seals the SSO transaction cookie (state, nonce, PKCE verifier) between the
+# authorization redirect and the callback. Generated here and read from
+# Secrets Manager like every other runtime secret: it never exists in the
+# repository, and rotating it only invalidates logins already in flight.
+resource "random_password" "sso_transaction" {
+  length  = 64
+  special = false
+}
+
 resource "aws_db_subnet_group" "database" {
   name       = "${local.namespace}-database"
   subnet_ids = aws_subnet.public[*].id
@@ -89,6 +98,11 @@ resource "aws_secretsmanager_secret_version" "runtime" {
     landscape_url              = "postgresql+psycopg://${local.database_runtime_role}:${random_password.database_runtime.result}@${aws_rds_cluster.database.endpoint}:5432/${local.landscape_database}?sslmode=verify-full&sslrootcert=${local.rds_ca_bundle_path}"
     secret_key                 = random_password.secret_key.result
     shareable_link_signing_key = random_password.shareable_link.result
+    sso_transaction_secret     = random_password.sso_transaction.result
+    # Cognito mints the confidential client's secret; Terraform reads it as an
+    # attribute and it reaches the task the same way as everything else here,
+    # by ARN reference. Empty outside upgrade mode, where no client exists.
+    sso_client_secret = local.deployment_mode == "upgrade" ? aws_cognito_user_pool_client.web[0].client_secret : ""
   })
 }
 
@@ -307,18 +321,29 @@ resource "aws_cognito_user_pool_domain" "web" {
 resource "aws_cognito_user_pool_client" "web" {
   count = local.deployment_mode == "upgrade" ? 1 : 0
 
-  name         = "${local.namespace}-public-client"
+  name         = "${local.namespace}-confidential-client"
   user_pool_id = aws_cognito_user_pool.web[0].id
 
-  generate_secret                      = false
+  # CONFIDENTIAL, not public. The backend redeems the authorization code as
+  # this client; the browser never holds the secret and never performs the
+  # token exchange (spec D2). Cognito mints the secret at create time and
+  # Terraform reads it as an attribute into Secrets Manager -- there is no
+  # console step, and no secret in this repository. Since the identity
+  # sprint deleted the legacy browser path, a public client would leave the
+  # deployment unable to authenticate anyone: `sso_client_secret` is one of
+  # the settings every non-local provider now requires.
+  generate_secret                      = true
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = ["openid", "profile", "email"]
   supported_identity_providers         = ["COGNITO"]
-  callback_urls                        = ["https://${aws_lb.web.dns_name}/"]
-  logout_urls                          = ["https://${aws_lb.web.dns_name}/"]
-  prevent_user_existence_errors        = "ENABLED"
-  explicit_auth_flows                  = ["ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH"]
+  # The exact URI the backend redeems against (sso_wiring.SSO_CALLBACK_PATH).
+  # Cognito matches callback_urls exactly, so the load balancer root would be
+  # refused at the callback with no way to tell from the browser why.
+  callback_urls                 = ["https://${aws_lb.web.dns_name}/api/auth/sso/callback"]
+  logout_urls                   = ["https://${aws_lb.web.dns_name}/"]
+  prevent_user_existence_errors = "ENABLED"
+  explicit_auth_flows           = ["ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH"]
 
   access_token_validity  = 1
   id_token_validity      = 1
