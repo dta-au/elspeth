@@ -450,14 +450,23 @@ class SinkEffectCoordinator:
                 # budget therefore carries one clock resolution ABOVE the
                 # remaining validity.
                 #
-                # The cap is the TTL ROUNDED UP to that same resolution, which
-                # is what the repository stamps (``_lease_deadline``). Capping
-                # at the raw TTL assumes a lease cannot outlive the TTL it was
-                # asked for, and on a quantised clock it always can: that
-                # assumption cost nine recovery resumes once already, patched
-                # then by adding a resolution on top of the wrong cap rather
-                # than correcting it. Remaining validity never exceeds the
-                # rounded TTL, so the cap binds only on a corrupt deadline.
+                # The cap is the TTL rounded up to that same resolution.
+                # Capping at the raw TTL assumes a lease cannot outlive the TTL
+                # it was asked for, and on a quantised clock it always can:
+                # that assumption cost nine recovery resumes once already,
+                # patched then by adding a resolution on top of the wrong cap
+                # rather than correcting it.
+                #
+                # The constant is the COARSEST resolution across dialects, and
+                # the executor holds no connection to ask for the live one. On
+                # SQLite it is exact: the cap is what
+                # ``sink_effect_lifecycle._aligned_lease_ttl`` stamps. On
+                # PostgreSQL the repository rounds to a microsecond, so a
+                # fractional TTL leaves the cap up to a second high -- slack in
+                # the safe direction, since remaining validity is measured on
+                # the database clock and still bounds the wait. Either way
+                # remaining validity never exceeds the cap, so the cap binds
+                # only on a corrupt deadline.
                 quantised_ttl = (
                     math.ceil(self._lease_ttl.total_seconds() / _LANDSCAPE_CLOCK_RESOLUTION_SECONDS) * _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
                 )
