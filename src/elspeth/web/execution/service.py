@@ -1143,19 +1143,20 @@ class ExecutionServiceImpl:
         completion_gate_state: CompositionState | None = None,
     ) -> ValidationResult:
         """Authoritative shared validation used by both validate and execute."""
-        result = cast(
-            ValidationResult,
-            await run_sync_in_worker(
-                partial(
-                    self._authoritative_state_preflight_sync,
-                    state,
-                    plugin_snapshot=plugin_snapshot,
-                    user_id=user_id,
-                    session_id=session_id,
-                    session_operation_context=session_operation_context,
-                )
-            ),
-        )
+
+        def _preflight() -> ValidationResult:
+            # A real call edge, not a ``partial``: the session-operation-lease
+            # gate follows ``self.<member>(...)`` and proves the exact context
+            # reaches the worker-side preflight (elspeth-01e919e13e).
+            return self._authoritative_state_preflight_sync(
+                state,
+                plugin_snapshot=plugin_snapshot,
+                user_id=user_id,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+
+        result = await run_sync_in_worker(_preflight)
         fingerprint_state = state if completion_gate_state is None else completion_gate_state
         return merge_completion_gates(result, completion_gates, fingerprint_state)
 
@@ -1573,7 +1574,7 @@ class ExecutionServiceImpl:
             plugin_snapshot=plugin_snapshot,
             user_id=user_id,
             session_id=session_id,
-            session_operation_context=session_operation_lease.context,
+            session_operation_context=session_operation_context,
             completion_gates=completion_gates,
             completion_gate_state=authored_state,
         )
