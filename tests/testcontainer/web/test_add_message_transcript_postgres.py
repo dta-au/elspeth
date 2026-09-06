@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import structlog
 from sqlalchemy import Engine, func, select
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
@@ -31,8 +31,8 @@ pytestmark = pytest.mark.testcontainer
 
 @pytest.fixture(scope="module")
 def postgres_engine() -> Iterator[Engine]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        engine = create_session_engine(postgres.get_connection_url())
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
         try:
             yield engine

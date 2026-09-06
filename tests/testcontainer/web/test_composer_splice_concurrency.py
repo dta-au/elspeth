@@ -13,7 +13,7 @@ import pytest
 import structlog
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine
-from testcontainers.postgres import PostgresContainer
+from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.web.conftest import _ensure_released_session_operation_fence, _make_session
 from tests.unit.web.sessions.test_routes import _make_app
 
@@ -256,8 +256,8 @@ async def test_concurrent_http_splices_serialize_reload_and_apply_once(tmp_path:
 
 @pytest.fixture(scope="module")
 def postgres_engine() -> Iterator[Engine]:
-    with PostgresContainer("postgres:16-alpine", driver="psycopg") as postgres:
-        engine = create_session_engine(postgres.get_connection_url())
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        engine = create_session_engine(postgres_url)
         initialize_session_schema(engine)
         try:
             yield engine

@@ -166,8 +166,10 @@ Composer authoring, trust boundaries, and committed blob cleanup.
 - **Deployment artifacts are production-shaped.** The release adds maintained
   Docker Compose/PostgreSQL and native Linux systemd bundles, retains the AWS
   ECS acceptance controller, and packages the Web Composer in a pinned,
-  non-root container image. Azure Container Apps remains deferred until the web
-  runtime can fence work across instances.
+  non-root container image. The Azure Container Apps Bicep bundle ships in
+  `deploy/azure-container-apps/` with its receipts, replica-count probes and
+  runbooks; its replica > 1 live acceptance is an operator-run step on dev
+  hardware, and the support claim waits for that receipt.
 - **Committed blob deletion is recoverable.** Durable cleanup state remains
   until both the staged unlink and parent-directory fsync succeed, so restart
   recovery does not retain unaccounted files.
@@ -196,8 +198,8 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.8.0 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 51; guided schema moves to 11, and Landscape moves from epoch
-29 to 36. Session epoch 40 makes the required coalesce timeout field an eager
+from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
+29 to 38. Session epoch 40 makes the required coalesce timeout field an eager
 startup cutover instead of allowing epoch-39 guided payloads to fail during
 replay, and session epoch 41 does the same for the projected node option
 summary the review cards render. Session epoch 42 retains the reviewed output-field

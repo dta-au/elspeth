@@ -197,6 +197,7 @@ def _store_testcontainer_run_receipt(manifest_path: Path, *, exit_code: int = 0,
         scenario_id="A",
         exit_code=exit_code,
         record=record,
+        target=testcontainer_run.resolve_testcontainer_run_target({}),
         recorded_at=datetime(2026, 7, 14, 1, 1, 45, tzinfo=UTC),
     )
     return acceptance.receipt_store(

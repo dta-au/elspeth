@@ -12,13 +12,13 @@ tests/integration/web/composer/guided/*.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 import structlog
 from fastapi import FastAPI
-from testcontainers.postgres import PostgresContainer
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -48,6 +48,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -119,15 +120,13 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         backend = request.param
     except AttributeError:
         backend = "sqlite"
-    postgres: PostgresContainer | None = None
+    postgres_target = ExitStack()
     if backend == "sqlite":
         # Use independent SQLite connections so route-race tests exercise the
         # same transaction/locking boundary as a deployed file-backed database.
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     elif backend == "postgres":
-        postgres = PostgresContainer("postgres:16-alpine")
-        postgres.start()
-        engine = create_session_engine(postgres.get_connection_url())
+        engine = create_session_engine(postgres_target.enter_context(postgres_test_target()))
     else:  # pragma: no cover - fixture contract
         raise AssertionError(f"unsupported guided integration backend: {backend}")
     initialize_session_schema(engine)
@@ -524,8 +523,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     finally:
         for fixture_engine in engines_to_dispose:
             fixture_engine.dispose()
-        if postgres is not None:
-            postgres.stop()
+        postgres_target.close()
 
 
 @pytest.fixture

@@ -22,7 +22,11 @@ import pytest
 
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.replica_probes import ProbeResult, decide_lease_takeover
-from elspeth.web._acceptance_common.testcontainer_run import TESTCONTAINER_RUN_RECEIPT_KIND, TESTCONTAINER_SELECTION
+from elspeth.web._acceptance_common.testcontainer_run import (
+    TESTCONTAINER_RUN_RECEIPT_KIND,
+    TESTCONTAINER_SELECTION,
+    resolve_testcontainer_run_target,
+)
 from elspeth.web._azure_container_apps_acceptance import evidence
 from elspeth.web._azure_container_apps_acceptance.controller import LabelWeight
 from elspeth.web._azure_container_apps_acceptance.evidence import (
@@ -433,6 +437,9 @@ def _receipt(kind: str) -> dict[str, object]:
     return cast(dict[str, object], json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))))
 
 
+_TARGET = resolve_testcontainer_run_target({})
+
+
 def _testcontainer_run(exit_code: int = 0, junit: str = "d" * 64) -> dict[str, object]:
     return {
         "schema": "elspeth.azure-container-apps-testcontainer-run.v1",
@@ -448,6 +455,11 @@ def _testcontainer_run(exit_code: int = 0, junit: str = "d" * 64) -> dict[str, o
         "skipped": 0,
         "junit_sha256": junit,
         "recorded_at": "2026-09-05T10:00:00Z",
+        # The receipt shape is shared across providers (TestcontainerRunReceipt);
+        # only the schema id is Azure's. The database fields come from the same
+        # resolver the CLI uses, here its Docker arm (elspeth-0ec6918940).
+        "database": _TARGET.database,
+        "database_identity_sha256": _TARGET.database_identity_sha256,
     }
 
 

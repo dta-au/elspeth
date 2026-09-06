@@ -974,12 +974,16 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionComposerMutationAuthority",
         line=7152,
     ),
+    # Each dialect arm is rebound through ``stmt = stmt.on_conflict_do_update``
+    # and executed once at :475; since elspeth-a85fb1555b the rebinding no
+    # longer reaches itself, so each arm is an ``upsert`` whose identity
+    # carries its arm, the rebinding and the execution.
     WriterIdentity(
         "src/elspeth/web/preferences/service.py",
         "PreferencesService.update_composer_preferences._sync",
         "user_preferences",
-        "insert",
-        "7726e34a790469ba",
+        "upsert",
+        "c060410920810694",
         1,
         "UserPreferenceAuthority",
         line=450,
@@ -988,9 +992,9 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "src/elspeth/web/preferences/service.py",
         "PreferencesService.update_composer_preferences._sync",
         "user_preferences",
-        "insert",
-        "7726e34a790469ba",
-        2,
+        "upsert",
+        "17f7d3261ce89a25",
+        1,
         "UserPreferenceAuthority",
         line=452,
     ),
@@ -1004,12 +1008,15 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "UserPreferenceAuthority",
         line=334,
     ),
+    # Two dialect arms rebound through ``stmt = stmt.on_conflict_do_nothing``
+    # and executed once at :63: each arm is an ``upsert`` bound to its
+    # execution (elspeth-a85fb1555b).
     WriterIdentity(
         "src/elspeth/web/sessions/skill_markdown_history.py",
         "RepositorySkillMarkdownHistoryAuthority.upsert_exact",
         "skill_markdown_history",
-        "insert",
-        "7c2e2edb43655500",
+        "upsert",
+        "b6800432c410bf7d",
         1,
         "SkillMarkdownHistoryAuthority",
         line=55,
@@ -1018,21 +1025,24 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "src/elspeth/web/sessions/skill_markdown_history.py",
         "RepositorySkillMarkdownHistoryAuthority.upsert_exact",
         "skill_markdown_history",
-        "insert",
-        "7c2e2edb43655500",
-        2,
+        "upsert",
+        "4a428fcdfa48f3bf",
+        1,
         "SkillMarkdownHistoryAuthority",
         line=57,
     ),
     # upsert_encrypted_secret builds one prebuilt upsert per dialect arm
     # (sqlite :170, postgresql :178, mysql :186) and executes it once at :190;
-    # each arm is its own writer identity.
+    # each arm is its own writer identity.  The sqlite and postgresql arms
+    # are ``on_conflict_do_update`` upserts; the mysql arm's
+    # ``on_duplicate_key_update`` is not an ``on_conflict_do_*`` and stays an
+    # insert (elspeth-a85fb1555b).
     WriterIdentity(
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "user_secrets",
-        "insert",
-        "96893964262bac72",
+        "upsert",
+        "3c2c7c4ba74f1683",
         1,
         "UserSecretAuthority",
         line=170,
@@ -1041,8 +1051,8 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "user_secrets",
-        "insert",
-        "8b0fd0f595fe372f",
+        "upsert",
+        "9ba92d555134ed3e",
         1,
         "UserSecretAuthority",
         line=178,
@@ -1052,7 +1062,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "user_secrets",
         "insert",
-        "3ac0a3fe10d1d8c0",
+        "bf6f84502dde47d2",
         1,
         "UserSecretAuthority",
         line=186,
@@ -4421,6 +4431,20 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             *self.definition_bindings.get(key, ()),
         ]
         candidates = [binding for binding in candidates if not self._is_in_sibling_branch(binding, use)]
+        # ``stmt = stmt.on_conflict_do_update(...)``: the right-hand side is
+        # evaluated before the target is bound, so the assignment never
+        # reaches a load inside its own value.  Its position precedes that
+        # load's, which used to make it its own reaching binding and cut a
+        # prebuilt DML off from its execution (elspeth-a85fb1555b).
+        candidates = [
+            binding
+            for binding in candidates
+            if not (
+                isinstance(binding.node, (ast.Assign, ast.AnnAssign))
+                and binding.value is not None
+                and self._is_descendant(use, binding.value)
+            )
+        ]
         use_position = self._position(use)
         nested_module_lookup = (
             include_late_module_bindings and isinstance(lexical_scope, ast.Module) and self._lexical_scope(use) is not lexical_scope
@@ -5636,8 +5660,15 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             key = (id(self._lexical_scope(use)), expression.id, id(use))
             if key in visited:
                 return False
-            reaching, complete, _ = self._potentially_reaching_bindings(use, expression.id)
-            if not complete or not reaching or any(binding.value is None for binding in reaching):
+            # The name is looked up exactly as the domain resolver looks it
+            # up: this scope, then each enclosing function, then the module
+            # (class namespaces skipped), every module-level rebinding
+            # counted.  A prebuilt ``_ROWS = select(...)`` module constant
+            # executed from a method is a read; before elspeth-a85fb1555b
+            # the lookup stopped at the method and the statement rode on its
+            # acquisition row, so the gap never showed.
+            reaching, complete, scope = self._visible_reaching_bindings(use, expression.id)
+            if scope is None or not complete or not reaching or any(binding.value is None for binding in reaching):
                 return False
             next_visited = visited | {key}
             return all(
@@ -5659,12 +5690,44 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 return False
             if isinstance(func, ast.Attribute) and func.attr in _TRANSPARENT_SQLALCHEMY_STATEMENT_METHODS:
                 return self._is_obviously_read_only_statement(func.value, use=use, visited=visited)
+            return self._private_helper_returns_only_read_only_statements(expression, visited=visited)
         if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
             return _raw_sql_is_obviously_read_only(expression.value)
         if isinstance(expression, ast.Attribute):
             texts = self._self_attribute_module_constant_texts(expression, use=use)
             return texts is not None and all(_raw_sql_is_obviously_read_only(text) for text in texts)
         return False
+
+    def _private_helper_returns_only_read_only_statements(
+        self,
+        call: ast.Call,
+        *,
+        visited: frozenset[tuple[int, str, int]],
+    ) -> bool:
+        """True when ``call`` resolves to one same-module private function or same-class method whose EVERY return is a read.
+
+        ``conn.execute(_select_rows_for(user_id))``: the statement executed is
+        whatever the helper returns, so the helper's returns are the statement.
+        Admitted only when the callee is exactly one inspectable definition
+        (``_resolvable_private_callee``), is a plain function (no yields, no
+        context manager), returns a value on every ``return`` and each of
+        those values is itself an obviously read-only statement.  Side effects
+        inside the helper are its own rows; only the returned statement is
+        judged here.  Anything wider -- a public or imported callee, a bare
+        ``return``, a generator -- is refused and the statement stays opaque.
+        """
+
+        definition = self._resolvable_private_callee(call)
+        if definition is None or self._is_contextmanager_definition(definition) or self._direct_yields(definition):
+            return False
+        key = (id(definition), "<returns>", id(call))
+        if key in visited:
+            return False
+        returns = self._direct_returns(definition)
+        if not returns or any(statement.value is None for statement in returns):
+            return False
+        next_visited = visited | {key}
+        return all(self._is_obviously_read_only_statement(statement.value, use=statement, visited=next_visited) for statement in returns)
 
     def _unrecognised_literal_statement(self, expression: ast.expr | None, *, use: ast.AST) -> bool:
         """True when every text ``expression`` can hold is readable here and none is a recognised read, lock or raw DML.
@@ -6306,9 +6369,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 # TRUNCATE, an unknown PRAGMA or a loosened LOCK inside an
                 # admitted authority's block moved the acquisition's
                 # fingerprint and nothing else, and a mechanical re-pin
-                # admitted it unread.  A statement with no readable text (a
-                # helper's return, a parameter) still rides on its acquisition
-                # row; widening that is a measured ruling, not a default.
+                # admitted it unread.
                 literal_unknown = self._unrecognised_literal_statement(statement, use=call)
                 if statement_domain == "unknown" and (
                     force_unresolved
@@ -6329,6 +6390,21 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                         and not self._raw_sql_names_sessions_table(statement, use=call)
                     ):
                         self.parameter_received.append((len(self.sites) - 1, *received))
+                elif acquisitions and id(call) not in self.classified_execution_calls:
+                    # Every statement executed inside an acquired block is its
+                    # own row (elspeth-a85fb1555b).  One with NO readable text
+                    # (a helper's return, a parameter, branch-built SQL) used
+                    # to ride on the acquisition row alone, so a re-pin of
+                    # that row admitted whatever the helper now returns
+                    # unread.  Its only evidence is the code around it, so it
+                    # is fingerprinted exactly as the acquisition is: the
+                    # statement plus its enclosing function.
+                    self._append_site(
+                        call,
+                        "<unresolved-session-write>",
+                        "unknown_opaque",
+                        fingerprint=self._connection_context_fingerprint(call),
+                    )
                 for acquisition in acquisitions:
                     self._record_connection(acquisition, escapes=False)
                 continue
@@ -7530,6 +7606,8 @@ def test_named_table_authority_cannot_authorize_a_raw_connection(tmp_path: Path)
     assert Counter((site.symbol, site.table, site.operation) for site in sites) == Counter(
         {
             ("BlobServiceImpl._fork_cleanup_transaction", "<sessions-write-connection>", "write_connection"): 1,
+            # The parameter statement is its own opaque row (elspeth-a85fb1555b).
+            ("BlobServiceImpl._fork_cleanup_transaction", "<unresolved-session-write>", "unknown_opaque"): 1,
         }
     )
 
@@ -7992,9 +8070,15 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
     ``with engine.begin()`` block moved the acquisition's fingerprint and
     nothing else, so a mechanical re-pin admitted it unread.  Every literal
     the scanner can read and no recogniser admits is an unresolved write now,
-    exactly as it is on a bare connection.  A statement with no readable
-    text (a helper's return) still rides on its acquisition row -- measured
-    at 29 live rows on 2026-09-05 and left for a ruling, not widened here.
+    exactly as it is on a bare connection.  A statement with NO readable
+    text (a helper's return, a parameter, branch-built SQL) is its own
+    ``unknown_opaque`` row too (elspeth-a85fb1555b): it used to ride on the
+    acquisition row alone, so re-pinning that row admitted whatever the
+    helper now returns, unread.  Its fingerprint is the acquisition's shape
+    (statement plus enclosing function), because the surrounding code is
+    the only evidence of what it executes.  On a bare connection the same
+    statement keeps its ``unknown_<method>`` row; a raw DML literal keeps
+    its one raw row and gains no opaque twin.
     """
     source = tmp_path / "acquired_unknowns.py"
     source.write_text(
@@ -8006,6 +8090,29 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
             class Authority:
                 def __init__(self, engine: Engine) -> None:
                     self._engine = engine
+
+                def helper_return(self):
+                    with self._engine.begin() as conn:
+                        conn.execute(self._build()).first()
+
+                def parameter(self, statement):
+                    with self._engine.begin() as conn:
+                        conn.execute(statement)
+
+                def parameter_twin(self, statement):
+                    with self._engine.begin() as conn:
+                        conn.execute(statement)
+
+                def branch_built(self, dialect):
+                    if dialect == "sqlite":
+                        statement = self._sqlite()
+                    else:
+                        statement = self._postgresql()
+                    with self._engine.begin() as conn:
+                        conn.execute(statement).one()
+
+                def bare_parameter(self, conn, statement):
+                    conn.execute(statement)
 
                 def truncate(self):
                     with self._engine.begin() as conn:
@@ -8042,6 +8149,11 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
     sites = scan_production_writers([source], anchor=tmp_path)
     assert Counter((site.symbol, site.table, site.operation) for site in sites if site.operation != "write_connection") == Counter(
         {
+            ("Authority.helper_return", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("Authority.parameter", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("Authority.parameter_twin", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("Authority.branch_built", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("Authority.bare_parameter", "<unresolved-session-write>", "unknown_execute"): 1,
             ("Authority.truncate", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
             ("Authority.unknown_pragma", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
             ("Authority.session_setting", "<unresolved-session-write>", "unknown_execute"): 1,
@@ -8050,8 +8162,22 @@ def test_unknown_statements_on_an_acquired_connection_are_reported_not_swallowed
             ("Authority.bound_raw_write_is_its_own_row", "identity_roles", "raw_delete_from"): 1,
         }
     )
+    by_symbol = {(site.symbol, site.operation): site for site in sites}
+    # The opaque row is fingerprinted as its acquisition is, never as the bare
+    # statement: the textually identical ``conn.execute(statement)`` of
+    # ``parameter`` and ``parameter_twin`` are different rows, and neither
+    # is the statement's own fingerprint.
+    parameter_row = by_symbol[("Authority.parameter", "unknown_opaque")]
+    twin_row = by_symbol[("Authority.parameter_twin", "unknown_opaque")]
+    assert parameter_row.fingerprint != twin_row.fingerprint
+    bare_statement = ast.parse("conn.execute(statement)").body[0]
+    assert _statement_fingerprint(bare_statement) not in {parameter_row.fingerprint, twin_row.fingerprint}
     assert Counter(site.symbol for site in sites if site.operation == "write_connection") == Counter(
         {
+            "Authority.helper_return": 1,
+            "Authority.parameter": 1,
+            "Authority.parameter_twin": 1,
+            "Authority.branch_built": 1,
             "Authority.truncate": 1,
             "Authority.unknown_pragma": 1,
             "Authority.session_setting": 1,
@@ -8217,6 +8343,173 @@ def test_self_attribute_bound_once_from_a_module_dict_of_literals_is_classified_
     )
     assert Counter(site.symbol for site in sites if site.operation == "write_connection") == Counter(
         {"Authority.clock_acquired": 1, "Authority.mixed_acquired": 1}
+    )
+
+
+def test_prebuilt_reads_resolve_through_module_constants_and_private_helpers(tmp_path: Path) -> None:
+    """The two prebuilt-read shapes the opaque row exposed (elspeth-a85fb1555b), and every loosening.
+
+    A module constant ``_ROWS = select(...)`` executed from a method, and a
+    same-module private helper whose every ``return`` is a select, are reads.
+    A constant rebound anywhere at module level to something unreadable, a
+    helper with a bare ``return``, a generator, a public or imported helper,
+    and a helper one of whose returns is a parameter, all stay opaque.
+    """
+    source = tmp_path / "prebuilt_reads.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy import bindparam, select
+            from sqlalchemy.engine import Engine
+            from elsewhere import imported_helper
+            from elspeth.web.sessions.models import sessions_table
+
+            _ROWS = select(sessions_table).where(sessions_table.c.session_id == bindparam("session_id"))
+            _ROWS_FOR_UPDATE = _ROWS.with_for_update()
+            _REBOUND = select(sessions_table)
+            _REBOUND = imported_helper()
+
+            def _rows_for(session_id):
+                return select(sessions_table).where(sessions_table.c.session_id == session_id)
+
+            def _rows_or_dynamic(session_id, dynamic):
+                if session_id:
+                    return select(sessions_table)
+                return dynamic
+
+            def _bare_return(session_id):
+                if session_id:
+                    return select(sessions_table)
+                return
+
+            def _generator(session_id):
+                yield select(sessions_table)
+
+            def public_rows(session_id):
+                return select(sessions_table)
+
+            class Authority:
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def _method_rows(self, session_id):
+                    return select(sessions_table).where(sessions_table.c.session_id == session_id)
+
+                def constant(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(_ROWS, {"session_id": session_id}).all()
+
+                def constant_for_update(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(_ROWS_FOR_UPDATE, {"session_id": session_id}).all()
+
+                def rebound_constant(self):
+                    with self._engine.begin() as conn:
+                        conn.execute(_REBOUND).all()
+
+                def private_helper(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(_rows_for(session_id)).first()
+
+                def method_helper(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(self._method_rows(session_id)).first()
+
+                def helper_with_dynamic_arm(self, session_id, dynamic):
+                    with self._engine.begin() as conn:
+                        conn.execute(_rows_or_dynamic(session_id, dynamic)).first()
+
+                def helper_with_bare_return(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(_bare_return(session_id)).first()
+
+                def generator_helper(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(_generator(session_id)).first()
+
+                def public_helper(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(public_rows(session_id)).first()
+
+                def imported(self, session_id):
+                    with self._engine.begin() as conn:
+                        conn.execute(imported_helper(session_id)).first()
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.operation) for site in sites if site.operation != "write_connection") == Counter(
+        {
+            ("Authority.rebound_constant", "unknown_opaque"): 1,
+            ("Authority.helper_with_dynamic_arm", "unknown_opaque"): 1,
+            ("Authority.helper_with_bare_return", "unknown_opaque"): 1,
+            ("Authority.generator_helper", "unknown_opaque"): 1,
+            ("Authority.public_helper", "unknown_opaque"): 1,
+            ("Authority.imported", "unknown_opaque"): 1,
+        }
+    )
+    assert Counter(site.symbol for site in sites if site.operation == "write_connection") == Counter(
+        {
+            "Authority.constant": 1,
+            "Authority.constant_for_update": 1,
+            "Authority.rebound_constant": 1,
+            "Authority.private_helper": 1,
+            "Authority.method_helper": 1,
+            "Authority.helper_with_dynamic_arm": 1,
+            "Authority.helper_with_bare_return": 1,
+            "Authority.generator_helper": 1,
+            "Authority.public_helper": 1,
+            "Authority.imported": 1,
+        }
+    )
+
+
+def test_dml_rebound_through_its_own_transparent_chain_links_to_its_execution(tmp_path: Path) -> None:
+    """``stmt = stmt.on_conflict_do_update(...)`` is the same upsert, and ``conn.execute(stmt)`` is its execution.
+
+    The rebinding's right-hand side is evaluated before its target is bound,
+    so it never reaches itself; the load inside it resolves to the dialect
+    arms above and the execution is the arms' execution -- one row per arm,
+    no opaque twin (elspeth-a85fb1555b).  A rebinding to something that does
+    not reach the arms breaks the chain honestly: the execution is opaque.
+    """
+    source = tmp_path / "rebound_upsert.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from sqlalchemy.engine import Engine
+            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            from elspeth.web.sessions.models import sessions_table
+
+            class Authority:
+                def __init__(self, engine: Engine) -> None:
+                    self._engine = engine
+
+                def upsert(self, values):
+                    if self._engine.dialect.name == "sqlite":
+                        stmt = sqlite_insert(sessions_table).values(**values)
+                    else:
+                        stmt = postgresql_insert(sessions_table).values(**values)
+                    stmt = stmt.on_conflict_do_update(index_elements=["session_id"], set_=values)
+                    with self._engine.begin() as conn:
+                        conn.execute(stmt.returning(sessions_table.c.session_id)).one()
+
+                def severed(self, values, dynamic):
+                    stmt = sqlite_insert(sessions_table).values(**values)
+                    stmt = dynamic
+                    with self._engine.begin() as conn:
+                        conn.execute(stmt)
+            """
+        )
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert Counter((site.symbol, site.table, site.operation) for site in sites if site.operation != "write_connection") == Counter(
+        {
+            ("Authority.upsert", "sessions", "upsert"): 2,
+            ("Authority.severed", "sessions", "insert"): 1,
+            ("Authority.severed", "<unresolved-session-write>", "unknown_opaque"): 1,
+        }
     )
 
 
@@ -8494,9 +8787,14 @@ def test_module_rebinding_after_nested_use_invalidates_sqlalchemy_provenance(tmp
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.line) for site in sites] == [
-        ("module_alias_reader", 5),
-        ("direct_alias_reader", 9),
+    # With ``sa`` / ``text`` rebound after the readers, ``text("SELECT 1")``
+    # is no longer provably a read: each statement is an opaque row of its
+    # own beside its acquisition (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.operation, site.line) for site in sites) == [
+        ("direct_alias_reader", "unknown_opaque", 10),
+        ("direct_alias_reader", "write_connection", 9),
+        ("module_alias_reader", "unknown_opaque", 6),
+        ("module_alias_reader", "write_connection", 5),
     ]
 
 
@@ -8537,10 +8835,14 @@ def test_import_provenance_is_invalidated_by_module_and_function_shadowing(tmp_p
     )
 
     sites = sorted(scan_production_writers([source], anchor=tmp_path), key=lambda site: site.line)
+    # A shadowed ``sa.select`` is not a proven read: the statement is an
+    # opaque row beside its acquisition (elspeth-a85fb1555b).
     assert [(site.symbol, site.table, site.line) for site in sites] == [
         ("module_select", "<sessions-write-connection>", 12),
+        ("module_select", "<unresolved-session-write>", 13),
         ("module_sqlite", "<sessions-write-connection>", 16),
         ("function_select", "<sessions-write-connection>", 19),
+        ("function_select", "<unresolved-session-write>", 20),
         ("function_sqlite", "<sessions-write-connection>", 23),
         ("shadowed_dml", "<unresolved-session-write>", 26),
         ("shadowed_dml", "<unresolved-session-write>", 27),
@@ -9079,9 +9381,14 @@ def test_sibling_branch_bindings_do_not_reach_each_other_but_post_branch_binding
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert sorted((site.symbol, site.line) for site in sites) == [
-        ("post_branch_use", 12),
-        ("sibling_use", 4),
+    # ``dynamic`` reaches both executions (the select binding sits in a
+    # sibling branch, or is only one of the reaching bindings), so each is an
+    # opaque row of its own (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.operation, site.line) for site in sites) == [
+        ("post_branch_use", "unknown_opaque", 16),
+        ("post_branch_use", "write_connection", 12),
+        ("sibling_use", "unknown_opaque", 9),
+        ("sibling_use", "write_connection", 4),
     ]
 
 
@@ -9139,8 +9446,13 @@ def test_method_bare_name_lookup_skips_class_namespace(tmp_path: Path) -> None:
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.line) for site in sites] == [
-        ("Reader.read", 7),
+    # The opaque row IS the proof: with the class namespace skipped, ``sa``
+    # is the module's ``provider`` and ``sa.text("SELECT 1")`` is not a
+    # read.  Before elspeth-a85fb1555b the swallowed statement made this
+    # assertion pass whether or not the namespace was skipped.
+    assert sorted((site.symbol, site.operation, site.line) for site in sites) == [
+        ("Reader.read", "unknown_opaque", 8),
+        ("Reader.read", "write_connection", 7),
     ]
 
 
@@ -9196,10 +9508,13 @@ def test_connection_acquisition_resolves_through_enclosing_function_closure(tmp_
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
+    # ``writer.inner`` executes ``dynamic`` on the closure's acquisition:
+    # its own opaque row, attributed to the inner function (elspeth-a85fb1555b).
     assert sorted((site.symbol, site.line) for site in sites) == [
         ("locally_shadowed", 10),
         ("locally_shadowed.inner", 14),
         ("writer", 2),
+        ("writer.inner", 5),
     ]
 
 
@@ -9228,8 +9543,11 @@ def test_connection_identity_drifts_when_sibling_write_capable_use_is_added(tmp_
             prefix + "def connection(engine, dynamic):\n" + f"    {acquisition}\n" + "    conn.execute(dynamic)\n" + "    return conn\n"
         )
         live = scan_production_writers([source], anchor=tmp_path)
-        assert [(site.table, site.operation) for site in live] == [
+        # The added ``conn.execute(dynamic)`` is an opaque row of its own and
+        # poisons the connection's domain (elspeth-a85fb1555b).
+        assert sorted((site.table, site.operation) for site in live) == [
             ("<sessions-write-connection>", "write_connection"),
+            ("<unresolved-session-write>", "unknown_opaque"),
         ]
         assert inventory_drift(live, reviewed) == (live, reviewed)
 
@@ -9319,8 +9637,11 @@ def test_nested_method_bare_name_lookup_skips_all_class_namespaces(tmp_path: Pat
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.table, site.line) for site in sites] == [
+    # As in the single-class case: the opaque row proves every class
+    # namespace was skipped (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.table, site.line) for site in sites) == [
         ("Outer.Inner.read", "<sessions-write-connection>", 8),
+        ("Outer.Inner.read", "<unresolved-session-write>", 9),
     ]
 
 
@@ -9351,9 +9672,13 @@ def test_connection_callable_alias_resolves_through_enclosing_function_scope(tmp
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.line) for site in sites] == [
-        ("shadowed.inner", 15),
-        ("writer.inner", 5),
+    # ``writer.inner`` acquires through the closure alias and executes
+    # ``dynamic`` on it: an opaque row beside the acquisition; ``shadowed.inner``
+    # executes on an unknown receiver and keeps its ``unknown_execute`` row.
+    assert sorted((site.symbol, site.operation, site.line) for site in sites) == [
+        ("shadowed.inner", "unknown_execute", 15),
+        ("writer.inner", "unknown_opaque", 6),
+        ("writer.inner", "write_connection", 5),
     ]
 
 
@@ -9493,6 +9818,11 @@ def test_parameter_fed_contextmanager_wrapper_acquisitions_are_attributed_to_cal
             ("landscape_caller", "<non-session-write-connection>", "write_connection", False): 1,
             ("sessions_caller", "<sessions-write-connection>", "write_connection", False): 1,
             ("unknown_caller", "<sessions-write-connection>", "write_connection", False): 1,
+            # ``dynamic`` on a Sessions or unknown engine is an opaque row of
+            # the caller's own (elspeth-a85fb1555b); the Landscape caller's
+            # update is classified by its connection's proven domain.
+            ("sessions_caller", "<unresolved-session-write>", "unknown_opaque", False): 1,
+            ("unknown_caller", "<unresolved-session-write>", "unknown_opaque", False): 1,
         }
     )
 
@@ -9530,8 +9860,11 @@ def test_self_fed_contextmanager_wrapper_remains_the_reported_boundary(tmp_path:
         )
     )
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.table, site.operation, site.connection_escape) for site in sites] == [
+    # The acquisition stays the wrapper's; the opaque statement is the
+    # caller's own row (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.table, site.operation, site.connection_escape) for site in sites) == [
         ("Store._begin", "<sessions-write-connection>", "write_connection", False),
+        ("Store.write", "<unresolved-session-write>", "unknown_opaque", False),
     ]
 
 
@@ -10621,9 +10954,15 @@ def test_production_scanner_proves_database_domains_from_semantic_provenance(tmp
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.table, site.operation) for site in sites if site.operation != "write_connection"] == [
-        ("sessions_writer", "sessions", "update"),
+    # Every ``statement`` executed on a connection whose domain is not proven
+    # non-Sessions is an opaque row of its own (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.table, site.operation) for site in sites if site.operation != "write_connection") == [
+        ("LandscapeDatabaseReader.dynamic_read", "<unresolved-session-write>", "unknown_opaque"),
+        ("LandscapeEngineReader.dynamic_read", "<unresolved-session-write>", "unknown_opaque"),
+        ("PluginTarget.dynamic_write", "<unresolved-session-write>", "unknown_opaque"),
         ("landscape_table_writer", "<unresolved-session-write>", "unknown_execute"),
+        ("sessions_writer", "sessions", "update"),
+        ("unknown_writer", "<unresolved-session-write>", "unknown_opaque"),
     ]
     connections = sorted(
         ((site.symbol, site.table) for site in sites if site.operation == "write_connection"),
@@ -11028,6 +11367,12 @@ def test_statement_domains_follow_exact_reaching_assignments_and_poison_ambiguit
             ("unknown_assignment", "<sessions-write-connection>", "write_connection"): 1,
             ("late_module_rebind", "<sessions-write-connection>", "write_connection"): 1,
             ("enclosing_late_rebind.inner", "<sessions-write-connection>", "write_connection"): 1,
+            # The four poisoned connections each carry the opaque statement
+            # that poisoned them as a row of its own (elspeth-a85fb1555b).
+            ("conditional_mixed_assignment", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("unknown_assignment", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("late_module_rebind", "<unresolved-session-write>", "unknown_opaque"): 1,
+            ("enclosing_late_rebind.inner", "<unresolved-session-write>", "unknown_opaque"): 1,
         }
     )
 
@@ -11473,9 +11818,13 @@ def test_bound_table_method_alias_ambiguity_fails_closed_at_connection(tmp_path:
     )
 
     sites = scan_production_writers([source], anchor=tmp_path)
-    assert [(site.symbol, site.table, site.operation, site.line) for site in sites] == [
+    # The ambiguous or shadowed statement is an opaque row of its own beside
+    # the acquisition it fails closed at (elspeth-a85fb1555b).
+    assert sorted((site.symbol, site.table, site.operation, site.line) for site in sites) == [
         ("ambiguous", "<sessions-write-connection>", "write_connection", 7),
+        ("ambiguous", "<unresolved-session-write>", "unknown_opaque", 9),
         ("shadowed", "<sessions-write-connection>", "write_connection", 14),
+        ("shadowed", "<unresolved-session-write>", "unknown_opaque", 15),
     ]
 
 
