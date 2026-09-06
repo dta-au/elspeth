@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import signal
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -23,6 +22,7 @@ from tests.e2e.recovery.harness import (
     _run_to_interrupted_checkpoint,
     spawn_database_process_at_seam,
 )
+from tests.fixtures.landscape import expire_lease
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
 
@@ -40,7 +40,6 @@ def _heartbeat_crashed_lease(
         work_item_id=work_item_id,
         lease_owner=worker_id,
         lease_seconds=2 * _DEFAULT_LEASE_SECONDS,
-        now=datetime.fromisoformat(now_iso),
         membership_fenced=True,
     )
 
@@ -98,7 +97,11 @@ def test_spawned_child_is_killed_at_named_seam_then_fresh_objects_resume(
     assert exit_status.exitcode == -signal.SIGKILL
     assert exit_status.was_killed is True
 
+    # The killed child renewed the lease on the database clock; age it into
+    # that clock's past (ADR-047) so the resume's sweep can reap it — the
+    # process MockClock cannot expire a database-time lease.
     clock.advance(2 * _DEFAULT_LEASE_SECONDS + 60)
+    expire_lease(crashed.db.engine, str(work_item_id))
     result, resume_sink, resume_source = _resume(crashed)
 
     assert result.status == RunStatus.COMPLETED

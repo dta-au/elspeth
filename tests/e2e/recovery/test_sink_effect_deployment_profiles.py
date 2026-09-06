@@ -134,7 +134,6 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
         run_id: str,
         lease_owner: str,
         lease_seconds: int,
-        now: datetime,
     ) -> Any:
         with db.engine.connect() as conn:
             role = conn.execute(
@@ -176,7 +175,6 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
             run_id=run_id,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
-            now=now,
         )
 
     TokenSchedulerRepository.claim_ready = wait_for_follower_handoff  # type: ignore[method-assign]

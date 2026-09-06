@@ -56,6 +56,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import (
     BatchMembershipSpec,
     BufferedOutcomeSpec,
@@ -144,13 +145,11 @@ def _seed_journal_row(crashed: _CrashedRun, *, ingest_sequence: int) -> tuple[st
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-        available_at=crashed.clock.now_utc(),
     )
     claimed = crashed.repo.claim_ready(
         run_id=crashed.run_id,
         lease_owner=WORKER_OLD,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
-        now=crashed.clock.now_utc(),
     )
     assert claimed is not None and claimed.token_id == token.token_id
     return token.token_id, row.row_id, claimed.work_item_id
@@ -177,7 +176,6 @@ def _parked_pending_sink(crashed: _CrashedRun, *, ingest_sequence: int, claim_ba
             run_id=crashed.run_id,
             lease_owner=WORKER_OLD,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=crashed.clock.now_utc(),
         )
         assert reclaimed is not None and reclaimed.token_id == token_id
     return token_id
@@ -194,7 +192,7 @@ def _seed_active_follower(crashed: _CrashedRun, *, worker_id: str = "worker-foll
                 role="follower",
                 status="active",
                 registered_at=now,
-                heartbeat_expires_at=now + timedelta(hours=1),
+                heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1),
                 entry_point="join",
             )
         )
@@ -628,7 +626,6 @@ class TestSuspendedWinnerFences:
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.ingest_row_with_initial_claim(
                 coordination_token=token_old,
-                now=crashed.clock.now_utc(),
                 insert_row_and_token=_insert_for("row-stale", "token-stale"),
                 token_id="token-stale",
                 row_id="row-stale",
@@ -653,7 +650,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader ingests at the SAME slot.
         _row, _token, work_item = crashed.repo.ingest_row_with_initial_claim(
             coordination_token=current,
-            now=crashed.clock.now_utc(),
             insert_row_and_token=_insert_for("row-current", "token-current"),
             token_id="token-current",
             row_id="row-current",
@@ -693,7 +689,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.recover_expired_leases(
-                now=clock.now_utc(),
                 coordination_token=token_old,
             )
 
@@ -707,7 +702,6 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader's sweep recovers it.
         assert (
             crashed.repo.recover_expired_leases(
-                now=clock.now_utc(),
                 coordination_token=current,
             )
             == 1
@@ -825,20 +819,20 @@ class TestSuspendedWinnerFences:
         no bulk follower eviction in the takeover transaction)."""
         crashed, token_old = _takeover_image(tmp_path)
         follower = _seed_active_follower(crashed)
-        clock = crashed.clock
 
-        # The fresh-heartbeat image: worker-old's REGISTRY clock far in the
-        # future; only the SEAT clock expires.
+        # The fresh-heartbeat image: worker-old's REGISTRY deadline far in the
+        # DATABASE clock's future; only the SEAT deadline is expired (ADR-047).
         with crashed.db.engine.begin() as conn:
+            database_now = read_landscape_transaction_time(conn)
             conn.execute(
                 update(run_workers_table)
                 .where(run_workers_table.c.worker_id == WORKER_OLD)
-                .values(heartbeat_expires_at=clock.now_utc() + timedelta(days=365))
+                .values(heartbeat_expires_at=database_now + timedelta(days=365))
             )
             conn.execute(
                 update(run_coordination_table)
                 .where(run_coordination_table.c.run_id == crashed.run_id)
-                .values(leader_heartbeat_expires_at=clock.now_utc() - timedelta(seconds=1))
+                .values(leader_heartbeat_expires_at=database_now - timedelta(seconds=1))
             )
 
         token_new = _coord(crashed).acquire_run_leadership(
@@ -939,7 +933,6 @@ class TestSuspendedWinnerFences:
                 run_id=crashed.run_id,
                 lease_owner=evicted_id,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
-                now=clock.now_utc(),
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == evicted_id
@@ -955,7 +948,6 @@ class TestSuspendedWinnerFences:
             run_id=crashed.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
         assert claimed.lease_owner == USURPER
@@ -978,7 +970,6 @@ class TestSuspendedWinnerFences:
         # Now run a real takeover CAS: evicts WORKER_OLD in run_workers. The
         # CAS judges the seat against the Landscape database clock (ADR-047),
         # so the seat is lapsed through the database, not the MockClock.
-        clock2 = crashed2.clock
         expire_leader_seat(crashed2.db, crashed2.run_id)
         _coord(crashed2).acquire_run_leadership(
             run_id=crashed2.run_id,
@@ -998,7 +989,6 @@ class TestSuspendedWinnerFences:
                 run_id=crashed2.run_id,
                 lease_owner=WORKER_OLD,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
-                now=clock2.now_utc(),
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == WORKER_OLD
@@ -1013,7 +1003,6 @@ class TestSuspendedWinnerFences:
             run_id=crashed2.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock2.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
         crashed.db.close()
@@ -1065,7 +1054,6 @@ class TestSuspendedWinnerFences:
                 step_index=crashed.journal_step_index,
                 ingest_sequence=seq,
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-                available_at=clock.now_utc(),
                 worker_id=worker_id,
             )
 

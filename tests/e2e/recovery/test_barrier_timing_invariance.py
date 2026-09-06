@@ -42,6 +42,7 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.schema import run_coordination_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.coalesce_executor import CoalesceExecutor
@@ -82,7 +83,9 @@ def _usurp_seat(db: LandscapeDB, run_id: str, clock: MockClock) -> None:
             .values(
                 leader_worker_id=USURPER,
                 leader_epoch=run_coordination_table.c.leader_epoch + 1,
-                leader_heartbeat_expires_at=now + timedelta(seconds=300),
+                # Live on the Landscape database clock (ADR-047), which is what
+                # the seat's liveness is judged against.
+                leader_heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
                 updated_at=now,
             )
         )

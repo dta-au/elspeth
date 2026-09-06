@@ -33,6 +33,7 @@ from elspeth.core.config import QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
@@ -59,6 +60,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_ready_row,
 )
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
+from tests.fixtures.landscape import expire_lease
 from tests.fixtures.plugins import CollectSink
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
@@ -384,22 +386,25 @@ def _run_stall_scenario(tmp_path: Path, *, late_outcome: Literal["success", "fai
         lease_expires_at = claimed["lease_expires_at"].replace(tzinfo=UTC)
         recovery_now = lease_expires_at + timedelta(seconds=_STALL_BUDGET_SECONDS + 1)
         clock_path.write_text(recovery_now.isoformat(), encoding="utf-8")
-        far_future = recovery_now + timedelta(hours=1)
+        # The sweep decides on the Landscape database clock (ADR-047): the
+        # old worker's lease is aged past the hard stall budget on that clock
+        # and every registry/seat heartbeat is kept live on it.
+        expire_lease(crashed.db.engine, str(claimed["work_item_id"]), seconds_ago=_STALL_BUDGET_SECONDS + 1)
         with crashed.db.engine.begin() as conn:
+            far_future = read_landscape_transaction_time(conn) + timedelta(hours=1)
             conn.execute(
                 update(run_workers_table)
                 .where(run_workers_table.c.run_id == crashed.run_id)
                 .where(run_workers_table.c.worker_id.in_([leader_id, old_worker_id, replacement_worker_id]))
-                .values(heartbeat_expires_at=far_future.replace(tzinfo=None))
+                .values(heartbeat_expires_at=far_future)
             )
             conn.execute(
                 update(run_coordination_table)
                 .where(run_coordination_table.c.run_id == crashed.run_id)
-                .values(leader_heartbeat_expires_at=far_future.replace(tzinfo=None))
+                .values(leader_heartbeat_expires_at=far_future)
             )
 
         recovered = crashed.repo.recover_expired_leases(
-            now=recovery_now,
             coordination_token=leader_token,
             stall_budget_seconds=_STALL_BUDGET_SECONDS,
         )

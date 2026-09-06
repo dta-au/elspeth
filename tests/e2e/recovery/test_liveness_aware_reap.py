@@ -45,6 +45,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
 )
 from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
@@ -61,6 +62,7 @@ from tests.e2e.recovery.harness import (
     _run_to_interrupted_checkpoint,
     _work_items_by_token,
 )
+from tests.fixtures.landscape import expire_lease, landscape_database_now
 
 # Grace window used in every test — matches production default.
 _GRACE = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
@@ -156,7 +158,6 @@ class TestLivenessAwareReap:
 
         # Mint the leader token for the sweeper (the takeover epoch = 2).
         clock.advance(_DEFAULT_LEASE_SECONDS + 60)
-        sweep_at = clock.now_utc()
 
         # Acquire leadership so we have a valid coordination token.
         coord_repo = RunCoordinationRepository(crashed.db.engine)
@@ -175,7 +176,6 @@ class TestLivenessAwareReap:
         # The crashed worker's heartbeat is far in the past (stale by many
         # grace windows) — owner_registry_dead arm (c).
         reaped = crashed.repo.recover_expired_leases(
-            now=sweep_at,
             coordination_token=leader_token,
             grace_seconds=_GRACE,
             stall_budget_seconds=_STALL_BUDGET,
@@ -212,7 +212,6 @@ class TestLivenessAwareReap:
 
         # Advance clock well past lease + grace.
         clock.advance(_DEFAULT_LEASE_SECONDS + _GRACE + 60)
-        sweep_at = clock.now_utc()
 
         coord_repo = RunCoordinationRepository(crashed.db.engine)
         leader_token = coord_repo.acquire_run_leadership(
@@ -236,7 +235,6 @@ class TestLivenessAwareReap:
         assert status == "evicted"
 
         reaped = crashed.repo.recover_expired_leases(
-            now=sweep_at,
             coordination_token=leader_token,
             grace_seconds=_GRACE,
             stall_budget_seconds=_STALL_BUDGET,
@@ -276,14 +274,14 @@ class TestLivenessAwareReap:
         # FRESH: update the worker's heartbeat_expires_at to well into the
         # future before the sweep runs.
         clock.advance(_DEFAULT_LEASE_SECONDS + 30)
-        sweep_at = clock.now_utc()
 
-        # Give the slow worker a FRESH heartbeat (far future).
+        # Give the slow worker a FRESH heartbeat (an hour into the DATABASE
+        # clock's future — liveness is judged against that clock, ADR-047).
         with crashed.db.engine.begin() as conn:
             conn.execute(
                 update(run_workers_table)
                 .where(run_workers_table.c.worker_id == slow_worker)
-                .values(heartbeat_expires_at=(sweep_at + timedelta(hours=1)).replace(tzinfo=None))
+                .values(heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1))
             )
 
         # Mint the leader token for the sweeper.
@@ -300,7 +298,6 @@ class TestLivenessAwareReap:
 
         # The sweep must NOT reap the live-owner's expired item.
         reaped = crashed.repo.recover_expired_leases(
-            now=sweep_at,
             coordination_token=leader_token,
             grace_seconds=_GRACE,
             stall_budget_seconds=_STALL_BUDGET,  # budget not exceeded: only 30s past expiry
@@ -319,29 +316,21 @@ class TestLivenessAwareReap:
         # No recovery events.
         assert _recovery_events(crashed.db, crashed.run_id) == [], "no reap = no RECOVER_EXPIRED_LEASE event"
 
-        # Revival: the slow worker re-claims using heartbeat_lease (simulated
-        # here via claim_ready after marking READY, which models the revive path).
-        # The item lease_expires_at is in the past, so we rotate it back to READY
-        # first (production heartbeat_lease would extend it in-place, but the
-        # READY claim is sufficient to demonstrate the survivor path).
-        with crashed.db.engine.begin() as conn:
-            conn.execute(
-                update(token_work_items_table)
-                .where(token_work_items_table.c.run_id == crashed.run_id)
-                .where(token_work_items_table.c.token_id == crashed_token)
-                .values(
-                    status=TokenWorkStatus.READY.value,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                )
-            )
-        revived = crashed.repo.claim_ready(
+        # Revival: the surviving slow worker's next heartbeat extends the
+        # still-LEASED item in place (the production revive path) — the
+        # deadline moves from the database clock's past to its future.
+        revived_until = crashed.repo.heartbeat_lease(
             run_id=crashed.run_id,
+            work_item_id=str(items_after[crashed_token]["work_item_id"]),
             lease_owner=slow_worker,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=sweep_at,
+            membership_fenced=True,
         )
-        assert revived is not None and revived.token_id == crashed_token, "the surviving slow worker can re-claim the protected item"
+        assert revived_until > landscape_database_now(crashed.db.engine) - timedelta(seconds=1)
+        revived = _work_items_by_token(crashed.db, crashed.run_id)[crashed_token]
+        assert revived["status"] == TokenWorkStatus.LEASED.value, "the surviving slow worker keeps the protected item"
+        assert revived["lease_owner"] == slow_worker
+        assert _recovery_events(crashed.db, crashed.run_id) == []
         crashed.db.close()
 
     def test_stall_budget_reaps_registered_but_wedged_owner_emits_worker_stalled(self, tmp_path: Path) -> None:
@@ -368,26 +357,23 @@ class TestLivenessAwareReap:
 
         # Advance clock past (lease + stall_budget): budget exceeded.
         clock.advance(_DEFAULT_LEASE_SECONDS + int(short_stall_budget) + 30)
-        sweep_at = clock.now_utc()
 
-        # Give the wedged worker a FRESH heartbeat (heartbeat alive, drain stuck).
+        # Give the wedged worker a FRESH heartbeat (heartbeat alive, drain
+        # stuck) an hour into the DATABASE clock's future (ADR-047).
         with crashed.db.engine.begin() as conn:
             conn.execute(
                 update(run_workers_table)
                 .where(run_workers_table.c.worker_id == wedged_worker)
-                .values(heartbeat_expires_at=(sweep_at + timedelta(hours=1)).replace(tzinfo=None))
+                .values(heartbeat_expires_at=read_landscape_transaction_time(conn) + timedelta(hours=1))
             )
 
-        # Force the item's lease_expires_at to be well in the past so
-        # (sweep_at - lease_expires_at) > stall_budget.
-        early_expiry = sweep_at - timedelta(seconds=short_stall_budget + 10)
-        with crashed.db.engine.begin() as conn:
-            conn.execute(
-                update(token_work_items_table)
-                .where(token_work_items_table.c.run_id == crashed.run_id)
-                .where(token_work_items_table.c.token_id == crashed_token)
-                .values(lease_expires_at=early_expiry.replace(tzinfo=None))
-            )
+        # Age the item's lease past the stall budget on the database clock so
+        # (database_now - lease_expires_at) > stall_budget.
+        expire_lease(
+            crashed.db.engine,
+            _work_items_by_token(crashed.db, crashed.run_id)[crashed_token]["work_item_id"],
+            seconds_ago=short_stall_budget + 10,
+        )
 
         # Mint leader token.
         coord_repo = RunCoordinationRepository(crashed.db.engine)
@@ -398,7 +384,6 @@ class TestLivenessAwareReap:
         )
 
         reaped = crashed.repo.recover_expired_leases(
-            now=sweep_at,
             coordination_token=leader_token,
             grace_seconds=_GRACE,
             stall_budget_seconds=short_stall_budget,

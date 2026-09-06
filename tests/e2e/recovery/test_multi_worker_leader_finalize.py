@@ -53,6 +53,7 @@ from elspeth.core.config import QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -189,11 +190,10 @@ def _seed_peer_leased_row(
     negative=already expired). No run_workers row is created → the leader's
     liveness-aware reaper treats the owner as dead (owner_registry_dead=TRUE).
     """
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
 
     factory = RecorderFactory(db, payload_store=payload_store)
     repo = TokenSchedulerRepository(db.engine)
-    now = datetime.now(UTC)
     data = {"id": 1000 + ingest_sequence, "value": ingest_sequence}
     row = factory.data_flow.create_row(
         run_id=run_id,
@@ -212,7 +212,6 @@ def _seed_peer_leased_row(
         step_index=0,
         ingest_sequence=1000 + ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-        available_at=now,
     )
     with db.engine.begin() as conn:
         conn.execute(
@@ -221,7 +220,8 @@ def _seed_peer_leased_row(
             .values(
                 status=TokenWorkStatus.LEASED.value,
                 lease_owner=PEER_OWNER,
-                lease_expires_at=now + timedelta(seconds=lease_expires_offset),
+                # Relative to the Landscape database clock (ADR-047).
+                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=lease_expires_offset),
             )
         )
     return token.token_id
@@ -285,14 +285,17 @@ def _seed_follower_pending_sink_row(
         step_index=1,
         ingest_sequence=row_ingest_sequence,
         row_payload_json=payload,
-        available_at=now,
     )
     # Flip LEASED under the peer so mark_pending_sink's owner CAS passes.
     with db.engine.begin() as conn:
         conn.execute(
             update(token_work_items_table)
             .where(token_work_items_table.c.work_item_id == item.work_item_id)
-            .values(status=TokenWorkStatus.LEASED.value, lease_owner=PEER_OWNER, lease_expires_at=now + timedelta(seconds=300))
+            .values(
+                status=TokenWorkStatus.LEASED.value,
+                lease_owner=PEER_OWNER,
+                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
+            )
         )
     repo.mark_pending_sink(
         work_item_id=item.work_item_id,

@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import CoordinationToken
@@ -80,6 +80,7 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
+from tests.fixtures.landscape import expire_leader_seat
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -395,7 +396,6 @@ class TestFollowerDispositions:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
         assert claimed.lease_owner == follower_id
@@ -436,7 +436,6 @@ class TestFollowerDispositions:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -487,7 +486,6 @@ class TestFollowerDispositions:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -528,7 +526,6 @@ class TestFollowerDispositions:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed2 is not None
         # Same (closer_name, group_id, member_key) → idempotent.
@@ -585,7 +582,6 @@ class TestFollowerDispositions:
             run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            now=clock.now_utc(),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -781,8 +777,10 @@ class TestFollowerLifecycle:
         )
         follower_id = _join_follower(crashed, leader_token)
 
-        # Advance clock past the seat window so live_leader returns seat_live=False.
+        # Lapse the seat on the Landscape database clock (ADR-047) so
+        # live_leader returns seat_live=False; the process MockClock cannot.
         clock.advance(10.0)
+        expire_leader_seat(crashed.db, crashed.run_id)
 
         stub_proc = _DrainFollowerReadyWork()
         follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
@@ -909,7 +907,6 @@ class TestFollowerEnqueueFence:
             step_index=crashed.journal_step_index,
             ingest_sequence=100,
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-            available_at=clock.now_utc(),
             worker_id=follower_id,
         )
 
@@ -965,7 +962,6 @@ class TestFollowerEnqueueFence:
                 step_index=crashed.journal_step_index,
                 ingest_sequence=101,
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-                available_at=clock.now_utc(),
                 worker_id=follower_id,
             )
 
@@ -1065,7 +1061,6 @@ def _seed_real_follower_ready_item(
     target_step_index: int,
 ) -> str:
     """Seed one source-complete READY item at the run's real processing node."""
-    from datetime import UTC, datetime
 
     from elspeth.contracts import PipelineRow
     from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -1102,7 +1097,6 @@ def _seed_real_follower_ready_item(
         step_index=target_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(row_data, _observed_contract(row_data))),
-        available_at=datetime.now(UTC),
     )
     return token.token_id
 
@@ -1409,7 +1403,9 @@ transforms:
                     select(scheduler_events_table.c.event_type)
                     .where(scheduler_events_table.c.run_id == run_id)
                     .where(scheduler_events_table.c.token_id == token_id)
-                    .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                    # Recording order (SQLite rowid): the production key
+                    # (recorded_at, event_id) ties inside one database second.
+                    .order_by(text("rowid"))
                 )
                 .scalars()
                 .all()

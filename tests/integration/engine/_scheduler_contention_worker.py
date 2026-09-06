@@ -66,7 +66,6 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -210,7 +209,6 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         run_id=args.run_id,
                         lease_owner=args.owner,
                         lease_seconds=args.lease_seconds,
-                        now=datetime.now(UTC),
                     ),
                 )
                 if item is None:
@@ -227,7 +225,6 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                         VERB_RECOVER,
                         lambda: repo.recover_expired_leases_legacy_unfenced(
                             run_id=args.run_id,
-                            now=datetime.now(UTC),
                             caller_owner=args.owner,
                         ),
                     )

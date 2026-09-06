@@ -1541,9 +1541,8 @@ class TestAggregationRecoveryIntegration:
                 step_index=1,
                 ingest_sequence=i,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
-                available_at=now,
             )
-            claimed = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="seeder", lease_seconds=60, now=now)
+            claimed = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="seeder", lease_seconds=60)
             assert claimed is not None and claimed.token_id == token.token_id
             blocked_at = first_blocked_at + timedelta(seconds=i)  # oldest row anchors the age
             factory.scheduler.mark_blocked(
