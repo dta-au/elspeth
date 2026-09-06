@@ -209,6 +209,15 @@ _TABLE_POLICIES: tuple[TablePolicy, ...] = (
             ("SessionForkAuthority", frozenset({"update"})),
             ("SessionInterpretationAuthority", frozenset({"update"})),
             ("RunDiagnosticsAuditMutationAuthority", frozenset({"update"})),
+            # Ruling 8925 #3 (Task-5 inventory record, P4-D2 elspeth-44751b3265):
+            # the session-side preferences writer
+            # ``SessionServiceImpl.update_composer_preferences._sync`` updates
+            # ``trust_mode`` / ``density_default`` under the per-session write
+            # lock and deliberately NEVER under the compose lease, so a
+            # mid-compose trust downgrade always lands. It takes the composer
+            # authority its ``proposal_events`` audit row already carries: one
+            # arm, update only.
+            ("SessionComposerMutationAuthority", frozenset({"update"})),
         ),
     ),
     TablePolicy("sessions_cleanup_claims", "global", "SessionCleanupClaimAuthority"),
@@ -251,9 +260,17 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "_SessionComposerMutations.accept_pending_ordinary_proposal",
         "SessionComposerMutationAuthority",
     ),
+    # ── preferences writers (ruling 8925 #3, Task-5 inventory record): both
+    # write directly, serialised by the per-session write lock / the sessions
+    # engine's write transaction, never by the compose lease ─────────────
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/service.py",
+        "SessionServiceImpl.update_composer_preferences",
+        "SessionComposerMutationAuthority",
+    ),
     AuthoritySymbol(
         "src/elspeth/web/preferences/service.py",
-        "RepositoryUserPreferenceAuthority.apply_patch",
+        "PreferencesService.update_composer_preferences",
         "UserPreferenceAuthority",
     ),
     AuthoritySymbol(
@@ -661,9 +678,16 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
         "_SessionComposerMutations.accept_pending_ordinary_proposal",
         "SessionComposerMutationAuthority",
     ),
+    # ── preferences writers (ruling 8925 #3): each ``_sync`` opens its one
+    # write transaction inside its own ``with`` and never hands it out ────
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/service.py",
+        "SessionServiceImpl.update_composer_preferences._sync",
+        "SessionComposerMutationAuthority",
+    ),
     AuthoritySymbol(
         "src/elspeth/web/preferences/service.py",
-        "RepositoryUserPreferenceAuthority.apply_patch._sync",
+        "PreferencesService.update_composer_preferences._sync",
         "UserPreferenceAuthority",
     ),
     AuthoritySymbol(
@@ -923,25 +947,62 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "SessionComposerMutationAuthority",
         line=3579,
     ),
+    # ── Ruling 8925 #3 (Task-5 inventory record, P4-D2 elspeth-44751b3265):
+    # the preferences writers write directly. Session side: audit row then
+    # session row in one transaction under the per-session write lock, never
+    # the compose lease. User side: one atomic dialect upsert (sqlite /
+    # postgresql arm) inside the sessions engine's write transaction. The
+    # compose-leased facet pair that once mirrored the session side is
+    # deleted; ``RepositoryUserPreferenceAuthority`` no longer exists. ──────
     WriterIdentity(
-        "src/elspeth/web/preferences/service.py",
-        "RepositoryUserPreferenceAuthority.apply_patch._sync",
-        "user_preferences",
+        "src/elspeth/web/sessions/service.py",
+        "SessionServiceImpl.update_composer_preferences._sync",
+        "proposal_events",
         "insert",
-        "8e94ada6ed873608",
+        "78fe65cf99c28d0f",
         1,
-        "UserPreferenceAuthority",
-        line=427,
+        "SessionComposerMutationAuthority",
+        line=7137,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/service.py",
+        "SessionServiceImpl.update_composer_preferences._sync",
+        "sessions",
+        "update",
+        "78fe65cf99c28d0f",
+        1,
+        "SessionComposerMutationAuthority",
+        line=7152,
     ),
     WriterIdentity(
         "src/elspeth/web/preferences/service.py",
-        "RepositoryUserPreferenceAuthority.apply_patch._sync",
+        "PreferencesService.update_composer_preferences._sync",
         "user_preferences",
         "insert",
-        "8e94ada6ed873608",
+        "7726e34a790469ba",
+        1,
+        "UserPreferenceAuthority",
+        line=450,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/preferences/service.py",
+        "PreferencesService.update_composer_preferences._sync",
+        "user_preferences",
+        "insert",
+        "7726e34a790469ba",
         2,
         "UserPreferenceAuthority",
-        line=429,
+        line=452,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/preferences/service.py",
+        "PreferencesService.update_composer_preferences._sync",
+        "<sessions-write-connection>",
+        "write_connection",
+        "a793cf5b38728669",
+        1,
+        "UserPreferenceAuthority",
+        line=334,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/skill_markdown_history.py",
@@ -6751,38 +6812,50 @@ def test_skill_markdown_history_authority_is_exact_contained_and_complete() -> N
 
 
 def test_user_preference_authority_is_exact_contained_and_complete() -> None:
+    """Ruling 8925 #3 (Task-5 inventory record): the ``user_preferences`` writer is
+    ``PreferencesService.update_composer_preferences._sync`` itself -- one atomic
+    dialect upsert inside the sessions engine's write transaction, never a compose
+    lease. ``RepositoryUserPreferenceAuthority`` is retired, and every
+    ``user_preferences`` write in the module must sit under the named writer."""
     root = _repo_root()
-    service_path = root / "src/elspeth/web/preferences/service.py"
-    authority_symbol = "RepositoryUserPreferenceAuthority.apply_patch._sync"
+    path = "src/elspeth/web/preferences/service.py"
+    service_path = root / path
+    authority_prefix = "PreferencesService.update_composer_preferences"
+    authority_symbol = f"{authority_prefix}._sync"
+    assert _authority_for(path, authority_prefix) == "UserPreferenceAuthority"
+    assert _authority_for(path, authority_symbol) == "UserPreferenceAuthority"
+    assert _authority_for(path, f"{authority_prefix}_replacement") is None
+    assert _authority_for(path, "PreferencesService.get_composer_preferences") is None
+    assert _contained_connection_authority_for(path, authority_symbol) == "UserPreferenceAuthority"
+    assert _contained_connection_authority_for(path, authority_prefix) is None
     live = scan_production_writers([service_path], anchor=root)
-    authority_live = [site for site in live if site.symbol.startswith("RepositoryUserPreferenceAuthority.apply_patch")]
+    authority_live = [site for site in live if site.symbol.startswith(f"{authority_prefix}.")]
     writes = [site for site in authority_live if site.table == "user_preferences"]
     reviewed = [site for site in _REVIEWED_WRITERS if site.table == "user_preferences"]
     connections = [site for site in authority_live if site.operation == "write_connection"]
+    reviewed_connections = [site for site in _REVIEWED_WRITERS if site.symbol == authority_symbol and site.operation == "write_connection"]
 
     assert len(writes) == len(reviewed) == 2
     assert inventory_drift(writes, reviewed) == ([], [])
     assert {site.authority for site in writes} == {"UserPreferenceAuthority"}
+    assert authority_policy_violations(writes, _TABLE_POLICIES) == ([], [])
     assert connections == [
         WriterIdentity(
-            "src/elspeth/web/preferences/service.py",
+            path,
             authority_symbol,
             "<sessions-write-connection>",
             "write_connection",
-            "d375e08da8900262",
+            "a793cf5b38728669",
             1,
             "UserPreferenceAuthority",
-            line=310,
+            line=334,
         )
     ]
+    assert inventory_drift(connections, reviewed_connections) == ([], [])
     assert connection_authority_violations(authority_live) == []
     assert not [site for site in authority_live if site.table == "<unresolved-session-write>"]
-    assert not [
-        site
-        for site in live
-        if site.symbol.startswith("PreferencesService.update_composer_preferences")
-        and (site.table == "user_preferences" or site.table == "<unresolved-session-write>")
-    ]
+    assert not [site for site in live if site.table == "user_preferences" and site not in writes]
+    assert not [site for site in live if site.symbol.startswith("RepositoryUserPreferenceAuthority")]
 
 
 def test_named_authority_registry_is_explicit_extensible_and_exact() -> None:
@@ -6862,6 +6935,7 @@ def test_named_authority_registry_is_explicit_extensible_and_exact() -> None:
         ("SessionForkAuthority", frozenset({"update"})),
         ("SessionInterpretationAuthority", frozenset({"update"})),
         ("RunDiagnosticsAuditMutationAuthority", frozenset({"update"})),
+        ("SessionComposerMutationAuthority", frozenset({"update"})),
     )
     policy_authorities = {policy.authority for policy in _TABLE_POLICIES} | {
         authority for policy in _TABLE_POLICIES for authority, _operations in policy.operation_authorities
@@ -7280,27 +7354,39 @@ def test_blob_proposal_effect_receipt_writers_are_exact_authorized_and_bidirecti
 
 
 def test_composer_preferences_facets_are_exact_contained_and_bidirectional() -> None:
+    """Ruling 8925 #3 (Task-5 inventory record): the session-side preferences writer
+    is ``SessionServiceImpl.update_composer_preferences._sync`` -- audit row, then
+    session row, in one transaction serialised by the per-session write lock and
+    deliberately NEVER by the compose lease, so a mid-compose trust downgrade always
+    lands. The compose-leased facet pair that mirrored it
+    (``_SessionComposerMutations.record_preferences_changed`` /
+    ``_SessionMutations.update_composer_preferences``) is deleted and stays deleted."""
     root = _repo_root()
-    path = root / "src/elspeth/web/sessions/service.py"
-    authorities = {
-        "_SessionComposerMutations.record_preferences_changed": "SessionComposerMutationAuthority",
-        "_SessionMutations.update_composer_preferences": "SessionMutationAuthority",
-    }
-    for symbol, authority in authorities.items():
-        assert _authority_for("src/elspeth/web/sessions/service.py", symbol) == authority
-        assert _contained_connection_authority_for("src/elspeth/web/sessions/service.py", symbol) == authority
-    scanned = scan_production_writers([path], anchor=root)
+    path = "src/elspeth/web/sessions/service.py"
+    prefix = "SessionServiceImpl.update_composer_preferences"
+    symbol = f"{prefix}._sync"
+    authority = "SessionComposerMutationAuthority"
+    assert _authority_for(path, prefix) == authority
+    assert _authority_for(path, symbol) == authority
+    assert _authority_for(path, f"{prefix}_replacement") is None
+    assert _authority_for(path, "SessionServiceImpl.get_composer_preferences") is None
+    assert _contained_connection_authority_for(path, symbol) == authority
+    assert _contained_connection_authority_for(path, prefix) is None
+    scanned = scan_production_writers([root / path], anchor=root)
     assert not [
-        site
-        for site in scanned
-        if site.symbol == "SessionServiceImpl.update_composer_preferences._sync" and site.table in {"proposal_events", "sessions"}
+        site for site in scanned if site.symbol.startswith(("_SessionComposerMutations.record_preferences_changed", "_SessionMutations."))
     ]
-    live = [site for site in scanned if site.symbol in authorities]
-    reviewed = [site for site in _REVIEWED_WRITERS if site.symbol in authorities]
+    live = [site for site in scanned if site.symbol == symbol]
+    reviewed = [site for site in _REVIEWED_WRITERS if site.symbol == symbol]
+    assert {(site.table, site.operation) for site in live} == {("proposal_events", "insert"), ("sessions", "update")}
     assert len(live) == len(reviewed) == 2
     assert inventory_drift(live, reviewed) == ([], [])
     assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
     assert connection_authority_violations(live) == []
+    assert not [site for site in live if site.table == "<unresolved-session-write>"]
+    sessions_policy = {entry.table: entry for entry in _TABLE_POLICIES}["sessions"]
+    assert (authority, frozenset({"update"})) in sessions_policy.operation_authorities
+    assert not sessions_policy.permits(replace(live[0], table="sessions", operation="delete"))
 
 
 def test_existing_guided_authority_registry_is_exact_and_keeps_connection_helpers_blocked() -> None:
@@ -7351,6 +7437,7 @@ def test_existing_guided_authority_table_policies_are_operation_exact() -> None:
         ("SessionForkAuthority", frozenset({"update"})),
         ("SessionInterpretationAuthority", frozenset({"update"})),
         ("RunDiagnosticsAuditMutationAuthority", frozenset({"update"})),
+        ("SessionComposerMutationAuthority", frozenset({"update"})),
     )
     assert policies["chat_messages"].operation_authorities == (
         ("SessionForkChildMutations", frozenset({"insert"})),
@@ -11882,6 +11969,7 @@ def test_writer_authority_must_match_the_table_policy() -> None:
                     ("SessionForkAuthority", frozenset({"update"})),
                     ("SessionInterpretationAuthority", frozenset({"update"})),
                     ("RunDiagnosticsAuditMutationAuthority", frozenset({"update"})),
+                    ("SessionComposerMutationAuthority", frozenset({"update"})),
                 ),
             ),
         ),
