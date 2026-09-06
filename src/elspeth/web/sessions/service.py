@@ -3341,19 +3341,12 @@ class _SessionComposerMutations:
     def create_guided_pipeline_proposal(
         self,
         *,
-        proposal_id: str,
+        command: GuidedPipelineProposalStageCommand | GuidedFullPipelineProposalStageCommand,
         event_id: str,
-        tool_call_id: str,
         user_message_id: UUID | None,
-        summary: str,
-        rationale: str,
-        affects: Sequence[str],
-        arguments_json: Mapping[str, Any],
-        arguments_redacted_json: Mapping[str, Any],
         base_state_id: str,
-        actor: str,
         normalized_provenance: Mapping[str, str | None],
-        payload: Mapping[str, Any],
+        payload: _PipelineCreatedEventPayload,
         created_at: datetime,
     ) -> CompositionProposalRecord:
         """Create the pending proposal a guided settlement stages in its own transaction.
@@ -3362,19 +3355,23 @@ class _SessionComposerMutations:
         checkpoint the caller inserted moments ago in this same transaction,
         so there is no current-head comparison here: the guided ``_sync``
         proved the checkpoint chain, validated blob references, and re-checks
-        the guided fence when it binds and completes the operation. Every row
-        of one settlement carries the caller's ``created_at``.
+        the guided fence when it binds and completes the operation. The
+        proposal content comes from the exact staging command; every row of
+        one settlement carries the caller's ``created_at``.
         """
         _service, connection, session_id, _now = self.__state._require_exact()
+        if type(command) not in (GuidedPipelineProposalStageCommand, GuidedFullPipelineProposalStageCommand):
+            raise TypeError("command must be an exact guided pipeline proposal stage command")
         if type(created_at) is not datetime:
             raise TypeError("created_at must be an exact datetime")
+        proposal_id = str(command.proposal_id)
         connection.execute(
             insert(proposal_events_table).values(
                 id=event_id,
                 session_id=session_id,
                 proposal_id=proposal_id,
                 event_type="proposal.created",
-                actor=actor,
+                actor=command.actor,
                 payload=payload,
                 created_at=created_at,
             )
@@ -3383,7 +3380,7 @@ class _SessionComposerMutations:
             insert(composition_proposals_table).values(
                 id=proposal_id,
                 session_id=session_id,
-                tool_call_id=tool_call_id,
+                tool_call_id=command.plan.tool_call_id,
                 user_message_id=str(user_message_id) if user_message_id is not None else None,
                 composer_model_identifier=normalized_provenance["composer_model_identifier"],
                 composer_model_version=normalized_provenance["composer_model_version"],
@@ -3392,11 +3389,11 @@ class _SessionComposerMutations:
                 tool_arguments_hash=normalized_provenance["tool_arguments_hash"],
                 tool_name="set_pipeline",
                 status="pending",
-                summary=summary,
-                rationale=rationale,
-                affects=list(affects),
-                arguments_json=deep_thaw(arguments_json),
-                arguments_redacted_json=deep_thaw(arguments_redacted_json),
+                summary=command.summary,
+                rationale=command.rationale,
+                affects=list(command.affects),
+                arguments_json=deep_thaw(command.plan.proposal.pipeline),
+                arguments_redacted_json=deep_thaw(command.arguments_redacted_json),
                 base_state_id=base_state_id,
                 committed_state_id=None,
                 audit_event_id=event_id,
@@ -4208,13 +4205,14 @@ class _GuidedComposerMutations:
         created_at: datetime,
         committed_state_id: str,
         state_content_hash: str,
-        final_composer_metadata: Mapping[str, Any] | None,
+        committed_state: CompositionStateData,
         dispatch: PipelineDispatchAuditBinding,
     ) -> str:
         """Terminal ``proposal.accepted`` event and pending->committed CAS for the proposal this operation holds.
 
-        The caller has already proved the durable dispatch and inserted the
-        committed state in this transaction. Returns the event id.
+        The caller has already proved the durable dispatch and inserted
+        ``committed_state`` (whose composer metadata the event commits to) in
+        this transaction. Returns the event id.
         """
         _service, connection, fence, _row, _database_now = self.__state._require_exact()
         if type(authority) is not AuthoritativePipelineProposal:
@@ -4223,13 +4221,15 @@ class _GuidedComposerMutations:
             raise AuditIntegrityError("guided pending proposal authority is not exact for this session")
         if type(created_at) is not datetime:
             raise TypeError("created_at must be an exact datetime")
+        if type(committed_state) is not CompositionStateData:
+            raise TypeError("committed_state must be an exact CompositionStateData")
         proposal_id = str(authority.row.id)
         event_id = str(uuid.uuid4())
         terminal_payload = _pipeline_accepted_payload(
             authority=authority,
             state_id=committed_state_id,
             state_content_hash=state_content_hash,
-            final_composer_metadata=final_composer_metadata,
+            final_composer_metadata=committed_state.composer_meta,
             dispatch=dispatch,
         )
         connection.execute(
@@ -11235,7 +11235,6 @@ class SessionServiceImpl:
             if staged_blob_id != str(custody_preparation.blob_id):
                 raise AuditIntegrityError("guided-full deferred custody blob differs from the staged source")
         sid = str(command.fence.session_id)
-        pid = str(command.proposal_id)
         event_id = str(uuid.uuid4())
         now = self._now()
 
@@ -11416,17 +11415,10 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ) as composer_transaction:
                     stored = composer_transaction.composer.create_guided_pipeline_proposal(
-                        proposal_id=pid,
+                        command=command,
                         event_id=event_id,
-                        tool_call_id=command.plan.tool_call_id,
                         user_message_id=command.originating_message.message_id,
-                        summary=command.summary,
-                        rationale=command.rationale,
-                        affects=command.affects,
-                        arguments_json=proposal.pipeline,
-                        arguments_redacted_json=command.arguments_redacted_json,
                         base_state_id=checkpoint_id,
-                        actor=command.actor,
                         normalized_provenance=normalized,
                         payload=creation_payload,
                         created_at=now,
@@ -11903,7 +11895,6 @@ class SessionServiceImpl:
         )
         prepared_state = with_guided_response_descriptor(command.state, command.response)
         sid = str(command.fence.session_id)
-        pid = str(command.proposal_id)
         event_id = str(uuid.uuid4())
         now = self._now()
 
@@ -12079,17 +12070,10 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ) as composer_transaction:
                     record = composer_transaction.composer.create_guided_pipeline_proposal(
-                        proposal_id=pid,
+                        command=command,
                         event_id=event_id,
-                        tool_call_id=command.plan.tool_call_id,
                         user_message_id=command.user_message_id,
-                        summary=command.summary,
-                        rationale=command.rationale,
-                        affects=command.affects,
-                        arguments_json=proposal.pipeline,
-                        arguments_redacted_json=command.arguments_redacted_json,
                         base_state_id=checkpoint_id,
-                        actor=command.actor,
                         normalized_provenance=normalized,
                         payload=creation_payload,
                         created_at=now,
@@ -12958,7 +12942,7 @@ class SessionServiceImpl:
                         created_at=now,
                         committed_state_id=state_id,
                         state_content_hash=command.executor_content_hash,
-                        final_composer_metadata=prepared_state.composer_meta,
+                        committed_state=prepared_state,
                         dispatch=dispatch,
                     )
                 updated_row = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.id == pid)).one()
