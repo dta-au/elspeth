@@ -16,7 +16,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import yaml
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
@@ -2602,8 +2602,7 @@ def _public_durable_records(db: LandscapeDB, *, run_id: str, payload_store: File
                 scheduler_events_table,
                 scheduler_fields,
                 scheduler_events_table.c.token_id,
-                scheduler_events_table.c.recorded_at,
-                scheduler_events_table.c.event_id,
+                scheduler_events_table.c.seq,
             )
         )
 
@@ -4385,10 +4384,7 @@ def _pending_sink_redrive_recovery_case(
                     select(scheduler_events_table)
                     .where(scheduler_events_table.c.run_id == run_id)
                     .where(scheduler_events_table.c.event_type == "claim_pending_sink")
-                    # Recording order (SQLite rowid): the production key
-                    # (recorded_at, event_id) ties inside one database second
-                    # now that claims stamp database time (ADR-047).
-                    .order_by(text("rowid"))
+                    .order_by(scheduler_events_table.c.seq)
                 ).mappings()
             )
         if len(recovery_events) != 1:

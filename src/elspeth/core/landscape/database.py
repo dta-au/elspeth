@@ -448,6 +448,8 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("group_losses", "recorded_by"),
     ("group_losses", "recorded_at"),
     ("group_losses", "adopted_epoch"),
+    # Epoch 38: authoritative replay order and row identity (AUTOINCREMENT).
+    ("scheduler_events", "seq"),
     ("scheduler_events", "event_id"),
     ("scheduler_events", "run_id"),
     ("scheduler_events", "token_id"),
@@ -760,7 +762,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("token_work_items", "ix_token_work_items_recovery"),
     ("token_work_items", "ix_token_work_items_pending_sink_token"),
     ("token_work_items", "uq_token_work_items_terminal_identity"),
-    ("scheduler_events", "ix_scheduler_events_run_token_time"),
+    ("scheduler_events", "ix_scheduler_events_run_token_seq"),
     ("scheduler_events", "ix_scheduler_events_work_item"),
     ("validation_errors", "ix_validation_errors_run_row"),
     ("artifacts", "uq_artifacts_run_idempotency_key"),

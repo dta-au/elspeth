@@ -347,7 +347,7 @@ class ConnectionBoundExportReadModel:
             rows = self._connection.execute(
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == run_id, scheduler_events_table.c.token_id.in_(chunk))
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                .order_by(scheduler_events_table.c.seq)
             ).fetchall()
             result.extend(self._scheduler_event_loader.load(row) for row in rows)
         return result

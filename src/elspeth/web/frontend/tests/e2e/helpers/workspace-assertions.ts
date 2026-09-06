@@ -514,11 +514,30 @@ export async function expectDialogGeometry(
       bodyOverflowY: getComputedStyle(body).overflowY,
       bodyScrolls: body.scrollHeight > body.clientHeight,
       bodyHorizontalOverflow: body.scrollWidth - body.clientWidth,
+      // The horizontal sweep skips ONLY the visually-hidden clip pattern —
+      // what src/styles/base.css defines `.sr-only` / `.visually-hidden` to
+      // be: position:absolute, a 1px box, overflow hidden (with nowrap, so
+      // its scrollWidth is the full text width). Tested on computed style
+      // rather than class name because the style IS the definition and a
+      // class rename must not silently widen the exclusion. A 1px hidden
+      // box cannot present content, so its scrollWidth is not a layout
+      // defect; every other element — including a narrow visible one whose
+      // overflow is visible — stays in the sweep. The run dialog has
+      // carried such spans since 6cac38852 (2026-08-30, the identifier
+      // register for screen readers).
       maxContentHorizontalOverflow: Math.max(
         0,
-        ...[...body.querySelectorAll<HTMLElement>("*")].map(
-          (content) => content.scrollWidth - content.clientWidth,
-        ),
+        ...[...body.querySelectorAll<HTMLElement>("*")]
+          .filter((content) => {
+            const style = getComputedStyle(content);
+            const visuallyHiddenClip =
+              style.position === "absolute" &&
+              style.overflowX === "hidden" &&
+              content.clientWidth <= 1 &&
+              content.clientHeight <= 1;
+            return !visuallyHiddenClip;
+          })
+          .map((content) => content.scrollWidth - content.clientWidth),
       ),
       titleVisible: (() => {
         const titleBounds = title.getBoundingClientRect();

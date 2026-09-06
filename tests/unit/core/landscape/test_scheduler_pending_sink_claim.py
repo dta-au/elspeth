@@ -303,9 +303,7 @@ def _durable_image(engine: Tier1Engine, work_item_id: str) -> tuple[dict[str, An
         events = tuple(
             dict(event_row)
             for event_row in conn.execute(
-                select(scheduler_events_table)
-                .where(scheduler_events_table.c.run_id == RUN_ID)
-                .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                select(scheduler_events_table).where(scheduler_events_table.c.run_id == RUN_ID).order_by(scheduler_events_table.c.seq)
             ).mappings()
         )
     return row, events

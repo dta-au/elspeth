@@ -842,6 +842,7 @@ class TestLineageTextFormatter:
             ),
             scheduler_events=(
                 SchedulerEvent(
+                    seq=1,
                     event_id="sched-1",
                     run_id="run-001",
                     token_id="tok-child",

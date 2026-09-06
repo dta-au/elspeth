@@ -1014,6 +1014,7 @@ class LandscapeExporter:
                     scheduler_event_record: SchedulerEventExportRecord = {
                         "record_type": "scheduler_event",
                         "run_id": run_id,
+                        "seq": event.seq,
                         "event_id": event.event_id,
                         "token_id": event.token_id,
                         "work_item_id": event.work_item_id,

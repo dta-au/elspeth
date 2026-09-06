@@ -1775,8 +1775,9 @@ class TestProcessRowNoTransforms:
                 .mappings()
                 .one()
             )
-            values = dict(claim)
-            values["event_id"] = "duplicate-claim-event"
+            # A duplicate witness is the same transition recorded twice: same
+            # content id, a fresh epoch-38 seq assigned by the database.
+            values = {column: value for column, value in claim.items() if column != "seq"}
             conn.execute(scheduler_events_table.insert().values(**values))
 
         with pytest.raises(AuditIntegrityError, match="exactly two scheduler events"):

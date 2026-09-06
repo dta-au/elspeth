@@ -859,8 +859,6 @@ def _node_state_identities(db: LandscapeDB, run_id: str) -> list[tuple[str, str,
 
 def _recovery_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
     """RECOVER_EXPIRED_LEASE events in durable insertion (rowid) order."""
-    from sqlalchemy import text
-
     with db.engine.connect() as conn:
         return [
             dict(row)
@@ -868,7 +866,7 @@ def _recovery_events(db: LandscapeDB, run_id: str) -> list[dict[str, Any]]:
                 select(scheduler_events_table)
                 .where(scheduler_events_table.c.run_id == run_id)
                 .where(scheduler_events_table.c.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value)
-                .order_by(text("rowid"))
+                .order_by(scheduler_events_table.c.seq)
             ).mappings()
         ]
 

@@ -1579,14 +1579,23 @@ class TestExecutionFlow:
 
         assert result is expected
         run_worker.assert_awaited_once()
-        worker_call = run_worker.await_args.args[0]
-        assert isinstance(worker_call, partial)
-        assert worker_call.func == service._authoritative_state_preflight_sync
-        assert worker_call.args == (state,)
-        assert worker_call.keywords is not None
-        assert worker_call.keywords["user_id"] == "alice"
-        assert worker_call.keywords["session_id"] is not None
-        assert worker_call.keywords["plugin_snapshot"] is not None
+        assert run_worker.await_args.kwargs == {}
+        (worker_call,) = run_worker.await_args.args
+        # The handoff is a local function whose body is a direct call the
+        # session-operation-lease gate can follow (elspeth-01e919e13e), not a
+        # ``partial`` that hides the callee and its context from the walk.
+        assert not isinstance(worker_call, partial)
+        assert worker_call.__qualname__ == "ExecutionServiceImpl._authoritative_state_preflight.<locals>._preflight"
+        with patch.object(service, "_authoritative_state_preflight_sync", autospec=True, return_value=expected) as preflight_sync:
+            assert worker_call() is expected
+        preflight_sync.assert_called_once()
+        assert preflight_sync.call_args.args == (state,)
+        forwarded = preflight_sync.call_args.kwargs
+        assert set(forwarded) == {"plugin_snapshot", "user_id", "session_id", "session_operation_context"}
+        assert forwarded["user_id"] == "alice"
+        assert forwarded["session_id"] == session_id
+        assert forwarded["session_operation_context"] is context
+        assert forwarded["plugin_snapshot"] is not None
 
     @pytest.mark.asyncio
     async def test_validate_state_merges_persisted_completion_gate(

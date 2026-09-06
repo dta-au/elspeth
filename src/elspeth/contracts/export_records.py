@@ -251,6 +251,8 @@ class TokenOutcomeExportRecord(TypedDict):
 class SchedulerEventExportRecord(TypedDict):
     record_type: Literal["scheduler_event"]
     run_id: str
+    # Authoritative replay order (epoch 38); event_id is a content digest.
+    seq: int
     event_id: str
     token_id: str
     work_item_id: str

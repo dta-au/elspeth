@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
@@ -20,6 +20,7 @@ from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, Token
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.export_read_model import ConnectionBoundExportReadModel
 from elspeth.core.landscape.schema import (
     group_losses_table,
     metadata,
@@ -28,16 +29,17 @@ from elspeth.core.landscape.schema import (
     run_coordination_table,
     run_workers_table,
     runs_table,
+    scheduler_events_table,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
 )
 from tests.fixtures.landscape import (
     assert_stamped_between,
-    await_database_time,
     expire_lease,
     landscape_database_now,
     make_recorder_with_run,
+    on_fresh_database_second,
     register_test_node,
 )
 
@@ -49,12 +51,10 @@ if TYPE_CHECKING:
 # require a non-None token; _insert_scheduler_prerequisites seeds the matching row.
 _COORD_TOKEN = CoordinationToken(run_id="run-1", worker_id="test-leader", leader_epoch=1)
 
-# Recording order of scheduler events (SQLite rowid — this module runs only
-# on the in-memory Tier-1 engine). The production readers order by
-# (recorded_at, event_id); under ADR-047 the lease verbs stamp recorded_at
-# from the whole-second SQLite database clock, so two events of one test
-# tie inside a database second and that key falls back to hash order.
-_RECORDING_ORDER = text("rowid")
+# Replay order of scheduler events: the epoch-38 AUTOINCREMENT ``seq`` the
+# production readers order by. recorded_at is whole-second database time
+# under ADR-047 and ties inside a second; it is evidence, not a key.
+_RECORDING_ORDER = scheduler_events_table.c.seq
 
 _DISPOSITION_CASES = (
     pytest.param("mark_blocked", TokenWorkStatus.BLOCKED, SchedulerEventType.MARK_BLOCKED, False, id="TS-07"),
@@ -65,9 +65,13 @@ _DISPOSITION_CASES = (
 
 
 def test_scheduler_events_schema_is_required_run_scoped_contract() -> None:
-    from elspeth.core.landscape.schema import scheduler_events_table
-
+    assert [column.name for column in scheduler_events_table.primary_key.columns] == ["seq"]
+    assert scheduler_events_table.c.seq.autoincrement is True
+    assert scheduler_events_table.kwargs["sqlite_autoincrement"] is True
+    assert scheduler_events_table.c.event_id.primary_key is False
+    assert scheduler_events_table.c.event_id.unique is None
     assert {
+        "seq",
         "event_id",
         "run_id",
         "token_id",
@@ -89,6 +93,7 @@ def test_scheduler_events_schema_is_required_run_scoped_contract() -> None:
 
     required_columns = {column for table, column in database_module._REQUIRED_COLUMNS if table == "scheduler_events"}
     assert {
+        "seq",
         "event_id",
         "run_id",
         "token_id",
@@ -116,7 +121,12 @@ def test_scheduler_events_schema_is_required_run_scoped_contract() -> None:
         "tokens",
         ("token_id", "run_id"),
     ) in database_module._REQUIRED_COMPOSITE_FOREIGN_KEYS
-    assert ("scheduler_events", "ix_scheduler_events_run_token_time") in database_module._REQUIRED_INDEXES
+    assert ("scheduler_events", "ix_scheduler_events_run_token_seq") in database_module._REQUIRED_INDEXES
+    assert ("scheduler_events", "ix_scheduler_events_work_item") in database_module._REQUIRED_INDEXES
+    run_token_seq = next(index for index in scheduler_events_table.indexes if index.name == "ix_scheduler_events_run_token_seq")
+    assert [column.name for column in run_token_seq.columns] == ["run_id", "token_id", "seq"]
+    work_item = next(index for index in scheduler_events_table.indexes if index.name == "ix_scheduler_events_work_item")
+    assert [column.name for column in work_item.columns] == ["run_id", "work_item_id", "seq"]
     assert all(fk.column.table.name != "token_work_items" for fk in scheduler_events_table.foreign_keys)
 
 
@@ -1847,10 +1857,6 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
                 heartbeat_expires_at=now + timedelta(hours=1),
             )
         )
-    # The production reader orders by (recorded_at, event_id) and the enqueue
-    # and the claim are both stamped from whole-second database time, so the
-    # claim waits for the next database second to keep that key total.
-    await_database_time(db.engine, landscape_database_now(db.engine))
     factory.scheduler.claim_ready(
         run_id="run-1",
         lease_owner="worker-a",
@@ -1864,6 +1870,142 @@ def test_query_repository_lists_scheduler_events_by_token_history() -> None:
     lineage = explain(factory.query, factory.data_flow, "run-1", token_id="token-1")
     assert lineage is not None
     assert [event.event_type for event in lineage.scheduler_events] == [SchedulerEventType.ENQUEUE, SchedulerEventType.CLAIM_READY]
+    db.close()
+
+
+def test_two_identical_same_second_transitions_are_two_rows_replayed_in_write_order() -> None:
+    """Epoch 38 (elspeth-5d66fc5ed1): identity is ``seq``, not a content hash.
+
+    Two content-identical transitions of one work item stamped inside one
+    database second used to collide on the ``event_id`` primary key (the hash
+    covered ``recorded_at``, whole-second under ADR-047). They are two facts
+    and must be two rows, replayed in write order.
+    """
+    from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+    from elspeth.core.landscape.scheduler.events import SchedulerEventStore
+
+    engine = _make_scheduler_engine()
+    now = landscape_database_now(engine)
+    _insert_scheduler_prerequisites(engine, now=now)
+    store = SchedulerEventStore()
+
+    def record_identical_claim(conn: Connection, *, recorded_at: datetime) -> None:
+        store.record(
+            conn,
+            event_type=SchedulerEventType.CLAIM_READY,
+            run_id="run-1",
+            token_id="token-1",
+            work_item_id="work-1",
+            node_id="normalize",
+            from_status=TokenWorkStatus.READY,
+            to_status=TokenWorkStatus.LEASED,
+            from_lease_owner=None,
+            to_lease_owner="worker-a",
+            from_attempt=1,
+            to_attempt=1,
+            recorded_at=recorded_at,
+            to_lease_expires_at=now + timedelta(seconds=30),
+            caller_owner="worker-a",
+        )
+
+    with engine.begin() as conn:
+        record_identical_claim(conn, recorded_at=now)
+        record_identical_claim(conn, recorded_at=now)
+        # event_id identifies WHAT happened, never when: the same transition a
+        # second later is the same content id, distinguished only by seq.
+        record_identical_claim(conn, recorded_at=now + timedelta(seconds=1))
+
+    events = _scheduler_events(engine)
+    assert len(events) == 3
+    assert len({event["event_id"] for event in events}) == 1
+    assert events[0]["seq"] < events[1]["seq"] < events[2]["seq"]
+    assert [event["recorded_at"] for event in events] == [
+        _stored_datetime(now),
+        _stored_datetime(now),
+        _stored_datetime(now + timedelta(seconds=1)),
+    ]
+
+
+def test_claim_written_after_mark_terminal_in_one_database_second_replays_after_it() -> None:
+    """Epoch 38 (elspeth-2d436dd6e8): replay order is ``seq``, never ``recorded_at``.
+
+    A caller-stamped ``mark_terminal`` at S.4 that precedes a database-stamped
+    claim at S.000000 replays AFTER the claim under a ``(recorded_at,
+    event_id)`` key. Every production reader orders by ``seq`` instead.
+    """
+    from elspeth.contracts.scheduler import SchedulerEventType
+
+    setup = make_recorder_with_run(run_id="run-1", source_node_id="source-0", source_plugin_name="csv")
+    db, factory = setup.db, setup.factory
+    register_test_node(factory.data_flow, "run-1", "normalize", plugin_name="identity")
+    for index in (1, 2):
+        factory.data_flow.create_row(
+            "run-1",
+            "source-0",
+            index - 1,
+            {"id": index},
+            row_id=f"row-{index}",
+            source_row_index=index - 1,
+            ingest_sequence=index - 1,
+        )
+        factory.data_flow.create_token(f"row-{index}", token_id=f"token-{index}")
+    seeded_at = landscape_database_now(db.engine)
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(run_workers_table).values(
+                worker_id="worker-a",
+                run_id="run-1",
+                role="follower",
+                status="active",
+                registered_at=seeded_at,
+                heartbeat_expires_at=seeded_at + timedelta(hours=1),
+            )
+        )
+    payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
+
+    def enqueue(token_id: str, row_id: str, ingest_sequence: int) -> None:
+        factory.scheduler.enqueue_ready(
+            run_id="run-1",
+            token_id=token_id,
+            row_id=row_id,
+            node_id="normalize",
+            step_index=1,
+            ingest_sequence=ingest_sequence,
+            row_payload_json=payload,
+        )
+
+    def transitions_inside_one_second(database_now: datetime) -> None:
+        enqueue("token-1", "row-1", 0)
+        first = factory.scheduler.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+        assert first is not None and first.token_id == "token-1"
+        factory.scheduler.mark_terminal(
+            work_item_id=first.work_item_id,
+            now=database_now + timedelta(microseconds=400_000),
+            expected_lease_owner="worker-a",
+        )
+        enqueue("token-2", "row-2", 1)
+        second = factory.scheduler.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+        assert second is not None and second.token_id == "token-2"
+
+    on_fresh_database_second(db.engine, transitions_inside_one_second)
+
+    expected_replay = [
+        ("token-1", SchedulerEventType.ENQUEUE),
+        ("token-1", SchedulerEventType.CLAIM_READY),
+        ("token-1", SchedulerEventType.MARK_TERMINAL),
+        ("token-2", SchedulerEventType.ENQUEUE),
+        ("token-2", SchedulerEventType.CLAIM_READY),
+    ]
+    events = factory.query.get_scheduler_events(run_id="run-1")
+    assert [(event.token_id, event.event_type) for event in events] == expected_replay
+    assert [event.seq for event in events] == sorted(event.seq for event in events)
+    # The same replay order through every production reader: the per-token
+    # chunked query reader and the connection-bound export reader.
+    by_token = factory.query.get_scheduler_events_for_tokens("run-1", ["token-1", "token-2"])
+    assert [(event.token_id, event.event_type) for event in by_token] == expected_replay
+    with db.read_only_connection() as conn:
+        exported = ConnectionBoundExportReadModel(conn).get_scheduler_events_for_tokens("run-1", ["token-1", "token-2"])
+    assert [(event.token_id, event.event_type) for event in exported] == expected_replay
     db.close()
 
 
@@ -2346,10 +2488,12 @@ def test_scheduler_event_store_rejects_unexpected_returned_identity() -> None:
 
     class _WrongIdentityConn:
         def execute(self, statement: object) -> SimpleNamespace:
-            return SimpleNamespace(scalar_one=lambda: "wrong-event-id")
+            # The writer RETURNs the epoch-38 ``seq``; a non-integer (or a
+            # bool, which is an int subclass) is not a row identity.
+            return SimpleNamespace(scalar_one=lambda: True)
 
     store = SchedulerEventStore()
-    with pytest.raises(LandscapeRecordError, match="returned unexpected event_id"):
+    with pytest.raises(LandscapeRecordError, match="returned unexpected seq=True"):
         store.record(
             cast(Connection, _WrongIdentityConn()),
             event_type=SchedulerEventType.RECOVER_EXPIRED_LEASE,

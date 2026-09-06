@@ -34,6 +34,7 @@ def test_buffered_outcome_context_is_frozen_after_construction() -> None:
 def test_scheduler_event_rejects_missing_required_event_type() -> None:
     with pytest.raises(TypeError, match="event_type must be SchedulerEventType"):
         SchedulerEvent(
+            seq=1,
             event_id="event-1",
             run_id="run-1",
             token_id="token-1",
@@ -48,6 +49,7 @@ def test_scheduler_event_rejects_missing_required_event_type() -> None:
 def test_scheduler_event_rejects_missing_required_to_status() -> None:
     with pytest.raises(TypeError, match="to_status must be TokenWorkStatus"):
         SchedulerEvent(
+            seq=1,
             event_id="event-1",
             run_id="run-1",
             token_id="token-1",
@@ -61,6 +63,7 @@ def test_scheduler_event_rejects_missing_required_to_status() -> None:
 
 def test_scheduler_event_allows_missing_optional_from_status() -> None:
     event = SchedulerEvent(
+        seq=1,
         event_id="event-1",
         run_id="run-1",
         token_id="token-1",
