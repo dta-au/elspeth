@@ -78,6 +78,7 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     composer_completion_events_table,
     composition_proposals_table,
+    composition_rejection_events_table,
     composition_states_table,
     guided_operations_table,
     interpretation_events_table,
@@ -563,6 +564,75 @@ class _RepositorySessionMutations:
         )
         if result.rowcount != 1:
             raise SessionDerivedCustodyError
+
+    def mark_session_updated(self, *, updated_at: datetime) -> None:
+        """Bump the bound session's ``updated_at`` after this operation appended rows to it.
+
+        COMPOSE or PROPOSAL over exactly the bound session (P4-D6 family A2a,
+        elspeth-99949c96ca). The stamp is the caller's so every row of one
+        settlement shares one clock; the live fence row is the enclosing
+        mutation transaction's proof, the facet re-checks the operation's
+        exact shape before the UPDATE.
+        """
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        if type(updated_at) is not datetime:
+            raise TypeError("updated_at must be an exact datetime")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(sessions_table).where(sessions_table.c.id == state._session_id).values(updated_at=updated_at)
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
+
+    def record_composition_rejection(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        error_code: str | None,
+        message: str,
+        planner_payload: str,
+        composition_state_id: str | None,
+        created_at: datetime,
+    ) -> None:
+        """Persist one refused composer tool call's unredacted reason (elspeth-3e28029d2f).
+
+        Written by ``persist_compose_turn`` alongside the turn's redacted tool
+        row, under exact COMPOSE authority over the bound session, linked to
+        the state current at rejection (a rejection commits no state of its
+        own).
+        """
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind is not SessionOperationKind.COMPOSE
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        if type(created_at) is not datetime:
+            raise TypeError("created_at must be an exact datetime")
+        _resolve_mutation_connection(state._connection_token).execute(
+            insert(composition_rejection_events_table).values(
+                id=str(uuid4()),
+                session_id=state._session_id,
+                composition_state_id=composition_state_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                error_code=error_code,
+                message=message,
+                planner_payload=planner_payload,
+                created_at=created_at,
+            )
+        )
 
     def decide_and_soft_archive(
         self,

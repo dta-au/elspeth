@@ -101,6 +101,7 @@ from elspeth.web.coordination.repository import (
     _ForkCreationTransaction,
     _RepositoryInterpretationMutations,
     _RepositoryMutationState,
+    _RepositorySessionMutations,
 )
 from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
@@ -145,7 +146,6 @@ from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
     composition_proposals_table,
-    composition_rejection_events_table,
     composition_states_table,
     guided_operation_admission_blocks_table,
     guided_operation_events_table,
@@ -6196,8 +6196,9 @@ class SessionServiceImpl:
         content: str,
         raw_content: str | None,
         created_at: datetime,
+        session_operation_context: SessionOperationContext,
     ) -> ChatMessageRecord:
-        """Insert one transition response under the caller's transaction."""
+        """Insert one transition response under the caller's fenced transaction."""
         self._assert_session_write_lock_held(
             conn,
             session_id,
@@ -6218,7 +6219,8 @@ class SessionServiceImpl:
             parent_assistant_id=None,
             created_at=created_at,
         )
-        conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(updated_at=created_at))
+        with self._session_mutations(conn, session_id=session_id, session_operation_context=session_operation_context) as session_mutations:
+            session_mutations.mark_session_updated(updated_at=created_at)
         message_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.id == message_id)).one()
         return self._row_to_chat_message_record(message_row)
 
@@ -6610,19 +6612,20 @@ class SessionServiceImpl:
                         for record in rejection_records:
                             if record.tool_call_id != tool_row.tool_call_id:
                                 continue
-                            conn.execute(
-                                composition_rejection_events_table.insert().values(
-                                    id=str(uuid.uuid4()),
-                                    session_id=session_id,
-                                    composition_state_id=current_state_id,
+                            with self._session_mutations(
+                                conn,
+                                session_id=session_id,
+                                session_operation_context=session_operation_context,
+                            ) as session_mutations:
+                                session_mutations.record_composition_rejection(
                                     tool_call_id=record.tool_call_id,
                                     tool_name=record.tool_name,
                                     error_code=record.error_code,
                                     message=record.message,
                                     planner_payload=record.planner_payload,
+                                    composition_state_id=current_state_id,
                                     created_at=now,
                                 )
-                            )
 
                 return AuditOutcome(
                     assistant_id=assistant_id,
@@ -7755,6 +7758,7 @@ class SessionServiceImpl:
                                 content=transition_assistant.content,
                                 raw_content=transition_assistant.raw_content,
                                 created_at=now,
+                                session_operation_context=session_operation_context,
                             )
                     return (
                         PipelineProposalSettlementResult(
@@ -7879,6 +7883,7 @@ class SessionServiceImpl:
                         content=transition_assistant.content,
                         raw_content=transition_assistant.raw_content,
                         created_at=now,
+                        session_operation_context=session_operation_context,
                     )
                 return (
                     PipelineProposalSettlementResult(
@@ -9256,7 +9261,10 @@ class SessionServiceImpl:
                     parent_assistant_id=pid,
                     created_at=now,
                 )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                with self._session_mutations(
+                    conn, session_id=sid, session_operation_context=session_operation_context
+                ) as session_mutations:
+                    session_mutations.mark_session_updated(updated_at=now)
                 # Transcript snapshot on the SAME connection, inside the
                 # SAME transaction as the insert — this read sees its own
                 # write on every dialect, which is the entire point.
@@ -9829,6 +9837,7 @@ class SessionServiceImpl:
                     content=assistant_content,
                     raw_content=raw_content,
                     created_at=now,
+                    session_operation_context=session_operation_context,
                 )
                 state_row = conn.execute(
                     select(composition_states_table)
@@ -14117,3 +14126,31 @@ class SessionServiceImpl:
 
         rows = await self._run_sync(_sync)
         return {row.id: int(row.version) for row in rows}
+
+    @contextlib.contextmanager
+    def _session_mutations(
+        self,
+        conn: Connection,
+        *,
+        session_id: str,
+        session_operation_context: SessionOperationContext,
+    ) -> Iterator[_RepositorySessionMutations]:
+        """Yield the repository's session-row facet over the caller's fenced transaction.
+
+        The caller sits inside a ``_session_composer_mutation_transaction``
+        block, so the live fence row on ``conn`` is already proved; the facet
+        re-checks the operation's exact shape before each write and dies with
+        this block (P4-D6 family A2a).
+        """
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        state = _RepositoryMutationState(
+            conn,
+            session_id=session_id,
+            database_now=self._guided_database_now(conn),
+            operation_context=session_operation_context,
+        )
+        try:
+            yield _RepositorySessionMutations(state)
+        finally:
+            state._close()
