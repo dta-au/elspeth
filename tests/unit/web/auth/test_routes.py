@@ -1525,3 +1525,51 @@ class TestAuthEventPrincipalConsistency:
 
         assert None not in identities, f"an event left identity_id NULL: {[r.event_type for r in rows if r.identity_id is None]}"
         assert identities == {claims["sub"]}
+
+
+class TestLogout:
+    """POST /api/auth/logout: the ``logout`` row is the whole effect (spec rev2)."""
+
+    @pytest.mark.asyncio
+    async def test_logout_records_a_durable_logout_row_and_answers_204(self, tmp_path) -> None:
+        audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        provider.create_user("alice", "password123", display_name="Alice")
+        app = _create_test_app(provider, landscape_url=audit_url)
+        _enable_auth_audit(app)
+
+        async with _client_for(app) as client:
+            login = await client.post("/api/auth/login", json={"username": "alice", "password": "password123"})
+            assert login.status_code == 200
+            token = login.json()["access_token"]
+            response = await client.post(
+                "/api/auth/logout",
+                headers={"Authorization": f"Bearer {token}", "user-agent": "pytest-client", "x-request-id": "logout-1"},
+            )
+
+        assert response.status_code == 204
+        assert response.content == b""
+        _assert_token_response_uncacheable(response)
+        event = _only_auth_event(_read_auth_event_rows(audit_url), "logout")
+        assert event.outcome == "success"
+        assert event.provider == "local"
+        assert event.username == "alice"
+        assert event.identity_id == pyjwt.decode(token, options={"verify_signature": False})["sub"]
+        assert event.request_id == "logout-1"
+        assert event.user_agent == "pytest-client"
+        assert json.loads(event.metadata_json) == {"method": "POST", "path": "/api/auth/logout"}
+
+    @pytest.mark.asyncio
+    async def test_logout_without_a_bearer_is_refused_and_writes_nothing(self, tmp_path) -> None:
+        audit_url = f"sqlite:///{tmp_path / 'audit.db'}"
+        provider = build_local_auth_provider(tmp_path / "auth.db")
+        app = _create_test_app(provider, landscape_url=audit_url)
+        _enable_auth_audit(app)
+        async with _client_for(app) as client:
+            response = await client.post("/api/auth/logout")
+        assert response.status_code == 401
+        # The bearer check records its own refusal; there is no logout row to
+        # attribute because nobody was logged in.
+        rows = _read_auth_event_rows(audit_url)
+        assert [row.event_type for row in rows] == ["auth_failure"]
+        assert json.loads(rows[0].metadata_json)["failure_stage"] == "authorization_header"

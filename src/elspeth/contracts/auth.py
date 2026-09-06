@@ -5,7 +5,7 @@ Layer: L0 (contracts). No upward imports.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Final, Literal
 
 AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]
 """Closed discriminator for the ways a browser can authenticate.
@@ -79,4 +79,16 @@ IdentityAccessState = Literal["pending", "active", "disabled"]
 in again; ``active`` is the only state a token is issued to; ``disabled`` is
 where an administrator or a credential deletion leaves a row, which is never
 deleted because it anchors that person's audit history.
+"""
+
+AUTH_EVENT_ON_BEHALF_OF_KEY: Final = "on_behalf_of"
+AUTH_EVENT_CONSOLE_REQUEST_ID_KEY: Final = "console_request_id"
+"""The two provenance keys every admin-mutation ``auth_events`` row carries (spec rev2.2).
+
+An organisation console acts through a ``service`` identity on behalf of a
+person, and the row must say so at the moment it is written: a row written
+without these keys is permanently anonymous, because nothing later can
+reconstruct who asked.  Pinned here, at L0, so the writer and every reader
+name the same keys; the writer records both on every admin mutation, ``None``
+when the actor is a human administrator acting for themselves.
 """

@@ -11,7 +11,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
 
 import typer
 import yaml
@@ -22,6 +22,7 @@ from pydantic import ValidationError
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
+from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import (
     CommencementGateFailedError,
     DependencyFailedError,
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator import RowPlugin
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
     from elspeth.telemetry import TelemetryManager
+    from elspeth.web.auth.audit import AuthAuditRecorder
     from elspeth.web.auth.local import LocalAuthProvider, RetireIdentity
     from elspeth.web.coordination.identity_authority import IdentityRetired
 __all__ = [
@@ -1966,17 +1968,8 @@ def _resolve_composer_landscape_url(*, data_dir: Path, landscape_url: str | None
     return resolve_landscape_url(data_dir=data_dir.expanduser().resolve(), landscape_url=configured)
 
 
-def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
-    """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
-
-    A credential deletion disables the identity and retires its binding, and
-    the authority invokes this INSIDE that transaction -- a retirement the
-    Landscape cannot hold does not commit, the rule every identity mutation
-    follows. The CLI is a surface whose audit trail matters (it deletes
-    accounts), so it does not take the "audits nothing" no-op the authority
-    allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
-    through the same recorder, resolved from the same URL rule.
-    """
+def _composer_auth_audit_recorder(landscape_url: str) -> AuthAuditRecorder:
+    """The CLI's Landscape auth-audit writer, resolved from the same URL rule app.py uses."""
     from sqlalchemy.engine.url import make_url
 
     from elspeth.web.auth.audit import AuthAuditRecorder
@@ -1989,13 +1982,27 @@ def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetir
         # first audit row of a fresh data dir must do the same, or SQLite
         # refuses to create the file.
         Path(sqlite_file).parent.mkdir(parents=True, exist_ok=True)
-    recorder = AuthAuditRecorder(
+    return AuthAuditRecorder(
         landscape_url=landscape_url,
         landscape_passphrase=os.environ.get("ELSPETH_WEB__LANDSCAPE_PASSPHRASE"),
         # Mirrors AuthAuditRecorder.from_settings: only a SQLite Landscape is
         # created on first write; an external store is provisioned by doctor.
         create_tables=sqlite_landscape,
     )
+
+
+def _composer_retirement_recorder(landscape_url: str) -> Callable[[IdentityRetired], None]:
+    """The CLI's audit sink for a retirement: the SAME Landscape row app.py writes.
+
+    A credential deletion disables the identity and retires its binding, and
+    the authority invokes this INSIDE that transaction -- a retirement the
+    Landscape cannot hold does not commit, the rule every identity mutation
+    follows. The CLI is a surface whose audit trail matters (it deletes
+    accounts), so it does not take the "audits nothing" no-op the authority
+    allows; it writes ``identity_disabled`` with ``cause=credential_deleted``
+    through the same recorder, resolved from the same URL rule.
+    """
+    recorder = _composer_auth_audit_recorder(landscape_url)
 
     def record(outcome: IdentityRetired) -> None:
         recorder.record_identity_retired(
@@ -2185,6 +2192,118 @@ def composer_users_remove(
     finally:
         session_engine.dispose()
     typer.echo(f"Removed composer user {username} from {db_path}")
+
+
+_AUTH_PROVIDER_NAMES: frozenset[str] = frozenset(get_args(AuthProviderType))
+"""The ``AuthProviderType`` members, as strings a CLI argument can be checked against."""
+
+
+@composer_users_app.command("bootstrap-admin")
+def composer_users_bootstrap_admin(
+    provider: str = typer.Argument(..., help="Identity provider of the subject: local, oidc, entra, vanguard or google."),
+    subject: str = typer.Argument(..., help="The IdP subject (``sub``) of the person who becomes the first admin."),
+    username: str | None = typer.Option(None, "--username", help="Username for a row that does not exist yet; defaults to the subject."),
+    note: str = typer.Option(..., "--note", help="Why this bootstrap is happening; written to the activation's audit row."),
+    data_dir: Path = typer.Option(Path("data"), "--data-dir", help="Web data directory."),
+    session_db_url: str | None = typer.Option(
+        None,
+        "--session-db-url",
+        help="Sessions store URL; defaults to ELSPETH_WEB__SESSION_DB_URL, then <data-dir>/sessions.db.",
+    ),
+    landscape_url: str | None = typer.Option(
+        None,
+        "--landscape-url",
+        help="Landscape URL for the activation audit rows; defaults to ELSPETH_WEB__LANDSCAPE_URL, then <data-dir>/runs/audit.db.",
+    ),
+    quota_tokens_per_day: int | None = typer.Option(
+        None, "--quota-tokens-per-day", min=1, help="The D31 allowance row; both quota options or neither."
+    ),
+    quota_storage_bytes: int | None = typer.Option(
+        None, "--quota-storage-bytes", min=1, help="The D31 allowance row; both quota options or neither."
+    ),
+) -> None:
+    """Make the first administrator, once: the operator's lockout recovery (spec D20).
+
+    Writes the whole state in one audited transaction -- the identity row
+    is created or bound, made active, granted a deployment-wide ``admin``
+    with no workload role, and given its quota row -- and is refused once
+    an active human admin exists. Adding a subject to
+    ``sso_admin_subjects`` does nothing after that point; this command is
+    the only path.
+    """
+    from elspeth.web.auth.models import IdentityClaims
+    from elspeth.web.coordination.identity_authority import (
+        AdminAlreadyBootstrapped,
+        IdentityActivated,
+        IdentityAlreadyDisabled,
+        RepositoryIdentityAuthority,
+        RoleForbiddenForIdentity,
+    )
+    from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
+
+    if provider not in _AUTH_PROVIDER_NAMES:
+        typer.echo(f"Error: unknown provider {provider!r}; expected one of {', '.join(sorted(_AUTH_PROVIDER_NAMES))}", err=True)
+        raise typer.Exit(2)
+    if (quota_tokens_per_day is None) != (quota_storage_bytes is None):
+        typer.echo("Error: --quota-tokens-per-day and --quota-storage-bytes go together", err=True)
+        raise typer.Exit(2)
+    # Narrowed by the closed-set check above; the Literal cannot be
+    # constructed from a str any other way.
+    provider_type = cast("AuthProviderType", provider)
+    claims = IdentityClaims(provider=provider_type, subject=subject, username=subject if username is None else username)
+    resolved_session_db_url = _resolve_composer_session_db_url(data_dir=data_dir, session_db_url=session_db_url)
+    session_engine = _composer_session_engine(resolved_session_db_url)
+    recorder = _composer_auth_audit_recorder(_resolve_composer_landscape_url(data_dir=data_dir, landscape_url=landscape_url))
+
+    def record(event: IdentityActivated) -> None:
+        # Inside the authority's transaction: a bootstrap the trail cannot
+        # hold does not commit.
+        recorder.record_identity_activated(
+            None,
+            provider=provider_type,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            actor_identity_id=None,
+            cause="bootstrap",
+            note=event.note,
+            role=None if event.role is None else event.role.role,
+            role_id=None if event.role is None else event.role.role_id,
+            tokens_per_day=quota_tokens_per_day if event.quota_written else None,
+            storage_bytes=quota_storage_bytes if event.quota_written else None,
+            on_behalf_of=event.on_behalf_of,
+            console_request_id=event.console_request_id,
+        )
+
+    try:
+        if session_engine.dialect.name == "sqlite":
+            sqlite_store = session_engine.url.database
+            if sqlite_store is not None and sqlite_store != ":memory:":
+                Path(sqlite_store).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            initialize_session_schema(session_engine)
+        except SessionSchemaError as exc:
+            typer.echo(f"Error: sessions store at {resolved_session_db_url} is not at the current schema: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        try:
+            activated = RepositoryIdentityAuthority(session_engine).bootstrap_admin(
+                claims=claims,
+                note=note,
+                quota_tokens_per_day=quota_tokens_per_day,
+                quota_storage_bytes=quota_storage_bytes,
+                record=record,
+            )
+        except AdminAlreadyBootstrapped as exc:
+            typer.echo("Error: an active human admin already exists; grant roles through the admin API instead", err=True)
+            raise typer.Exit(1) from exc
+        except IdentityAlreadyDisabled as exc:
+            typer.echo(f"Error: the identity for {provider}:{subject} is disabled; enable it through the admin API first", err=True)
+            raise typer.Exit(1) from exc
+        except RoleForbiddenForIdentity as exc:
+            typer.echo(f"Error: the identity for {provider}:{subject} is a service identity; admin is a human role", err=True)
+            raise typer.Exit(1) from exc
+    finally:
+        session_engine.dispose()
+    typer.echo(f"Bootstrapped admin {activated.record.username} ({activated.record.identity_id}) for {provider}:{subject}")
 
 
 @app.command()

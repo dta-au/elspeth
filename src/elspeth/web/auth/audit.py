@@ -5,15 +5,22 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
 
 import jwt as pyjwt
 import structlog
 from fastapi import Request
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.auth import (
+    AUTH_EVENT_CONSOLE_REQUEST_ID_KEY,
+    AUTH_EVENT_ON_BEHALF_OF_KEY,
+    AuthProviderType,
+    IdentityRole,
+    RelationshipType,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -114,6 +121,112 @@ class AuthAuditWriter(Protocol):
         reason: str,
     ) -> None: ...
 
+    def record_logout(
+        self,
+        request: Request,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+    ) -> None: ...
+
+    # Admin mutations (identity sprint step D). ``request`` is optional
+    # because the same mutation reaches the trail from three surfaces: the
+    # admin routes (a request), the bootstrap seed inside the login worker
+    # (none), and the operator CLI (none). Absent means the request columns
+    # are NULL, never invented.
+    def record_identity_activated(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str | None,
+        cause: AdminActivationCause,
+        note: str,
+        role: IdentityRole | None,
+        role_id: str | None,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None: ...
+
+    def record_identity_enabled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str,
+        note: str,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None: ...
+
+    def record_identity_disabled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str,
+        reason: str,
+        revoked_relationship_ids: tuple[str, ...],
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None: ...
+
+    def record_role_changed(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str | None,
+        actor_identity_id: str,
+        change: RoleChange,
+        role: IdentityRole,
+        role_id: str,
+        scope: str | None,
+        expires_at: datetime | None,
+        note: str | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None: ...
+
+    def record_relationship_changed(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        actor_identity_id: str,
+        change: RelationshipChange,
+        relationship_id: str,
+        from_identity_id: str,
+        to_identity_id: str,
+        relationship_type: RelationshipType,
+        note: str | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None: ...
+
+
+AdminActivationCause = Literal["admin_activation", "pre_provision", "bootstrap"]
+"""How an ``identity_activated`` admin row came to be written.
+
+``admin_activation`` is the tick of approval on a pending row;
+``pre_provision`` creates the active row before first login; ``bootstrap``
+is the first administrator activating themselves (D20), from the seed at
+first login or from the operator CLI.
+"""
+
+RoleChange = Literal["granted", "revoked"]
+RelationshipChange = Literal["asserted", "revoked"]
+
 
 class AuthAuditOperation(StrEnum):
     LOGIN_SUCCESS_AND_TOKEN_ISSUED = "login_success_and_token_issued"
@@ -122,6 +235,12 @@ class AuthAuditOperation(StrEnum):
     AUTH_FAILURE = "auth_failure"
     LOGIN_FAILURE = "login_failure"
     IDENTITY_RETIRED = "identity_retired"
+    LOGOUT = "logout"
+    IDENTITY_ACTIVATED = "identity_activated"
+    IDENTITY_ENABLED = "identity_enabled"
+    IDENTITY_DISABLED = "identity_disabled"
+    ROLE_CHANGED = "role_changed"
+    RELATIONSHIP_CHANGED = "relationship_changed"
 
 
 def _bounded_text(value: str | None, *, max_length: int = MAX_AUTH_AUDIT_TEXT_LENGTH) -> str | None:
@@ -551,3 +670,306 @@ class AuthAuditRecorder:
                     "reason": _bounded_text(reason),
                 },
             )
+
+    def record_logout(
+        self,
+        request: Request,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+    ) -> None:
+        """Write the ``logout`` row. The client discards the token; nothing is revoked server-side (spec rev2)."""
+        with self._open_landscape(AuthAuditOperation.LOGOUT) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="logout",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=_request_id(request),
+                client_host=_client_host(request),
+                user_agent=_bounded_text(_optional_header(request, "user-agent")),
+                metadata=_request_metadata(request),
+            )
+
+    def record_identity_activated(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str | None,
+        cause: AdminActivationCause,
+        note: str,
+        role: IdentityRole | None,
+        role_id: str | None,
+        tokens_per_day: int | None,
+        storage_bytes: int | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None:
+        """Write ``identity_activated``, then ``role_granted`` and ``quota_set`` when the activation wrote them.
+
+        One Landscape open, in the order an administrator reads them: the
+        identity was admitted, this is the role it was admitted with, and
+        this is its allowance. Invoked INSIDE the authority's transaction,
+        so an activation this trail cannot hold does not commit.
+        """
+        provenance = _admin_provenance(
+            request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
+        )
+        with self._open_landscape(AuthAuditOperation.IDENTITY_ACTIVATED) as db:
+            recorder = RecorderFactory(db).auth_audit
+            recorder.record_auth_event(
+                event_type="identity_activated",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                metadata={**provenance.metadata, "cause": cause, "note": _bounded_text(note)},
+                **provenance.request_columns,
+            )
+            if role is not None and role_id is not None:
+                recorder.record_auth_event(
+                    event_type="role_granted",
+                    outcome="success",
+                    provider=provider,
+                    identity_id=identity_id,
+                    user_id=username,
+                    username=username,
+                    failure_category=None,
+                    metadata={**provenance.metadata, "cause": cause, "role": role, "role_id": role_id, "scope": None, "expires_at": None},
+                    **provenance.request_columns,
+                )
+            if tokens_per_day is not None and storage_bytes is not None:
+                recorder.record_auth_event(
+                    event_type="quota_set",
+                    outcome="success",
+                    provider=provider,
+                    identity_id=identity_id,
+                    user_id=username,
+                    username=username,
+                    failure_category=None,
+                    metadata={
+                        **provenance.metadata,
+                        "tokens_per_day": tokens_per_day,
+                        "storage_bytes": storage_bytes,
+                        "source": "container_defaults",
+                    },
+                    **provenance.request_columns,
+                )
+
+    def record_identity_enabled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str,
+        note: str,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None:
+        provenance = _admin_provenance(
+            request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
+        )
+        with self._open_landscape(AuthAuditOperation.IDENTITY_ENABLED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_enabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                metadata={**provenance.metadata, "note": _bounded_text(note)},
+                **provenance.request_columns,
+            )
+
+    def record_identity_disabled(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        actor_identity_id: str,
+        reason: str,
+        revoked_relationship_ids: tuple[str, ...],
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None:
+        """The administrative disable; ``record_identity_retired`` is the credential-deletion form of the same event."""
+        provenance = _admin_provenance(
+            request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
+        )
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DISABLED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_disabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "cause": "admin_disable",
+                    "reason": _bounded_text(reason),
+                    "revoked_relationship_ids": list(revoked_relationship_ids),
+                },
+                **provenance.request_columns,
+            )
+
+    def record_role_changed(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str | None,
+        actor_identity_id: str,
+        change: RoleChange,
+        role: IdentityRole,
+        role_id: str,
+        scope: str | None,
+        expires_at: datetime | None,
+        note: str | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None:
+        provenance = _admin_provenance(
+            request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
+        )
+        with self._open_landscape(AuthAuditOperation.ROLE_CHANGED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="role_granted" if change == "granted" else "role_revoked",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "role": role,
+                    "role_id": role_id,
+                    "scope": scope,
+                    "expires_at": None if expires_at is None else expires_at.isoformat(),
+                    "note": _bounded_text(note),
+                },
+                **provenance.request_columns,
+            )
+
+    def record_relationship_changed(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        actor_identity_id: str,
+        change: RelationshipChange,
+        relationship_id: str,
+        from_identity_id: str,
+        to_identity_id: str,
+        relationship_type: RelationshipType,
+        note: str | None,
+        on_behalf_of: str | None,
+        console_request_id: str | None,
+    ) -> None:
+        """The row is anchored on the overseen identity (``to``); the edge's other end is metadata."""
+        provenance = _admin_provenance(
+            request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
+        )
+        with self._open_landscape(AuthAuditOperation.RELATIONSHIP_CHANGED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="relationship_asserted" if change == "asserted" else "relationship_revoked",
+                outcome="success",
+                provider=provider,
+                identity_id=to_identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "relationship_id": relationship_id,
+                    "relationship_type": relationship_type,
+                    "from_identity_id": from_identity_id,
+                    "to_identity_id": to_identity_id,
+                    "note": _bounded_text(note),
+                },
+                **provenance.request_columns,
+            )
+
+
+class _AdminProvenanceMetadata(TypedDict):
+    """The metadata every admin-mutation row starts from; the two console keys are the L0-pinned names."""
+
+    actor: str
+    on_behalf_of: str | None
+    console_request_id: str | None
+    method: NotRequired[str]
+    path: NotRequired[str]
+
+
+class _RequestColumns(TypedDict):
+    """The three request-derived columns of an ``auth_events`` row, ``None`` when there was no request."""
+
+    request_id: str | None
+    client_host: str | None
+    user_agent: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdminProvenance:
+    """What an admin-mutation row says about who asked, and through which request."""
+
+    metadata: _AdminProvenanceMetadata
+    request_columns: _RequestColumns
+
+
+def _admin_provenance(
+    request: Request | None,
+    *,
+    actor_identity_id: str | None,
+    on_behalf_of: str | None,
+    console_request_id: str | None,
+) -> _AdminProvenance:
+    """The provenance every admin mutation row carries.
+
+    ``actor`` is the administrator's identity_id, or ``operator`` for the
+    two actor-less paths (bootstrap seed, operator CLI). The two console
+    keys are ALWAYS present (L0-pinned), ``None`` for a human acting for
+    themselves, so a reader never has to guess whether a missing key meant
+    "not a console" or "written before the keys existed".
+    """
+    actor = "operator" if actor_identity_id is None else actor_identity_id
+    if request is None:
+        return _AdminProvenance(
+            metadata={
+                "actor": actor,
+                AUTH_EVENT_ON_BEHALF_OF_KEY: _bounded_text(on_behalf_of),
+                AUTH_EVENT_CONSOLE_REQUEST_ID_KEY: _bounded_text(console_request_id),
+            },
+            request_columns={"request_id": None, "client_host": None, "user_agent": None},
+        )
+    return _AdminProvenance(
+        metadata={
+            "actor": actor,
+            AUTH_EVENT_ON_BEHALF_OF_KEY: _bounded_text(on_behalf_of),
+            AUTH_EVENT_CONSOLE_REQUEST_ID_KEY: _bounded_text(console_request_id),
+            "method": request.method,
+            "path": request.url.path,
+        },
+        request_columns={
+            "request_id": _request_id(request),
+            "client_host": _client_host(request),
+            "user_agent": _bounded_text(_optional_header(request, "user-agent")),
+        },
+    )

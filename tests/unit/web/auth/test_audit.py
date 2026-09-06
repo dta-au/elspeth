@@ -612,3 +612,279 @@ class TestSsoRowsCarryTheirJoins:
             _request(), provider="local", user_id="ada", username="ada", access_token=_issued_token(), issuance_path="login"
         )
         assert "login_request_id" not in repository.record_token_issued.call_args.kwargs["metadata"]
+
+
+# ── Admin mutations and logout (identity sprint step D) ──────────────────
+
+
+def _durable_recorder(tmp_path: Any) -> tuple[AuthAuditRecorder, str]:
+    landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    return AuthAuditRecorder(landscape_url=landscape_url, landscape_passphrase=None, create_tables=True), landscape_url
+
+
+def _durable_rows(landscape_url: str) -> list[Any]:
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import auth_events_table
+
+    with LandscapeDB.from_url(landscape_url) as db, db.read_only_connection() as conn:
+        return list(conn.execute(select(auth_events_table).order_by(auth_events_table.c.occurred_at)).fetchall())
+
+
+def _metadata(row: Any) -> dict[str, Any]:
+    import json
+
+    return json.loads(row.metadata_json)
+
+
+_PROVENANCE: dict[str, object] = {"on_behalf_of": None, "console_request_id": None}
+
+
+def test_admin_provenance_keys_are_the_l0_pinned_names() -> None:
+    """The writer and every reader must name the same keys (spec rev2.2); the contract owns them."""
+    from elspeth.contracts.auth import AUTH_EVENT_CONSOLE_REQUEST_ID_KEY, AUTH_EVENT_ON_BEHALF_OF_KEY
+
+    assert set(_PROVENANCE) == {AUTH_EVENT_ON_BEHALF_OF_KEY, AUTH_EVENT_CONSOLE_REQUEST_ID_KEY}
+
+
+def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_request(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_activated(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id="identity-admin",
+        cause="admin_activation",
+        note="approved",
+        role="user",
+        role_id="role-1",
+        tokens_per_day=1000,
+        storage_bytes=2000,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["identity_activated", "role_granted", "quota_set"]
+    for row in rows:
+        assert (row.outcome, row.provider, row.identity_id, row.user_id, row.username) == ("success", "oidc", "identity-1", "ada", "ada")
+        assert (row.request_id, row.client_host, row.user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
+        metadata = _metadata(row)
+        assert metadata["actor"] == "identity-admin"
+        assert {key: metadata[key] for key in _PROVENANCE} == _PROVENANCE
+        assert (metadata["method"], metadata["path"]) == ("POST", "/api/auth/login")
+    assert _metadata(rows[0])["cause"] == "admin_activation" and _metadata(rows[0])["note"] == "approved"
+    assert _metadata(rows[1])["role"] == "user" and _metadata(rows[1])["role_id"] == "role-1"
+    assert (_metadata(rows[2])["tokens_per_day"], _metadata(rows[2])["storage_bytes"]) == (1000, 2000)
+
+
+def test_a_request_less_bootstrap_activation_writes_null_request_columns_and_an_operator_actor(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_activated(
+        None,
+        provider="vanguard",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id=None,
+        cause="bootstrap",
+        note="seed",
+        role="admin",
+        role_id="role-1",
+        tokens_per_day=None,
+        storage_bytes=None,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["identity_activated", "role_granted"]
+    for row in rows:
+        assert (row.request_id, row.client_host, row.user_agent) == (None, None, None)
+        metadata = _metadata(row)
+        assert metadata["actor"] == "operator"
+        assert "method" not in metadata and "path" not in metadata
+
+
+def test_console_provenance_is_recorded_when_supplied(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_enabled(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id="identity-service",
+        note="re-enabled from the console",
+        on_behalf_of="person@example.gov.au",
+        console_request_id="console-42",
+    )
+    (row,) = _durable_rows(url)
+    assert row.event_type == "identity_enabled"
+    metadata = _metadata(row)
+    assert (metadata["on_behalf_of"], metadata["console_request_id"]) == ("person@example.gov.au", "console-42")
+    assert metadata["note"] == "re-enabled from the console"
+
+
+def test_disable_role_and_relationship_rows(tmp_path: Any) -> None:
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_disabled(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id="identity-admin",
+        reason="left",
+        revoked_relationship_ids=("rel-1", "rel-2"),
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_role_changed(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username=None,
+        actor_identity_id="identity-admin",
+        change="granted",
+        role="approver",
+        role_id="role-1",
+        scope=None,
+        expires_at=datetime(2027, 1, 1, tzinfo=UTC),
+        note="lead",
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_role_changed(
+        None,
+        provider="oidc",
+        identity_id="identity-1",
+        username=None,
+        actor_identity_id="identity-admin",
+        change="revoked",
+        role="approver",
+        role_id="role-1",
+        scope=None,
+        expires_at=None,
+        note=None,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_relationship_changed(
+        _request(),
+        provider="oidc",
+        actor_identity_id="identity-admin",
+        change="asserted",
+        relationship_id="rel-9",
+        from_identity_id="identity-approver",
+        to_identity_id="identity-1",
+        relationship_type="approver",
+        note="org chart",
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    recorder.record_relationship_changed(
+        _request(),
+        provider="oidc",
+        actor_identity_id="identity-admin",
+        change="revoked",
+        relationship_id="rel-9",
+        from_identity_id="identity-approver",
+        to_identity_id="identity-1",
+        relationship_type="approver",
+        note=None,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == [
+        "identity_disabled",
+        "role_granted",
+        "role_revoked",
+        "relationship_asserted",
+        "relationship_revoked",
+    ]
+    disabled = _metadata(rows[0])
+    assert (disabled["cause"], disabled["reason"], disabled["revoked_relationship_ids"]) == ("admin_disable", "left", ["rel-1", "rel-2"])
+    granted = _metadata(rows[1])
+    assert (granted["role"], granted["role_id"], granted["expires_at"], granted["note"]) == (
+        "approver",
+        "role-1",
+        "2027-01-01T00:00:00+00:00",
+        "lead",
+    )
+    assert rows[1].user_id is None and rows[1].username is None and rows[1].identity_id == "identity-1"
+    assert rows[2].request_id is None and _metadata(rows[2])["expires_at"] is None
+    asserted = _metadata(rows[3])
+    assert (asserted["relationship_id"], asserted["from_identity_id"], asserted["to_identity_id"]) == (
+        "rel-9",
+        "identity-approver",
+        "identity-1",
+    )
+    assert rows[3].identity_id == "identity-1", "anchored on the overseen identity"
+    assert rows[3].user_id is None and rows[3].username is None
+    assert _metadata(rows[4])["note"] is None
+    assert all({key: _metadata(row)[key] for key in _PROVENANCE} == _PROVENANCE for row in rows)
+
+
+def test_logout_writes_a_request_bound_row(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_logout(_request(), provider="entra", identity_id="identity-1", username="ada")
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome, row.provider, row.identity_id, row.user_id, row.username) == (
+        "logout",
+        "success",
+        "entra",
+        "identity-1",
+        "ada",
+        "ada",
+    )
+    assert (row.request_id, row.client_host, row.user_agent) == ("request-id", "127.0.0.1", "bounded-agent")
+    assert _metadata(row) == {"method": "POST", "path": "/api/auth/login"}
+
+
+def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(monkeypatch: pytest.MonkeyPatch) -> None:
+    failure = LandscapeRecordError("RAW_SQL_MARKER CREDENTIAL_MARKER")
+
+    class _DBContext:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    class _FakeLandscapeDB:
+        @classmethod
+        def from_url(cls, url: str, **kwargs: object) -> _DBContext:
+            return _DBContext()
+
+    auth_repository = create_autospec(AuthAuditRepository, instance=True)
+    auth_repository.record_auth_event.side_effect = failure
+    monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
+    monkeypatch.setattr(
+        audit_module,
+        "RecorderFactory",
+        create_autospec(audit_module.RecorderFactory, return_value=SimpleNamespace(auth_audit=auth_repository)),
+    )
+    recorder = AuthAuditRecorder(landscape_url="sqlite:///auth-audit.db", landscape_passphrase=None, create_tables=False)
+    with capture_logs() as logs, pytest.raises(LandscapeRecordError) as exc_info:
+        recorder.record_identity_activated(
+            None,
+            provider="local",
+            identity_id="identity-1",
+            username="ada",
+            actor_identity_id=None,
+            cause="bootstrap",
+            note="seed",
+            role=None,
+            role_id=None,
+            tokens_per_day=None,
+            storage_bytes=None,
+            on_behalf_of=None,
+            console_request_id=None,
+        )
+    assert exc_info.value is failure
+    assert len(logs) == 1
+    operation = logs[0]["operation"]
+    operation_value = operation.value if isinstance(operation, audit_module.AuthAuditOperation) else operation
+    assert operation_value == "identity_activated"
+    assert "RAW_SQL_MARKER" not in repr(logs)
