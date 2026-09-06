@@ -1009,10 +1009,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 871
+  Mapping[str, Any]: 866
   Mapping[str, object]: 285
   MutableMapping[str, Any]: 13
-  boundary: 62
+  boundary: 63
   dict[str, Any]: 1143
   dict[str, object]: 389
-  soft: 2701
+  soft: 2696

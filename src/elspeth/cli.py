@@ -2028,7 +2028,7 @@ def _deferred_identity_retirer(session_db_url: str, landscape_url: str) -> Retir
     user to. So ``add`` binds the real authority, with the real audit sink,
     behind a first-call open.
     """
-    from elspeth.web.sessions.identity_repository import local_identity_retirer
+    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
 
     def retire(username: str) -> None:
         engine = _composer_session_engine(session_db_url)
@@ -2144,7 +2144,7 @@ def composer_users_remove(
     ),
 ) -> None:
     """Remove a local Composer web user and retire the identity it was bound to."""
-    from elspeth.web.sessions.identity_repository import local_identity_retirer
+    from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority, local_identity_retirer
     from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
     db_path = _resolve_composer_auth_db(data_dir=data_dir, auth_db=auth_db)
