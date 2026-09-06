@@ -16,9 +16,30 @@ from typing import Any
 
 import pytest
 
+from elspeth.web.auth.claims import IdTokenClaims, UserinfoClaims, claim_is_exactly_true
+from elspeth.web.auth.id_token import parse_id_token_claims
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.auth.providers import PROFILE_REGISTRY, get_profile
 from elspeth.web.config import WebSettings
+
+
+def _id_claims(**overrides: Any) -> IdTokenClaims:
+    """Owned claims as the token boundary would have produced them."""
+    fields: dict[str, Any] = {
+        "issuer": "https://issuer.example.gov.au",
+        "subject": "s",
+        "audience": "client",
+        "issued_at": 1_700_000_000,
+        "expires_at": 1_700_000_300,
+    }
+    fields.update(overrides)
+    return IdTokenClaims(**fields)
+
+
+def _userinfo(**overrides: Any) -> UserinfoClaims:
+    fields: dict[str, Any] = {"subject": "s"}
+    fields.update(overrides)
+    return UserinfoClaims(**fields)
 
 
 def _settings(**overrides: object) -> WebSettings:
@@ -65,17 +86,17 @@ class TestEntraTenantCheck:
     def test_a_token_from_another_tenant_is_refused(self) -> None:
         settings = _idp_settings("entra", entra_tenant_id="ours")
         with pytest.raises(AuthenticationError, match="different tenant"):
-            get_profile("entra").claim_checks({"tid": "theirs"}, settings)
+            get_profile("entra").claim_checks(_id_claims(tenant_id="theirs"), settings)
 
     def test_a_token_with_no_tenant_claim_is_refused(self) -> None:
         """Absence must not read as "unrestricted"."""
         settings = _idp_settings("entra", entra_tenant_id="ours")
         with pytest.raises(AuthenticationError, match="missing the required claim 'tid'"):
-            get_profile("entra").claim_checks({}, settings)
+            get_profile("entra").claim_checks(_id_claims(), settings)
 
     def test_the_configured_tenant_passes(self) -> None:
         settings = _idp_settings("entra", entra_tenant_id="ours")
-        get_profile("entra").claim_checks({"tid": "ours"}, settings)
+        get_profile("entra").claim_checks(_id_claims(tenant_id="ours"), settings)
 
     def test_the_issuer_is_derived_from_the_tenant_not_configured(self) -> None:
         settings = _idp_settings("entra", entra_tenant_id="ours")
@@ -94,32 +115,35 @@ class TestGoogleHostedDomainCheck:
     def test_a_personal_account_with_no_hosted_domain_is_refused(self) -> None:
         settings = _idp_settings("google", google_hosted_domain="example.gov.au")
         with pytest.raises(AuthenticationError, match="missing the required claim 'hd'"):
-            get_profile("google").claim_checks({"email_verified": True}, settings)
+            get_profile("google").claim_checks(_id_claims(email_verified=True), settings)
 
     def test_another_workspace_domain_is_refused(self) -> None:
         settings = _idp_settings("google", google_hosted_domain="example.gov.au")
         with pytest.raises(AuthenticationError, match="different hosted domain"):
-            get_profile("google").claim_checks({"email_verified": True, "hd": "elsewhere.com"}, settings)
+            get_profile("google").claim_checks(_id_claims(email_verified=True, hosted_domain="elsewhere.com"), settings)
 
     def test_an_unverified_email_is_refused_even_in_the_right_domain(self) -> None:
         settings = _idp_settings("google", google_hosted_domain="example.gov.au")
         with pytest.raises(AuthenticationError, match="verified email"):
-            get_profile("google").claim_checks({"email_verified": False, "hd": "example.gov.au"}, settings)
+            get_profile("google").claim_checks(_id_claims(email_verified=False, hosted_domain="example.gov.au"), settings)
 
     def test_a_missing_email_verified_claim_is_refused(self) -> None:
         settings = _idp_settings("google", google_hosted_domain="example.gov.au")
         with pytest.raises(AuthenticationError, match="verified email"):
-            get_profile("google").claim_checks({"hd": "example.gov.au"}, settings)
+            get_profile("google").claim_checks(_id_claims(hosted_domain="example.gov.au"), settings)
 
     def test_a_truthy_non_true_email_verified_is_refused(self) -> None:
-        """``"false"`` is a non-empty string, and a loose check would admit it."""
-        settings = _idp_settings("google", google_hosted_domain="example.gov.au")
-        with pytest.raises(AuthenticationError, match="verified email"):
-            get_profile("google").claim_checks({"email_verified": "false", "hd": "example.gov.au"}, settings)
+        """``"false"`` is a non-empty string, and a loose check would admit it.
+
+        The check now reads a boolean the token boundary produced, so the
+        rule is pinned where it is decided: only the JSON ``true`` is true.
+        """
+        assert claim_is_exactly_true(True) is True
+        assert all(claim_is_exactly_true(value) is False for value in ("false", "true", 1, "1", [True], None))
 
     def test_a_verified_workspace_account_passes(self) -> None:
         settings = _idp_settings("google", google_hosted_domain="example.gov.au")
-        get_profile("google").claim_checks({"email_verified": True, "hd": "example.gov.au"}, settings)
+        get_profile("google").claim_checks(_id_claims(email_verified=True, hosted_domain="example.gov.au"), settings)
 
 
 class TestEndpointOriginPolicy:
@@ -160,27 +184,25 @@ class TestEndpointOriginPolicy:
 
 
 class TestIdentityMapping:
-    def test_a_token_with_no_subject_is_refused_by_every_profile(self) -> None:
-        """``(provider, subject)`` is the identity key; blank collapses it."""
+    def test_every_profile_keys_the_identity_on_the_boundary_subject(self) -> None:
+        """``(provider, subject)`` is the identity key. A blank or missing ``sub`` never
+        reaches a profile: the token boundary refuses it (``TestIdTokenClaimsBoundary``)."""
         for name, profile in PROFILE_REGISTRY.items():
-            with pytest.raises(AuthenticationError, match="sub"):
-                profile.map_identity({"email": "a@b.gov.au"}, None)
-            with pytest.raises(AuthenticationError, match="non-blank"):
-                profile.map_identity({"sub": "   "}, None)
-            assert name  # every registered profile was exercised
+            mapped = profile.map_identity(_id_claims(subject="s-1"), _userinfo(subject="s-1") if profile.userinfo else None)
+            assert (mapped.provider, mapped.subject) == (name, "s-1")
 
     def test_cognito_username_fallback_order(self) -> None:
         profile = get_profile("oidc")
-        preferred = profile.map_identity({"sub": "s", "preferred_username": "ada", "cognito:username": "cog"}, None)
+        preferred = profile.map_identity(_id_claims(preferred_username="ada", cognito_username="cog"), None)
         assert preferred.username == "ada"
-        cognito = profile.map_identity({"sub": "s", "cognito:username": "cog"}, None)
+        cognito = profile.map_identity(_id_claims(cognito_username="cog"), None)
         assert cognito.username == "cog"
-        bare = profile.map_identity({"sub": "s"}, None)
+        bare = profile.map_identity(_id_claims(), None)
         assert bare.username == "s"
 
     def test_entra_collects_no_groups(self) -> None:
         """D17: IdP groups are organisation facts, never compartment facts."""
-        claims = profile_claims = {"sub": "s", "preferred_username": "ada", "groups": ["admins", "everyone"]}
+        claims = _id_claims(preferred_username="ada", groups=("admins", "everyone"))
         mapped = get_profile("entra").map_identity(claims, None)
         # Asserted against the DECLARED fields, not probed with hasattr.
         # IdentityClaims is a type we own, so its shape is knowable
@@ -188,35 +210,41 @@ class TestIdentityMapping:
         # would also pass vacuously if the class were ever renamed out from
         # under this test.
         assert "groups" not in {declared.name for declared in dataclasses.fields(mapped)}
-        assert profile_claims["groups"] == ["admins", "everyone"]  # untouched, just unread
+        assert claims.groups == ("admins", "everyone")  # untouched, just unread
 
     def test_vanguard_assembles_a_display_name_and_carries_the_abn(self) -> None:
         mapped = get_profile("vanguard").map_identity(
-            {"sub": "person@example.gov.au"},
-            {"given_name": "Ada", "family_name": "Lovelace", "abn": "51824753556"},
+            _id_claims(subject="person@example.gov.au"),
+            _userinfo(subject="person@example.gov.au", given_name="Ada", family_name="Lovelace", abn="51824753556"),
         )
         assert mapped.display_name == "Ada Lovelace"
         assert mapped.organisation_id == "51824753556"
         assert mapped.subject == "person@example.gov.au"
 
     def test_vanguard_survives_a_partial_name(self) -> None:
-        mapped = get_profile("vanguard").map_identity({"sub": "p@x.gov.au"}, {"given_name": "Ada"})
+        subject = _id_claims(subject="p@x.gov.au")
+        mapped = get_profile("vanguard").map_identity(subject, _userinfo(subject="p@x.gov.au", given_name="Ada"))
         assert mapped.display_name == "Ada"
-        onlyfamily = get_profile("vanguard").map_identity({"sub": "p@x.gov.au"}, {"family_name": "Lovelace"})
+        onlyfamily = get_profile("vanguard").map_identity(subject, _userinfo(subject="p@x.gov.au", family_name="Lovelace"))
         assert onlyfamily.display_name == "Lovelace"
-        neither = get_profile("vanguard").map_identity({"sub": "p@x.gov.au"}, {})
+        neither = get_profile("vanguard").map_identity(subject, _userinfo(subject="p@x.gov.au"))
         assert neither.display_name is None
 
     def test_a_non_string_claim_never_reaches_an_owned_field(self) -> None:
-        """An IdP sending the wrong type must not deny access over a display name."""
-        mapped = get_profile("google").map_identity({"sub": "s", "name": 42, "email": ["a@b"]}, None)
+        """An IdP sending the wrong type must not deny access over a display name.
+
+        Through the token boundary, as production does: the wrong-typed
+        cosmetic claims read as absent there, and the profile sees ``None``.
+        """
+        payload = {"iss": "https://issuer.example.gov.au", "sub": "s", "aud": "client", "iat": 1, "exp": 2, "name": 42, "email": ["a@b"]}
+        mapped = get_profile("google").map_identity(parse_id_token_claims(payload=payload), None)
         assert mapped.display_name is None
         assert mapped.email is None
         assert mapped.username == "s"
 
     def test_every_profile_maps_to_its_own_provider_value(self) -> None:
         for name, profile in PROFILE_REGISTRY.items():
-            mapped = profile.map_identity({"sub": "s"}, {} if profile.userinfo else None)
+            mapped = profile.map_identity(_id_claims(), _userinfo() if profile.userinfo else None)
             assert mapped.provider == name
 
 

@@ -14,6 +14,7 @@ from typing import cast
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.auth import AuthProviderType
@@ -26,6 +27,19 @@ from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConfl
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
 from elspeth.web.auth.protocol import AuthProvider, CredentialAuthProvider
+from elspeth.web.auth.sso import (
+    COOKIE_NAME,
+    AdmittedIdentity,
+    CallbackQuery,
+    SsoLoginError,
+    SsoRuntime,
+    authorization_redirect,
+    complete_login,
+    cookie_attributes,
+    failure_category,
+    failure_location,
+    login_callback,
+)
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import check_auth_rate_limit
 from elspeth.web.validation import has_visible_content
@@ -144,6 +158,22 @@ class AuthConfigResponse(_StrictResponse):
     oidc_client_id: str | None = None
     authorization_endpoint: str | None = None
     token_endpoint: str | None = None
+    # Where the SPA's "Sign in with SSO" button navigates. ``None`` whenever
+    # the deployment is not wired for SSO — the same fact that makes the
+    # three ``/sso/*`` routes refuse — so the button is hidden by the
+    # condition that would make it fail, not by a separate guess.
+    sso_start_url: str | None = None
+
+
+class SsoCompleteRequest(BaseModel):
+    """Request body for POST /api/auth/sso/complete: the handoff code from the fragment."""
+
+    # A handoff code is 43 characters (token_urlsafe(32)). The bound is
+    # generous but present: the code is hashed as-is, and an unauthenticated
+    # caller must not be able to make the hash the expensive part.
+    code: str = Field(min_length=1, max_length=128)
+
+    model_config = ConfigDict(strict=True, extra="forbid")
 
 
 def _mark_sensitive_auth_response_uncacheable(response: Response) -> None:
@@ -154,6 +184,73 @@ def _mark_sensitive_auth_response_uncacheable(response: Response) -> None:
 
 def _auth_audit_recorder(request: Request) -> AuthAuditWriter:
     return cast(AuthAuditWriter, request.app.state.auth_audit_recorder)
+
+
+def _sso_runtime_if_wired(request: Request) -> SsoRuntime | None:
+    """The SSO runtime, or ``None`` when this deployment is not wired for it.
+
+    ONE attribute, ONE owned type. ``app.state.sso`` is set by the app
+    factory when the provider is an IdP and every SSO setting resolved; the
+    routes and ``/config`` read it here and nowhere else. Absent, or present
+    but not an ``SsoRuntime``, means "not wired" — and that answer is the
+    same whether the process is genuinely local-auth or is running a build in
+    which the wiring has not landed yet. Nothing here reaches for a second
+    attribute or guesses.
+    """
+    settings: WebSettings = request.app.state.settings
+    if settings.auth_provider == "local":
+        return None
+    try:
+        candidate = request.app.state.sso
+    except AttributeError:
+        # Absent IS the answer: this deployment is not wired. Returning the
+        # "not wired" value here is the refusal, not a swallowed error.
+        return None
+    if type(candidate) is not SsoRuntime:
+        return None
+    return candidate
+
+
+async def _sso_runtime(request: Request, *, stage: str) -> SsoRuntime:
+    """The SSO runtime for a ``/sso/*`` route, or the route's refusal.
+
+    Local auth: 404, the route does not exist for this deployment — same as
+    ``/login`` on an IdP deployment. An IdP provider with no runtime: 503
+    ``provider_unavailable`` WITH an audit row, because a browser reached an
+    SSO route on a deployment that says it does SSO and could not be served.
+    That is exactly the unwired state a build carries before its wiring
+    lands, and it fails closed rather than half-way.
+    """
+    settings: WebSettings = request.app.state.settings
+    if settings.auth_provider == "local":
+        raise HTTPException(status_code=404, detail="Not found")
+    runtime = _sso_runtime_if_wired(request)
+    if runtime is None:
+        _auth_audit_recorder(request).record_auth_failure(
+            request,
+            provider=settings.auth_provider,
+            failure_category="provider_unavailable",
+            failure_stage=stage,
+            user_id=None,
+            username=None,
+            exception_class=None,
+        )
+        raise HTTPException(status_code=503, detail="Single sign-on is not configured on this deployment")
+    return runtime
+
+
+def _single_query_value(request: Request, key: str) -> str | None:
+    """Exactly one occurrence of ``key`` in the query string, else ``None``.
+
+    The callback's query is written by whoever redirected the browser. A
+    duplicated ``state`` or ``code`` is not a value with a tie-break rule; it
+    is a request that does not match the one the IdP sends, and absence is
+    what the walk refuses on.
+    """
+    values = request.query_params.getlist(key)
+    if len(values) != 1:
+        return None
+    return values[0]
 
 
 def _route_auth_failure(
@@ -452,6 +549,7 @@ def create_auth_router() -> APIRouter:
         """
         settings: WebSettings = request.app.state.settings
         _mark_sensitive_auth_response_uncacheable(response)
+        sso_runtime = _sso_runtime_if_wired(request)
         return AuthConfigResponse(
             provider=settings.auth_provider,
             registration_mode=settings.registration_mode,
@@ -459,7 +557,153 @@ def create_auth_router() -> APIRouter:
             oidc_client_id=settings.oidc_client_id,
             authorization_endpoint=request.app.state.oidc_authorization_endpoint,
             token_endpoint=request.app.state.oidc_token_endpoint,
+            sso_start_url=None if sso_runtime is None else sso_runtime.client.start_url,
         )
+
+    # ── the SSO walk ─────────────────────────────────────────────────────
+    #
+    # Three routes, one service (web/auth/sso.py). These are DARK until the
+    # app factory sets ``app.state.sso`` (identity sprint step C-wiring):
+    # until then every one of them refuses through ``_sso_runtime`` and
+    # ``/config`` reports ``sso_start_url: null``. The bodies below do no
+    # verification of their own — they read the request, hand it to the
+    # service, and write the audit rows the service leaves to them.
+
+    @router.get("/sso/start")
+    async def sso_start(
+        request: Request,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> RedirectResponse:
+        """Begin a login: seal a transaction cookie and send the browser to the IdP.
+
+        Accepts NO query parameters (spec §2 [rev2]): a return path here
+        would be an open-redirect parameter on the one route guaranteed to
+        be reachable unauthenticated. Anything supplied is ignored.
+        """
+        runtime = await _sso_runtime(request, stage="sso_start")
+        client = runtime.client
+        redirect = authorization_redirect(
+            authorization_endpoint=client.endpoints.authorization_endpoint,
+            client_id=client.client_id,
+            redirect_uri=client.redirect_uri,
+            scopes=client.scopes,
+            transaction_secret=client.transaction_secret,
+            provider=client.provider,
+        )
+        response = RedirectResponse(redirect.location, status_code=302)
+        response.set_cookie(**cookie_attributes(redirect.cookie_value))
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
+
+    @router.get("/sso/callback")
+    async def sso_callback(
+        request: Request,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> RedirectResponse:
+        """The IdP sent the browser back. Verify everything, hand back a handoff.
+
+        Every outcome is a redirect to the SPA's ``#/auth/callback`` route
+        with either ``code`` or ``error`` in the FRAGMENT, and every outcome
+        clears the transaction cookie — a cookie that survived a failed
+        callback would be a state the next login compares against.
+        """
+        runtime = await _sso_runtime(request, stage="sso_callback")
+        settings: WebSettings = request.app.state.settings
+        client = runtime.client
+        recorder = _auth_audit_recorder(request)
+        query = CallbackQuery(
+            code=_single_query_value(request, "code"),
+            state=_single_query_value(request, "state"),
+            error=_single_query_value(request, "error"),
+        )
+        cookie_value = request.cookies[COOKIE_NAME] if COOKIE_NAME in request.cookies else None
+
+        def record_login(identity: AdmittedIdentity) -> None:
+            recorder.record_login_success(
+                request,
+                provider=settings.auth_provider,
+                user_id=identity.identity_id,
+                username=identity.username,
+                identity_id=identity.identity_id,
+            )
+
+        try:
+            location = await login_callback(
+                query,
+                cookie_value,
+                client=client,
+                validator=runtime.validator,
+                claim_checks=runtime.claim_checks,
+                map_identity=runtime.map_identity,
+                upsert_identity=runtime.upsert_identity,
+                record_login=record_login,
+                handoffs=runtime.handoffs,
+                request_id=request.state.request_id,
+                transport=runtime.transport,
+            )
+        except (SsoLoginError, AuthProviderUnavailable) as exc:
+            category = failure_category(exc)
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=category,
+                failure_stage="sso_callback",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            location = failure_location(client.public_base_url, category)
+
+        response = RedirectResponse(location, status_code=302)
+        response.set_cookie(**cookie_attributes(None))
+        _mark_sensitive_auth_response_uncacheable(response)
+        return response
+
+    @router.post("/sso/complete", response_model=TokenResponse)
+    async def sso_complete(
+        body: SsoCompleteRequest,
+        request: Request,
+        response: Response,
+        _rate_limit: None = Depends(check_auth_rate_limit),
+    ) -> TokenResponse:
+        """Trade the handoff code for the session token. The only place one is minted."""
+        runtime = await _sso_runtime(request, stage="sso_complete")
+        settings: WebSettings = request.app.state.settings
+        recorder = _auth_audit_recorder(request)
+
+        def record_token_issued(identity: AdmittedIdentity, token: str, login_request_id: str) -> None:
+            recorder.record_token_issued(
+                request,
+                provider=settings.auth_provider,
+                user_id=identity.identity_id,
+                username=identity.username,
+                access_token=token,
+                issuance_path="sso_complete",
+                login_request_id=login_request_id,
+            )
+
+        try:
+            session = complete_login(
+                body.code,
+                handoffs=runtime.handoffs,
+                read_identity=runtime.read_identity,
+                issuer=runtime.issuer,
+                record_token_issued=record_token_issued,
+            )
+        except SsoLoginError as exc:
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=exc.category,
+                failure_stage="sso_complete",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            raise HTTPException(status_code=401, detail=exc.detail) from exc
+
+        _mark_sensitive_auth_response_uncacheable(response)
+        return TokenResponse(access_token=session.access_token)
 
     @router.get("/me", response_model=UserProfileResponse)
     async def me(

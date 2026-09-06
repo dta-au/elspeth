@@ -1392,7 +1392,6 @@ class TestOIDCBlankStringRejection:
 
     def test_oidc_browser_fields_have_closed_defaults(self) -> None:
         settings = WebSettings(**self._COMPOSER_DEFAULTS)
-        assert settings.oidc_authorization_allowed_origins == ()
         assert settings.oidc_token_endpoint is None
         assert settings.oidc_audience_claim == "aud"
 
@@ -1476,42 +1475,12 @@ class TestOIDCBlankStringRejection:
             "oidc_token_endpoint": "https://example.auth.ap-southeast-2.amazoncognito.com/oauth2/token",
             **self._COMPOSER_DEFAULTS,
         }
+        # There is no browser-origin allowlist any more: an IdP whose endpoints
+        # live off the issuer's origin (Cognito's hosted domain) is served by the
+        # SSO profile and its per-profile sso_endpoint_origins, never by the
+        # legacy browser path.
         with pytest.raises(ValidationError, match="not allowed"):
             WebSettings(**values)
-        settings = WebSettings(
-            **values,
-            oidc_authorization_allowed_origins=("https://example.auth.ap-southeast-2.amazoncognito.com",),
-        )
-        assert settings.oidc_authorization_endpoint is not None
-        assert settings.oidc_token_endpoint is not None
-
-    @pytest.mark.parametrize("provider", ["local", "entra"])
-    def test_allowlist_is_oidc_only(self, provider: str) -> None:
-        provider_fields: dict[str, object] = {}
-        if provider == "entra":
-            provider_fields = {
-                "oidc_audience": "audience",
-                "oidc_client_id": "client",
-                "entra_tenant_id": "tenant",
-            }
-        with pytest.raises(ValidationError, match="allowlist"):
-            WebSettings(
-                auth_provider=provider,  # type: ignore[arg-type]
-                oidc_authorization_allowed_origins=("https://login.example.com",),
-                **provider_fields,
-                **self._COMPOSER_DEFAULTS,
-            )
-
-    def test_allowlist_is_validated_without_explicit_endpoints(self) -> None:
-        with pytest.raises(ValidationError, match="bare-origin"):
-            WebSettings(
-                auth_provider="oidc",
-                oidc_issuer="https://issuer.example.com",
-                oidc_audience="audience",
-                oidc_client_id="client",
-                oidc_authorization_allowed_origins=("https://host.example.com/not-an-origin",),
-                **self._COMPOSER_DEFAULTS,
-            )
 
     def test_local_auth_blank_oidc_field_still_rejected(self) -> None:
         """Field validator fires regardless of auth_provider — blank is always invalid."""
@@ -2222,6 +2191,105 @@ class TestDevAdminUser:
     def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ELSPETH_WEB__DEV_ADMIN_USER", "john")
         assert web_config.settings_from_env().dev_admin_user == "john"
+
+
+# ==========================================================================
+# Break-glass SSO endpoint overrides.
+#
+# The four sso_* endpoint settings let an operator bypass discovery when an
+# IdP's document is wrong or unreachable. Until this landed they were accepted
+# unvalidated beyond a blank check, which made the break-glass path the
+# weakest way into a deployment: a typo — or an environment variable set by
+# something other than the operator — could point the token endpoint anywhere.
+# ==========================================================================
+
+_VANGUARD_ISSUER = "https://idp.example.gov.au"
+
+
+def _vanguard(**overrides: Any) -> WebSettings:
+    base: dict[str, Any] = {
+        "auth_provider": "vanguard",
+        "sso_issuer": _VANGUARD_ISSUER,
+        "sso_client_id": "elspeth",
+        "sso_client_secret": "s" * 40,
+        "sso_transaction_secret": "t" * 40,
+        "public_base_url": "https://elspeth.example.gov.au",
+        "compartment_id": "example-compartment",
+        "quota_default_tokens_per_day": 100_000,
+        "quota_default_storage_bytes": 1_000_000,
+    }
+    base.update(overrides)
+    return _settings(**base)
+
+
+def _all_four(origin: str = _VANGUARD_ISSUER, **overrides: Any) -> dict[str, Any]:
+    values = {
+        "sso_authorization_endpoint": f"{origin}/authorize",
+        "sso_token_endpoint": f"{origin}/token",
+        "sso_jwks_uri": f"{origin}/keys",
+        "sso_userinfo_endpoint": f"{origin}/userinfo",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_no_endpoint_overrides_is_the_ordinary_case() -> None:
+    """Positive control: discovery is the default and must stay unencumbered."""
+    settings = _vanguard()
+    assert settings.sso_authorization_endpoint is None
+
+
+def test_all_four_overrides_on_an_expected_origin_are_accepted() -> None:
+    """The other positive control — a break-glass path that refused everything
+    would pass every test below and be useless in the outage it exists for."""
+    settings = _vanguard(**_all_four())
+    assert settings.sso_token_endpoint == f"{_VANGUARD_ISSUER}/token"
+
+
+@pytest.mark.parametrize("omitted", ["sso_authorization_endpoint", "sso_token_endpoint", "sso_jwks_uri"])
+def test_a_partial_override_is_refused(omitted: str) -> None:
+    """All-or-none. A partial override silently mixes operator-supplied and
+    discovered endpoints, so WHICH origin policy applied to WHICH URL would
+    depend on which variables happened to be set."""
+    values = _all_four()
+    values[omitted] = None
+    with pytest.raises(ValidationError, match="all-or-none"):
+        _vanguard(**values)
+
+
+def test_userinfo_alone_is_not_an_override() -> None:
+    """With no endpoints to pair it with there is nothing to bypass discovery
+    FOR, so a lone userinfo is a misconfiguration rather than a narrow override."""
+    with pytest.raises(ValidationError, match="sso_userinfo_endpoint requires"):
+        _vanguard(sso_userinfo_endpoint=f"{_VANGUARD_ISSUER}/userinfo")
+
+
+def test_omitting_only_userinfo_is_allowed() -> None:
+    """userinfo is the one genuinely optional endpoint; a provider that does
+    not publish one is not misconfigured."""
+    settings = _vanguard(**_all_four(sso_userinfo_endpoint=None))
+    assert settings.sso_userinfo_endpoint is None
+
+
+@pytest.mark.parametrize("field", ["sso_authorization_endpoint", "sso_token_endpoint", "sso_jwks_uri", "sso_userinfo_endpoint"])
+def test_an_override_may_not_leave_the_profiles_expected_origins(field: str) -> None:
+    """THE point of validating these at all.
+
+    An override names a DIFFERENT URL on an origin the IdP is expected to
+    serve from. It is not a way to leave that set — otherwise break-glass is
+    an unauthenticated redirect of the whole login walk, and jwks_uri is the
+    worst of the four because it supplies the keys every signature is checked
+    against.
+    """
+    with pytest.raises(ValidationError, match=f"{field.removeprefix('sso_')} failed expected-origin check"):
+        _vanguard(**_all_four(**{field: "https://attacker.example.net/path"}))
+
+
+def test_an_override_still_meets_every_ssrf_check() -> None:
+    """The overrides go through the same parse as a discovered endpoint —
+    being operator-supplied does not exempt them."""
+    with pytest.raises(ValidationError, match="failed HTTPS check"):
+        _vanguard(**_all_four(sso_token_endpoint="http://idp.example.gov.au/token"))
 
 
 class TestInstanceId:

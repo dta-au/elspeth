@@ -1967,6 +1967,53 @@ class TestForkSession:
 # ── Route-level tests ───────────────────────────────────────────────────
 
 
+def _expire_dead_fork_worker_leases(
+    service: SessionServiceImpl,
+    *,
+    parent_id: uuid.UUID,
+    operation_id: str,
+    child_id: uuid.UUID,
+    expired_at: datetime,
+) -> None:
+    """Age every database-clocked lease a fork worker held past ``expired_at``.
+
+    Three rows, not two: the guided operation row, the parent's live
+    SESSION_FORK fence, and the child's live SESSION_FORK fence, which
+    ``_insert_fork_child`` mints as a shadow of the parent lease (same owner,
+    same expiry). A worker that died holds none of them.
+    """
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(guided_operations_table)
+            .where(
+                guided_operations_table.c.session_id == str(parent_id),
+                guided_operations_table.c.operation_id == operation_id,
+            )
+            .values(lease_expires_at=expired_at)
+        )
+        for session_id in (parent_id, child_id):
+            conn.execute(
+                update(session_operation_fences_table)
+                .where(
+                    session_operation_fences_table.c.session_id == str(session_id),
+                    session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
+                    session_operation_fences_table.c.released_at.is_(None),
+                )
+                .values(lease_expires_at=expired_at)
+            )
+
+
+def _fork_responses_diagnostic(winner_response: Any, stale_response: Any) -> str:
+    """Both responses' status and body, so a red carries the server's own reason.
+
+    The integrity envelope is fixed text; the exception message lives only in
+    the ``session.fork_rewrite_integrity_error`` server log line. The body
+    still names the failure code, which is what distinguishes a takeover
+    refusal from a crash.
+    """
+    return f"winner={winner_response.status_code} {winner_response.text!r}; stale={stale_response.status_code} {stale_response.text!r}"
+
+
 def _make_fork_app(
     tmp_path: Path,
     user_id: str = "alice",
@@ -2111,29 +2158,32 @@ class TestForkEndpoint:
                     ).scalar_one()
                     == 1
                 )
-            # A dead worker loses BOTH database-clocked leases: the guided
-            # operation row and its session-operation fence. Expire both so the
-            # takeover winner acquires the parent SESSION_FORK lease honestly
-            # instead of stealing a live one.
+            # A dead worker loses EVERY database-clocked lease it held: the
+            # guided operation row, the parent's SESSION_FORK fence, and the
+            # child's SESSION_FORK fence that was minted as a shadow of that
+            # parent lease (same owner, same expiry). Expire all three so the
+            # takeover winner acquires the parent lease honestly and then takes
+            # the child over as an expired fence.
+            #
+            # Expiring only the parent's two leases made this test a
+            # same-second race: the winner's re-acquired parent lease expires
+            # at CURRENT_TIMESTAMP + lease (one-second resolution on SQLite),
+            # and ``_resume_or_take_over_fork_child`` adopts a still-live child
+            # only when its expiry EQUALS that value -- true exactly when the
+            # stale worker's acquire and the winner's fell in the same clock
+            # second, and false (an ``AuditIntegrityError``, "bound fork child
+            # has an independently live session authority", answered as the
+            # 500 integrity envelope) whenever the box was slow enough for the
+            # two to straddle a boundary. The control below pins that refusal
+            # deterministically.
             expired_at = datetime.now(UTC) - timedelta(seconds=1)
-            with service._engine.begin() as conn:
-                conn.execute(
-                    update(guided_operations_table)
-                    .where(
-                        guided_operations_table.c.session_id == str(parent.id),
-                        guided_operations_table.c.operation_id == operation_id,
-                    )
-                    .values(lease_expires_at=expired_at)
-                )
-                conn.execute(
-                    update(session_operation_fences_table)
-                    .where(
-                        session_operation_fences_table.c.session_id == str(parent.id),
-                        session_operation_fences_table.c.operation_kind == SessionOperationKind.SESSION_FORK.value,
-                        session_operation_fences_table.c.released_at.is_(None),
-                    )
-                    .values(lease_expires_at=expired_at)
-                )
+            _expire_dead_fork_worker_leases(
+                service,
+                parent_id=parent.id,
+                operation_id=operation_id,
+                child_id=child_id,
+                expired_at=expired_at,
+            )
 
             winner_response = await asyncio.to_thread(
                 client.post,
@@ -2143,8 +2193,8 @@ class TestForkEndpoint:
             await asyncio.to_thread(resume_stale.wait, 5)
             stale_response = await stale_task
 
-        assert winner_response.status_code == stale_response.status_code == 201
-        assert winner_response.content == stale_response.content
+        assert winner_response.status_code == stale_response.status_code == 201, _fork_responses_diagnostic(winner_response, stale_response)
+        assert winner_response.content == stale_response.content, _fork_responses_diagnostic(winner_response, stale_response)
         assert winner_response.json() == {"session_id": str(child_id)}
         assert copy_calls == 2
         assert cleanup_calls == 0
@@ -2168,6 +2218,145 @@ class TestForkEndpoint:
             assert operation.status == "completed"
             assert operation.attempt == 2
             assert operation.result_session_id == str(child_id)
+
+    @pytest.mark.asyncio
+    async def test_a_bound_child_whose_fence_outlives_the_parent_lease_is_refused_not_adopted(self, tmp_path) -> None:
+        """A live child fence the winner's parent lease does not cover is an integrity refusal.
+
+        Deterministic form of the race the takeover test above used to lose:
+        the parent's two leases are expired, the child's fence is left LIVE
+        with an expiry no future acquire can equal (its own value plus an
+        hour). ``_resume_or_take_over_fork_child`` then finds a child that
+        is neither expired nor the shadow of the winner's parent lease and
+        raises ``AuditIntegrityError("bound fork child has an independently
+        live session authority")``; the route settles the winner's attempt as
+        the closed ``integrity_error`` envelope. Under the old two-lease
+        expiry the same refusal fired whenever the stale worker's acquire and
+        the winner's straddled a CURRENT_TIMESTAMP second, so it needed no
+        load to reproduce -- only a slow enough box. No sleep is needed here.
+        """
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        parent = await service.create_session("alice", "Parent", "local")
+        for index in range(2):
+            await create_blob_under_fence(service, blob_service, parent.id, f"source-{index}.csv", f"v\n{index}\n".encode(), "text/csv")
+        message = await service.add_message(
+            parent.id,
+            "user",
+            "fork",
+            writer_principal="route_user_message",
+        )
+        operation_id = str(uuid.uuid4())
+        body = {
+            "operation_id": operation_id,
+            "from_message_id": str(message.id),
+            "new_message_content": "edited",
+        }
+        client = TestClient(app, raise_server_exceptions=False)
+        original_copy = blob_service.copy_blobs_for_fork
+        partial_copied = threading.Barrier(2)
+        resume_stale = threading.Barrier(2)
+        call_guard = threading.Lock()
+        copy_calls = 0
+
+        async def controlled_copy(*args: Any, **kwargs: Any):
+            nonlocal copy_calls
+            with call_guard:
+                copy_calls += 1
+                invocation = copy_calls
+            checkpoint = kwargs["checkpoint"]
+            checkpoint_count = 0
+
+            async def controlled_checkpoint() -> None:
+                nonlocal checkpoint_count
+                await checkpoint()
+                checkpoint_count += 1
+                if invocation == 1 and checkpoint_count == 3:
+                    await asyncio.to_thread(partial_copied.wait, 5)
+                    await asyncio.to_thread(resume_stale.wait, 5)
+
+            return await original_copy(*args, **{**kwargs, "checkpoint": controlled_checkpoint})
+
+        with patch.object(blob_service, "copy_blobs_for_fork", new=controlled_copy):
+            stale_task = asyncio.create_task(
+                asyncio.to_thread(
+                    client.post,
+                    f"/api/sessions/{parent.id}/fork",
+                    json=body,
+                )
+            )
+            await asyncio.to_thread(partial_copied.wait, 5)
+            with service._engine.connect() as conn:
+                operation = conn.execute(
+                    select(guided_operations_table).where(
+                        guided_operations_table.c.session_id == str(parent.id),
+                        guided_operations_table.c.operation_id == operation_id,
+                    )
+                ).one()
+                child_id = uuid.UUID(operation.result_session_id)
+                child_fence = conn.execute(
+                    select(session_operation_fences_table).where(
+                        session_operation_fences_table.c.session_id == str(child_id),
+                        session_operation_fences_table.c.released_at.is_(None),
+                    )
+                ).one()
+            expired_at = datetime.now(UTC) - timedelta(seconds=1)
+            _expire_dead_fork_worker_leases(
+                service,
+                parent_id=parent.id,
+                operation_id=operation_id,
+                child_id=child_id,
+                expired_at=expired_at,
+            )
+            # Revive the child's fence alone, an hour past its minted expiry:
+            # still live, and equal to no lease the winner can acquire. (One
+            # second would NOT do: the winner's lease is CURRENT_TIMESTAMP +
+            # 30 s, so a winner acquiring exactly one second after the stale
+            # worker would match it -- that offset made this control flake
+            # once in three runs before it was widened.)
+            with service._engine.begin() as conn:
+                conn.execute(
+                    update(session_operation_fences_table)
+                    .where(
+                        session_operation_fences_table.c.session_id == str(child_id),
+                        session_operation_fences_table.c.operation_id == child_fence.operation_id,
+                    )
+                    .values(lease_expires_at=child_fence.lease_expires_at + timedelta(hours=1))
+                )
+
+            winner_response = await asyncio.to_thread(
+                client.post,
+                f"/api/sessions/{parent.id}/fork",
+                json=body,
+            )
+            await asyncio.to_thread(resume_stale.wait, 5)
+            stale_response = await stale_task
+
+        diagnostic = _fork_responses_diagnostic(winner_response, stale_response)
+        assert winner_response.status_code == 500, diagnostic
+        assert winner_response.json() == {
+            "detail": {
+                "error_type": "guided_operation_terminal_failure",
+                "failure_code": "integrity_error",
+                "detail": "The operation failed an integrity check.",
+            }
+        }, diagnostic
+        assert copy_calls == 1, diagnostic
+        with service._engine.connect() as conn:
+            operation = conn.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == str(parent.id),
+                    guided_operations_table.c.operation_id == operation_id,
+                )
+            ).one()
+            assert operation.status == "failed", diagnostic
+            fence = conn.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(child_id))
+            ).one()
+            # The refusal adopted nothing: the child's fence is the row the
+            # stale worker minted, untouched.
+            assert fence.operation_id == child_fence.operation_id, diagnostic
+            assert fence.operation_epoch == child_fence.operation_epoch, diagnostic
 
     @pytest.mark.asyncio
     async def test_successful_fork_lost_response_replays_exact_locator_and_rejects_hash_tamper(self, tmp_path) -> None:

@@ -59,6 +59,24 @@ from elspeth.web.validation import has_visible_content
 _SIGNING_ALGORITHM: Final = "HS256"
 _ISSUER: Final = "elspeth"
 LOCAL_AUDIENCE: Final = "elspeth-local"
+
+
+def session_token_audience(public_base_url: str | None) -> str:
+    """Bind tokens to THIS deployment.
+
+    Without an audience, two deployments configured from the same
+    ``secret_key`` -- a staging clone of production, most obviously -- would
+    each accept the other's tokens. ``LOCAL_AUDIENCE`` is the fallback for a
+    deployment with no public URL, where there is no second deployment to be
+    confused with. An SSO deployment always has one: the profile requires
+    ``public_base_url``, and this value is what the browser-evidence harness
+    checks the token's ``aud`` against.
+    """
+    if public_base_url is None or not public_base_url.strip():
+        return LOCAL_AUDIENCE
+    return public_base_url.strip()
+
+
 """Audience for a deployment that has no public base URL configured."""
 
 _JTI_BYTES: Final = 18

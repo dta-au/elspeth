@@ -522,8 +522,10 @@ locals {
     { name = "ELSPETH_WEB__OIDC_CLIENT_ID", value = aws_cognito_user_pool_client.web[0].id },
     { name = "ELSPETH_WEB__OIDC_AUTHORIZATION_ENDPOINT", value = "${local.oidc_authorization_origin}/oauth2/authorize" },
     { name = "ELSPETH_WEB__OIDC_TOKEN_ENDPOINT", value = "${local.oidc_authorization_origin}/oauth2/token" },
-    { name = "ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS", value = jsonencode([local.oidc_authorization_origin]) },
-    { name = "ELSPETH_WEB__OIDC_AUDIENCE_CLAIM", value = "client_id" },
+    # The browser-origin allowlist and the Cognito access-token audience mode
+    # are deleted settings (identity sprint step C); exporting either refuses
+    # to boot. Cognito's hosted-domain origin belongs in sso_endpoint_origins
+    # once the confidential client and the sso_* settings land (cutover).
     ], local.bedrock_backend ? [] : [
     # Both Composer roles target the loopback gateway sidecar. The paired
     # API keys arrive via runtime_secrets, never as environment literals.

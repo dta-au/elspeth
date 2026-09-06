@@ -52,6 +52,7 @@ _DERIVED_KEY_BYTES: Final = 32
 _SESSION_TOKEN_INFO: Final = b"elspeth-session-token-hs256-v1"
 _USER_SECRET_INFO: Final = b"elspeth-user-secret-encryption-v1"
 _BINDING_GENERATION_INFO: Final = b"elspeth-plugin-binding-generation-v1"
+_SSO_TRANSACTION_INFO: Final = b"sso-transaction-v1"
 
 
 def _derive(secret_key: str, *, info: bytes) -> bytes:
@@ -89,6 +90,22 @@ def derive_user_secret_master_key(secret_key: str) -> str:
     """
     derived = _derive(secret_key, info=_USER_SECRET_INFO)
     return base64.urlsafe_b64encode(derived).decode("ascii")
+
+
+def derive_sso_transaction_key(sso_transaction_secret: str) -> bytes:
+    """Return the AES-256-GCM key that seals the SSO transaction cookie.
+
+    Derived from ``sso_transaction_secret`` — its OWN operator setting, not
+    ``secret_key``. That separation is the point: this key protects state
+    held by a browser mid-login, and an operator who has to rotate it after a
+    suspected cookie compromise must not thereby invalidate every stored user
+    secret and every session token as well.
+
+    The info string is the one the spec fixes (``sso-transaction-v1``), so
+    the derivation is reproducible from the written contract rather than
+    from this file.
+    """
+    return _derive(sso_transaction_secret, info=_SSO_TRANSACTION_INFO)
 
 
 def derive_binding_generation_key(secret_key: str) -> bytes:

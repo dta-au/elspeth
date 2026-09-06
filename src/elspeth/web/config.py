@@ -28,10 +28,11 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import (
 )
 from elspeth.plugins.transforms.aws.textract_regions import is_well_formed_aws_region
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
-from elspeth.web.auth.providers import get_profile
+from elspeth.web.auth.providers import IdPProfile, get_profile
 from elspeth.web.auth.urls import (
+    DiscoveredEndpoints,
+    validate_discovered_endpoints,
     validate_oidc_browser_endpoints,
-    validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
 from elspeth.web.composer.reasoning import ReasoningEffort
@@ -505,7 +506,6 @@ class WebSettings(BaseModel):
     oidc_client_id: str | None = None
     oidc_authorization_endpoint: str | None = None
     oidc_token_endpoint: str | None = None
-    oidc_authorization_allowed_origins: tuple[str, ...] = ()
     oidc_audience_claim: Literal["aud", "client_id"] = "aud"
     entra_tenant_id: str | None = None
 
@@ -690,11 +690,6 @@ class WebSettings(BaseModel):
         if value is not None and not is_well_formed_aws_region(value):
             raise ValueError("deployment_aws_region must be a non-blank well-formed AWS region identifier")
         return value
-
-    @field_validator("oidc_authorization_allowed_origins")
-    @classmethod
-    def _validate_oidc_authorization_allowed_origins(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        return validate_oidc_browser_origins(v)
 
     @field_validator("landscape_url", "session_db_url")
     @classmethod
@@ -1040,8 +1035,6 @@ class WebSettings(BaseModel):
         if self.auth_provider == "local":
             if self.oidc_audience_claim != "aud":
                 raise ValueError("Local auth does not permit the OIDC client_id audience claim mode")
-            if self.oidc_authorization_allowed_origins:
-                raise ValueError("Local auth does not permit the OIDC browser origin allowlist")
             configured = [
                 name
                 for name, val in (
@@ -1050,10 +1043,6 @@ class WebSettings(BaseModel):
                     ("oidc_client_id", self.oidc_client_id),
                     ("oidc_authorization_endpoint", self.oidc_authorization_endpoint),
                     ("oidc_token_endpoint", self.oidc_token_endpoint),
-                    (
-                        "oidc_authorization_allowed_origins",
-                        self.oidc_authorization_allowed_origins or None,
-                    ),
                     ("entra_tenant_id", self.entra_tenant_id),
                 )
                 if val is not None
@@ -1083,7 +1072,6 @@ class WebSettings(BaseModel):
                     self.oidc_authorization_endpoint,
                     self.oidc_token_endpoint,
                     issuer=self.oidc_issuer,
-                    allowed_origins=self.oidc_authorization_allowed_origins,
                 )
                 object.__setattr__(self, "oidc_authorization_endpoint", authorization_endpoint)
                 object.__setattr__(self, "oidc_token_endpoint", token_endpoint)
@@ -1101,8 +1089,6 @@ class WebSettings(BaseModel):
             ]
             if missing:
                 raise ValueError(f"Entra auth requires: {', '.join(missing)}")
-            if self.oidc_authorization_allowed_origins:
-                raise ValueError("Entra auth does not permit the OIDC browser origin allowlist")
             if self.oidc_audience_claim != "aud":
                 raise ValueError("Entra auth does not permit the OIDC client_id audience claim mode")
             if (self.oidc_authorization_endpoint is None) != (self.oidc_token_endpoint is None):
@@ -1139,7 +1125,61 @@ class WebSettings(BaseModel):
                 missing = [name for name in profile.required_settings if not configured_settings[name]]
                 if missing:
                     raise ValueError(f"auth_provider={self.auth_provider!r} requires: {', '.join(missing)}")
+            self._validate_sso_endpoint_overrides(profile)
         return self
+
+    def _validate_sso_endpoint_overrides(self, profile: IdPProfile) -> None:
+        """Hold the break-glass endpoint overrides to the same origin policy.
+
+        The four ``sso_*`` endpoint settings exist so an operator can bypass
+        discovery when an IdP's document is wrong or unreachable. Until now
+        they were accepted unvalidated beyond a blank check, which made the
+        break-glass path the weakest way into the deployment: an operator
+        typo, or an environment variable set by something other than the
+        operator, could point the token endpoint anywhere.
+
+        ALL OR NONE. A partial override silently mixes operator-supplied and
+        discovered endpoints, so which origin policy applied to which URL
+        would depend on which variables happened to be set. Refusing the
+        mixture is the only reading that keeps the answer knowable.
+
+        The origin policy is the profile's, exactly as it is for discovery.
+        An override is a way to name a DIFFERENT URL on an origin the IdP is
+        expected to serve from — not a way to leave the expected origins.
+        """
+        overrides = {
+            "sso_authorization_endpoint": self.sso_authorization_endpoint,
+            "sso_token_endpoint": self.sso_token_endpoint,
+            "sso_jwks_uri": self.sso_jwks_uri,
+        }
+        supplied = sorted(name for name, value in overrides.items() if value is not None)
+        if not supplied:
+            # userinfo alone is not an override: with no endpoints to pair it
+            # with there is nothing for discovery to be bypassed FOR.
+            if self.sso_userinfo_endpoint is not None:
+                raise ValueError("sso_userinfo_endpoint requires the other sso endpoint overrides: " + ", ".join(overrides))
+            return
+        if len(supplied) != len(overrides):
+            missing = sorted(set(overrides) - set(supplied))
+            raise ValueError(f"sso endpoint overrides are all-or-none; missing: {', '.join(missing)}")
+
+        assert self.sso_issuer is not None
+        assert self.sso_authorization_endpoint is not None
+        assert self.sso_token_endpoint is not None
+        assert self.sso_jwks_uri is not None
+        validated = validate_discovered_endpoints(
+            DiscoveredEndpoints(
+                authorization_endpoint=self.sso_authorization_endpoint,
+                token_endpoint=self.sso_token_endpoint,
+                jwks_uri=self.sso_jwks_uri,
+                userinfo_endpoint=self.sso_userinfo_endpoint,
+            ),
+            expected_origins=profile.expected_origins(self, profile.resolve_issuer(self)),
+        )
+        object.__setattr__(self, "sso_authorization_endpoint", validated.authorization_endpoint)
+        object.__setattr__(self, "sso_token_endpoint", validated.token_endpoint)
+        object.__setattr__(self, "sso_jwks_uri", validated.jwks_uri)
+        object.__setattr__(self, "sso_userinfo_endpoint", validated.userinfo_endpoint)
 
     @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
@@ -1312,10 +1352,7 @@ class WebSettings(BaseModel):
 
     def get_landscape_url(self) -> str:
         """Resolve landscape DB URL, defaulting to data_dir-relative path."""
-        if self.landscape_url is not None:
-            return self.landscape_url
-        db_path = self.data_dir / "runs" / "audit.db"
-        return f"sqlite:///{db_path}"
+        return resolve_landscape_url(data_dir=self.data_dir, landscape_url=self.landscape_url)
 
     def get_payload_store_path(self) -> Path:
         """Resolve payload store path, defaulting to data_dir-relative path."""
@@ -1325,10 +1362,31 @@ class WebSettings(BaseModel):
 
     def get_session_db_url(self) -> str:
         """Resolve session DB URL, defaulting to data_dir-relative path."""
-        if self.session_db_url is not None:
-            return self.session_db_url
-        db_path = self.data_dir / "sessions.db"
-        return f"sqlite:///{db_path}"
+        return resolve_session_db_url(data_dir=self.data_dir, session_db_url=self.session_db_url)
+
+
+def resolve_landscape_url(*, data_dir: Path, landscape_url: str | None) -> str:
+    """Where the Landscape lives: the configured URL, else ``data_dir/runs/audit.db``.
+
+    Module-level for the same reason as :func:`resolve_session_db_url`: the
+    ``composer users`` CLI writes the identity-retirement audit row to the
+    same Landscape the web app would, resolved by the same rule.
+    """
+    if landscape_url is not None:
+        return landscape_url
+    return f"sqlite:///{data_dir / 'runs' / 'audit.db'}"
+
+
+def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str:
+    """Where the sessions store lives: the configured URL, else ``data_dir/sessions.db``.
+
+    Module-level so the ``composer users`` CLI -- which takes ``--data-dir``
+    rather than a full :class:`WebSettings` -- resolves the store by the same
+    rule the web app does, instead of by a copy of it.
+    """
+    if session_db_url is not None:
+        return session_db_url
+    return f"sqlite:///{data_dir / 'sessions.db'}"
 
 
 # Fields that accept JSON-encoded collection values from environment variables.
@@ -1338,7 +1396,6 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     {
         "cors_origins",
         "server_secret_allowlist",
-        "oidc_authorization_allowed_origins",
         # Both arrive from the ECS task definition as JSON, so they decode the
         # same way every other collection setting does.
         "sso_endpoint_origins",

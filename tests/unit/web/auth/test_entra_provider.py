@@ -68,6 +68,7 @@ def _valid_entra_claims(overrides: dict[str, object] | None = None) -> dict[str,
         "tid": TENANT_ID,
         "iss": ISSUER,
         "aud": AUDIENCE,
+        "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
     }
     if overrides:
@@ -97,7 +98,7 @@ def mock_httpx_discovery(jwks_response):
     Intentionally kept separate — different ISSUER and JWKS URL patterns.
     """
     client = _DiscoveryAsyncClient(jwks_response)
-    return patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client)
+    return patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client)
 
 
 class TestEntraTenantValidation:
@@ -165,7 +166,7 @@ class TestEntraTenantValidation:
         claims = _valid_entra_claims()
         del claims["sub"]
         token = make_rs256_token(private_key, claims)
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Missing required 'sub' claim"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="Invalid token: MissingRequiredClaimError"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -178,7 +179,7 @@ class TestEntraTenantValidation:
         private_key, _ = rsa_keypair
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_entra_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.authenticate(token)
 
     @pytest.mark.asyncio
@@ -235,7 +236,7 @@ class TestEntraSigningKeyRotation:
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         client = _DiscoveryAsyncClient(old_jwks)
 
-        with patch("elspeth.web.auth.oidc.httpx.AsyncClient", return_value=client):
+        with patch("elspeth.web.auth.id_token.httpx.AsyncClient", return_value=client):
             assert (await provider.authenticate(old_token)).user_id == "entra-user-456"
             client.discovery_fetches = 0
             client.jwks_fetches = 0
@@ -457,7 +458,7 @@ class TestEntraGetUserInfoTenantValidation:
             mock_httpx_discovery,
             pytest.raises(
                 AuthenticationError,
-                match="Missing required 'sub' claim",
+                match="Invalid token: MissingRequiredClaimError",
             ),
         ):
             await provider.get_user_info(token)
@@ -472,7 +473,7 @@ class TestEntraGetUserInfoTenantValidation:
         private_key, _ = rsa_keypair
         provider = EntraAuthProvider(tenant_id=TENANT_ID, audience=AUDIENCE)
         token = make_rs256_token(private_key, _valid_entra_claims({"sub": ""}))
-        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="user_id"):
+        with mock_httpx_discovery, pytest.raises(AuthenticationError, match="'sub' must be a non-blank string"):
             await provider.get_user_info(token)
 
     @pytest.mark.asyncio

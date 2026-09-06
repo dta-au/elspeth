@@ -15,9 +15,11 @@ from structlog.testing import capture_logs
 from elspeth.core.landscape.auth_audit_repository import AuthAuditRepository
 from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
-from elspeth.web.auth.models import AccessPending, AuthenticationError, IdentityDisabled
+from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
+from elspeth.web.auth.sso import SSO_FAILURE_CATEGORIES, SsoIdpError, SsoLoginError, SsoStateMismatch
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -497,3 +499,116 @@ class TestAdmissionFailureCategories:
             )
         }
         assert len(categories) == 4
+
+
+def _every_sso_error_type() -> frozenset[type[SsoLoginError]]:
+    """Derived from the class tree, so a new refusal cannot be left untested."""
+    found: set[type[SsoLoginError]] = set()
+    pending = [SsoLoginError]
+    while pending:
+        base = pending.pop()
+        for sub in base.__subclasses__():
+            found.add(sub)
+            pending.append(sub)
+    return frozenset(found)
+
+
+_SSO_ERROR_TYPES = sorted(_every_sso_error_type(), key=lambda cls: cls.__name__)
+
+
+def _issued_token() -> str:
+    return jwt.encode({"sub": "identity-1", "iat": 1, "exp": 2}, "bounded-test-key-that-is-at-least-32-bytes", algorithm="HS256")
+
+
+class TestSsoFailureCategories:
+    """SSO refusals carry their category on the TYPE; the classifier reads it.
+
+    A second list of the twelve literals here would be the message-prefix
+    drift the admission arms above were rewritten to remove, in another
+    form: two copies of one closed set with nothing binding them.
+    """
+
+    @pytest.mark.parametrize("error", _SSO_ERROR_TYPES, ids=[cls.__name__ for cls in _SSO_ERROR_TYPES])
+    def test_every_sso_refusal_classifies_to_its_own_category(self, error: type[SsoLoginError]) -> None:
+        exc = error(reason="other") if error is SsoIdpError else error()
+        assert classify_authentication_failure(exc) == error.category
+        assert error.category in SSO_FAILURE_CATEGORIES
+
+    def test_rewording_an_sso_message_does_not_change_the_category(self) -> None:
+        assert classify_authentication_failure(SsoStateMismatch("Please try that again")) == "sso_state_mismatch"
+
+    def test_a_provider_outage_is_the_spec_named_non_sso_category(self) -> None:
+        assert classify_authentication_failure(AuthProviderUnavailable()) == "provider_unavailable"
+        assert "provider_unavailable" in SSO_FAILURE_CATEGORIES
+
+
+class TestSsoRowsCarryTheirJoins:
+    """The two rows of one SSO login are written on two requests.
+
+    ``login`` at the callback has no token to derive an identity from, so it
+    takes ``identity_id`` explicitly; ``token_issued`` at complete takes the
+    callback's request id so an auditor can join the pair without guessing
+    from timestamps.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch: pytest.MonkeyPatch) -> Any:
+        class _DBContext:
+            def __enter__(self) -> object:
+                return object()
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        class _FakeLandscapeDB:
+            @classmethod
+            def from_url(cls, url: str, **kwargs: object) -> _DBContext:
+                del url, kwargs
+                return _DBContext()
+
+        auth_repository = create_autospec(AuthAuditRepository, instance=True)
+        monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
+        monkeypatch.setattr(
+            audit_module,
+            "RecorderFactory",
+            create_autospec(RecorderFactory, return_value=SimpleNamespace(auth_audit=auth_repository)),
+        )
+        return auth_repository
+
+    @staticmethod
+    def _recorder() -> AuthAuditRecorder:
+        return AuthAuditRecorder(landscape_url="sqlite:///audit.db", landscape_passphrase=None, create_tables=False)
+
+    def test_the_login_row_carries_the_identity_it_was_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        repository = self._capture(monkeypatch)
+        self._recorder().record_login_success(_request(), provider="oidc", user_id="ada", username="ada", identity_id="id-ada")
+        assert repository.record_login_outcome.call_args.kwargs["identity_id"] == "id-ada"
+
+    def test_the_login_row_carries_no_identity_when_none_was_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The local path's existing behaviour, unchanged: nothing is invented."""
+        repository = self._capture(monkeypatch)
+        self._recorder().record_login_success(_request(), provider="local", user_id="ada", username="ada")
+        assert repository.record_login_outcome.call_args.kwargs["identity_id"] is None
+
+    def test_the_token_issued_row_carries_the_login_request_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        repository = self._capture(monkeypatch)
+        self._recorder().record_token_issued(
+            _request(),
+            provider="oidc",
+            user_id="ada",
+            username="ada",
+            access_token=_issued_token(),
+            issuance_path="sso_complete",
+            login_request_id="req-callback-7",
+        )
+        metadata = repository.record_token_issued.call_args.kwargs["metadata"]
+        assert metadata["login_request_id"] == "req-callback-7"
+        assert metadata["issuance_path"] == "sso_complete"
+
+    def test_the_token_issued_row_has_no_join_key_when_there_is_nothing_to_join(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A null-valued key would read as 'joined to nothing'; the local path simply has no key."""
+        repository = self._capture(monkeypatch)
+        self._recorder().record_token_issued(
+            _request(), provider="local", user_id="ada", username="ada", access_token=_issued_token(), issuance_path="login"
+        )
+        assert "login_request_id" not in repository.record_token_issued.call_args.kwargs["metadata"]

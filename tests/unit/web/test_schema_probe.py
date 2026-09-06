@@ -298,10 +298,116 @@ def test_session_tableless_foreign_sentinels_are_stale() -> None:
 
 
 def test_session_initializer_verifies_noop_create_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_all produced no tables at all — a defect in this build.
+
+    Deliberately NOT the same message as a shape mismatch after a successful
+    create: an incomplete table set is a first-party bug, while drift is a
+    database an operator can delete. Both once said "initialization did not
+    produce the current schema", which made them indistinguishable in a log.
+    """
     engine = create_engine("sqlite:///:memory:")
     monkeypatch.setattr(session_metadata, "create_all", lambda **_kwargs: None)
-    with pytest.raises(SessionSchemaError, match="did not produce the current schema"):
+    with pytest.raises(SessionSchemaError, match="created no elspeth_schema_identity table"):
         init_session_schema(engine)
+    engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# A schema failure must name what drifted (elspeth-d0e62aea41).
+#
+# The precise subject was never missing: ``_validate_current_schema`` computes
+# "<table>.<constraint> CHECK constraint SQL mismatch" with both sides, and
+# ``probe_current_schema`` discarded it to answer a yes/no question. Every
+# test below asserts on the SUBJECT, not merely that something was raised —
+# "an error occurred" is exactly the state these replace.
+# --------------------------------------------------------------------------
+
+_DECLARED_CHECK = "CHECK (relationship_type IN ('approver'))"
+_DRIFTED_CHECK = "CHECK (relationship_type IN ('approver', 'sponsor'))"
+
+
+def _drift_one_check_constraint(engine) -> None:
+    """Recreate one table with a widened CHECK, as a stale deployment would.
+
+    SQLite cannot ALTER a constraint, so the table is recreated from its own
+    stored DDL with one predicate changed. That keeps every other column,
+    index and foreign key byte-identical, so the collector has exactly one
+    thing to find.
+    """
+    with engine.begin() as conn:
+        ddl = conn.exec_driver_sql("SELECT sql FROM sqlite_master WHERE type='table' AND name='identity_relationships'").scalar_one()
+        assert _DECLARED_CHECK in ddl, "the fixture must drift the constraint the model actually declares"
+        conn.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        conn.exec_driver_sql("DROP TABLE identity_relationships")
+        conn.exec_driver_sql(ddl.replace(_DECLARED_CHECK, _DRIFTED_CHECK))
+
+
+def test_an_existing_database_with_a_drifted_check_names_the_constraint() -> None:
+    """The operator-facing path: a deployment whose DB predates a schema edit."""
+    engine = create_engine("sqlite:///:memory:")
+    init_session_schema(engine)
+    _drift_one_check_constraint(engine)
+
+    with pytest.raises(SessionSchemaError) as raised:
+        init_session_schema(engine)
+
+    message = str(raised.value)
+    assert "identity_relationships.ck_identity_relationships_type" in message
+    assert "CHECK constraint SQL mismatch" in message
+    assert "sponsor" in message, "the message must carry the FOUND side, not only the expected one"
+    # The instruction the old sentence carried must not have been traded away
+    # for the detail: an operator needs both.
+    assert "Delete the old session database and restart" in message
+    engine.dispose()
+
+
+def test_a_fresh_create_that_does_not_validate_names_the_constraint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exact shape of elspeth-d0e62aea41: an EMPTY database, creation
+    runs, and what it produced does not match the model.
+
+    This is the ``verify`` path rather than the stale-database path, and it is
+    the one that reached operators as "did not produce the current schema"
+    with no table, constraint or subject in it.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    real_create = schema_probe_module._create_session_tables
+
+    def create_then_drift(conn: Any, **kwargs: Any) -> None:
+        real_create(conn, **kwargs)
+        ddl = conn.exec_driver_sql("SELECT sql FROM sqlite_master WHERE type='table' AND name='identity_relationships'").scalar_one()
+        conn.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        conn.exec_driver_sql("DROP TABLE identity_relationships")
+        conn.exec_driver_sql(ddl.replace(_DECLARED_CHECK, _DRIFTED_CHECK))
+
+    monkeypatch.setattr(schema_probe_module, "_create_session_tables", create_then_drift)
+
+    with pytest.raises(SessionSchemaError) as raised:
+        init_session_schema(engine)
+
+    message = str(raised.value)
+    assert "identity_relationships.ck_identity_relationships_type" in message
+    assert "CHECK constraint SQL mismatch" in message
+    assert "did not produce the current schema" not in message, "the sentence that named nothing must be gone"
+    engine.dispose()
+
+
+def test_the_probe_and_the_validator_disagreeing_gets_its_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The contradiction branch, which must not silently reuse the vague text.
+
+    If the probe reports stale and re-validation finds nothing, one of the two
+    is wrong about the same database. That is a defect in this build, not a
+    schema an operator can repair, so it must not read like drift.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    init_session_schema(engine)
+    monkeypatch.setattr(schema_probe_module, "probe_current_schema", lambda _bind: False)
+
+    with pytest.raises(SessionSchemaError) as raised:
+        init_session_schema(engine)
+
+    message = str(raised.value)
+    assert "re-validating it found nothing wrong" in message
+    assert "defect in one of them" in message
     engine.dispose()
 
 

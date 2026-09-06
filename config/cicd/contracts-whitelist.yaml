@@ -21,6 +21,13 @@ allowed_external_types:
   - "core/dag/group_bindings:GroupBindingRegistry"
   # Plugin bundle type shared between runtime construction, CLI, and web preflight
   - "plugins/infrastructure/runtime_factory:PluginBundle"
+  # The identity-retirement outcome and the Landscape auth recorder cross from
+  # web/ into the CLI: `composer users remove` audits its retirement to the
+  # same Landscape row the web app writes, through the same recorder. Neither
+  # is a serializable L0 DTO -- the outcome carries an IdentityRecord the
+  # authority just wrote, the recorder holds a Landscape URL and passphrase.
+  - "web/coordination/identity_authority:IdentityRetired"
+  - "web/auth/audit:AuthAuditRecorder"
   # SSRF safety type - security infrastructure, tightly coupled to validation logic
   - "core/security/web:SSRFSafeRequest"
   # Engine types used in testing factories - test infrastructure wraps these for convenience
@@ -686,26 +693,15 @@ allowed_dict_patterns:
   - "src/elspeth/core/dependency_config.py:CollectionProbeConfig._serialize_provider_config:return"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # WEB AUTH — OIDC/Entra token validation (Tier 3 boundary)
-  # JWKS and JWT payloads are external IdP data with no typed schema.
+  # WEB AUTH — ID-token validation (Tier 3 boundary)
+  # The two boundaries whose input is PyJWT's own return type (dict[str, Any]
+  # from jwt.decode and jwt.get_unverified_header). Each parses that dict ONCE
+  # into an owned type (IdTokenClaims / the header's kid); everything past
+  # them is nominally typed, and the JWKS document crosses its boundary as
+  # unparsed JSON (typed Any) into the owned JwkSet.
   # ═══════════════════════════════════════════════════════════════════════════
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.ensure_jwks:return"
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_token:jwks"
-  # Same foreign JWKS document as decode_token above: PyJWKSet.from_dict
-  # requires a real dict, and this is the SSO ID-token path's copy of it.
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_id_token:jwks"
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator.decode_token:return"
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._parse_jwk_set:jwks"
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._get_token_algorithm:header"
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._get_jwk_algorithm:jwks"
-  # Shape validator returns the same external JWKS dict after top-level type
-  # checks; PyJWKSet.from_dict consumes the raw IdP structure so the return
-  # type must stay dict[str, Any].
-  - "src/elspeth/web/auth/oidc.py:JWKSTokenValidator._validate_jwks_document:return"
-  - "src/elspeth/web/auth/oidc.py:optional_profile_claim:payload"
-  - "src/elspeth/web/auth/oidc.py:OIDCAuthProvider._optional_profile_claim:payload"
-  - "src/elspeth/web/auth/entra.py:EntraAuthProvider._validate_tenant:payload"
-  - "src/elspeth/web/auth/entra.py:EntraAuthProvider._extract_groups:payload"
+  - "src/elspeth/web/auth/id_token.py:parse_id_token_claims:payload"
+  - "src/elspeth/web/auth/id_token.py:JWKSTokenValidator._header_key_id:header"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # WEB AUTH — Session service protocol
@@ -1118,7 +1114,6 @@ allowed_dict_patterns:
   - "src/elspeth/telemetry/serialization.py:serialize_otlp_event_attributes:return"
   - "src/elspeth/web/interpretation_state.py:serialize_authoring_review_options:return"
   - "src/elspeth/web/readiness.py:_readiness_engine_kwargs:return"
-  - "src/elspeth/web/auth/oidc.py:_validate_cognito_access_claims:payload"
   - "src/elspeth/web/execution/preflight.py:_authored_options:return"
   - "src/elspeth/web/execution/preflight.py:audit_safe_resolved_config:return"
   - "src/elspeth/web/execution/preflight.py:restore_options:component"

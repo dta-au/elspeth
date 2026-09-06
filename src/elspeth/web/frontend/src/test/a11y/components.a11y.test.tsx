@@ -1993,9 +1993,7 @@ describe("LoginPage", () => {
     const config: AuthConfig = {
       provider: "local",
       registration_mode: "open",
-      oidc_issuer: null,
-      oidc_client_id: null,
-      authorization_endpoint: null,
+      sso_start_url: null,
     };
     vi.mocked(apiClient.fetchAuthConfig).mockResolvedValue(config);
   }

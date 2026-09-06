@@ -19,6 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityErro
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
+from elspeth.web.auth.sso import SsoLoginError
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.schema_probe import postgres_engine_kwargs
 
@@ -53,6 +54,7 @@ class AuthAuditWriter(Protocol):
         provider: AuthProviderType,
         user_id: str,
         username: str,
+        identity_id: str | None = None,
     ) -> None: ...
 
     def record_login_failure(
@@ -73,6 +75,7 @@ class AuthAuditWriter(Protocol):
         username: str,
         access_token: str,
         issuance_path: str,
+        login_request_id: str | None = None,
     ) -> None: ...
 
     def record_auth_failure(
@@ -192,13 +195,26 @@ def _required_int_claim(claims: dict[str, object], claim_name: str) -> int:
     return value
 
 
-def _token_issued_metadata(request: Request, *, access_token: str, issuance_path: str) -> dict[str, object]:
+def _token_issued_metadata(
+    request: Request,
+    *,
+    access_token: str,
+    issuance_path: str,
+    login_request_id: str | None = None,
+) -> dict[str, object]:
     claims = _issued_token_claims(access_token)
     metadata = _request_metadata(request)
     metadata["issuance_path"] = issuance_path
     metadata["token_type"] = "bearer"
     metadata["issued_at"] = _required_int_claim(claims, "iat")
     metadata["expires_at"] = _required_int_claim(claims, "exp")
+    if login_request_id is not None:
+        # The SSO walk writes ``login`` at callback and ``token_issued`` at
+        # complete — two requests, possibly two replicas. This is the join:
+        # the callback's request id, carried on the handoff row and handed
+        # back by ``consume``. Absent for the local path, where both rows
+        # share one request and ``request_id`` already joins them.
+        metadata["login_request_id"] = login_request_id
     return metadata
 
 
@@ -206,6 +222,11 @@ def classify_authentication_failure(exc: AuthenticationError) -> str:
     """Classify auth errors without storing their external-data-bearing detail."""
     if type(exc) is AuthProviderUnavailable:
         return "provider_unavailable"
+    # SSO refusals carry their category ON THE TYPE (sso.py's closed set), so
+    # the classifier reads it rather than restating twelve literals here —
+    # a second copy would be the message-prefix drift below in another form.
+    if isinstance(exc, SsoLoginError):
+        return exc.category
     # Admission outcomes are matched by TYPE. They used to be matched on a
     # message prefix, which put the same literal in the raiser and here with
     # nothing binding the two: rewording the message an operator reads would
@@ -294,7 +315,11 @@ class AuthAuditRecorder:
         provider: AuthProviderType,
         user_id: str,
         username: str,
+        identity_id: str | None = None,
     ) -> None:
+        # ``identity_id`` is explicit here because this row is written at the
+        # SSO callback, where no token exists yet to derive it from — unlike
+        # ``record_token_issued``, which reads it out of the minted token.
         with self._open_landscape(AuthAuditOperation.LOGIN_SUCCESS) as db:
             RecorderFactory(db).auth_audit.record_login_outcome(
                 outcome="success",
@@ -306,6 +331,7 @@ class AuthAuditRecorder:
                 client_host=_client_host(request),
                 user_agent=_bounded_text(_optional_header(request, "user-agent")),
                 metadata=_request_metadata(request),
+                identity_id=identity_id,
             )
 
     def record_login_success_and_token_issued(
@@ -344,6 +370,7 @@ class AuthAuditRecorder:
         username: str,
         access_token: str,
         issuance_path: str,
+        login_request_id: str | None = None,
     ) -> None:
         with self._open_landscape(AuthAuditOperation.TOKEN_ISSUED) as db:
             RecorderFactory(db).auth_audit.record_token_issued(
@@ -358,6 +385,7 @@ class AuthAuditRecorder:
                     request,
                     access_token=access_token,
                     issuance_path=issuance_path,
+                    login_request_id=login_request_id,
                 ),
             )
 
