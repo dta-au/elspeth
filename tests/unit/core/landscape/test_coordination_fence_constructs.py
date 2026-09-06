@@ -860,17 +860,12 @@ class TestDispositionMembershipFence:
         self._set_worker_status(db, "worker-a", "evicted")
 
         dispositions = {
-            "mark_terminal": lambda: repo.mark_terminal(
-                work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-a", worker_id="worker-a"
-            ),
-            "mark_failed": lambda: repo.mark_failed(
-                work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-a", worker_id="worker-a"
-            ),
+            "mark_terminal": lambda: repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a"),
+            "mark_failed": lambda: repo.mark_failed(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a"),
             "mark_blocked": lambda: repo.mark_blocked(
                 work_item_id=work_item_id,
                 queue_key=None,
                 barrier_key="barrier-1",
-                now=NOW,
                 expected_lease_owner="worker-a",
                 worker_id="worker-a",
             ),
@@ -882,7 +877,6 @@ class TestDispositionMembershipFence:
                 path=TerminalPath.DEFAULT_FLOW.value,
                 error_hash=None,
                 error_message=None,
-                now=NOW,
                 expected_lease_owner="worker-a",
                 worker_id="worker-a",
             ),
@@ -904,7 +898,7 @@ class TestDispositionMembershipFence:
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
         self._set_worker_status(db, "worker-a", "departed")
         with pytest.raises(RunWorkerEvictedError):
-            repo.mark_terminal(work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-a", worker_id="worker-a")
+            repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a")
 
     def test_fenced_disposition_succeeds_when_run_has_no_workers(self, db: LandscapeDB) -> None:
         """The LENIENT clause's N=0 OR-branch: a disposition WITH worker_id
@@ -915,9 +909,7 @@ class TestDispositionMembershipFence:
 
         _insert_run(db, RUN_1)
         repo, work_item_id = self._leased_item(db, worker_id="worker-unregistered")
-        item = repo.mark_terminal(
-            work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-unregistered", worker_id="worker-unregistered"
-        )
+        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-unregistered", worker_id="worker-unregistered")
         assert item.status is TokenWorkStatus.TERMINAL
 
     def test_active_worker_disposition_succeeds_with_fence(self, db: LandscapeDB) -> None:
@@ -926,7 +918,7 @@ class TestDispositionMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
-        item = repo.mark_terminal(work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-a", worker_id="worker-a")
+        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a")
         assert item.status is TokenWorkStatus.TERMINAL
 
     def test_unfenced_disposition_keeps_legacy_behavior_when_worker_id_omitted(self, db: LandscapeDB) -> None:
@@ -939,5 +931,5 @@ class TestDispositionMembershipFence:
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
         self._set_worker_status(db, "worker-a", "evicted")
-        item = repo.mark_terminal(work_item_id=work_item_id, now=NOW, expected_lease_owner="worker-a")
+        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a")
         assert item.status is TokenWorkStatus.TERMINAL

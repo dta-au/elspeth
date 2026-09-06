@@ -79,6 +79,17 @@ class BarrierJournalRepository:
         self._engine = engine
         self._events = events
 
+    def database_now(self) -> datetime:
+        """Read the Landscape database clock once, outside any decision transaction.
+
+        A resume measures a hold's age as this instant minus the row's
+        ``barrier_blocked_at`` (ADR-047): both operands come from the
+        database, so a leader whose process clock has drifted cannot fire
+        or starve a timeout by the size of its drift.
+        """
+        with self._engine.connect() as conn:
+            return read_landscape_transaction_time(conn)
+
     def complete_barrier(
         self,
         *,
@@ -87,7 +98,6 @@ class BarrierJournalRepository:
         consumed_token_ids: Sequence[str],
         emitted_pending_sink: Sequence[BarrierEmission],
         emitted_ready: Sequence[BarrierEmission],
-        now: datetime,
         require_exhaustive_release: bool = True,
         scope_row_id: str | None = None,
         intake_snapshot_token_ids: frozenset[str] | None = None,
@@ -264,23 +274,19 @@ class BarrierJournalRepository:
         # (terminalization scrubs it, passthrough overwrites it with the
         # handoff payload), so fetching it would drag every held row's full
         # payload into memory on large barrier sets for nothing.
-        blocked_select = (
-            select(
-                token_work_items_table.c.work_item_id,
-                token_work_items_table.c.token_id,
-                token_work_items_table.c.node_id,
-                token_work_items_table.c.attempt,
-                token_work_items_table.c.lease_owner,
-                token_work_items_table.c.lease_expires_at,
-            )
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.barrier_key == barrier_key)
-            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
-        )
+        blocked_predicates = [
+            token_work_items_table.c.run_id == run_id,
+            token_work_items_table.c.barrier_key == barrier_key,
+            token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value,
+        ]
         if scope_row_id is not None:
-            blocked_select = blocked_select.where(token_work_items_table.c.row_id == scope_row_id)
+            blocked_predicates.append(token_work_items_table.c.row_id == scope_row_id)
 
         with fenced_write(self._engine, coordination_token=coordination_token, verb="complete_barrier") as conn:
+            # ADR-047: one database-time read stamps every row and event this
+            # completion writes; the fence that admitted the transaction
+            # decided on the same clock.
+            database_now = read_landscape_transaction_time(conn)
             if terminal_outcome_token_ids:
                 locked_tokens = conn.execute(
                     select(tokens_table.c.token_id, tokens_table.c.run_id)
@@ -309,7 +315,16 @@ class BarrierJournalRepository:
                     )
             blocked_rows = (
                 conn.execute(
-                    blocked_select.order_by(
+                    select(
+                        token_work_items_table.c.work_item_id,
+                        token_work_items_table.c.token_id,
+                        token_work_items_table.c.node_id,
+                        token_work_items_table.c.attempt,
+                        token_work_items_table.c.lease_owner,
+                        token_work_items_table.c.lease_expires_at,
+                    )
+                    .where(*blocked_predicates)
+                    .order_by(
                         token_work_items_table.c.ingest_sequence,
                         token_work_items_table.c.step_index,
                         token_work_items_table.c.work_item_id,
@@ -428,7 +443,7 @@ class BarrierJournalRepository:
                 barrier_key=barrier_key,
                 consumed=consumed,
                 blocked_by_token=blocked_by_token,
-                now=now,
+                database_now=database_now,
                 release_context=release_context,
             )
             for terminal_outcome in terminal_outcomes:
@@ -438,7 +453,7 @@ class BarrierJournalRepository:
                     token_id=terminal_outcome.token_id,
                     outcome=terminal_outcome.outcome,
                     path=terminal_outcome.path,
-                    recorded_at=now,
+                    recorded_at=database_now,
                     error_hash=terminal_outcome.error_hash,
                 )
             self._transition_passthrough_pending_sink(
@@ -448,7 +463,7 @@ class BarrierJournalRepository:
                 blocked_rows=blocked_rows,
                 passthrough_emissions=passthrough_emissions,
                 emission_context=emission_context,
-                now=now,
+                database_now=database_now,
                 parked_lease_owner=pending_sink_lease_owner,
             )
             for emission in fresh_emissions:
@@ -458,7 +473,7 @@ class BarrierJournalRepository:
                     barrier_key=barrier_key,
                     emission=emission,
                     emission_context=emission_context,
-                    now=now,
+                    database_now=database_now,
                     parked_lease_owner=pending_sink_lease_owner,
                 )
             ready_emission_count = len(emitted_ready)
@@ -470,14 +485,14 @@ class BarrierJournalRepository:
                 # the barrier completion timestamp. available_at is stamped
                 # from Landscape database time inside the insert (ADR-047), so
                 # the whole group is claimable by the very next claim_ready.
-                claim_order_at = now - timedelta(microseconds=ready_emission_count - emission_index - 1)
+                claim_order_at = database_now - timedelta(microseconds=ready_emission_count - emission_index - 1)
                 self._insert_ready_emission(
                     conn,
                     run_id=run_id,
                     barrier_key=barrier_key,
                     emission=emission,
                     emission_context=emission_context,
-                    now=now,
+                    database_now=database_now,
                     claim_order_at=claim_order_at,
                 )
             for spec in group_losses:
@@ -492,7 +507,7 @@ class BarrierJournalRepository:
                     run_id=run_id,
                     spec=spec,
                     recorded_by=coordination_token.worker_id,
-                    now=now,
+                    now=database_now,
                 )
         return terminalized
 
@@ -504,7 +519,7 @@ class BarrierJournalRepository:
         barrier_key: str,
         consumed: tuple[str, ...],
         blocked_by_token: Mapping[str, list[RowMapping]],
-        now: datetime,
+        database_now: datetime,
         release_context: Mapping[str, object] | None = None,
     ) -> int:
         """BLOCKED -> TERMINAL for the consumed set (legacy terminalization arm).
@@ -535,7 +550,7 @@ class BarrierJournalRepository:
                     row_payload_json=scrubbed_row_payload_json(barrier_key),
                     lease_owner=None,
                     lease_expires_at=None,
-                    updated_at=now,
+                    updated_at=database_now,
                 )
             )
             if result.rowcount == 1:
@@ -552,7 +567,7 @@ class BarrierJournalRepository:
                     to_lease_owner=None,
                     from_attempt=row["attempt"],
                     to_attempt=row["attempt"],
-                    recorded_at=now,
+                    recorded_at=database_now,
                     from_lease_expires_at=row["lease_expires_at"],
                     to_lease_expires_at=None,
                     context=terminal_event_context,
@@ -579,7 +594,7 @@ class BarrierJournalRepository:
         blocked_rows: Sequence[RowMapping],
         passthrough_emissions: Sequence[BarrierEmission],
         emission_context: Mapping[str, object],
-        now: datetime,
+        database_now: datetime,
         parked_lease_owner: str | None = None,
     ) -> None:
         """BLOCKED -> PENDING_SINK in place for buffered passthrough tokens (legacy handoff arm).
@@ -614,7 +629,7 @@ class BarrierJournalRepository:
                     pending_error_message=emission.error_message,
                     lease_owner=parked_lease_owner,
                     lease_expires_at=None,
-                    updated_at=now,
+                    updated_at=database_now,
                 )
             )
             if result.rowcount == 1:
@@ -631,7 +646,7 @@ class BarrierJournalRepository:
                     to_lease_owner=parked_lease_owner,
                     from_attempt=row["attempt"],
                     to_attempt=row["attempt"],
-                    recorded_at=now,
+                    recorded_at=database_now,
                     from_lease_expires_at=row["lease_expires_at"],
                     to_lease_expires_at=None,
                     context=emission_context,
@@ -656,7 +671,7 @@ class BarrierJournalRepository:
         barrier_key: str,
         emission: BarrierEmission,
         emission_context: Mapping[str, object],
-        now: datetime,
+        database_now: datetime,
         parked_lease_owner: str | None = None,
     ) -> None:
         """INSERT a fresh PENDING_SINK row on the node_id-NULL terminal lane.
@@ -713,9 +728,9 @@ class BarrierJournalRepository:
             "attempt": emission.attempt,
             "lease_owner": parked_lease_owner,
             "lease_expires_at": None,
-            "available_at": now,
-            "created_at": now,
-            "updated_at": now,
+            "available_at": database_now,
+            "created_at": database_now,
+            "updated_at": database_now,
         }
         insert_work_item(conn, values=values, operation="barrier-completion PENDING_SINK emission")
         self._events.record(
@@ -731,7 +746,7 @@ class BarrierJournalRepository:
             to_lease_owner=parked_lease_owner,
             from_attempt=None,
             to_attempt=emission.attempt,
-            recorded_at=now,
+            recorded_at=database_now,
             context=emission_context,
         )
 
@@ -743,7 +758,7 @@ class BarrierJournalRepository:
         barrier_key: str,
         emission: BarrierEmission,
         emission_context: Mapping[str, object],
-        now: datetime,
+        database_now: datetime,
         claim_order_at: datetime,
     ) -> None:
         """INSERT a READY continuation emitted by a barrier completion."""
@@ -799,7 +814,7 @@ class BarrierJournalRepository:
             to_lease_owner=None,
             from_attempt=None,
             to_attempt=emission.attempt,
-            recorded_at=now,
+            recorded_at=database_now,
             context=emission_context,
         )
 
@@ -809,7 +824,6 @@ class BarrierJournalRepository:
         run_id: str,
         barrier_key: str,
         handoffs: Mapping[str, BlockedPendingSinkHandoff],
-        now: datetime,
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
     ) -> int:
@@ -846,7 +860,6 @@ class BarrierJournalRepository:
             consumed_token_ids=(),
             emitted_pending_sink=emissions,
             emitted_ready=(),
-            now=now,
             require_exhaustive_release=False,
             coordination_token=coordination_token,
             pending_sink_lease_owner=pending_sink_lease_owner,
@@ -860,7 +873,6 @@ class BarrierJournalRepository:
         run_id: str,
         barrier_key: str,
         token_ids: tuple[str, ...],
-        now: datetime,
         coordination_token: CoordinationToken,
         release_context: Mapping[str, object] | None = None,
         group_losses: Sequence[GroupLossSpec] = (),
@@ -904,7 +916,6 @@ class BarrierJournalRepository:
             consumed_token_ids=token_ids,
             emitted_pending_sink=(),
             emitted_ready=(),
-            now=now,
             require_exhaustive_release=False,
             coordination_token=coordination_token,
             release_context=release_context,
@@ -920,7 +931,6 @@ class BarrierJournalRepository:
         barrier_key: str,
         membership: BatchMembershipSpec | None,
         buffered_outcome: BufferedOutcomeSpec | None,
-        now: datetime,
         coordination_token: CoordinationToken,
     ) -> BarrierAdoptionResult:
         """Fenced, backdated adoption of one durable BLOCKED barrier hold (§E.2).
@@ -944,7 +954,7 @@ class BarrierJournalRepository:
 
         Backdated accept timing (§E.2): the BUFFERED outcome's
         ``recorded_at`` is the row's durable ``barrier_blocked_at`` arrival
-        stamp, NOT ``now`` — the audit's accept instant is invariant under
+        stamp, NOT the adoption instant — the audit's accept instant is invariant under
         leader takeover. Honest provenance rides ``context_json``
         (``adopted_epoch`` / ``adopted_at``).
 
@@ -983,6 +993,7 @@ class BarrierJournalRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_blocked_barrier_item",
         ) as conn:
+            database_now = read_landscape_transaction_time(conn)
             result = conn.execute(
                 update(token_work_items_table)
                 .where(token_work_items_table.c.work_item_id == work_item_id)
@@ -991,7 +1002,7 @@ class BarrierJournalRepository:
                 .where(token_work_items_table.c.barrier_key == barrier_key)
                 .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
                 .where(token_work_items_table.c.barrier_adopted_epoch.is_(None))
-                .values(barrier_adopted_epoch=epoch, updated_at=now)
+                .values(barrier_adopted_epoch=epoch, updated_at=database_now)
             )
             if result.rowcount != 1:
                 row = (
@@ -1068,7 +1079,7 @@ class BarrierJournalRepository:
                         **caller_context,
                         # Honest provenance — caller context cannot mask it.
                         "adopted_epoch": epoch,
-                        "adopted_at": now.isoformat(),
+                        "adopted_at": database_now.isoformat(),
                     },
                 )
         return BarrierAdoptionResult(adopted=True, barrier_adopted_epoch=epoch, outcome_id=outcome_id)

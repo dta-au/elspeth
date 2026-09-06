@@ -112,7 +112,6 @@ def test_mixed_statuses_counts_only_ready() -> None:
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=LEASE_OWNER,
     )
     # leased_id stays LEASED (claimed, untouched). ready_id: push it back to READY
@@ -138,7 +137,7 @@ def test_all_non_ready_returns_zero() -> None:
     for _ in range(2):
         item = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
         assert item is not None
-        scheduler.mark_terminal(work_item_id=item.work_item_id, now=NOW + timedelta(seconds=1), expected_lease_owner=LEASE_OWNER)
+        scheduler.mark_terminal(work_item_id=item.work_item_id, expected_lease_owner=LEASE_OWNER)
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=ids) == 0
 
 
@@ -283,11 +282,11 @@ def test_count_failed_counts_only_failed_rows() -> None:
     # Claim FAILED + TERMINAL + LEASED ids (lowest ingest_sequence first).
     claimed_failed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
     assert claimed_failed is not None and claimed_failed.work_item_id == failed_id
-    scheduler.mark_failed(work_item_id=failed_id, now=NOW + timedelta(seconds=1), expected_lease_owner=LEASE_OWNER_LEADER)
+    scheduler.mark_failed(work_item_id=failed_id, expected_lease_owner=LEASE_OWNER_LEADER)
 
     claimed_terminal = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
     assert claimed_terminal is not None and claimed_terminal.work_item_id == terminal_id
-    scheduler.mark_terminal(work_item_id=terminal_id, now=NOW + timedelta(seconds=1), expected_lease_owner=LEASE_OWNER_LEADER)
+    scheduler.mark_terminal(work_item_id=terminal_id, expected_lease_owner=LEASE_OWNER_LEADER)
 
     claimed_leased = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
     assert claimed_leased is not None and claimed_leased.work_item_id == leased_id
@@ -345,7 +344,7 @@ def test_count_failed_is_run_scoped() -> None:
         )
         claimed = scheduler.claim_ready(run_id=run.run_id, lease_owner=lease_owner, lease_seconds=300)
         assert claimed is not None
-        scheduler.mark_failed(work_item_id=item.work_item_id, now=NOW + timedelta(seconds=1), expected_lease_owner=lease_owner)
+        scheduler.mark_failed(work_item_id=item.work_item_id, expected_lease_owner=lease_owner)
         return item.work_item_id
 
     a_id = _make_failed("failed-run-A", 0)
@@ -424,7 +423,6 @@ def test_has_peer_owned_work_true_for_peer_pending_sink_even_after_lease_lapses(
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=NOW + timedelta(seconds=1),
         expected_lease_owner=PEER_OWNER,
     )
     # No active peer LEASE remains, but the PENDING_SINK row still carries the peer.

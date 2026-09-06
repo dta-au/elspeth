@@ -190,7 +190,7 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
         factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}])
         (token,) = tokens
         leader = leader_coordination_token(factory, run_id)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         ready = factory.scheduler.enqueue_ready(
             run_id=run_id,
             token_id=token.token_id,
@@ -214,7 +214,6 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
             path=TerminalPath.DEFAULT_FLOW.value,
             error_hash=None,
             error_message=None,
-            now=now,
             expected_lease_owner=leader.worker_id,
             worker_id=leader.worker_id,
         )

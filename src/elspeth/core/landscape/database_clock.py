@@ -37,7 +37,7 @@ liveness window, production or test, has to absorb a sub-second artefact.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import Connection, func
 
@@ -64,3 +64,24 @@ def read_landscape_transaction_time(conn: Connection) -> datetime:
             raise AuditIntegrityError(f"Tier 1: SQLite CURRENT_TIMESTAMP returned {type(stamped).__name__}, expected a naive UTC datetime")
         return stamped.replace(tzinfo=UTC)
     raise NotImplementedError(f"read_landscape_transaction_time is not implemented for dialect {dialect!r}")
+
+
+def landscape_clock_resolution(conn: Connection) -> timedelta:
+    """Return the smallest interval this dialect's Landscape clock can distinguish.
+
+    A deadline is only as precise as the clock that stamps it AND the clock
+    that later compares against it, and under ADR-047 both are this one.
+    SQLite's ``CURRENT_TIMESTAMP`` is whole-second, so a deadline stamped
+    ``database_now + ttl`` from an instant part-way through second S is
+    compared as though it had been stamped at S: it lapses at the next second
+    boundary and delivers ``floor(ttl) + 1 - fraction`` seconds of life, which
+    for any sub-second ``ttl`` does not depend on ``ttl`` at all and has a
+    floor of zero. PostgreSQL's transaction timestamp carries microseconds, so
+    the quantisation is immaterial there.
+    """
+    dialect = conn.dialect.name
+    if dialect == "postgresql":
+        return timedelta(microseconds=1)
+    if dialect == "sqlite":
+        return timedelta(seconds=1)
+    raise NotImplementedError(f"landscape_clock_resolution is not implemented for dialect {dialect!r}")

@@ -54,7 +54,7 @@ from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sinks.document_sink import DocumentSink
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import expire_sink_effect_lease, make_factory, make_landscape_db, register_test_node
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.tree_gate import iter_gate_files
@@ -1055,7 +1055,11 @@ def test_preparation_claim_stays_live_while_adapter_installs_local_stage(
     install_entered = threading.Event()
     rival_errors: list[BaseException] = []
     stale_errors: list[BaseException] = []
-    lease_ttl = timedelta(milliseconds=50)
+    # One database second is the resolution of the clock the claim is decided
+    # against (ADR-047, whole-second SQLite time): a shorter TTL lapses at
+    # every second boundary between two heartbeats, which is a clock
+    # artefact, not the slow preparer losing its claim.
+    lease_ttl = timedelta(seconds=1)
     target = tmp_path / "out.csv"
     sink_config = {"path": str(target), "schema": {"mode": "observed"}}
     original_replace = local_effects.os.replace
@@ -1300,6 +1304,10 @@ def test_takeover_closes_stale_abandoned_intent_before_new_generation_call(
                 clock=clock,
             ).execute(request, sink)
         clock.advance(lease_ttl.total_seconds() + 1)
+        # The abandoned lease lapses on the Landscape database clock (ADR-047),
+        # which the mock clock cannot move.
+        (abandoned,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        expire_sink_effect_lease(db.engine, abandoned.effect_id)
         SinkEffectCoordinator(factory=factory, worker_id="worker-b", clock=clock).execute(request, sink)
 
         with db.read_only_connection() as conn:
@@ -1346,6 +1354,8 @@ def test_retry_consumes_returned_commit_without_another_reconcile(
             ).execute(request, sink)
         if takeover:
             clock.advance(takeover_ttl.total_seconds() + 1)
+            (abandoned,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+            expire_sink_effect_lease(db.engine, abandoned.effect_id)
         SinkEffectCoordinator(
             factory=factory,
             worker_id="worker-b" if takeover else "worker-a",
@@ -1401,7 +1411,7 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
         lease = factory.execution.sink_effects.acquire_lease(
             reserved.effect_id,
             owner="worker-a",
-            ttl=timedelta(microseconds=1) if takeover else timedelta(seconds=30),
+            ttl=timedelta(seconds=30),
         )
         reconciliation = SinkEffectReconcileResult.not_applied(evidence={"target": "not_applied"})
         attempt = factory.execution.sink_effects.begin_attempt(
@@ -1421,6 +1431,9 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
                 latency_ms=0.0,
             )
         )
+        if takeover:
+            # worker-a's lease lapses on the Landscape database clock (ADR-047).
+            expire_sink_effect_lease(db.engine, reserved.effect_id)
 
         SinkEffectCoordinator(
             factory=factory,

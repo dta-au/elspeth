@@ -1733,7 +1733,7 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
 
@@ -1766,7 +1766,6 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
             repo,
             transition,
             work_item_id=second_claim.work_item_id,
-            now=now + timedelta(seconds=33),
             expected_lease_owner="worker-a",
         )
 
@@ -1882,7 +1881,6 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=now + timedelta(seconds=1),
         expected_lease_owner="worker-a",
     )
     raced = False
@@ -2054,7 +2052,6 @@ def _apply_scheduler_transition(
     transition: _SchedulerTransition,
     *,
     work_item_id: str,
-    now: datetime,
     expected_lease_owner: str = "worker-a",
 ):
     if transition == "blocked":
@@ -2062,13 +2059,12 @@ def _apply_scheduler_transition(
             work_item_id=work_item_id,
             queue_key="queue:inbound",
             barrier_key="barrier:row-1",
-            now=now,
             expected_lease_owner=expected_lease_owner,
         )
     if transition == "terminal":
-        return repo.mark_terminal(work_item_id=work_item_id, now=now, expected_lease_owner=expected_lease_owner)
+        return repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
     if transition == "failed":
-        return repo.mark_failed(work_item_id=work_item_id, now=now, expected_lease_owner=expected_lease_owner)
+        return repo.mark_failed(work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
     raise AssertionError(f"Unhandled scheduler transition {transition!r}")
 
 
@@ -2173,7 +2169,7 @@ def _insert_scheduler_owner_records(
             )
 
 
-def _enqueue_scheduler_test_item(repo, *, engine, now: datetime, token_id: str = "token-1", ingest_sequence: int = 0):
+def _enqueue_scheduler_test_item(repo, *, engine, token_id: str = "token-1", ingest_sequence: int = 0):
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 
     metadata.create_all(engine)
@@ -2373,11 +2369,11 @@ def test_scheduler_transitions_raise_for_missing_work_item(transition: _Schedule
 
     engine = _make_tier1_engine()
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    _enqueue_scheduler_test_item(repo, engine=engine)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to .*work_item_id='missing-{transition}'"):
-        _apply_scheduler_transition(repo, transition, work_item_id=f"missing-{transition}", now=now)
+        _apply_scheduler_transition(repo, transition, work_item_id=f"missing-{transition}")
 
 
 @pytest.mark.parametrize("transition", ["blocked", "terminal", "failed"])
@@ -2386,15 +2382,15 @@ def test_scheduler_transitions_raise_when_work_item_already_in_target_status(tra
 
     engine = _make_tier1_engine()
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
 
-    _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id, now=now)
+    _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to '{transition.upper()}'.*work_item_id='{item.work_item_id}'"):
-        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id, now=now + timedelta(seconds=1))
+        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
 
 
 @pytest.mark.parametrize("transition", ["blocked", "terminal"])
@@ -2403,11 +2399,11 @@ def test_scheduler_transitions_raise_when_work_item_is_not_leased(transition: _S
 
     engine = _make_tier1_engine()
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to '{transition.upper()}'.*expected status LEASED"):
-        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id, now=now)
+        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
 
 
 def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
@@ -2415,8 +2411,8 @@ def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
 
     engine = _make_tier1_engine()
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
@@ -2425,7 +2421,6 @@ def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
 
     failed = repo.mark_failed(
         work_item_id=item.work_item_id,
-        now=now + timedelta(seconds=1),
         expected_lease_owner="worker-a",
     )
 
@@ -2465,12 +2460,11 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
 
-    retry_at = now + timedelta(seconds=10)
+    now + timedelta(seconds=10)
     blocked = repo.mark_blocked(
         work_item_id=item.work_item_id,
         queue_key="queue:inbound",
         barrier_key="barrier:row-1",
-        now=retry_at,
         expected_lease_owner="worker-a",
     )
     assert blocked.status is TokenWorkStatus.BLOCKED
@@ -2485,7 +2479,6 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
         run_id="run-1",
         barrier_key="barrier:row-1",
         token_ids=("token-1",),
-        now=retry_at,
         coordination_token=_COORD_TOKEN_RUN1,
     )
     assert completed == 1
@@ -2505,12 +2498,11 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     assert claimed_second is not None
     assert claimed_second.work_item_id == second.work_item_id
 
-    terminal = repo.mark_terminal(work_item_id=second.work_item_id, now=retry_at, expected_lease_owner="worker-d")
+    terminal = repo.mark_terminal(work_item_id=second.work_item_id, expected_lease_owner="worker-d")
     assert terminal.status is TokenWorkStatus.TERMINAL
     with pytest.raises(AuditIntegrityError, match=f"work_item_id='{second.work_item_id}'"):
         repo.mark_terminal(
             work_item_id=second.work_item_id,
-            now=retry_at + timedelta(seconds=1),
             expected_lease_owner="worker-d",
         )
     assert repo.claim_ready(run_id="run-1", lease_owner="worker-c", lease_seconds=30) is None
@@ -2523,7 +2515,7 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(
         engine,
@@ -2555,7 +2547,6 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         work_item_id=first.work_item_id,
         queue_key=None,
         barrier_key="merge",
-        now=now,
         expected_lease_owner="worker-a",
     )
 
@@ -2566,7 +2557,6 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         work_item_id=second.work_item_id,
         queue_key=None,
         barrier_key="merge",
-        now=now,
         expected_lease_owner="worker-b",
     )
 
@@ -2574,7 +2564,6 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         run_id="run-1",
         barrier_key="merge",
         token_ids=("token-row-1-branch-a",),
-        now=now,
         coordination_token=_COORD_TOKEN_RUN1,
     )
 
@@ -2598,8 +2587,8 @@ def test_scheduler_unresolved_work_excludes_durable_sink_handoffs() -> None:
 
     engine = _make_tier1_engine()
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     assert repo.count_unresolved_work(run_id="run-1") == 1
@@ -2617,7 +2606,6 @@ def test_scheduler_unresolved_work_excludes_durable_sink_handoffs() -> None:
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=now + timedelta(seconds=1),
         expected_lease_owner="worker-a",
     )
     assert repo.count_unresolved_work(run_id="run-1") == 0
@@ -2632,7 +2620,6 @@ def test_scheduler_unresolved_work_excludes_durable_sink_handoffs() -> None:
     terminalized = repo.mark_pending_sink_terminal(
         run_id="run-1",
         token_id="token-1",
-        now=now + timedelta(seconds=3),
         expected_lease_owner="worker-b",
         coordination_token=_COORD_TOKEN_RUN1,
     )
@@ -2648,7 +2635,7 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
@@ -2668,7 +2655,6 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key=None,
-            now=now,
             expected_lease_owner="worker-a",
         )
 
@@ -2923,7 +2909,7 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(
         engine,
@@ -2948,7 +2934,6 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner=f"worker-{index}",
         )
 
@@ -2957,7 +2942,6 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
             run_id="run-1",
             barrier_key="merge",
             token_ids=("token-a", "token-b", "token-c"),
-            now=now,
             coordination_token=_COORD_TOKEN_RUN1,
         )
 
@@ -2980,7 +2964,7 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(
         engine,
@@ -3005,7 +2989,6 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner=f"worker-{index}",
         )
 
@@ -3014,7 +2997,6 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
             run_id="run-1",
             barrier_key="merge",
             token_ids=("live-a", "live-b", "live-c"),
-            now=now,
             coordination_token=_COORD_TOKEN_RUN1,
         )
 
@@ -3038,7 +3020,7 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
+    landscape_database_now(engine)
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(
         engine,
@@ -3063,7 +3045,6 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
-            now=now,
             expected_lease_owner=f"worker-{index}",
         )
 
@@ -3072,7 +3053,6 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
             run_id="run-1",
             barrier_key="merge",
             token_ids=(),
-            now=now,
             coordination_token=_COORD_TOKEN_RUN1,
         )
 
@@ -3105,8 +3085,8 @@ def test_scheduler_heartbeat_lease_extends_expires_at_for_held_lease() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     before_claim = landscape_database_now(engine)
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
@@ -3154,8 +3134,8 @@ def test_scheduler_heartbeat_lease_prevents_peer_reaper_from_reaping_alive_slow_
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     caller_owner = "row-processor:run-1:alive-slow"
     peer_owner = "row-processor:run-1:peer-reaper"
@@ -3206,8 +3186,8 @@ def test_scheduler_heartbeat_lease_does_not_block_reaping_dead_worker() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    _enqueue_scheduler_test_item(repo, engine=engine)
 
     dead_owner = "row-processor:run-1:dead-worker"
     peer_owner = "row-processor:run-1:peer-reaper"
@@ -3252,8 +3232,8 @@ def test_scheduler_heartbeat_lease_raises_lease_lost_when_lease_was_reaped() -> 
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     dead_owner = "row-processor:run-1:dead-worker"
     peer_owner = "row-processor:run-1:peer-reaper"
@@ -3296,8 +3276,8 @@ def test_scheduler_heartbeat_lease_raises_lease_lost_for_non_owner_caller() -> N
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
@@ -3327,8 +3307,8 @@ def test_scheduler_heartbeat_lease_composes_with_peer_active_leases() -> None:
     engine = _make_tier1_engine()
     metadata.create_all(engine)
     repo = TokenSchedulerRepository(engine)
-    now = landscape_database_now(engine)
-    item = _enqueue_scheduler_test_item(repo, engine=engine, now=now)
+    landscape_database_now(engine)
+    item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     original_owner = "row-processor:run-1:original"
     peer_owner = "row-processor:run-1:peer"

@@ -77,7 +77,6 @@ def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch:
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
             coordination_token=COORD_TOKEN,
             terminal_outcomes=terminal_outcomes,
@@ -223,7 +222,6 @@ def _enqueue_and_block(
     row_id: str,
     ingest_sequence: int,
     payload: str,
-    now: datetime,
     barrier_key: str = BARRIER_KEY,
 ) -> None:
     """Enqueue one READY item, claim it, and block it at the barrier."""
@@ -243,7 +241,6 @@ def _enqueue_and_block(
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        now=now + timedelta(seconds=2),
         expected_lease_owner="w1",
     )
 
@@ -256,7 +253,7 @@ def _seed_three_blocked(engine: Tier1Engine, repo, *, extra_tokens: list[tuple[s
         now=NOW,
     )
     for ingest_sequence, (row_id, token_id) in enumerate([("r1", "t1"), ("r2", "t2"), ("r3", "t3")]):
-        _enqueue_and_block(repo, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, payload=payload, now=NOW)
+        _enqueue_and_block(repo, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, payload=payload)
     return payload
 
 
@@ -325,7 +322,6 @@ def test_complete_barrier_consumes_and_emits_atomically() -> None:
             )
         ],
         emitted_ready=[],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -372,7 +368,6 @@ def test_complete_barrier_refuses_partial_consumed_set() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -390,7 +385,6 @@ def test_complete_barrier_refuses_consumed_tokens_missing_from_blocked_set() -> 
             consumed_token_ids=["t1", "t2", "t3", "t4"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -438,7 +432,6 @@ def test_complete_barrier_crash_atomicity() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -468,7 +461,6 @@ def test_complete_barrier_passthrough_handoff_counts_toward_blocked_coverage() -
             )
         ],
         emitted_ready=[],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -499,7 +491,6 @@ def test_complete_barrier_snapshot_equal_to_durable_is_n1_parity() -> None:
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
         coordination_token=COORD_TOKEN,
     )
@@ -538,7 +529,6 @@ def test_complete_barrier_late_arrival_outside_snapshot_stays_blocked() -> None:
                 ingest_sequence=3,
             )
         ],
-        now=NOW,
         intake_snapshot_token_ids=frozenset({"t1", "t2"}),
         coordination_token=COORD_TOKEN,
     )
@@ -570,7 +560,6 @@ def test_complete_barrier_snapshot_minus_durable_is_tier1() -> None:
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2", "t3", "t-ghost"}),
             coordination_token=COORD_TOKEN,
         )
@@ -590,7 +579,6 @@ def test_complete_barrier_consumed_outside_snapshot_is_tier1() -> None:
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             coordination_token=COORD_TOKEN,
         )
@@ -618,7 +606,6 @@ def test_complete_barrier_handed_off_outside_snapshot_is_tier1() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             coordination_token=COORD_TOKEN,
         )
@@ -640,7 +627,6 @@ def test_complete_barrier_snapshot_orphan_within_snapshot_is_tier1() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
             coordination_token=COORD_TOKEN,
         )
@@ -669,7 +655,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=None,
             coordination_token=COORD_TOKEN,
         )
@@ -681,7 +666,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         intake_snapshot_token_ids=None,
         coordination_token=COORD_TOKEN,
     )
@@ -706,7 +690,6 @@ def test_complete_barrier_leased_exclusion_token_id_parameter_is_deleted() -> No
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             leased_exclusion_token_id="t3",
             coordination_token=COORD_TOKEN,
         )
@@ -733,7 +716,6 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
                 ingest_sequence=3,
             )
         ],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -774,7 +756,6 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
         row_id="r1",
         ingest_sequence=0,
         payload=payload,
-        now=NOW,
         barrier_key="variant_union",
     )
     _enqueue_and_block(
@@ -783,7 +764,6 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
         row_id="r1",
         ingest_sequence=0,
         payload=payload,
-        now=NOW,
         barrier_key="variant_union",
     )
 
@@ -812,7 +792,6 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
                 lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-variant-union", member_key="treatment"),),
             ),
         ],
-        now=NOW,
         scope_row_id="r1",
         coordination_token=COORD_TOKEN,
     )
@@ -841,7 +820,6 @@ def test_complete_barrier_rejects_duplicate_consumed_token_ids() -> None:
             consumed_token_ids=["t1", "t1", "t2", "t3"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -867,7 +845,6 @@ def test_complete_barrier_rejects_consumed_token_also_emitted() -> None:
                 )
             ],
             emitted_ready=[],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 
@@ -899,7 +876,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
                 error_message=None,
             )
         },
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
     assert transitioned == 1
@@ -911,7 +887,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
         run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t2",),  # t3 left blocked: legacy partial release
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
     assert terminalized == 1
@@ -945,7 +920,6 @@ def _seed_two_coalesce_groups(engine: Tier1Engine, repo, *, extra_tokens: list[t
             row_id=row_id,
             ingest_sequence=ingest_sequence,
             payload=payload,
-            now=NOW,
             barrier_key=COALESCE_KEY,
         )
     return payload
@@ -966,7 +940,6 @@ def test_complete_barrier_scope_row_id_isolates_coalesce_group() -> None:
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r1",
         coordination_token=COORD_TOKEN,
     )
@@ -989,7 +962,6 @@ def test_complete_barrier_scoped_group_still_catches_cross_group_consumed_token(
             consumed_token_ids=["t1a", "t1b", "t2a"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -1009,7 +981,6 @@ def test_complete_barrier_scoped_group_still_catches_uncovered_blocked_row() -> 
             consumed_token_ids=["t1a"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -1029,7 +1000,6 @@ def test_complete_barrier_scope_row_id_requires_exhaustive_release() -> None:
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             require_exhaustive_release=False,
             coordination_token=COORD_TOKEN,
@@ -1078,7 +1048,6 @@ def test_complete_barrier_combined_lanes_one_call() -> None:
                 ingest_sequence=4,
             )
         ],
-        now=NOW,
         coordination_token=COORD_TOKEN,
     )
 
@@ -1128,7 +1097,6 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
                 ingest_sequence=0,
             )
         ],
-        now=NOW,
         scope_row_id="r1",
         coordination_token=COORD_TOKEN,
     )
@@ -1171,7 +1139,6 @@ def test_complete_barrier_scoped_fire_rejects_emission_outside_scope_group() -> 
                     ingest_sequence=1,
                 )
             ],
-            now=NOW,
             scope_row_id="r1",
             coordination_token=COORD_TOKEN,
         )
@@ -1191,7 +1158,6 @@ def test_complete_barrier_snapshot_requires_exhaustive_release() -> None:
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             intake_snapshot_token_ids=frozenset({"t1", "t2"}),
             require_exhaustive_release=False,
             coordination_token=COORD_TOKEN,
@@ -1214,7 +1180,6 @@ def test_complete_barrier_cross_group_snapshot_token_is_tier1() -> None:
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
             emitted_ready=[],
-            now=NOW,
             scope_row_id="r1",
             intake_snapshot_token_ids=frozenset({"t1a", "t1b", "t2a"}),
             coordination_token=COORD_TOKEN,
@@ -1237,7 +1202,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r1",
         intake_snapshot_token_ids=frozenset({"t1a", "t1b"}),
         coordination_token=COORD_TOKEN,
@@ -1254,7 +1218,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
         consumed_token_ids=["t2a", "t2b"],
         emitted_pending_sink=[],
         emitted_ready=[],
-        now=NOW,
         scope_row_id="r2",
         intake_snapshot_token_ids=frozenset({"t2a", "t2b"}),
         coordination_token=COORD_TOKEN,
@@ -1275,7 +1238,6 @@ def test_mark_blocked_barrier_terminal_release_context_merged_into_event() -> No
         run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t3",),
-        now=NOW,
         coordination_token=COORD_TOKEN,
         release_context={
             "late_arrival": True,
@@ -1330,7 +1292,6 @@ def test_complete_barrier_rejects_duplicate_ready_emissions() -> None:
                     ingest_sequence=3,
                 ),
             ],
-            now=NOW,
             coordination_token=COORD_TOKEN,
         )
 

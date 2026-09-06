@@ -257,7 +257,7 @@ def _seed_follower_pending_sink_row(
 
     factory = RecorderFactory(db, payload_store=payload_store)
     repo = TokenSchedulerRepository(db.engine)
-    now = datetime.now(UTC)
+    datetime.now(UTC)
     # Reuse an existing leader source row (a continuation child), not a new row.
     # The child's scheduler cursor MUST carry the parent row's ingest_sequence
     # (enqueue_ready enforces row_id↔ingest_sequence ownership).
@@ -305,7 +305,6 @@ def _seed_follower_pending_sink_row(
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=now + timedelta(seconds=1),
         expected_lease_owner=PEER_OWNER,
     )
     return token.token_id

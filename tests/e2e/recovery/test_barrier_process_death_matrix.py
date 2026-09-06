@@ -295,7 +295,9 @@ def _arrive_row_union(factory: RecorderFactory, processor: RowProcessor, token: 
         ingest_sequence=ingest_sequence,
         coalesce_name=str(_ROW_UNION),
     )
-    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key=str(_ROW_UNION))
+    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+        token=token, barrier_key=str(_ROW_UNION), arrived_monotonic=processor._clock.monotonic()
+    )
     return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
 
 
@@ -786,7 +788,9 @@ def _arrive_collector(factory: RecorderFactory, processor: RowProcessor, token: 
         ingest_sequence=ingest_sequence,
         collector_name=str(_COLLECTOR),
     )
-    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key=barrier_key)
+    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+        token=token, barrier_key=barrier_key, arrived_monotonic=processor._clock.monotonic()
+    )
     return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
 
 
@@ -803,7 +807,9 @@ def _arrive_coalesce(factory: RecorderFactory, processor: RowProcessor, token: T
         ingest_sequence=ingest_sequence,
         coalesce_name=str(_MERGE),
     )
-    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key=str(_MERGE))
+    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+        token=token, barrier_key=str(_MERGE), arrived_monotonic=processor._clock.monotonic()
+    )
     return processor.run_barrier_intake(make_context(landscape=factory.plugin_audit_writer()))
 
 

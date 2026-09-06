@@ -180,7 +180,9 @@ def _arrive_via_intake(factory: Any, processor: Any, token: TokenInfo, *, ingest
     # META-38: the crafted FORK frame's group gets the group_records row a real
     # fork mints (the merge reads the written release fact for it).
     ensure_fork_group_record(factory, run_id=RUN_ID, group_id=token.lineage_path[-1].group_id, opener_token_id=token.token_id)
-    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(token=token, barrier_key="merge")
+    processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
+        token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+    )
     return processor.run_barrier_intake(ctx)
 
 

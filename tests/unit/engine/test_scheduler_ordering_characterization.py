@@ -137,7 +137,7 @@ def _insert_row_with_tokens(
             )
 
 
-def _claim_tokens_in_order(repo: TokenSchedulerRepository, *, lease_owner: str, now: datetime) -> list[str]:
+def _claim_tokens_in_order(repo: TokenSchedulerRepository, *, lease_owner: str) -> list[str]:
     """Claim every READY item without terminalizing; return token_ids in claim order."""
     claimed: list[str] = []
     while True:
@@ -200,7 +200,7 @@ def test_claim_ready_order_is_global_ingest_sequence_not_enqueue_order() -> None
             row_payload_json=payload,
         )
 
-    claimed = _claim_tokens_in_order(repo, lease_owner="worker-a", now=now + timedelta(seconds=1))
+    claimed = _claim_tokens_in_order(repo, lease_owner="worker-a")
 
     assert claimed == ["token-a0", "token-a1", "token-b0", "token-b1"]
 
@@ -256,7 +256,7 @@ def test_claim_ready_ties_resolve_by_step_index_then_created_at_then_work_item_i
                 .values(created_at=created_at)
             )
 
-    claimed = _claim_tokens_in_order(repo, lease_owner="worker-a", now=now + timedelta(seconds=10))
+    claimed = _claim_tokens_in_order(repo, lease_owner="worker-a")
 
     tied_pair = sorted(("token-y", "token-z"), key=lambda token_id: items[token_id].work_item_id)
     assert claimed == [*tied_pair, "token-x", "token-w"]
@@ -363,7 +363,6 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=now + timedelta(seconds=2),
         expected_lease_owner="worker-a",
     )
 
@@ -378,7 +377,7 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
         ).scalar_one()
     assert parked_status == TokenWorkStatus.PENDING_SINK.value
 
-    repo.mark_terminal(work_item_id=second.work_item_id, now=now + timedelta(seconds=4), expected_lease_owner="worker-a")
+    repo.mark_terminal(work_item_id=second.work_item_id, expected_lease_owner="worker-a")
 
     # The parked token drains afterward.
     drained = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300)
@@ -389,7 +388,6 @@ def test_pending_sink_parked_token_does_not_block_later_tokens_and_drains_afterw
         repo.mark_pending_sink_terminal(
             run_id=RUN_ID,
             token_id="token-1",
-            now=now + timedelta(seconds=6),
             expected_lease_owner="worker-a",
             coordination_token=COORD_TOKEN,
         )

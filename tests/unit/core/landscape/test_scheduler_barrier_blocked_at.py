@@ -30,6 +30,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
 
 
 def _make_scheduler_engine() -> Tier1Engine:
@@ -125,7 +126,6 @@ def _enqueue_and_block(
     payload: str,
     queue_key: str | None,
     barrier_key: str | None,
-    now: datetime,
 ) -> TokenWorkItem:
     """Enqueue one READY item, claim it, and block it at a queue or barrier.
 
@@ -150,7 +150,6 @@ def _enqueue_and_block(
             work_item_id=item.work_item_id,
             queue_key=queue_key,
             barrier_key=barrier_key,
-            now=now + timedelta(seconds=2),
             expected_lease_owner="w1",
         ),
     )
@@ -174,23 +173,29 @@ def test_mark_blocked_stamps_barrier_blocked_at() -> None:
     )
     assert repo.claim_ready(run_id="run-1", lease_owner="w1", lease_seconds=30) is not None
 
+    # The hold instant is Landscape database time read inside mark_blocked's
+    # transaction (ADR-047): the seed instant above is a 2026-06 process
+    # value and must not appear on the row.
+    blocked_from = landscape_database_now(engine)
     blocked = repo.mark_blocked(
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key="agg-1",
-        now=now,
         expected_lease_owner="w1",
     )
+    blocked_until = landscape_database_now(engine)
 
     assert blocked.status is TokenWorkStatus.BLOCKED
-    assert blocked.barrier_blocked_at == now
+    assert blocked.barrier_blocked_at is not None
+    assert_stamped_between(blocked.barrier_blocked_at, start=blocked_from, end=blocked_until, tolerance=timedelta(0))
+    assert blocked.barrier_blocked_at != now
     # Raw row check: SQLite's DateTime adapter stores tz-aware values naive.
     with engine.connect() as conn:
         raw = (
             conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == item.work_item_id)).mappings().one()
         )
     assert raw["status"] == "blocked"
-    assert raw["barrier_blocked_at"] == now.replace(tzinfo=None)
+    assert raw["barrier_blocked_at"] == blocked.barrier_blocked_at.replace(tzinfo=None)
 
 
 def test_mark_blocked_queue_hold_is_stamped_but_never_swept_as_barrier() -> None:
@@ -210,7 +215,6 @@ def test_mark_blocked_queue_hold_is_stamped_but_never_swept_as_barrier() -> None
         payload=payload,
         queue_key="queue-1",
         barrier_key=None,
-        now=now,
     )
     assert blocked.status is TokenWorkStatus.BLOCKED
     assert blocked.barrier_blocked_at is not None
@@ -241,7 +245,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
         payload=payload_a,
         queue_key=None,
         barrier_key="agg-1",
-        now=now,
     )
     # run-A: one ADR-028 queue-hold (status=blocked, queue_key set, barrier_key NULL).
     _enqueue_and_block(
@@ -253,7 +256,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
         payload=payload_a,
         queue_key="queue-1",
         barrier_key=None,
-        now=now,
     )
     # run-B: one barrier-BLOCKED item (must not bleed into run-A's sweep).
     _enqueue_and_block(
@@ -265,7 +267,6 @@ def test_list_blocked_barrier_items_returns_only_barrier_blocked_for_run() -> No
         payload=payload_b,
         queue_key=None,
         barrier_key="agg-1",
-        now=now,
     )
     # run-A: one READY item (enqueued last so the claims above stay deterministic).
     repo.enqueue_ready(
@@ -317,7 +318,6 @@ def test_list_blocked_barrier_items_orders_by_barrier_key_ingest_sequence_work_i
         payload=payload,
         queue_key=None,
         barrier_key="barrier-b",
-        now=now,
     )
     _enqueue_and_block(
         repo,
@@ -328,7 +328,6 @@ def test_list_blocked_barrier_items_orders_by_barrier_key_ingest_sequence_work_i
         payload=payload,
         queue_key=None,
         barrier_key="barrier-a",
-        now=now,
     )
     _enqueue_and_block(
         repo,
@@ -339,7 +338,6 @@ def test_list_blocked_barrier_items_orders_by_barrier_key_ingest_sequence_work_i
         payload=payload,
         queue_key=None,
         barrier_key="barrier-a",
-        now=now,
     )
 
     items = repo.list_blocked_barrier_items(run_id="run-1")

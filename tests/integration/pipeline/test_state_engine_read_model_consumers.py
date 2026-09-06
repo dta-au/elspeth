@@ -205,7 +205,7 @@ def test_rm08_maintenance_evicts_exact_dead_worker_listing_in_order() -> None:
     drain._run_id = RUN_ID
     drain._scheduler_drains_since_maintenance = 9
 
-    assert drain.run_maintenance(NOW) == 4
+    assert drain.run_maintenance() == 4
     assert trace[0] == "require-token"
     dead_call = cast(tuple[object, ...], trace[1])
     assert dead_call == ("dead", RUN_ID, "leader-worker", DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)

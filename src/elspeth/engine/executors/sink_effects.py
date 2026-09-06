@@ -52,7 +52,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectState,
 )
 from elspeth.core.clock import Clock
-from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     SinkEffectReturnedResult,
     decode_sink_effect_returned_result,
@@ -63,6 +63,11 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.clock import DEFAULT_CLOCK, SystemClock
 
 logger = logging.getLogger(__name__)
+
+# Resolution of the clock the repository measures lease validity against:
+# SQLite's CURRENT_TIMESTAMP is whole-second (ADR-047), so a reported
+# remaining validity of N seconds means the lease lapses inside [N, N + 1).
+_LANDSCAPE_CLOCK_RESOLUTION_SECONDS = 1.0
 
 
 class SinkEffectExecutionSeam(StrEnum):
@@ -437,7 +442,35 @@ class SinkEffectCoordinator:
 
             monotonic_now = self._clock.monotonic()
             if deadline is None:
-                initial_budget = min(self._lease_ttl.total_seconds(), remaining_validity)
+                # The repository reports validity against Landscape database
+                # time, whole-second on SQLite (ADR-047): "N seconds remain"
+                # means [N, N + 1), and the takeover needs the database clock
+                # strictly PAST the deadline, so a lease stamped at whole
+                # second S with TTL T is held until second S + T + 1. The
+                # budget therefore carries one clock resolution ABOVE the
+                # remaining validity.
+                #
+                # The cap is the TTL rounded up to that same resolution.
+                # Capping at the raw TTL assumes a lease cannot outlive the TTL
+                # it was asked for, and on a quantised clock it always can:
+                # that assumption cost nine recovery resumes once already,
+                # patched then by adding a resolution on top of the wrong cap
+                # rather than correcting it.
+                #
+                # The constant is the COARSEST resolution across dialects, and
+                # the executor holds no connection to ask for the live one. On
+                # SQLite it is exact: the cap is what
+                # ``sink_effect_lifecycle._aligned_lease_ttl`` stamps. On
+                # PostgreSQL the repository rounds to a microsecond, so a
+                # fractional TTL leaves the cap up to a second high -- slack in
+                # the safe direction, since remaining validity is measured on
+                # the database clock and still bounds the wait. Either way
+                # remaining validity never exceeds the cap, so the cap binds
+                # only on a corrupt deadline.
+                quantised_ttl = (
+                    math.ceil(self._lease_ttl.total_seconds() / _LANDSCAPE_CLOCK_RESOLUTION_SECONDS) * _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
+                )
+                initial_budget = min(quantised_ttl, remaining_validity) + _LANDSCAPE_CLOCK_RESOLUTION_SECONDS
                 # Repository takeover is deliberately strict (expires_at < now).
                 # One bounded poll interval permits the final authority check to
                 # cross an exact equality without introducing an open-ended wait.
@@ -483,8 +516,10 @@ class SinkEffectCoordinator:
         heartbeat_at = self._utc(effect.lease_heartbeat_at)
         if expires_at <= heartbeat_at:
             raise LandscapeRecordError("sink effect wait encountered non-positive lease validity")
-        remaining = (expires_at - self._clock.now_utc()).total_seconds()
-        return None if remaining < 0.0 else remaining
+        # Remaining validity is measured on Landscape database time (ADR-047),
+        # the clock the repository's takeover decides against; this process
+        # clock only paces the polls.
+        return self._effects.lease_validity_seconds(effect.effect_id)
 
     def _check_wait_interruptions(self) -> None:
         if self._shutdown_event is not None and self._shutdown_event.is_set():
@@ -1067,20 +1102,18 @@ class SinkEffectCoordinator:
         if effect.state is not SinkEffectState.RESERVED:
             return self._load_plan(effect)
         # Preparation runs side-effecting adapter code, so ownership must be
-        # durably claimed before any staging mutation. Refuse politely while
-        # another worker's claim is live; close abandoned inspect intents
-        # while their generation still matches the row; then claim (which
-        # bumps the generation and fences the eventual plan bind).
-        if (
-            effect.lease_owner is not None
-            and effect.lease_owner != self._worker_id
-            and effect.lease_expires_at is not None
-            and self._utc(effect.lease_expires_at) >= self._clock.now_utc()
-        ):
-            raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation is claimed by another worker")
+        # durably claimed before any staging mutation. Whether another
+        # worker's claim is still live is the repository's decision against
+        # Landscape database time (ADR-047), never this process clock's: the
+        # claim is attempted and a live foreign claim comes back as the typed
+        # refusal that the lease wait understands. Abandoned inspect intents
+        # are closed while their generation still matches the row; the claim
+        # then bumps the generation and fences the eventual plan bind.
         self._close_abandoned_attempts(effect.effect_id, actions=(SinkEffectAttemptAction.INSPECT,))
         try:
             claim = self._effects.claim_preparation(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
+        except SinkEffectLeaseLiveError as exc:
+            raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation is claimed by another worker") from exc
         except LandscapeRecordError as exc:
             current = self._require_effect(effect.effect_id)
             if current.state in {SinkEffectState.PREPARED, SinkEffectState.IN_FLIGHT, SinkEffectState.FINALIZED}:
@@ -1208,12 +1241,20 @@ class SinkEffectCoordinator:
                 return self._effects.acquire_lease(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
             if effect.state is not SinkEffectState.IN_FLIGHT or effect.lease_expires_at is None:
                 raise LandscapeRecordError(f"sink effect cannot execute from state {effect.state.value!r}")
-            expires_at = self._utc(effect.lease_expires_at)
-            if effect.lease_owner == self._worker_id and expires_at >= self._clock.now_utc():
-                return self._effects.acquire_lease(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
-            if expires_at < self._clock.now_utc():
+            # Whether this worker's own lease is still live, or a foreign
+            # lease has expired, is decided by the repository against
+            # Landscape database time (ADR-047): acquire_lease re-acquires a
+            # live own lease idempotently, takeover_expired refuses a live
+            # foreign lease with the typed error mapped to the lease wait.
+            if effect.lease_owner == self._worker_id:
+                try:
+                    return self._effects.acquire_lease(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
+                except LandscapeRecordError:
+                    return self._effects.takeover_expired(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
+            try:
                 return self._effects.takeover_expired(effect.effect_id, owner=self._worker_id, ttl=self._lease_ttl)
-            raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} has a live lease owned by another worker")
+            except SinkEffectLeaseLiveError as exc:
+                raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} has a live lease owned by another worker") from exc
         except SinkEffectLeaseHeld:
             raise
         except LandscapeRecordError as exc:

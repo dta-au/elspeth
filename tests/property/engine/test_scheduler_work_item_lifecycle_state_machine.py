@@ -340,7 +340,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.LEASED or model.pending_sink_name is not None:
             return
-        now = self._tick()
+        self._tick()
         assert model.lease_owner is not None
         item = self.repo.mark_pending_sink(
             work_item_id=model.work_item_id,
@@ -350,7 +350,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             path=TerminalPath.DEFAULT_FLOW.value,
             error_hash=None,
             error_message=None,
-            now=now,
             expected_lease_owner=model.lease_owner,
         )
         assert item.status is TokenWorkStatus.PENDING_SINK
@@ -367,13 +366,12 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.LEASED or model.pending_sink_name is not None:
             return
-        now = self._tick()
+        self._tick()
         assert model.lease_owner is not None
         item = self.repo.mark_blocked(
             work_item_id=model.work_item_id,
             queue_key=None,
             barrier_key=barrier_key,
-            now=now,
             expected_lease_owner=model.lease_owner,
         )
         assert item.status is TokenWorkStatus.BLOCKED
@@ -390,9 +388,9 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.LEASED or model.pending_sink_name is not None:
             return
-        now = self._tick()
+        self._tick()
         assert model.lease_owner is not None
-        item = self.repo.mark_terminal(work_item_id=model.work_item_id, now=now, expected_lease_owner=model.lease_owner)
+        item = self.repo.mark_terminal(work_item_id=model.work_item_id, expected_lease_owner=model.lease_owner)
         assert item.status is TokenWorkStatus.TERMINAL
         assert item.lease_owner is None
         model.status = TokenWorkStatus.TERMINAL
@@ -405,9 +403,9 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.LEASED or model.pending_sink_name is not None:
             return
-        now = self._tick()
+        self._tick()
         assert model.lease_owner is not None
-        item = self.repo.mark_failed(work_item_id=model.work_item_id, now=now, expected_lease_owner=model.lease_owner)
+        item = self.repo.mark_failed(work_item_id=model.work_item_id, expected_lease_owner=model.lease_owner)
         assert item.status is TokenWorkStatus.FAILED
         assert item.lease_owner is None
         model.status = TokenWorkStatus.FAILED
@@ -428,13 +426,12 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         is_claimed_handoff = model.status is TokenWorkStatus.LEASED and model.pending_sink_name is not None
         if not (is_parked_handoff or is_claimed_handoff):
             return
-        now = self._tick()
+        self._tick()
         if model.lease_owner is None:
             # Reap-parked handoff: strict CAS refusal, zero mutation.
             terminalized = self.repo.mark_pending_sink_terminal(
                 run_id=RUN_ID,
                 token_id=token_id,
-                now=now,
                 expected_lease_owner=WORKERS[0],
                 coordination_token=LEADER_TOKEN,
             )
@@ -443,7 +440,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         terminalized = self.repo.mark_pending_sink_terminal(
             run_id=RUN_ID,
             token_id=token_id,
-            now=now,
             expected_lease_owner=model.lease_owner,
             coordination_token=LEADER_TOKEN,
         )
@@ -462,13 +458,12 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         blocked = self._blocked_at(barrier_key)
         if not blocked:
             return
-        now = self._tick()
+        self._tick()
         token_ids = tuple(item.token_id for item in blocked)
         terminalized = self.repo.mark_blocked_barrier_terminal(
             run_id=RUN_ID,
             barrier_key=barrier_key,
             token_ids=token_ids,
-            now=now,
             coordination_token=LEADER_TOKEN,
         )
         assert terminalized == len(blocked)
@@ -486,7 +481,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         blocked = self._blocked_at(barrier_key)
         if not blocked:
             return
-        now = self._tick()
+        self._tick()
         handoffs = {
             item.token_id: BlockedPendingSinkHandoff(
                 row_payload_json=self.payload,
@@ -502,7 +497,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             run_id=RUN_ID,
             barrier_key=barrier_key,
             handoffs=handoffs,
-            now=now,
             coordination_token=LEADER_TOKEN,
             pending_sink_lease_owner=owner,
         )
@@ -520,13 +514,12 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             return
         assert model.barrier_key is not None
         foreign_barrier = next(barrier for barrier in BARRIERS if barrier != model.barrier_key)
-        now = self._tick()
+        self._tick()
         with pytest.raises(AuditIntegrityError):
             self.repo.mark_blocked_barrier_terminal(
                 run_id=RUN_ID,
                 barrier_key=foreign_barrier,
                 token_ids=(token_id,),
-                now=now,
                 coordination_token=LEADER_TOKEN,
             )
 
@@ -541,7 +534,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         if model.status is not TokenWorkStatus.BLOCKED:
             return
         assert model.barrier_key is not None
-        now = self._tick()
+        self._tick()
         result = self.repo.adopt_blocked_barrier_item(
             run_id=RUN_ID,
             work_item_id=model.work_item_id,
@@ -549,7 +542,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
             barrier_key=model.barrier_key,
             membership=None,
             buffered_outcome=None,
-            now=now,
             coordination_token=LEADER_TOKEN,
         )
         if model.barrier_adopted_epoch is None:
@@ -567,7 +559,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is TokenWorkStatus.BLOCKED:
             return
-        now = self._tick()
+        self._tick()
         with pytest.raises(AuditIntegrityError):
             self.repo.adopt_blocked_barrier_item(
                 run_id=RUN_ID,
@@ -576,7 +568,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
                 barrier_key=BARRIERS[0],
                 membership=None,
                 buffered_outcome=None,
-                now=now,
                 coordination_token=LEADER_TOKEN,
             )
 
@@ -587,7 +578,7 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         if model.status is not TokenWorkStatus.BLOCKED:
             return
         assert model.barrier_key is not None
-        now = self._tick()
+        self._tick()
         with pytest.raises(RunLeadershipLostError):
             self.repo.adopt_blocked_barrier_item(
                 run_id=RUN_ID,
@@ -596,7 +587,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
                 barrier_key=model.barrier_key,
                 membership=None,
                 buffered_outcome=None,
-                now=now,
                 coordination_token=STALE_LEADER_TOKEN,
             )
 
@@ -606,8 +596,18 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
 
     @rule()
     def let_leases_expire(self) -> None:
-        """Advance time past every live lease window (a crashed/stalled worker)."""
+        """Every live lease lapses (a crashed/stalled worker) — on the model clock AND in the database.
+
+        Recovery decides expiry against the Landscape database clock (ADR-047),
+        which advancing the model clock cannot move, so each live lease's
+        deadline is written into the database's past exactly as the model
+        believes it has lapsed. A rule that only moved the model clock left
+        the repository recovering 0 where the model expected 1.
+        """
         self.now += timedelta(seconds=LEASE_SECONDS + 1)
+        for item in self.model.values():
+            if item.status is TokenWorkStatus.LEASED:
+                expire_lease(self.engine, item.work_item_id)
 
     @rule(caller_owner=st.sampled_from(WORKERS))
     def recover_expired_leases(self, caller_owner: str) -> None:
@@ -656,9 +656,9 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status is not TokenWorkStatus.READY:
             return
-        now = self._tick()
+        self._tick()
         with pytest.raises(AuditIntegrityError):
-            self.repo.mark_terminal(work_item_id=model.work_item_id, now=now, expected_lease_owner=WORKERS[0])
+            self.repo.mark_terminal(work_item_id=model.work_item_id, expected_lease_owner=WORKERS[0])
 
     @rule(token_id=tokens)
     def final_states_are_final(self, token_id: str) -> None:
@@ -666,9 +666,9 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
         model = self.model[token_id]
         if model.status not in FINAL_STATUSES:
             return
-        now = self._tick()
+        self._tick()
         with pytest.raises(AuditIntegrityError):
-            self.repo.mark_terminal(work_item_id=model.work_item_id, now=now, expected_lease_owner=WORKERS[0])
+            self.repo.mark_terminal(work_item_id=model.work_item_id, expected_lease_owner=WORKERS[0])
         with pytest.raises(AuditIntegrityError):
             self.repo.mark_pending_sink(
                 work_item_id=model.work_item_id,
@@ -678,7 +678,6 @@ class SchedulerWorkItemLifecycleStateMachine(RuleBasedStateMachine):
                 path=TerminalPath.DEFAULT_FLOW.value,
                 error_hash=None,
                 error_message=None,
-                now=now,
                 expected_lease_owner=WORKERS[0],
             )
 
@@ -768,6 +767,25 @@ TestSchedulerWorkItemLifecycleStateMachine = SchedulerWorkItemLifecycleStateMach
 TestSchedulerWorkItemLifecycleStateMachine.settings = settings(max_examples=50, stateful_step_count=30, deadline=None)
 
 
+def test_minimal_sequence_expired_lease_is_recovered_after_let_leases_expire() -> None:
+    """Explicit pin of the minimal falsifying sequence hypothesis found (C6-34).
+
+    enqueue -> claim_ready(worker-a) -> let_leases_expire -> recover_expired_leases(worker-b).
+    Red while ``let_leases_expire`` only advanced the model clock: the
+    repository decides expiry on Landscape database time (ADR-047), so it
+    recovered 0 where the model expected 1. Deterministic, no example
+    database needed.
+    """
+    machine = SchedulerWorkItemLifecycleStateMachine()
+    try:
+        machine.enqueue()
+        machine.claim_ready("worker-a")
+        machine.let_leases_expire()
+        machine.recover_expired_leases("worker-b")
+    finally:
+        machine.teardown()
+
+
 def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_work_item_id() -> None:
     """Deterministic pin of invariant 5's EXCEPT branch (Phase-1 trace): a
     re-claimed sink handoff (LEASED with pending_sink_name) whose lease expires
@@ -802,7 +820,6 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
         path=TerminalPath.DEFAULT_FLOW.value,
         error_hash=None,
         error_message=None,
-        now=now + timedelta(seconds=1),
         expected_lease_owner="worker-a",
     )
     reclaimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=LEASE_SECONDS)
@@ -811,7 +828,6 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
     assert reclaimed.pending_sink_name == SINK_NAME
     assert reclaimed.attempt == 1
 
-    expired_at = now + timedelta(seconds=LEASE_SECONDS + 3)
     expire_lease(engine, reclaimed.work_item_id)
     assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="worker-b") == 1
 
@@ -839,7 +855,6 @@ def test_expired_pending_sink_lease_recovers_in_place_preserving_attempt_and_wor
         repo.mark_pending_sink_terminal(
             run_id=RUN_ID,
             token_id=token_id,
-            now=expired_at + timedelta(seconds=1),
             expected_lease_owner="worker-b",
             coordination_token=LEADER_TOKEN,
         )

@@ -50,6 +50,7 @@ from elspeth.engine.orchestrator.types import ExecutionCounters, PipelineConfig
 from elspeth.engine.processor import _LiveBarrierHold
 from elspeth.testing import make_row, make_token_info
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import age_barrier_hold
 from tests.unit.engine.test_processor import (
     BarrierJournalRestoreContext,
     _make_claimed_work_item,
@@ -126,7 +127,7 @@ class TestBackdatedAcceptTiming:
         T0, so it fires at T0+10 — invariant under takeover (§H 476).
         """
         clock = MockClock(start=1_700_000_000.0)
-        _db, factory = _make_factory()
+        db, factory = _make_factory()
         transform = _passthrough_flush_transform()
         processor = _agg_processor(
             factory,
@@ -144,10 +145,16 @@ class TestBackdatedAcceptTiming:
         # T0: a prior leader deposited the BLOCKED row and crashed before
         # adoption (barrier_adopted_epoch stays NULL).
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
-        _persist_blocked_scheduler_work(factory, processor, token, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False)
+        work_item_id = _persist_blocked_scheduler_work(
+            factory, processor, token, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False
+        )
 
         # T0+5: the new leader's first intake adopts with the backdated anchor.
+        # The hold's age is measured on the Landscape database clock (ADR-047),
+        # which the mock clock cannot move: the five seconds are written into
+        # the row's past while the mock clock paces the trigger.
         clock.advance(5.0)
+        age_barrier_hold(db.engine, work_item_id, seconds_ago=5.0)
         intake_results = processor.run_barrier_intake(ctx)
         assert intake_results == []
         assert processor.get_aggregation_buffer_count(AGG_NODE) == 1
@@ -219,7 +226,9 @@ class TestLateArrivalRelease:
         _persist_blocked_scheduler_work(
             factory, processor, late_token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False
         )
-        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(token=late_token, barrier_key="merge")
+        processor._live_barrier_holds[late_token.token_id] = _LiveBarrierHold(
+            token=late_token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
+        )
 
         results, child_items = processor._run_barrier_intake_pass(ctx)
 
@@ -325,7 +334,6 @@ class TestGroupLossHandOff:
         )
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            now=processor._clock.now_utc(),
             expected_lease_owner="test-harness",
             group_losses=losses,
         )
@@ -402,7 +410,6 @@ class TestGroupLossHandOff:
 
         factory.scheduler.mark_failed(
             work_item_id=item.work_item_id,
-            now=bootstrap._clock.now_utc(),
             expected_lease_owner="dead-leader",
             group_losses=(
                 GroupLossSpec(

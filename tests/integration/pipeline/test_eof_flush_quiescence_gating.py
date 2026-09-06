@@ -112,7 +112,7 @@ class _PeerSimulatingSource(_TestSourceBase):
             self._write_peer_journal_rows()
 
     def _write_peer_journal_rows(self) -> None:
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         with self._db.connection() as conn:
             run_id = str(conn.execute(select(runs_table.c.run_id)).scalar_one())
             source_node_id = str(
@@ -159,7 +159,6 @@ class _PeerSimulatingSource(_TestSourceBase):
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key=str(sample["barrier_key"]),
-                now=now,
                 expected_lease_owner=PEER_OWNER,
             )
 
@@ -230,12 +229,11 @@ class TestEofFlushQuiescenceGating:
 
         # ── Phase 2: the slow peer completes into the barrier... ───────────
         repo = TokenSchedulerRepository(db.engine)
-        now = datetime.now(UTC)
+        datetime.now(UTC)
         repo.mark_blocked(
             work_item_id=str(peer_row["work_item_id"]),
             queue_key=None,
             barrier_key=str(blocked[0]["barrier_key"]),
-            now=now,
             expected_lease_owner=PEER_OWNER,
         )
 

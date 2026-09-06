@@ -120,6 +120,75 @@ def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) ->
     return lapsed
 
 
+def expire_sink_effect_lease(engine: Any, effect_id: str, *, seconds_ago: float = 1.0) -> datetime:
+    """Age a sink effect's ``lease_expires_at`` to ``seconds_ago`` seconds before database time.
+
+    The sink-effect lease family (``claim_preparation``, ``acquire_lease``,
+    ``heartbeat_lease``, ``takeover_expired``, member results, finalization)
+    decides liveness against the Landscape database clock (ADR-047, C6 stage
+    4); a test that needs an expired effect lease writes the deadline into the
+    database's past instead of advancing a process clock the repository no
+    longer reads. Refuses (``AssertionError``) unless exactly one row carries
+    ``effect_id`` with a non-NULL deadline: ageing a lease that does not exist
+    would turn the test into a no-op that still passes. Returns the deadline
+    written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import sink_effects_table
+
+    with engine.begin() as conn:
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        # ck_sink_effects_lease_window keeps lease_expires_at >= lease_heartbeat_at,
+        # and the executor's wait refuses a non-positive window, so the last
+        # heartbeat moves back with the deadline: a one-second window that
+        # ended ``seconds_ago``.
+        result = conn.execute(
+            update(sink_effects_table)
+            .where(sink_effects_table.c.effect_id == effect_id)
+            .where(sink_effects_table.c.lease_expires_at.is_not(None))
+            .values(lease_heartbeat_at=lapsed - timedelta(seconds=1), lease_expires_at=lapsed)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"expire_sink_effect_lease: expected exactly one leased sink effect for effect_id={effect_id!r}, matched {result.rowcount}"
+            )
+    return lapsed
+
+
+def age_barrier_hold(engine: Any, work_item_id: str, *, seconds_ago: float) -> datetime:
+    """Move a BLOCKED work item's ``barrier_blocked_at`` to ``seconds_ago`` seconds before database time.
+
+    Barrier and coalesce restores anchor a hold's age at its durable
+    ``barrier_blocked_at`` measured against the Landscape database clock
+    (ADR-047, C6 stage 3); ``mark_blocked`` stamps that column from the
+    database, so a test that needs an older hold writes the instant into the
+    database's past instead of handing the disposition a clock. Refuses
+    (``AssertionError``) unless exactly one BLOCKED row carries
+    ``work_item_id``. Returns the instant written.
+    """
+    from sqlalchemy import update
+
+    from elspeth.contracts.scheduler import TokenWorkStatus
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import token_work_items_table
+
+    with engine.begin() as conn:
+        blocked_at = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
+        result = conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == work_item_id)
+            .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
+            .values(barrier_blocked_at=blocked_at)
+        )
+        if result.rowcount != 1:
+            raise AssertionError(
+                f"age_barrier_hold: expected exactly one BLOCKED row for work_item_id={work_item_id!r}, matched {result.rowcount}"
+            )
+    return blocked_at
+
+
 def await_database_time(engine: Any, instant: datetime, *, timeout_seconds: float = 5.0) -> datetime:
     """Block until the Landscape database clock is strictly past ``instant``; return the clock read.
 
@@ -196,6 +265,35 @@ def on_fresh_database_second(engine: Any, action: Any) -> Any:
             f"the Landscape database second rolled over during the boundary action ({before.isoformat()} -> {after.isoformat()})"
         )
     return result
+
+
+def late_in_a_database_second(engine: Any, action: Any, *, fraction: float = 0.95) -> Any:
+    """Run ``action(database_now)`` in the last sliver of a database second and return its result.
+
+    The mirror of :func:`on_fresh_database_second`, and the corner where a
+    quantised clock is least forgiving: a deadline stamped as
+    ``database_now + ttl`` from here discards almost a whole second of the
+    stamp instant, so a lease that should live for ``ttl`` lapses at the
+    boundary a few tens of milliseconds away. Any lever that stamps a deadline
+    and then asserts it survives a real interval belongs here rather than at
+    the top of a second, where the same defect is invisible.
+    """
+    import time
+
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("fraction must sit strictly inside one second")
+    first = landscape_database_now(engine)
+    deadline = time.monotonic() + 3.0
+    while (before := landscape_database_now(engine)) == first:
+        if time.monotonic() > deadline:
+            raise AssertionError("the Landscape database second did not advance within 3 s")
+        time.sleep(0.002)
+    # ``before`` is the first read of a fresh second; hold until ``fraction``
+    # of that second has passed, then act.
+    boundary = time.monotonic()
+    while time.monotonic() - boundary < fraction:
+        time.sleep(0.002)
+    return action(before)
 
 
 def within_one_database_second(engine: Any, action: Any, *, attempts: int = 20) -> Any:

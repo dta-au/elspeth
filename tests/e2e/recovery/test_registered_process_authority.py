@@ -148,7 +148,7 @@ def _park_pending_sink_as_registered_process(
 ) -> None:
     """Child action: claim READY and park the exact result bundle."""
     factory = RecorderFactory(db)
-    now = datetime.fromisoformat(now_iso)
+    datetime.fromisoformat(now_iso)
     claimed = factory.scheduler.claim_ready(
         run_id=run_id,
         lease_owner=worker_id,
@@ -164,7 +164,6 @@ def _park_pending_sink_as_registered_process(
         path="default_flow",
         error_hash=None,
         error_message=None,
-        now=now,
         expected_lease_owner=worker_id,
         worker_id=worker_id,
     )
@@ -408,7 +407,6 @@ def _refuse_inactive_disposition_process(
     with pytest.raises(RunWorkerEvictedError):
         RecorderFactory(db).scheduler.mark_terminal(
             work_item_id=work_item_id,
-            now=datetime.fromisoformat(now_iso),
             expected_lease_owner=worker_id,
             worker_id=worker_id,
         )
