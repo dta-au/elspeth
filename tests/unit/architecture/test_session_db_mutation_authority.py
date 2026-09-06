@@ -279,6 +279,16 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
         "SkillMarkdownHistoryAuthority",
     ),
     AuthoritySymbol(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.issue",
+        "SsoHandoffAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.consume",
+        "SsoHandoffAuthority",
+    ),
+    AuthoritySymbol(
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "UserSecretAuthority",
@@ -696,6 +706,16 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
         "SkillMarkdownHistoryAuthority",
     ),
     AuthoritySymbol(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.issue",
+        "SsoHandoffAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.consume",
+        "SsoHandoffAuthority",
+    ),
+    AuthoritySymbol(
         "src/elspeth/web/secrets/user_store.py",
         "RepositoryUserSecretAuthority.upsert_encrypted_secret",
         "UserSecretAuthority",
@@ -1030,6 +1050,53 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         1,
         "SkillMarkdownHistoryAuthority",
         line=57,
+    ),
+    # The single-use SSO handoff (identity sprint step C, elspeth-07cd19ba73;
+    # family T of elspeth-e483fe7f85). ``issue`` purges this identity's
+    # expired codes then inserts the new one; ``consume`` is ONE conditional
+    # ``UPDATE ... RETURNING`` that claims the row and decides it may be
+    # claimed in the same statement, then purges expired rows AFTER the
+    # claim. The two ``issue`` statements share a fingerprint because they
+    # are shaped alike; the (table, operation) pair keeps them distinct.
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.issue",
+        "sso_handoffs",
+        "delete",
+        "637344665f07bd53",
+        1,
+        "SsoHandoffAuthority",
+        line=84,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.issue",
+        "sso_handoffs",
+        "insert",
+        "637344665f07bd53",
+        1,
+        "SsoHandoffAuthority",
+        line=90,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.consume",
+        "sso_handoffs",
+        "update",
+        "3fd95b6dc7620925",
+        1,
+        "SsoHandoffAuthority",
+        line=112,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.consume",
+        "sso_handoffs",
+        "delete",
+        "6c55e19965dc4706",
+        1,
+        "SsoHandoffAuthority",
+        line=124,
     ),
     # upsert_encrypted_secret builds one prebuilt upsert per dialect arm
     # (sqlite :170, postgresql :178, mysql :186) and executes it once at :190;
@@ -2502,6 +2569,27 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         1,
         "SkillMarkdownHistoryAuthority",
         line=62,
+    ),
+    # src/elspeth/web/sessions/sso_handoff_repository.py :: SsoHandoffAuthority
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.issue",
+        "<sessions-write-connection>",
+        "write_connection",
+        "3e5d66c4e0feb243",
+        1,
+        "SsoHandoffAuthority",
+        line=76,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/sessions/sso_handoff_repository.py",
+        "SsoHandoffRepository.consume",
+        "<sessions-write-connection>",
+        "write_connection",
+        "776f801ca8b2be96",
+        1,
+        "SsoHandoffAuthority",
+        line=109,
     ),
     # src/elspeth/web/coordination/repository.py :: SessionOperationAuthority
     WriterIdentity(
@@ -7086,6 +7174,50 @@ def test_user_secret_writers_are_exactly_bound_to_the_handle_free_authority() ->
         and site.table in {"user_secrets", "<unresolved-session-write>"}
         for site in scanned
     )
+
+
+def test_sso_handoff_writers_are_exactly_bound_to_the_handle_free_authority() -> None:
+    """Family T (elspeth-e483fe7f85): the single-use SSO handoff store.
+
+    ``SsoHandoffRepository`` already has the handle-free shape -- it holds
+    the engine, opens one committed transaction per method and hands no
+    connection out -- so the binding keys on its two methods where they
+    live rather than renaming the class into ``Repository*Authority`` form.
+    """
+    root = _repo_root()
+    path = "src/elspeth/web/sessions/sso_handoff_repository.py"
+    symbols = {"SsoHandoffRepository.issue", "SsoHandoffRepository.consume"}
+    for symbol in symbols:
+        assert _authority_for(path, symbol) == "SsoHandoffAuthority"
+        assert _contained_connection_authority_for(path, symbol) == "SsoHandoffAuthority"
+        assert _authority_for(path, f"{symbol}_replacement") is None
+    assert _authority_for(path, "SsoHandoffRepository.future_method") is None
+
+    scanned = scan_production_writers([root / path], anchor=root)
+    writes = [site for site in scanned if site.table == "sso_handoffs"]
+    reviewed = [site for site in _REVIEWED_WRITERS if site.table == "sso_handoffs"]
+    connections = [site for site in scanned if site.operation == "write_connection"]
+
+    assert len(writes) == len(reviewed) == 4
+    assert {site.symbol for site in writes} == symbols
+    assert {(site.symbol, site.operation) for site in writes} == {
+        ("SsoHandoffRepository.issue", "delete"),
+        ("SsoHandoffRepository.issue", "insert"),
+        ("SsoHandoffRepository.consume", "update"),
+        ("SsoHandoffRepository.consume", "delete"),
+    }
+    assert {site.authority for site in writes} == {"SsoHandoffAuthority"}
+    assert inventory_drift(writes, reviewed) == ([], [])
+    assert authority_policy_violations(writes, _TABLE_POLICIES) == ([], [])
+
+    assert len(connections) == 2
+    assert {site.symbol for site in connections} == symbols
+    assert not any(site.connection_escape for site in connections)
+    assert connection_authority_violations(connections) == []
+    assert inventory_drift(
+        connections, [site for site in _REVIEWED_WRITERS if site.path == path and site.operation == "write_connection"]
+    ) == ([], [])
+    assert not [site for site in scanned if site.table == "<unresolved-session-write>"]
 
 
 def test_fork_facet_writer_identities_are_exact_and_bidirectional() -> None:
