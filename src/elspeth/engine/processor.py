@@ -4119,7 +4119,6 @@ class RowProcessor:
         repaired_source_states = self._execution.reconcile_source_completions_from_scheduler(
             run_id=self._run_id,
             coordination_token=self._require_coordination_token(),
-            at=self._clock.now_utc(),
         )
         if repaired_source_states:
             logger.info(

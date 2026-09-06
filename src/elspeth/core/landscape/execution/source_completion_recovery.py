@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -126,7 +124,6 @@ class SourceCompletionReconciler:
         *,
         run_id: str,
         coordination_token: CoordinationToken,
-        at: datetime,
     ) -> int:
         """Repair pre-fix TS-02 gaps atomically before any plugin can run.
 

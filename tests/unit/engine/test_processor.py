@@ -1701,7 +1701,6 @@ class TestProcessRowNoTransforms:
         """A fully witnessed TS-02 image never overwrites conflicting evidence."""
         _db, factory = _make_factory()
         coordination_token = leader_coordination_token(factory, "test-run")
-        observed_at = datetime.now(UTC)
         source_data = {"value": 42}
         pipeline_row = _make_source_row(source_data).to_pipeline_row()
 
@@ -1744,7 +1743,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
 
     def test_source_completion_reconciliation_rejects_duplicate_claim_witness(self) -> None:
@@ -1784,7 +1782,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1821,7 +1818,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1849,7 +1845,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() == []
@@ -1886,7 +1881,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
         with db.connection() as conn:
             assert conn.execute(select(node_states_table).where(node_states_table.c.token_id == token_id)).all() != []
@@ -1932,7 +1926,6 @@ class TestProcessRowNoTransforms:
             factory.execution.reconcile_source_completions_from_scheduler(
                 run_id="test-run",
                 coordination_token=coordination_token,
-                at=observed_at,
             )
 
     def test_source_boundary_violation_records_failed_outcome_and_failed_source_state(self) -> None:

@@ -512,7 +512,6 @@ def test_f10_stale_leader_cannot_reconcile_source_completions(harness: _Harness)
         harness.factory.execution.reconcile_source_completions_from_scheduler(
             run_id=RUN_ID,
             coordination_token=harness.coordination_token,
-            at=NOW + timedelta(seconds=1),
         )
 
     assert raised.value.verb == "reconcile_source_completions_from_scheduler"

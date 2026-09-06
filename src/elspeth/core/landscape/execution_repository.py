@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -289,13 +288,15 @@ class ExecutionRepository:
         *,
         run_id: str,
         coordination_token: CoordinationToken,
-        at: datetime,
     ) -> int:
-        """Repair fully witnessed pre-fix TS-02 source-completion gaps."""
+        """Repair fully witnessed pre-fix TS-02 source-completion gaps.
+
+        The repair runs inside a leader-fenced transaction whose deadline is
+        Landscape database time (ADR-047); no caller instant enters it.
+        """
         return self.source_completion_recovery.reconcile(
             run_id=run_id,
             coordination_token=coordination_token,
-            at=at,
         )
 
     def begin_node_states_many(
