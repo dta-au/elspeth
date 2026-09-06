@@ -3140,34 +3140,6 @@ class _SessionComposerMutations:
     def __init__(self, state: _SessionComposerMutationState) -> None:
         self.__state = state
 
-    def record_preferences_changed(
-        self,
-        *,
-        event_id: str,
-        actor: str,
-        trust_mode: ComposerTrustMode,
-        prior_trust_mode: ComposerTrustMode,
-        density_default: ComposerDensityDefault,
-        transaction_time: datetime,
-    ) -> None:
-        """Append the preferences audit event under exact COMPOSE authority."""
-        _service, connection, session_id, _now = self.__state._require_exact()
-        connection.execute(
-            insert(proposal_events_table).values(
-                id=event_id,
-                session_id=session_id,
-                proposal_id=None,
-                event_type="trust_mode.changed",
-                actor=actor,
-                payload={
-                    "trust_mode": trust_mode,
-                    "prior_trust_mode": prior_trust_mode,
-                    "density_default": density_default,
-                },
-                created_at=transaction_time,
-            )
-        )
-
     def create_composition_proposal(
         self,
         *,
@@ -3626,71 +3598,10 @@ class _SessionComposerMutations:
 
 
 @final
-class _SessionMutations:
-    """Narrow session-row writes sharing an exact COMPOSE transaction."""
-
-    __slots__ = ("__composer", "__state")
-
-    def __init__(
-        self,
-        state: _SessionComposerMutationState,
-        composer: _SessionComposerMutations,
-    ) -> None:
-        self.__state = state
-        self.__composer = composer
-
-    def update_composer_preferences(
-        self,
-        *,
-        event_id: str,
-        trust_mode: ComposerTrustMode,
-        density_default: ComposerDensityDefault,
-        actor: str,
-    ) -> ComposerSessionPreferencesTransition:
-        """Audit and update preferences atomically under exact COMPOSE authority."""
-        service, connection, session_id, transaction_time = self.__state._require_exact()
-        prior_row = connection.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
-        prior_record = ComposerSessionPreferencesRecord(
-            session_id=UUID(prior_row.id),
-            trust_mode=prior_row.trust_mode,
-            density_default=prior_row.density_default,
-            interpretation_review_disabled=bool(prior_row.interpretation_review_disabled),
-            updated_at=service._ensure_utc(prior_row.updated_at),
-        )
-        self.__composer.record_preferences_changed(
-            event_id=event_id,
-            actor=actor,
-            trust_mode=trust_mode,
-            prior_trust_mode=prior_record.trust_mode,
-            density_default=density_default,
-            transaction_time=transaction_time,
-        )
-        _service, connection, session_id, _now = self.__state._require_exact()
-        connection.execute(
-            update(sessions_table)
-            .where(sessions_table.c.id == session_id)
-            .values(
-                trust_mode=trust_mode,
-                density_default=density_default,
-                updated_at=transaction_time,
-            )
-        )
-        row = connection.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
-        current_record = ComposerSessionPreferencesRecord(
-            session_id=UUID(row.id),
-            trust_mode=row.trust_mode,
-            density_default=row.density_default,
-            interpretation_review_disabled=bool(row.interpretation_review_disabled),
-            updated_at=service._ensure_utc(row.updated_at),
-        )
-        return ComposerSessionPreferencesTransition(prior=prior_record, current=current_record)
-
-
-@final
 class _SessionComposerMutationTransaction:
     """Handle-free ordinary Composer mutation capability."""
 
-    __slots__ = ("__composer", "__session", "__state")
+    __slots__ = ("__composer", "__state")
 
     def __init__(
         self,
@@ -3710,17 +3621,11 @@ class _SessionComposerMutationTransaction:
         )
         self.__state = state
         self.__composer = _SessionComposerMutations(state)
-        self.__session = _SessionMutations(state, self.__composer)
 
     @property
     def composer(self) -> _SessionComposerMutations:
         self.__state._require_active()
         return self.__composer
-
-    @property
-    def session(self) -> _SessionMutations:
-        self.__state._require_active()
-        return self.__session
 
     def _close(self) -> None:
         self.__state._close()
