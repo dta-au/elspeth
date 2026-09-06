@@ -4197,6 +4197,18 @@ _TABLE_IDENTIFIERS = {f"{table}_table": table for table in _TABLE_NAMES}
 _SESSION_TABLE_MODULE = "elspeth.web.sessions.models"
 _LANDSCAPE_TABLE_MODULE = "elspeth.core.landscape.schema"
 _SESSION_ENGINE_FACTORIES = frozenset({"elspeth.web.sessions.engine.create_session_engine"})
+# Decorators that return a callable of the SAME signature, so a name-matched
+# call can be sized against the decorated definition (``_call_shape_binds``):
+# ``trust_boundary(...)`` documents itself as a strict passthrough wrapper.
+_SIGNATURE_PRESERVING_DECORATORS = frozenset(
+    {
+        "builtins.staticmethod",
+        "builtins.classmethod",
+        "contextlib.contextmanager",
+        "contextlib.asynccontextmanager",
+        "elspeth.contracts.trust_boundary.trust_boundary",
+    }
+)
 _NON_SESSION_ENGINE_FACTORIES = frozenset(
     {
         "sqlite3.connect",
@@ -4681,13 +4693,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             instance_method = self._is_instance_method(definition)
         if any(isinstance(argument, ast.Starred) for argument in call.args) or any(keyword.arg is None for keyword in call.keywords):
             return True
-        if any(
-            not (
-                (isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"})
-                or self._imported_qualified_name(decorator) in {"builtins.staticmethod", "builtins.classmethod"}
-            )
-            for decorator in definition.decorator_list
-        ):
+        if not all(self._decorator_preserves_signature(decorator) for decorator in definition.decorator_list):
             return True
         positional = [*definition.args.posonlyargs, *definition.args.args]
         defaults = definition.args.defaults
@@ -4709,6 +4715,14 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         if any(name not in supplied for name in required):
             return False
         return all(default is not None or name in supplied for name, default in zip(kwonly, definition.args.kw_defaults, strict=True))
+
+    def _decorator_preserves_signature(self, decorator: ast.expr) -> bool:
+        """``staticmethod``/``classmethod``, a contextmanager, or the passthrough ``trust_boundary(...)`` keep the signature."""
+
+        if isinstance(decorator, ast.Name) and decorator.id in {"staticmethod", "classmethod"}:
+            return True
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        return self._imported_qualified_name(target) in _SIGNATURE_PRESERVING_DECORATORS
 
     def _self_attribute_class(self, use: ast.AST, attribute: ast.Attribute) -> str | None:
         """The qualified class ``self.<attr>`` is bound to exactly once in the enclosing class, else ``None``.
@@ -5123,16 +5137,33 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 return None
             return definition
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            owner = self._enclosing_function(call)
+            owner = self._self_binding_method(call, func.value.id)
             if owner is None:
                 return None
-            owner_class = self.method_owners.get(id(owner))
-            positional = (*owner.args.posonlyargs, *owner.args.args)
-            if owner_class is None or not positional or positional[0].arg != func.value.id:
+            return self.class_methods.get((id(self.method_owners[id(owner)]), func.attr))
+        return None
+
+    def _self_binding_method(self, use: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        """The instance method whose first parameter ``name`` is at ``use``, through closures that neither bind nor rebind it.
+
+        ``self._finalize(...)`` inside a verb's nested ``_sync`` closure names
+        the enclosing method's class (elspeth-e483fe7f85 family H); a closure
+        that takes or assigns ``name`` itself dispatches through an unknown
+        object.
+        """
+
+        scope: ast.AST | None = self._enclosing_function(use)
+        while isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = (*scope.args.posonlyargs, *scope.args.args)
+            if self._name_reassigned_in(scope, name):
                 return None
-            if self._name_reassigned_in(owner, func.value.id) or not self._is_instance_method(owner):
+            if positional and positional[0].arg == name:
+                if id(scope) not in self.method_owners or not self._is_instance_method(scope):
+                    return None
+                return scope
+            if name in {argument.arg for argument in (*positional, *scope.args.kwonlyargs)}:
                 return None
-            return self.class_methods.get((id(owner_class), func.attr))
+            scope = self._next_lexical_scope(scope)
         return None
 
     def _name_reassigned_in(self, scope: ast.AST, name: str) -> bool:
@@ -7416,6 +7447,7 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         active: frozenset[tuple[int, str]],
         allow_yield: bool = False,
         strict: bool = False,
+        allow_none_check: bool = False,
     ) -> bool:
         """Every use of connection ``name`` inside ``scope`` keeps the capability there.
 
@@ -7444,7 +7476,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 continue
             if not (isinstance(node, ast.Name) and node.id == name):
                 continue
-            if not self._connection_use_is_contained(node, depth=depth, active=active, allow_yield=allow_yield, strict=strict):
+            if not self._connection_use_is_contained(
+                node, depth=depth, active=active, allow_yield=allow_yield, strict=strict, allow_none_check=allow_none_check
+            ):
                 return False
         return True
 
@@ -7456,8 +7490,18 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         active: frozenset[tuple[int, str]],
         allow_yield: bool,
         strict: bool,
+        allow_none_check: bool = False,
     ) -> bool:
         parent = getattr(use, "_inventory_parent", None)
+        if (
+            allow_none_check
+            and isinstance(parent, ast.Compare)
+            and parent.left is use
+            and all(isinstance(operator, (ast.Is, ast.IsNot)) for operator in parent.ops)
+            and all(isinstance(comparator, ast.Constant) and comparator.value is None for comparator in parent.comparators)
+        ):
+            # ``held_connection is None``: an identity check hands nothing on.
+            return True
         if isinstance(use.ctx, ast.Del):
             # ``del conn`` unbinds the local name; nothing receives the capability.
             return True
@@ -7489,6 +7533,50 @@ class _ProductionWriterCollector(ast.NodeVisitor):
             return False
         return self._forward_is_contained(call, use, depth=depth + 1, active=active, strict=strict)
 
+    def _is_wrapper_parameter_yield(self, node: ast.Yield) -> bool:
+        """A direct ``yield <parameter>`` of a contextmanager wrapper, the parameter unreassigned."""
+
+        if not isinstance(node.value, ast.Name):
+            return False
+        wrapper = self._enclosing_function(node)
+        if wrapper is None or not self._is_contextmanager_definition(wrapper) or node not in self._direct_yields(wrapper):
+            return False
+        parameters = {argument.arg for argument in (*wrapper.args.posonlyargs, *wrapper.args.args, *wrapper.args.kwonlyargs)}
+        return node.value.id in parameters and not self._name_reassigned_in(wrapper, node.value.id)
+
+    def _forward_is_own_wrapper_acquisition(
+        self,
+        call: ast.Call,
+        use: ast.Name,
+        *,
+        depth: int,
+        active: frozenset[tuple[int, str]],
+        strict: bool,
+    ) -> bool:
+        """``with _blob_phase_transaction(engine, conn) as c:`` -- a forward into a wrapper the scanner records as this caller's own acquisition.
+
+        A parameter-fed wrapper call is already a ``write_connection`` row of
+        the caller, with its own containment verdict over the connection it
+        yields, so the forwarded connection stays accounted for -- provided
+        the wrapper's own uses of that parameter are contained: yielding it,
+        an anonymous ``with parameter.begin():``, and the ``is None`` arm that
+        chooses between it and a fresh transaction (elspeth-e483fe7f85 family
+        H, family B finding F1).
+        """
+
+        if id(call) not in self.wrapper_calls or not self._wrapper_call_is_parameter_fed(call):
+            return False
+        wrapper, _ = self.wrapper_calls[id(call)]
+        parameter = self._forwarded_parameter(call, wrapper, use)
+        if parameter is None:
+            return False
+        key = (id(wrapper), parameter)
+        if key in active:
+            return False
+        return self._connection_uses_are_contained(
+            wrapper, parameter, depth=depth, active=active | {key}, allow_yield=True, strict=strict, allow_none_check=True
+        )
+
     def _forward_is_contained(
         self,
         call: ast.Call,
@@ -7504,6 +7592,8 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         collector, and from there on the walk is strict.
         """
 
+        if self._forward_is_own_wrapper_acquisition(call, argument, depth=depth, active=active, strict=strict):
+            return True
         owner: _ProductionWriterCollector = self
         callee = self._resolvable_private_callee(call)
         if callee is None:
@@ -7528,6 +7618,15 @@ class _ProductionWriterCollector(ast.NodeVisitor):
 
         for node in ast.walk(self.tree):
             if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+                if isinstance(node, ast.Yield) and self._is_wrapper_parameter_yield(node):
+                    # ``yield held_connection`` in ``_blob_phase_transaction``:
+                    # the wrapper hands back the connection a caller forwarded
+                    # into it. That forward is judged at the CALLER (a forward
+                    # into its own parameter-fed wrapper acquisition, or an
+                    # ordinary forward whose walk refuses this yield), never
+                    # as a yield-escape charged to every caller's acquisition
+                    # (elspeth-e483fe7f85 family H, family B finding F1).
+                    continue
                 for acquisition in self._connection_acquisitions_for_expression(node, node.value):
                     self._record_connection(acquisition, escapes=True)
                 continue
@@ -8579,14 +8678,27 @@ class _CallerSideProof:
         target = f"{collector._module_qualified_name()}.{owner.name}" if owner is not None else None
         result = True
         for referrer, node in self._references_by_name.get(definition.name, ()):
-            if target is not None and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute):
-                receiver = referrer._self_attribute_class(node, node.value)
+            if target is not None and isinstance(node, ast.Attribute):
+                receiver = self._reference_receiver_class(referrer, node)
                 if receiver is not None and not self._class_may_be(receiver, target, visited=frozenset()):
                     continue
             result = False
             break
         self._unreferenced[key] = result
         return result
+
+    @staticmethod
+    def _reference_receiver_class(referrer: _ProductionWriterCollector, node: ast.Attribute) -> str | None:
+        """The class of an attribute reference's receiver: ``self.<attr>`` by its one binding, bare ``self`` by its method."""
+
+        if isinstance(node.value, ast.Attribute):
+            return referrer._self_attribute_class(node, node.value)
+        if isinstance(node.value, ast.Name):
+            method = referrer._self_binding_method(node, node.value.id)
+            if method is None:
+                return None
+            return f"{referrer._module_qualified_name()}.{referrer.method_owners[id(method)].name}"
+        return None
 
     @staticmethod
     def _parameter_bound_argument(
@@ -13236,17 +13348,26 @@ def test_caller_side_proof_ignores_a_call_whose_shape_cannot_bind_the_definition
     keyword, or passes more positionals than the definition accepts would
     raise ``TypeError`` before executing anything, so it cannot be the
     definition's live call site. A same-named call that DOES bind the
-    signature is one, and refuses when it hands a Sessions connection.
+    signature is one, and refuses when it hands a Sessions connection. A
+    definition under a passthrough decorator (``trust_boundary(...)``, the
+    MCP analyzer's ``query``) is sized like an undecorated one: the MCP
+    server's ``a.query(sql=..., params=..., limit=...)`` cannot bind it.
     """
 
     declared = """\
         from sqlalchemy import insert
+        from elspeth.contracts.trust_boundary import trust_boundary
         from elspeth.core.landscape.database import Tier1Engine, begin_write
         from elspeth.core.landscape.schema import runs_table
 
         class EventStore:
             def record(self, conn, *, event_type, run_id):
                 conn.execute(insert(runs_table).values(run_id=run_id, event_type=event_type))
+
+        @trust_boundary(tier=3, source="MCP tool-call query arguments", source_param="limit")
+        def query(db, sql, *, limit):
+            with db.write_connection() as conn:
+                conn.execute(insert(runs_table).values(run_id=sql, event_type=limit))
 
         class Scheduler:
             def __init__(self, engine: Tier1Engine, events):
@@ -13258,6 +13379,9 @@ def test_caller_side_proof_ignores_a_call_whose_shape_cannot_bind_the_definition
                     self._events.record(conn, event_type="enqueue", run_id="r")
         """
     other_record = """\
+        from elspeth.core.landscape.database import LandscapeDB
+        from elspeth.core.landscape.events import query
+
         class Recorder:
             def __init__(self):
                 self._sink = []
@@ -13265,8 +13389,15 @@ def test_caller_side_proof_ignores_a_call_whose_shape_cannot_bind_the_definition
             def record(self, invocation):
                 self._sink.append(invocation)
 
+            def query(self, sql, *, limit, params):
+                return self._sink
+
         def call_tool(recorder, invocation):
             recorder.record(invocation)
+            recorder.query(sql="select 1", limit=1, params=None)
+
+        def run_query(db: LandscapeDB, sql):
+            return query(db, sql, limit=10)
         """
     binding_record = """\
         from elspeth.web.sessions.engine import create_session_engine
@@ -13712,7 +13843,8 @@ def test_a_method_referenced_only_through_receivers_of_another_class_is_unrefere
 
     ``ExecutionRepository.register_artifact`` forwards its ``conn`` to the
     component; every ``register_artifact`` reference in the tree sits on a
-    receiver whose class is the component, never the facade, so the facade
+    receiver whose class is the component, never the facade -- including
+    the component's own ``self.register_artifact(...)`` -- so the facade
     verb is unreferenced and its forwarding site is neutral. A bare
     reference through an untyped receiver keeps it live, and its parameter
     -- with no call site -- refuses.
@@ -13723,8 +13855,15 @@ def test_a_method_referenced_only_through_receivers_of_another_class_is_unrefere
         from elspeth.core.landscape.schema import artifacts_table
 
         class ArtifactRepository:
+            def __init__(self, db):
+                self._db = db
+
             def register_artifact(self, conn, *, artifact_id):
                 conn.execute(insert(artifacts_table).values(artifact_id=artifact_id))
+
+            def register_own(self, artifact_id):
+                with self._db.write_connection() as conn:
+                    self.register_artifact(conn, artifact_id=artifact_id)
         """
     facade = """\
         from elspeth.core.landscape.artifacts import ArtifactRepository
@@ -13732,7 +13871,7 @@ def test_a_method_referenced_only_through_receivers_of_another_class_is_unrefere
         class ExecutionRepository:
             def __init__(self, db):
                 self._db = db
-                self.artifacts = ArtifactRepository()
+                self.artifacts = ArtifactRepository(db)
 
             def register_artifact(self, conn, *, artifact_id):
                 return self.artifacts.register_artifact(conn, artifact_id=artifact_id)
@@ -14008,6 +14147,143 @@ def test_forwarding_proof_refuses_every_escape_form(tmp_path: Path) -> None:
         "Repo.compared",
     }
     assert {symbol for symbol, escaped in escapes.items() if escaped} == expected
+
+
+def test_forward_into_the_callers_own_parameter_fed_wrapper_acquisition_is_contained(tmp_path: Path) -> None:
+    """The custody-lock connection handed to ``_blob_phase_transaction(engine, held_connection)`` does not escape.
+
+    The phase wrapper yields its own parameter (or a fresh ``engine.begin()``
+    when handed ``None``); the scanner already records that wrapper call as
+    the CALLER's own parameter-fed acquisition, a row with its own
+    containment verdict, so the forward keeps the outer connection
+    accounted for, whether the forward is direct (``with
+    _blob_phase_transaction(engine, held_connection) as conn``) or through a
+    private helper. The wrapper's ``yield held_connection`` is that same
+    forward seen from inside and is not a yield-escape of the callers'
+    acquisitions; its ``held_connection is None`` arm is an identity check,
+    not a leak. A forward into a plain helper that stores
+    the connection is still an escape, and so is one into a wrapper that
+    stores its parameter before yielding it (elspeth-e483fe7f85 family H,
+    family B finding F1).
+    """
+
+    blobs = """\
+        from contextlib import contextmanager
+        from sqlalchemy import insert
+        from elspeth.web.sessions.schema import blobs_table
+
+        @contextmanager
+        def _phase_transaction(engine, held_connection):
+            if held_connection is None:
+                with engine.begin() as conn:
+                    yield conn
+                return
+            with held_connection.begin():
+                yield held_connection
+
+        @contextmanager
+        def _storing_phase_transaction(engine, held_connection):
+            _LAST.append(held_connection)
+            with held_connection.begin():
+                yield held_connection
+
+        _LAST = []
+
+        @contextmanager
+        def _custody_lock(engine, session_id):
+            with engine.connect() as conn:
+                yield conn
+
+        def _reserve(engine, held_connection, blob_id):
+            with _phase_transaction(engine, held_connection) as conn:
+                conn.execute(insert(blobs_table).values(blob_id=blob_id))
+
+        def _reserve_storing(engine, held_connection, blob_id):
+            with _storing_phase_transaction(engine, held_connection) as conn:
+                conn.execute(insert(blobs_table).values(blob_id=blob_id))
+
+        def _keep(held_connection):
+            _LAST.append(held_connection)
+
+        def persist(engine, session_id, blob_id):
+            with _custody_lock(engine, session_id) as held_connection:
+                _reserve(engine, held_connection, blob_id)
+
+        def persist_direct(engine, session_id, blob_id):
+            with _custody_lock(engine, session_id) as held_connection:
+                with _phase_transaction(engine, held_connection) as conn:
+                    conn.execute(insert(blobs_table).values(blob_id=blob_id))
+
+        def persist_storing_wrapper(engine, session_id, blob_id):
+            with _custody_lock(engine, session_id) as held_connection:
+                _reserve_storing(engine, held_connection, blob_id)
+
+        def persist_leaking(engine, session_id, blob_id):
+            with _custody_lock(engine, session_id) as held_connection:
+                _keep(held_connection)
+        """
+    escapes = _acquisition_escapes(tmp_path, {"src/elspeth/web/blobs.py": blobs})
+    assert escapes["persist"] is False
+    assert escapes["persist_direct"] is False
+    assert escapes["persist_storing_wrapper"] is True
+    assert escapes["persist_leaking"] is True
+
+
+def test_a_closure_captured_self_resolves_the_enclosing_methods_class(tmp_path: Path) -> None:
+    """``self._finalize(held_connection=...)`` inside a method's ``_sync`` closure is the same-class method.
+
+    The blob service runs every verb as a nested ``_sync`` closure over the
+    method's ``self``; the forward through that closure into a same-class
+    helper is inspected exactly as a forward from the method body would be
+    (elspeth-e483fe7f85 family H, family B finding F1). A closure that
+    rebinds ``self`` is dispatched through an unknown object and refuses.
+    """
+
+    blobs = """\
+        from contextlib import contextmanager
+        from sqlalchemy import insert
+        from elspeth.web.sessions.schema import blobs_table
+
+        @contextmanager
+        def _phase_transaction(engine, held_connection):
+            if held_connection is None:
+                with engine.begin() as conn:
+                    yield conn
+                return
+            with held_connection.begin():
+                yield held_connection
+
+        @contextmanager
+        def _custody_lock(engine, session_id):
+            with engine.connect() as conn:
+                yield conn
+
+        class BlobService:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def _finalize(self, *, held_connection, blob_id):
+                with _phase_transaction(self._engine, held_connection) as conn:
+                    conn.execute(insert(blobs_table).values(blob_id=blob_id))
+
+            def delete(self, session_id, blob_id):
+                def _sync():
+                    with _custody_lock(self._engine, session_id) as held_connection:
+                        self._finalize(held_connection=held_connection, blob_id=blob_id)
+
+                return _sync()
+
+            def delete_rebound(self, session_id, blob_id, other):
+                def _sync():
+                    self = other
+                    with _custody_lock(self._engine, session_id) as held_connection:
+                        self._finalize(held_connection=held_connection, blob_id=blob_id)
+
+                return _sync()
+        """
+    escapes = _acquisition_escapes(tmp_path, {"src/elspeth/web/blobs.py": blobs})
+    assert escapes["BlobService.delete._sync"] is False
+    assert escapes["BlobService.delete_rebound._sync"] is True
 
 
 def test_wrapper_containment_is_all_callers_and_same_class_only(tmp_path: Path) -> None:
