@@ -4838,6 +4838,41 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         monkeypatch.setattr(Path, "read_bytes", _read_bytes_or_permission_error)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    async def test_quota_rejection_preserves_evidence_and_continues(
+        self, blob_service, session_id, db_engine, run_env, monkeypatch, cleanup_fails
+    ) -> None:
+        run_id, session_id_str = run_env
+        execute = _execute_context(db_engine, session_id)
+        rejected = await self._create_linked_blob(blob_service, session_id, run_id, execute, "large.csv", b"x" * 11)
+        accepted = await self._create_linked_blob(blob_service, session_id, run_id, execute, "small.csv", b"x")
+        monkeypatch.setattr(blob_service, "_max_storage_per_session", 10)
+        rejected_path = Path(rejected.storage_path)
+        if cleanup_fails:
+            original_unlink = Path.unlink
+
+            def fail_rejected_unlink(path: Path, missing_ok: bool = False) -> None:
+                if path == rejected_path:
+                    raise PermissionError("quota cleanup refused")
+                original_unlink(path, missing_ok=missing_ok)
+
+            monkeypatch.setattr(Path, "unlink", fail_rejected_unlink)
+
+        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+
+        assert [record.id for record in result.finalized] == [accepted.id]
+        assert result.errors[0].blob_id == rejected.id
+        assert result.errors[0].exc_type == "BlobQuotaExceededError"
+        assert result.errors[0].detail == str(BlobQuotaExceededError(session_id_str, current_bytes=0, limit_bytes=10))
+        assert [error.exc_type for error in result.errors] == (
+            ["BlobQuotaExceededError", "PermissionError"] if cleanup_fails else ["BlobQuotaExceededError"]
+        )
+        with db_engine.connect() as conn:
+            status = conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(rejected.id))).scalar_one()
+        assert status == "error"
+        assert rejected_path.exists() is cleanup_fails
+
+    @pytest.mark.asyncio
     async def test_continues_after_concurrent_deletion(
         self,
         blob_service,

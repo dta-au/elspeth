@@ -3046,6 +3046,7 @@ class BlobServiceImpl:
         # module scope (see _fenced_blob_record).
         from elspeth.web.coordination.repository import SessionDerivedCustodyError
 
+        blob_errors: list[BlobFinalizationError] = []
         try:
             if success:
                 if storage.exists():
@@ -3058,7 +3059,8 @@ class BlobServiceImpl:
                             size_bytes=len(file_bytes),
                             content_hash_val=content_hash(file_bytes),
                         )
-                    except BlobQuotaExceededError:
+                    except BlobQuotaExceededError as exc:
+                        blob_errors.append(BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc)))
                         # Run succeeded but this blob would breach the
                         # session quota — mark as error so the run
                         # finalization isn't aborted entirely.
@@ -3066,7 +3068,8 @@ class BlobServiceImpl:
                         # disk growth from repeated over-quota outputs.
                         if storage.exists():
                             storage.unlink()
-                        record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
+                        self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
+                        return blob_errors
                 else:
                     record = self._mark_run_output_error(context, run_id=run_id, blob_id=blob_id)
             else:
@@ -3084,19 +3087,20 @@ class BlobServiceImpl:
             # The row is gone, is not this run's output, or is already
             # finalized: there is nothing left to transition, so the facet's
             # refusal is the whole per-blob outcome.
-            return [BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc))]
+            blob_errors.append(BlobFinalizationError(blob_id=blob_id, exc_type=type(exc).__name__, detail=str(exc)))
+            return blob_errors
         except (OSError, SQLAlchemyError) as exc:
             # Best-effort: transition the failed blob to "error" so it does
             # not remain permanently pending.  Return explicit error records
             # (never a silent swallow) describing the primary fault and any
             # recovery fault, so the batch caller surfaces both to auditors.
-            blob_errors = [
+            blob_errors.append(
                 BlobFinalizationError(
                     blob_id=blob_id,
                     exc_type=type(exc).__name__,
                     detail=str(exc),
                 )
-            ]
+            )
             recovery_exc = self._best_effort_mark_blob_error(context, run_id=run_id, blob_id=blob_id)
             if recovery_exc is not None:
                 blob_errors.append(
