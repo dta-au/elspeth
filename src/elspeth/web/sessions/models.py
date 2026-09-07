@@ -3204,9 +3204,29 @@ audit_access_log_table = Table(
 #
 # Spec: docs/specs/2026-09-02-pluggable-sso-design.md, §Data model.
 #
-# ``identities`` is CURRENT STATE. The history of record is the per-login
-# profile snapshot in the Landscape ``auth_events.metadata_json``; nothing
-# here is an audit log, and nothing here may be read as one.
+# ``identities`` is CURRENT STATE. Nothing here is an audit log, and nothing
+# here may be read as one.
+#
+# This comment used to continue "the history of record is the per-login
+# profile snapshot in the Landscape ``auth_events.metadata_json``". That
+# snapshot is NOT WRITTEN (measured 2026-09-07): the SSO login row's
+# ``metadata_json`` holds exactly ``{"method", "path"}`` -- ``routes.py``'s
+# ``record_login`` closure passes provider, user_id, username and
+# identity_id, ``record_login_success`` passes
+# ``metadata=_request_metadata(request)``, and ``_request_metadata`` in
+# ``web/auth/audit.py`` returns the HTTP method and path and nothing else.
+# The identity_id, provider, username and request_id it named are top-level
+# COLUMNS on ``auth_events``, not metadata keys.
+#
+# So the "not an audit log" rule above is now the WHOLE of it, and it binds
+# harder than before rather than less: there is no profile history anywhere
+# to redirect a reader to, which makes reading these mutable rows as history
+# the tempting mistake rather than an obviously wrong one. Asked what a
+# person's display name or organisation was at a login last month, the
+# honest answer today is that nothing recorded it. The spec states the
+# requirement (§Data model, rev2.12); until something writes it, do not
+# repeat the claim here or anywhere else -- this comment agreeing with the
+# spec is exactly why the spec's error survived three reviews.
 #
 # The provider discriminator on ``identities`` is DELIBERATELY WIDER than
 # the one on ``sessions`` and ``user_secrets``: an identity may exist for a
