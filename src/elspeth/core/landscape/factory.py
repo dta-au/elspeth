@@ -503,7 +503,11 @@ class RecorderFactory:
         # SQLite Tier-1 PRAGMA probe when applicable — nothing it could do on
         # a read-only handle.
         self._run_coordination: RunCoordinationRepository | None = None if db.is_read_only else RunCoordinationRepository(db.engine)
-        self._audit_export_snapshots = AuditExportSnapshotRepository()
+        # No read-only guard: unlike the scheduler and coordination
+        # repositories this constructor runs no PRAGMA probe, and the export
+        # read surfaces (MCP analyzer, immutable snapshot opens) use its read
+        # verbs on read-only handles. A write attempt fails at begin_write.
+        self._audit_export_snapshots = AuditExportSnapshotRepository(db.engine)
 
     @property
     def run_lifecycle(self) -> RunLifecycleRepository:

@@ -31,6 +31,9 @@ from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
+from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
+from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
 from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
 from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
 from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
@@ -227,6 +230,12 @@ def _install_profile_run_liveness() -> None:
     scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
     scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+    # ADR-048 D8.5: the sink-effect verbs fence too, and every fence EXTENDS
+    # the seat it verifies — a profile that shrinks the window everywhere else
+    # would still see the killed leader's seat held open by these three.
+    sink_effect_lifecycle_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+    sink_effect_finalization_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+    sink_effect_reservation_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
 
     real_heartbeat_init = RunHeartbeatThread.__init__
 

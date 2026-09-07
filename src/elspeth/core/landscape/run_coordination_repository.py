@@ -72,6 +72,7 @@ from elspeth.contracts.coordination import (
     CoordinationToken,
     LeaderInfo,
     RegisteredWorker,
+    WorkerMembershipLost,
     WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
@@ -452,7 +453,9 @@ def verify_membership_fence(
     when that verb says so — a departing or claiming member must never look
     fresher than its last beat.
 
-    On rowcount 0 raises :class:`RunMembershipLostError`. The caller (or
+    On rowcount 0, reads registration in this transaction: an absent row is
+    :class:`AuditIntegrityError`; an inactive row raises
+    :class:`RunMembershipLostError`. No payload write occurs in either case. The caller (or
     :func:`fenced_member_transaction`) records the ``fence_refusal`` event on
     a fresh connection AFTER its rollback completes.
     """
@@ -466,6 +469,17 @@ def verify_membership_fence(
         .values(status="active")
     )
     if result.rowcount != 1:
+        registered = conn.execute(
+            select(run_workers_table.c.worker_id).where(
+                run_workers_table.c.run_id == member_token.run_id,
+                run_workers_table.c.worker_id == member_token.worker_id,
+            )
+        ).scalar_one_or_none()
+        if registered is None:
+            raise AuditIntegrityError(
+                f"{verb} for unregistered worker_id={member_token.worker_id!r} in run {member_token.run_id!r}; "
+                "membership authority requires a durable registration."
+            )
         raise RunMembershipLostError(
             run_id=member_token.run_id,
             worker_id=member_token.worker_id,
@@ -1057,15 +1071,16 @@ class RunCoordinationRepository:
 
     # ── registry membership (slice-4/5 consumers) ────────────────────────
 
-    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
+    def worker_heartbeat(
+        self, *, member_token: WorkerMembershipToken, window_seconds: float
+    ) -> CoordinationSnapshot | WorkerMembershipLost:
         """Member-fenced worker-row beat + seat snapshot, one transaction (§A.3).
 
         SLICE-4 CONSUMER: the dedicated heartbeat thread. The membership fence
         is the first statement (ADR-030 D4); its refusal — this worker is no
         longer ``active`` (departed at finalize, or evicted) — is this verb's
-        DECLARED outcome, ``worker_active=False``, with the seat read back on
-        a plain connection so the snapshot stays whole: the thread latches its
-        coordination-lost flag on THAT, never on a DB error, and the
+        DECLARED outcome, ``WorkerMembershipLost``, requiring no further read:
+        the thread latches its coordination-lost flag on THAT, never on a DB error, and the
         ``fence_refusal`` row the fence recorded is the durable evidence of
         the zombie beat. A leader beats BOTH rows in one transaction (identity
         CAS on the seat — no epoch parameter here; the leader-fenced verbs are
@@ -1112,101 +1127,13 @@ class RunCoordinationRepository:
                     ).where(run_coordination_table.c.run_id == member_token.run_id)
                 ).one_or_none()
         except RunMembershipLostError:
-            return self._inactive_member_snapshot(member_token)
+            return WorkerMembershipLost(member_token=member_token)
         return CoordinationSnapshot(
             leader_worker_id=None if seat is None else seat.leader_worker_id,
             leader_epoch=0 if seat is None else int(seat.leader_epoch),
             seat_live=seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live),
             worker_active=True,
             worker_role=role,  # ADR-030 §B: follower sees foreign leader_worker_id normally
-        )
-
-    def _inactive_member_snapshot(self, member_token: WorkerMembershipToken) -> CoordinationSnapshot:
-        """The refused beat's snapshot: role and seat read back, ``worker_active=False``.
-
-        Plain read connection: the refused transaction has rolled back and its
-        refusal event is written. A row that is absent altogether is
-        corruption (a token exists for a registration that never happened or
-        was deleted), not a departed member.
-
-        DISPUTED, AND THE VERDICT BELOW IS CONTINGENT (elspeth-9c4f6c43a7).
-        Two objections stand against this method, both raised by its own author:
-
-        1. The seat fields are decorative on this path. They are read for a
-           worker the fence has just proven holds no membership, and exist only
-           to fill a frozen dataclass. They are not consumed:
-           ``RunHeartbeatThread._beat_once`` latches on ``worker_active=False``
-           and RETURNS before the deposed-latch examines any seat field. That is
-           safety by consumer behaviour, not by construction, so it is
-           conditional on that consumer not being edited to read them.
-        2. The ``AuditIntegrityError`` for an absent role row is now reached
-           from an UNFENCED read in a SECOND transaction, where the same check
-           previously sat inside the single write transaction. That boundary is
-           new and this change created it. A row vanishing between the two would
-           be reported as audit corruption rather than as a lost race.
-
-        Objection 2's failure mode is UNREACHABLE TODAY, measured rather than
-        assumed. Every DML verb applied to ``run_workers`` across ``src/`` was
-        ENUMERATED by AST -- not searched for by expected spelling, since finding
-        no ``delete(run_workers_table)`` would prove only that one string absent
-        -- and the verb set is ``{insert, update}``: 1 insert, 8 updates, ZERO
-        deletes on this tree.
-
-        The enumeration covers BOTH call styles, and that correction is recorded
-        rather than quietly folded in, because the first pass made the very
-        mistake this paragraph warns about. It matched only the prefix form
-        ``update(run_workers_table)`` and so reported SEVEN, missing the method
-        form ``run_workers_table.update()`` at
-        ``run_lifecycle_repository.py:700`` -- finalize's leftover-member
-        hygiene, which departs stragglers. **A spelling-search dressed as an
-        enumeration is still a spelling-search**; only walking the AST for
-        ``insert``/``update``/``delete`` applied to this table in either form,
-        plus checking the table is never handed to a generic DML helper (it is
-        not -- the only pass-through uses are ``with_for_update``, a SELECT
-        lock), actually enumerates it.
-
-        The count is tree-dependent -- one of the eight is the membership fence's
-        own verify-UPDATE -- but the ZERO is what the verdict rests on, and it is
-        zero in BOTH call styles and on the pre-fence tree. No raw SQL names the
-        table and no retention or purge path touches it. Single-use identity is
-        why: departed and evicted rows keep their row and change status rather
-        than being removed -- including the finalize path above, which sets
-        ``status='departed'`` rather than deleting. So a row cannot vanish
-        between the two reads, and an absent row still means a registration that
-        never happened.
-
-        **A DELETE on ``run_workers`` invalidates objection 2's verdict.** This
-        note is that condition, kept beside the code because whoever adds such a
-        delete will be reading this repository, not a ticket. The proposed
-        narrowing -- a refusal return carrying no seat fields, or carrying them
-        as unknown -- is endorsed and unimplemented.
-        """
-        with self._engine.connect() as conn:
-            database_now = read_landscape_transaction_time(conn)
-            role = conn.execute(
-                select(run_workers_table.c.role).where(
-                    run_workers_table.c.run_id == member_token.run_id,
-                    run_workers_table.c.worker_id == member_token.worker_id,
-                )
-            ).scalar_one_or_none()
-            if role is None:
-                raise AuditIntegrityError(
-                    f"worker_heartbeat for unregistered worker_id={member_token.worker_id!r} in run {member_token.run_id!r}; "
-                    "registration precedes the heartbeat thread by construction."
-                )
-            seat = conn.execute(
-                select(
-                    run_coordination_table.c.leader_worker_id,
-                    run_coordination_table.c.leader_epoch,
-                    (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
-                ).where(run_coordination_table.c.run_id == member_token.run_id)
-            ).one_or_none()
-        return CoordinationSnapshot(
-            leader_worker_id=None if seat is None else seat.leader_worker_id,
-            leader_epoch=0 if seat is None else int(seat.leader_epoch),
-            seat_live=seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live),
-            worker_active=False,
-            worker_role=role,
         )
 
     def admit_follower(

@@ -29,7 +29,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.engine.spans import SpanFactory
 from elspeth.web.execution.diagnostics import load_run_diagnostics_from_db
 from tests.fixtures.base_classes import as_sink, as_source, create_observed_contract
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.fixtures.pipeline import build_linear_pipeline
 from tests.fixtures.sink_effects import DuplicateObservableTarget, PartitioningObservableSink
 from tests.fixtures.stores import MockPayloadStore
@@ -173,6 +173,7 @@ def _run_failing_failsink(db: LandscapeDB) -> tuple[str, str]:
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             primary,  # type: ignore[arg-type]
             [accepted, diverted],

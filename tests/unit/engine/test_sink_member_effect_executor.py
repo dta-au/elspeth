@@ -22,7 +22,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import (
 from elspeth.core.landscape.schema import sink_effects_table
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionRequest
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 
@@ -138,6 +138,7 @@ def test_response_lost_member_is_reconciled_and_only_missing_members_are_committ
                 factory=factory,
                 worker_id="worker-a",
                 lease_ttl=timedelta(minutes=5),
+                coordination_token=leader_token_for(db, run.run_id),
             ).execute(request, first_sink)
 
         durable_binding = factory.execution.sink_effects.get_members_for_tokens(
@@ -170,6 +171,7 @@ def test_response_lost_member_is_reconciled_and_only_missing_members_are_committ
         result = SinkEffectCoordinator(
             factory=make_factory(db),
             worker_id="worker-b" if takeover else "worker-a",
+            coordination_token=leader_token_for(db, run.run_id),
         ).execute(request, recovered_sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED

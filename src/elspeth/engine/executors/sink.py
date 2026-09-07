@@ -23,6 +23,7 @@ from elspeth.contracts import (
     TokenInfo,
 )
 from elspeth.contracts.audit import NodeState, NodeStateFailed, TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.declaration_contracts import (
     AggregateDeclarationContractViolation,
     BoundaryInputs,
@@ -151,6 +152,7 @@ class SinkExecutor:
         *,
         factory: RecorderFactory | None = None,
         worker_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
         clock: Clock = DEFAULT_CLOCK,
         sink_effect_fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
         shutdown_event: threading.Event | None = None,
@@ -164,12 +166,17 @@ class SinkExecutor:
             data_flow: Data flow repository for token outcomes
             span_factory: Span factory for tracing
             run_id: Run identifier for artifact registration
+            coordination_token: The run's current leader token (ADR-048).
+                Every durable sink effect this executor drives fences on it;
+                like ``factory``, it is required on the effect path and
+                checked there, so a plain (non-effect) sink write needs neither.
         """
         self._execution = execution
         self._data_flow = data_flow
         self._spans = span_factory
         self._run_id = run_id
         self._factory = factory
+        self._coordination_token = coordination_token
         # A deterministic per-run owner lets separate processes look like the
         # same live lease holder and dispatch the same external effect. Normal
         # orchestration threads its registered coordination worker id; direct
@@ -182,6 +189,16 @@ class SinkExecutor:
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
         self._make_shutdown_error = make_shutdown_error
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        """The leader token every fenced sink-effect verb requires (ADR-048)."""
+        if self._coordination_token is None:
+            raise OrchestrationInvariantError(
+                "effect-capable sink execution requires the run's coordination token: durable sink effects are "
+                "leader-fenced Landscape writes with no unfenced arm (ADR-048). Construct SinkExecutor with "
+                "coordination_token — the orchestrator threads the processor's leader token through the sink flush."
+            )
+        return self._coordination_token
 
     def _complete_states_failed(
         self,
@@ -764,6 +781,7 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            coordination_token=self._require_coordination_token(),
             clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
             shutdown_event=self._shutdown_event,
@@ -1098,6 +1116,7 @@ class SinkExecutor:
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
+            coordination_token=self._require_coordination_token(),
             clock=self._clock,
             fault_hook=self._sink_effect_fault_hook,
             shutdown_event=self._shutdown_event,

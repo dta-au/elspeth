@@ -12,16 +12,63 @@ identified as unwitnessed anywhere in the corpus.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import Column, DateTime, MetaData, String, Table, create_engine, insert
 
+from tests.fixtures.dag_scenario_corpus import recovery_conditional_route, recovery_conditional_route_second_sink
 from tests.fixtures.dag_scenario_corpus.harness import compute_fixture_sha256
 from tests.fixtures.dag_scenario_corpus.plugins import install_corpus_plugin_manager
 from tests.fixtures.dag_scenario_corpus.recovery_conditional_route_second_sink import (
     run_conditional_route_second_sink_recovery_case,
 )
 from tests.fixtures.dag_scenario_corpus.schema import SummaryRunExpectation
+
+
+@pytest.mark.parametrize(
+    "effect_names",
+    [recovery_conditional_route._effect_names, recovery_conditional_route_second_sink._effect_names],
+    ids=["first-sink", "second-sink"],
+)
+@pytest.mark.parametrize("effect_ids", [("z", "a"), ("a", "z")], ids=["reversed-hashes", "ordered-hashes"])
+def test_effect_names_do_not_infer_chronology_from_tied_timestamps(
+    effect_names: Callable[..., tuple[str, ...]],
+    effect_ids: tuple[str, str],
+) -> None:
+    """The query's projected columns cannot establish cross-sink chronology."""
+    metadata = MetaData()
+    effects = Table(
+        "sink_effects",
+        metadata,
+        Column("effect_id", String, primary_key=True),
+        Column("run_id", String, nullable=False),
+        Column("sink_node_id", String, nullable=False),
+        Column("created_at", DateTime, nullable=False),
+    )
+    engine = create_engine("sqlite://")
+    try:
+        metadata.create_all(engine)
+        with engine.begin() as connection:
+            # Equal database seconds carry no ordering, regardless of hash order.
+            tied_at = datetime(2026, 9, 7, tzinfo=UTC)
+            connection.execute(
+                insert(effects),
+                [
+                    {"effect_id": effect_ids[0], "run_id": "run", "sink_node_id": "accepted-node", "created_at": tied_at},
+                    {"effect_id": effect_ids[1], "run_id": "run", "sink_node_id": "rejected-node", "created_at": tied_at},
+                    {"effect_id": "0", "run_id": "other-run", "sink_node_id": "foreign-node", "created_at": tied_at},
+                ],
+            )
+            assert effect_names(
+                connection,
+                run_id="run",
+                sink_names_by_node_id={"accepted-node": "accepted", "rejected-node": "rejected"},
+            ) == ("accepted", "rejected")
+    finally:
+        engine.dispose()
 
 
 def test_route_reopens_and_resumes_after_second_rejected_sink_boundary(
@@ -67,10 +114,11 @@ def test_route_reopens_and_resumes_after_second_rejected_sink_boundary(
         (2, "success", "gate_routed", "accepted"),
     )
 
-    # Precondition 1 (panel-replay §5, item 1): the accepted sink -- declared
-    # and executed FIRST -- has already finalized and published before the
-    # rejected sink's effect ever opens.
-    assert interrupted.sink_effect_order == ("accepted", "rejected")
+    # Precondition 1 (panel-replay §5, item 1): accepted has already finalized
+    # and published at rejected's before_effect fault. The mixed-state snapshot
+    # below proves that causal boundary; timestamps and effect hashes cannot
+    # establish effect-open chronology. Names here report membership only.
+    assert interrupted.sink_effect_names == ("accepted", "rejected")
     assert interrupted.output_files_exist == (("accepted", True), ("rejected", False))
 
     # Precondition 2 (panel-replay §5, item 2): effects_before carries TWO
@@ -196,7 +244,7 @@ def test_route_reopens_and_resumes_after_second_rejected_sink_boundary(
     final = result.final
     assert final.routes_by_source_row == interrupted.routes_by_source_row
     assert final.dispositions_by_source_row == interrupted.dispositions_by_source_row
-    assert final.sink_effect_order == ("accepted", "rejected")
+    assert final.sink_effect_names == ("accepted", "rejected")
     assert final.faulted_intent_reclassified_response_lost is True
     assert final.faulted_commit_intent_count == 0
     assert final.terminal_work_count == 3

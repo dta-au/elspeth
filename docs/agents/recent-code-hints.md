@@ -8,6 +8,26 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-07 — auto-gc was deadlocked by its own warning file: `.git/gc.log` blocked every `--auto` run, and the two-week default prune expiry could never clear it**
+  `git gc --auto` had done no housekeeping for weeks. `.git/gc.log` held `warning: There are too many unreachable loose
+  objects; run 'git prune' to remove them.`, and git prints that file and exits **0** instead of running whenever the
+  file is newer than `gc.logExpiry` (default 1 day) — *"Automatic cleanup will not be performed until the file is
+  removed"*. The state could not self-clear: all 8,254 loose objects were ≤10 days old against the default
+  `gc.pruneExpire` of **two weeks**, so no run could prune enough to fall below the `gc.auto` threshold of 6,700, and at
+  this repo's churn (~800 unreachable objects/day across 51 worktrees) the trailing fourteen-day window sits permanently
+  near 11,000. Cost: 43 unconsolidated packs (oldest 2026-08-02) and a 490 MB `.git`. Fix:
+  `git config gc.pruneExpire 3.days.ago` (repo-local) then one `git gc --prune=3.days.ago` → 0 loose objects, 2 packs
+  (the second a cruft pack), `.git` 305 MB, `git gc --auto` silent, `git fsck --connectivity-only` clean (533
+  `dangling`, 0 missing/broken/corrupt), 52/52 worktree HEADs resolving, reflogs untouched (2.0 MB/184 files before and
+  after). Three days ≈ 2,400 objects steady-state against the 6,700 threshold; seven days clears once and re-deadlocks
+  within a day. Two traps for the next reader: **`.git/config` is untracked**, so a fresh clone or a second machine
+  inherits the two-week default and will re-enter this state — re-apply the setting there; and deleting `.git/gc.log`
+  alone only buys a day, because the expiry, not the log, is the root cause. `git fsck --unreachable` also found 2,240
+  orphaned `WIP on …`/`index on …` snapshot commits (~1,120 snapshot events), against the 650 stash-shaped dangling
+  commits the 2026-09-02 entry below counted five days earlier; the other 1,137 unreachable commits were dropped rebase
+  originals, packed to a standalone rescue pack outside the repository before pruning.
+  See [CONTRIBUTING: Convention: repository and process hygiene](../../CONTRIBUTING.md#convention-repository-and-process-hygiene).
+
 - **2026-09-02 — `git stash` was never blocked: `pre-stash` is not a git hook, and the "blocked by a hook" rule was false for six months**
   `AGENTS.md` and `CONTRIBUTING.md` both stated `git stash` was blocked by a hook. It was not, and never had been.
   `.git/hooks/pre-stash` (created 2026-03-06) was broken three independent ways: (1) **git has no `pre-stash` hook** —

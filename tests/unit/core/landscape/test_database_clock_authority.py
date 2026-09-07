@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.tree_gate import iter_gate_files
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -66,7 +67,6 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
 )
 
 _SENSITIVE_SYMBOLS = _CLOCK_AUTHORITY_VERBS | {
-    "CheckpointManager._fenced_or_plain_write",
     "CheckpointManager.delete_checkpoints",
     "FollowerProcessor._best_effort_depart",
     "FollowerProcessor._drain_loop",
@@ -132,15 +132,29 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fenced_leader_transaction, and every fence reads the Landscape clock to verify-and-
 # extend the seat — so fencing a verb makes it a clock boundary even when the verb's
 # own UPDATE writes no timestamp. Re-derived from the printed output.
-# MEMBER-FENCE (elspeth-43ddb79074): ba944a5b… → 046226a2…, +1 identity:
-# RunCoordinationRepository._inactive_member_snapshot, the refused beat's seat
-# read-back. This value is neither side of the rebase conflict that produced it:
-# BARRIER-ADOPT pinned ba944a5b… on the tip and the member-fence branch pinned
-# 038cab48… on its own base, and the merged tree carries BOTH new boundaries, so
-# it is a THIRD value. Taking either side textually would have pinned a digest
-# that describes neither tree — re-derived from this file's printed output
-# instead, with the identity assertion above passing unchanged.
-_CLOCK_BOUNDARY_DIGEST = "046226a2e0d5b17621d7dadc048c451c73f11a456b5197ad1cb5b8f1a94c94c0"
+# SINKFX (elspeth-43ddb79074, ADR-048 D8.5): ba944a5b… → 81fd6c8f…, +4 identities:
+# begin_attempt, record_attempt_result, reserve and _reserve_export gained
+# fenced_leader_transaction, and the same rule applies — the fence's verify-and-extend
+# reads the Landscape clock, so fencing a verb makes it a clock boundary. The identity
+# rows below are the UNION of both lanes' additions (86 at the tip + 4 = 90); this
+# digest was re-derived by RUNNING the gate on the merged tree, because it hashes the
+# source tree's DISCOVERY ORDER rather than this literal, so it cannot be computed by
+# reasoning about rows and the literal's own row order is not load-bearing.
+# CKPT-SNAP (elspeth-43ddb79074, ADR-048 D8.5): 81fd6c8f… → the value below.
+# +2 identities: the audit-export registry's two public write verbs,
+# register_candidate and register_verified_candidate, each open their OWN
+# fenced_leader_transaction over one shared connection helper, so each reads the
+# Landscape clock to judge the seat it extends — boundaries purely because they fence,
+# since the snapshot and chunk rows they write carry no authority timestamp.
+# -1 identity: CheckpointManager._fenced_or_plain_write is DELETED with its method, so
+# its row goes with it. THIS LANE IS THE ONLY ONE CARRYING A MINUS TERM: a mechanical
+# union of the row sets resurrects a row whose definition no longer exists, and the
+# gate then reports it as stale rather than as a merge artefact. Row set is therefore
+# UNION MINUS DELETIONS: 90 (tip at landing) + 2 - 1 = 91, AST-counted on the rebased
+# tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
+# by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
+# this literal is not load-bearing and was resolved purely for readability.
+_CLOCK_BOUNDARY_DIGEST = "5ea9883f9b58a904ca3a949d15685667bd1902d36b00849c6fe48d86ef088067"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -201,7 +215,6 @@ class _FunctionRecord:
 # authority definition requires an explicit review of this gate.
 _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
     {
-        ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager._fenced_or_plain_write"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.create_checkpoint"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
@@ -209,16 +222,22 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token_transaction"),
+        ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_candidate"),
+        ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_verified_candidate"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._finalize_on"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._validate_effect_authority"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization.finalize"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.acquire_lease"),
+        ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.begin_attempt"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.claim_preparation"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.complete_member_result"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.complete_plan"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.mark_response_lost"),
+        ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.record_attempt_result"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.takeover_expired"),
+        ("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "SinkEffectReservation._reserve_export"),
+        ("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "SinkEffectReservation.reserve"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.acquire_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.claim_preparation"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
@@ -226,7 +245,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._inactive_member_snapshot"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
@@ -301,7 +319,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
 # no direct SQL decision.
 _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
     {
-        ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager._fenced_or_plain_write"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.acquire_lease"),
@@ -4132,7 +4149,7 @@ class Harmless:
 def test_required_authority_boundary_injection_cannot_mask_a_deleted_definition() -> None:
     path = "src/elspeth/core/checkpoint/manager.py"
     missing = _missing_required_boundaries({path: "def unrelated(): pass"})
-    assert (path, "CheckpointManager._fenced_or_plain_write") in missing
+    assert (path, "CheckpointManager.delete_checkpoints") in missing
     assert not _discover_authority_boundaries({path: "def unrelated(): pass"})
 
 
@@ -5799,7 +5816,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
 
         monkeypatch.setattr(checkpoint_module, "datetime", SessionsDateTime)
         landscape_before = database_now()
-        CheckpointManager(db).delete_checkpoints(run_id, coordination_token=token)
+        CheckpointManager(db).delete_checkpoints(coordination_token=token)
         landscape_after = database_now()
         with db.engine.connect() as connection:
             checkpoint_fence_expiry = connection.execute(
@@ -5906,7 +5923,9 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             replacing_target=False,
             primary_effect_id=None,
         )
-        effect = factory.execution.sink_effects.reserve(reservation).new_effect
+        effect = factory.execution.sink_effects.reserve(
+            reservation, coordination_token=leader_coordination_token(factory, run_id)
+        ).new_effect
         assert effect is not None
         monkeypatch.setattr(effect_module, "now", lambda: observed_sessions_now)
         landscape_before = database_now()
@@ -5914,6 +5933,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             effect.effect_id,
             owner="effect-worker",
             ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         landscape_after = database_now()
         with db.engine.connect() as connection:

@@ -16,7 +16,7 @@ Value objects threaded through the leader/follower coordination protocol
   leader derives its own through ``CoordinationToken.membership``.
 - :class:`LeaderInfo` — read-only seat snapshot (``live_leader``); the
   slice-4 entry-guard precision upgrade consumes it.
-- :class:`CoordinationSnapshot` — returned by ``worker_heartbeat`` so
+- :class:`CoordinationSnapshot` — returned by an admitted ``worker_heartbeat`` so
   followers learn of seat handover on their existing cadence (§A.3;
   consumed by the slice-4 heartbeat thread).
 - :class:`RegisteredWorker` — forensic registry row surfaced by the §B.4
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 from uuid import uuid4
 
 __all__ = [
@@ -39,6 +39,7 @@ __all__ = [
     "CoordinationToken",
     "LeaderInfo",
     "RegisteredWorker",
+    "WorkerMembershipLost",
     "WorkerMembershipToken",
     "mint_worker_id",
 ]
@@ -129,6 +130,17 @@ class WorkerMembershipToken:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerMembershipLost:
+    """A refused heartbeat: membership is lost and no seat state was observed.
+
+    This outcome needs no database read after the membership fence refuses.
+    An absent registration is audit corruption and raises instead.
+    """
+
+    member_token: WorkerMembershipToken
+
+
+@dataclass(frozen=True, slots=True)
 class LeaderInfo:
     """Read-only view of a run's leader seat (``live_leader``).
 
@@ -149,23 +161,26 @@ class LeaderInfo:
 class CoordinationSnapshot:
     """Seat state observed atomically by ``worker_heartbeat`` (§A.3).
 
-    ``worker_active`` is False when the heartbeat CAS missed (this worker is
-    no longer ``active`` — departed at finalize, or evicted); the slice-4
-    heartbeat thread latches its coordination-lost flag on that, never on a
-    DB error. ``leader_worker_id`` is None for a vacant seat. A leader-mode
-    process observing a snapshot whose leader is not itself treats that as
+    A successful heartbeat returns ``worker_active=True``. A refused heartbeat
+    returns :class:`WorkerMembershipLost` instead: no seat read is needed to
+    report that membership ended. ``leader_worker_id`` is None for a vacant
+    seat. A leader-mode process observing a snapshot whose leader is not itself treats that as
     fatal (deposed even if its registry row was not yet evicted).
     """
 
     leader_worker_id: str | None
     leader_epoch: int
     seat_live: bool
-    worker_active: bool
+    worker_active: Literal[True]
     # Role of THIS worker (the one that called worker_heartbeat). Defaults to
     # "leader" for backward-compat with slice-4 tests that construct snapshots
     # directly. The heartbeat thread uses this to gate the deposed-latch: a
     # follower seeing a foreign leader_worker_id is NORMAL, not deposed.
     worker_role: str = "leader"
+
+    def __post_init__(self) -> None:
+        if self.worker_active is not True:
+            raise ValueError("Inactive membership requires WorkerMembershipLost, not a coordination snapshot")
 
 
 @dataclass(frozen=True, slots=True)

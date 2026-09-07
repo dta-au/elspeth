@@ -531,29 +531,42 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "depart_worker",
         "release_seat",
         "worker_heartbeat",
+        "acquire_lease",
         "adopt_blocked_barrier_item",
         "adopt_group_losses",
+        "begin_attempt",
+        "claim_preparation",
         "complete_barrier",
+        "complete_member_result",
+        "complete_plan",
         "complete_run",
         "create_checkpoint",
         "create_row_with_token",
         "delete_checkpoints",
         "evict_worker",
+        "finalize",
+        "heartbeat_lease",
         "ingest_row_with_initial_claim",
         "mark_pending_sink_terminal",
         "mark_pending_sink_terminal_many",
+        "mark_response_lost",
         "reconcile_source_completions_from_scheduler",
+        "record_attempt_result",
         "record_preflight_results",
         "record_readiness_check",
         "record_run_source",
         "record_secret_resolutions",
         "record_source_field_resolution",
         "recover_expired_leases",
+        "register_candidate",
+        "register_verified_candidate",
+        "reserve",
         "reset_adoption_marker_to_pending",
         "set_export_failed_unless_completed",
         "set_export_pending_unless_completed",
         "set_export_status",
         "stage_escalation_loss",
+        "takeover_expired",
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_source_contract",
         "update_run_status",
@@ -622,6 +635,18 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_recover_expired_leases_refused",
         ),
+        # The audit-export registry CAS (ADR-048): its stale-token evidence
+        # lives beside the export-bundle derivation machinery it needs to
+        # build a verified candidate, not in the shared fence suite. Both
+        # public write verbs open their own fence, so both owe evidence.
+        "register_candidate": (
+            "tests/unit/core/landscape/test_audit_export_snapshots.py",
+            "test_register_candidate_refused",
+        ),
+        "register_verified_candidate": (
+            "tests/unit/core/landscape/test_audit_export_snapshots.py",
+            "test_register_verified_candidate_refused",
+        ),
         "reset_adoption_marker_to_pending": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_reset_adoption_marker_to_pending_refused",
@@ -685,6 +710,54 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "worker_heartbeat": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_worker_heartbeat_refused_for_evicted_member",
+        ),
+        # D8.5 sink-effect family (ADR-048): nine verbs share one parametrized
+        # arm; `reserve` and `finalize` need a real effect to reach the fence
+        # (both validate a witness before the write transaction opens), so
+        # each has its own.
+        "acquire_lease": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "begin_attempt": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "claim_preparation": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "complete_member_result": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "complete_plan": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "heartbeat_lease": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "mark_response_lost": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "record_attempt_result": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "takeover_expired": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "reserve": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_reserve_refused",
+        ),
+        "finalize": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_finalize_refused",
         ),
     }
     # Verbs whose refusal is REIFIED rather than propagated (see the

@@ -55,6 +55,7 @@ from elspeth.web.auth.session_token import (
 from elspeth.web.auth.sso import (
     AdmittedIdentity,
     SsoClient,
+    SsoIdentityRebound,
     SsoRuntime,
     configured_endpoint_override,
     fetch_discovery_endpoints,
@@ -64,6 +65,7 @@ from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     IdentityActivated,
     IdentityAlreadyDisabled,
+    IdentityRebound,
     RepositoryIdentityAuthority,
     RoleForbiddenForIdentity,
 )
@@ -151,6 +153,20 @@ def build_sso_wiring(
             storage_bytes=settings.quota_default_storage_bytes if quota_written else None,
         )
 
+    def _record_rebound(event: IdentityRebound) -> None:
+        # Runs INSIDE ensure_identity's transaction, like _record_admission:
+        # a disable this trail cannot hold does not commit. No request -- the
+        # refused login writes its own auth_failure row with the request
+        # context and the sso_identity_rebound category, and the two join on
+        # identity_id.
+        audit_recorder.record_identity_rebound(
+            provider=provider,
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            previous_email=event.previous_email,
+            current_email=event.current_email,
+        )
+
     def _record_bootstrap(event: IdentityActivated) -> None:
         # Runs INSIDE bootstrap_admin's transaction, like _record_admission:
         # a seed the trail cannot hold does not commit. No request: the seed
@@ -198,13 +214,27 @@ def build_sso_wiring(
         # activates it. There is no open-registration reading for an IdP
         # login -- the IdP verified who the person is, not whether this
         # container admits them.
-        return identity_authority.ensure_identity(
+        outcome = identity_authority.ensure_identity(
             claims=claims,
             activate=False,
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
             record_admission=_record_admission,
-        ).record
+            record_rebound=_record_rebound,
+        )
+        if outcome.rebound_refused:
+            # R3, and the ONLY place this refusal can be raised: the authority
+            # writes the state change, but a refusal is a login-path concept
+            # and ``web.coordination`` does not import ``web.auth.sso``.
+            #
+            # Read from the OUTCOME, never from ``record.access_state``. R5's
+            # carve-out leaves the last active human admin ``active`` while
+            # still refusing them, so a state check here would admit the one
+            # identity in the deployment whose subject being recycled matters
+            # most. ``admit`` below is the state gate and stays that; this is
+            # the rebound gate.
+            raise SsoIdentityRebound
+        return outcome.record
 
     def _read_identity(identity_id: str) -> AdmittedIdentity | None:
         return identity_authority.read_identity(identity_id=identity_id)

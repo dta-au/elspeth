@@ -20,7 +20,7 @@ from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import nodes_table, run_sources_table, runs_table
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for, make_landscape_db
 from tests.helpers.checkpoint import checkpoint_draft
 
 
@@ -42,6 +42,9 @@ def _insert_interrupted_run(conn: Connection, run_id: str, *, lifecycle_state: s
             openrouter_catalog_source="bundled",
         )
     )
+    # A run written by raw SQL has no seat; the checkpoint below is written
+    # under the lapsed seat the interrupted leader left (ADR-048 §5 read-back).
+    insert_crashed_leader_seat(conn, run_id=run_id)
     for node_id, node_type in (("source-node", NodeType.SOURCE), ("checkpoint-node", NodeType.TRANSFORM)):
         conn.execute(
             nodes_table.insert().values(
@@ -76,7 +79,10 @@ def _insert_interrupted_run(conn: Connection, run_id: str, *, lifecycle_state: s
 def _create_checkpoint(db: LandscapeDB, run_id: str) -> None:
     graph = ExecutionGraph()
     graph.add_node("checkpoint-node", node_type=NodeType.TRANSFORM, plugin_name="test", config={})
-    CheckpointManager(db).create_checkpoint(draft=checkpoint_draft(run_id=run_id, sequence_number=1, graph=graph))
+    CheckpointManager(db).create_checkpoint(
+        draft=checkpoint_draft(run_id=run_id, sequence_number=1, graph=graph),
+        coordination_token=leader_token_for(db, run_id),
+    )
 
 
 def test_incomplete_source_prints_refusal_not_execute_suggestion(db: LandscapeDB, capsys: pytest.CaptureFixture[str]) -> None:

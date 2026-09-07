@@ -44,7 +44,7 @@ class ConditionalRouteInterruptedFacts:
     routes_by_source_row: RouteFacts
     dispositions_by_source_row: DispositionFacts
     work_by_source_row: tuple[tuple[int, str, str, str], ...]
-    sink_effect_order: tuple[str, ...]
+    sink_effect_names: tuple[str, ...]
     accepted_attempts: tuple[tuple[str, str], ...]
     accepted_commit_attempt_id: str
     artifact_count: int
@@ -58,7 +58,7 @@ class ConditionalRouteInterruptedFacts:
 class ConditionalRouteFinalFacts:
     routes_by_source_row: RouteFacts
     dispositions_by_source_row: DispositionFacts
-    sink_effect_order: tuple[str, ...]
+    sink_effect_names: tuple[str, ...]
     accepted_intent_reclassified_response_lost: bool
     accepted_response_lost_attempt_id: str
     accepted_commit_intent_count: int
@@ -162,18 +162,15 @@ def _route_facts(
     )
 
 
-def _effect_order(
+def _effect_names(
     connection: Any,
     *,
     run_id: str,
     sink_names_by_node_id: dict[str, str],
 ) -> tuple[str, ...]:
-    node_ids = connection.execute(
-        select(sink_effects_table.c.sink_node_id)
-        .where(sink_effects_table.c.run_id == run_id)
-        .order_by(sink_effects_table.c.created_at, sink_effects_table.c.effect_id)
-    ).scalars()
-    return tuple(sink_names_by_node_id[str(node_id)] for node_id in node_ids)
+    """Canonical effect membership, not chronology: timestamps can tie."""
+    node_ids = connection.execute(select(sink_effects_table.c.sink_node_id).where(sink_effects_table.c.run_id == run_id)).scalars()
+    return tuple(sorted(sink_names_by_node_id[str(node_id)] for node_id in node_ids))
 
 
 def _interrupted_facts(
@@ -214,7 +211,7 @@ def _interrupted_facts(
                 for item in context.work
             )
         )
-        effect_order = _effect_order(
+        effect_names = _effect_names(
             connection,
             run_id=context.run_id,
             sink_names_by_node_id=sink_names_by_node_id,
@@ -260,7 +257,7 @@ def _interrupted_facts(
         routes_by_source_row=routes,
         dispositions_by_source_row=dispositions,
         work_by_source_row=work_by_source_row,
-        sink_effect_order=effect_order,
+        sink_effect_names=effect_names,
         accepted_attempts=accepted_attempts,
         accepted_commit_attempt_id=str(pending_commit[0]["attempt_id"]),
         artifact_count=artifact_count,
@@ -323,7 +320,7 @@ def _final_facts(
                     for token_id, outcome, path, sink_name in outcomes
                 )
             )
-            sink_effect_order = _effect_order(
+            sink_effect_names = _effect_names(
                 connection,
                 run_id=str(evidence.runtime.run_id),
                 sink_names_by_node_id=sink_names_by_node_id,
@@ -389,7 +386,7 @@ def _final_facts(
     return ConditionalRouteFinalFacts(
         routes_by_source_row=routes,
         dispositions_by_source_row=dispositions,
-        sink_effect_order=sink_effect_order,
+        sink_effect_names=sink_effect_names,
         accepted_intent_reclassified_response_lost=accepted_intent_reclassified_response_lost,
         accepted_response_lost_attempt_id=str(accepted_response_lost_attempts[0]["attempt_id"]),
         accepted_commit_intent_count=accepted_commit_intent_count,

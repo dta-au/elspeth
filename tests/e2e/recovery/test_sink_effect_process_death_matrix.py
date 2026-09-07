@@ -24,6 +24,9 @@ from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
+from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
+from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
+from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
 from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
 from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
 from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
@@ -275,6 +278,13 @@ def _install_short_run_liveness() -> None:
     scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
+    # ADR-048 D8.5: the sink-effect verbs fence too, and every fence EXTENDS
+    # the seat it verifies. Leaving these three at the product window keeps the
+    # killed leader's seat alive past the test's patience, so the run never
+    # becomes resumable.
+    sink_effect_lifecycle_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
+    sink_effect_finalization_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
+    sink_effect_reservation_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
 
 
 def _run_to_sink_seam(

@@ -22,7 +22,7 @@ from elspeth.contracts.audit_export import (
     IterableBoundAuditExportContentReader,
     RegisteredAuditExportContent,
 )
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -52,6 +52,7 @@ from tests.fixtures.landscape import (
     expire_sink_effect_lease,
     insert_crashed_leader_seat,
     leader_coordination_token,
+    leader_token_for,
     register_test_node,
 )
 
@@ -190,6 +191,22 @@ def _insert_terminal_run(db: LandscapeDB, run_id: str = "run-export") -> None:
         insert_crashed_leader_seat(connection, run_id=run_id)
 
 
+def _export_seat(db: LandscapeDB, *, worker_id: str, run_id: str = "run-export") -> CoordinationToken:
+    """Take the export seat a direct ``execute_audit_export_effect`` acts under.
+
+    Production reaches that verb through ``resume_audit_export``, which claims
+    this same seat first (ADR-048 §4); a test that drives the verb directly
+    owes the same claim, so the token is read from the CAS rather than minted.
+    One seat covers a scenario's fault run and its re-drive: both act as the
+    same export worker.
+    """
+    return RecorderFactory(db).run_coordination.acquire_export_leadership(
+        run_id=run_id,
+        worker_id=worker_id,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    )
+
+
 def _config(**overrides: object) -> LandscapeExportSettings:
     config = LandscapeExportSettings(
         enabled=True,
@@ -242,7 +259,7 @@ def test_configured_total_limits_fail_before_content_store_or_registry_writes(
         with pytest.raises(ValueError, match=error):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(**overrides),
                 signing_key=None,
                 content_store=store,
@@ -293,7 +310,7 @@ def test_candidate_verification_reads_run_outside_the_write_transaction(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -331,7 +348,7 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="primary export failure"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -399,7 +416,7 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
         with caplog.at_level("ERROR"):
             snapshot = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -420,7 +437,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -432,7 +449,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         ):
             second = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -461,7 +478,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -469,7 +486,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -494,7 +511,7 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -523,7 +540,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         _insert_terminal_run(db)
         prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -537,7 +554,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         with pytest.raises(ValueError, match="single_export"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(
                     signing_mode="hmac_sha256",
                     signer_key_id="audit-key-v2",
@@ -567,7 +584,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=old_store,
@@ -575,7 +592,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=new_store,
@@ -589,7 +606,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         with pytest.raises(LookupError, match=r"audit-store-v1.*unresolvable"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=new_store,
@@ -618,9 +635,13 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -650,6 +671,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
                 sink_node_id=sink_node_id,
                 target_config={"path": "audit-export.json"},
                 worker_id="audit-export-worker",
+                coordination_token=export_token,
                 fault_hook=fail_once,
             )
 
@@ -675,6 +697,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
             sink_node_id=sink_node_id,
             target_config={"path": "audit-export.json"},
             worker_id="audit-export-worker",
+            coordination_token=export_token,
         )
 
         assert target.publication_count == 1
@@ -710,9 +733,13 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-json-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(
                 format="json",
                 signing_mode="hmac_sha256" if signed else "unsigned",
@@ -745,6 +772,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-json-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -759,6 +787,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-json-worker",
+            coordination_token=export_token,
         )
 
         assert output.read_bytes() == expected
@@ -781,9 +810,15 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): resume_audit_export CLAIMS the export
+        # seat first, and every export write then runs under it. Preparing under
+        # the CRASHED leader's token instead fences with that dead seat's own
+        # identity, and the fence's verify-and-extend then EXTENDS it — reviving
+        # the leader this scenario's takeover exists to depose.
+        export_token = _export_seat(db, worker_id="audit-export-csv-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=export_token,
             config=_config(format="csv"),
             signing_key=None,
             content_store=store,
@@ -814,6 +849,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-csv-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -828,6 +864,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-csv-worker",
+            coordination_token=export_token,
         )
 
         assert (target / _audit_export_bundle_effects.AUDIT_MANIFEST_NAME).read_bytes() == snapshot.reader.read_verified_signed_manifest()
@@ -997,9 +1034,17 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert poll_sleeps
         assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
         assert sum(poll_sleeps) <= lease_ttl.total_seconds() + 0.25
+        # Both resume attempts released the export seat on the way out
+        # (ADR-048 §4), so this re-derivation takes the seat the way a third
+        # export leader would rather than reading a vacant one back.
+        assertion_token = RecorderFactory(db).run_coordination.acquire_export_leadership(
+            run_id="run-export",
+            worker_id="audit-export-assertion-worker",
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        )
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=assertion_token,
             config=_config(),
             signing_key=None,
             content_store=store,

@@ -464,18 +464,18 @@ an over-broad requirement that the leader design never made.
 
 ### A1. The tree had ONE fence wearing two names
 
-Before this amendment there was no membership fence to build on. Two symbols
-looked like two fences and were one:
+Before this amendment there was no shared transaction-level membership fence.
+Heartbeat and departure already used active-membership UPDATE predicates, and
+scheduler claims used membership EXISTS predicates. The two shared transaction
+helpers both enforced leader authority:
 
 - `run_coordination_repository.py::fenced_leader_transaction` — the real fence.
 - `scheduler/fencing.py::fenced_write` — **a thin wrapper over it**, not an
   independent construct.
 
-The gate's `_TRUSTED_FENCE_QUALIFIED` and `_FENCED_CONTEXT_NAMES` list both
-names, and a reader of that list would reasonably conclude two independent
-fences already existed and that D4 was therefore already implemented. It was
-not. `fenced_member_transaction` is the **second** fence, and the first one that
-is not the leader epoch CAS under another name.
+`fenced_member_transaction` adds a shared membership transaction helper beside
+the leader helper. Scheduler claim/enqueue adoption remains subsequent work;
+this amendment does not certify that every D4 mutation path is migrated.
 
 ### A2. Option (A): a second owned type, not one type with two meanings
 
@@ -518,11 +518,20 @@ verify-UPDATE with the equivalent un-locked `SELECT` and running both forms:
 So the row lock is load-bearing and only the container suite can say so. Every
 membership-fence contention claim in this amendment rests on
 `tests/testcontainer/core/test_run_coordination_release_postgres.py`, repeated
-per race because a single green pass cannot be told from luck. Rowcount 0 rolls the whole transaction
-back and raises `RunMembershipLostError`, the sibling of `RunLeadershipLostError`,
+per race because a single green pass cannot be told from luck. On rowcount 0,
+the same transaction checks that the registration exists. An absent registration
+is `AuditIntegrityError`; an inactive registration rolls the transaction back
+and raises `RunMembershipLostError`, the sibling of `RunLeadershipLostError`,
 recording a `fence_refusal` event on a fresh connection exactly as the leader
 fence does. The refusal row carries `leader_epoch=NULL` — a member holds no epoch
 — and names the fence in its context so the ledger can tell the two apart.
+
+A refused heartbeat returns `WorkerMembershipLost`, an owned outcome without
+seat fields. The heartbeat thread latches membership loss without another
+database read. This closes elspeth-9c4f6c43a7: a failed read after an established
+refusal cannot turn known loss into an unknown heartbeat result. `RowProcessor`
+also checks both authority parameters nominally, so matching run and worker
+identities cannot substitute one token class for the other.
 
 ### A3. Scope table — all 90 APIs
 

@@ -276,6 +276,15 @@ class RunLifecycleCoordinator:
         """Finalize the run the token leads; the epoch fence is the terminal transaction's first statement."""
         factory.run_lifecycle.finalize_run(terminal_status, coordination_token=coordination_token)
 
+    def _delete_checkpoints_after_success(self, *, coordination_token: CoordinationToken) -> None:
+        """Purge the finalized run's resume anchors under the leader token (ADR-048 §3).
+
+        The delete is epoch-fenced (ADR-030 §C.4 row 5): a deposed leader
+        cannot destroy the new leader's checkpoints, and the token travels
+        here by value from the seat ``begin_run`` minted.
+        """
+        self._checkpoints.delete_checkpoints(coordination_token=coordination_token)
+
     def execute_export_phase(
         self,
         factory: RecorderFactory,
@@ -336,6 +345,7 @@ class RunLifecycleCoordinator:
                 audit_export_content_store=audit_export_content_store,
                 audit_export_content_store_resolver=audit_export_content_store_resolver,
                 worker_id=worker_id,
+                coordination_token=coordination_token,
             )
 
             factory.run_lifecycle.set_export_status(status=ExportStatus.COMPLETED, coordination_token=coordination_token)
@@ -461,10 +471,9 @@ class RunLifecycleCoordinator:
         # Record pre-flight results (deferred from bootstrap_and_run)
         self._record_preflight_results(factory, preflight_results, coordination_token=coordination_token)
 
-        # Thread the coordination token to the collaborators that step 4 of
-        # slice 2 fences (checkpoint writes, finalize, ceremonies): the
-        # token is carried by value, never re-read mid-run.
-        self._checkpoints.bind_coordination(coordination_token)
+        # The token reaches every fenced collaborator (checkpoint writes,
+        # finalize, ceremonies) as a parameter of the call that performs the
+        # write — carried by value, never re-read mid-run (ADR-048 §3).
 
         # ADR-030 §A.3 (slice 4): start the dedicated heartbeat thread AFTER
         # the seat is minted and the token is bound, BEFORE the run body's
@@ -554,7 +563,7 @@ class RunLifecycleCoordinator:
             # delete is epoch-fenced (ADR-030 §C.4 row 5), so it must run
             # BEFORE the seat release vacates the fence's CAS target.
             _check_combined_coordination_latch()
-            self._checkpoints.delete_checkpoints(run.run_id)
+            self._delete_checkpoints_after_success(coordination_token=coordination_token)
 
             # Emit telemetry AFTER Landscape finalize succeeds
             run_duration = time.perf_counter() - run_start_time

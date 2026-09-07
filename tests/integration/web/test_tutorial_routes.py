@@ -36,7 +36,11 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.integration.web.conftest import _make_session, _save_composition_state_with_compose_authority
+from tests.integration.web.conftest import (
+    _ensure_released_session_operation_fence,
+    _make_session,
+    _save_composition_state_with_compose_authority,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -318,6 +322,14 @@ def test_delete_orphans_soft_renames_only_pending_tutorial_sessions(tmp_path: Pa
     with app.state.session_engine.begin() as conn:
         _make_session(conn, session_id=str(orphan_id), user_id="alice", title="First-run tutorial (in progress)")
         _make_session(conn, session_id=str(keep_id), user_id="alice", title="ordinary session")
+    # Direct-SQL seeding writes sessions_table only; production's create_session
+    # mints a closed epoch-1 CREATE fence alongside it. Without that fence the
+    # sweep's COMPOSE lease raises SessionOperationFenceLost and every candidate
+    # is skipped, so the endpoint returns 200 with deleted_count 0. Backfill EVERY
+    # seeded session, not only the one under test: in production every session has
+    # a fence, and fencing only the subject would encode the wrong model.
+    for seeded in (orphan_id, keep_id):
+        _ensure_released_session_operation_fence(app.state.session_service, seeded)
     client = TestClient(app)
 
     response = client.delete("/api/tutorial/orphans")
@@ -342,6 +354,8 @@ def test_delete_orphans_never_touches_graduated_tutorial_session(tmp_path: Path)
         # Graduated title mirrors HELLO_WORLD_SESSION_TITLE in frontend copy.ts.
         _make_session(conn, session_id=str(graduated_id), user_id="alice", title="First-run tutorial")
         _make_session(conn, session_id=str(pending_id), user_id="alice", title="First-run tutorial (in progress)")
+    for seeded in (graduated_id, pending_id):
+        _ensure_released_session_operation_fence(app.state.session_service, seeded)
     # tutorial_completed_at is None for alice (no preferences row) — the
     # graduated session must be protected by its title, not by the flag.
     client = TestClient(app)
@@ -369,6 +383,8 @@ def test_delete_orphans_never_touches_the_resumable_tutorial_session(tmp_path: P
     with app.state.session_engine.begin() as conn:
         _make_session(conn, session_id=str(resumable_id), user_id="alice", title="First-run tutorial (in progress)")
         _make_session(conn, session_id=str(orphan_id), user_id="alice", title="First-run tutorial (in progress)")
+    for seeded in (resumable_id, orphan_id):
+        _ensure_released_session_operation_fence(app.state.session_service, seeded)
     asyncio.run(
         app.state.preferences_service.update_composer_preferences(
             "alice",

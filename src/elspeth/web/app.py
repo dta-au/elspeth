@@ -81,7 +81,12 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
-from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.identity_authority import (
+    IdentityRebound,
+    IdentityRetired,
+    RepositoryIdentityAuthority,
+    local_identity_retirer,
+)
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     web_instance_identity_from_settings,
@@ -1031,6 +1036,25 @@ def _build_local_auth_provider(
             reason=outcome.reason,
         )
 
+    def _record_rebound(event: IdentityRebound) -> None:
+        # R3 EXCLUDES LOCAL AUTH, so this cannot fire for this provider, and
+        # it is wired rather than stubbed for one reason: a no-op here would
+        # be the thing that silently swallows the audit row if the exclusion
+        # were ever narrowed. The recorder is real; the exclusion is what
+        # makes it unused.
+        #
+        # Why local is excluded (the authority carries the full reasoning):
+        # its subject IS the username, freeing a username RETIRES the identity
+        # so nothing is inherited, and a local user who changed their email
+        # address would otherwise lock themselves out on the next login.
+        audit_recorder.record_identity_rebound(
+            provider="local",
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            previous_email=event.previous_email,
+            current_email=event.current_email,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
@@ -1043,6 +1067,7 @@ def _build_local_auth_provider(
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
             record_admission=_record_admission,
+            record_rebound=_record_rebound,
         )
 
     issuer = SessionTokenIssuer(

@@ -326,3 +326,49 @@ async def test_the_spec_pin_a_fresh_store_and_one_listed_subject_walk_to_a_token
     assert [grant.role for grant in authority.active_roles(identity_id=identity_id)] == ["admin"]
     assert authority.count_active_human_admins() == 1
     assert [row.event_type for row in _auth_event_rows(settings)] == ["identity_activated", "role_granted", "quota_set"]
+
+
+# ── R3: the rebound refusal reaches the login path ───────────────────────
+
+
+def _identity_claims(subject: str, email: str):
+    from elspeth.web.auth.models import IdentityClaims
+
+    return IdentityClaims(provider="oidc", subject=subject, username=subject, display_name=None, email=email)
+
+
+def test_a_rebound_login_is_refused_at_the_wiring_and_writes_the_system_disable(tmp_path: Path, substrate) -> None:
+    """R3's seam: the authority writes the state, the wiring turns it into a refusal.
+
+    ``_upsert_identity`` is the ONLY place this can be raised -- the authority
+    cannot import the login errors -- so a rebound that never became an
+    ``SsoIdentityRebound`` would be a silently admitted login.
+    """
+    from elspeth.web.auth.sso import SsoIdentityRebound
+
+    engine, authority = substrate
+    idp = FakeIdP()
+    settings = _oidc_wired(tmp_path, idp)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    wiring = build_sso_wiring(settings, session_engine=engine, identity_authority=authority, resolved_state_mode="sqlite-single")
+    assert wiring is not None
+
+    admitted = wiring.upsert_identity(_identity_claims("ada", "ada@old.example"))
+    assert admitted.access_state == "pending"
+
+    with pytest.raises(SsoIdentityRebound) as refused:
+        wiring.upsert_identity(_identity_claims("ada", "ada@new.example"))
+
+    # The category is what the browser is sent and what the auth_failure row
+    # files the refusal under.
+    assert refused.value.category == "sso_identity_rebound"
+    # ...and the detail names neither address.
+    assert "@" not in refused.value.detail
+
+    disabled = [row for row in _auth_event_rows(settings) if row.event_type == "identity_disabled"]
+    assert len(disabled) == 1
+    assert disabled[0].identity_id == admitted.identity_id
+    assert disabled[0].outcome == "success"
+    # No request columns: the disable is the authority's act, not the
+    # request's. The refused login writes its own row with those.
+    assert disabled[0].request_id is None

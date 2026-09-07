@@ -33,7 +33,7 @@ from elspeth.contracts import (
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
-from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
+from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.identity import LineageFrame, innermost_own_frame, truncate_at_closer_frame
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -98,7 +98,6 @@ if TYPE_CHECKING:
     from elspeth.contracts import CommittedAggregationOutputReceipt, CommittedAggregationResidual, CommittedCoalesceResidual
     from elspeth.contracts.audit import Row as AuditRow
     from elspeth.contracts.audit import Token as AuditToken
-    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -726,6 +725,11 @@ class RowProcessor:
             barrier_key_for_item=self._barrier_key_for_blocked_item,
             create_work_item=self._work_items.create,
         )
+        if coordination_token is not None and not isinstance(coordination_token, CoordinationToken):
+            raise OrchestrationInvariantError(
+                "The coordination_token parameter requires a CoordinationToken: membership alone "
+                "cannot authorize leader maintenance or recovery."
+            )
         self._coordination_token = coordination_token
         self._member_token = member_token
         self._run_coordination = run_coordination
@@ -790,6 +794,11 @@ class RowProcessor:
                     "ProcessorMode.FOLLOWER requires a member_token: a follower's authority is its "
                     "WorkerMembershipToken (ADR-030 D4 membership fence), the value admit_follower "
                     "returned. A follower without one cannot present membership to any fenced verb."
+                )
+            if not isinstance(member_token, WorkerMembershipToken):
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires a WorkerMembershipToken: matching run and worker "
+                    "identities do not make a leader token membership authority."
                 )
             if member_token.run_id != run_id or member_token.worker_id != self._scheduler_lease_owner:
                 raise OrchestrationInvariantError(

@@ -965,7 +965,8 @@ class TestInterruptAndResume:
         # A checkpoint exists (as it would under every_row checkpointing) —
         # the arm this test pins is "incomplete_sources", not "no_checkpoint".
         CheckpointManager(setup.db).create_checkpoint(
-            draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash="a" * 64)
+            draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash="a" * 64),
+            coordination_token=setup.coordination_token,
         )
 
         # The source lifecycle is INTERRUPTED — mirroring a shutdown mid-load

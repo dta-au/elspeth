@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import PendingOutcome, TokenInfo
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
@@ -601,6 +602,7 @@ def test_flush_threads_live_coordination_worker_into_sink_effects() -> None:
             sink_id_map={},
             edge_map={},
             interrupted_by_shutdown=False,
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:process-unique", leader_epoch=1),
         )
 
     assert write_pending.call_args.kwargs["worker_id"] == "worker:run-1:process-unique"

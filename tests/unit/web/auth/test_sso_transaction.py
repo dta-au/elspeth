@@ -257,10 +257,14 @@ def test_the_challenge_is_s256_and_not_the_verifier() -> None:
 def test_every_failure_category_is_distinct() -> None:
     """Two categories collapsing would merge two different diagnoses.
 
-    Twelve is the spec's count (§Failure categories [rev2]): eleven ``sso_*``
-    refusals plus ``provider_unavailable``.
+    Thirteen: twelve ``sso_*`` refusals plus ``provider_unavailable``. The
+    spec's own list (§Failure categories [rev2]) was eleven ``sso_*`` until
+    R3 landed and added ``sso_identity_rebound``, which is deliberately NOT
+    ``sso_identity_disabled``: in R5's carve-out the identity is not disabled
+    at all, and collapsing the two would tell the last active human admin
+    their account was disabled when it was not.
     """
-    assert len(SSO_FAILURE_CATEGORIES) == 12
+    assert len(SSO_FAILURE_CATEGORIES) == 13
 
 
 def test_categories_are_carried_by_TYPE_not_message_prefix() -> None:

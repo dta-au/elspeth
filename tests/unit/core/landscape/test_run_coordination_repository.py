@@ -40,7 +40,7 @@ from sqlalchemy import create_engine, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -893,8 +893,7 @@ class TestRegistryVerbs:
         events_before = _events(engine)
         snapshot = repo.worker_heartbeat(member_token=deposed.membership, window_seconds=WINDOW)
 
-        assert snapshot.worker_active is False  # the coordination-lost latch signal
-        assert snapshot.leader_worker_id == usurper  # foreign leader: fatal for a leader-mode process
+        assert snapshot == WorkerMembershipLost(member_token=deposed.membership)
         # The takeover evicted the deposed leader's row, so its beat is a
         # membership-fence refusal: one evidence row, leader_epoch NULL.
         refusals = _events(engine)[len(events_before) :]
@@ -936,15 +935,15 @@ class TestRegistryVerbs:
         assert len(departs) == 1
         departed_row = _worker_row(engine, follower)
 
-        # Idempotent by fence: a departed identity and a never-registered one
-        # are both refused by the membership verify-UPDATE — zero mutation,
-        # one fence_refusal evidence row each, no second worker_depart.
+        # A repeat departure is refused without another transition; an unknown
+        # identity is corruption because membership tokens require registration.
         repo.depart_worker(member_token=member)
-        repo.depart_worker(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker:ghost:0"))
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            repo.depart_worker(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker:ghost:0"))
         assert _worker_row(engine, follower) == departed_row
         assert len([e for e in _events(engine) if e["event_type"] == "worker_depart"]) == 1
         refusals = [e for e in _events(engine) if e["event_type"] == "fence_refusal"]
-        assert [(e["worker_id"], e["leader_epoch"]) for e in refusals] == [(follower, None), ("worker:ghost:0", None)]
+        assert [(e["worker_id"], e["leader_epoch"]) for e in refusals] == [(follower, None)]
         assert {json.loads(str(e["context_json"]))["verb"] for e in refusals} == {"depart_worker"}
 
     def test_evict_worker_grace_predicate_and_fence(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
@@ -1145,7 +1144,7 @@ class TestRunCoordinationTruthTables:
             window_seconds=WINDOW,
         )
 
-        assert snapshot.worker_active is False
+        assert snapshot == WorkerMembershipLost(member_token=follower)
         # Zero mutation: the only delta is the membership fence's own refusal
         # evidence (one fence_refusal row, leader_epoch NULL, fence named).
         after = _coordination_image(engine)

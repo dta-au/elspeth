@@ -5,6 +5,13 @@ Extracted from Orchestrator (core.py) — these methods own:
 - ``_active_graph``: the current ExecutionGraph (late-bound at fire time)
 - ``_checkpoint_manager``: persists checkpoints to the database
 - ``_checkpoint_config``: determines whether/how often to checkpoint
+
+ADR-048 §3: the leader ``CoordinationToken`` reaches every checkpoint write as
+a PARAMETER of the call that performs it, carried by value from the seat mint
+(``begin_run`` / ``acquire_run_leadership``) through the orchestrator's drain
+and flush collaborators. The coordinator holds no token of its own, so no
+write can run under a token bound earlier for a different run or epoch. The
+run a checkpoint belongs to is ``coordination_token.run_id`` (ADR-048 §2).
 """
 
 from __future__ import annotations
@@ -12,13 +19,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import CheckpointDraft
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 
 if TYPE_CHECKING:
     from elspeth.contracts.barrier_scalars import BarrierScalars
     from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.identity import TokenInfo
     from elspeth.core.checkpoint import CheckpointManager
     from elspeth.core.dag import ExecutionGraph
@@ -43,23 +50,10 @@ class CheckpointCoordinator:
         self._checkpoint_config = checkpoint_config
         self._sequence_number = 0
         self._active_graph: ExecutionGraph | None = None  # relocated from Orchestrator._current_graph; late-bound at fire time
-        # ADR-030 leader fencing token; bound at run/resume start and
-        # threaded into every CheckpointManager write so the checkpoint
-        # INSERT/DELETE carries the verify-and-extend epoch fence.
-        self._coordination_token: CoordinationToken | None = None
 
     def set_active_graph(self, graph: ExecutionGraph | None) -> None:
         """Set (or clear) the active execution graph for late-bound checkpoint calls."""
         self._active_graph = graph
-
-    def bind_coordination(self, token: CoordinationToken | None) -> None:
-        """Bind (or clear) the leader fencing token for this run's checkpoint writes.
-
-        Called once at run/resume start with the token minted by
-        ``begin_run`` / ``acquire_run_leadership``. The token is carried by
-        value and never re-read mid-run (ADR-030 §G).
-        """
-        self._coordination_token = token
 
     def _checkpoint_gate(self, *, action: str) -> tuple[RuntimeCheckpointConfig, CheckpointManager, ExecutionGraph] | None:
         """Shared enabled/manager/graph precondition gate for checkpoint writes.
@@ -78,42 +72,17 @@ class CheckpointCoordinator:
             raise OrchestrationInvariantError(f"Cannot create {action}: execution graph not available")
         return self._checkpoint_config, self._checkpoint_manager, self._active_graph
 
-    def _require_fence(self, run_id: str) -> CoordinationToken:
-        """Fail closed unless a leader token bound to THIS run is held.
-
-        ADR-030 defense-in-depth (elspeth-fab455790d): checkpoint create and
-        delete are leader-only writes. A missing token would fall through to
-        CheckpointManager's unfenced plain-write arm (a deliberate seam for
-        direct repository/test/tooling callers, NOT the coordinator runtime
-        path); a token minted for a different run would fence against the
-        wrong run's epoch seat. Both are wiring bugs and must crash before
-        any manager call. Callers invoke this AFTER their enabled/manager
-        gate so disabled-checkpointing runs stay token-free.
-        """
-        token = self._coordination_token
-        if token is None:
-            raise OrchestrationInvariantError(
-                f"Checkpoint write for run {run_id!r} attempted with no bound leader token; "
-                "bind_coordination must run at run/resume start before any checkpoint write (ADR-030)."
-            )
-        if token.run_id != run_id:
-            raise OrchestrationInvariantError(
-                f"Checkpoint write for run {run_id!r} attempted under a leader token for run "
-                f"{token.run_id!r}; the coordinator's bound token must belong to the run being written (ADR-030)."
-            )
-        return token
-
     def _build_checkpoint_draft(
         self,
         *,
-        run_id: str,
+        coordination_token: CoordinationToken,
         sequence_number: int,
         barrier_scalars: BarrierScalars | None,
         graph: ExecutionGraph,
     ) -> CheckpointDraft:
         """Build persistence-ready checkpoint data at the topology boundary."""
         return CheckpointDraft(
-            run_id=run_id,
+            run_id=coordination_token.run_id,
             sequence_number=sequence_number,
             barrier_scalars=barrier_scalars,
             upstream_topology_hash=CheckpointCompatibilityValidator().compute_full_topology_hash(graph),
@@ -127,7 +96,7 @@ class CheckpointCoordinator:
         """Continue checkpoint ordering from a previously persisted checkpoint."""
         self._sequence_number = sequence_number
 
-    def checkpoint_run_start(self, run_id: str) -> None:
+    def checkpoint_run_start(self, *, coordination_token: CoordinationToken) -> None:
         """Write the sequence-0 run-start checkpoint (F1 design D4).
 
         Called once per fresh run, before source iteration. Every
@@ -150,22 +119,21 @@ class CheckpointCoordinator:
         if gate is None:
             return
         _config, manager, graph = gate
-        token = self._require_fence(run_id)
 
         manager.create_checkpoint(
             draft=self._build_checkpoint_draft(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 sequence_number=0,
                 barrier_scalars=None,
                 graph=graph,
             ),
-            coordination_token=token,
+            coordination_token=coordination_token,
         )
 
     def maybe_checkpoint(
         self,
-        run_id: str,
         *,
+        coordination_token: CoordinationToken,
         barrier_scalars: BarrierScalars | None,
     ) -> None:
         """Create checkpoint if configured.
@@ -178,7 +146,8 @@ class CheckpointCoordinator:
         actual durable output, not just processing completion.
 
         Args:
-            run_id: Current run ID
+            coordination_token: The run's current leader token; the run
+                being checkpointed is ``coordination_token.run_id``.
             barrier_scalars: Composed barrier scalars from the live executors
                 (``processor.get_barrier_scalars()``, F1 Task 2.4). Passed to
                 ``create_checkpoint`` unconditionally — the manager serializes
@@ -191,9 +160,6 @@ class CheckpointCoordinator:
         if gate is None:
             return
         config, manager, graph = gate
-        # Before the sequence increment: every-N runs fail closed even on
-        # rows the frequency gate would skip.
-        token = self._require_fence(run_id)
 
         self._sequence_number += 1
 
@@ -218,18 +184,19 @@ class CheckpointCoordinator:
         if should_checkpoint:
             manager.create_checkpoint(
                 draft=self._build_checkpoint_draft(
-                    run_id=run_id,
+                    coordination_token=coordination_token,
                     sequence_number=self._sequence_number,
                     barrier_scalars=barrier_scalars,
                     graph=graph,
                 ),
-                coordination_token=token,
+                coordination_token=coordination_token,
             )
 
     def make_checkpoint_after_sink_factory(
         self,
-        run_id: str,
         barrier_scalars_source: BarrierScalarsSource,
+        *,
+        coordination_token: CoordinationToken,
     ) -> _CheckpointFactory:
         """Create a per-sink checkpoint-PROGRESS callback factory.
 
@@ -239,6 +206,10 @@ class CheckpointCoordinator:
         share this callback but is now a separate lifecycle composed at the
         sink-write call site (``SinkFlushCoordinator.flush_and_write_sinks``,
         elspeth-107a29d02e). Used by both the normal execution path and resume.
+
+        The leader token is captured by value at factory construction: every
+        progress checkpoint the callbacks write runs under the seat the
+        caller holds, never one re-read later (ADR-030 §G).
 
         Depends on the narrow :class:`BarrierScalarsSource` slice of the
         processor rather than the broad ``RowProcessorHandle``.
@@ -262,7 +233,7 @@ class CheckpointCoordinator:
                 # only consumed by the terminalization lifecycle, now split out).
                 del token
                 coordinator.maybe_checkpoint(
-                    run_id=run_id,
+                    coordination_token=coordination_token,
                     barrier_scalars=barrier_scalars_source.get_barrier_scalars(),
                 )
 
@@ -281,8 +252,9 @@ class CheckpointCoordinator:
 
     def checkpoint_interrupted_progress(
         self,
-        run_id: str,
         loop_ctx: LoopContext,
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
         """Persist a resumable checkpoint for graceful shutdown.
 
@@ -296,25 +268,26 @@ class CheckpointCoordinator:
         if gate is None:
             return
         _config, manager, graph = gate
-        token = self._require_fence(run_id)
 
         self._sequence_number += 1
         manager.create_checkpoint(
             draft=self._build_checkpoint_draft(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 sequence_number=self._sequence_number,
                 barrier_scalars=loop_ctx.processor.get_barrier_scalars(),
                 graph=graph,
             ),
-            coordination_token=token,
+            coordination_token=coordination_token,
         )
 
-    def delete_checkpoints(self, run_id: str) -> None:
-        """Delete all checkpoints for a run after successful completion.
+    def delete_checkpoints(self, *, coordination_token: CoordinationToken) -> None:
+        """Delete all checkpoints of the run the token leads, after successful completion.
 
-        Args:
-            run_id: Run to clean up checkpoints for
+        LEADER WORK (ADR-030 §C.4 row 5): the delete is epoch-fenced, so the
+        caller must run it BEFORE the seat release vacates the fence's CAS
+        target. ``delete`` has no ``_checkpoint_gate`` by design — a run whose
+        checkpointing was disabled mid-way still cleans up what it wrote — so
+        only the manager-None arm short-circuits.
         """
         if self._checkpoint_manager is not None:
-            token = self._require_fence(run_id)
-            self._checkpoint_manager.delete_checkpoints(run_id, coordination_token=token)
+            self._checkpoint_manager.delete_checkpoints(coordination_token=coordination_token)

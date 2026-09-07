@@ -68,7 +68,7 @@ def test_route_reopens_and_resumes_after_first_accepted_sink_boundary(
         (1, "pending_sink", "accepted", "live"),
         (2, "pending_sink", "accepted", "live"),
     )
-    assert interrupted.sink_effect_order == ("accepted",)
+    assert interrupted.sink_effect_names == ("accepted",)
     assert interrupted.accepted_attempts == (
         ("inspect", "returned"),
         ("reconcile", "returned"),
@@ -168,7 +168,7 @@ def test_route_reopens_and_resumes_after_first_accepted_sink_boundary(
     final = result.final
     assert final.routes_by_source_row == interrupted.routes_by_source_row
     assert final.dispositions_by_source_row == interrupted.dispositions_by_source_row
-    assert final.sink_effect_order == ("accepted", "rejected")
+    assert final.sink_effect_names == ("accepted", "rejected")
     assert final.accepted_intent_reclassified_response_lost is True
     assert final.accepted_response_lost_attempt_id == interrupted.accepted_commit_attempt_id
     assert final.accepted_commit_intent_count == 0

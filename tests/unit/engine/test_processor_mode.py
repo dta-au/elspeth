@@ -35,7 +35,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import RowResult
-from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL
 from elspeth.engine.scheduler_drain import ProcessorMode
@@ -218,6 +218,18 @@ def test_follower_mode_with_foreign_member_token_refuses_construction() -> None:
         _construct(setup, clock, member_token=WorkerMembershipToken(run_id="another-run", worker_id=FOLLOWER_OWNER))
 
 
+def test_follower_mode_rejects_leader_authority_in_member_parameter() -> None:
+    """Matching identities cannot turn a leader token into membership authority."""
+    _follower, _spy, setup, clock = _build(lease_owner=FOLLOWER_OWNER, mode=ProcessorMode.FOLLOWER)
+
+    with pytest.raises(OrchestrationInvariantError, match="requires a WorkerMembershipToken"):
+        _construct(
+            setup,
+            clock,
+            member_token=CoordinationToken(run_id=setup.run_id, worker_id=FOLLOWER_OWNER, leader_epoch=1),
+        )
+
+
 def test_leader_mode_with_member_token_refuses_construction() -> None:
     """The other half of the type split: a leader derives membership, never carries it.
 
@@ -234,6 +246,21 @@ def test_leader_mode_with_member_token_refuses_construction() -> None:
             mode=ProcessorMode.LEADER,
             scheduler_lease_owner=LEADER_OWNER,
             member_token=WorkerMembershipToken(run_id=setup.run_id, worker_id=LEADER_OWNER),
+        )
+
+
+def test_leader_mode_rejects_membership_in_coordination_parameter() -> None:
+    """Membership cannot authorize the leader's maintenance and recovery verbs."""
+    _leader, _spy, setup, clock = _build(lease_owner=LEADER_OWNER, mode=ProcessorMode.LEADER)
+
+    with pytest.raises(OrchestrationInvariantError, match="requires a CoordinationToken"):
+        _construct(
+            setup,
+            clock,
+            mode=ProcessorMode.LEADER,
+            scheduler_lease_owner=LEADER_OWNER,
+            member_token=None,
+            coordination_token=WorkerMembershipToken(run_id=setup.run_id, worker_id=LEADER_OWNER),
         )
 
 

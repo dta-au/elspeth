@@ -13,7 +13,7 @@ communicates through :class:`threading.Event` flags:
   membership row may already be departed, preventing shutdown from
   misclassifying that clean departure as eviction.
 - ``_coordination_lost_event``: set by the thread when ``worker_heartbeat``
-  returns ``worker_active=False`` (this worker's registry row left ``active``)
+    returns ``WorkerMembershipLost`` (this worker's registry row left ``active``)
   OR when the snapshot's ``leader_worker_id`` differs from our own worker_id
   (deposed — another process took the seat). The drain loop raises
   :class:`~elspeth.contracts.errors.RunWorkerEvictedError` at the next
@@ -63,6 +63,8 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationSnapshot,
+    WorkerMembershipLost,
     WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
@@ -77,23 +79,12 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DEGRADED_THRESHOLD: int = 3
 
 
-class _HeartbeatSnapshot(Protocol):
-    """Snapshot fields consumed by the heartbeat thread."""
-
-    @property
-    def leader_worker_id(self) -> str | None: ...
-
-    @property
-    def worker_active(self) -> bool: ...
-
-    @property
-    def worker_role(self) -> str: ...
-
-
 class _HeartbeatRepository(Protocol):
     """Repository operations required by ``RunHeartbeatThread``."""
 
-    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> _HeartbeatSnapshot: ...
+    def worker_heartbeat(
+        self, *, member_token: WorkerMembershipToken, window_seconds: float
+    ) -> CoordinationSnapshot | WorkerMembershipLost: ...
 
     def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None: ...
 
@@ -234,7 +225,7 @@ class RunHeartbeatThread:
         1. Fatal-integrity latch — a Tier-1 error captured by the beat thread
            (e.g. ``AuditIntegrityError`` for a vanished registry row) is
            re-raised verbatim; audit corruption outranks eviction semantics.
-        2. Coordination-lost latch — ``worker_active=False`` or seat
+        2. Coordination-lost latch — ``WorkerMembershipLost`` or seat
            deposition raises
            :class:`~elspeth.contracts.errors.RunWorkerEvictedError`.
         """
@@ -273,13 +264,13 @@ class RunHeartbeatThread:
         Outcomes:
         1. ``worker_active=True``, and (if leader) snapshot
            ``leader_worker_id==our_id`` → healthy; reset busy counter.
-        2. ``worker_active=False`` (the membership fence refused this beat —
+        2. ``WorkerMembershipLost`` (the membership fence refused this beat —
            ADR-030 D4; the repository returns the refusal as this declared
            outcome) → coordination lost; latch the flag.
            For a LEADER ONLY: foreign ``leader_worker_id`` (deposed) also
            latches.  A follower seeing a foreign leader is the NORMAL case
            (the follower is never the leader); follower deposed-latch is
-           triggered only by ``worker_active=False`` (eviction/departure).
+           triggered only by ``WorkerMembershipLost`` (eviction/departure).
         3. ``TIER_1_ERRORS`` (audit-integrity / framework invariant, e.g. a
            vanished registry row) → corruption, not contention: latch the
            exception for ``check_and_raise()`` to re-raise at the next drain
@@ -307,7 +298,7 @@ class RunHeartbeatThread:
             # Applies to BOTH leaders and followers: if the run_workers row is
             # no longer active the worker must stop (evicted by leader, or
             # departed at finalize).
-            if not snapshot.worker_active:
+            if isinstance(snapshot, WorkerMembershipLost):
                 logger.warning(
                     "run_heartbeat: worker %r row left 'active' in run %r (evicted or departed)",
                     self._token.worker_id,

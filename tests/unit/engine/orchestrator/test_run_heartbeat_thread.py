@@ -21,8 +21,8 @@ Tests cover:
    ``worker_heartbeat`` returning ``worker_active=True`` but
    ``leader_worker_id != our_id`` sets ``_coordination_lost_event`` and
    ``check_and_raise()`` raises ``RunWorkerEvictedError``.
-5. **Fatal latch set when worker_active=False** — ``worker_heartbeat``
-   returning ``worker_active=False`` sets the latch.
+5. **Fatal latch set on membership loss** — ``worker_heartbeat``
+   returning ``WorkerMembershipLost`` sets the latch.
 6. **Clean start/join lifecycle** — start() + step_beat() (healthy) +
    stop() completes without leaking threads; the thread is a daemon so it
    does not prevent process exit, but stop() must join it within the test.
@@ -42,6 +42,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
+    WorkerMembershipLost,
     WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
@@ -55,7 +56,7 @@ from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 class _StubRepo:
     """Minimal stub of RunCoordinationRepository for heartbeat unit tests.
 
-    Configurable via ``snapshot`` (the next CoordinationSnapshot to return),
+    Configurable via ``snapshot`` (the next heartbeat outcome to return),
     ``side_effect`` (raise this exception from worker_heartbeat instead),
     ``side_effects`` (per-call sequence that overrides both), and
     ``degraded_exception`` (raise this from record_heartbeat_degraded).
@@ -63,15 +64,17 @@ class _StubRepo:
     """
 
     def __init__(self) -> None:
-        self.snapshot: CoordinationSnapshot | None = None
+        self.snapshot: CoordinationSnapshot | WorkerMembershipLost | None = None
         self.side_effect: Exception | None = None
-        self.side_effects: list[CoordinationSnapshot | Exception] = []
+        self.side_effects: list[CoordinationSnapshot | WorkerMembershipLost | Exception] = []
         self.degraded_exception: Exception | None = None
 
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
         self.record_heartbeat_degraded_calls: list[dict[str, Any]] = []
 
-    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
+    def worker_heartbeat(
+        self, *, member_token: WorkerMembershipToken, window_seconds: float
+    ) -> CoordinationSnapshot | WorkerMembershipLost:
         self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         if self.side_effects:
             result = self.side_effects.pop(0)
@@ -108,13 +111,8 @@ _HEALTHY_SNAPSHOT = CoordinationSnapshot(
     worker_active=True,
 )
 
-# Evicted snapshot: our registry row left 'active'.
-_EVICTED_SNAPSHOT = CoordinationSnapshot(
-    leader_worker_id=_WORKER_ID,
-    leader_epoch=1,
-    seat_live=True,
-    worker_active=False,
-)
+# Refused heartbeat: our registry row left 'active', with no seat observation.
+_EVICTED_OUTCOME = WorkerMembershipLost(member_token=_TOKEN)
 
 # Deposed snapshot: another worker took the seat (our row still active).
 _DEPOSED_SNAPSHOT = CoordinationSnapshot(
@@ -123,6 +121,17 @@ _DEPOSED_SNAPSHOT = CoordinationSnapshot(
     seat_live=True,
     worker_active=True,
 )
+
+
+def test_snapshot_rejects_inactive_membership() -> None:
+    """Inactive membership must use the refusal outcome, never a seat snapshot."""
+    with pytest.raises(ValueError, match="WorkerMembershipLost"):
+        CoordinationSnapshot(
+            leader_worker_id=_WORKER_ID,
+            leader_epoch=1,
+            seat_live=True,
+            worker_active=False,
+        )
 
 
 def _make_thread(
@@ -460,15 +469,15 @@ class TestFatalLatchForeignLeader:
 
 
 # ---------------------------------------------------------------------------
-# 5. Fatal latch: worker_active=False (evicted or departed)
+# 5. Fatal latch: membership lost (evicted or departed)
 # ---------------------------------------------------------------------------
 
 
 class TestFatalLatchEvicted:
     def test_worker_inactive_sets_latch(self) -> None:
-        """worker_active=False latches coordination_lost."""
+        """WorkerMembershipLost latches coordination_lost without snapshot fields."""
         repo = _StubRepo()
-        repo.snapshot = _EVICTED_SNAPSHOT
+        repo.snapshot = _EVICTED_OUTCOME
 
         thread = _make_thread(repo)
         thread._step_beat()
@@ -478,7 +487,7 @@ class TestFatalLatchEvicted:
     def test_check_and_raise_raises_after_eviction(self) -> None:
         """check_and_raise() raises RunWorkerEvictedError when evicted."""
         repo = _StubRepo()
-        repo.snapshot = _EVICTED_SNAPSHOT
+        repo.snapshot = _EVICTED_OUTCOME
 
         thread = _make_thread(repo)
         thread._step_beat()
@@ -534,7 +543,7 @@ class TestLifecycle:
     def test_stop_can_skip_final_beat_for_known_terminal_exit(self) -> None:
         """A caller that observed terminal state can stop without re-beating a departed row."""
         repo = _StubRepo()
-        repo.snapshot = _EVICTED_SNAPSHOT
+        repo.snapshot = _EVICTED_OUTCOME
         thread_obj = RunHeartbeatThread(
             repo,
             member_token=_TOKEN,
@@ -651,17 +660,11 @@ class TestFollowerHeartbeatRoleGating:
         thread.check_and_raise()  # must not raise
 
     def test_follower_eviction_does_latch(self) -> None:
-        """worker_role='follower' + worker_active=False → latch set (evicted)."""
+        """Membership loss latches a follower without reading any role field."""
         follower_worker_id = f"worker:{_RUN_ID}:follower-xyz"
         follower_token = WorkerMembershipToken(run_id=_RUN_ID, worker_id=follower_worker_id)
         repo = _StubRepo()
-        repo.snapshot = CoordinationSnapshot(
-            leader_worker_id="worker:some-run:the-leader",
-            leader_epoch=1,
-            seat_live=True,
-            worker_active=False,  # our row left 'active' (evicted or departed)
-            worker_role="follower",
-        )
+        repo.snapshot = WorkerMembershipLost(member_token=follower_token)
 
         thread = RunHeartbeatThread(
             repo,

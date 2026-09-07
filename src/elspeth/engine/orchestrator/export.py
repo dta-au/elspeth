@@ -132,10 +132,15 @@ def export_landscape(
     audit_export_content_store: AuditExportContentStore,
     audit_export_content_store_resolver: AuditExportContentStoreResolver,
     worker_id: str,
+    coordination_token: CoordinationToken,
     prepared_binding: SinkEffectRuntimeBinding | None = None,
     sink_effect_admission: object | None = None,
 ) -> None:
     """Export audit trail to configured sink after run completion.
+
+    ``coordination_token`` is the seat the caller holds on ``run_id`` — the
+    run's leader token from the export phase, or the export seat a resume
+    takes (ADR-048 §4) — and every durable sink-effect write fences on it.
 
     For JSON format: writes all records to a single sink (records are
     heterogeneous but JSON handles that naturally).
@@ -163,6 +168,11 @@ def export_landscape(
 
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
+    # ADR-048 §2: the snapshot registry write is fenced against the seat this
+    # token names, so a run_id that is not the token's run would fence one run
+    # and write another. Fail closed before any export effect.
+    if run_id != coordination_token.run_id:
+        raise ValueError(f"audit export for run {run_id!r} attempted under a leader token for run {coordination_token.run_id!r}")
 
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
@@ -215,7 +225,7 @@ def export_landscape(
 
     snapshot = prepare_audit_export_snapshot(
         db,
-        run_id=run_id,
+        coordination_token=coordination_token,
         config=export_config,
         signing_key=signing_key,
         content_store=audit_export_content_store,
@@ -282,6 +292,7 @@ def export_landscape(
             sink_node_id=sink.node_id,
             target_config=dict(settings.sinks[sink_name].options),
             worker_id=worker_id,
+            coordination_token=coordination_token,
         )
     finally:
         sink.close()
@@ -445,6 +456,7 @@ def _resume_audit_export_led(
             audit_export_content_store=audit_export_content_store,
             audit_export_content_store_resolver=audit_export_content_store_resolver,
             worker_id=coordination_token.worker_id,
+            coordination_token=coordination_token,
         )
     except Exception as export_error:
         from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld

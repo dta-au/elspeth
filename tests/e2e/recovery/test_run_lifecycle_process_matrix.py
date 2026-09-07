@@ -88,7 +88,8 @@ def _build_open_effect_run(
         )
         if with_checkpoint:
             CheckpointManager(db).create_checkpoint(
-                draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH)
+                draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH),
+                coordination_token=leader_coordination_token(factory, run_id),
             )
         _row, token = factory.data_flow.create_row_with_token(
             run_id,
@@ -109,7 +110,10 @@ def _build_open_effect_run(
             factory,
             (SinkEffectMemberCandidate(token_id=token.token_id, row={"value": 1}),),
         )
-        effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members)).new_effect
+        effect = factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, members),
+            coordination_token=leader_coordination_token(factory, run_id),
+        ).new_effect
         assert effect is not None
         operation = next(item for item in factory.execution.get_operations_for_run(run_id) if item.sink_effect_id == effect.effect_id)
         return token.token_id, operation.operation_id
@@ -241,7 +245,10 @@ def test_public_resume_refuses_non_resumable_failed_effect_without_reopening_or_
         crashed.factory,
         (SinkEffectMemberCandidate(token_id=token.token_id, row={"id": 50_000, "value": 1}),),
     )
-    effect = crashed.factory.execution.sink_effects.reserve(_pipeline_request(crashed.run_id, sink_node_id, members)).new_effect
+    effect = crashed.factory.execution.sink_effects.reserve(
+        _pipeline_request(crashed.run_id, sink_node_id, members),
+        coordination_token=leader_coordination_token(crashed.factory, crashed.run_id),
+    ).new_effect
     assert effect is not None
     operation = next(
         item for item in crashed.factory.execution.get_operations_for_run(crashed.run_id) if item.sink_effect_id == effect.effect_id

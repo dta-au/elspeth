@@ -17,7 +17,13 @@ from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.state_engine import capture_state_engine_image
 
-from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.coordination import (
+    CoordinationSnapshot,
+    CoordinationToken,
+    WorkerMembershipLost,
+    WorkerMembershipToken,
+    mint_worker_id,
+)
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -429,9 +435,7 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
             window_seconds=30,
         )
 
-        assert snapshot.worker_active is False
-        assert snapshot.worker_role == "follower"
-        assert snapshot.leader_worker_id == leader_id
+        assert snapshot == WorkerMembershipLost(member_token=follower)
         # Zero mutation on PostgreSQL too: the departed row and the seat are
         # byte-identical; the only new row is the membership fence's refusal
         # evidence (leader_epoch NULL — a member holds no epoch).
@@ -773,8 +777,9 @@ def test_postgresql_heartbeat_racing_depart_never_leaves_a_departed_member_live(
             # active and leaves no refusal; a beat that fenced after the commit
             # is refused and leaves exactly one. Both are correct; a beat that
             # reported active AFTER the departure committed would be neither.
-            assert isinstance(beat, CoordinationSnapshot), f"heartbeat returned {beat!r}"
-            if beat.worker_active:
+            if isinstance(beat, CoordinationSnapshot):
+                assert beat.worker_active
                 assert beat_refusals == [], "a beat that won the lock must not also record a refusal"
             else:
+                assert beat == WorkerMembershipLost(member_token=member)
                 assert len(beat_refusals) == 1, "a refused beat records exactly one fence_refusal"

@@ -3072,9 +3072,22 @@ Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secret
 # and do NOT touch this row; this is exclusively account-level preference
 # state.
 #
-# ``user_id`` is opaque and matches ``sessions_table.user_id``. No FK is
-# declared because auth providers vary across deployments and there is no
-# canonical users table in the session DB to reference.
+# ``user_id`` holds an ``identities.identity_id`` (the D6 ownership re-key;
+# ``routes.py`` writes ``user_id=identity.identity_id`` and the session token's
+# ``sub`` is that same id) and matches ``sessions_table.user_id``.
+#
+# No FK is declared, and the reason is COST, not impossibility. The original
+# reason recorded here — "auth providers vary across deployments and there is
+# no canonical users table in the session DB to reference" — was true when it
+# was written and was invalidated by this very epoch, which created
+# ``identities_table`` on this same ``metadata``. An FK is therefore available.
+# It is deferred because adding one to three tables is a TABLE SHAPE change,
+# and shape changes cost a one-way pre-1.0 epoch window under the
+# delete-the-old-DB migration policy; it must ride a window already being paid
+# for rather than opening one alone. Tracked as elspeth-2371269e07.
+#
+# Do not restore the old justification: a reader who takes it at face value
+# concludes no FK is possible, which is no longer true.
 #
 # CLOSED-LIST default_composer_mode. Permitted values are exactly
 # {"guided", "freeform"} — enforced at the Tier-3 boundary by Pydantic

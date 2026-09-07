@@ -28,6 +28,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts import CallType, Determinism, NodeType
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
@@ -160,12 +161,28 @@ _TEST_AUDIT_CONTENT_STORE_RESOLVER = AuditExportContentStoreResolver()
 _TEST_AUDIT_CONTENT_STORE_RESOLVER.register(_TEST_AUDIT_CONTENT_STORE)
 
 
+def _export_seat_token(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CoordinationToken:
+    """The export seat these scenarios act under (ADR-048 §4).
+
+    Constructed rather than read back from the seat, deliberately: this module
+    drives ``export_landscape`` against resource doubles with no Landscape
+    behind them — several scenarios pass ``object()`` as the database — so
+    there is no ``run_coordination`` row a read-back could return. The real
+    seat is covered where a real one exists, by
+    ``tests/integration/pipeline/test_audit_export_effect_recovery.py`` and the
+    e2e export suites.
+    """
+    run_id = kwargs["run_id"] if "run_id" in kwargs else args[1]
+    return CoordinationToken(run_id=run_id, worker_id=kwargs["worker_id"], leader_epoch=1)
+
+
 def export_landscape(*args: Any, **kwargs: Any) -> None:
     """Keep existing unit scenarios explicit without repeating resource doubles."""
     kwargs.setdefault("payload_store", _TEST_PAYLOAD_STORE)
     kwargs.setdefault("audit_export_content_store", _TEST_AUDIT_CONTENT_STORE)
     kwargs.setdefault("audit_export_content_store_resolver", _TEST_AUDIT_CONTENT_STORE_RESOLVER)
     kwargs.setdefault("worker_id", "runtime-worker")
+    kwargs.setdefault("coordination_token", _export_seat_token(args, kwargs))
     _production_export_landscape(*args, **kwargs)
 
 
@@ -371,11 +388,35 @@ class _LegacyExportLandscapeJSON:
                 audit_export_content_store=audit_content_store,
                 audit_export_content_store_resolver=audit_content_store_resolver,
                 worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="runtime-worker", leader_epoch=1),
             )
 
         recorder_factory.assert_called_once_with(exporter.call_args.args[0], payload_store=payload_store)
         assert exporter.call_args.kwargs["read_model"] is not None
         assert sink.node_id is None
+
+    def test_export_landscape_refuses_a_token_for_another_run(self) -> None:
+        """ADR-048 §2: the export writes are fenced against the token's seat.
+
+        A ``run_id`` that is not the token's run would fence one run's seat and
+        register another run's snapshot. This refusal is what stops the unit
+        wrapper's minted default from papering over a real wiring mismatch —
+        it fires before any export effect, so nothing needs patching.
+        """
+        _sink, factory = _make_sink_and_factory()
+
+        with pytest.raises(ValueError, match="under a leader token for run 'other-run'"):
+            _production_export_landscape(
+                object(),
+                "run-1",
+                self._make_settings(),
+                factory,
+                payload_store=object(),
+                audit_export_content_store=_AuditContentStoreDouble(),
+                audit_export_content_store_resolver=AuditExportContentStoreResolver(),
+                worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="other-run", worker_id="worker:runtime-worker", leader_epoch=1),
+            )
 
     def test_export_preflight_passes_explicit_audit_snapshot_kind(self) -> None:
         sink, factory = _make_sink_and_factory()

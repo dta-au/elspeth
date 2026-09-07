@@ -255,9 +255,12 @@ def test_get_sink_effect_history_exposes_recovery_state_without_provider_bodies(
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=CallType.FILESYSTEM,
                 request_hash="f" * 64,
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
-        lost = factory.execution.sink_effects.mark_response_lost(attempt.attempt_id)
+        lost = factory.execution.sink_effects.mark_response_lost(
+            attempt.attempt_id, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
         history = get_sink_effect_history(db, factory, effect.effect_id)
 

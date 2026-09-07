@@ -1114,9 +1114,10 @@ class RunMembershipLostError(Exception):
 
     The first statement of every membership-fenced transaction is a
     conditional UPDATE on ``run_workers`` matching ``(run_id, worker_id,
-    status='active')``. Rowcount 0 means this worker departed or was evicted:
-    the entire transaction rolls back before any payload write, and the
-    worker must abandon its work under this identity.
+    status='active')``. When no active row matches, an existing registration
+    means this worker departed or was evicted. The entire transaction rolls
+    back before any payload write, and the worker must abandon this identity.
+    A missing registration raises ``AuditIntegrityError`` instead.
 
     Attributes:
         run_id: The run whose membership fence refused this worker.
