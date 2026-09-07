@@ -53,6 +53,12 @@ against different work.
 > when false). Pass `--advance` (CLI) / `advance=true` (MCP) to walk the soft
 > transitions automatically.
 
+**Check whether it is held before choosing the form.** `issue_get` tells you:
+an unheld issue has `assignee: ""` with null `claimed_at`. The precondition
+below is checked against the CURRENT holder, so passing it on an *unheld* issue
+returns `CONFLICT` and drops your comment — it fails closed in both directions.
+Unheld: comment with `actor` and no precondition. Held: use the form below.
+
 **A held ticket still accepts your measurement.** `comment_add` and
 `issue_update` (MCP) take an `expected_assignee` precondition. When you pass
 `actor` on a held issue, *your own* actor is the default expected holder —
