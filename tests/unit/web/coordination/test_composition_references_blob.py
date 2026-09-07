@@ -13,11 +13,13 @@ to an exact comparison must turn the case-variant rows red again.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.blobs.service import _composition_references_blob as _service_references_blob
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 from elspeth.web.coordination.repository import _composition_references_blob
@@ -96,10 +98,35 @@ def test_corrupt_options_still_crash_rather_than_read_as_unreferenced() -> None:
         _composition_references_blob(state, _BLOB_ID, "/unused")
 
 
-def test_missing_canonical_source_options_crashes() -> None:
+@pytest.mark.parametrize("walker", [_composition_references_blob, _service_references_blob], ids=["repository", "service"])
+def test_missing_canonical_source_options_crashes(walker: Callable[[Any, str, str], bool]) -> None:
     state = {"sources": {"primary": {"plugin": "csv"}}}
     with pytest.raises(KeyError, match="options"):
-        _composition_references_blob(state, _BLOB_ID, "/unused")
+        walker(state, _BLOB_ID, "/unused")
+
+
+@pytest.mark.parametrize("walker", [_composition_references_blob, _service_references_blob], ids=["repository", "service"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"transforms": None},
+        {"collectors": None},
+        {"sinks": None},
+        {"sources": {"primary": {"options": None}}},
+        {"transforms": [{"options": None}]},
+        {"collectors": [{"options": None}]},
+        {"sinks": {"output": {"options": None}}},
+    ],
+)
+def test_present_null_sections_and_options_are_corruption(walker: Callable[[Any, str, str], bool], state: dict[str, Any]) -> None:
+    with pytest.raises(AuditIntegrityError):
+        walker(state, _BLOB_ID, "/unused")
+
+
+@pytest.mark.parametrize("walker", [_composition_references_blob, _service_references_blob], ids=["repository", "service"])
+def test_absent_optional_sections_and_options_are_not_references(walker: Callable[[Any, str, str], bool]) -> None:
+    assert not walker({}, _BLOB_ID, "/unused")
+    assert not walker({"transforms": [{"plugin": "identity"}], "sinks": {"output": {"plugin": "csv"}}}, _BLOB_ID, "/unused")
 
 
 @pytest.mark.parametrize("reference", [{"blob_ref": _BLOB_ID}, {"blob_id": _UPPER}, {"path": "/blob/collector.txt"}])

@@ -375,8 +375,6 @@ def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -
 
 
 def _options_reference_blob(options: Any, blob_id: str, storage_path: str, owner: str) -> bool:
-    if options is None:
-        return False
     if type(options) is not dict:
         raise AuditIntegrityError(f"Tier 1: composition_states.{owner}.options is {type(options).__name__}, expected dict")
     return _option_value_references_blob(options, blob_id, storage_path)
@@ -400,26 +398,26 @@ def _composition_references_blob(composition_state: Any, blob_id: str, storage_p
                 return True
 
     for collection_key in ("transforms", "gates", "aggregations", "coalesce", "collectors"):
-        nodes = composition_state.get(collection_key)
-        if nodes is None:
+        if collection_key not in composition_state:
             continue
+        nodes = composition_state[collection_key]
         if type(nodes) is not list:
             raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key} is {type(nodes).__name__}, expected list")
         for index, node in enumerate(nodes):
             if type(node) is not dict:
                 raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key}[{index}] is {type(node).__name__}, expected dict")
-            if _options_reference_blob(node.get("options"), blob_id, storage_path, f"{collection_key}[{index}]"):
+            if "options" in node and _options_reference_blob(node["options"], blob_id, storage_path, f"{collection_key}[{index}]"):
                 return True
 
-    sinks = composition_state.get("sinks")
-    if sinks is None:
+    if "sinks" not in composition_state:
         return False
+    sinks = composition_state["sinks"]
     if type(sinks) is not dict:
         raise AuditIntegrityError(f"Tier 1: composition_states.sinks is {type(sinks).__name__}, expected dict")
     for sink_name, sink in sinks.items():
         if type(sink) is not dict:
             raise AuditIntegrityError(f"Tier 1: composition_states.sinks[{sink_name!r}] is {type(sink).__name__}, expected dict")
-        if _options_reference_blob(sink.get("options"), blob_id, storage_path, f"sinks[{sink_name!r}]"):
+        if "options" in sink and _options_reference_blob(sink["options"], blob_id, storage_path, f"sinks[{sink_name!r}]"):
             return True
     return False
 

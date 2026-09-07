@@ -1877,8 +1877,6 @@ def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -
 
 
 def _options_reference_blob(options: Any, blob_id: str, storage_path: str, owner: str) -> bool:
-    if options is None:
-        return False
     if type(options) is not dict:
         raise AuditIntegrityError(f"Tier 1: composition_states.{owner}.options is {type(options).__name__}, expected dict")
     return _option_value_references_blob(options, blob_id, storage_path)
@@ -1918,8 +1916,7 @@ def _composition_references_blob(
                 raise AuditIntegrityError(f"Tier 1: composition_states.sources[{source_name!r}] is null, expected dict")
             if type(source) is not dict:
                 raise AuditIntegrityError(f"Tier 1: composition_states.sources[{source_name!r}] is {type(source).__name__}, expected dict")
-            source_options = source["options"] if "options" in source else None
-            if _options_reference_blob(source_options, blob_id, storage_path, f"sources[{source_name!r}]"):
+            if _options_reference_blob(source["options"], blob_id, storage_path, f"sources[{source_name!r}]"):
                 return True
 
     # AUTHORITY: ``generate_pipeline_dict`` — the sole producer of the dict
@@ -1949,29 +1946,23 @@ def _composition_references_blob(
         if collection_key not in composition_state:
             continue
         nodes = composition_state[collection_key]
-        if nodes is None:
-            continue
         if type(nodes) is not list:
             raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key} is {type(nodes).__name__}, expected list")
         for index, node in enumerate(nodes):
             if type(node) is not dict:
                 raise AuditIntegrityError(f"Tier 1: composition_states.{collection_key}[{index}] is {type(node).__name__}, expected dict")
-            node_options = node["options"] if "options" in node else None
-            if _options_reference_blob(node_options, blob_id, storage_path, f"{collection_key}[{index}]"):
+            if "options" in node and _options_reference_blob(node["options"], blob_id, storage_path, f"{collection_key}[{index}]"):
                 return True
 
     if "sinks" not in composition_state:
         return False
     sinks = composition_state["sinks"]
-    if sinks is None:
-        return False
     if type(sinks) is not dict:
         raise AuditIntegrityError(f"Tier 1: composition_states.sinks is {type(sinks).__name__}, expected dict")
     for sink_name, sink in sinks.items():
         if type(sink) is not dict:
             raise AuditIntegrityError(f"Tier 1: composition_states.sinks[{sink_name!r}] is {type(sink).__name__}, expected dict")
-        sink_options = sink["options"] if "options" in sink else None
-        if _options_reference_blob(sink_options, blob_id, storage_path, f"sinks[{sink_name!r}]"):
+        if "options" in sink and _options_reference_blob(sink["options"], blob_id, storage_path, f"sinks[{sink_name!r}]"):
             return True
     return False
 
