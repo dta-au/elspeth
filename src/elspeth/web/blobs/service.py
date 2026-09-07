@@ -11,7 +11,6 @@ import os
 import re
 import stat
 import threading
-import traceback
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -687,6 +686,19 @@ def _restore_staged_blob_deletion(stage: _StagedBlobDeletion, primary_exc: BaseE
             f"{tombstone} ({type(rollback_exc).__name__}: {rollback_exc}). "
             "Blob row and storage may now diverge; manual reconciliation required."
         )
+
+
+def _cleanup_error_detail(exc: BaseException) -> str:
+    """Preserve the primary message and PEP 678 notes without hiding formatting failures."""
+    detail = str(exc)
+    try:
+        notes = exc.__notes__
+    except AttributeError:
+        # BaseException creates this optional attribute on the first add_note.
+        return detail
+    if type(notes) is not list or any(type(note) is not str for note in notes):
+        raise TypeError("exception __notes__ must be a list of strings")
+    return "\n".join((detail, *notes))
 
 
 def _finalize_staged_blob_deletion(stage: _StagedBlobDeletion) -> None:
@@ -3450,7 +3462,7 @@ class BlobServiceImpl:
                             exc_type=type(cleanup_exc).__name__,
                             # Rollback failures are PEP 678 notes on the
                             # primary error; keep them in returned evidence.
-                            detail="".join(traceback.format_exception_only(cleanup_exc)).strip(),
+                            detail=_cleanup_error_detail(cleanup_exc),
                         )
                     )
                     try:

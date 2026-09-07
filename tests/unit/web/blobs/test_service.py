@@ -33,7 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs import service as blob_service_module
 from elspeth.web.blobs.protocol import (
@@ -4416,6 +4416,28 @@ class TestCopyBlobsForFork:
         assert context is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+    async def test_cleanup_propagates_integrity_failure_from_exception_text(
+        self, blob_service, session_id, target_session_id, monkeypatch, compose_context, error_class
+    ) -> None:
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        integrity_failure = error_class("cleanup error formatting failed")
+
+        class UnformattableCleanupError(OSError):
+            def __str__(self) -> str:
+                raise integrity_failure
+
+        def fail_delete(*args, **kwargs):
+            raise UnformattableCleanupError("primary cleanup failure")
+
+        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", fail_delete)
+        with pytest.raises(error_class) as caught:
+            await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+        assert caught.value is integrity_failure
+
+    @pytest.mark.asyncio
     async def test_cleanup_preserves_commit_failure_and_failed_restore_evidence(
         self, blob_service, session_id, target_session_id, db_engine, monkeypatch, compose_context
     ) -> None:
@@ -4806,6 +4828,24 @@ class TestFinalizeRunOutputBlobs:
 # ---------------------------------------------------------------------------
 # Partial-failure resilience — elspeth-9f31c32cce
 # ---------------------------------------------------------------------------
+
+
+class TestCleanupErrorDetail:
+    def test_missing_notes_preserves_exact_message(self) -> None:
+        assert blob_service_module._cleanup_error_detail(OSError("primary failure")) == "primary failure"
+
+    def test_notes_preserve_order_and_primary_message(self) -> None:
+        error = OSError("primary failure")
+        error.add_note("first rollback failure")
+        error.add_note("second rollback failure")
+        assert blob_service_module._cleanup_error_detail(error) == "primary failure\nfirst rollback failure\nsecond rollback failure"
+
+    @pytest.mark.parametrize("notes", ["not a note list", None, ("tuple note",), [42]])
+    def test_malformed_notes_fail_loudly(self, notes) -> None:
+        error = OSError("primary failure")
+        error.__notes__ = notes
+        with pytest.raises(TypeError, match="exception __notes__ must be a list of strings"):
+            blob_service_module._cleanup_error_detail(error)
 
 
 class TestFinalizeRunOutputBlobsPartialFailure:
