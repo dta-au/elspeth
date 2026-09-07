@@ -519,9 +519,18 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "4abf5f610cef539417cbbb143c9dfd720b424c8a55
 # x3 (complete_barrier, _transition_on, stage_escalation_loss).
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 80
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "dccb6ab7403f684b881ea3aad3d4c4046c20a4359e3e81c272d93b9d72fc72f6"
-# Coordination callers: unchanged between the pin tree and the landed tree.
-_EXPECTED_COORDINATION_CALL_COUNT = 15
-_EXPECTED_COORDINATION_CALL_SHA256 = "e2c82952e49763ee53e8772dcaedd9afbeecd1448c7c93a99659e25037e8d511"
+# Coordination callers 15 -> 20 (+5, none removed), all seat acquire/release
+# arriving with the ADR-048 run-coordination work and each forwarding an exact
+# token: web/app.py's orphan finaliser takes the dead leader's seat through the
+# takeover CAS (_finalize_orphaned_landscape_runs -> acquire_run_leadership) and
+# vacates it (_finalize_orphan_as_interrupted -> release_seat); export.py's
+# resume_audit_export releases the export seat in its finally block; and
+# RunLifecycleCoordinator.run gained two further except-arm releases, ordinals 5
+# and 6, alongside the four it already had. Re-derived from the gate's own
+# printed output, not hand-counted. The drift was masked until the C6-34 landing
+# re-pinned _EXPECTED_CALL_COUNT above and moved the first failure down to here.
+_EXPECTED_COORDINATION_CALL_COUNT = 20
+_EXPECTED_COORDINATION_CALL_SHA256 = "55dc60ee8f4d822eaea9b889920e77fff395d117faf8cbc63f43bb2d7d5584bf"
 # Internal edges 98 -> 101 (-2 +5): create_row_with_token's second
 # insert_row_with_token_on edge and TokenSchedulerRepository's
 # adopt_coalesce_branch_losses forward retired; added:
