@@ -884,10 +884,6 @@ class ExpressionParser:
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             return True
 
-        # Name references to True/False
-        if isinstance(node, ast.Name) and node.id in ("True", "False"):
-            return True
-
         # Ternary: boolean if both branches are boolean
         if isinstance(node, ast.IfExp):
             return self._is_boolean_node(node.body) and self._is_boolean_node(node.orelse)
@@ -906,10 +902,8 @@ class ExpressionParser:
         fan-out idiom (``pipeline_composer.md``, "Dual independent outputs").
         """
         body = self._ast.body
-        # ``True``/``False``/``None`` parse to ast.Constant on every supported
-        # Python; the Name arm is a belt-and-braces carry-over from the same
-        # pairing in ``_is_boolean_node``.
-        return isinstance(body, ast.Constant) or (isinstance(body, ast.Name) and body.id in ("True", "False", "None"))
+        # Every supported Python represents bare literals as ast.Constant.
+        return isinstance(body, ast.Constant)
 
     def is_provably_non_routable(self) -> bool:
         """Check if the expression's result is statically guaranteed to be neither bool nor str.

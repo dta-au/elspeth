@@ -1044,6 +1044,16 @@ class TestExpressionParserFuzz:
             self._assert_safe_parse(expr)
 
 
+class TestIsConstantExpression:
+    @pytest.mark.parametrize("expression", ["True", "False", "None", "42", "3.14", "'route'"])
+    def test_bare_literals_read_no_row_data(self, expression: str) -> None:
+        assert ExpressionParser(expression).is_constant_expression() is True
+
+    @pytest.mark.parametrize("expression", ["row['x']", "row.get('x')", "row['x'] > 0", "'a' if row['x'] else 'b'"])
+    def test_row_dependent_expressions_are_not_constant(self, expression: str) -> None:
+        assert ExpressionParser(expression).is_constant_expression() is False
+
+
 class TestIsBooleanExpression:
     """Tests for is_boolean_expression() static type detection."""
 
