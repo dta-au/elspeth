@@ -10,13 +10,14 @@ only what varies per provider:
   and replica names from ``az containerapp replica list`` (control-plane
   verified) and the ARM id from ``az containerapp show``; every receipt names
   the replica the evidence was collected against (plan §5).
-- **Kinds.** Twelve closed check kinds (plan §6.1 item 4), each with a closed
+- **Kinds.** Closed check kinds, each with a closed
   detail set and a ``mechanism`` from a closed enum: overclaiming is a schema
   violation. The replica kinds carry the shared :class:`ProbeReceiptDetails`
   shape and are re-admitted through :class:`ProbeResult`, so the P4b
   cannot-pass rule and the per-probe mechanism subsets hold by construction.
-  ``testcontainer-run`` is the thirteenth *stored* kind, validated by the
-  shared validator under the ``azure`` schema id.
+  Dedicated Single-revision kinds also carry the platform topology needed to
+  recompute both replica bindings during stored admission. ``testcontainer-run``
+  is validated by the shared validator under the ``azure`` schema id.
 - **Compatibility record.** Scenario A only, in the shape the acceptance
   runbook fixes, with ``schema_facts`` byte-equal to the shared derivation.
 
@@ -288,6 +289,7 @@ class SingleRevisionReplicaDetails(TypedDict):
 
 
 class SingleRevisionTopologyDetails(TypedDict):
+    container_app_id: str
     active_revisions_mode: str
     session_affinity: str
     min_replicas: int
@@ -438,6 +440,7 @@ def _single_topology(raw: object) -> SingleRevisionTopologyDetails:
     _exact(topology["min_replicas"], 2)
     _exact(topology["max_replicas"], 2)
     revision = _text(topology["revision"], _REVISION_PATTERN)
+    app_id = _text(topology["container_app_id"], _CONTAINER_APP_ID_PATTERN)
     replicas = topology["replicas"]
     if len(replicas) != 2:
         raise _schema_violation()
@@ -446,6 +449,12 @@ def _single_topology(raw: object) -> SingleRevisionTopologyDetails:
         if not _text(replica["replica"]).startswith(f"{revision}-"):
             raise _schema_violation()
         _sha256_text(replica["replica_binding_sha256"])
+        try:
+            binding = ReplicaBinding(app_id, revision, replica["replica"])
+        except AcceptanceInputError:
+            raise _schema_violation() from None
+        if binding.sha256 != replica["replica_binding_sha256"]:
+            raise AcceptanceCheckError("replica_binding")
     for values in (
         (replicas[0]["instance_id"], replicas[1]["instance_id"]),
         (replicas[0]["replica"], replicas[1]["replica"]),
@@ -458,12 +467,12 @@ def _single_topology(raw: object) -> SingleRevisionTopologyDetails:
 
 def _single_expected_binding(raw: object, binding: ReplicaBinding) -> None:
     topology = _single_topology(raw)
-    if topology["revision"] != binding.revision or topology["replicas"][0]["replica"] != binding.replica:
+    if (
+        topology["container_app_id"] != binding.container_app_id
+        or topology["revision"] != binding.revision
+        or topology["replicas"][0]["replica"] != binding.replica
+    ):
         raise AcceptanceCheckError("replica_binding")
-    for replica in topology["replicas"]:
-        observed = ReplicaBinding(binding.container_app_id, binding.revision, replica["replica"])
-        if observed.sha256 != replica["replica_binding_sha256"]:
-            raise AcceptanceCheckError("replica_binding")
 
 
 def _job_execution(*, kind: str, job_name: object, execution_name: object, execution_status: object, job_names: frozenset[str]) -> str:
@@ -746,7 +755,11 @@ def _admit_exec_receipt(payload: object) -> StoredReceipt:
 
 
 def encode_exec_receipt(check: str, details: CheckDetails, *, candidate_sha: str, binding: ReplicaBinding, scenario_id: str) -> str:
-    """Encode one closed receipt line; the binding is hashed, never carried."""
+    """Encode one closed receipt line with a hashed subject.
+
+    Single-revision topology also carries the platform identity needed to
+    recompute both replica hashes when an external receipt is read back.
+    """
 
     if _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None or _SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
         raise AcceptanceCheckError("exec_receipt_binding")

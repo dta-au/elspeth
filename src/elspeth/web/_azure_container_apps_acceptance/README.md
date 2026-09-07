@@ -34,6 +34,10 @@ of:
 
 ## Modules
 
+Dedicated Single-revision receipts carry the app ARM identifier, revision,
+and both replica identities so every admission boundary can recompute their
+binding hashes. The envelope and receipt index retain their hashed subjects.
+
 | module | layer | contents |
 |---|---|---|
 | `receipt_contracts.py` | 0 | `ReplicaBinding` (`sha256("<app ARM id>/revisions/<revision>/replicas/<replica>")`), required check kinds with owned `TypedDict` detail shapes, per-kind validators and `mechanism` subsets, the `azure` `ExecReceiptDescriptor`, exec-receipt encode/extract, the Scenario A compatibility record, and stored-receipt admission including `testcontainer-run`. Dedicated Single-revision P1/P4a kinds require two cookie-pinned replica identities and bindings, so labelled proofs cannot replace the final production-topology phase. |

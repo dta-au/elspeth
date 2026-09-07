@@ -281,6 +281,7 @@ def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_reques
     document = json.loads(receipt.canonical_json)
     assert document["details"]["outcome"] == "pass"
     assert document["details"]["topology"] == {
+        "container_app_id": APP_ID,
         "active_revisions_mode": "Single",
         "session_affinity": "sticky",
         "min_replicas": 2,

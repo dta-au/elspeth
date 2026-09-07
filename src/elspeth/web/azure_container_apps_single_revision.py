@@ -311,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             binding = ReplicaBinding(topology.container_app_id, topology.revision, owner.replica_name)
             reader_binding = ReplicaBinding(topology.container_app_id, topology.revision, reader.replica_name)
             topology_details: SingleRevisionTopologyDetails = {
+                "container_app_id": topology.container_app_id,
                 "active_revisions_mode": "Single",
                 "session_affinity": "sticky",
                 "min_replicas": 2,

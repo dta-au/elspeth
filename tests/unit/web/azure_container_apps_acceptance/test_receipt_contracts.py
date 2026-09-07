@@ -187,6 +187,7 @@ def _job(name: str) -> dict[str, object]:
 def _single_topology() -> dict[str, object]:
     peer = ReplicaBinding(APP_ID, REVISION, f"{REVISION}-86c8c4b497-peer1")
     return {
+        "container_app_id": APP_ID,
         "active_revisions_mode": "Single",
         "session_affinity": "sticky",
         "min_replicas": 2,
@@ -333,6 +334,28 @@ def test_single_stored_receipt_cannot_move_topology_to_another_envelope_binding(
     with pytest.raises(AcceptanceCheckError, match="replica_binding"):
         validate_stored_receipt(
             document, kind="single-revision-progress", scenario_id="A", subject_sha256="0" * 64, candidate_sha=CANDIDATE
+        )
+
+
+@pytest.mark.parametrize("fault", ["peer_hash", "revision_and_names", "app_id"])
+def test_direct_single_stored_admission_rederives_both_bindings(fault: str) -> None:
+    details = VALID["single-revision-progress"]()
+    topology = details["topology"]
+    if fault == "peer_hash":
+        topology["replicas"][1]["replica_binding_sha256"] = "0" * 64
+    elif fault == "app_id":
+        topology["container_app_id"] = APP_ID.replace("elspeth-acc-run1", "elspeth-acc-other")
+    else:
+        topology["revision"] = "elspeth-web--wrong"
+        topology["replicas"][0]["replica"] = "elspeth-web--wrong-owner"
+        topology["replicas"][1]["replica"] = "elspeth-web--wrong-peer"
+    with pytest.raises(AcceptanceCheckError, match="replica_binding"):
+        validate_stored_receipt(
+            _envelope("single-revision-progress", details),
+            kind="single-revision-progress",
+            scenario_id="A",
+            subject_sha256=BINDING.sha256,
+            candidate_sha=CANDIDATE,
         )
 
 
