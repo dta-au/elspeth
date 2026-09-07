@@ -1673,6 +1673,29 @@ _CATEGORY_RECEIVER_MARKERS: dict[str, frozenset[str]] = {
     "audit-export": frozenset({"audit_export_snapshot_repository", "audit_export_snapshots", "snapshots"}),
     "coordination": frozenset({"repo", "run_coordination"}),
 }
+_TOKEN_CARRYING_CONTEXT_QUALIFIED = frozenset(
+    {
+        "elspeth.contracts.plugin_context.PluginContext",
+        "elspeth.contracts.contexts.LifecycleContext",
+        "elspeth.contracts.contexts.SourceContext",
+        "elspeth.contracts.contexts.TransformContext",
+        "elspeth.contracts.contexts.SinkContext",
+    }
+)
+"""Context types a plugin may receive and forward through (ADR-048 §3).
+
+Four of these are ``Protocol`` classes, so the annotation is NOT an authority
+proof and is not used as one: admitting a ``ctx.record_*`` call DEFERS the proof
+to whatever class actually forwards to Landscape, it never grants it. That
+receiver's own forwarding call is scanned like any other and is admitted only by
+``_context_attribute_token_is_carried_by_value``, which is keyed on a concrete
+owned class at an exact path. A structural impostor therefore cannot launder an
+unfenced write through here — it can only move where the proof is demanded.
+"""
+
+_TOKEN_CARRYING_CONTEXT_OWNER = ("src/elspeth/contracts/plugin_context.py", "PluginContext")
+"""The one concrete class whose ``self``-attribute token is provable by value."""
+
 _PLUGIN_CONTEXT_METHODS = frozenset(
     {
         "allocate_call_index",
@@ -2110,6 +2133,112 @@ def _is_exact_token_run_id(run_id: ast.expr, token: ast.expr) -> bool:
     return isinstance(run_id, ast.Attribute) and run_id.attr == "run_id" and stable_ast_dump(run_id.value) == stable_ast_dump(token)
 
 
+def _is_token_carrying_context_receiver(node: ast.AST, resolver: _Resolver, *, use: ast.AST) -> bool:
+    """``ctx`` is a parameter of the enclosing function annotated with an ELSPETH-owned context type."""
+
+    if not isinstance(node, ast.Name):
+        return False
+    parameter = resolver.parameter(node.id, use)
+    if parameter is None or parameter.annotation is None:
+        return False
+    return resolver.qualified_name(parameter.annotation, use=use) in _TOKEN_CARRYING_CONTEXT_QUALIFIED
+
+
+def _is_fail_closed_none_guard(statement: ast.stmt, receiver: str, attribute: str) -> bool:
+    """``if self.<attr> is None: raise`` (possibly as one arm of an ``or``)."""
+
+    if not isinstance(statement, ast.If) or not statement.body or not isinstance(statement.body[0], ast.Raise):
+        return False
+
+    def matches(test: ast.expr) -> bool:
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+            return any(matches(value) for value in test.values)
+        return (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Is)
+            and isinstance(test.left, ast.Attribute)
+            and test.left.attr == attribute
+            and isinstance(test.left.value, ast.Name)
+            and test.left.value.id == receiver
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        )
+
+    return matches(statement.test)
+
+
+def _context_attribute_token_is_carried_by_value(
+    token: ast.expr,
+    owner: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    resolver: _Resolver,
+    use: ast.Call,
+) -> bool:
+    """``self.<attr>`` bound ONLY from an exact ``__init__`` token parameter, never minted, and None-guarded."""
+
+    if not isinstance(token, ast.Attribute) or not isinstance(token.value, ast.Name):
+        return False
+    located = _method_receiver(use)
+    if located is None or token.value.id != located[1] or resolver.unit.path != _TOKEN_CARRYING_CONTEXT_OWNER[0]:
+        return False
+    owner_class = located[0]
+    if owner_class.name != _TOKEN_CARRYING_CONTEXT_OWNER[1]:
+        return False
+    bindings = 0
+    for member in ast.walk(owner_class):
+        if isinstance(member, ast.Call) and _call_name(member) == "setattr":
+            return False
+        if not isinstance(member, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            continue
+        targets = list(member.targets) if isinstance(member, ast.Assign) else [member.target]
+        for target in targets:
+            matches = [
+                child
+                for child in ast.walk(target)
+                if isinstance(child, ast.Attribute) and child.attr == token.attr and isinstance(child.value, ast.Name)
+            ]
+            if not matches:
+                continue
+            binder = _method_receiver(member)
+            if (
+                not isinstance(member, ast.Assign)
+                or target is not matches[0]
+                or len(matches) != 1
+                or binder is None
+                or binder[0] is not owner_class
+                or matches[0].value.id != binder[1]
+            ):
+                return False
+            init = _owner_function(member)
+            if init is None or init.name != "__init__" or not isinstance(member.value, ast.Name):
+                return False
+            parameter = next(
+                (
+                    argument
+                    for argument in (*init.args.posonlyargs, *init.args.args, *init.args.kwonlyargs)
+                    if argument.arg == member.value.id
+                ),
+                None,
+            )
+            if parameter is None or _parameter_rebound(init, parameter.arg):
+                return False
+            annotation = parameter.annotation
+            if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                # ``CoordinationToken | None``: the executor-less context carries nothing.
+                arms = [annotation.left, annotation.right]
+                annotation = next((arm for arm in arms if not (isinstance(arm, ast.Constant) and arm.value is None)), None)
+                if len(arms) != 2 or not any(isinstance(arm, ast.Constant) and arm.value is None for arm in arms):
+                    return False
+            if not _is_exact_coordination_token_annotation(annotation, resolver=resolver, use=init):
+                return False
+            bindings += 1
+    if bindings == 0:
+        return False
+    # Fail-closed: the forwarding call must sit below an ``if self.<attr> is None: raise`` in its own function.
+    return any(statement.lineno < use.lineno and _is_fail_closed_none_guard(statement, located[1], token.attr) for statement in owner.body)
+
+
 def _caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     unit_list = tuple(units)
     definitions = _find_api_definitions(unit_list)
@@ -2136,6 +2265,16 @@ def _caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]
                 continue
             if any(keyword.arg is None for keyword in call.keywords):
                 violations.append(f"{unit.path}:{call.lineno} {_symbol(call)} forwards authority through **kwargs")
+                continue
+            if call.func.attr in _PLUGIN_CONTEXT_METHODS and _is_token_carrying_context_receiver(call.func.value, resolver, use=call):
+                # A plugin never holds a token (ADR-048 §3). It forwards through
+                # its context, and the context's own forwarding call — scanned
+                # below on ``self.landscape`` — is where authority is proven.
+                continue
+            token_keywords_by_value = [keyword.value for keyword in call.keywords if keyword.arg in _AUTHORITY_PARAMETER_NAMES]
+            if len(token_keywords_by_value) == 1 and _context_attribute_token_is_carried_by_value(
+                token_keywords_by_value[0], owner, resolver=resolver, use=call
+            ):
                 continue
             capability_token = _proven_token_bound_capability_token(call.func.value, resolver=resolver, use=call)
             if capability_token is not None:
@@ -5299,6 +5438,137 @@ def test_receiver_provenance_excludes_unrelated_common_names_and_resolves_alias(
     )
     assert any("dynamic getattr('complete_run')" in item for item in _mutation_callable_escapes([internal_dynamic_wrapper]))
     assert any(edge.method == "release_seat" for edge in scan_internal_landscape_wrapper_edges([internal_dynamic_wrapper]))
+
+
+def test_caller_authority_admits_a_context_that_carries_the_token_by_value_and_nothing_else() -> None:
+    """ADR-048 §3: a plugin never holds a token; its context forwards the executor's by value.
+
+    (a) ``ctx.record_*`` is admitted only when ``ctx`` is a parameter annotated with an
+    ELSPETH-owned context type and the method is a PluginContext forwarder; (b) inside
+    ``PluginContext`` the forwarding call is admitted only when ``self.coordination_token``
+    is bound solely in ``__init__`` from an exact token parameter, never minted or
+    rebound, with a fail-closed ``is None`` guard above the call.
+
+    Arm (a) is a DEFERRAL, not a grant: four of the admitted annotations are
+    ``Protocol`` classes, so the ``bypassing_plugin`` and ``foreign_class`` arms
+    below pin that the proof obligation lands on the concrete forwarder instead
+    of evaporating.
+    """
+
+    plugin = _parse_source(
+        "src/elspeth/plugins/sources/probe.py",
+        textwrap.dedent(
+            """\
+            from elspeth.contracts.contexts import SourceContext
+
+            def load(ctx: SourceContext, row):
+                ctx.record_validation_error(row=row, error="bad")
+            """
+        ),
+    )
+    assert _caller_authority_violations([plugin]) == ()
+
+    untyped_plugin = _parse_source(plugin.path, plugin.source.replace("ctx: SourceContext", "ctx"))
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([untyped_plugin]))
+
+    bypassing_plugin = _parse_source(
+        plugin.path, plugin.source.replace("ctx.record_validation_error(", "ctx.landscape.record_validation_error(")
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([bypassing_plugin]))
+
+    context = _parse_source(
+        _TOKEN_CARRYING_CONTEXT_OWNER[0],
+        textwrap.dedent(
+            """\
+            from elspeth.contracts.coordination import CoordinationToken
+
+            class PluginContext:
+                def __init__(self, landscape, coordination_token: CoordinationToken | None = None):
+                    self.landscape = landscape
+                    self.coordination_token = coordination_token
+
+                def record_validation_error(self, *, row, error):
+                    if self.landscape is None or self.coordination_token is None:
+                        raise RuntimeError("no authority")
+                    return self.landscape.record_validation_error(row=row, error=error, coordination_token=self.coordination_token)
+            """
+        ),
+    )
+    assert _caller_authority_violations([context]) == ()
+
+    minted = _parse_source(
+        context.path,
+        context.source.replace(
+            "coordination_token=self.coordination_token)",
+            'coordination_token=CoordinationToken(run_id="r", worker_id="w", leader_epoch=1))',
+        ),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([minted]))
+
+    rebound = _parse_source(
+        context.path,
+        context.source.replace(
+            "    def record_validation_error(self, *, row, error):\n",
+            "    def retarget(self, token):\n        self.coordination_token = token\n\n    def record_validation_error(self, *, row, error):\n",
+        ),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([rebound]))
+
+    unguarded = _parse_source(
+        context.path,
+        context.source.replace(
+            '        if self.landscape is None or self.coordination_token is None:\n            raise RuntimeError("no authority")\n',
+            "",
+        ),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([unguarded]))
+
+    foreign_class = _parse_source(context.path, context.source.replace("class PluginContext:", "class OtherContext:"))
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([foreign_class]))
+
+    untyped_init = _parse_source(
+        context.path, context.source.replace("coordination_token: CoordinationToken | None = None", "coordination_token=None")
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([untyped_init]))
+
+    # The deferral in (a) is bounded to the forwarders PluginContext actually
+    # defines. A mutation API it does NOT forward has no second proof site, so
+    # admitting it on the strength of the annotation alone would lose the write.
+    # The parameter is named ``audit`` deliberately: that is an ``execution``
+    # category receiver marker, so the call clears the receiver heuristic on its
+    # NAME and reaches the admission arm. A parameter called ``ctx`` would be
+    # turned away one step earlier and would prove nothing about this arm.
+    assert "begin_operation" in _MUTATION_METHOD_NAMES and "begin_operation" not in _PLUGIN_CONTEXT_METHODS
+    assert "audit" in _CATEGORY_RECEIVER_MARKERS["execution"]
+    non_forwarder = _parse_source(
+        plugin.path,
+        plugin.source.replace("ctx: SourceContext", "audit: SourceContext").replace(
+            'ctx.record_validation_error(row=row, error="bad")', "audit.begin_operation(row=row)"
+        ),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([non_forwarder]))
+
+    # ...and bounded to the owned context types. Any other annotation, including
+    # a sibling Protocol from the same module, proves nothing about forwarding.
+    foreign_annotation = _parse_source(
+        plugin.path,
+        plugin.source.replace("import SourceContext", "import LimiterProtocol").replace("ctx: SourceContext", "ctx: LimiterProtocol"),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([foreign_annotation]))
+
+    # A rebinder whose parameter is correctly typed still breaks carry-by-value:
+    # only ``__init__`` may bind the attribute, or the token is no longer the one
+    # the executor handed in. The untyped ``rebound`` arm above cannot see this,
+    # because its annotation check fires first.
+    annotated_rebinder = _parse_source(
+        context.path,
+        context.source.replace(
+            "    def record_validation_error(self, *, row, error):\n",
+            "    def retarget(self, token: CoordinationToken):\n        self.coordination_token = token\n\n"
+            "    def record_validation_error(self, *, row, error):\n",
+        ),
+    )
+    assert any("lacks one exact current token" in item for item in _caller_authority_violations([annotated_rebinder]))
 
 
 def test_caller_authority_rejects_rebound_or_untyped_attribute_tokens() -> None:
