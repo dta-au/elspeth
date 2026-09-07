@@ -143,7 +143,7 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
     """Attach the ``--judge-tools`` flag (read-only investigation mode).
 
     'none' (default) keeps the blinded judge — it sees only the excerpt.
-    'readonly' lets the agent transport Read/Grep/Glob within the source tree +
+    'readonly' lets the agent transport Read/Grep/Glob throughout the checkout +
     allowlist dir (fail-closed transport guard) to resolve a would-be block for
     lack of context. Requires ``--judge-transport agent`` or ``codex-cli`` (the
     OpenRouter path has no tool loop). Since 2026-07-09 signing paths accept it too — the
@@ -159,7 +159,8 @@ def _add_judge_tools_arg(parser: argparse.ArgumentParser) -> None:
         help=(
             "Read-only tool access for the judge. 'none' (default) is blinded "
             "(excerpt only). 'readonly' lets a local agent transport Read/Grep/Glob "
-            "within src + allowlist dir to investigate; requires --judge-transport "
+            "throughout the checkout (including tests, docs, scripts and config) "
+            "+ allowlist dir to investigate; requires --judge-transport "
             "agent or codex-cli. Less reproducible than blinded mode. Valid on signing paths "
             "since 2026-07-09; readonly-mode judge rationales are secret-scrubbed "
             "before being persisted into signed allowlist entries."
@@ -3369,9 +3370,9 @@ def _run_reaudit(args: argparse.Namespace) -> int:
     # ``--judge-transport agent`` sweep re-judges through the Agent SDK.
     transport: str = _CLI_TRANSPORT_CHOICES[args.judge_transport]
 
-    # Read-only tool-augmented investigation mode. Only valid with the agent
-    # transport (OpenRouter has no tool loop); the scope confines reads to the
-    # source tree + allowlist dir via a fail-closed PreToolUse guard.
+    # Read-only tool-augmented investigation mode. Local agent transports
+    # expose the whole checkout + allowlist dir through fail-closed guards;
+    # OpenRouter has no tool loop.
     tool_scope: AgentToolScope | None = None
     if args.judge_tools == "readonly":
         if transport not in _READONLY_TOOL_TRANSPORTS:
