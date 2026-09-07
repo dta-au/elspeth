@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError
+from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError, BlobQuotaExceededError
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.engine import create_session_engine
@@ -448,11 +448,22 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         reserved = reserve_output_blob(service, session_id, run_id, execute)
         storage = Path(reserved.storage_path)
         storage.write_bytes(b"x" * 64)
+        recorder = _RecordingAuthority(service._session_operation_authority)
+        service._session_operation_authority = recorder
 
         result = await service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
 
-        assert list(result.errors) == []
-        assert [(record.id, record.status, record.size_bytes, record.content_hash) for record in result.finalized] == [
-            (reserved.id, "error", 0, None)
-        ]
+        assert list(result.finalized) == []
+        assert len(result.errors) == 1
+        failure = result.errors[0]
+        assert failure.blob_id == reserved.id
+        assert failure.exc_type == "BlobQuotaExceededError"
+        assert failure.detail == str(BlobQuotaExceededError(str(session_id), current_bytes=0, limit_bytes=8))
+        # The quota-refused ready mutation and subsequent error mutation both
+        # use the reserving EXECUTE authority, after the run-level CAS.
+        assert recorder.mutations == [execute, execute]
+        assert recorder.standalone_cas == [execute]
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == str(reserved.id))).one()
+        assert (row.status, row.size_bytes, row.content_hash, row.custody_operation_id) == ("error", 0, None, None)
         assert not storage.exists()
