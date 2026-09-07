@@ -141,7 +141,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # digest was re-derived by RUNNING the gate on the merged tree, because it hashes the
 # source tree's DISCOVERY ORDER rather than this literal, so it cannot be computed by
 # reasoning about rows and the literal's own row order is not load-bearing.
-_CLOCK_BOUNDARY_DIGEST = "55c0ef02a6575deabd6ea9ed00ec156b5f0f210a3483392dce9a7caf8a1690dd"
+_CLOCK_BOUNDARY_DIGEST = "81fd6c8f20c2dcdc6300aa8281766d9ea78a33ea5fc1e58d9e409a86e3a2fba7"
 
 
 def _name_has_clock_marker(name: str) -> bool:
