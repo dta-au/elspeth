@@ -52,7 +52,7 @@ class ArtifactRepository:
         idempotency_key: str | None = None,
         publication_performed: bool = True,
         publication_evidence_kind: ArtifactPublicationEvidenceKind | None = None,
-        conn: Connection | None = None,
+        conn: Connection,
     ) -> Artifact:
         """Register an artifact produced by a sink.
 
@@ -114,12 +114,8 @@ class ArtifactRepository:
             "publication_evidence_kind": artifact.publication_evidence_kind,
             "created_at": artifact.created_at,
         }
-        if conn is not None:
-            return self._insert_or_fetch(conn, values)
-
         try:
-            with self._ops.write_connection() as owned_conn:
-                return self._insert_or_fetch(owned_conn, values)
+            return self._insert_or_fetch(conn, values)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"register_artifact failed for producer={artifact.producer_kind!r} — database rejected audit write: {type(exc).__name__}"

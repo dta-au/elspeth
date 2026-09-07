@@ -24,16 +24,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
 from elspeth.contracts.audit import validate_resolved_prompt_template_hash
 from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import calls_table, node_states_table, operations_table
 
 if TYPE_CHECKING:
@@ -87,7 +91,18 @@ class CallAuditRepository:
         self._pending_call_indices: set[tuple[str, int]] = set()
         self._pending_operation_call_indices: set[tuple[str, int]] = set()
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+        """Allocate a proposal only for this worker's current claimed state."""
+        with fenced_item_transaction(
+            self._db.engine,
+            member_token=member_token,
+            work_item=work_item,
+            verb="allocate_call_index",
+        ) as conn:
+            self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+            return self._allocate_call_index_on(conn, state_id)
+
+    def _allocate_call_index_on(self, conn: Connection, state_id: str) -> int:
         """Allocate next call index for a state_id (thread-safe).
 
         Provides centralized call index allocation ensuring UNIQUE(state_id, call_index)
@@ -132,7 +147,7 @@ class CallAuditRepository:
                 # The DB query is serialized under the lock — acceptable because
                 # it only fires once per state_id per recorder lifetime. All
                 # subsequent allocations hit the fast path (no DB access).
-                row = self._ops.execute_fetchone(select(func.max(calls_table.c.call_index)).where(calls_table.c.state_id == state_id))
+                row = conn.execute(select(func.max(calls_table.c.call_index)).where(calls_table.c.state_id == state_id)).fetchone()
                 existing_max = row[0] if row is not None and row[0] is not None else -1
                 self._call_indices[state_id] = existing_max + 1
             # Fast path: allocate from in-memory counter (no DB access)
@@ -141,7 +156,18 @@ class CallAuditRepository:
             self._pending_call_indices.add((state_id, idx))
             return idx
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        """Allocate a proposal for an operation in the current leader's run."""
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="allocate_operation_call_index",
+        ) as conn:
+            self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+            return self._allocate_operation_call_index_on(conn, operation_id)
+
+    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str) -> int:
         """Allocate next call index for an operation_id (thread-safe).
 
         Provides process-local call index proposals within each operation.
@@ -160,9 +186,7 @@ class CallAuditRepository:
                 # Slow path (once per operation_id): seed from database to survive
                 # recorder recreation on resume. Serialized under lock — acceptable
                 # because it fires only once per operation_id per recorder lifetime.
-                row = self._ops.execute_fetchone(
-                    select(func.max(calls_table.c.call_index)).where(calls_table.c.operation_id == operation_id)
-                )
+                row = conn.execute(select(func.max(calls_table.c.call_index)).where(calls_table.c.operation_id == operation_id)).fetchone()
                 existing_max = row[0] if row is not None and row[0] is not None else -1
                 self._operation_call_indices[operation_id] = existing_max + 1
             # Fast path: allocate from in-memory counter (no DB access)
@@ -204,6 +228,7 @@ class CallAuditRepository:
 
     def _insert_allocated_call(
         self,
+        conn: Connection,
         values: dict[str, object],
         *,
         parent_column: str,
@@ -216,31 +241,30 @@ class CallAuditRepository:
             raise FrameworkBugError("prepared call_index must be an exact integer")
 
         try:
-            with self._db.write_connection() as conn:
-                if not allocation_is_owned:
-                    conn.execute(calls_table.insert().values(**values))
-                    return values
+            if not allocation_is_owned:
+                conn.execute(calls_table.insert().values(**values))
+                return values
 
-                candidate = proposed_index
-                for _attempt in range(1_000):
-                    candidate_values = dict(values)
-                    candidate_values["call_index"] = candidate
-                    if parent_column == "operation_id":
-                        candidate_values["call_id"] = f"call_{parent_id}_{candidate}"
-                    inserted_id = conn.execute(
-                        self._collision_tolerant_insert(
-                            conn,
-                            candidate_values,
-                            parent_column=parent_column,
-                        ).returning(calls_table.c.call_id)
-                    ).scalar_one_or_none()
-                    if inserted_id is not None:
-                        return candidate_values
+            candidate = proposed_index
+            for _attempt in range(1_000):
+                candidate_values = dict(values)
+                candidate_values["call_index"] = candidate
+                if parent_column == "operation_id":
+                    candidate_values["call_id"] = f"call_{parent_id}_{candidate}"
+                inserted_id = conn.execute(
+                    self._collision_tolerant_insert(
+                        conn,
+                        candidate_values,
+                        parent_column=parent_column,
+                    ).returning(calls_table.c.call_id)
+                ).scalar_one_or_none()
+                if inserted_id is not None:
+                    return candidate_values
 
-                    existing_max = conn.execute(
-                        select(func.max(calls_table.c.call_index)).where(calls_table.c[parent_column] == parent_id)
-                    ).scalar_one()
-                    candidate = (existing_max if existing_max is not None else -1) + 1
+                existing_max = conn.execute(
+                    select(func.max(calls_table.c.call_index)).where(calls_table.c[parent_column] == parent_id)
+                ).scalar_one()
+                candidate = (existing_max if existing_max is not None else -1) + 1
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"record_call failed for {parent_column}={parent_id!r} — database rejected audit write: {type(exc).__name__}"
@@ -331,7 +355,7 @@ class CallAuditRepository:
         column_name: str,
         payload_bytes: bytes | None,
     ) -> str | None:
-        """Store one call payload and update the already-recorded call row."""
+        """Store one payload outside SQL; the caller fences its metadata update."""
         if payload_bytes is None:
             return None
         if self._payload_store is None:
@@ -339,10 +363,6 @@ class CallAuditRepository:
 
         try:
             payload_ref = self._payload_store.store(payload_bytes)
-            self._ops.execute_update(
-                calls_table.update().where(calls_table.c.call_id == call_id).values(**{column_name: payload_ref}),
-                context=f"calls.{column_name} for {call_id}",
-            )
         except Exception as exc:
             raise LandscapePostCommitError(
                 f"Call {call_id} was recorded, but {column_name} materialization failed: {type(exc).__name__}: {exc}"
@@ -372,6 +392,30 @@ class CallAuditRepository:
 
         return request_ref, response_ref
 
+    @staticmethod
+    def _verify_state_parent(conn: Connection, *, state_id: str, run_id: str, token_id: str) -> None:
+        parent = conn.execute(
+            select(node_states_table.c.run_id, node_states_table.c.token_id).where(node_states_table.c.state_id == state_id)
+        ).one_or_none()
+        if parent is None or parent.run_id != run_id or parent.token_id != token_id:
+            raise AuditIntegrityError("call parent state does not belong to the claimed work item")
+
+    @staticmethod
+    def _verify_operation_parent(conn: Connection, *, operation_id: str, run_id: str) -> None:
+        parent_run_id = conn.execute(
+            select(operations_table.c.run_id).where(operations_table.c.operation_id == operation_id)
+        ).scalar_one_or_none()
+        if parent_run_id != run_id:
+            raise AuditIntegrityError("call parent operation does not belong to the authorized run")
+
+    @staticmethod
+    def _update_call_refs_on(conn: Connection, *, call_id: str, request_ref: str | None, response_ref: str | None) -> None:
+        result = conn.execute(
+            calls_table.update().where(calls_table.c.call_id == call_id).values(request_ref=request_ref, response_ref=response_ref)
+        )
+        if result.rowcount != 1:
+            raise AuditIntegrityError("call disappeared before payload materialization")
+
     def record_call(
         self,
         state_id: str,
@@ -383,6 +427,8 @@ class CallAuditRepository:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -462,12 +508,20 @@ class CallAuditRepository:
         )
         recorded_index: int | None = None
         try:
-            values = self._insert_allocated_call(
-                values,
-                parent_column="state_id",
-                parent_id=state_id,
-                allocation_is_owned=allocation_is_owned,
-            )
+            with fenced_item_transaction(
+                self._db.engine,
+                member_token=member_token,
+                work_item=work_item,
+                verb="record_call",
+            ) as conn:
+                self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                values = self._insert_allocated_call(
+                    conn,
+                    values,
+                    parent_column="state_id",
+                    parent_id=state_id,
+                    allocation_is_owned=allocation_is_owned,
+                )
             call_id = str(values["call_id"])
             recorded_value = values["call_index"]
             if type(recorded_value) is not int:
@@ -482,6 +536,18 @@ class CallAuditRepository:
                 operation=False,
             )
         request_ref, response_ref = self._materialize_call_refs_after_insert(call_id, prepared)
+        if prepared.request_bytes is not None or prepared.response_bytes is not None:
+            try:
+                with fenced_item_transaction(
+                    self._db.engine,
+                    member_token=member_token,
+                    work_item=work_item,
+                    verb="record_call_payload_refs",
+                ) as conn:
+                    self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                    self._update_call_refs_on(conn, call_id=call_id, request_ref=request_ref, response_ref=response_ref)
+            except SQLAlchemyError as exc:
+                raise LandscapePostCommitError(f"Call {call_id} was recorded, but payload reference update failed") from exc
 
         return Call(
             call_id=call_id,
@@ -510,6 +576,7 @@ class CallAuditRepository:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
@@ -541,7 +608,7 @@ class CallAuditRepository:
         validate_resolved_prompt_template_hash(call_type, resolved_prompt_template_hash)
 
         if call_index is None:
-            call_index = self.allocate_operation_call_index(operation_id)
+            call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         call_id = f"call_{operation_id}_{call_index}"
         timestamp = now()
         prepared = self._prepare_call_payloads(
@@ -577,12 +644,20 @@ class CallAuditRepository:
         )
         recorded_index = None
         try:
-            values = self._insert_allocated_call(
-                values,
-                parent_column="operation_id",
-                parent_id=operation_id,
-                allocation_is_owned=allocation_is_owned,
-            )
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_operation_call",
+            ) as conn:
+                self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                values = self._insert_allocated_call(
+                    conn,
+                    values,
+                    parent_column="operation_id",
+                    parent_id=operation_id,
+                    allocation_is_owned=allocation_is_owned,
+                )
             call_id = str(values["call_id"])
             recorded_value = values["call_index"]
             if type(recorded_value) is not int:
@@ -597,6 +672,19 @@ class CallAuditRepository:
                 operation=True,
             )
         request_ref, response_ref = self._materialize_call_refs_after_insert(call_id, prepared)
+
+        if prepared.request_bytes is not None or prepared.response_bytes is not None:
+            try:
+                with fenced_leader_transaction(
+                    self._db.engine,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="record_operation_call_payload_refs",
+                ) as conn:
+                    self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                    self._update_call_refs_on(conn, call_id=call_id, request_ref=request_ref, response_ref=response_ref)
+            except SQLAlchemyError as exc:
+                raise LandscapePostCommitError(f"Call {call_id} was recorded, but payload reference update failed") from exc
 
         return Call(
             call_id=call_id,

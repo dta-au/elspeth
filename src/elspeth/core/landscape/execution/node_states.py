@@ -32,15 +32,23 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.advisory_locks import ELSPETH_ROUTING_GROUP_LOCK_CLASSID
 from elspeth.contracts.audit import validate_node_state_completion_fields
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.hashing import repr_hash
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import NodeStateLoader, RoutingEventLoader
+from elspeth.core.landscape.run_coordination_repository import (
+    fenced_leader_transaction,
+    fenced_member_transaction,
+    verify_and_extend_leader_fence,
+)
 from elspeth.core.landscape.schema import (
     edges_table,
     node_states_table,
@@ -93,10 +101,10 @@ class NodeStateRepository:
         self,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         *,
+        member_token: WorkerMembershipToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -144,20 +152,22 @@ class NodeStateRepository:
             started_at=timestamp,
         )
 
-        self._ops.execute_insert(
-            node_states_table.insert().values(
-                state_id=state.state_id,
-                token_id=state.token_id,
-                node_id=state.node_id,
-                run_id=run_id,  # Added for composite FK to nodes
-                step_index=state.step_index,
-                attempt=state.attempt,
-                status=state.status,
-                input_hash=state.input_hash,
-                started_at=state.started_at,
-                resume_checkpoint_id=resume_checkpoint_id,
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="begin_node_state") as conn:
+            self._ops.execute_insert_on(
+                conn,
+                node_states_table.insert().values(
+                    state_id=state.state_id,
+                    token_id=state.token_id,
+                    node_id=state.node_id,
+                    run_id=member_token.run_id,
+                    step_index=state.step_index,
+                    attempt=state.attempt,
+                    status=state.status,
+                    input_hash=state.input_hash,
+                    started_at=state.started_at,
+                    resume_checkpoint_id=resume_checkpoint_id,
+                ),
             )
-        )
 
         return state
 
@@ -165,12 +175,12 @@ class NodeStateRepository:
         self,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         output_data: Mapping[str, object] | list[Mapping[str, object]],
         duration_ms: float,
         *,
+        coordination_token: CoordinationToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -186,16 +196,21 @@ class NodeStateRepository:
         """
         state_id = state_id or generate_id()
         try:
-            with self._db.write_connection() as conn:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_completed_node_state",
+            ) as conn:
                 return self.record_completed_node_state_on(
                     conn,
                     token_id,
                     node_id,
-                    run_id,
                     step_index,
                     input_data,
                     output_data,
                     duration_ms,
+                    coordination_token=coordination_token,
                     state_id=state_id,
                     attempt=attempt,
                     quarantined=quarantined,
@@ -212,12 +227,12 @@ class NodeStateRepository:
         conn: Connection,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         output_data: Mapping[str, object] | list[Mapping[str, object]],
         duration_ms: float,
         *,
+        coordination_token: CoordinationToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -225,6 +240,12 @@ class NodeStateRepository:
         context_after: NodeStateContext | None = None,
     ) -> NodeStateCompleted:
         """Insert an immediately completed state on a caller-owned transaction."""
+        verify_and_extend_leader_fence(
+            conn,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_completed_node_state_on",
+        )
         state_id = state_id or generate_id()
         if quarantined:
             try:
@@ -245,7 +266,7 @@ class NodeStateRepository:
                     state_id=state_id,
                     token_id=token_id,
                     node_id=node_id,
-                    run_id=run_id,
+                    run_id=coordination_token.run_id,
                     step_index=step_index,
                     attempt=attempt,
                     status=NodeStateStatus.COMPLETED.value,
@@ -335,7 +356,7 @@ class NodeStateRepository:
         *,
         token_id: str,
         source_node_id: str,
-        run_id: str,
+        coordination_token: CoordinationToken,
         source_data: Mapping[str, object],
     ) -> bool:
         """Insert a missing source completion or validate the exact existing witness."""
@@ -344,7 +365,7 @@ class NodeStateRepository:
             conn,
             token_id=token_id,
             source_node_id=source_node_id,
-            run_id=run_id,
+            run_id=coordination_token.run_id,
             expected_hash=expected_hash,
         ):
             return False
@@ -352,7 +373,7 @@ class NodeStateRepository:
             conn,
             token_id=token_id,
             node_id=source_node_id,
-            run_id=run_id,
+            coordination_token=coordination_token,
             step_index=0,
             input_data=source_data,
             output_data=source_data,
@@ -362,7 +383,9 @@ class NodeStateRepository:
 
     def begin_node_states_many(
         self,
-        entries: Sequence[tuple[str, str, str, int, Mapping[str, object]]],
+        entries: Sequence[tuple[str, str, int, Mapping[str, object]]],
+        *,
+        coordination_token: CoordinationToken,
     ) -> list[NodeStateOpen]:
         """Begin many node states in one audit transaction.
 
@@ -372,12 +395,18 @@ class NodeStateRepository:
         node_states row; only the database round trips are batched.
         """
         if not entries:
-            return []
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="begin_node_states_many",
+            ):
+                return []
 
         timestamp = now()
         states: list[NodeStateOpen] = []
         values: list[dict[str, object]] = []
-        for token_id, node_id, run_id, step_index, input_data in entries:
+        for token_id, node_id, step_index, input_data in entries:
             input_hash = stable_hash(input_data)
             state = NodeStateOpen(
                 state_id=generate_id(),
@@ -396,7 +425,7 @@ class NodeStateRepository:
                     "state_id": state.state_id,
                     "token_id": state.token_id,
                     "node_id": state.node_id,
-                    "run_id": run_id,
+                    "run_id": coordination_token.run_id,
                     "step_index": state.step_index,
                     "attempt": state.attempt,
                     "status": state.status,
@@ -406,7 +435,12 @@ class NodeStateRepository:
             )
 
         try:
-            with self._db.write_connection() as conn:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="begin_node_states_many",
+            ) as conn:
                 result = conn.execute(node_states_table.insert(), values)
                 if result.rowcount not in (-1, len(values)):
                     raise LandscapeRecordError(
@@ -424,12 +458,39 @@ class NodeStateRepository:
         state_id: str,
         status: NodeStateStatus,
         *,
+        member_token: WorkerMembershipToken,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
-        conn: Connection | None = None,
+    ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
+        """Complete one state under the writer's current membership."""
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="complete_node_state") as conn:
+            return self.complete_node_state_on(
+                state_id,
+                status,
+                conn=conn,
+                run_id=member_token.run_id,
+                output_data=output_data,
+                duration_ms=duration_ms,
+                error=error,
+                success_reason=success_reason,
+                context_after=context_after,
+            )
+
+    def complete_node_state_on(
+        self,
+        state_id: str,
+        status: NodeStateStatus,
+        *,
+        run_id: str,
+        output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
+        duration_ms: float | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
+        success_reason: TransformSuccessReason | None = None,
+        context_after: NodeStateContext | None = None,
+        conn: Connection,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
         """Complete a node state.
 
@@ -484,6 +545,7 @@ class NodeStateRepository:
             update_result = active_conn.execute(
                 node_states_table.update()
                 .where(node_states_table.c.state_id == state_id)
+                .where(node_states_table.c.run_id == run_id)
                 .where(node_states_table.c.status.notin_(terminal_values))
                 .values(
                     status=status,
@@ -498,9 +560,11 @@ class NodeStateRepository:
             if update_result.rowcount == 0:
                 # Distinguish "not found" from "already terminal".
                 existing = active_conn.execute(
-                    select(node_states_table.c.status).where(node_states_table.c.state_id == state_id)
+                    select(node_states_table.c.status, node_states_table.c.run_id).where(node_states_table.c.state_id == state_id)
                 ).fetchone()
                 if existing is not None:
+                    if existing.run_id != run_id:
+                        raise AuditIntegrityError("Cannot complete a node state belonging to a foreign run")
                     raise LandscapeRecordError(
                         f"Cannot complete node state {state_id}: current status {existing.status!r} is already terminal. "
                         f"Terminal node states are immutable."
@@ -511,11 +575,7 @@ class NodeStateRepository:
             return active_conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
 
         try:
-            if conn is None:
-                with self._db.write_connection() as active_conn:
-                    row = _complete_on(active_conn)
-            else:
-                row = _complete_on(conn)
+            row = _complete_on(conn)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"complete_node_state failed for state_id={state_id} — database rejected audit update: {type(exc).__name__}: {exc}"
@@ -536,7 +596,7 @@ class NodeStateRepository:
         self,
         completions: Sequence[tuple[str, Mapping[str, object], float]],
         *,
-        conn: Connection | None = None,
+        conn: Connection,
     ) -> None:
         """Complete many node states as COMPLETED in one audit transaction.
 
@@ -641,11 +701,7 @@ class NodeStateRepository:
             return after_rows
 
         try:
-            if conn is None:
-                with self._db.write_connection() as active_conn:
-                    after_rows = _complete_on(active_conn)
-            else:
-                after_rows = _complete_on(conn)
+            after_rows = _complete_on(conn)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"complete_node_states_completed_many failed for {len(params)} states — database rejected audit update: "
@@ -769,6 +825,7 @@ class NodeStateRepository:
         mode: RoutingMode,
         reason: RoutingReason | None = None,
         *,
+        member_token: WorkerMembershipToken,
         event_id: str | None = None,
         routing_group_id: str | None = None,
         ordinal: int = 0,
@@ -822,18 +879,24 @@ class NodeStateRepository:
             created_at=timestamp,
         )
 
-        return self._insert_or_load_routing_decision(
-            [event],
-            owner="record_routing_event",
-            enforce_event_ids=event_id_was_supplied,
-            enforce_group_id=routing_group_id_was_supplied,
-        )[0]
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="record_routing_event") as conn:
+            return self._insert_or_load_routing_decision(
+                [event],
+                conn=conn,
+                run_id=member_token.run_id,
+                owner="record_routing_event",
+                enforce_event_ids=event_id_was_supplied,
+                enforce_group_id=routing_group_id_was_supplied,
+            )[0]
 
     def record_routing_events(
         self,
         state_id: str,
         routes: list[RoutingSpec],
         reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RoutingEvent]:
         """Record one complete fork/multi-destination routing decision.
 
@@ -850,7 +913,13 @@ class NodeStateRepository:
             List of RoutingEvent models
         """
         if not routes:
-            return []
+            with fenced_item_transaction(
+                self._db.engine,
+                member_token=member_token,
+                work_item=work_item,
+                verb="record_routing_events",
+            ):
+                return []
 
         routing_group_id = self._default_routing_group_id(state_id)
         reason_hash = stable_hash(reason) if reason is not None else None
@@ -880,12 +949,23 @@ class NodeStateRepository:
             )
             for ordinal, route in enumerate(routes)
         ]
-        return self._insert_or_load_routing_decision(
-            events,
-            owner="record_routing_events",
-            enforce_event_ids=False,
-            enforce_group_id=False,
-        )
+        with fenced_item_transaction(
+            self._db.engine,
+            member_token=member_token,
+            work_item=work_item,
+            verb="record_routing_events",
+        ) as conn:
+            state_token_id = conn.execute(select(node_states_table.c.token_id).where(node_states_table.c.state_id == state_id)).scalar_one()
+            if state_token_id != work_item.token_id:
+                raise AuditIntegrityError("record_routing_events: state does not belong to the claimed work item")
+            return self._insert_or_load_routing_decision(
+                events,
+                conn=conn,
+                run_id=member_token.run_id,
+                owner="record_routing_events",
+                enforce_event_ids=False,
+                enforce_group_id=False,
+            )
 
     def _routing_event_run_id(
         self,
@@ -1138,6 +1218,8 @@ class NodeStateRepository:
         self,
         events: list[RoutingEvent],
         *,
+        conn: Connection,
+        run_id: str,
         owner: str,
         enforce_event_ids: bool,
         enforce_group_id: bool,
@@ -1146,72 +1228,71 @@ class NodeStateRepository:
         state_id = events[0].state_id
         routing_group_id = events[0].routing_group_id
         try:
-            with self._db.write_connection() as conn:
-                self._acquire_routing_group_authority(conn, routing_group_id=routing_group_id)
-                locked_run_id = self._lock_routing_state(conn, state_id=state_id, owner=owner)
-                run_ids: list[str] = []
-                for event in events:
-                    if event.state_id != state_id or event.routing_group_id != routing_group_id:
-                        raise AuditIntegrityError(f"{owner} attempted to write a mixed routing decision")
-                    durable_run_id = self._routing_event_run_id(
-                        state_id=state_id,
-                        edge_id=event.edge_id,
-                        owner=owner,
-                        conn=conn,
-                    )
-                    if durable_run_id != locked_run_id:
-                        raise LandscapeRecordError(
-                            f"{owner} requires state_id={state_id!r} and edge_id={event.edge_id!r} to remain in the same run"
-                        )
-                    run_ids.append(durable_run_id)
-
-                existing = list(conn.execute(self._routing_state_decision_query(state_id)).fetchall())
-                if existing:
-                    loaded = self._load_matching_routing_decision(
-                        existing,
-                        events,
-                        run_ids=run_ids,
-                        enforce_event_ids=enforce_event_ids,
-                        enforce_group_id=enforce_group_id,
-                    )
-                    durable_group_id = str(existing[0].routing_group_id)
-                    self._assert_group_is_state_owned(
-                        conn,
-                        routing_group_id=durable_group_id,
-                        state_id=state_id,
-                        expected_count=len(existing),
-                    )
-                    return loaded
-
-                # A legacy/corrupt row may already own this group under a
-                # different state. Never grow it into a mixed decision.
-                self._assert_group_is_state_owned(
-                    conn,
-                    routing_group_id=routing_group_id,
+            self._acquire_routing_group_authority(conn, routing_group_id=routing_group_id)
+            locked_run_id = self._lock_routing_state(conn, state_id=state_id, owner=owner)
+            if locked_run_id != run_id:
+                raise AuditIntegrityError(f"{owner}: routing state belongs to a foreign run")
+            run_ids: list[str] = []
+            for event in events:
+                if event.state_id != state_id or event.routing_group_id != routing_group_id:
+                    raise AuditIntegrityError(f"{owner} attempted to write a mixed routing decision")
+                durable_run_id = self._routing_event_run_id(
                     state_id=state_id,
-                    expected_count=0,
+                    edge_id=event.edge_id,
+                    owner=owner,
+                    conn=conn,
                 )
-                for event, run_id in zip(events, run_ids, strict=True):
-                    result = conn.execute(self._routing_insert_statement(conn, self._routing_event_values(event, run_id=run_id)))
-                    if result.rowcount != 1 and conn.dialect.name != "postgresql":
-                        raise AuditIntegrityError(
-                            f"Failed to insert routing event {event.event_id} for state {state_id} - zero rows affected"
-                        )
+                if durable_run_id != locked_run_id:
+                    raise LandscapeRecordError(
+                        f"{owner} requires state_id={state_id!r} and edge_id={event.edge_id!r} to remain in the same run"
+                    )
+                run_ids.append(durable_run_id)
 
-                durable_rows = list(conn.execute(self._routing_state_decision_query(state_id)).fetchall())
-                self._assert_group_is_state_owned(
-                    conn,
-                    routing_group_id=routing_group_id,
-                    state_id=state_id,
-                    expected_count=len(events),
-                )
-                return self._load_matching_routing_decision(
-                    durable_rows,
+            existing = list(conn.execute(self._routing_state_decision_query(state_id)).fetchall())
+            if existing:
+                loaded = self._load_matching_routing_decision(
+                    existing,
                     events,
                     run_ids=run_ids,
-                    enforce_event_ids=True,
-                    enforce_group_id=True,
+                    enforce_event_ids=enforce_event_ids,
+                    enforce_group_id=enforce_group_id,
                 )
+                durable_group_id = str(existing[0].routing_group_id)
+                self._assert_group_is_state_owned(
+                    conn,
+                    routing_group_id=durable_group_id,
+                    state_id=state_id,
+                    expected_count=len(existing),
+                )
+                return loaded
+
+            # A legacy/corrupt row may already own this group under a
+            # different state. Never grow it into a mixed decision.
+            self._assert_group_is_state_owned(
+                conn,
+                routing_group_id=routing_group_id,
+                state_id=state_id,
+                expected_count=0,
+            )
+            for event, event_run_id in zip(events, run_ids, strict=True):
+                result = conn.execute(self._routing_insert_statement(conn, self._routing_event_values(event, run_id=event_run_id)))
+                if result.rowcount != 1 and conn.dialect.name != "postgresql":
+                    raise AuditIntegrityError(f"Failed to insert routing event {event.event_id} for state {state_id} - zero rows affected")
+
+            durable_rows = list(conn.execute(self._routing_state_decision_query(state_id)).fetchall())
+            self._assert_group_is_state_owned(
+                conn,
+                routing_group_id=routing_group_id,
+                state_id=state_id,
+                expected_count=len(events),
+            )
+            return self._load_matching_routing_decision(
+                durable_rows,
+                events,
+                run_ids=run_ids,
+                enforce_event_ids=True,
+                enforce_group_id=True,
+            )
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"{owner} failed for state_id={state_id} — database rejected audit write: {type(exc).__name__}"

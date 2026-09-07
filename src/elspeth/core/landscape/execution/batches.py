@@ -14,6 +14,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import Batch, BatchMember, BatchStatus, TriggerType
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -21,6 +22,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.model_loaders import BatchLoader, BatchMemberLoader
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, verify_and_extend_leader_fence
 from elspeth.core.landscape.schema import batch_members_table, batches_table, tokens_table
 
 _TERMINAL_BATCH_STATUSES = frozenset({BatchStatus.COMPLETED, BatchStatus.FAILED})
@@ -164,9 +166,9 @@ class BatchRepository:
 
     def create_batch(
         self,
-        run_id: str,
         aggregation_node_id: str,
         *,
+        coordination_token: CoordinationToken,
         batch_id: str | None = None,
         attempt: int = 0,
     ) -> Batch:
@@ -186,61 +188,39 @@ class BatchRepository:
 
         batch = Batch(
             batch_id=batch_id,
-            run_id=run_id,
+            run_id=coordination_token.run_id,
             aggregation_node_id=aggregation_node_id,
             attempt=attempt,
             status=BatchStatus.DRAFT,  # Strict: enum type
             created_at=timestamp,
         )
 
-        self._ops.execute_insert(
-            batches_table.insert().values(
-                batch_id=batch.batch_id,
-                run_id=batch.run_id,
-                aggregation_node_id=batch.aggregation_node_id,
-                attempt=batch.attempt,
-                status=batch.status,
-                created_at=batch.created_at,
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="create_batch",
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                batches_table.insert().values(
+                    batch_id=batch.batch_id,
+                    run_id=batch.run_id,
+                    aggregation_node_id=batch.aggregation_node_id,
+                    attempt=batch.attempt,
+                    status=batch.status,
+                    created_at=batch.created_at,
+                ),
             )
-        )
 
         return batch
-
-    def add_batch_member(
-        self,
-        batch_id: str,
-        token_id: str,
-        ordinal: int,
-        *,
-        conn: Connection | None = None,
-    ) -> BatchMember:
-        """Add a token to a DRAFT batch in one atomic database boundary.
-
-        Args:
-            batch_id: Batch to add to
-            token_id: Token to add
-            ordinal: Order in batch
-            conn: Optional caller-owned write transaction
-
-        Returns:
-            BatchMember model
-        """
-
-        try:
-            if conn is not None:
-                return add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal)
-            with self._db.write_connection() as active_conn:
-                return add_batch_member_guarded(active_conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal)
-        except SQLAlchemyError as exc:
-            raise LandscapeRecordError(
-                f"add_batch_member failed (batch_members) — database rejected audit write: {type(exc).__name__}"
-            ) from exc
 
     def update_batch_status(
         self,
         batch_id: str,
         status: BatchStatus,
         *,
+        coordination_token: CoordinationToken,
         trigger_type: TriggerType | None = None,
         trigger_reason: str | None = None,
         state_id: str | None = None,
@@ -274,17 +254,27 @@ class BatchRepository:
         # TOCTOU race between the old get_batch() read and the subsequent update.
         terminal_values = [s.value for s in _TERMINAL_BATCH_STATUSES]
         try:
-            with self._db.write_connection() as conn:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="update_batch_status",
+            ) as conn:
                 result = conn.execute(
                     batches_table.update()
                     .where(batches_table.c.batch_id == batch_id)
+                    .where(batches_table.c.run_id == coordination_token.run_id)
                     .where(batches_table.c.status.notin_(terminal_values))
                     .values(**updates)
                 )
                 if result.rowcount == 0:
                     # Distinguish "not found" from "already terminal".
-                    existing = conn.execute(select(batches_table.c.status).where(batches_table.c.batch_id == batch_id)).fetchone()
+                    existing = conn.execute(
+                        select(batches_table.c.status, batches_table.c.run_id).where(batches_table.c.batch_id == batch_id)
+                    ).fetchone()
                     if existing is not None:
+                        if existing.run_id != coordination_token.run_id:
+                            raise AuditIntegrityError("Cannot update a batch belonging to a foreign run")
                         raise AuditIntegrityError(
                             f"Cannot transition batch {batch_id} from terminal status {existing.status!r} "
                             f"to {status.value!r}. Terminal batches are immutable."
@@ -300,6 +290,7 @@ class BatchRepository:
         batch_id: str,
         status: BatchStatus,
         *,
+        coordination_token: CoordinationToken,
         trigger_type: TriggerType | None = None,
         trigger_reason: str | None = None,
         state_id: str | None = None,
@@ -336,6 +327,7 @@ class BatchRepository:
             update_result = active_conn.execute(
                 batches_table.update()
                 .where(batches_table.c.batch_id == batch_id)
+                .where(batches_table.c.run_id == coordination_token.run_id)
                 .where(batches_table.c.status.notin_(terminal_values))
                 .values(
                     status=status,
@@ -347,8 +339,12 @@ class BatchRepository:
             )
             if update_result.rowcount == 0:
                 # Distinguish "not found" from "already terminal".
-                existing = active_conn.execute(select(batches_table.c.status).where(batches_table.c.batch_id == batch_id)).fetchone()
+                existing = active_conn.execute(
+                    select(batches_table.c.status, batches_table.c.run_id).where(batches_table.c.batch_id == batch_id)
+                ).fetchone()
                 if existing is not None:
+                    if existing.run_id != coordination_token.run_id:
+                        raise AuditIntegrityError("Cannot complete a batch belonging to a foreign run")
                     raise AuditIntegrityError(
                         f"Cannot complete batch {batch_id}: current status {existing.status!r} is already terminal. "
                         f"Terminal batches are immutable."
@@ -360,9 +356,20 @@ class BatchRepository:
 
         try:
             if conn is None:
-                with self._db.write_connection() as active_conn:
+                with fenced_leader_transaction(
+                    self._db.engine,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="complete_batch",
+                ) as active_conn:
                     row = _complete_on(active_conn)
             else:
+                verify_and_extend_leader_fence(
+                    conn,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="complete_batch",
+                )
                 row = _complete_on(conn)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
@@ -479,7 +486,7 @@ class BatchRepository:
         rows = self._ops.execute_fetchall(query)
         return [self._batch_member_loader.load(row) for row in rows]
 
-    def retry_batch(self, batch_id: str) -> Batch:
+    def retry_batch(self, batch_id: str, *, coordination_token: CoordinationToken) -> Batch:
         """Create a new batch attempt from a failed batch (idempotent).
 
         Copies batch metadata and members to a new batch with
@@ -499,12 +506,19 @@ class BatchRepository:
         Raises:
             ValueError: If original batch not found or not in failed status
         """
-        with self._db.write_connection() as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="retry_batch",
+        ) as conn:
             # 1. Get original batch
             original_row = conn.execute(select(batches_table).where(batches_table.c.batch_id == batch_id)).fetchone()
             if original_row is None:
                 raise AuditIntegrityError(f"retry_batch: batch {batch_id} not found — audit data corruption")
             original = self._batch_loader.load(original_row)
+            if original.run_id != coordination_token.run_id:
+                raise AuditIntegrityError("retry_batch: batch belongs to a foreign run")
             if original.status != BatchStatus.FAILED:
                 raise AuditIntegrityError(f"retry_batch: can only retry failed batches, batch {batch_id} has status {original.status!r}")
 

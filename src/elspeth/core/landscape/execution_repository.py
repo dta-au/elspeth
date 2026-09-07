@@ -31,7 +31,6 @@ from elspeth.contracts import (
     AggregationResultMember,
     AggregationResultReceipt,
     Artifact,
-    ArtifactPublicationEvidenceKind,
     Batch,
     BatchMember,
     BatchStatus,
@@ -58,8 +57,9 @@ from elspeth.contracts import (
     TriggerType,
 )
 from elspeth.contracts.call_data import CallPayload
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
@@ -90,6 +90,7 @@ from elspeth.core.landscape.model_loaders import (
     SinkEffectStreamLoader,
 )
 from elspeth.core.landscape.row_data import CallDataResult
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
     aggregation_result_outputs_table,
@@ -195,10 +196,10 @@ class ExecutionRepository:
         self,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         *,
+        member_token: WorkerMembershipToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -208,9 +209,9 @@ class ExecutionRepository:
         return self.node_states.begin_node_state(
             token_id,
             node_id,
-            run_id,
             step_index,
             input_data,
+            member_token=member_token,
             state_id=state_id,
             attempt=attempt,
             quarantined=quarantined,
@@ -221,12 +222,12 @@ class ExecutionRepository:
         self,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         output_data: Mapping[str, object] | list[Mapping[str, object]],
         duration_ms: float,
         *,
+        coordination_token: CoordinationToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -237,11 +238,11 @@ class ExecutionRepository:
         return self.node_states.record_completed_node_state(
             token_id,
             node_id,
-            run_id,
             step_index,
             input_data,
             output_data,
             duration_ms,
+            coordination_token=coordination_token,
             state_id=state_id,
             attempt=attempt,
             quarantined=quarantined,
@@ -254,12 +255,12 @@ class ExecutionRepository:
         conn: Connection,
         token_id: str,
         node_id: str,
-        run_id: str,
         step_index: int,
         input_data: Mapping[str, object],
         output_data: Mapping[str, object] | list[Mapping[str, object]],
         duration_ms: float,
         *,
+        coordination_token: CoordinationToken,
         state_id: str | None = None,
         attempt: int = 0,
         quarantined: bool = False,
@@ -271,11 +272,11 @@ class ExecutionRepository:
             conn,
             token_id,
             node_id,
-            run_id,
             step_index,
             input_data,
             output_data,
             duration_ms,
+            coordination_token=coordination_token,
             state_id=state_id,
             attempt=attempt,
             quarantined=quarantined,
@@ -286,7 +287,6 @@ class ExecutionRepository:
     def reconcile_source_completions_from_scheduler(
         self,
         *,
-        run_id: str,
         coordination_token: CoordinationToken,
     ) -> int:
         """Repair fully witnessed pre-fix TS-02 source-completion gaps.
@@ -295,16 +295,17 @@ class ExecutionRepository:
         Landscape database time (ADR-047); no caller instant enters it.
         """
         return self.source_completion_recovery.reconcile(
-            run_id=run_id,
             coordination_token=coordination_token,
         )
 
     def begin_node_states_many(
         self,
-        entries: Sequence[tuple[str, str, str, int, Mapping[str, object]]],
+        entries: Sequence[tuple[str, str, int, Mapping[str, object]]],
+        *,
+        coordination_token: CoordinationToken,
     ) -> list[NodeStateOpen]:
         """Begin many node states in one audit transaction."""
-        return self.node_states.begin_node_states_many(entries)
+        return self.node_states.begin_node_states_many(entries, coordination_token=coordination_token)
 
     @overload
     def complete_node_state(
@@ -312,6 +313,7 @@ class ExecutionRepository:
         state_id: str,
         status: Literal[NodeStateStatus.PENDING],
         *,
+        member_token: WorkerMembershipToken,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
@@ -324,6 +326,7 @@ class ExecutionRepository:
         state_id: str,
         status: Literal[NodeStateStatus.COMPLETED],
         *,
+        member_token: WorkerMembershipToken,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
@@ -337,6 +340,7 @@ class ExecutionRepository:
         state_id: str,
         status: Literal[NodeStateStatus.FAILED],
         *,
+        member_token: WorkerMembershipToken,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
@@ -348,6 +352,7 @@ class ExecutionRepository:
         state_id: str,
         status: NodeStateStatus,
         *,
+        member_token: WorkerMembershipToken,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
@@ -358,21 +363,13 @@ class ExecutionRepository:
         return self.node_states.complete_node_state(
             state_id,
             status,
+            member_token=member_token,
             output_data=output_data,
             duration_ms=duration_ms,
             error=error,
             success_reason=success_reason,
             context_after=context_after,
         )
-
-    def complete_node_states_completed_many(
-        self,
-        completions: Sequence[tuple[str, Mapping[str, object], float]],
-        *,
-        conn: Connection | None = None,
-    ) -> None:
-        """Complete many node states as COMPLETED in one audit transaction."""
-        return self.node_states.complete_node_states_completed_many(completions, conn=conn)
 
     def get_node_state(self, state_id: str) -> NodeState | None:
         """Get a node state by ID."""
@@ -552,6 +549,7 @@ class ExecutionRepository:
         mode: RoutingMode,
         reason: RoutingReason | None = None,
         *,
+        member_token: WorkerMembershipToken,
         event_id: str | None = None,
         routing_group_id: str | None = None,
         ordinal: int = 0,
@@ -569,6 +567,7 @@ class ExecutionRepository:
             edge_id,
             mode,
             reason,
+            member_token=member_token,
             event_id=event_id,
             routing_group_id=routing_group_id,
             ordinal=ordinal,
@@ -580,15 +579,18 @@ class ExecutionRepository:
         state_id: str,
         routes: list[RoutingSpec],
         reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RoutingEvent]:
         """Atomically record one complete fork/multi-destination decision."""
-        return self.node_states.record_routing_events(state_id, routes, reason)
+        return self.node_states.record_routing_events(state_id, routes, reason, member_token=member_token, work_item=work_item)
 
     # ── Call recording (CallAuditRepository) ───────────────────────────
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         """Allocate next call index for a state_id (thread-safe)."""
-        return self.calls.allocate_call_index(state_id)
+        return self.calls.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
 
     def record_call(
         self,
@@ -601,6 +603,8 @@ class ExecutionRepository:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -615,6 +619,8 @@ class ExecutionRepository:
             response_data,
             error,
             latency_ms,
+            member_token=member_token,
+            work_item=work_item,
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
@@ -624,18 +630,18 @@ class ExecutionRepository:
 
     def begin_operation(
         self,
-        run_id: str,
         node_id: str,
         operation_type: OperationType,
         *,
+        coordination_token: CoordinationToken,
         input_data: Mapping[str, object] | None = None,
         sink_effect_id: str | None = None,
     ) -> Operation:
         """Begin an operation for source/sink I/O."""
         return self.operations.begin_operation(
-            run_id,
             node_id,
             operation_type,
+            coordination_token=coordination_token,
             input_data=input_data,
             sink_effect_id=sink_effect_id,
         )
@@ -645,6 +651,7 @@ class ExecutionRepository:
         operation_id: str,
         status: Literal["completed", "failed"],
         *,
+        coordination_token: CoordinationToken,
         output_data: Mapping[str, object] | None = None,
         error: str | None = None,
         duration_ms: float | None = None,
@@ -653,14 +660,15 @@ class ExecutionRepository:
         return self.operations.complete_operation(
             operation_id,
             status,
+            coordination_token=coordination_token,
             output_data=output_data,
             error=error,
             duration_ms=duration_ms,
         )
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         """Allocate next call index for an operation_id (thread-safe)."""
-        return self.calls.allocate_operation_call_index(operation_id)
+        return self.calls.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
 
     def record_operation_call(
         self,
@@ -672,6 +680,7 @@ class ExecutionRepository:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
@@ -686,6 +695,7 @@ class ExecutionRepository:
             response_data,
             error,
             latency_ms,
+            coordination_token=coordination_token,
             call_index=call_index,
             request_ref=request_ref,
             response_ref=response_ref,
@@ -727,31 +737,21 @@ class ExecutionRepository:
 
     def create_batch(
         self,
-        run_id: str,
         aggregation_node_id: str,
         *,
+        coordination_token: CoordinationToken,
         batch_id: str | None = None,
         attempt: int = 0,
     ) -> Batch:
         """Create a new batch for aggregation."""
-        return self.batches.create_batch(run_id, aggregation_node_id, batch_id=batch_id, attempt=attempt)
-
-    def add_batch_member(
-        self,
-        batch_id: str,
-        token_id: str,
-        ordinal: int,
-        *,
-        conn: Connection | None = None,
-    ) -> BatchMember:
-        """Add a token to a batch."""
-        return self.batches.add_batch_member(batch_id, token_id, ordinal, conn=conn)
+        return self.batches.create_batch(aggregation_node_id, coordination_token=coordination_token, batch_id=batch_id, attempt=attempt)
 
     def update_batch_status(
         self,
         batch_id: str,
         status: BatchStatus,
         *,
+        coordination_token: CoordinationToken,
         trigger_type: TriggerType | None = None,
         trigger_reason: str | None = None,
         state_id: str | None = None,
@@ -760,6 +760,7 @@ class ExecutionRepository:
         return self.batches.update_batch_status(
             batch_id,
             status,
+            coordination_token=coordination_token,
             trigger_type=trigger_type,
             trigger_reason=trigger_reason,
             state_id=state_id,
@@ -770,6 +771,7 @@ class ExecutionRepository:
         batch_id: str,
         status: BatchStatus,
         *,
+        coordination_token: CoordinationToken,
         trigger_type: TriggerType | None = None,
         trigger_reason: str | None = None,
         state_id: str | None = None,
@@ -778,6 +780,7 @@ class ExecutionRepository:
         return self.batches.complete_batch(
             batch_id,
             status,
+            coordination_token=coordination_token,
             trigger_type=trigger_type,
             trigger_reason=trigger_reason,
             state_id=state_id,
@@ -828,7 +831,7 @@ class ExecutionRepository:
         self,
         *,
         batch_id: str,
-        run_id: str,
+        coordination_token: CoordinationToken,
         aggregation_node_id: str,
         state_id: str,
         trigger_type: TriggerType,
@@ -843,6 +846,7 @@ class ExecutionRepository:
         context_after: NodeStateContext,
     ) -> AggregationResultReceipt:
         """Atomically complete node, batch, and durable aggregation output."""
+        run_id = coordination_token.run_id
         if type(output_mode) is not OutputMode:
             raise AuditIntegrityError("aggregation result receipt requires a nominal OutputMode")
         rows = tuple(output_rows)
@@ -982,7 +986,12 @@ class ExecutionRepository:
         )
         write_body_completed = False
         try:
-            with self._db.write_connection() as conn:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="complete_aggregation_result",
+            ) as conn:
                 token_rows = conn.execute(
                     select(tokens_table.c.token_id, tokens_table.c.run_id)
                     .where(tokens_table.c.token_id.in_(member_token_ids))
@@ -1076,7 +1085,8 @@ class ExecutionRepository:
                             f"aggregation result receipt members already have terminal outcomes: {terminal_token_ids!r}"
                         )
 
-                    self.node_states.complete_node_state(
+                    self.node_states.complete_node_state_on(
+                        run_id=coordination_token.run_id,
                         state_id=state_id,
                         status=NodeStateStatus.COMPLETED,
                         output_data=output_data,
@@ -1086,6 +1096,7 @@ class ExecutionRepository:
                         conn=conn,
                     )
                     self.batches.complete_batch(
+                        coordination_token=coordination_token,
                         batch_id=batch_id,
                         status=BatchStatus.COMPLETED,
                         trigger_type=trigger_type,
@@ -1202,45 +1213,11 @@ class ExecutionRepository:
         """Get all batch members for a run (batch query)."""
         return self.batches.get_all_batch_members_for_run(run_id)
 
-    def retry_batch(self, batch_id: str) -> Batch:
+    def retry_batch(self, batch_id: str, *, coordination_token: CoordinationToken) -> Batch:
         """Create a new batch attempt from a failed batch (idempotent)."""
-        return self.batches.retry_batch(batch_id)
+        return self.batches.retry_batch(batch_id, coordination_token=coordination_token)
 
     # === Artifact Registration (ArtifactRepository) ===
-
-    def register_artifact(
-        self,
-        run_id: str,
-        sink_node_id: str,
-        artifact_type: str,
-        path: str,
-        content_hash: str,
-        size_bytes: int,
-        *,
-        state_id: str | None = None,
-        sink_effect_id: str | None = None,
-        artifact_id: str | None = None,
-        idempotency_key: str | None = None,
-        publication_performed: bool = True,
-        publication_evidence_kind: ArtifactPublicationEvidenceKind | None = None,
-        conn: Connection | None = None,
-    ) -> Artifact:
-        """Register an artifact produced by a sink."""
-        return self.artifacts.register_artifact(
-            run_id,
-            sink_node_id,
-            artifact_type,
-            path,
-            content_hash,
-            size_bytes,
-            state_id=state_id,
-            sink_effect_id=sink_effect_id,
-            artifact_id=artifact_id,
-            idempotency_key=idempotency_key,
-            publication_performed=publication_performed,
-            publication_evidence_kind=publication_evidence_kind,
-            conn=conn,
-        )
 
     def get_artifacts(
         self,

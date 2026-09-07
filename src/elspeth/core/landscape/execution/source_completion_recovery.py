@@ -122,7 +122,6 @@ class SourceCompletionReconciler:
     def reconcile(
         self,
         *,
-        run_id: str,
         coordination_token: CoordinationToken,
     ) -> int:
         """Repair pre-fix TS-02 gaps atomically before any plugin can run.
@@ -132,6 +131,7 @@ class SourceCompletionReconciler:
         LEASED attempt-1 work item has the exact two-event initial scheduler
         history. Every ambiguity is an audit-integrity failure.
         """
+        run_id = coordination_token.run_id
         repaired = 0
         with fenced_leader_transaction(
             self._db.engine,
@@ -214,7 +214,7 @@ class SourceCompletionReconciler:
                         conn,
                         token_id=token_id,
                         source_node_id=source_node_id,
-                        run_id=run_id,
+                        coordination_token=coordination_token,
                         source_data=source_data,
                     )
                 )
