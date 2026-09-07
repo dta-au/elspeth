@@ -37,6 +37,8 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Final, TypedDict, cast
 
+from pydantic import TypeAdapter, ValidationError
+
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.receipt_validation import (
@@ -58,11 +60,15 @@ from elspeth.web._acceptance_common.replica_probes import (
 )
 from elspeth.web._acceptance_common.replica_probes import (
     PROBE_MECHANISMS,
+    CrossReplicaProgressObservation,
+    LeaseTakeoverObservation,
     Mechanism,
     Probe,
     ProbeOutcome,
     ProbeReceiptDetails,
     ProbeResult,
+    decide_cross_replica_progress,
+    decide_lease_takeover,
 )
 from elspeth.web._acceptance_common.schema_facts import _CANDIDATE_PACKAGE_VERSION, _expected_schema_facts
 from elspeth.web._acceptance_common.testcontainer_run import (
@@ -410,7 +416,7 @@ def _probe_result(
     # The casts assert nothing: ProbeResult's own construction rejects an
     # outcome or mechanism outside the closed vocabularies with ValueError.
     try:
-        return ProbeResult(
+        result = ProbeResult(
             probe=probe,
             outcome=cast(ProbeOutcome, outcome),
             mechanism=cast(Mechanism, mechanism),
@@ -419,6 +425,33 @@ def _probe_result(
         )
     except ValueError:
         raise _schema_violation() from None
+    if result.outcome == "pass" and probe in {"P3", "P4a"}:
+        if "observation" not in evidence:
+            raise _schema_violation()
+        try:
+            encoded = json.dumps(evidence["observation"], allow_nan=False)
+            if probe == "P3":
+                takeover = TypeAdapter(LeaseTakeoverObservation).validate_json(encoded, strict=True, extra="forbid")
+                _text(takeover.owner_instance_id)
+                _text(takeover.survivor_instance_id)
+                scored = decide_lease_takeover(takeover)
+            else:
+                progress = TypeAdapter(CrossReplicaProgressObservation).validate_json(encoded, strict=True, extra="forbid")
+                _text(progress.owner_instance_id)
+                _text(progress.reader_instance_id)
+                _sha256_text(progress.blob_sha256_via_owner)
+                _sha256_text(progress.blob_sha256_via_reader)
+                scored = decide_cross_replica_progress(progress)
+        except (ValidationError, TypeError, ValueError, AcceptanceCheckError):
+            raise _schema_violation() from None
+        if (scored.outcome, scored.mechanism, scored.reasons, scored.evidence) != (
+            result.outcome,
+            result.mechanism,
+            result.reasons,
+            result.evidence,
+        ):
+            raise _schema_violation()
+    return result
 
 
 def _log_query(query: object) -> str:

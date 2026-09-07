@@ -23,7 +23,15 @@ import pytest
 from elspeth.web._acceptance_common.compatibility_gate import compatibility_record_gate
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.replica_probes import MECHANISMS as PROBE_MECHANISMS_SET
-from elspeth.web._acceptance_common.replica_probes import PROBE_MECHANISMS, Mechanism, Probe, ProbeResult
+from elspeth.web._acceptance_common.replica_probes import (
+    PROBE_MECHANISMS,
+    CrossReplicaProgressObservation,
+    Mechanism,
+    Probe,
+    ProbeResult,
+    decide_cross_replica_progress,
+    decide_lease_takeover,
+)
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
 from elspeth.web._acceptance_common.testcontainer_run import (
     REQUIRED_POSTGRES_PROOF_IDS,
@@ -100,6 +108,25 @@ def _budget() -> dict[str, object]:
 
 
 def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, reasons: list[str] | None = None) -> dict[str, object]:
+    from .test_replica_probes import _takeover
+
+    evidence: dict[str, object] = {"trials": 20, "distinct_winners": 2}
+    if probe == "P3":
+        evidence = decide_lease_takeover(_takeover()).to_receipt_details()["evidence"]
+    elif probe == "P4a":
+        evidence = decide_cross_replica_progress(
+            CrossReplicaProgressObservation(
+                owner_instance_id="instance-a",
+                reader_instance_id="instance-b",
+                poll_interval_seconds=2.0,
+                status_visible_after_seconds=0.5,
+                outputs_visible_after_seconds=1.0,
+                messages_visible_after_seconds=1.5,
+                blob_sha256_via_owner=SHA,
+                blob_sha256_via_reader=SHA,
+                terminal_status_on_reader="completed",
+            )
+        ).to_receipt_details()["evidence"]
     return {
         "probe": probe,
         "outcome": outcome,
@@ -109,7 +136,7 @@ def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, r
         if probe != "P3"
         else "role_revocation_lease_expiry",
         "reasons": reasons if reasons is not None else ([] if outcome == "pass" else ["trial[0]:not_one_success_and_one_fence_refusal"]),
-        "evidence": {"trials": 20, "distinct_winners": 2},
+        "evidence": evidence,
     }
 
 
@@ -128,6 +155,27 @@ def test_external_p1_pass_requires_real_distinct_winner_count(winners: object) -
     details["evidence"] = {"trials": 20, "distinct_winners": winners}
     with pytest.raises(AcceptanceCheckError):
         _validate("replica-fence-conflict", details)
+
+
+@pytest.mark.parametrize("kind", ["replica-lease-takeover", "replica-progress"])
+@pytest.mark.parametrize("evidence", [{}, {"owner_row_state": "stopped"}])
+def test_external_p3_p4_receipts_require_replayable_observations(kind: str, evidence: object) -> None:
+    details = VALID[kind]()
+    details["evidence"] = evidence
+    with pytest.raises(AcceptanceCheckError):
+        _validate(kind, details)
+
+
+def test_external_p3_receipt_replays_before_expiry_identity_and_physical_effects() -> None:
+    for field, value in (("duplicate_sink_effects", 1), ("cancelled_run_reason", None)):
+        details = VALID["replica-lease-takeover"]()
+        details["evidence"]["observation"][field] = value
+        with pytest.raises(AcceptanceCheckError):
+            _validate("replica-lease-takeover", details)
+    details = VALID["replica-lease-takeover"]()
+    details["evidence"]["observation"]["before_expiry"]["instance_id"] = "third-instance"
+    with pytest.raises(AcceptanceCheckError):
+        _validate("replica-lease-takeover", details)
 
 
 def _job(name: str) -> dict[str, object]:

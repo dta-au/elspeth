@@ -277,7 +277,9 @@ class TestRunStartRecorded:
         replicas = _RecordedReplicas()
         driver, reader = _driver(replicas)
         reader.landscape_missing = True
-        trial = driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        trial = driver.run_start_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}), observation_timeout_seconds=0
+        )
         assert trial.landscape_run_ids == ()
         assert "trial[0]:landscape_runs:0!=1" in decide_run_start([trial]).reasons
 
@@ -305,6 +307,14 @@ def _takeover(**overrides: object) -> LeaseTakeoverObservation:
 
 
 class TestLeaseTakeover:
+    def test_before_expiry_refusal_must_come_from_survivor(self) -> None:
+        wrong_instance = replica_response_from_envelope(
+            addressed_to="b", status=409, instance_id="third-instance", body={"detail": SESSION_OPERATION_CONFLICT_DETAIL}
+        )
+        result = decide_lease_takeover(_takeover(before_expiry=wrong_instance))
+        assert result.outcome == "fail"
+        assert "before_expiry_response_not_from_survivor" in result.reasons
+
     def test_a_dead_owner_takeover_after_expiry_passes_and_validates_as_a_receipt(self) -> None:
         result = lease_takeover_for_receipt(decide_lease_takeover(_takeover()))
         assert result.outcome == "pass" and result.mechanism == "role_revocation_lease_expiry"

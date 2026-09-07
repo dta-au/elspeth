@@ -13,6 +13,7 @@ from typing import TypedDict
 from uuid import uuid4
 
 from azure.core.exceptions import ResourceExistsError
+from azure.storage.blob import BlobClient
 
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
 
@@ -23,6 +24,14 @@ class BlobProbeReport(TypedDict):
     blob_sha256: str
     collision_rejected: bool
     cleanup_succeeded: bool
+
+
+def _collision_is_rejected(blob: BlobClient) -> bool:
+    try:
+        blob.upload_blob(b"conflicting-content", overwrite=False)
+    except ResourceExistsError:
+        return True
+    return False
 
 
 def _pipeline(document: str, directory: Path, name: str) -> None:
@@ -45,7 +54,7 @@ def _pipeline(document: str, directory: Path, name: str) -> None:
 def run_probe(*, account_url: str, container: str, directory: Path) -> BlobProbeReport:
     """Publish through the sink, consume through the source, and independently check the remote object."""
 
-    if os.environ.get("AZURE_TOKEN_CREDENTIALS") != "ManagedIdentityCredential":
+    if "AZURE_TOKEN_CREDENTIALS" not in os.environ or os.environ["AZURE_TOKEN_CREDENTIALS"] != "ManagedIdentityCredential":
         raise ValueError("managed_identity_credential_required")
     auth = AzureAuthConfig(auth_mode="managed_identity", use_managed_identity=True, account_url=account_url)
     blob_path = f"elspeth-acceptance/{uuid4().hex}/probe.jsonl"
@@ -124,11 +133,7 @@ def run_probe(*, account_url: str, container: str, directory: Path) -> BlobProbe
         )
         if [json.loads(line) for line in output_path.read_bytes().splitlines() if line.strip()] != [row]:
             raise RuntimeError("blob_source_bytes_mismatch")
-        collision_rejected = False
-        try:
-            blob.upload_blob(b"conflicting-content", overwrite=False)
-        except ResourceExistsError:
-            collision_rejected = True
+        collision_rejected = _collision_is_rejected(blob)
         if not collision_rejected or blob.download_blob().readall() != published:
             raise RuntimeError("blob_collision_not_rejected")
         digest = hashlib.sha256(published).hexdigest()

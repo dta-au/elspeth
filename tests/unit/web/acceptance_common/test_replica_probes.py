@@ -467,6 +467,24 @@ def _driver(observer: _FakeObserver, replicas: _RecordedReplicas) -> ReplicaProb
 
 
 class TestDriver:
+    def test_run_start_waits_for_background_landscape_publication(self) -> None:
+        class DelayedObserver(_FakeObserver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reads_after_start = 0
+
+            def landscape_run_ids(self, session_id: str) -> tuple[str, ...]:
+                if self.owner is None:
+                    return ()
+                self.reads_after_start += 1
+                return ("landscape-1",) if self.reads_after_start == 2 else ()
+
+        observer = DelayedObserver()
+        driver = _driver(observer, _RecordedReplicas(observer))
+        trial = driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        assert trial.landscape_run_ids == ("landscape-1",)
+        assert observer.reads_after_start == 2
+
     def test_run_start_refuses_a_session_with_historical_runs_before_dispatch(self) -> None:
         observer = _FakeObserver()
         observer.owner = RA

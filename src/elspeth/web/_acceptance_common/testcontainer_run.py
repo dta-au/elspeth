@@ -21,8 +21,8 @@ covers host, port and database name only — never credentials.
 
 One validator and ONE gate predicate (:func:`testcontainer_run_gate`) serve both
 providers; each binds its own schema id
-(:data:`TESTCONTAINER_RUN_SCHEMAS`). The kind is NEW in 0.8.0 — no existing
-other receipt kinds retain their existing schemas. Version 2 of this kind
+(:data:`TESTCONTAINER_RUN_SCHEMAS`). Other receipt kinds retain their existing
+schemas. Version 2 of this kind
 adds the exact mandatory PostgreSQL witnesses that passed. Version 1 cannot
 prove that any required test executed and is refused by the evidence gate.
 Every field is required and the schema remains closed.

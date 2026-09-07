@@ -292,6 +292,30 @@ def _trial_session_ids(path: str, *, trials: int) -> tuple[str, ...]:
     return tuple(sessions)
 
 
+def _fence_trial_requests(path: str, *, trials: int) -> tuple[tuple[str, object], ...]:
+    """Each guided turn has its own session, operation ID and server-issued token."""
+
+    document = _list_document(path)
+    if type(document) is not list or len(document) != trials:
+        raise AcceptanceInputError("--trial-requests must contain one prepared guided request per trial")
+    requests: list[tuple[str, object]] = []
+    for item in document:
+        if type(item) is not dict or set(item) != {"session_id", "body"} or type(item["body"]) is not dict:
+            raise AcceptanceInputError("--trial-requests requires session_id and body records")
+        session = item["session_id"]
+        if (
+            type(session) is not str
+            or not session
+            or len(session) > 128
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in session)
+        ):
+            raise AcceptanceInputError("--trial-requests contains an invalid session identifier")
+        requests.append((session, item["body"]))
+    if len({session for session, _ in requests}) != trials:
+        raise AcceptanceInputError("guided contention trials require distinct sessions")
+    return tuple(requests)
+
+
 def _binding(args: argparse.Namespace) -> ReplicaBinding:
     return ReplicaBinding(container_app_id=args.container_app_id, revision=args.revision, replica=args.replica)
 
@@ -370,9 +394,9 @@ def probe_topology_check(
     require_even_label_split(project_label_weights(traffic), labels=(first.name, second.name))
     instances: list[str] = []
     for address in (first, second):
-        _status, instance_id, _body = client_factory(address.origin).request_json_with_instance(
-            "GET", PROBE_STATUS_PATH, expected_statuses={200}
-        )
+        with client_factory(address.origin) as client:
+            client.authenticate(register=False)
+            _status, instance_id, _body = client.request_json_with_instance("GET", PROBE_STATUS_PATH, expected_statuses={200})
         if instance_id is None:
             raise AcceptanceCheckError("probe_topology", missing=("X-Elspeth-Instance",))
         instances.append(instance_id)
@@ -480,9 +504,8 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--default-domain")
     probes.add_argument("--revision-suffix")
     probes.add_argument("--traffic", help="`az containerapp ingress traffic show` JSON")
-    probes.add_argument("--session-id")
     probes.add_argument("--session-ids", help="JSON array of distinct fresh, executable sessions, one per run-start trial")
-    probes.add_argument("--body", help="JSON request body file for the guided respond pair")
+    probes.add_argument("--trial-requests", help="JSON array of distinct guided sessions and their current response bodies")
     probes.add_argument("--trials", type=_trials_argument, default=DEFAULT_TRIALS)
     probes.add_argument("--observation", help="P3 / P4a observation document assembled by the driver")
 
@@ -521,20 +544,23 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
         if None in (args.resource_group, args.default_domain, args.revision_suffix, args.traffic):
             raise AcceptanceInputError("--resource-group, --default-domain, --revision-suffix and --traffic are required for a live probe")
         session_ids: tuple[str, ...] = ()
+        fence_requests: tuple[tuple[str, object], ...] = ()
         if args.probe == "run-start":
             if args.session_ids is None:
                 raise AcceptanceInputError("--session-ids is required for isolated run-start trials")
             session_ids = _trial_session_ids(args.session_ids, trials=args.trials)
-        elif args.session_id is None:
-            raise AcceptanceInputError("--session-id is required for fence-conflict")
+        else:
+            if args.trial_requests is None:
+                raise AcceptanceInputError("--trial-requests is required for isolated guided trials")
+            fence_requests = _fence_trial_requests(args.trial_requests, trials=args.trials)
         controller, client_factory = _probe_pair(args, env)
         probe_topology_check(controller, client_factory, traffic=_list_document(args.traffic))
         driver = ReplicaProbeDriver(controller=controller, observer=_observer(env), client_factory=client_factory)
         if args.probe == "fence-conflict":
-            if args.body is None:
-                raise AcceptanceInputError("--body is required for the guided respond pair")
-            request = ProbeRequest("POST", f"/api/sessions/{args.session_id}/guided/respond", _document(args.body))
-            trials = [driver.fence_conflict_trial(args.session_id, request) for _ in range(args.trials)]
+            trials = [
+                driver.fence_conflict_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/guided/respond", body))
+                for session_id, body in fence_requests
+            ]
             result = decide_fence_conflict(trials, required_trials=args.trials)
             return "replica-fence-conflict", result, result.to_receipt_details()
         run_trials = [
@@ -555,7 +581,7 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
         "outcome": result.outcome,
         "mechanism": result.mechanism,
         "reasons": list(result.reasons),
-        "evidence": dict(result.evidence),
+        "evidence": result.to_receipt_details()["evidence"],
         "owner_affine": owner_affine.to_receipt_details(),
     }
     return "replica-progress", result, progress

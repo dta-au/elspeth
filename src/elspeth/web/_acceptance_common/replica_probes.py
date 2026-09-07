@@ -47,12 +47,12 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
 
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
@@ -157,11 +157,15 @@ class ProbeResult:
         if any(type(key) is not str or not key for key in self.evidence):
             raise ValueError("evidence keys must be non-empty strings")
         if self.outcome == "pass" and self.probe in {"P1", "P2"}:
-            trials = self.evidence.get("trials")
+            if "trials" not in self.evidence:
+                raise ValueError("passing contention evidence requires a trial count")
+            trials = self.evidence["trials"]
             if type(trials) is not int or trials < DEFAULT_TRIALS:
                 raise ValueError("passing contention evidence requires at least twenty trials")
             if self.probe == "P1":
-                winners = self.evidence.get("distinct_winners")
+                if "distinct_winners" not in self.evidence:
+                    raise ValueError("passing P1 evidence requires a winner count")
+                winners = self.evidence["distinct_winners"]
                 if type(winners) is not int or not 2 <= winners <= trials:
                     raise ValueError("passing P1 evidence requires distinct winners")
         freeze_fields(self, "evidence")
@@ -172,7 +176,7 @@ class ProbeResult:
             "outcome": self.outcome,
             "mechanism": self.mechanism,
             "reasons": list(self.reasons),
-            "evidence": dict(self.evidence),
+            "evidence": {key: deep_thaw(value) for key, value in self.evidence.items()},
         }
 
 
@@ -392,6 +396,8 @@ def decide_lease_takeover(observation: LeaseTakeoverObservation) -> ProbeResult:
         reasons.append(f"owner_row_state_unknown:{row.state}")
     if not observation.before_expiry.refused_by_fence:
         reasons.append("survivor_not_refused_before_lease_expiry")
+    if observation.before_expiry.instance_id != observation.survivor_instance_id:
+        reasons.append("before_expiry_response_not_from_survivor")
     if takeover_observed_at <= lease_expires_at:
         reasons.append("takeover_observed_before_lease_expiry")
     if not observation.after_expiry.succeeded:
@@ -416,6 +422,22 @@ def decide_lease_takeover(observation: LeaseTakeoverObservation) -> ProbeResult:
             "owner_row_state": row.state,
             "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
             "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+            "observation": {
+                "primitive": observation.primitive,
+                "owner_instance_id": observation.owner_instance_id,
+                "survivor_instance_id": observation.survivor_instance_id,
+                "owner_row": {
+                    "instance_id": row.instance_id,
+                    "state": row.state,
+                    "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
+                },
+                "before_expiry": asdict(observation.before_expiry),
+                "after_expiry": asdict(observation.after_expiry),
+                "takeover_observed_at": takeover_observed_at.isoformat().replace("+00:00", "Z"),
+                "cancelled_run_reason": observation.cancelled_run_reason,
+                "fence_owner_after": observation.fence_owner_after,
+                "duplicate_sink_effects": observation.duplicate_sink_effects,
+            },
         },
     )
 
@@ -444,7 +466,7 @@ def decide_cross_replica_progress(observation: CrossReplicaProgressObservation) 
         outcome="pass" if not reasons else "fail",
         mechanism="postgresql_and_nfs",
         reasons=tuple(reasons),
-        evidence={"poll_interval_seconds": observation.poll_interval_seconds},
+        evidence={"poll_interval_seconds": observation.poll_interval_seconds, "observation": asdict(observation)},
     )
 
 
@@ -565,19 +587,20 @@ class ReplicaProbeDriver:
         first, second = self._controller.replicas()
         if first.name == second.name or first.origin == second.origin:
             raise AcceptanceInputError("replica probes need two distinct replicas")
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2, timeout=30.0)
         sent_at: dict[str, float] = {}
 
         def fire(address: ReplicaAddress) -> ReplicaResponse:
-            client = self._client_factory(address.origin)
-            barrier.wait()
-            sent_at[address.name] = self._clock()
-            status, instance_id, body = client.request_json_with_instance(
-                request.method,
-                request.path,
-                expected_statuses=expected_statuses,
-                json_body=request.json_body,
-            )
+            with self._client_factory(address.origin) as client:
+                client.authenticate(register=False)
+                barrier.wait()
+                sent_at[address.name] = self._clock()
+                status, instance_id, body = client.request_json_with_instance(
+                    request.method,
+                    request.path,
+                    expected_statuses=expected_statuses,
+                    json_body=request.json_body,
+                )
             return replica_response_from_envelope(addressed_to=address.name, status=status, instance_id=instance_id, body=body)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -600,15 +623,22 @@ class ReplicaProbeDriver:
             dispatch_spread_ms=spread_ms,
         )
 
-    def run_start_trial(self, session_id: str, request: ProbeRequest) -> RunStartTrial:
+    def run_start_trial(self, session_id: str, request: ProbeRequest, *, observation_timeout_seconds: float = 30.0) -> RunStartTrial:
         """One P2 trial against a fresh prepared session; historical runs invalidate isolation."""
 
         if self._observer.runs_row_ids(session_id) or self._observer.landscape_run_ids(session_id):
             raise AcceptanceCheckError("probe_session_not_fresh")
         responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409})
+        # HTTP 202 follows worker submission; the worker creates its Landscape
+        # row asynchronously. Observe its durable publication before scoring.
+        deadline = time.monotonic() + observation_timeout_seconds
+        landscape_ids = self._observer.landscape_run_ids(session_id)
+        while not landscape_ids and time.monotonic() < deadline:
+            time.sleep(0.05)
+            landscape_ids = self._observer.landscape_run_ids(session_id)
         return RunStartTrial(
             responses=responses,
             runs_row_ids=self._observer.runs_row_ids(session_id),
-            landscape_run_ids=self._observer.landscape_run_ids(session_id),
+            landscape_run_ids=landscape_ids,
             dispatch_spread_ms=spread_ms,
         )

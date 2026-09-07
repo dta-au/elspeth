@@ -630,14 +630,15 @@ def test_bundle_check_refuses_missing_kinds_invalid_receipts_and_failed_probes(t
     assert verdict.failed_probes == ("P3",) and not verdict.passed, "an unreachable P3 is not waived"
     # `bundle_check` validates the document before it compares the stored hash,
     # so the two tampers below are refused by different checks. Editing a value
-    # inside the open `evidence` mapping keeps the envelope schema-valid, and
-    # only the content hash catches it.
+    # both the observation and its matching summary keeps the decision valid;
+    # the content hash still catches the replacement evidence.
     tampered = tmp_path / "tampered"
     _fill_store(tampered)
     row = next(row for row in read_receipt_index(tampered) if row["kind"] == "replica-progress")
     path = tampered / f"{row['receipt_sha256']}.json"
     document = json.loads(path.read_text())
     document["details"]["evidence"]["poll_interval_seconds"] = 3.0
+    document["details"]["evidence"]["observation"]["poll_interval_seconds"] = 3.0
     os.chmod(path, 0o600)
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
     verdict = bundle_check(tampered, candidate_sha=CANDIDATE, scenario_id="A")

@@ -109,6 +109,16 @@ def test_trial_session_inventory_rejects_duplicates_and_wrong_count(tmp_path: Pa
     assert facade._trial_session_ids(str(inventory), trials=20) == tuple(sessions)
 
 
+def test_guided_trial_inventory_requires_distinct_current_turns(tmp_path: Path) -> None:
+    requests = [{"session_id": f"session-{index}", "body": {"turn_token": str(index)}} for index in range(20)]
+    path = _protected(tmp_path / "guided.json", requests)
+    assert facade._fence_trial_requests(path, trials=20) == tuple((item["session_id"], item["body"]) for item in requests)
+    requests[1] = requests[0]
+    _protected(Path(path), requests)
+    with pytest.raises(AcceptanceInputError, match="distinct sessions"):
+        facade._fence_trial_requests(path, trials=20)
+
+
 def test_default_twenty_trial_path_executes_each_prepared_session_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runs: dict[str, str] = {}
     requests: list[str] = []
