@@ -7992,16 +7992,15 @@ def test_every_landscape_mutation_api_requires_current_typed_authority() -> None
 def test_every_landscape_dml_transaction_is_full_token_fenced_first() -> None:
     units = _production_units()
     dml = scan_dml_identities(units)
-    violations = _transaction_order_violations(units, dml)
-    if not violations:
-        return
-    pytest.xfail(
-        _format_violations(
-            "Every Landscape DML owner must fence before payload SQL; raw-Connection helpers need one exact fenced caller",
-            violations,
-        )
-    )
 
+    # PIN FIRST, COUNTER LAST -- the ordering the caller id already uses, and it is
+    # load-bearing. ``pytest.xfail()`` aborts the test immediately, so anything after
+    # it is unreachable. This pin sat behind the violations assert before the xfail
+    # conversion and was already dormant; leaving it there would have converted a
+    # TRANSIENT blindness (red, so something is outstanding) into a PERMANENT and
+    # benign-looking one (xfail, so it reads as known and expected). A pin is a defect
+    # detector -- drift means something moved that nobody accounted for -- and it must
+    # be reachable whatever the counter below it does.
     edges = _subordinate_helper_edges(units, dml)
     assert (len(edges), _canonical_digest(edges)) == (
         _EXPECTED_SUBORDINATE_EDGE_COUNT,
@@ -8011,6 +8010,16 @@ def test_every_landscape_dml_transaction_is_full_token_fenced_first() -> None:
         f"expected={_EXPECTED_SUBORDINATE_EDGE_COUNT}/{_EXPECTED_SUBORDINATE_EDGE_SHA256}\n"
         f"actual={len(edges)}/{_canonical_digest(edges)}\n"
         + "\n".join(f"  {edge.helper_path}:{edge.helper_symbol} -> {edge.caller_path}:{edge.caller_symbol}" for edge in edges)
+    )
+
+    violations = _transaction_order_violations(units, dml)
+    if not violations:
+        return
+    pytest.xfail(
+        _format_violations(
+            "Every Landscape DML owner must fence before payload SQL; raw-Connection helpers need one exact fenced caller",
+            violations,
+        )
     )
 
 
