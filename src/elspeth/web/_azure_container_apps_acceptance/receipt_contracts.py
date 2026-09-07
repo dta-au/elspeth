@@ -704,7 +704,7 @@ def extract_exec_receipt(
         "candidate sha and subject; returns only the owned StoredReceipt"
     ),
     test_ref="tests/unit/web/azure_container_apps_acceptance/test_receipt_contracts.py::test_validate_stored_receipt_rejects_foreign_kinds_and_mismatched_bindings",
-    test_fingerprint="254a74a12e42bbf61766ef787a18afec1d00dd10534be41498d655b7e97c5898",
+    test_fingerprint="a32d153d546bd122c2ed782891ca5cad7ed9bcf925e1e3a8047911f5b7d37c23",
 )
 def validate_stored_receipt(payload: object, *, kind: str, scenario_id: str, subject_sha256: str, candidate_sha: str) -> StoredReceipt:
     """Admit one stored receipt of ``kind`` bound to the run's scenario, candidate and subject."""

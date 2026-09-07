@@ -53,6 +53,7 @@ from ._acceptance_common.replica_probes import (
     decide_lease_takeover,
     decide_run_start,
     record_owner_affine_progress,
+    require_contention_trials,
 )
 from ._acceptance_common.secure_documents import MAX_CONTROL_DOCUMENT_BYTES, _read_protected_document
 from ._azure_container_apps_acceptance.controller import (
@@ -263,6 +264,34 @@ def _seconds_argument(value: str) -> float:
     return seconds
 
 
+def _trials_argument(value: str) -> int:
+    try:
+        return require_contention_trials(int(value))
+    except (ValueError, AcceptanceInputError):
+        raise argparse.ArgumentTypeError(f"trials must be an integer at least {DEFAULT_TRIALS}") from None
+
+
+def _trial_session_ids(path: str, *, trials: int) -> tuple[str, ...]:
+    """Admit the prepared P2 session inventory before any remote request."""
+
+    document = _list_document(path)
+    if type(document) is not list or len(document) != trials:
+        raise AcceptanceInputError("--session-ids must contain exactly one fresh session per trial")
+    sessions: list[str] = []
+    for value in document:
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 128
+            or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in value)
+        ):
+            raise AcceptanceInputError("--session-ids contains an invalid session identifier")
+        sessions.append(value)
+    if len(set(sessions)) != trials:
+        raise AcceptanceInputError("--session-ids must contain distinct sessions")
+    return tuple(sessions)
+
+
 def _binding(args: argparse.Namespace) -> ReplicaBinding:
     return ReplicaBinding(container_app_id=args.container_app_id, revision=args.revision, replica=args.replica)
 
@@ -452,8 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--revision-suffix")
     probes.add_argument("--traffic", help="`az containerapp ingress traffic show` JSON")
     probes.add_argument("--session-id")
+    probes.add_argument("--session-ids", help="JSON array of distinct fresh, executable sessions, one per run-start trial")
     probes.add_argument("--body", help="JSON request body file for the guided respond pair")
-    probes.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
+    probes.add_argument("--trials", type=_trials_argument, default=DEFAULT_TRIALS)
     probes.add_argument("--observation", help="P3 / P4a observation document assembled by the driver")
 
     partition = commands.add_parser("partition-owner")
@@ -487,10 +517,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, ProbeResult, CheckDetails]:
     if args.probe in {"fence-conflict", "run-start"}:
-        if None in (args.resource_group, args.default_domain, args.revision_suffix, args.traffic, args.session_id):
-            raise AcceptanceInputError(
-                "--resource-group, --default-domain, --revision-suffix, --traffic and --session-id are required for a live probe"
-            )
+        require_contention_trials(args.trials)
+        if None in (args.resource_group, args.default_domain, args.revision_suffix, args.traffic):
+            raise AcceptanceInputError("--resource-group, --default-domain, --revision-suffix and --traffic are required for a live probe")
+        session_ids: tuple[str, ...] = ()
+        if args.probe == "run-start":
+            if args.session_ids is None:
+                raise AcceptanceInputError("--session-ids is required for isolated run-start trials")
+            session_ids = _trial_session_ids(args.session_ids, trials=args.trials)
+        elif args.session_id is None:
+            raise AcceptanceInputError("--session-id is required for fence-conflict")
         controller, client_factory = _probe_pair(args, env)
         probe_topology_check(controller, client_factory, traffic=_list_document(args.traffic))
         driver = ReplicaProbeDriver(controller=controller, observer=_observer(env), client_factory=client_factory)
@@ -501,8 +537,10 @@ def _run_probe(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[str, P
             trials = [driver.fence_conflict_trial(args.session_id, request) for _ in range(args.trials)]
             result = decide_fence_conflict(trials, required_trials=args.trials)
             return "replica-fence-conflict", result, result.to_receipt_details()
-        request = ProbeRequest("POST", f"/api/sessions/{args.session_id}/execute", {})
-        run_trials = [driver.run_start_trial(args.session_id, request) for _ in range(args.trials)]
+        run_trials = [
+            driver.run_start_trial(session_id, ProbeRequest("POST", f"/api/sessions/{session_id}/execute", {}))
+            for session_id in session_ids
+        ]
         result = decide_run_start(run_trials, required_trials=args.trials)
         return "replica-run-start", result, result.to_receipt_details()
     if args.observation is None:

@@ -54,7 +54,9 @@ carry the slippage budget.
 - `verify-connection-budget` wraps the shared budget validator under
   `elspeth.postgres-flexible-connection-budget.v1`.
 - `testcontainer-run` is stored under
-  `elspeth.azure-container-apps-testcontainer-run.v1`; `bundle_check` refuses
+  `elspeth.azure-container-apps-testcontainer-run.v2`; the receipt identifies
+  required PostgreSQL proofs that actually passed, and live ACA bundles require
+  the provisioned database target. `bundle_check` refuses
   the bundle unless exactly one passing run is on record.
 - No receipt kind claims that a live acceptance ran: the kinds are what a run
   *would* record; the first live run is 6b-7's and needs an operator-owned

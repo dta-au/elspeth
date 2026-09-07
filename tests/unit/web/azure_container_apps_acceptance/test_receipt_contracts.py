@@ -26,6 +26,7 @@ from elspeth.web._acceptance_common.replica_probes import MECHANISMS as PROBE_ME
 from elspeth.web._acceptance_common.replica_probes import PROBE_MECHANISMS, Mechanism, Probe, ProbeResult
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
 from elspeth.web._acceptance_common.testcontainer_run import (
+    REQUIRED_POSTGRES_PROOF_IDS,
     TESTCONTAINER_RUN_RECEIPT_KIND,
     TESTCONTAINER_SELECTION,
     resolve_testcontainer_run_target,
@@ -110,6 +111,23 @@ def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, r
         "reasons": reasons if reasons is not None else ([] if outcome == "pass" else ["trial[0]:not_one_success_and_one_fence_refusal"]),
         "evidence": {"trials": 20, "distinct_winners": 2},
     }
+
+
+@pytest.mark.parametrize("kind", ["replica-fence-conflict", "replica-run-start"])
+@pytest.mark.parametrize("trials", [None, 0, -1, 1, 19, True, 20.0, "20"])
+def test_external_passing_receipts_cannot_claim_weak_contention(kind: str, trials: object) -> None:
+    details = VALID[kind]()
+    details["evidence"] = {"trials": trials, "distinct_winners": 2}
+    with pytest.raises(AcceptanceCheckError):
+        _validate(kind, details)
+
+
+@pytest.mark.parametrize("winners", [None, 0, 1, True, 2.0, 21])
+def test_external_p1_pass_requires_real_distinct_winner_count(winners: object) -> None:
+    details = VALID["replica-fence-conflict"]()
+    details["evidence"] = {"trials": 20, "distinct_winners": winners}
+    with pytest.raises(AcceptanceCheckError):
+        _validate("replica-fence-conflict", details)
 
 
 def _job(name: str) -> dict[str, object]:
@@ -594,13 +612,14 @@ def test_extract_exec_receipt_rejects_malformed_streams_and_wrong_bindings() -> 
 _TARGET = resolve_testcontainer_run_target({})
 
 
-def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontainer-run.v1", exit_code: int = 0) -> dict[str, object]:
+def _testcontainer_run(*, schema: str = "elspeth.azure-container-apps-testcontainer-run.v2", exit_code: int = 0) -> dict[str, object]:
     return {
         "schema": schema,
         "kind": TESTCONTAINER_RUN_RECEIPT_KIND,
         "candidate_sha": CANDIDATE,
         "scenario_id": "A",
         "selection": list(TESTCONTAINER_SELECTION),
+        "required_tests_passed": sorted(REQUIRED_POSTGRES_PROOF_IDS),
         "exit_code": exit_code,
         "collected": 40,
         "passed": 40 - (2 if exit_code else 0),
@@ -665,7 +684,7 @@ def test_validate_stored_receipt_rejects_foreign_kinds_and_mismatched_bindings()
         ),
         ([], "replica-run-start", "A", BINDING.sha256, CANDIDATE, "receipt_store_schema"),
         (
-            _testcontainer_run(schema="elspeth.aws-ecs-testcontainer-run.v1"),
+            _testcontainer_run(schema="elspeth.aws-ecs-testcontainer-run.v2"),
             TESTCONTAINER_RUN_RECEIPT_KIND,
             "A",
             JUNIT_SUBJECT,
@@ -687,7 +706,7 @@ def test_testcontainer_run_is_stored_under_the_azure_schema_id_through_the_share
         candidate_sha=CANDIDATE,
     )
     document = json.loads(stored.canonical_json)
-    assert document["schema"] == "elspeth.azure-container-apps-testcontainer-run.v1"
+    assert document["schema"] == "elspeth.azure-container-apps-testcontainer-run.v2"
     assert document["exit_code"] == 1, "a failing run is recorded, not refused; the gate decides"
 
 

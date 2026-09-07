@@ -132,7 +132,7 @@ class _FakeReader(SqlReader):
         if statement.startswith("SELECT id FROM runs"):
             return ((f"run-{self._replicas.run_counter}",),) if self._replicas.run_counter else ()
         if "landscape_run_id" in statement:
-            return ((f"landscape-{self._replicas.run_counter}",),)
+            return ((f"landscape-{self._replicas.run_counter}",),) if self._replicas.run_counter else ()
         if statement.startswith("SELECT run_id FROM runs"):
             return () if self.landscape_missing else ((parameters["run_id"],),)
         if "web_instances" in statement:
@@ -234,18 +234,28 @@ class TestFenceConflictRecorded:
         driver, _reader = _driver(replicas)
         trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
         assert [response.status for response in trial.responses] == [200, 200]
-        result = decide_fence_conflict([trial], required_trials=1)
+        result = decide_fence_conflict([trial])
         assert result.outcome == "fail" and "trial[0]:not_one_success_and_one_fence_refusal" in result.reasons
 
     def test_two_labels_answered_by_one_instance_fail_the_probe(self) -> None:
         replicas = _RecordedReplicas(same_instance=True)
         driver, _reader = _driver(replicas)
         trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
-        result = decide_fence_conflict([trial], required_trials=1)
+        result = decide_fence_conflict([trial])
         assert "trial[0]:instances_not_distinct" in result.reasons
 
 
 class TestRunStartRecorded:
+    def test_reusing_a_previously_executed_session_is_rejected(self) -> None:
+        replicas = _RecordedReplicas()
+        driver, _reader = _driver(replicas)
+        request = ProbeRequest("POST", "/api/sessions/session-1/execute", {})
+        driver.run_start_trial("session-1", request)
+        replicas.reset()
+        with pytest.raises(AcceptanceCheckError, match="probe_session_not_fresh"):
+            driver.run_start_trial("session-1", request)
+        assert replicas.run_counter == 1
+
     def test_one_run_id_across_both_responses_and_no_permit_row_field(self) -> None:
         replicas = _RecordedReplicas()
         driver, reader = _driver(replicas)
@@ -261,7 +271,7 @@ class TestRunStartRecorded:
             "dispatch_spread_ms",
         }
         assert not any("run_start_permits" in statement for statement in reader.statements)
-        assert decide_run_start([trial], required_trials=1).outcome == "pass"
+        assert decide_run_start([trial]).outcome == "fail", "one trial is insufficient acceptance evidence"
 
     def test_a_landscape_run_that_does_not_exist_is_not_counted(self) -> None:
         replicas = _RecordedReplicas()
@@ -269,7 +279,7 @@ class TestRunStartRecorded:
         reader.landscape_missing = True
         trial = driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
         assert trial.landscape_run_ids == ()
-        assert "trial[0]:landscape_runs:0!=1" in decide_run_start([trial], required_trials=1).reasons
+        assert "trial[0]:landscape_runs:0!=1" in decide_run_start([trial]).reasons
 
 
 # --------------------------------------------------------------------------- P3 / P4 decision tables

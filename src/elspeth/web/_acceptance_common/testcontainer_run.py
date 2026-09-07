@@ -22,9 +22,10 @@ covers host, port and database name only — never credentials.
 One validator and ONE gate predicate (:func:`testcontainer_run_gate`) serve both
 providers; each binds its own schema id
 (:data:`TESTCONTAINER_RUN_SCHEMAS`). The kind is NEW in 0.8.0 — no existing
-receipt gains a field, so every receipt produced before its introduction
-validates byte-for-byte as before, and every field of a ``testcontainer-run``
-receipt is required (closed set, adversarial rejects) from the first one.
+other receipt kinds retain their existing schemas. Version 2 of this kind
+adds the exact mandatory PostgreSQL witnesses that passed. Version 1 cannot
+prove that any required test executed and is refused by the evidence gate.
+Every field is required and the schema remains closed.
 
 Layer: L2 (acceptance policy, provider-neutral). Tier-3 boundaries:
 :func:`parse_junit_report` (pytest's junit XML) and
@@ -71,8 +72,8 @@ Provider = Literal["aws", "azure"]
 
 TESTCONTAINER_RUN_SCHEMAS: Final[Mapping[Provider, str]] = MappingProxyType(
     {
-        "aws": "elspeth.aws-ecs-testcontainer-run.v1",
-        "azure": "elspeth.azure-container-apps-testcontainer-run.v1",
+        "aws": "elspeth.aws-ecs-testcontainer-run.v2",
+        "azure": "elspeth.azure-container-apps-testcontainer-run.v2",
     }
 )
 """Provider-scoped schema ids: one validator, two bindings, neither accepts the other's receipt."""
@@ -92,6 +93,23 @@ MAX_JUNIT_BYTES: Final = 16 * 1024 * 1024
 
 _MAX_COUNT: Final = 100_000
 _OUTCOME_TAGS: Final = frozenset({"failure", "error", "skipped"})
+
+REQUIRED_POSTGRES_PROOF_IDS: Final[frozenset[str]] = frozenset(
+    {
+        "tests.testcontainer.core.test_checkpoint_fence_serialisation_postgres::test_two_fenced_checkpoint_verbs_serialise_on_the_seat_row",
+        "tests.testcontainer.core.test_run_coordination_release_postgres::test_postgresql_concurrent_takeover_conditional_update_has_one_winner",
+        "tests.testcontainer.web.test_session_operation_fence_postgres::test_postgres_two_claimants_have_exactly_one_winner",
+        "tests.testcontainer.web.test_blob_custody_lock_isolation_postgres::test_postgres_lease_renew_is_not_blocked_by_an_in_flight_blob_persist",
+        "tests.testcontainer.web.test_sso_handoff_race_postgres::test_exactly_one_of_many_racing_consumers_wins",
+    }
+)
+"""Mandatory PostgreSQL witnesses: checkpoint fencing, leadership takeover,
+session exclusion, blob-I/O lease independence and atomic SSO consumption.
+
+These are a minimum evidence floor within the unchanged CI selection, not an
+alternative selection. A JUnit pass for each exact identity is required;
+unrelated passes, skips, and expected failures cannot replace a witness.
+"""
 
 
 class TestcontainerRunReceipt(TypedDict):
@@ -116,6 +134,7 @@ class TestcontainerRunReceipt(TypedDict):
     failed: int
     errors: int
     skipped: int
+    required_tests_passed: list[str]
     junit_sha256: str
     recorded_at: str
 
@@ -144,6 +163,7 @@ class TestcontainerRunRecord:
     errors: int
     skipped: int
     junit_sha256: str
+    required_tests_passed: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         counts = (self.collected, self.passed, self.failed, self.errors, self.skipped)
@@ -153,6 +173,12 @@ class TestcontainerRunRecord:
             raise ValueError("testcontainer run outcomes must partition the collected ids")
         if type(self.junit_sha256) is not str or len(self.junit_sha256) != 64 or set(self.junit_sha256) - set("0123456789abcdef"):
             raise ValueError("junit_sha256 must be a lowercase hex sha256")
+        if (
+            self.required_tests_passed != tuple(sorted(set(self.required_tests_passed)))
+            or not set(self.required_tests_passed) <= REQUIRED_POSTGRES_PROOF_IDS
+            or len(self.required_tests_passed) > self.passed
+        ):
+            raise ValueError("required_tests_passed must be a sorted unique subset of the required PostgreSQL witnesses")
 
 
 @dataclass(frozen=True)
@@ -216,8 +242,9 @@ def resolve_testcontainer_run_target(environ: Mapping[str, str]) -> Testcontaine
     suppresses=("R1", "R5"),
     invariant=(
         "raises AcceptanceCheckError('testcontainer_junit') before use unless the bytes are a bounded, DTD-free "
-        "junit document with at least one <testcase>, each classified by at most one failure/error/skipped child; "
-        "returns only the owned TestcontainerRunRecord whose outcomes partition the collected count"
+        "junit document with at least one uniquely identified <testcase>, each classified by at most one "
+        "failure/error/skipped child; returns only the owned TestcontainerRunRecord whose outcomes partition the "
+        "collected count and whose required witness identities were successful testcases"
     ),
     test_ref="tests/unit/web/acceptance_common/test_testcontainer_run.py::test_parse_junit_report_rejects_malformed_reports",
     test_fingerprint="b7e38e832933fd68d4de535884e201ad480a4163db0e4ecd2726f788742f2d72",
@@ -238,13 +265,25 @@ def parse_junit_report(content: bytes) -> TestcontainerRunRecord:
     if root.tag not in {"testsuites", "testsuite"}:
         raise AcceptanceCheckError("testcontainer_junit")
     collected = passed = failed = errors = skipped = 0
+    required_tests_passed: set[str] = set()
+    seen: set[str] = set()
     for case in root.iter("testcase"):
+        classname = case.get("classname")
+        name = case.get("name")
+        if not classname or not name:
+            raise AcceptanceCheckError("testcontainer_junit")
+        identity = f"{classname}::{name}"
+        if identity in seen:
+            raise AcceptanceCheckError("testcontainer_junit")
+        seen.add(identity)
         outcomes = [child.tag for child in case if child.tag in _OUTCOME_TAGS]
         if len(outcomes) > 1:
             raise AcceptanceCheckError("testcontainer_junit")
         collected += 1
         if not outcomes:
             passed += 1
+            if identity in REQUIRED_POSTGRES_PROOF_IDS:
+                required_tests_passed.add(identity)
         elif outcomes[0] == "failure":
             failed += 1
         elif outcomes[0] == "error":
@@ -260,6 +299,7 @@ def parse_junit_report(content: bytes) -> TestcontainerRunRecord:
         errors=errors,
         skipped=skipped,
         junit_sha256=_sha256(content),
+        required_tests_passed=tuple(sorted(required_tests_passed)),
     )
 
 
@@ -317,6 +357,7 @@ def build_testcontainer_run_receipt(
         "failed": record.failed,
         "errors": record.errors,
         "skipped": record.skipped,
+        "required_tests_passed": list(record.required_tests_passed),
         "junit_sha256": record.junit_sha256,
         "recorded_at": _utc_timestamp(recorded_at),
     }
@@ -338,7 +379,8 @@ def build_testcontainer_run_receipt(
         "raises AcceptanceCheckError('receipt_store_schema' or 'receipt_store_binding') before use unless the payload "
         "is a dict with exactly the testcontainer-run fields, the provider's own schema id, the pinned selection, a "
         "database of testcontainers-docker (with its fixed identity) or provisioned (with any other sha256 identity), a "
-        "process exit code and bounded counts that partition the collected ids and agree with the exit code, bound "
+        "process exit code and bounded counts that partition the collected ids and agree with the exit code, a sorted "
+        "unique subset of required successful proof identities no larger than the passed count, bound "
         "to the caller's candidate sha, scenario and junit subject hash"
     ),
     test_ref="tests/unit/web/acceptance_common/test_testcontainer_run.py::test_validate_testcontainer_run_receipt_rejects_open_or_inconsistent_receipts",
@@ -372,6 +414,7 @@ def validate_testcontainer_run_receipt(
     counts = {name: payload[name] for name in ("collected", "passed", "failed", "errors", "skipped")}
     junit_sha256 = payload["junit_sha256"]
     recorded_at = payload["recorded_at"]
+    required_tests_passed = payload["required_tests_passed"]
     if (
         schema != TESTCONTAINER_RUN_SCHEMAS[provider]
         or kind != TESTCONTAINER_RUN_RECEIPT_KIND
@@ -385,12 +428,17 @@ def validate_testcontainer_run_receipt(
         or any(not _is_int(count) or not 0 <= count <= _MAX_COUNT for count in counts.values())
         or not _is_hex_sha256(junit_sha256)
         or type(recorded_at) is not str
+        or not isinstance(required_tests_passed, list)
+        or any(type(identity) is not str for identity in required_tests_passed)
     ):
         raise AcceptanceCheckError("receipt_store_schema")
     if (
         counts["collected"] == 0
         or counts["passed"] + counts["failed"] + counts["errors"] + counts["skipped"] != counts["collected"]
         or (exit_code == 0) != (counts["failed"] == 0 and counts["errors"] == 0)
+        or required_tests_passed != sorted(set(required_tests_passed))
+        or not set(required_tests_passed) <= REQUIRED_POSTGRES_PROOF_IDS
+        or len(required_tests_passed) > counts["passed"]
     ):
         raise AcceptanceCheckError("receipt_store_schema")
     try:
@@ -417,6 +465,7 @@ def validate_testcontainer_run_receipt(
         failed=counts["failed"],
         errors=counts["errors"],
         skipped=counts["skipped"],
+        required_tests_passed=list(required_tests_passed),
         junit_sha256=junit_sha256,
         recorded_at=recorded_at,
     )
@@ -459,6 +508,7 @@ def testcontainer_run_gate(
     provider: Provider,
     candidate_sha: str,
     read_receipt: Callable[[str], object],
+    required_database: TestcontainerRunDatabase | None = None,
 ) -> TestcontainerRunGateVerdict:
     """The ONE gate predicate: refuse unless exactly one passing testcontainer run is on record.
 
@@ -469,7 +519,9 @@ def testcontainer_run_gate(
     Every ``testcontainer-run`` row is validated for ``provider`` and
     ``candidate_sha`` through :func:`validate_testcontainer_run_receipt`, and
     the document must hash to the row that indexes it. A candidate passes iff
-    exactly one such receipt validates AND records exit code 0: no receipt is
+    exactly one such receipt validates, records exit code 0, and carries every
+    mandatory PostgreSQL witness as passed. When ``required_database`` is
+    supplied, only that target class can satisfy the gate. No receipt is
     ``testcontainer_run_missing``; a receipt that no longer validates (or hashes
     elsewhere) is ``testcontainer_run_invalid``; only failing runs on record is
     ``testcontainer_run_failed`` (a failed run stays in the store as evidence
@@ -480,6 +532,8 @@ def testcontainer_run_gate(
 
     if provider not in TESTCONTAINER_RUN_SCHEMAS:
         raise AcceptanceInputError("provider must be aws or azure")
+    if required_database is not None and required_database not in TESTCONTAINER_RUN_DATABASES:
+        raise AcceptanceInputError("required_database must be testcontainers-docker or provisioned")
     rows = [row for row in receipt_index if row["kind"] == TESTCONTAINER_RUN_RECEIPT_KIND]
     if not rows:
         return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_missing", receipt_sha256=None)
@@ -500,7 +554,12 @@ def testcontainer_run_gate(
             return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)
         if _canonical_sha256(document) != receipt_sha256:
             return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_invalid", receipt_sha256=None)
-        if document["exit_code"] == 0:
+        if (
+            document["exit_code"] == 0
+            and document["passed"] > 0
+            and set(document["required_tests_passed"]) == REQUIRED_POSTGRES_PROOF_IDS
+            and (required_database is None or document["database"] == required_database)
+        ):
             passing.append(receipt_sha256)
     if not passing:
         return TestcontainerRunGateVerdict(passed=False, reason="testcontainer_run_failed", receipt_sha256=None)

@@ -27,11 +27,15 @@ CANDIDATE = "c" * 40
 RECORDED_AT = datetime(2026, 9, 5, 6, 0, tzinfo=UTC)
 
 
-def _junit(outcomes: list[str | None]) -> bytes:
+def _junit(outcomes: list[str | None], *, required: bool = False) -> bytes:
     cases = []
     for index, outcome in enumerate(outcomes):
         child = "" if outcome is None else f'<{outcome} message="m"/>'
         cases.append(f'<testcase classname="tests.testcontainer.t" name="test_{index}" time="0.1">{child}</testcase>')
+    if required:
+        for identity in sorted(tr.REQUIRED_POSTGRES_PROOF_IDS):
+            classname, name = identity.split("::")
+            cases.append(f'<testcase classname="{classname}" name="{name}" time="0.1"/>')
     return f'<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" tests="{len(outcomes)}">{"".join(cases)}</testsuite></testsuites>'.encode()
 
 
@@ -380,7 +384,7 @@ def _gate(index: list[dict[str, object]], store: dict[str, object], *, provider:
 
 @pytest.mark.parametrize("provider", ["aws", "azure"])
 def test_gate_passes_only_with_exactly_one_passing_run(provider: tr.Provider) -> None:
-    clean = tr.parse_junit_report(_junit([None, None]))
+    clean = tr.parse_junit_report(_junit([None, None], required=True))
     passing = _receipt(provider, exit_code=0, record=clean)
     index, store = _index_and_reader(passing)
     verdict = _gate(index, store, provider=provider)
@@ -392,10 +396,10 @@ def test_gate_passes_only_with_exactly_one_passing_run(provider: tr.Provider) ->
 
 
 def test_gate_refuses_absence_failure_ambiguity_and_tampering() -> None:
-    clean = tr.parse_junit_report(_junit([None, None]))
+    clean = tr.parse_junit_report(_junit([None, None], required=True))
     passing = _receipt(exit_code=0, record=clean)
     failed = _receipt(exit_code=1)
-    other_passing = _receipt(exit_code=0, record=tr.parse_junit_report(_junit([None, None, None])))
+    other_passing = _receipt(exit_code=0, record=tr.parse_junit_report(_junit([None, None, None], required=True)))
     verify_s3 = {"kind": "verify-s3", "scenario_id": "A", "junit_sha256": "0" * 64}
 
     assert _gate(*_index_and_reader()) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_missing", None)
@@ -418,6 +422,62 @@ def test_gate_refuses_absence_failure_ambiguity_and_tampering() -> None:
     assert _gate([{**index[0], "receipt_sha256": 1}], store) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_invalid", None)
     with pytest.raises(AcceptanceInputError):
         _gate(index, store, provider="gcp")  # type: ignore[arg-type]
+
+
+def test_gate_refuses_a_successful_exit_with_no_executed_tests() -> None:
+    skipped = _receipt(exit_code=0, record=tr.parse_junit_report(_junit(["skipped", "skipped"])))
+    assert _gate(*_index_and_reader(skipped)) == tr.TestcontainerRunGateVerdict(False, "testcontainer_run_failed", None)
+
+
+def test_live_provider_requirement_refuses_local_postgres_evidence() -> None:
+    clean = tr.parse_junit_report(_junit([None, None], required=True))
+    for target, expected in ((DOCKER, False), (PROVISIONED, True)):
+        receipt = _receipt("azure", exit_code=0, record=clean, target=target)
+        index, store = _index_and_reader(receipt)
+        verdict = tr.testcontainer_run_gate(
+            index,
+            provider="azure",
+            candidate_sha=CANDIDATE,
+            read_receipt=store.__getitem__,
+            required_database="provisioned",
+        )
+        assert verdict.passed is expected
+        if not expected:
+            assert verdict.reason == "testcontainer_run_failed"
+
+
+def test_gate_requires_every_postgres_witness_even_when_unrelated_tests_pass() -> None:
+    passing = _junit([None], required=True)
+    assert _gate(*_index_and_reader(_receipt(exit_code=0, record=tr.parse_junit_report(passing)))).passed
+    for identity in tr.REQUIRED_POSTGRES_PROOF_IDS:
+        classname, name = identity.split("::")
+        case = f'<testcase classname="{classname}" name="{name}" time="0.1"/>'.encode()
+        for replacement in (b"", case.replace(b"/>", b"><skipped/></testcase>")):
+            incomplete = tr.parse_junit_report(passing.replace(case, replacement))
+            assert identity not in incomplete.required_tests_passed
+            assert _gate(*_index_and_reader(_receipt(exit_code=0, record=incomplete))).reason == "testcontainer_run_failed"
+    unrelated = tr.parse_junit_report(_junit([None] * 50))
+    assert _gate(*_index_and_reader(_receipt(exit_code=0, record=unrelated))).reason == "testcontainer_run_failed"
+
+
+def test_junit_rejects_missing_or_duplicate_test_identities() -> None:
+    case = b'<testcase classname="tests.testcontainer.t" name="test_one"/>'
+    for cases in (case + case, b'<testcase name="test_one"/>', b'<testcase classname="tests.testcontainer.t"/>'):
+        with pytest.raises(AcceptanceCheckError, match="testcontainer_junit"):
+            tr.parse_junit_report(b"<testsuite>" + cases + b"</testsuite>")
+
+
+@pytest.mark.parametrize("proofs", [["unrelated::test"], [1], "not-a-list", [next(iter(tr.REQUIRED_POSTGRES_PROOF_IDS))] * 2])
+def test_stored_receipt_refuses_invalid_required_proof_ids(proofs: object) -> None:
+    receipt = _receipt()
+    with pytest.raises(AcceptanceCheckError, match="receipt_store_schema"):
+        _validate({**receipt, "required_tests_passed": proofs})
+
+
+def test_stored_receipt_cannot_claim_more_required_passes_than_passed_tests() -> None:
+    receipt = _receipt()
+    with pytest.raises(AcceptanceCheckError, match="receipt_store_schema"):
+        _validate({**receipt, "required_tests_passed": sorted(tr.REQUIRED_POSTGRES_PROOF_IDS)})
 
 
 def test_gate_verdict_is_internally_consistent() -> None:

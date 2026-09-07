@@ -13,15 +13,22 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from functools import partial
 from pathlib import Path
 
+import httpx
 import pytest
 
 from elspeth.web import azure_container_apps_acceptance as facade
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceHttpError, AcceptanceInputError
+from elspeth.web._acceptance_common.http_client import AcceptanceCredentials, AcceptanceHttpClient
+from elspeth.web._acceptance_common.replica_probes import SESSION_OPERATION_CONFLICT_DETAIL, ReplicaProbeDriver
 from elspeth.web._acceptance_common.schema_facts import _expected_schema_facts
+from elspeth.web._azure_container_apps_acceptance.controller import PostgresEvidenceObserver, SqlReader
 
 from .test_receipt_contracts import APP_ID, BINDING, CANDIDATE, REPLICA, REVISION, SHA, VALID, _envelope
+from .test_replica_probes import _controller
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 FACADE = REPO_ROOT / "src" / "elspeth" / "web" / "azure_container_apps_acceptance.py"
@@ -82,6 +89,89 @@ def test_command_surface_is_the_exact_reviewed_set() -> None:
     subparsers = next(action for action in parser._actions if action.dest == "command")
     assert isinstance(subparsers, argparse._SubParsersAction)
     assert set(subparsers.choices) == EXPECTED_COMMANDS
+
+
+@pytest.mark.parametrize("trials", ["0", "-1", "1", "19", "1.5", "true"])
+def test_invalid_trial_counts_are_rejected_before_cloud_access(trials: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        facade.build_parser().parse_args(["replica-probes", *BINDING_ARGS, "--probe", "run-start", "--trials", trials])
+    assert exc.value.code == 2
+
+
+def test_trial_session_inventory_rejects_duplicates_and_wrong_count(tmp_path: Path) -> None:
+    inventory = tmp_path / "sessions.json"
+    for document in (["session-1"] * 20, [f"session-{i}" for i in range(19)], [None] * 20):
+        inventory.write_text(json.dumps(document))
+        with pytest.raises(AcceptanceInputError):
+            facade._trial_session_ids(str(inventory), trials=20)
+    sessions = [f"session-{i}" for i in range(20)]
+    inventory.write_text(json.dumps(sessions))
+    assert facade._trial_session_ids(str(inventory), trials=20) == tuple(sessions)
+
+
+def test_default_twenty_trial_path_executes_each_prepared_session_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs: dict[str, str] = {}
+    requests: list[str] = []
+    lock = threading.Lock()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        instance = "instance-a" if "---a." in request.url.host else "instance-b"
+        headers = {"X-Elspeth-Instance": instance}
+        if request.url.path == "/api/system/status":
+            return httpx.Response(200, json={}, headers=headers)
+        session = request.url.path.split("/")[3]
+        with lock:
+            requests.append(session)
+            if session in runs:
+                return httpx.Response(409, json={"detail": SESSION_OPERATION_CONFLICT_DETAIL}, headers=headers)
+            runs[session] = f"run-{session}"
+        return httpx.Response(202, json={"run_id": runs[session]}, headers=headers)
+
+    class Reader(SqlReader):
+        def scalar(self, statement: str, **parameters: object) -> object:
+            raise AssertionError("P2 has no scalar or permit-row assertion")
+
+        def rows(self, statement: str, **parameters: object) -> tuple[tuple[object, ...], ...]:
+            if "session_id" in parameters:
+                session = str(parameters["session_id"])
+                return ((runs[session],),) if session in runs else ()
+            return ((parameters["run_id"],),)
+
+    transport = httpx.MockTransport(handle)
+    controller = _controller()
+
+    def client_factory(origin: str) -> AcceptanceHttpClient:
+        return AcceptanceHttpClient(
+            origin=origin, credentials=AcceptanceCredentials(mode="bearer", bearer_token="test"), transport=transport
+        )
+
+    monkeypatch.setattr(facade, "_probe_pair", lambda args, env: (controller, client_factory))
+    monkeypatch.setattr(facade, "_observer", lambda env: PostgresEvidenceObserver(sessions=Reader(), landscape=Reader()))
+    monkeypatch.setattr(facade, "ReplicaProbeDriver", partial(ReplicaProbeDriver, clock=lambda: 1.0))
+    sessions = [f"session-{index}" for index in range(20)]
+    inventory = _protected(tmp_path / "sessions.json", sessions)
+    traffic = _protected(tmp_path / "traffic.json", [{"label": "a", "weight": 50}, {"label": "b", "weight": 50}])
+    result = facade.main(
+        [
+            "replica-probes",
+            *BINDING_ARGS,
+            "--probe",
+            "run-start",
+            "--resource-group",
+            "rg",
+            "--default-domain",
+            "example.test",
+            "--revision-suffix",
+            "abc",
+            "--traffic",
+            traffic,
+            "--session-ids",
+            inventory,
+        ]
+    )
+    assert result == 0
+    assert set(runs) == set(sessions)
+    assert len(requests) == 40 and all(requests.count(session) == 2 for session in sessions)
 
 
 def test_public_exports_are_the_exact_reviewed_set() -> None:

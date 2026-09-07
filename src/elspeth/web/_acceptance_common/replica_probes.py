@@ -113,6 +113,14 @@ DEFAULT_TRIALS: Final = 20
 DEFAULT_MAX_DISPATCH_SPREAD_MS: Final = 5.0
 
 
+def require_contention_trials(value: int) -> int:
+    """The acceptance plan requires at least twenty independent contention pairs."""
+
+    if type(value) is not int or value < DEFAULT_TRIALS:
+        raise AcceptanceInputError(f"contention trials must be an integer at least {DEFAULT_TRIALS}")
+    return value
+
+
 class ProbeReceiptDetails(TypedDict):
     """The closed detail set a probe result contributes to a receipt."""
 
@@ -148,6 +156,14 @@ class ProbeResult:
             raise ValueError("reasons must be non-empty bounded strings")
         if any(type(key) is not str or not key for key in self.evidence):
             raise ValueError("evidence keys must be non-empty strings")
+        if self.outcome == "pass" and self.probe in {"P1", "P2"}:
+            trials = self.evidence.get("trials")
+            if type(trials) is not int or trials < DEFAULT_TRIALS:
+                raise ValueError("passing contention evidence requires at least twenty trials")
+            if self.probe == "P1":
+                winners = self.evidence.get("distinct_winners")
+                if type(winners) is not int or not 2 <= winners <= trials:
+                    raise ValueError("passing P1 evidence requires distinct winners")
         freeze_fields(self, "evidence")
 
     def to_receipt_details(self) -> ProbeReceiptDetails:
@@ -272,6 +288,7 @@ def decide_fence_conflict(
 ) -> ProbeResult:
     """P1: every trial is exactly one success and one fence refusal from two distinct replicas."""
 
+    require_contention_trials(required_trials)
     reasons: list[str] = []
     if len(trials) != required_trials:
         reasons.append(f"trial_count:{len(trials)}!={required_trials}")
@@ -314,6 +331,7 @@ def decide_run_start(
 ) -> ProbeResult:
     """P2: every trial is one accepted run and one fence refusal, and exactly one run row exists."""
 
+    require_contention_trials(required_trials)
     reasons: list[str] = []
     if len(trials) != required_trials:
         reasons.append(f"trial_count:{len(trials)}!={required_trials}")
@@ -583,8 +601,10 @@ class ReplicaProbeDriver:
         )
 
     def run_start_trial(self, session_id: str, request: ProbeRequest) -> RunStartTrial:
-        """One P2 trial: fire the pair, then read the run rows the session now has."""
+        """One P2 trial against a fresh prepared session; historical runs invalidate isolation."""
 
+        if self._observer.runs_row_ids(session_id) or self._observer.landscape_run_ids(session_id):
+            raise AcceptanceCheckError("probe_session_not_fresh")
         responses, spread_ms = self.fire_pair(request, expected_statuses={202, 409})
         return RunStartTrial(
             responses=responses,

@@ -864,6 +864,7 @@ def bundle_check(store_dir: Path, *, candidate_sha: str, scenario_id: str) -> Bu
     verdict = testcontainer_run_gate(
         rows,
         provider=PROVIDER,
+        required_database="provisioned",
         candidate_sha=candidate_sha,
         read_receipt=lambda receipt_sha256: _read_protected_document(
             store_dir / f"{receipt_sha256}.json", check="testcontainer_run_receipt"

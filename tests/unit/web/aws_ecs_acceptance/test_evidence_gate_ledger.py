@@ -189,6 +189,9 @@ def _store_testcontainer_run_receipt(manifest_path: Path, *, exit_code: int = 0,
     """Store one testcontainer-run receipt for the fixture candidate; returns its receipt sha256."""
     outcomes = ["", '<failure message="m"/>'] if exit_code else ["", ""]
     cases = "".join(f'<testcase classname="t" name="test_{index}">{child}</testcase>' for index, child in enumerate(outcomes))
+    for identity in sorted(testcontainer_run.REQUIRED_POSTGRES_PROOF_IDS):
+        classname, name = identity.split("::")
+        cases += f'<testcase classname="{classname}" name="{name}"/>'
     junit = f'<testsuites><testsuite name="pytest">{cases}</testsuite></testsuites>'.encode() + junit_salt
     record = testcontainer_run.parse_junit_report(junit)
     receipt = testcontainer_run.build_testcontainer_run_receipt(

@@ -422,10 +422,10 @@ class _FakeObserver(EvidenceObserver):
         return 1
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
-        return ("run-1",)
+        return ("run-1",) if self.owner is not None else ()
 
     def landscape_run_ids(self, session_id: str) -> tuple[str, ...]:
-        return ("landscape-1",)
+        return ("landscape-1",) if self.owner is not None else ()
 
     def membership_row(self, instance_id: str) -> MembershipRow | None:
         return None
@@ -467,6 +467,21 @@ def _driver(observer: _FakeObserver, replicas: _RecordedReplicas) -> ReplicaProb
 
 
 class TestDriver:
+    def test_run_start_refuses_a_session_with_historical_runs_before_dispatch(self) -> None:
+        observer = _FakeObserver()
+        observer.owner = RA
+        driver = _driver(observer, _RecordedReplicas(observer))
+        with pytest.raises(AcceptanceCheckError, match="probe_session_not_fresh"):
+            driver.run_start_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/execute", {}))
+        assert observer.epoch == 3
+
+    @pytest.mark.parametrize("count", [0, -1, 1, 19, True, 20.0])
+    def test_decision_boundaries_refuse_insufficient_or_noninteger_counts(self, count: int) -> None:
+        with pytest.raises(AcceptanceInputError):
+            decide_run_start([], required_trials=count)
+        with pytest.raises(AcceptanceInputError):
+            decide_fence_conflict([], required_trials=count)
+
     def test_fence_conflict_trial_records_both_instances_and_the_fence_facts(self) -> None:
         observer = _FakeObserver()
         driver = _driver(observer, _RecordedReplicas(observer))
