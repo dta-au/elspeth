@@ -1,38 +1,15 @@
-title: "ELSPETH — Program of Outstanding Work"
-subtitle: "Outstanding work by package, with dependencies and the decisions each requires"
+title: "ELSPETH – Program of outstanding work"
 author: "John Morrissey"
-date: "5 September 2026"
+date: "7 September 2026"
 version: "1.0.0"
 status: "DRAFT"
-
-# Template variables
-running-title: "Program of Outstanding Work"
+compact-control: true
+running-title: "Program of outstanding work"
 doc-id: "ELS-POW"
-document-category: "Delivery Planning"
+document-category: "Delivery planning"
 document-type: "Program of outstanding work"
 classification: "OFFICIAL"
-
-# NOTE: a source-control revision is deliberately not carried on the cover.
-# It is working-level detail for this audience; the source-data cut-off is
-# stated as a date in the document header.
-
-scope-blurb: >-
-  This document states the work remaining to take ELSPETH from its current
-  pre-release state to a product that can be given to users.  It groups that
-  work into six themes — readiness for users, platform and deployment,
-  correctness by construction, assurance and release readiness, capability,
-  and continuity — and states, for each package, what exists today, what is
-  left, and what it depends on.  Figures are measured from the source tree,
-  the issue tracker and the deployed service at the date named above,
-  not estimated.  It is a statement of scope, not a schedule; the decisions
-  the program needs from its owner are listed separately at the end.
-
-# Organization branding (appears on cover page)
-org-name: "ELSPETH"
-org-tagline: "Auditable LLM and Data Pipelines"
-
-# Revision history (newest first)
 revisions:
   - version: "1.0.0"
-    date: "5 September 2026"
-    changes: "Initial issue."
+    date: "7 September 2026"
+    changes: "Draft."

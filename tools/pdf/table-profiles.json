@@ -2,6 +2,46 @@
   "_comment": "Table column-width profiles for the ELSPETH PDF pipelines (arch-pack and control-pack). Each profile matches a table by exact column count + header-cell prefix or substring match, and applies hand-tuned widths summing to 1.0 for A4 layout. Add a profile only when Pandoc's auto-sizing produces a table that demonstrably reads poorly in the rendered PDF. Matchers name at least two header cells so a profile cannot capture an unrelated table of the same width.",
   "profiles": [
     {
+      "_doc": "control-pack: executive outstanding work packages",
+      "cols": 3,
+      "match": {
+        "col_1": "package",
+        "col_2": "position and remaining work",
+        "col_3": "decision or dependency"
+      },
+      "widths": [0.19, 0.52, 0.29]
+    },
+    {
+      "_doc": "control-pack: compact executive RAID entries",
+      "cols": 3,
+      "match": {
+        "col_1": "id / impact",
+        "col_2": "condition and consequence",
+        "col_3": "next action"
+      },
+      "widths": [0.12, 0.43, 0.45]
+    },
+    {
+      "_doc": "control-pack: pilot requirements and evidence",
+      "cols": 3,
+      "match": {
+        "col_1": "id",
+        "col_2": "requirement and acceptance",
+        "col_3": "evidence status"
+      },
+      "widths": [0.08, 0.57, 0.35]
+    },
+    {
+      "_doc": "control-pack: release requirements and acceptance",
+      "cols": 3,
+      "match": {
+        "col_1": "requirement",
+        "col_2": "acceptance evidence",
+        "col_3": "release treatment"
+      },
+      "widths": [0.27, 0.48, 0.25]
+    },
+    {
       "_doc": "control-pack: RAID tier table (reader / visibility)",
       "cols": 7,
       "match": {

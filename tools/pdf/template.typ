@@ -13,6 +13,9 @@
 // Pandoc variables consumed: title, subtitle, author, date, version, status,
 //   running-title, doc-id, document-category, document-type, classification,
 //   commit, scope-blurb, org-name, org-tagline, revisions[].
+//   compact-control: opt in to the project-control layout without front matter.
+
+#let compact-control = $if(compact-control)$true$else$false$endif$
 
 // ─────────────────────────────────────────────────────────────
 // COLOUR PALETTE
@@ -68,7 +71,11 @@
 #set document(
   title: "$title$",
   author: "$author$",
-  keywords: ("elspeth", "architecture", "audit", "sda pipeline", "evidence-anchored"),
+  keywords: if compact-control {
+    ("elspeth", "project control")
+  } else {
+    ("elspeth", "architecture", "audit", "sda pipeline", "evidence-anchored")
+  },
 )
 
 // PDF bookmarks for outline navigation in viewers.
@@ -79,7 +86,7 @@
 // ─────────────────────────────────────────────────────────────
 #set text(
   font: ("Libertinus Serif", "DejaVu Serif"),
-  size: 10.5pt,
+  size: if compact-control { 10pt } else { 10.5pt },
   lang: "en",
   region: "AU",
   hyphenate: true,
@@ -87,9 +94,9 @@
 )
 
 #set par(
-  justify: true,
-  leading: 0.72em,
-  spacing: 1.1em,
+  justify: not compact-control,
+  leading: if compact-control { 0.5em } else { 0.72em },
+  spacing: if compact-control { 0.65em } else { 1.1em },
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -107,11 +114,22 @@
   paper: "a4",
   // Asymmetric margins: wider left (2.8cm) accommodates a binding gutter
   // for A4 print.  Bottom is generous for footer rule + page-number chip.
-  margin: (top: 2.6cm, bottom: 2.8cm, left: 2.8cm, right: 2.2cm),
+  margin: if compact-control {
+    (top: 1.8cm, bottom: 1.8cm, left: 1.8cm, right: 1.8cm)
+  } else {
+    (top: 2.6cm, bottom: 2.8cm, left: 2.8cm, right: 2.2cm)
+  },
 
   header: context {
     let pg = counter(page).get().first()
-    if pg > 1 and body-started.get() [
+    if compact-control [
+      #set text(8pt, font: "TeX Gyre Heros", fill: c-muted)
+      ELSPETH · $running-title$
+      #h(1fr)
+      $classification$
+      #v(3pt)
+      #line(length: 100%, stroke: 0.5pt + c-rule)
+    ] else if pg > 1 and body-started.get() [
       #line(length: 100%, stroke: 0.5pt + c-rule)
       #v(2pt)
       #set text(7.5pt, font: "TeX Gyre Heros", fill: c-muted, tracking: 0.5pt)
@@ -126,7 +144,16 @@
 
   footer: context {
     let pg = counter(page).get().first()
-    if pg > 1 [
+    if compact-control [
+      #line(length: 100%, stroke: 0.5pt + c-rule)
+      #v(3pt)
+      #set text(8pt, font: "TeX Gyre Heros", fill: c-muted)
+      $doc-id$-$version$
+      #h(1fr)
+      $status$ · $date$
+      #h(1fr)
+      #counter(page).display("1")
+    ] else if pg > 1 [
       #v(2pt)
       #line(length: 100%, stroke: 0.5pt + c-rule)
       #v(3pt)
@@ -196,50 +223,64 @@
 // accent bar + heading text, and updates the running-header state.
 #show heading.where(level: 1): it => {
   current-chapter.update(it.body)
-  pagebreak(weak: true)
-  v(0.8cm)
-  grid(
-    columns: (6pt, 1fr),
-    column-gutter: 10pt,
-    rect(width: 6pt, height: 1.5em, fill: c-navy, stroke: none),
-    text(
-      font: "TeX Gyre Heros",
-      size: 17pt,
-      weight: "bold",
-      fill: c-navy,
-    )[#it.body],
-  )
-  v(0.5em)
-  line(length: 100%, stroke: 0.6pt + c-rule)
-  v(0.45cm)
+  if compact-control {
+    block(above: 0.5em, below: 0.6em)[
+      #text(font: "TeX Gyre Heros", size: 17pt, weight: "bold", fill: c-navy)[#it.body]
+      #v(4pt)
+      #line(length: 100%, stroke: 1pt + c-teal)
+    ]
+  } else {
+    pagebreak(weak: true)
+    v(0.8cm)
+    grid(
+      columns: (6pt, 1fr),
+      column-gutter: 10pt,
+      rect(width: 6pt, height: 1.5em, fill: c-navy, stroke: none),
+      text(
+        font: "TeX Gyre Heros",
+        size: 17pt,
+        weight: "bold",
+        fill: c-navy,
+      )[#it.body],
+    )
+    v(0.5em)
+    line(length: 100%, stroke: 0.6pt + c-rule)
+    v(0.45cm)
+  }
 }
 
 // Level 2 — Section heading
 #show heading.where(level: 2): it => {
-  v(0.9em)
-  block(width: 100%)[
+  v(if compact-control { 0.45em } else { 0.9em })
+  block(width: 100%, sticky: compact-control)[
     #text(
       font: "TeX Gyre Heros",
-      size: 13.5pt,
+      size: if compact-control { 12pt } else { 13.5pt },
       weight: "bold",
       fill: c-navy,
     )[#it.body]
     #v(-2pt)
     #line(length: 40pt, stroke: 2pt + c-teal)
   ]
-  v(0.35em)
+  v(if compact-control { 0.2em } else { 0.35em })
 }
 
 // Level 3 — Sub-section heading
 #show heading.where(level: 3): it => {
-  v(0.75em)
-  text(
-    font: "TeX Gyre Heros",
-    size: 11.5pt,
-    weight: "bold",
-    fill: c-navy,
-  )[#it.body]
-  v(0.25em)
+  if compact-control {
+    block(above: 0.35em, below: 0.2em, sticky: true)[
+      #text(font: "TeX Gyre Heros", size: 10.5pt, weight: "bold", fill: c-navy)[#it.body]
+    ]
+  } else {
+    v(0.75em)
+    text(
+      font: "TeX Gyre Heros",
+      size: 11.5pt,
+      weight: "bold",
+      fill: c-navy,
+    )[#it.body]
+    v(0.25em)
+  }
 }
 
 // Level 4 — Minor heading
@@ -307,11 +348,14 @@
     else if calc.odd(row) { c-shade }
     else { white }
   },
-  inset: (x: 9pt, y: 7pt),
+  inset: if compact-control { (x: 5pt, y: 4pt) } else { (x: 9pt, y: 7pt) },
   align: left,
 )
 
 #show table.cell: it => {
+  $if(compact-control)$
+  set par(leading: 0.35em, spacing: 0.3em)
+  $endif$
   if it.y == 0 {
     set text(
       font: "TeX Gyre Heros",
@@ -355,21 +399,25 @@
 #show figure: set block(breakable: true)
 
 #show figure.where(kind: table): it => {
-  // Caption ABOVE the table, standard for technical specs.
-  set align(left)
-  block(width: 100%, breakable: true)[
-    #context {
-      let num = counter(figure.where(kind: table)).display()
-      text(
-        font: "TeX Gyre Heros",
-        size: 8pt,
-        fill: c-muted,
-        weight: "bold",
-      )[Table #num#if it.caption != none [: #it.caption.body]]
-    }
-    #v(4pt)
-    #it.body
-  ]
+  if compact-control and it.caption == none {
+    it.body
+  } else {
+    // Caption ABOVE the table, standard for technical specs.
+    set align(left)
+    block(width: 100%, breakable: true)[
+      #context {
+        let num = counter(figure.where(kind: table)).display()
+        text(
+          font: "TeX Gyre Heros",
+          size: 8pt,
+          fill: c-muted,
+          weight: "bold",
+        )[Table #num#if it.caption != none [: #it.caption.body]]
+      }
+      #v(4pt)
+      #it.body
+    ]
+  }
 }
 
 #show figure.where(kind: image): it => {
@@ -563,6 +611,8 @@
 //
 // Page margin: top=2.6cm, left=2.8cm, right=2.2cm.  A4 = 210×297mm.
 
+$if(compact-control)$
+$else$
 // ── Top navy bleed band ───────────────────────────────────────
 // Height chosen to accommodate up to two lines of 25pt title text
 // without the wrapped second line falling under the teal accent
@@ -949,6 +999,7 @@ $endif$
 // ─────────────────────────────────────────────────────────────
 // BODY CONTENT (from pandoc)
 // ─────────────────────────────────────────────────────────────
+$endif$
 
 // From this point the running header is visible.
 #body-started.update(true)
