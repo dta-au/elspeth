@@ -299,9 +299,11 @@ def test_check_judge_quality_cli_gives_the_codex_judge_the_readonly_harness(
     assert exit_code == 0
     scope = seen["tool_scope"]
     assert isinstance(scope, AgentToolScope)
-    # The judge must be able to search the SOURCE TREE, not just the excerpt.
-    assert scope.cwd == Path("src/elspeth").resolve()
-    assert Path("src/elspeth").resolve() in scope.allowed_roots
+    # The judge can follow controls into tests, documentation, and other code
+    # outside src/elspeth while assessing the same checkout as the operator.
+    repository_root = Path.cwd().resolve()
+    assert scope.cwd == repository_root
+    assert repository_root in scope.allowed_roots
     payload = json.loads(capsys.readouterr().out)
     assert payload["judge_tool_mode"] == "readonly"
 
