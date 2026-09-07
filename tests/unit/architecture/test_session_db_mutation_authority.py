@@ -4257,10 +4257,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RunCoordinationRepository._inactive_member_snapshot",
         "<non-session-write-connection>",
         "write_connection",
-        "008c2f94937aea42",
+        "f6825423068f581e",
         1,
         None,
-        line=1167,
+        line=1184,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4271,7 +4271,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1462,
+        line=1479,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4282,7 +4282,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1487,
+        line=1504,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",

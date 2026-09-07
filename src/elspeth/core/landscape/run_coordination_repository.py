@@ -1147,16 +1147,33 @@ class RunCoordinationRepository:
 
         Objection 2's failure mode is UNREACHABLE TODAY, measured rather than
         assumed. Every DML verb applied to ``run_workers`` across ``src/`` was
-        ENUMERATED -- not searched for by expected spelling, since finding no
-        ``delete(run_workers_table)`` would prove only that one string absent --
-        and the verb set is ``{insert, update}``: 1 insert, 7 updates, ZERO
-        deletes on this tree. The seventh update is the membership fence's own
-        verify-UPDATE, so that count is tree-dependent; the ZERO is what the
-        verdict rests on, and it holds on the pre-fence tree too. No raw SQL
-        names the table and no retention or purge path touches it. Single-use
-        identity is why: departed and evicted rows keep their row and change
-        status rather than being removed. So a row cannot vanish between the two
-        reads, and an absent row still means a registration that never happened.
+        ENUMERATED by AST -- not searched for by expected spelling, since finding
+        no ``delete(run_workers_table)`` would prove only that one string absent
+        -- and the verb set is ``{insert, update}``: 1 insert, 8 updates, ZERO
+        deletes on this tree.
+
+        The enumeration covers BOTH call styles, and that correction is recorded
+        rather than quietly folded in, because the first pass made the very
+        mistake this paragraph warns about. It matched only the prefix form
+        ``update(run_workers_table)`` and so reported SEVEN, missing the method
+        form ``run_workers_table.update()`` at
+        ``run_lifecycle_repository.py:700`` -- finalize's leftover-member
+        hygiene, which departs stragglers. **A spelling-search dressed as an
+        enumeration is still a spelling-search**; only walking the AST for
+        ``insert``/``update``/``delete`` applied to this table in either form,
+        plus checking the table is never handed to a generic DML helper (it is
+        not -- the only pass-through uses are ``with_for_update``, a SELECT
+        lock), actually enumerates it.
+
+        The count is tree-dependent -- one of the eight is the membership fence's
+        own verify-UPDATE -- but the ZERO is what the verdict rests on, and it is
+        zero in BOTH call styles and on the pre-fence tree. No raw SQL names the
+        table and no retention or purge path touches it. Single-use identity is
+        why: departed and evicted rows keep their row and change status rather
+        than being removed -- including the finalize path above, which sets
+        ``status='departed'`` rather than deleting. So a row cannot vanish
+        between the two reads, and an absent row still means a registration that
+        never happened.
 
         **A DELETE on ``run_workers`` invalidates objection 2's verdict.** This
         note is that condition, kept beside the code because whoever adds such a
