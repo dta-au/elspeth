@@ -93,6 +93,11 @@ class FencedContext:
     owner: ast.With | ast.AsyncWith
     call: ast.Call
     connection: str | None
+    # Qualified name of the fence actually entered.  Carried so a verb can be
+    # held to the fence its OWN authority class names: admitting both fences
+    # into one set without recording which was used would let a member fence
+    # satisfy a leader verb, which is option (B) by accident.
+    fence: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,14 +350,34 @@ _EXACT_BEGIN_RUN_PRODUCTION_CALLERS = frozenset(
     }
 )
 
-_AUTHORITY_PARAMETER_NAMES = frozenset({"coordination_token", "token"})
-_FENCED_CONTEXT_NAMES = frozenset({"fenced_leader_transaction", "fenced_write"})
-_TRUSTED_FENCE_QUALIFIED = frozenset(
+_AUTHORITY_PARAMETER_NAMES = frozenset({"coordination_token", "member_token", "token"})
+_FENCED_CONTEXT_NAMES = frozenset({"fenced_leader_transaction", "fenced_member_transaction", "fenced_write"})
+
+# ADR-030 D4 names THREE fences, and until the membership fence landed the tree
+# had ONE wearing two names: ``fenced_write`` is a thin wrapper over
+# ``fenced_leader_transaction``, so a reader of this set must not conclude two
+# independent leader fences pre-existed.  ``fenced_member_transaction`` is the
+# genuinely second fence (elspeth-43ddb79074).
+_LEADER_FENCE_QUALIFIED = frozenset(
     {
         "elspeth.core.landscape.run_coordination_repository.fenced_leader_transaction",
         "elspeth.core.landscape.scheduler.fencing.fenced_write",
     }
 )
+_MEMBER_FENCE_QUALIFIED = frozenset({"elspeth.core.landscape.run_coordination_repository.fenced_member_transaction"})
+_TRUSTED_FENCE_QUALIFIED = _LEADER_FENCE_QUALIFIED | _MEMBER_FENCE_QUALIFIED
+
+# ADR-030 D4's authority classes.  ONE exact concrete type per class, never a
+# union, never Optional, and never both on one verb: a leader verb that
+# accidentally accepted a follower's token would be unprovable, which is the
+# fail-open class this programme exists to close (ADR-048 amendment, option A).
+_LEADER_SCOPE = "leader"
+_MEMBER_SCOPE = "member"
+_AUTHORITY_QUALIFIED_BY_SCOPE = {
+    _LEADER_SCOPE: "elspeth.contracts.coordination.CoordinationToken",
+    _MEMBER_SCOPE: "elspeth.contracts.coordination.WorkerMembershipToken",
+}
+_FENCE_QUALIFIED_BY_SCOPE = {_LEADER_SCOPE: _LEADER_FENCE_QUALIFIED, _MEMBER_SCOPE: _MEMBER_FENCE_QUALIFIED}
 _MUTATION_METHOD_NAMES = frozenset(api.method for api in _MUTATION_APIS)
 _COORDINATION_MUTATION_METHOD_NAMES = frozenset(
     {
@@ -369,6 +394,46 @@ _COORDINATION_MUTATION_METHOD_NAMES = frozenset(
     }
 )
 _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_METHOD_NAMES
+
+# The MEMBER-scoped verbs (ADR-030 D4's second fence): a follower's own
+# liveness and departure writes, whose authority is membership in
+# ``run_workers``, not the leader epoch.  Everything else -- all 90 facade APIs
+# and every other coordination verb -- is LEADER-scoped.
+#
+# ``release_seat`` is deliberately NOT here, and the reason is worth stating
+# because the lane brief grouped it with the member verbs: the seat is a
+# run-scoped row and its CAS ``WHERE`` is identical to the leader fence
+# predicate (run_id, leader_worker_id, leader_epoch), so it is leader-scoped in
+# the code and the ADR-048 amendment classifies it that way.  Where the brief
+# and the code disagreed, the code won.
+_MEMBER_SCOPED_METHOD_NAMES = frozenset(
+    {
+        "depart_worker",
+        "worker_heartbeat",
+        # The fence machinery itself carries the member token and is scanned
+        # like any other writer, so it must classify MEMBER too. Naming these
+        # explicitly, rather than inferring scope from the annotation each
+        # function happens to declare, is deliberate: inferring would let a
+        # verb choose its own authority class, which is not a check.
+        "fenced_member_transaction",
+        "verify_membership_fence",
+    }
+)
+
+
+def _verb_authority_scope(method: str) -> str:
+    """The ONE authority class a verb may accept (ADR-030 D4, ADR-048 §1 as amended).
+
+    A single classifier serves both sweeps -- the 90-API sweep and the DML
+    transaction sweep -- so a verb cannot be leader-scoped in one and
+    member-scoped in the other.  It is a function rather than a column on
+    ``_MUTATION_APIS`` because the coordination repository is NOT among those
+    90 owners: the member verbs are enumerated in
+    ``_COORDINATION_MUTATION_METHOD_NAMES``, and a scope column on the facade
+    tuple could never have reached them.
+    """
+    return _MEMBER_SCOPE if method in _MEMBER_SCOPED_METHOD_NAMES else _LEADER_SCOPE
+
 
 # Filled from the canonical scanners below.  These literals intentionally
 # represent the pre-Task-6 surface; production migration may satisfy the
@@ -394,7 +459,13 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # (49a7bb16c), _recover_expired_leases (55a8a94f4) and
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
-_EXPECTED_DML_COUNT = 144
+# MEMBER-FENCE (elspeth-43ddb79074, ADR-030 D4): 144 -> 145, +1 identity —
+# verify_membership_fence's run_workers UPDATE, the membership fence's own
+# first statement. The write set is UNCHANGED (added=[] removed=[]): run_workers
+# already took an UPDATE through depart_worker and evict_worker, so this is a
+# new construction of an existing write shape, not a new shape. Re-derived from
+# this file's own printed output on the rebased tree, applied and run.
+_EXPECTED_DML_COUNT = 145
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -429,7 +500,7 @@ _EXPECTED_DML_COUNT = 144
 # statement change and not the fencing. Path, symbol, table, operation, ordinal
 # and authority are all unchanged. Attributed by scanning base f83011bb7 and the
 # merged tree with this same scanner: one site differs, no other.
-_EXPECTED_DML_INVENTORY_SHA256 = "a76a88f5d2d5445abc01c6cf59380087f68d55ee3ce65c036a52ba152a1de381"
+_EXPECTED_DML_INVENTORY_SHA256 = "411d346629ebbca0269b05c95f9456d17fa6cdc0790c047f693fed2186e655c7"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -527,8 +598,21 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "4abf5f610cef539417cbbb143c9dfd720b424c8a55
 # x5, insert_row_with_token_on <- create_quarantine_row_with_token,
 # fail_open_effect_operations_for_run <- _complete_run_in, record_group_loss
 # x3 (complete_barrier, _transition_on, stage_escalation_loss).
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 80
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "dccb6ab7403f684b881ea3aad3d4c4046c20a4359e3e81c272d93b9d72fc72f6"
+# 80 -> 87 (+7, none removed), re-derived on the rebased tree AFTER the split
+# above made this pin runnable for the first time in weeks. Classified row by
+# row against a git archive of the base (af03b56d8), not asserted:
+#   * SIX had already drifted in on the tip while this pin sat behind the red
+#     transaction sweep and nothing could say so — the base measures 86 live
+#     against its pinned 80. That is the predicted cost of clearing a
+#     long-masked assertion, not a regression from nowhere.
+#   * ONE arrived with this lane: verify_membership_fence <- fenced_member_transaction.
+# The digest also absorbs one FINGERPRINT move that changes no count:
+# record_coordination_event <- depart_worker, 00c206f91d9891ef -> 9358eb23fea70fa2,
+# because depart_worker's call arguments changed when it took the member token.
+# An earlier hand-off carried 86/226272b7… — computed before the membership
+# fence existed, so stale rather than wrong; it is NOT reused here.
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 87
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "12d7b9d45b263ac8b97e945e9fa672427e449d5f67590c6cd8beae9bf450cb17"
 # Coordination callers 15 -> 20 (+5, none removed), all seat acquire/release
 # arriving with the ADR-048 run-coordination work and each forwarding an exact
 # token: web/app.py's orphan finaliser takes the dead leader's seat through the
@@ -2615,18 +2699,38 @@ def _annotation_names(annotation: ast.expr | None) -> frozenset[str]:
     return frozenset(name for child in ast.walk(annotation) if (name := _dotted_name(child)) is not None)
 
 
+def _is_exact_scoped_authority_annotation(
+    annotation: ast.expr | None,
+    *,
+    scope: str,
+    resolver: _Resolver | None = None,
+    use: ast.AST | None = None,
+) -> bool:
+    """Exactly ONE concrete authority type, chosen by the verb's scope class.
+
+    Deliberately NOT a widening of the leader predicate.  Admitting either type
+    everywhere would let a leader verb accept a follower's token -- one type
+    with two meanings, ADR-048's rejected option (B), unprovable by
+    construction.  The scope is decided by the verb, and the annotation must
+    match that scope's single type: no union, no ``| None``, no string
+    annotation.
+    """
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return False
+    dotted = resolver.qualified_name(annotation, use=use or annotation) if resolver is not None else _dotted_name(annotation)
+    return dotted == _AUTHORITY_QUALIFIED_BY_SCOPE[scope]
+
+
 def _is_exact_coordination_token_annotation(
     annotation: ast.expr | None,
     *,
     resolver: _Resolver | None = None,
     use: ast.AST | None = None,
 ) -> bool:
-    if annotation is None:
-        return False
-    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-        return False
-    dotted = resolver.qualified_name(annotation, use=use or annotation) if resolver is not None else _dotted_name(annotation)
-    return dotted == "elspeth.contracts.coordination.CoordinationToken"
+    """The LEADER-scoped predicate.  Unchanged in meaning; every existing caller keeps it."""
+    return _is_exact_scoped_authority_annotation(annotation, scope=_LEADER_SCOPE, resolver=resolver, use=use)
 
 
 def _api_authority_violations(
@@ -3617,16 +3721,22 @@ def _has_repeating_ancestor(node: ast.AST, *, stop: ast.AST) -> bool:
 
 
 def _database_effect_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Call, ...]:
+    # The fence names come from ``_FENCED_CONTEXT_NAMES`` rather than being
+    # spelled again here.  They were duplicated, and the duplicate silently
+    # went stale when the membership fence landed: a fence this set does not
+    # know is not counted as a database effect, so the verb's FIRST effect
+    # looked like its payload and every member-fenced verb reported "fence is
+    # not the transaction owner's first database effect" while being correctly
+    # fenced. One list, one source of truth.
     effect_names = {
         "begin_write",
         "execute",
         "execute_insert",
         "execute_update",
         "exec_driver_sql",
-        "fenced_leader_transaction",
-        "fenced_write",
         "scalar",
         "write_connection",
+        *_FENCED_CONTEXT_NAMES,
     }
     resolver = _resolver_for_node(node)
     return tuple(
@@ -3668,7 +3778,7 @@ def _fenced_contexts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[Fenc
                 and not _trusted_qualified_name_is_mutated(qualified, resolver=resolver, use=item.context_expr)
             ):
                 connection = item.optional_vars.id if isinstance(item.optional_vars, ast.Name) else None
-                result.append(FencedContext(child, item.context_expr, connection))
+                result.append(FencedContext(child, item.context_expr, connection, qualified))
     return tuple(result)
 
 
@@ -3967,8 +4077,10 @@ def _function_fence_violation(node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
     if parameter is None:
         return "missing explicit current token"
     resolver = _resolver_for_node(node)
-    if not _is_exact_coordination_token_annotation(parameter.annotation, resolver=resolver, use=node):
-        return "token annotation is not CoordinationToken"
+    scope = _verb_authority_scope(node.name)
+    expected_type = _AUTHORITY_QUALIFIED_BY_SCOPE[scope].rsplit(".", maxsplit=1)[-1]
+    if not _is_exact_scoped_authority_annotation(parameter.annotation, scope=scope, resolver=resolver, use=node):
+        return f"{scope}-scoped verb's token annotation is not {expected_type}"
     if _argument_default(node, parameter.arg) is not None:
         return "token is optional/defaulted"
     if _parameter_rebound(node, parameter.arg):
@@ -3977,6 +4089,11 @@ def _function_fence_violation(node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
     if len(contexts) != 1:
         return f"fenced transaction contexts={len(contexts)} expected=1"
     context = contexts[0]
+    # The fence must be the one this verb's authority class names.  A member
+    # fence on a leader verb (or the reverse) is admitted by neither: each
+    # class proves a different thing, and crossing them proves nothing.
+    if context.fence not in _FENCE_QUALIFIED_BY_SCOPE[scope]:
+        return f"{scope}-scoped verb is fenced by {context.fence.rsplit('.', maxsplit=1)[-1]}"
     if context.connection is None:
         return "fenced transaction must bind one exact connection name"
     if len(context.owner.items) != 1:
@@ -4285,6 +4402,10 @@ def _transaction_order_violations(
     unit_list = tuple(units)
     index = _function_index(unit_list)
     dml_symbols = {(site.path, site.symbol) for site in dml}
+    # Each fence's OWN first statement. These are the fence, not a payload
+    # writer reached through one, so they cannot be required to run inside a
+    # fence without demanding that a fence fence itself. One entry per fence,
+    # so a third fence has to be added here deliberately rather than inherited.
     exact_establishment_symbols = (
         {(item.caller_path, item.caller_symbol) for item in _AUTHORITY_ESTABLISHMENTS}
         | {(item.callee_path, item.callee_symbol) for item in _AUTHORITY_ESTABLISHMENTS}
@@ -4292,7 +4413,11 @@ def _transaction_order_violations(
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
                 "verify_and_extend_leader_fence",
-            )
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "verify_membership_fence",
+            ),
         }
     )
     edges = _subordinate_helper_edges(unit_list, dml)
@@ -6787,6 +6912,90 @@ def test_transaction_scanner_requires_context_order_exact_connection_and_semanti
     assert "non-token run-column subject" in (_function_fence_violation(alien_writer) or "")
 
 
+def test_each_verb_class_accepts_exactly_one_authority_type_and_its_own_fence() -> None:
+    """ADR-030 D4 / ADR-048 amendment: one concrete type per verb class, and no crossing.
+
+    ADR-048 §1 originally required the leader token on EVERY mutation API,
+    which overreached D4's three-fence split: a follower writes its own
+    liveness and departure rows and holds no epoch. The fix is a SECOND owned
+    type, never one type with two meanings -- option (B) was rejected because a
+    leader verb accidentally accepting a follower's token would be unprovable,
+    which is the fail-open class this gate exists to close.
+
+    So the cross arms below are the point of the test, not decoration: they are
+    what distinguishes this rule from simply widening the annotation predicate
+    to accept either type.
+    """
+    source = (
+        "from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken\n"
+        "from elspeth.core.landscape.run_coordination_repository import (\n"
+        "    fenced_leader_transaction,\n"
+        "    fenced_member_transaction,\n"
+        ")\n"
+        "from elspeth.core.landscape.schema import run_workers_table\n"
+        "from sqlalchemy import update\n"
+        "\n"
+        "def depart_worker(*, member_token: WorkerMembershipToken):\n"
+        "    with fenced_member_transaction(engine, member_token=member_token, verb='depart_worker') as conn:\n"
+        "        conn.execute(update(run_workers_table).where(run_workers_table.c.run_id == member_token.run_id))\n"
+    )
+    admitted = _parse_source("src/elspeth/core/landscape/member_verbs.py", source)
+    member_verb = next(node for node in ast.walk(admitted.tree) if isinstance(node, ast.FunctionDef))
+    assert _function_fence_violation(member_verb) is None
+
+    # A member verb fenced by the LEADER fence. The membership fence is what
+    # proves this worker is still 'active'; the leader fence proves an epoch
+    # the member does not hold, so it cannot stand in.
+    leader_fence_on_member = _parse_source(
+        admitted.path,
+        source.replace(
+            "fenced_member_transaction(engine, member_token=member_token, verb='depart_worker')",
+            "fenced_leader_transaction(engine, token=member_token)",
+        ),
+    )
+    crossed = next(node for node in ast.walk(leader_fence_on_member.tree) if isinstance(node, ast.FunctionDef))
+    assert "member-scoped verb is fenced by fenced_leader_transaction" in (_function_fence_violation(crossed) or "")
+
+    # The mirror: a LEADER verb fenced by the membership fence.
+    member_fence_on_leader = _parse_source(
+        admitted.path,
+        source.replace(
+            "def depart_worker(*, member_token: WorkerMembershipToken):", "def complete_run(*, member_token: WorkerMembershipToken):"
+        ),
+    )
+    leader_verb = next(node for node in ast.walk(member_fence_on_leader.tree) if isinstance(node, ast.FunctionDef))
+    assert "leader-scoped verb's token annotation is not CoordinationToken" in (_function_fence_violation(leader_verb) or "")
+
+    # A leader verb carrying the leader token but entering the member fence:
+    # the annotation is right, so only the FENCE check can catch this one.
+    leader_token_member_fence = _parse_source(
+        admitted.path,
+        source.replace(
+            "def depart_worker(*, member_token: WorkerMembershipToken):", "def complete_run(*, coordination_token: CoordinationToken):"
+        )
+        .replace("member_token=member_token", "member_token=coordination_token")
+        .replace("member_token.run_id", "coordination_token.run_id"),
+    )
+    leader_crossed = next(node for node in ast.walk(leader_token_member_fence.tree) if isinstance(node, ast.FunctionDef))
+    assert "leader-scoped verb is fenced by fenced_member_transaction" in (_function_fence_violation(leader_crossed) or "")
+
+    # Optional authority is not authority, for either class.
+    optional_member = _parse_source(
+        admitted.path, source.replace("member_token: WorkerMembershipToken", "member_token: WorkerMembershipToken | None")
+    )
+    optional_verb = next(node for node in ast.walk(optional_member.tree) if isinstance(node, ast.FunctionDef))
+    assert "member-scoped verb's token annotation is not WorkerMembershipToken" in (_function_fence_violation(optional_verb) or "")
+
+    # A member verb annotated with the LEADER type: the same rule read the
+    # other way, and the one that would pass if the predicate were widened to
+    # accept either type instead of being keyed on the verb's scope.
+    wrong_type_member = _parse_source(
+        admitted.path, source.replace("member_token: WorkerMembershipToken", "member_token: CoordinationToken")
+    )
+    wrong_type_verb = next(node for node in ast.walk(wrong_type_member.tree) if isinstance(node, ast.FunctionDef))
+    assert "member-scoped verb's token annotation is not WorkerMembershipToken" in (_function_fence_violation(wrong_type_verb) or "")
+
+
 def test_shared_subordinate_helper_is_admitted_only_when_every_caller_edge_is_fenced() -> None:
     """ADR-048 D8.8 closure: a raw-Connection helper is admitted per EDGE, never by caller count.
 
@@ -7601,6 +7810,23 @@ def test_landscape_production_caller_set_is_frozen() -> None:
         f"actual={len(internal_edges)}/{_canonical_digest(internal_edges)}"
     )
 
+
+def test_every_landscape_production_caller_forwards_exact_authority() -> None:
+    """The caller SWEEP, split out of ``test_landscape_production_caller_set_is_frozen``.
+
+    Split because the four pin assertions above used to sit in front of this
+    sweep, and the sweep has been red for the life of the ADR-048 burn-down.
+    A red test stops at its first failure, so every assertion behind it was
+    DORMANT — and dormancy is indistinguishable from passing in a suite
+    summary. That is the fail-open-guard shape reproduced in the gate's own
+    structure: a check that exists but cannot run. Two of the pins had in fact
+    drifted while masked and nothing could say so.
+
+    Nothing is loosened by the split: same scanners, same data, same
+    thresholds. The only change is that the pins can now fail on their own
+    evidence while this sweep burns down.
+    """
+    units = _production_units()
     violations = (*_caller_authority_violations(units), *_coordination_caller_authority_violations(units))
     assert not violations, _format_violations(
         "Every Landscape production caller must forward one exact token and exact token.run_id",
@@ -7625,6 +7851,16 @@ def test_every_landscape_dml_transaction_is_full_token_fenced_first() -> None:
         violations,
     )
 
+
+def test_landscape_subordinate_helper_edge_set_is_frozen() -> None:
+    """The subordinate-edge PIN, split out of the transaction sweep above.
+
+    Same reason as the caller-set split: this pin sat behind a sweep that has
+    been red throughout the burn-down, so it could not run and its drift was
+    invisible. It is the pin the split exists to make runnable again.
+    """
+    units = _production_units()
+    dml = scan_dml_identities(units)
     edges = _subordinate_helper_edges(units, dml)
     assert (len(edges), _canonical_digest(edges)) == (
         _EXPECTED_SUBORDINATE_EDGE_COUNT,

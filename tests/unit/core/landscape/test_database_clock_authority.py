@@ -132,7 +132,15 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fenced_leader_transaction, and every fence reads the Landscape clock to verify-and-
 # extend the seat — so fencing a verb makes it a clock boundary even when the verb's
 # own UPDATE writes no timestamp. Re-derived from the printed output.
-_CLOCK_BOUNDARY_DIGEST = "ba944a5b536c57c97165469b7d237ef72ccd0c3eb4b3bf24e665bbbcff137c74"
+# MEMBER-FENCE (elspeth-43ddb79074): ba944a5b… → 046226a2…, +1 identity:
+# RunCoordinationRepository._inactive_member_snapshot, the refused beat's seat
+# read-back. This value is neither side of the rebase conflict that produced it:
+# BARRIER-ADOPT pinned ba944a5b… on the tip and the member-fence branch pinned
+# 038cab48… on its own base, and the merged tree carries BOTH new boundaries, so
+# it is a THIRD value. Taking either side textually would have pinned a digest
+# that describes neither tree — re-derived from this file's printed output
+# instead, with the identity assertion above passing unchanged.
+_CLOCK_BOUNDARY_DIGEST = "046226a2e0d5b17621d7dadc048c451c73f11a456b5197ad1cb5b8f1a94c94c0"
 
 
 def _name_has_clock_marker(name: str) -> bool:

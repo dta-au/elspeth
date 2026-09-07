@@ -4204,6 +4204,12 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=1173,
     ),
+    # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
+    # ONLY -- same symbol, same fingerprint, same domain -- because the
+    # membership fence added ~200 lines above them. This manifest is
+    # POSITION-DEPENDENT (it pins path:line per writer), unlike the fencing
+    # gate's DML digest, which is position-independent. A re-pin here is a
+    # POSITION movement and must never be ledgered as threading.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository.live_leader",
@@ -4212,7 +4218,40 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2b52f58624e1e33d",
         1,
         None,
-        line=866,
+        line=985,
+        connection_escape=True,
+    ),
+    # The one GENUINELY NEW connection, and the only entry here that is a
+    # review question rather than a re-pin: the seat/role read-back a refused
+    # heartbeat takes on a plain connection after its fenced transaction has
+    # rolled back (RunCoordinationRepository._inactive_member_snapshot).
+    #
+    # It belongs in this tuple, which is for acquisitions "proven to belong
+    # wholly to another database domain", and the proof is threefold. It
+    # acquires the LANDSCAPE engine and never the sessions database. It
+    # executes SELECTs only, so no classification here can launder a write.
+    # And the read is taken precisely when membership is already lost, so
+    # there is no authority under which it could be fenced -- the only fence
+    # available is the membership fence that just refused it.
+    #
+    # What makes "reviewed" correct rather than convenient is a CONSUMER fact,
+    # not a property of the read: the snapshot's seat fields are unfenced and
+    # may be stale the instant they are read, and the deposed-latch in
+    # RunHeartbeatThread._beat_once would be a genuine fail-open if it acted on
+    # them. It cannot: worker_active=False latches coordination-lost and
+    # RETURNS before any seat field is examined. That is the whole argument,
+    # and it is conditional -- a future consumer that reads leader_worker_id or
+    # seat_live from a worker_active=False snapshot would invalidate this
+    # entry, not merely extend it.
+    WriterIdentity(
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "RunCoordinationRepository._inactive_member_snapshot",
+        "<non-session-write-connection>",
+        "write_connection",
+        "cef7ee23193b44a9",
+        1,
+        None,
+        line=1132,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4223,7 +4262,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1254,
+        line=1427,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4234,7 +4273,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1279,
+        line=1452,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
@@ -16564,7 +16603,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=466,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 55
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,
