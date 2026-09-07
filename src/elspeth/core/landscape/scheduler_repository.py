@@ -742,10 +742,10 @@ class TokenSchedulerRepository:
         self,
         *,
         work_item_ids: Sequence[str],
-        run_id: str,
+        coordination_token: CoordinationToken,
     ) -> int:
-        """Reset ``barrier_adopted_epoch`` to NULL for crash-window BLOCKED rows."""
-        return self.barriers.reset_adoption_marker_to_pending(work_item_ids=work_item_ids, run_id=run_id)
+        """Reset ``barrier_adopted_epoch`` to NULL for crash-window BLOCKED rows (leader-fenced)."""
+        return self.barriers.reset_adoption_marker_to_pending(work_item_ids=work_item_ids, coordination_token=coordination_token)
 
     # ------------------------------------------------------------------
     # Group-loss ledger (GroupLossRepository)

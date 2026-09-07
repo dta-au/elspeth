@@ -31,7 +31,7 @@ from elspeth.contracts.scheduler import (
     TokenWorkStatus,
 )
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcome_guarded
-from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -1174,7 +1174,7 @@ class BarrierJournalRepository:
         self,
         *,
         work_item_ids: Sequence[str],
-        run_id: str,
+        coordination_token: CoordinationToken,
     ) -> int:
         """Reset ``barrier_adopted_epoch`` to NULL for crash-window BLOCKED rows.
 
@@ -1191,20 +1191,37 @@ class BarrierJournalRepository:
         read and this call — a non-matching count is logged but not fatal because
         the next intake pass will re-classify the row correctly).
 
-        Called from ``BarrierRecoveryCoordinator.restore_from_journal`` for holdless non-completed
-        rows (before ``restore_from_journal`` runs, so no executor state is
-        touched).  The operation is epoch-fence-free (it runs before the new
-        leader's first fenced verb and its safety derives from the takeover CAS
-        already having committed — any concurrent old-leader adoption attempt
-        would fail the CAS, and the new leader is the only actor with write
-        access at this point).
+        Called from ``BarrierRecoveryCoordinator.restore_from_journal`` for
+        holdless non-completed rows, before any executor state is touched.
+
+        Leader-fenced (ADR-030 §D4, ADR-048). This verb previously ran on a bare
+        ``begin_write`` and its docstring argued the fence was unnecessary
+        because "the takeover CAS has already committed, so the new leader is
+        the only actor with write access at this point". That is true of ONE
+        takeover and false of two. Leader A takes the seat at epoch N, enters
+        ``restore_from_journal``, and stalls; A's lease lapses, B takes over at
+        epoch N+1 and begins adopting rows; A's in-flight restore then resumes
+        and resets the markers B has just set — under a live successor, with no
+        refusal and no ``fence_refusal`` event. A's own takeover CAS committed
+        long ago and gates nothing now. The epoch fence is what turns "the only
+        actor with write access" from an assumption into a statement the write
+        itself verifies, which is exactly the write this fence exists to refuse.
+
+        An empty ``work_item_ids`` returns before the fence: there is no
+        database effect to fence, so a caller with nothing to reset is not
+        charged a seat verification (and does not have its seat extended).
         """
         if not work_item_ids:
             return 0
-        with begin_write(self._engine) as conn:
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="reset_adoption_marker_to_pending",
+        ) as conn:
             result = conn.execute(
                 update(token_work_items_table)
-                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.run_id == coordination_token.run_id)
                 .where(token_work_items_table.c.work_item_id.in_(list(work_item_ids)))
                 .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
                 .values(barrier_adopted_epoch=None)
