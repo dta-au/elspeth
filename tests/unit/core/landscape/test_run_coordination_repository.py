@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterator, MutableMapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -51,8 +51,10 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine, begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import (
+    CoordinationEventRow,
     RunCoordinationRepository,
     fenced_leader_transaction,
+    record_coordination_events,
     verify_and_extend_leader_fence,
 )
 from elspeth.core.landscape.schema import (
@@ -131,6 +133,30 @@ def _seed_run(engine: Tier1Engine, *, run_id: str = RUN_ID, status: str = "runni
                 openrouter_catalog_source="bundled",
             )
         )
+
+
+def test_batched_coordination_event_preserves_context_at_construction(engine: Tier1Engine) -> None:
+    _seed_run(engine)
+    labels = {"reason": "run_finalized"}
+    event_row = CoordinationEventRow(
+        event_type="worker_depart", worker_id="worker:batch:0", leader_epoch=None, recorded_at=NOW, context=labels
+    )
+    labels["reason"] = "changed_after_construction"
+    with begin_write(engine) as conn:
+        record_coordination_events(conn, run_id=RUN_ID, events=(event_row,))
+    with engine.connect() as conn:
+        context_json = conn.execute(
+            select(run_coordination_events_table.c.context_json).where(run_coordination_events_table.c.run_id == RUN_ID)
+        ).scalar_one()
+    assert json.loads(context_json) == {"reason": "run_finalized"}
+
+
+def test_batched_coordination_event_context_rejects_mutation() -> None:
+    event_row = CoordinationEventRow(
+        event_type="worker_depart", worker_id="worker:batch:0", leader_epoch=None, recorded_at=NOW, context={"reason": "run_finalized"}
+    )
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, str], event_row.context)["reason"] = "changed_after_construction"
 
 
 def _seat_row(engine: Tier1Engine, run_id: str = RUN_ID) -> dict[str, object]:

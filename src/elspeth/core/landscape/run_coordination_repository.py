@@ -61,6 +61,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from types import MappingProxyType
 
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Connection
@@ -221,6 +222,10 @@ class CoordinationEventRow:
     leader_epoch: int | None
     recorded_at: datetime
     context: Mapping[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.context is not None:
+            object.__setattr__(self, "context", MappingProxyType(dict(self.context)))
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
