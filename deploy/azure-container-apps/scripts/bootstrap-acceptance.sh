@@ -38,6 +38,42 @@ capture() {
   fi
 }
 
+wait_for_keyvault_rbac() {
+  local wait_seconds=${KEY_VAULT_RBAC_WAIT_SECONDS:-600}
+  [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] && (( wait_seconds <= 600 )) || {
+    echo 'invalid Key Vault RBAC wait budget' >&2; return 2;
+  }
+  local deadline=$((SECONDS + wait_seconds)) remaining command_timeout delay code
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    command_timeout=$((remaining < 30 ? remaining : 30))
+    code=0
+    (ulimit -f 4096; timeout --signal=TERM --kill-after=5s "$command_timeout" \
+      az keyvault secret set --vault-name "$vault" --name elspeth-secret-key \
+      --file "$secret_dir/elspeth-secret-key" --encoding utf-8 --query id --output tsv --only-show-errors \
+      >"$private_dir/elspeth-secret-key.version" 2>"$private_dir/stderr") || code=$?
+    if (( code == 0 )); then return 0; fi
+    # Only this explicit data-plane RBAC refusal is eligible for propagation
+    # retry after the just-created assignment. Probe the required WRITE action
+    # using the first real secret; a pre-existing Reader grant is insufficient.
+    # Firewall/network/other errors
+    # retain their failure code and do not repeat any SQL or secret writes.
+    if [[ $(<"$private_dir/stderr") != *ForbiddenByRbac* ]]; then
+      cp -- "$private_dir/stderr" "$output_dir/bootstrap-error.log"
+      echo 'key_vault_access_probe_failed' >&2
+      return "$code"
+    fi
+    remaining=$((deadline - SECONDS))
+    if (( remaining > 0 )); then
+      delay=$((remaining < 10 ? remaining : 10))
+      sleep "$delay"
+    fi
+  done
+  cp -- "$private_dir/stderr" "$output_dir/bootstrap-error.log"
+  echo 'key_vault_rbac_propagation_timeout' >&2
+  return 124
+}
+
 for name in elspeth-schema-owner-password elspeth-runtime-password elspeth-runtime-a-password elspeth-runtime-b-password \
   elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key elspeth-operator-metrics-bearer-token; do
   test -s "$secret_dir/$name" || { echo 'required operator secret file missing or empty' >&2; exit 2; }
@@ -46,6 +82,14 @@ export PGHOST PGUSER PGPASSWORD PGDATABASE=postgres PGSSLMODE=verify-full PGCONN
 PGHOST=$(jq -er '.postgresFqdn.value' "$inventory")
 PGUSER=$(jq -er '.parameters.postgresAdministratorLogin.value | select(length > 0)' "$MAIN_PARAMETERS")
 PGPASSWORD=$(jq -er '.parameters.postgresAdministratorPassword.value | select(length > 0)' "$MAIN_PARAMETERS")
+vault=$(jq -er '.keyVaultName.value' "$inventory")
+capture "$private_dir/vault-id" az keyvault show --name "$vault" --query id --output tsv --only-show-errors
+vault_id=$(cat "$private_dir/vault-id")
+capture "$private_dir/role.json" az role assignment create --assignee-object-id "$BOOTSTRAP_PRINCIPAL_ID" \
+  --assignee-principal-type "$BOOTSTRAP_PRINCIPAL_TYPE" --role 'Key Vault Secrets Officer' --scope "$vault_id" --only-show-errors
+wait_for_keyvault_rbac
+
+# Do not create non-idempotent SQL roles until Key Vault access has propagated.
 export ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD ELSPETH_RUNTIME_A_PASSWORD ELSPETH_RUNTIME_B_PASSWORD
 ELSPETH_SCHEMA_OWNER_PASSWORD=$(cat "$secret_dir/elspeth-schema-owner-password")
 ELSPETH_RUNTIME_PASSWORD=$(cat "$secret_dir/elspeth-runtime-password")
@@ -53,12 +97,6 @@ ELSPETH_RUNTIME_A_PASSWORD=$(cat "$secret_dir/elspeth-runtime-a-password")
 ELSPETH_RUNTIME_B_PASSWORD=$(cat "$secret_dir/elspeth-runtime-b-password")
 capture "$private_dir/bootstrap-sql.log" psql --no-psqlrc --set=ON_ERROR_STOP=1 --file "$script_dir/bootstrap-acceptance-roles.sql"
 unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD ELSPETH_RUNTIME_A_PASSWORD ELSPETH_RUNTIME_B_PASSWORD
-
-vault=$(jq -er '.keyVaultName.value' "$inventory")
-capture "$private_dir/vault-id" az keyvault show --name "$vault" --query id --output tsv --only-show-errors
-vault_id=$(cat "$private_dir/vault-id")
-capture "$private_dir/role.json" az role assignment create --assignee-object-id "$BOOTSTRAP_PRINCIPAL_ID" \
-  --assignee-principal-type "$BOOTSTRAP_PRINCIPAL_TYPE" --role 'Key Vault Secrets Officer' --scope "$vault_id" --only-show-errors
 
 # Build database URLs from raw password files using URL encoding. No value is
 # passed to a child process through argv; psql read the same password bytes.
@@ -84,6 +122,8 @@ for value_file in "$private_dir"/elspeth-*-url-* "$private_dir"/elspeth-secret-k
   "$private_dir"/elspeth-shareable-link-signing-key "$private_dir"/elspeth-fingerprint-key \
   "$private_dir"/elspeth-operator-metrics-bearer-token; do
   name=${value_file##*/}
+  # The permission proof already wrote this exact value and captured its version.
+  if [[ "$name" == elspeth-secret-key ]]; then continue; fi
   capture "$private_dir/$name.version" az keyvault secret set --vault-name "$vault" --name "$name" \
     --file "$value_file" --encoding utf-8 --query id --output tsv --only-show-errors
 done

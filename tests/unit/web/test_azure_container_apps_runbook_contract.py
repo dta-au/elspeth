@@ -439,7 +439,8 @@ def test_parameter_validator_rejects_unresolved_configuration(tmp_path: Path, pa
 
 
 @pytest.mark.parametrize("fail_sql", [False, True])
-def test_acceptance_bootstrap_creates_role_secret_dependencies_and_protects_values(tmp_path: Path, fail_sql: bool) -> None:
+@pytest.mark.parametrize("rbac", ["ready", "delayed", "firewall", "permanent"])
+def test_acceptance_bootstrap_creates_role_secret_dependencies_and_protects_values(tmp_path: Path, fail_sql: bool, rbac: str) -> None:
     secrets = tmp_path / "secrets"
     secrets.mkdir()
     password = "sensitive:+ /?password"
@@ -501,7 +502,6 @@ if os.environ["FAIL_SQL"] == "true":
     az.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ["FAKE_STATE"])
-assert (root / "sql-done").exists()
 a = sys.argv[1:]
 with (root / "azure-argv.jsonl").open("a") as log:
     log.write(json.dumps(a) + "\\n")
@@ -512,6 +512,19 @@ elif a[:3] == ["role", "assignment", "create"]:
 elif a[:3] == ["keyvault", "secret", "set"]:
     assert (root / "role-done").exists()
     name = a[a.index("--name") + 1]
+    if name == "elspeth-secret-key":
+        attempts = root / "rbac-attempts"
+        attempt = int(attempts.read_text()) + 1 if attempts.exists() else 1
+        attempts.write_text(str(attempt))
+        mode = os.environ["FAKE_RBAC"]
+        if mode == "firewall":
+            print('Inner error: {"code":"ForbiddenByFirewall"}', file=sys.stderr)
+            sys.exit(1)
+        if mode == "permanent" or (mode == "delayed" and attempt == 1):
+            print('Inner error: {"code":"ForbiddenByRbac"}', file=sys.stderr)
+            sys.exit(1)
+    else:
+        assert (root / "sql-done").exists()
     value = pathlib.Path(a[a.index("--file") + 1]).read_text()
     if "-url-" in name:
         assert "sensitive%3A%2B%20%2F%3Fpassword" in value
@@ -526,6 +539,9 @@ else:
     raise AssertionError(a)
 """)
     az.chmod(0o755)
+    sleeper = tmp_path / "sleep"
+    sleeper.write_text('#!/bin/bash\nif [[ "$FAKE_RBAC" != delayed ]]; then exec /bin/sleep "$@"; fi\n')
+    sleeper.chmod(0o755)
     output = tmp_path / "parameters"
     env = {
         **os.environ,
@@ -540,6 +556,8 @@ else:
         "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
         "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
         "FAIL_SQL": str(fail_sql).lower(),
+        "FAKE_RBAC": rbac,
+        "KEY_VAULT_RBAC_WAIT_SECONDS": "1",
     }
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "deploy/azure-container-apps/scripts/bootstrap-acceptance.sh"), str(inventory), str(secrets), str(output)],
@@ -547,14 +565,24 @@ else:
         capture_output=True,
         text=True,
     )
-    assert result.returncode == (3 if fail_sql else 0), result.stderr
+    expected = 1 if rbac == "firewall" else 124 if rbac == "permanent" else 3 if fail_sql else 0
+    assert result.returncode == expected, result.stderr
     assert password not in result.stdout + result.stderr
     assert list(output.glob("bootstrap-private.*")) == []
-    if fail_sql:
-        assert not (tmp_path / "azure-argv.jsonl").exists()
+    if rbac in {"firewall", "permanent"}:
+        assert not (tmp_path / "sql-done").exists()
+        assert not (output / "workload.parameters.json").exists()
+        if rbac == "firewall":
+            assert (tmp_path / "rbac-attempts").read_text() == "1"
+        else:
+            assert "key_vault_rbac_propagation_timeout" in result.stderr
+    elif fail_sql:
+        assert not (tmp_path / "elspeth-session-db-url-runtime.uploaded").exists()
         assert not (output / "workload.parameters.json").exists()
         assert (output / "bootstrap-error.log").stat().st_mode & 0o777 == 0o600
     else:
+        assert (tmp_path / "rbac-attempts").read_text() == ("2" if rbac == "delayed" else "1")
+        assert not (output / "bootstrap-error.log").exists()
         assert password not in (tmp_path / "azure-argv.jsonl").read_text()
         credentials_path = output / "acceptance-env.json"
         assert credentials_path.stat().st_mode & 0o777 == 0o600

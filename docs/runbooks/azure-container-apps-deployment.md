@@ -240,6 +240,14 @@ workload parameter files and a private `acceptance-env.json` containing host
 observer credentials. That credential file is never receipt evidence. A failed
 bootstrap stops the driver and leaves only a private bounded error log; do not
 rerun the cold-only SQL against partially created roles without investigating.
+The helper first proves the operator's newly assigned secret-write permission
+by writing the real `elspeth-secret-key` value. It retries only an explicit
+`ForbiddenByRbac` response, for at most 600 seconds; firewall, network and other
+failures stop immediately. SQL role creation starts only after this succeeds,
+so an ordinary RBAC propagation delay does not strand non-idempotent role
+creation. This follows Microsoft's [Key Vault RBAC guidance](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-guide),
+which requires allowing role assignments time to refresh. A shorter bound can
+be selected through `KEY_VAULT_RBAC_WAIT_SECONDS` (1–600).
 
 Use individual driver stages while establishing the environment, role grants,
 secret versions and probe fixtures. The `all` path runs `prepare` through the
