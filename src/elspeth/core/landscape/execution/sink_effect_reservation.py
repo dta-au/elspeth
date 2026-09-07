@@ -12,6 +12,7 @@ from sqlalchemy import Row, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.audit import SinkEffect
 from elspeth.contracts.audit_export import C, H, final_manifest_identity_payload, hash_final_manifest_identity_payload
@@ -211,24 +212,8 @@ def _export_identity(request: SinkEffectReservationRequest, snapshot: Row[Any]) 
     )
 
 
-def _conflict_safe_insert(conn: Connection, table: Any, values: Mapping[str, object], *, index_elements: Sequence[str]) -> bool:
-    if conn.dialect.name == "sqlite":
-        statement = (
-            sqlite_insert(table)
-            .values(**values)
-            .on_conflict_do_nothing(index_elements=list(index_elements))
-            .returning(*table.primary_key.columns)
-        )
-        return conn.execute(statement).fetchone() is not None
-    if conn.dialect.name == "postgresql":
-        statement = (
-            postgresql_insert(table)
-            .values(**values)
-            .on_conflict_do_nothing(index_elements=list(index_elements))
-            .returning(*table.primary_key.columns)
-        )
-        return conn.execute(statement).fetchone() is not None
-    raise RuntimeError(f"unsupported Landscape backend {conn.dialect.name!r}")  # pragma: no cover
+def _unsupported_backend(conn: Connection) -> RuntimeError:
+    return RuntimeError(f"unsupported Landscape backend {conn.dialect.name!r}")
 
 
 class SinkEffectReservation:
@@ -573,23 +558,32 @@ class SinkEffectReservation:
         if not request.replacing_target:
             return None
         if create:
-            _conflict_safe_insert(
-                conn,
-                sink_effect_streams_table,
-                {
-                    "stream_id": stream_id,
-                    "run_id": request.run_id,
-                    "sink_node_id": request.sink_node_id,
-                    "role": request.role.value,
-                    "requested_target_hash": request.requested_target_hash,
-                    "resolved_target": None,
-                    "next_sequence": 0,
-                    "tail_effect_id": None,
-                    "head_effect_id": None,
-                    "head_descriptor_hash": None,
-                },
-                index_elements=("run_id", "sink_node_id", "role", "requested_target_hash"),
-            )
+            # Conflict-safe on the stream's natural key: a concurrent creator
+            # of the same target stream wins by identity, and the locked read
+            # below binds this reservation to whichever row won. Each table's
+            # insert is written out per dialect so the statement names its
+            # table (the fencing gate classifies DML by the table it binds).
+            values = {
+                "stream_id": stream_id,
+                "run_id": request.run_id,
+                "sink_node_id": request.sink_node_id,
+                "role": request.role.value,
+                "requested_target_hash": request.requested_target_hash,
+                "resolved_target": None,
+                "next_sequence": 0,
+                "tail_effect_id": None,
+                "head_effect_id": None,
+                "head_descriptor_hash": None,
+            }
+            natural_key = ["run_id", "sink_node_id", "role", "requested_target_hash"]
+            if conn.dialect.name == "sqlite":
+                conn.execute(sqlite_insert(sink_effect_streams_table).values(**values).on_conflict_do_nothing(index_elements=natural_key))
+            elif conn.dialect.name == "postgresql":
+                conn.execute(
+                    postgresql_insert(sink_effect_streams_table).values(**values).on_conflict_do_nothing(index_elements=natural_key)
+                )
+            else:  # pragma: no cover - dialect gate
+                raise _unsupported_backend(conn)
         row = conn.execute(
             select(sink_effect_streams_table)
             .where(
@@ -737,7 +731,28 @@ class SinkEffectReservation:
             "updated_at": timestamp,
             "finalized_at": None,
         }
-        inserted = _conflict_safe_insert(conn, sink_effects_table, values, index_elements=("effect_id",))
+        if conn.dialect.name == "sqlite":
+            inserted = (
+                conn.execute(
+                    sqlite_insert(sink_effects_table)
+                    .values(**values)
+                    .on_conflict_do_nothing(index_elements=["effect_id"])
+                    .returning(sink_effects_table.c.effect_id)
+                ).fetchone()
+                is not None
+            )
+        elif conn.dialect.name == "postgresql":
+            inserted = (
+                conn.execute(
+                    postgresql_insert(sink_effects_table)
+                    .values(**values)
+                    .on_conflict_do_nothing(index_elements=["effect_id"])
+                    .returning(sink_effects_table.c.effect_id)
+                ).fetchone()
+                is not None
+            )
+        else:  # pragma: no cover - dialect gate
+            raise _unsupported_backend(conn)
         row = conn.execute(
             select(sink_effects_table).where(sink_effects_table.c.effect_id == identity.effect_id).with_for_update()
         ).fetchone()
@@ -769,49 +784,66 @@ class SinkEffectReservation:
 
     @staticmethod
     def _insert_members(conn: Connection, request: SinkEffectReservationRequest, identity: _EffectIdentity) -> None:
-        for member in identity.members:
-            inserted = _conflict_safe_insert(
-                conn,
-                sink_effect_members_table,
-                {
-                    "effect_id": identity.effect_id,
-                    "input_kind": request.input_kind.value,
-                    "ordinal": member.ordinal,
-                    "run_id": request.run_id,
-                    "sink_node_id": request.sink_node_id,
-                    "role": request.role.value,
-                    "token_id": member.token_id,
-                    "row_id": member.row_id,
-                    "ingest_sequence": member.ingest_sequence,
-                    "lineage_json": member.lineage_json,
-                    "lineage_hash": member.lineage_hash,
-                    "payload_hash": member.payload_hash,
-                    "primary_effect_id": member.primary_effect_id,
-                    "prepared_disposition": None,
-                    "reason_hash": None,
-                    "member_effect_id": member.member_effect_id,
-                    "member_state": None,
-                    "descriptor_hash": None,
-                    "evidence_hash": None,
-                },
-                index_elements=("effect_id", "ordinal"),
-            )
-            if not inserted:
-                raise ValueError("sink effect member winner already exists during new reservation")
+        """Insert every member of a NEW effect in one statement.
+
+        The effect row was inserted by this same transaction under the token
+        and stream locks, so no member row can exist yet; a uniqueness
+        collision is the same integrity failure the per-member conflict-safe
+        insert used to report, not a rival to defer to.
+        """
+        if not identity.members:
+            return
+        rows = [
+            {
+                "effect_id": identity.effect_id,
+                "input_kind": request.input_kind.value,
+                "ordinal": member.ordinal,
+                "run_id": request.run_id,
+                "sink_node_id": request.sink_node_id,
+                "role": request.role.value,
+                "token_id": member.token_id,
+                "row_id": member.row_id,
+                "ingest_sequence": member.ingest_sequence,
+                "lineage_json": member.lineage_json,
+                "lineage_hash": member.lineage_hash,
+                "payload_hash": member.payload_hash,
+                "primary_effect_id": member.primary_effect_id,
+                "prepared_disposition": None,
+                "reason_hash": None,
+                "member_effect_id": member.member_effect_id,
+                "member_state": None,
+                "descriptor_hash": None,
+                "evidence_hash": None,
+            }
+            for member in identity.members
+        ]
+        try:
+            conn.execute(sink_effect_members_table.insert(), rows)
+        except IntegrityError as exc:
+            raise ValueError("sink effect member winner already exists during new reservation") from exc
 
     @staticmethod
     def _insert_or_compare_export_association(conn: Connection, effect_id: str, snapshot_id: str) -> None:
-        _conflict_safe_insert(
-            conn,
-            sink_effect_export_snapshots_table,
-            {
-                "effect_id": effect_id,
-                "input_kind": SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT.value,
-                "slot": 0,
-                "snapshot_id": snapshot_id,
-            },
-            index_elements=("effect_id", "slot"),
-        )
+        values = {
+            "effect_id": effect_id,
+            "input_kind": SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT.value,
+            "slot": 0,
+            "snapshot_id": snapshot_id,
+        }
+        if conn.dialect.name == "sqlite":
+            conn.execute(
+                sqlite_insert(sink_effect_export_snapshots_table)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["effect_id", "slot"])
+            )
+        elif conn.dialect.name == "postgresql":
+            conn.execute(
+                postgresql_insert(sink_effect_export_snapshots_table)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=["effect_id", "slot"])
+            )
+        else:  # pragma: no cover - dialect gate
+            raise _unsupported_backend(conn)
         row = conn.execute(
             select(sink_effect_export_snapshots_table).where(
                 sink_effect_export_snapshots_table.c.effect_id == effect_id,
@@ -824,27 +856,28 @@ class SinkEffectReservation:
     @staticmethod
     def _insert_or_compare_operation(conn: Connection, request: SinkEffectReservationRequest, effect: SinkEffect) -> None:
         operation_id = _labeled_hash("sink-effect-operation-v1", {"effect_id": effect.effect_id})
-        _conflict_safe_insert(
-            conn,
-            operations_table,
-            {
-                "operation_id": operation_id,
-                "run_id": request.run_id,
-                "node_id": request.sink_node_id,
-                "operation_type": "sink_write",
-                "sink_effect_id": effect.effect_id,
-                "started_at": effect.created_at,
-                "completed_at": None,
-                "status": "open",
-                "input_data_ref": None,
-                "input_data_hash": None,
-                "output_data_ref": None,
-                "output_data_hash": None,
-                "error_message": None,
-                "duration_ms": None,
-            },
-            index_elements=("sink_effect_id",),
-        )
+        values = {
+            "operation_id": operation_id,
+            "run_id": request.run_id,
+            "node_id": request.sink_node_id,
+            "operation_type": "sink_write",
+            "sink_effect_id": effect.effect_id,
+            "started_at": effect.created_at,
+            "completed_at": None,
+            "status": "open",
+            "input_data_ref": None,
+            "input_data_hash": None,
+            "output_data_ref": None,
+            "output_data_hash": None,
+            "error_message": None,
+            "duration_ms": None,
+        }
+        if conn.dialect.name == "sqlite":
+            conn.execute(sqlite_insert(operations_table).values(**values).on_conflict_do_nothing(index_elements=["sink_effect_id"]))
+        elif conn.dialect.name == "postgresql":
+            conn.execute(postgresql_insert(operations_table).values(**values).on_conflict_do_nothing(index_elements=["sink_effect_id"]))
+        else:  # pragma: no cover - dialect gate
+            raise _unsupported_backend(conn)
         row = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == effect.effect_id)).fetchone()
         if (
             row is None

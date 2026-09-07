@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, Row, func, select
+from sqlalchemy import ColumnElement, Row, bindparam, func, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import CallStatus, CallType
@@ -293,31 +293,29 @@ class SinkEffectLifecycle:
                     durable_ordinals_list.append(ordinal)
                 durable_ordinals = tuple(durable_ordinals_list)
                 accepted, diverted, reason_hashes = self._planned_member_partition(plan, durable_ordinals)
+                # One executemany UPDATE binds every member's planned
+                # disposition (the fencing gate forbids DML inside a loop);
+                # durable_ordinals is dense and non-empty for pipeline members.
+                member_dispositions: list[dict[str, int | str | None]] = []
                 for ordinal in accepted:
-                    conn.execute(
-                        sink_effect_members_table.update()
-                        .where(
-                            sink_effect_members_table.c.effect_id == effect_id,
-                            sink_effect_members_table.c.ordinal == ordinal,
-                        )
-                        .values(
-                            prepared_disposition="accepted",
-                            reason_hash=None,
-                            member_state=SinkEffectState.PREPARED.value,
-                        )
-                    )
+                    member_dispositions.append({"member_ordinal": ordinal, "disposition": "accepted", "member_reason_hash": None})
                 for ordinal in diverted:
+                    member_dispositions.append(
+                        {"member_ordinal": ordinal, "disposition": "diverted", "member_reason_hash": reason_hashes[ordinal]}
+                    )
+                if member_dispositions:
                     conn.execute(
                         sink_effect_members_table.update()
                         .where(
                             sink_effect_members_table.c.effect_id == effect_id,
-                            sink_effect_members_table.c.ordinal == ordinal,
+                            sink_effect_members_table.c.ordinal == bindparam("member_ordinal"),
                         )
                         .values(
-                            prepared_disposition="diverted",
-                            reason_hash=reason_hashes[ordinal],
+                            prepared_disposition=bindparam("disposition"),
+                            reason_hash=bindparam("member_reason_hash"),
                             member_state=SinkEffectState.PREPARED.value,
-                        )
+                        ),
+                        member_dispositions,
                     )
             winner = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == effect_id)).fetchone()
             if winner is None:  # pragma: no cover - same transaction

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Final
 
-from sqlalchemy import Row, func, select
+from sqlalchemy import Row, bindparam, func, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -311,35 +311,29 @@ class SinkEffectFinalization:
                 )
             )
 
-        for ordinal in request.accepted_ordinals:
+        # One executemany UPDATE stamps every member's final disposition; the
+        # fencing gate forbids a DML construction inside a loop, and an
+        # audit-export effect has no members at all (an empty parameter set
+        # would execute the template unbound, so it is skipped outright).
+        member_dispositions = [
+            *({"member_ordinal": ordinal, "disposition": "accepted"} for ordinal in request.accepted_ordinals),
+            *({"member_ordinal": ordinal, "disposition": "diverted"} for ordinal in request.diverted_ordinals),
+        ]
+        if member_dispositions:
             conn.execute(
                 sink_effect_members_table.update()
                 .where(
                     sink_effect_members_table.c.effect_id == request.effect_id,
-                    sink_effect_members_table.c.ordinal == ordinal,
+                    sink_effect_members_table.c.ordinal == bindparam("member_ordinal"),
                     sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
                 )
                 .values(
-                    prepared_disposition="accepted",
+                    prepared_disposition=bindparam("disposition"),
                     member_state=SinkEffectState.FINALIZED.value,
                     descriptor_hash=descriptor_hash,
                     evidence_hash=evidence_hash,
-                )
-            )
-        for ordinal in request.diverted_ordinals:
-            conn.execute(
-                sink_effect_members_table.update()
-                .where(
-                    sink_effect_members_table.c.effect_id == request.effect_id,
-                    sink_effect_members_table.c.ordinal == ordinal,
-                    sink_effect_members_table.c.member_state != SinkEffectState.FINALIZED.value,
-                )
-                .values(
-                    prepared_disposition="diverted",
-                    member_state=SinkEffectState.FINALIZED.value,
-                    descriptor_hash=descriptor_hash,
-                    evidence_hash=evidence_hash,
-                )
+                ),
+                member_dispositions,
             )
 
         self._advance_stream_head(conn, effect, descriptor_hash)
