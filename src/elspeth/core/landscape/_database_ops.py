@@ -97,6 +97,30 @@ class DatabaseOps(ReadOnlyDatabaseOps):
     connection management.
     """
 
+    @staticmethod
+    def execute_insert_on(conn: Connection, stmt: Executable, *, context: str = "") -> None:
+        """Execute on the caller's fenced connection without owning a transaction."""
+        try:
+            result = conn.execute(stmt)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(operation="execute_insert_on", action="write", exc=exc, context=context)
+            ) from exc
+        if result.rowcount == 0:
+            raise LandscapeRecordError("execute_insert_on: zero rows affected — audit write failed")
+
+    @staticmethod
+    def execute_update_on(conn: Connection, stmt: Executable, *, context: str = "") -> None:
+        """Execute on the caller's fenced connection and require a target row."""
+        try:
+            result = conn.execute(stmt)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(operation="execute_update_on", action="update", exc=exc, context=context)
+            ) from exc
+        if result.rowcount == 0:
+            raise LandscapeRecordNotFoundError("execute_update_on: zero rows affected — target row does not exist")
+
     def execute_insert(self, stmt: Executable, *, context: str = "") -> None:
         """Execute insert statement.
 
