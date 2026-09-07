@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 import pytest
 from _pytest.mark import ParameterSet
 from sqlalchemy import select
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import Select, Update
 
@@ -40,12 +41,15 @@ from elspeth.contracts import (
     TriggerType,
 )
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason, ExecutionError, TransformSuccessReason
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
-from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape import LandscapeDB, run_coordination_repository
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.model_loaders import (
@@ -60,12 +64,79 @@ from elspeth.core.landscape.model_loaders import (
     SinkEffectMemberLoader,
     SinkEffectStreamLoader,
 )
-from elspeth.core.landscape.schema import node_states_table, routing_events_table
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, verify_and_extend_leader_fence
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping
+from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+from elspeth.core.landscape.schema import (
+    node_states_table,
+    routing_events_table,
+    rows_table,
+    token_work_items_table,
+    tokens_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
+
+
+def _leader_token(repo: ExecutionRepository) -> CoordinationToken:
+    return leader_token_for(repo._db, "run-1")
+
+
+def _work_item_for_state(repo: ExecutionRepository, state_id: str) -> TokenWorkItem:
+    leader = _leader_token(repo)
+    with repo._db.read_only_connection() as conn:
+        state = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).one()
+        existing = conn.execute(
+            select(token_work_items_table).where(
+                token_work_items_table.c.run_id == leader.run_id,
+                token_work_items_table.c.token_id == state.token_id,
+                token_work_items_table.c.node_id == state.node_id,
+            )
+        ).one_or_none()
+        if existing is not None:
+            return item_from_mapping(existing._mapping)
+        row = conn.execute(
+            select(rows_table)
+            .join(tokens_table, rows_table.c.row_id == tokens_table.c.row_id)
+            .where(
+                tokens_table.c.token_id == state.token_id,
+            )
+        ).one()
+    return TokenSchedulerRepository(repo._db.engine).enqueue_ready_claimed(
+        run_id=leader.run_id,
+        token_id=state.token_id,
+        row_id=row.row_id,
+        node_id=state.node_id,
+        step_index=state.step_index,
+        ingest_sequence=row.ingest_sequence,
+        row_payload_json="{}",
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
+
+
+def _register_artifact(repo: ExecutionRepository, *args: Any, **kwargs: Any) -> Any:
+    with fenced_leader_transaction(repo._db.engine, token=_leader_token(repo), window_seconds=300, verb="test_artifact") as conn:
+        return repo.artifacts.register_artifact(*args, **kwargs, conn=conn)
+
+
+def _add_batch_member(repo: ExecutionRepository, batch_id: str, token_id: str, ordinal: int) -> Any:
+    leader = _leader_token(repo)
+    with fenced_leader_transaction(repo._db.engine, token=leader, window_seconds=300, verb="test_batch_member") as conn:
+        return add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal, expected_run_id=leader.run_id)
+
+
+def _complete_many(repo: ExecutionRepository, completions: Any, *, conn: Connection | None = None) -> None:
+    if conn is not None:
+        repo.node_states.complete_node_states_completed_many(completions, conn=conn)
+        return
+    leader = _leader_token(repo)
+    with repo._db.write_connection() as active_conn:
+        verify_and_extend_leader_fence(active_conn, token=leader, window_seconds=300, verb="test_complete_many")
+        repo.node_states.complete_node_states_completed_many(completions, conn=active_conn)
 
 
 @dataclass(frozen=True)
@@ -189,14 +260,7 @@ class TestBeginNodeStateQuarantined:
         """
         _db, repo, _fac, tok = _make_repo_with_token()
         data_with_nan = {"value": float("nan")}
-        state = repo.begin_node_state(
-            tok,
-            "transform-1",
-            "run-1",
-            1,
-            data_with_nan,
-            quarantined=True,
-        )
+        state = repo.begin_node_state(tok, "transform-1", 1, data_with_nan, quarantined=True, member_token=_leader_token(repo).membership)
         assert isinstance(state, NodeStateOpen)
         assert state.input_hash is not None
         assert len(state.input_hash) > 0
@@ -208,14 +272,7 @@ class TestBeginNodeStateQuarantined:
         """
         _db, repo, _fac, tok = _make_repo_with_token()
         normal_data = {"value": 42}
-        state = repo.begin_node_state(
-            tok,
-            "transform-1",
-            "run-1",
-            1,
-            normal_data,
-            quarantined=True,
-        )
+        state = repo.begin_node_state(tok, "transform-1", 1, normal_data, quarantined=True, member_token=_leader_token(repo).membership)
         assert isinstance(state, NodeStateOpen)
         # Verify it used stable_hash (canonical) not repr_hash
         from elspeth.core.canonical import stable_hash
@@ -232,14 +289,7 @@ class TestBeginNodeStateQuarantined:
         _db, repo, _fac, tok = _make_repo_with_token()
         data_with_nan = {"value": float("nan")}
         with pytest.raises(ValueError, match=r"[Nn]a[Nn]"):
-            repo.begin_node_state(
-                tok,
-                "transform-1",
-                "run-1",
-                1,
-                data_with_nan,
-                quarantined=False,
-            )
+            repo.begin_node_state(tok, "transform-1", 1, data_with_nan, quarantined=False, member_token=_leader_token(repo).membership)
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +307,11 @@ class TestCompleteNodeStateCrashPaths:
         state = repo.record_completed_node_state(
             token_id=tok,
             node_id="source-0",
-            run_id="run-1",
             step_index=0,
             input_data={"name": "test"},
             output_data={"name": "test"},
             duration_ms=0,
+            coordination_token=_leader_token(repo),
         )
 
         assert isinstance(state, NodeStateCompleted)
@@ -288,18 +338,20 @@ class TestCompleteNodeStateCrashPaths:
 
         states = repo.begin_node_states_many(
             (
-                (tok, "sink-0", "run-1", 2, {"name": "test"}),
-                ("tok-2", "sink-0", "run-1", 2, {"name": "second"}),
-            )
+                (tok, "sink-0", 2, {"name": "test"}),
+                ("tok-2", "sink-0", 2, {"name": "second"}),
+            ),
+            coordination_token=_leader_token(repo),
         )
 
         assert [state.token_id for state in states] == [tok, "tok-2"]
         assert all(isinstance(state, NodeStateOpen) for state in states)
-        repo.complete_node_states_completed_many(
+        _complete_many(
+            repo,
             (
                 (states[0].state_id, {"row": {"name": "test"}, "artifact_path": "out.csv", "content_hash": "hash"}, 2.5),
                 (states[1].state_id, {"row": {"name": "second"}, "artifact_path": "out.csv", "content_hash": "hash"}, 2.5),
-            )
+            ),
         )
 
         with db.read_only_connection() as conn:
@@ -320,7 +372,7 @@ class TestCompleteNodeStateCrashPaths:
         """Large batch validation/readback must stay below SQLite parameter ceilings."""
         _db, repo, fac, _tok = _make_repo_with_token()
         state_count = 501
-        begin_entries: list[tuple[str, str, str, int, dict[str, object]]] = []
+        begin_entries: list[tuple[str, str, int, dict[str, object]]] = []
         for index in range(state_count):
             row_id = f"row-bulk-{index}"
             token_id = f"tok-bulk-{index}"
@@ -334,8 +386,8 @@ class TestCompleteNodeStateCrashPaths:
                 ingest_sequence=index + 1,
             )
             fac.data_flow.create_token(row_id, token_id=token_id)
-            begin_entries.append((token_id, "sink-0", "run-1", 2, {"name": f"bulk-{index}"}))
-        states = repo.begin_node_states_many(tuple(begin_entries))
+            begin_entries.append((token_id, "sink-0", 2, {"name": f"bulk-{index}"}))
+        states = repo.begin_node_states_many(tuple(begin_entries), coordination_token=_leader_token(repo))
 
         original_connection = repo._db.write_connection
         observed_select_sizes: list[int] = []
@@ -362,7 +414,7 @@ class TestCompleteNodeStateCrashPaths:
 
         repo._db.write_connection = bounded_state_select_connection  # type: ignore[method-assign]
 
-        repo.complete_node_states_completed_many(tuple((state.state_id, {"completed": index}, 1.0) for index, state in enumerate(states)))
+        _complete_many(repo, tuple((state.state_id, {"completed": index}, 1.0) for index, state in enumerate(states)))
 
         assert sorted(observed_select_sizes) == [1, 1, 500, 500]
 
@@ -388,8 +440,10 @@ class TestCompleteNodeStateCrashPaths:
             ingest_sequence=1,
         )
         fac.data_flow.create_token("row-2", token_id="tok-2")
-        state_b = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"name": "test"}, state_id="state-b")
-        state_a = repo.begin_node_state("tok-2", "sink-0", "run-1", 2, {"name": "second"}, state_id="state-a")
+        state_b = repo.begin_node_state(tok, "sink-0", 2, {"name": "test"}, state_id="state-b", member_token=_leader_token(repo).membership)
+        state_a = repo.begin_node_state(
+            "tok-2", "sink-0", 2, {"name": "second"}, state_id="state-a", member_token=_leader_token(repo).membership
+        )
         completions = (
             (state_b.state_id, {"completed": "b"}, 1.0),
             (state_a.state_id, {"completed": "a"}, 1.0),
@@ -418,7 +472,7 @@ class TestCompleteNodeStateCrashPaths:
         if caller_owns_connection:
             with pytest.raises(LandscapeRecordError, match="affected 2 rows for 3 states"), db.write_connection() as conn:
                 observe_connection(conn)
-                repo.complete_node_states_completed_many(completions, conn=conn)
+                _complete_many(repo, completions, conn=conn)
         else:
             original_connection = repo._db.write_connection
 
@@ -432,7 +486,7 @@ class TestCompleteNodeStateCrashPaths:
 
             repo._db.write_connection = observed_write_connection  # type: ignore[method-assign]
             with pytest.raises(LandscapeRecordError, match="affected 2 rows for 3 states"):
-                repo.complete_node_states_completed_many(completions)
+                _complete_many(repo, completions)
 
         assert ("lock", None) not in events
         assert events[0] == ("read", None)
@@ -447,18 +501,18 @@ class TestCompleteNodeStateCrashPaths:
             ("state-b", NodeStateStatus.OPEN.value),
         ]
 
-    def test_batch_begin_rowcount_mismatch_rolls_back_inserted_open_states(self) -> None:
+    def test_batch_begin_rowcount_mismatch_rolls_back_inserted_open_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Rowcount mismatches must abort inside the write transaction."""
         db, repo, fac, tok = _make_repo_with_token()
         fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
         fac.data_flow.create_token("row-2", token_id="tok-2")
-        original_connection = repo._db.write_connection
+        original_connection = run_coordination_repository.begin_write
 
         from contextlib import contextmanager
 
         @contextmanager
-        def rowcount_mismatch_connection():
-            with original_connection() as conn:
+        def rowcount_mismatch_connection(engine):
+            with original_connection(engine) as conn:
                 original_execute = conn.execute
 
                 def patched_execute(stmt, *args: Any, **kwargs: Any):
@@ -470,14 +524,15 @@ class TestCompleteNodeStateCrashPaths:
                 conn.execute = patched_execute
                 yield conn
 
-        repo._db.write_connection = rowcount_mismatch_connection  # type: ignore[method-assign]
+        monkeypatch.setattr(run_coordination_repository, "begin_write", rowcount_mismatch_connection)
 
         with pytest.raises(LandscapeRecordError, match="affected 1 rows for 2 states"):
             repo.begin_node_states_many(
                 (
-                    (tok, "sink-0", "run-1", 2, {"name": "test"}),
-                    ("tok-2", "sink-0", "run-1", 2, {"name": "second"}),
-                )
+                    (tok, "sink-0", 2, {"name": "test"}),
+                    ("tok-2", "sink-0", 2, {"name": "second"}),
+                ),
+                coordination_token=_leader_token(repo),
             )
 
         with db.read_only_connection() as conn:
@@ -487,11 +542,13 @@ class TestCompleteNodeStateCrashPaths:
     def test_batch_complete_rejects_already_terminal_state(self) -> None:
         """Batch completion must preserve terminal-state immutability checks."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"a": 1})
-        repo.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=1.0)
+        state = repo.begin_node_state(tok, "sink-0", 2, {"a": 1}, member_token=_leader_token(repo).membership)
+        repo.complete_node_state(
+            state.state_id, NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=1.0, member_token=_leader_token(repo).membership
+        )
 
         with pytest.raises(AuditIntegrityError, match="already terminal"):
-            repo.complete_node_states_completed_many(((state.state_id, {"b": 3}, 2.0),))
+            _complete_many(repo, ((state.state_id, {"b": 3}, 2.0),))
 
     def test_nonexistent_state_raises_audit_integrity(self) -> None:
         """Completing a nonexistent state must raise AuditIntegrityError.
@@ -505,6 +562,7 @@ class TestCompleteNodeStateCrashPaths:
                 NodeStateStatus.COMPLETED,
                 output_data={"result": "ok"},
                 duration_ms=10.0,
+                member_token=_leader_token(repo).membership,
             )
 
     def test_completed_node_state_rewrite_raises(self) -> None:
@@ -515,8 +573,12 @@ class TestCompleteNodeStateCrashPaths:
         rewritten to FAILED (audit immutability violation).
         """
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="state-term-c", attempt=0)
-        repo.complete_node_state("state-term-c", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0)
+        repo.begin_node_state(
+            tok, "transform-1", 1, {"a": 1}, state_id="state-term-c", attempt=0, member_token=_leader_token(repo).membership
+        )
+        repo.complete_node_state(
+            "state-term-c", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0, member_token=_leader_token(repo).membership
+        )
 
         from elspeth.contracts.errors import ExecutionError
 
@@ -526,6 +588,7 @@ class TestCompleteNodeStateCrashPaths:
                 NodeStateStatus.FAILED,
                 error=ExecutionError(exception="late failure", exception_type="RuntimeError"),
                 duration_ms=1.0,
+                member_token=_leader_token(repo).membership,
             )
 
     def test_failed_node_state_rewrite_raises(self) -> None:
@@ -537,19 +600,33 @@ class TestCompleteNodeStateCrashPaths:
         from elspeth.contracts.errors import ExecutionError
 
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="state-term-f", attempt=0)
+        repo.begin_node_state(
+            tok, "transform-1", 1, {"a": 1}, state_id="state-term-f", attempt=0, member_token=_leader_token(repo).membership
+        )
         error = ExecutionError(exception="first failure", exception_type="ValueError")
-        repo.complete_node_state("state-term-f", NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+        repo.complete_node_state(
+            "state-term-f", NodeStateStatus.FAILED, error=error, duration_ms=1.0, member_token=_leader_token(repo).membership
+        )
 
         with pytest.raises(AuditIntegrityError, match="already terminal"):
-            repo.complete_node_state("state-term-f", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0)
+            repo.complete_node_state(
+                "state-term-f",
+                NodeStateStatus.COMPLETED,
+                output_data={"b": 2},
+                duration_ms=5.0,
+                member_token=_leader_token(repo).membership,
+            )
 
     def test_pending_node_state_can_be_completed(self) -> None:
         """PENDING is non-terminal — completing a PENDING state to COMPLETED must succeed."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="state-pend", attempt=0)
-        repo.complete_node_state("state-pend", NodeStateStatus.PENDING, duration_ms=3.0)
-        result = repo.complete_node_state("state-pend", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0)
+        repo.begin_node_state(
+            tok, "transform-1", 1, {"a": 1}, state_id="state-pend", attempt=0, member_token=_leader_token(repo).membership
+        )
+        repo.complete_node_state("state-pend", NodeStateStatus.PENDING, duration_ms=3.0, member_token=_leader_token(repo).membership)
+        result = repo.complete_node_state(
+            "state-pend", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0, member_token=_leader_token(repo).membership
+        )
         assert isinstance(result, NodeStateCompleted)
 
     def test_complete_returns_typed_union(self) -> None:
@@ -557,21 +634,27 @@ class TestCompleteNodeStateCrashPaths:
         _db, repo, _fac, tok = _make_repo_with_token()
 
         # COMPLETED (attempt=0)
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="state-c", attempt=0)
-        result_c = repo.complete_node_state("state-c", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0)
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="state-c", attempt=0, member_token=_leader_token(repo).membership)
+        result_c = repo.complete_node_state(
+            "state-c", NodeStateStatus.COMPLETED, output_data={"b": 2}, duration_ms=5.0, member_token=_leader_token(repo).membership
+        )
         assert isinstance(result_c, NodeStateCompleted)
 
         # PENDING (attempt=1 to avoid UNIQUE constraint)
-        repo.begin_node_state(tok, "transform-1", "run-1", 2, {"a": 1}, state_id="state-p", attempt=1)
-        result_p = repo.complete_node_state("state-p", NodeStateStatus.PENDING, duration_ms=3.0)
+        repo.begin_node_state(tok, "transform-1", 2, {"a": 1}, state_id="state-p", attempt=1, member_token=_leader_token(repo).membership)
+        result_p = repo.complete_node_state(
+            "state-p", NodeStateStatus.PENDING, duration_ms=3.0, member_token=_leader_token(repo).membership
+        )
         assert isinstance(result_p, NodeStatePending)
 
         # FAILED (attempt=2 to avoid UNIQUE constraint)
         from elspeth.contracts.errors import ExecutionError
 
-        repo.begin_node_state(tok, "transform-1", "run-1", 3, {"a": 1}, state_id="state-f", attempt=2)
+        repo.begin_node_state(tok, "transform-1", 3, {"a": 1}, state_id="state-f", attempt=2, member_token=_leader_token(repo).membership)
         error = ExecutionError(exception="test failure", exception_type="ValueError")
-        result_f = repo.complete_node_state("state-f", NodeStateStatus.FAILED, error=error, duration_ms=1.0)
+        result_f = repo.complete_node_state(
+            "state-f", NodeStateStatus.FAILED, error=error, duration_ms=1.0, member_token=_leader_token(repo).membership
+        )
         assert isinstance(result_f, NodeStateFailed)
 
 
@@ -591,14 +674,23 @@ class TestReleasedTokenLookup:
         _db, repo, fac, tok = _make_repo_with_token()
         fac.data_flow.create_token("row-1", token_id="tok-late")
 
-        member = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
-        residual = repo.begin_node_state("tok-late", "transform-1", "run-1", 1, {"name": "test"}, attempt=1)
-        repo.complete_node_state(member.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        member = repo.begin_node_state(tok, "transform-1", 1, {"name": "test"}, member_token=_leader_token(repo).membership)
+        residual = repo.begin_node_state(
+            "tok-late", "transform-1", 1, {"name": "test"}, attempt=1, member_token=_leader_token(repo).membership
+        )
+        repo.complete_node_state(
+            member.state_id,
+            NodeStateStatus.COMPLETED,
+            output_data={"ok": True},
+            duration_ms=1.0,
+            member_token=_leader_token(repo).membership,
+        )
         repo.complete_node_state(
             residual.state_id,
             NodeStateStatus.FAILED,
             error=ExecutionError(exception="late_arrival_after_release", exception_type="RowUnionFailure"),
             duration_ms=1.0,
+            member_token=_leader_token(repo).membership,
         )
 
         reads = fac.barrier_restore
@@ -618,42 +710,66 @@ class TestCompleteNodeStateForbiddenFields:
 
     def test_pending_rejects_output_data(self) -> None:
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="s-1")
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="s-1", member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match=r"PENDING.*must not have output_data"):
-            repo.complete_node_state("s-1", NodeStateStatus.PENDING, output_data={"x": 1}, duration_ms=5.0)
+            repo.complete_node_state(
+                "s-1", NodeStateStatus.PENDING, output_data={"x": 1}, duration_ms=5.0, member_token=_leader_token(repo).membership
+            )
 
     def test_pending_rejects_error(self) -> None:
         from elspeth.contracts.errors import ExecutionError
 
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="s-1")
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="s-1", member_token=_leader_token(repo).membership)
         err = ExecutionError(exception="oops", exception_type="ValueError")
         with pytest.raises(ValueError, match=r"PENDING.*must not have error"):
-            repo.complete_node_state("s-1", NodeStateStatus.PENDING, error=err, duration_ms=5.0)
+            repo.complete_node_state(
+                "s-1", NodeStateStatus.PENDING, error=err, duration_ms=5.0, member_token=_leader_token(repo).membership
+            )
 
     def test_pending_rejects_success_reason(self) -> None:
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="s-1")
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="s-1", member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match=r"PENDING.*must not have success_reason"):
-            repo.complete_node_state("s-1", NodeStateStatus.PENDING, success_reason={"reason": "ok"}, duration_ms=5.0)  # type: ignore[call-overload]  # intentionally invalid: testing rejection of success_reason with PENDING
+            repo.complete_node_state(
+                "s-1",
+                NodeStateStatus.PENDING,
+                success_reason={"reason": "ok"},
+                duration_ms=5.0,
+                member_token=_leader_token(repo).membership,
+            )  # type: ignore[call-overload]  # intentionally invalid: testing rejection of success_reason with PENDING
 
     def test_completed_rejects_error(self) -> None:
         from elspeth.contracts.errors import ExecutionError
 
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="s-1")
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="s-1", member_token=_leader_token(repo).membership)
         err = ExecutionError(exception="oops", exception_type="ValueError")
         with pytest.raises(ValueError, match=r"COMPLETED.*must not have error"):
-            repo.complete_node_state("s-1", NodeStateStatus.COMPLETED, output_data={"x": 1}, error=err, duration_ms=5.0)
+            repo.complete_node_state(
+                "s-1",
+                NodeStateStatus.COMPLETED,
+                output_data={"x": 1},
+                error=err,
+                duration_ms=5.0,
+                member_token=_leader_token(repo).membership,
+            )
 
     def test_failed_rejects_success_reason(self) -> None:
         from elspeth.contracts.errors import ExecutionError
 
         _db, repo, _fac, tok = _make_repo_with_token()
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1}, state_id="s-1")
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, state_id="s-1", member_token=_leader_token(repo).membership)
         err = ExecutionError(exception="oops", exception_type="ValueError")
         with pytest.raises(ValueError, match=r"FAILED.*must not have success_reason"):
-            repo.complete_node_state("s-1", NodeStateStatus.FAILED, error=err, success_reason={"reason": "ok"}, duration_ms=5.0)  # type: ignore[call-overload]  # intentionally invalid: testing rejection of success_reason with FAILED
+            repo.complete_node_state(
+                "s-1",
+                NodeStateStatus.FAILED,
+                error=err,
+                success_reason={"reason": "ok"},
+                duration_ms=5.0,
+                member_token=_leader_token(repo).membership,
+            )  # type: ignore[call-overload]  # intentionally invalid: testing rejection of success_reason with FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +780,7 @@ class TestCompleteNodeStateForbiddenFields:
 class TestRecordRoutingEventsRowcount:
     """Test that record_routing_events checks INSERT rowcount (H5)."""
 
-    def test_zero_rowcount_raises_audit_integrity(self) -> None:
+    def test_zero_rowcount_raises_audit_integrity(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fake zero rowcount on routing event INSERT raises AuditIntegrityError.
 
         This simulates a database anomaly where the INSERT succeeds but
@@ -673,7 +789,7 @@ class TestRecordRoutingEventsRowcount:
         _db, repo, fac, tok = _make_repo_with_token()
 
         # Create a node state and edge so the routing event has valid references
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -686,13 +802,13 @@ class TestRecordRoutingEventsRowcount:
         routes = [RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE)]
 
         # Fake the connection's execute to return rowcount=0 for INSERTs
-        original_connection = repo._db.write_connection
+        original_connection = run_coordination_repository.begin_write
 
         from contextlib import contextmanager
 
         @contextmanager
-        def mock_connection():
-            with original_connection() as conn:
+        def mock_connection(engine):
+            with original_connection(engine) as conn:
                 original_execute = conn.execute
 
                 def patched_execute(stmt, *args: Any, **kwargs: Any):
@@ -705,10 +821,12 @@ class TestRecordRoutingEventsRowcount:
                 conn.execute = patched_execute
                 yield conn
 
-        repo._db.write_connection = mock_connection  # type: ignore[method-assign]
+        monkeypatch.setattr(run_coordination_repository, "begin_write", mock_connection)
 
         with pytest.raises(AuditIntegrityError, match="zero rows affected"):
-            repo.record_routing_events(state.state_id, routes)
+            repo.record_routing_events(
+                state.state_id, routes, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -722,16 +840,13 @@ class TestBeginAndCompleteNodeState:
     def test_begin_and_complete_roundtrip(self) -> None:
         """Begin a node state, complete it, verify all fields."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         assert isinstance(state, NodeStateOpen)
         assert state.status == NodeStateStatus.OPEN
         assert state.token_id == tok
 
         completed = repo.complete_node_state(
-            state.state_id,
-            NodeStateStatus.COMPLETED,
-            output_data={"y": 2},
-            duration_ms=42.0,
+            state.state_id, NodeStateStatus.COMPLETED, output_data={"y": 2}, duration_ms=42.0, member_token=_leader_token(repo).membership
         )
         assert isinstance(completed, NodeStateCompleted)
         assert completed.status == NodeStateStatus.COMPLETED
@@ -750,9 +865,11 @@ class TestRecordCall:
     def test_record_call_roundtrip(self) -> None:
         """Record a call and verify it's retrievable."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
 
-        idx = repo.allocate_call_index(state.state_id)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
         assert idx == 0
 
         call = repo.record_call(
@@ -762,6 +879,8 @@ class TestRecordCall:
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "hello"}),
             RawCallPayload({"response": "world"}),
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
         assert call.call_type == CallType.LLM
         assert call.status == CallStatus.SUCCESS
@@ -779,10 +898,10 @@ class TestBatchLifecycle:
         """Create batch, add members, complete it."""
         _db, repo, _fac, tok = _make_repo_with_token()
 
-        batch = repo.create_batch("run-1", "agg-1")
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
         assert batch.status == BatchStatus.DRAFT
 
-        member = repo.add_batch_member(batch.batch_id, tok, 0)
+        member = _add_batch_member(repo, batch.batch_id, tok, 0)
         assert member.ordinal == 0
 
         completed = repo.complete_batch(
@@ -790,6 +909,7 @@ class TestBatchLifecycle:
             BatchStatus.COMPLETED,
             trigger_type=TriggerType.COUNT,
             trigger_reason="count=1",
+            coordination_token=_leader_token(repo),
         )
         assert completed.status == BatchStatus.COMPLETED
         assert completed.trigger_type == TriggerType.COUNT
@@ -806,8 +926,8 @@ class TestCompleteOperationRowcount:
     def test_complete_operation_basic(self) -> None:
         """complete_operation without payload_store skips the second UPDATE."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
-        repo.complete_operation(op.operation_id, "completed", duration_ms=10.0)
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
+        repo.complete_operation(op.operation_id, "completed", duration_ms=10.0, coordination_token=_leader_token(repo))
         result = repo.get_operation(op.operation_id)
         assert result is not None
         assert result.status == "completed"
@@ -824,12 +944,9 @@ class TestCompleteOperationWithPayloadStore:
     def test_complete_operation_with_output_data_no_payload_store(self) -> None:
         """complete_operation with output_data but no payload_store stores hash only."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
         repo.complete_operation(
-            op.operation_id,
-            "completed",
-            output_data={"rows_loaded": 100},
-            duration_ms=50.0,
+            op.operation_id, "completed", output_data={"rows_loaded": 100}, duration_ms=50.0, coordination_token=_leader_token(repo)
         )
         result = repo.get_operation(op.operation_id)
         assert result is not None
@@ -842,12 +959,9 @@ class TestCompleteOperationWithPayloadStore:
         """complete_operation with payload_store persists output_data to store."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, _fac, _tok = _make_repo_with_token(payload_store=store)
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
         repo.complete_operation(
-            op.operation_id,
-            "completed",
-            output_data={"rows_loaded": 42},
-            duration_ms=15.0,
+            op.operation_id, "completed", output_data={"rows_loaded": 42}, duration_ms=15.0, coordination_token=_leader_token(repo)
         )
         result = repo.get_operation(op.operation_id)
         assert result is not None
@@ -861,12 +975,9 @@ class TestCompleteOperationWithPayloadStore:
     def test_complete_operation_failed_status(self) -> None:
         """complete_operation with failed status records error message."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
         repo.complete_operation(
-            op.operation_id,
-            "failed",
-            error="Connection refused",
-            duration_ms=100.0,
+            op.operation_id, "failed", error="Connection refused", duration_ms=100.0, coordination_token=_leader_token(repo)
         )
         result = repo.get_operation(op.operation_id)
         assert result is not None
@@ -876,52 +987,45 @@ class TestCompleteOperationWithPayloadStore:
     def test_complete_operation_failed_status_rejects_empty_error_message(self) -> None:
         """complete_operation must reject blank error strings for failed operations."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         with pytest.raises(FrameworkBugError, match="error must not be empty"):
-            repo.complete_operation(
-                op.operation_id,
-                "failed",
-                error="",
-                duration_ms=100.0,
-            )
+            repo.complete_operation(op.operation_id, "failed", error="", duration_ms=100.0, coordination_token=_leader_token(repo))
 
     @pytest.mark.parametrize("invalid_status", ["open", "bogus", "pending"])
     def test_complete_operation_rejects_invalid_runtime_statuses(self, invalid_status: str) -> None:
         """complete_operation must reject runtime status strings outside the terminal allowlist."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         with pytest.raises(FrameworkBugError, match="unsupported status"):
             repo.complete_operation(
                 op.operation_id,
                 invalid_status,  # type: ignore[arg-type]  # Intentional runtime-boundary test
                 duration_ms=5.0,
+                coordination_token=_leader_token(repo),
             )
 
     def test_complete_nonexistent_operation_raises_framework_bug(self) -> None:
         """Completing a nonexistent operation raises FrameworkBugError."""
         _db, repo, _fac, _tok = _make_repo_with_token()
         with pytest.raises(FrameworkBugError, match="non-existent"):
-            repo.complete_operation("op_doesnotexist", "completed", duration_ms=10.0)
+            repo.complete_operation("op_doesnotexist", "completed", duration_ms=10.0, coordination_token=_leader_token(repo))
 
     def test_complete_already_completed_operation_raises_framework_bug(self) -> None:
         """Completing an already-completed operation raises FrameworkBugError."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
-        repo.complete_operation(op.operation_id, "completed", duration_ms=10.0)
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
+        repo.complete_operation(op.operation_id, "completed", duration_ms=10.0, coordination_token=_leader_token(repo))
         with pytest.raises(FrameworkBugError, match="already-completed"):
-            repo.complete_operation(op.operation_id, "completed", duration_ms=10.0)
+            repo.complete_operation(op.operation_id, "completed", duration_ms=10.0, coordination_token=_leader_token(repo))
 
     def test_begin_operation_with_input_data_and_payload_store(self, tmp_path: Path) -> None:
         """begin_operation with input_data and payload_store persists input."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, _fac, _tok = _make_repo_with_token(payload_store=store)
         op = repo.begin_operation(
-            "run-1",
-            "source-0",
-            "source_load",
-            input_data={"source_path": "/data/input.csv"},
+            "source-0", "source_load", input_data={"source_path": "/data/input.csv"}, coordination_token=_leader_token(repo)
         )
         assert op.input_data_hash is not None
         assert op.input_data_ref is not None
@@ -930,10 +1034,7 @@ class TestCompleteOperationWithPayloadStore:
         """begin_operation with input_data but no payload_store stores hash only."""
         _db, repo, _fac, _tok = _make_repo_with_token()
         op = repo.begin_operation(
-            "run-1",
-            "source-0",
-            "source_load",
-            input_data={"source_path": "/data/input.csv"},
+            "source-0", "source_load", input_data={"source_path": "/data/input.csv"}, coordination_token=_leader_token(repo)
         )
         assert op.input_data_hash is not None
         assert op.input_data_ref is None
@@ -950,9 +1051,11 @@ class TestFindCallByRequestHash:
     def test_find_call_found(self) -> None:
         """Find a previously recorded call by its request hash."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         request_data = RawCallPayload({"prompt": "classify this"})
-        idx = repo.allocate_call_index(state.state_id)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
         recorded_call = repo.record_call(
             state.state_id,
             idx,
@@ -960,6 +1063,8 @@ class TestFindCallByRequestHash:
             CallStatus.SUCCESS,
             request_data,
             RawCallPayload({"result": "positive"}),
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
 
         found = repo.find_call_by_request_hash(
@@ -975,7 +1080,7 @@ class TestFindCallByRequestHash:
         """Return None when no call matches the request hash."""
         _db, repo, _fac, tok = _make_repo_with_token()
         # Create a state so the run has node_states, but no calls
-        repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
 
         result = repo.find_call_by_request_hash(
             "run-1",
@@ -987,9 +1092,11 @@ class TestFindCallByRequestHash:
     def test_find_call_wrong_type_not_found(self) -> None:
         """Return None when call type doesn't match even if hash matches."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         request_data = RawCallPayload({"url": "https://api.example.com"})
-        idx = repo.allocate_call_index(state.state_id)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
         recorded = repo.record_call(
             state.state_id,
             idx,
@@ -997,6 +1104,8 @@ class TestFindCallByRequestHash:
             CallStatus.SUCCESS,
             request_data,
             RawCallPayload({"status": 200}),
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
 
         # Search with LLM type but HTTP hash
@@ -1010,13 +1119,15 @@ class TestFindCallByRequestHash:
     def test_find_call_sequence_index_for_duplicates(self) -> None:
         """sequence_index disambiguates duplicate request hashes (retries)."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         request_data = RawCallPayload({"prompt": "same request"})
 
         # Record same request 3 times with different responses
         call_ids = []
         for i in range(3):
-            idx = repo.allocate_call_index(state.state_id)
+            idx = repo.allocate_call_index(
+                state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+            )
             call = repo.record_call(
                 state.state_id,
                 idx,
@@ -1024,6 +1135,8 @@ class TestFindCallByRequestHash:
                 CallStatus.SUCCESS,
                 request_data,
                 RawCallPayload({"response": f"response-{i}"}),
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
             call_ids.append(call.call_id)
 
@@ -1062,12 +1175,14 @@ class TestRetryBatch:
         _db, repo, _fac, tok = _make_repo_with_token()
 
         # Create and fail a batch
-        batch = repo.create_batch("run-1", "agg-1", batch_id="batch-orig")
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.complete_batch(batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err")
+        batch = repo.create_batch("agg-1", batch_id="batch-orig", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        repo.complete_batch(
+            batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err", coordination_token=_leader_token(repo)
+        )
 
         # Retry
-        retry = repo.retry_batch(batch.batch_id)
+        retry = repo.retry_batch(batch.batch_id, coordination_token=_leader_token(repo))
         assert retry.batch_id != batch.batch_id
         assert retry.status == BatchStatus.DRAFT
         assert retry.attempt == 1  # original was 0, retry is 1
@@ -1079,12 +1194,14 @@ class TestRetryBatch:
         _db, repo, fac, tok = _make_repo_with_token()
         fac.data_flow.create_token("row-1", token_id="tok-2")
 
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.add_batch_member(batch.batch_id, "tok-2", 1)
-        repo.complete_batch(batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err")
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        _add_batch_member(repo, batch.batch_id, "tok-2", 1)
+        repo.complete_batch(
+            batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err", coordination_token=_leader_token(repo)
+        )
 
-        retry = repo.retry_batch(batch.batch_id)
+        retry = repo.retry_batch(batch.batch_id, coordination_token=_leader_token(repo))
         members = repo.get_batch_members(retry.batch_id)
         assert len(members) == 2
         assert members[0].token_id == tok
@@ -1096,12 +1213,14 @@ class TestRetryBatch:
         """Calling retry_batch twice returns the same retry batch (no duplicates)."""
         _db, repo, _fac, tok = _make_repo_with_token()
 
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.complete_batch(batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err")
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        repo.complete_batch(
+            batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="err", coordination_token=_leader_token(repo)
+        )
 
-        retry1 = repo.retry_batch(batch.batch_id)
-        retry2 = repo.retry_batch(batch.batch_id)
+        retry1 = repo.retry_batch(batch.batch_id, coordination_token=_leader_token(repo))
+        retry2 = repo.retry_batch(batch.batch_id, coordination_token=_leader_token(repo))
         assert retry1.batch_id == retry2.batch_id
         assert retry1.attempt == retry2.attempt
 
@@ -1111,15 +1230,27 @@ class TestRetryBatch:
         fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
         fac.data_flow.create_token("row-2", token_id="tok-2")
 
-        batch_a = repo.create_batch("run-1", "agg-1", batch_id="batch-a")
-        repo.add_batch_member(batch_a.batch_id, tok, 0)
-        repo.complete_batch(batch_a.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="fail-a")
-        retry_a = repo.retry_batch(batch_a.batch_id)
+        batch_a = repo.create_batch("agg-1", batch_id="batch-a", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch_a.batch_id, tok, 0)
+        repo.complete_batch(
+            batch_a.batch_id,
+            BatchStatus.FAILED,
+            trigger_type=TriggerType.COUNT,
+            trigger_reason="fail-a",
+            coordination_token=_leader_token(repo),
+        )
+        retry_a = repo.retry_batch(batch_a.batch_id, coordination_token=_leader_token(repo))
 
-        batch_b = repo.create_batch("run-1", "agg-1", batch_id="batch-b")
-        repo.add_batch_member(batch_b.batch_id, "tok-2", 0)
-        repo.complete_batch(batch_b.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.COUNT, trigger_reason="fail-b")
-        retry_b = repo.retry_batch(batch_b.batch_id)
+        batch_b = repo.create_batch("agg-1", batch_id="batch-b", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch_b.batch_id, "tok-2", 0)
+        repo.complete_batch(
+            batch_b.batch_id,
+            BatchStatus.FAILED,
+            trigger_type=TriggerType.COUNT,
+            trigger_reason="fail-b",
+            coordination_token=_leader_token(repo),
+        )
+        retry_b = repo.retry_batch(batch_b.batch_id, coordination_token=_leader_token(repo))
 
         assert retry_b.batch_id != retry_a.batch_id
         assert [member.token_id for member in repo.get_batch_members(retry_b.batch_id)] == ["tok-2"]
@@ -1128,17 +1259,17 @@ class TestRetryBatch:
         """Cannot retry a batch that isn't in FAILED status."""
         _db, repo, _fac, tok = _make_repo_with_token()
 
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
         # Batch is still DRAFT, not FAILED
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            repo.retry_batch(batch.batch_id)
+            repo.retry_batch(batch.batch_id, coordination_token=_leader_token(repo))
 
     def test_retry_nonexistent_batch_raises_audit_integrity_error(self) -> None:
         """Retrying a nonexistent batch raises AuditIntegrityError."""
         _db, repo, _fac, _tok = _make_repo_with_token()
         with pytest.raises(AuditIntegrityError, match="not found"):
-            repo.retry_batch("nonexistent-batch")
+            repo.retry_batch("nonexistent-batch", coordination_token=_leader_token(repo))
 
 
 # ---------------------------------------------------------------------------
@@ -1152,7 +1283,7 @@ class TestRecordOperationCall:
     def test_record_operation_call_basic(self) -> None:
         """Record an external call attributed to an operation (not a node state)."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         call = repo.record_operation_call(
             op.operation_id,
@@ -1161,6 +1292,7 @@ class TestRecordOperationCall:
             RawCallPayload({"url": "https://api.example.com/data"}),
             RawCallPayload({"status": 200, "body": "ok"}),
             latency_ms=150.0,
+            coordination_token=_leader_token(repo),
         )
         assert call.call_type == CallType.HTTP
         assert call.status == CallStatus.SUCCESS
@@ -1171,11 +1303,11 @@ class TestRecordOperationCall:
     def test_operation_call_index_sequential(self) -> None:
         """Operation call indices are allocated sequentially starting at 0."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
-        idx0 = repo.allocate_operation_call_index(op.operation_id)
-        idx1 = repo.allocate_operation_call_index(op.operation_id)
-        idx2 = repo.allocate_operation_call_index(op.operation_id)
+        idx0 = repo.allocate_operation_call_index(op.operation_id, coordination_token=_leader_token(repo))
+        idx1 = repo.allocate_operation_call_index(op.operation_id, coordination_token=_leader_token(repo))
+        idx2 = repo.allocate_operation_call_index(op.operation_id, coordination_token=_leader_token(repo))
 
         assert idx0 == 0
         assert idx1 == 1
@@ -1184,12 +1316,12 @@ class TestRecordOperationCall:
     def test_operation_call_independent_indices(self) -> None:
         """Different operations have independent call index sequences."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op1 = repo.begin_operation("run-1", "source-0", "source_load")
-        op2 = repo.begin_operation("run-1", "sink-0", "sink_write")
+        op1 = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
+        op2 = repo.begin_operation("sink-0", "sink_write", coordination_token=_leader_token(repo))
 
-        idx_op1_0 = repo.allocate_operation_call_index(op1.operation_id)
-        idx_op2_0 = repo.allocate_operation_call_index(op2.operation_id)
-        idx_op1_1 = repo.allocate_operation_call_index(op1.operation_id)
+        idx_op1_0 = repo.allocate_operation_call_index(op1.operation_id, coordination_token=_leader_token(repo))
+        idx_op2_0 = repo.allocate_operation_call_index(op2.operation_id, coordination_token=_leader_token(repo))
+        idx_op1_1 = repo.allocate_operation_call_index(op1.operation_id, coordination_token=_leader_token(repo))
 
         assert idx_op1_0 == 0
         assert idx_op2_0 == 0
@@ -1198,7 +1330,7 @@ class TestRecordOperationCall:
     def test_record_operation_call_with_error(self) -> None:
         """Record an operation call with error status and error payload."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         call = repo.record_operation_call(
             op.operation_id,
@@ -1207,6 +1339,7 @@ class TestRecordOperationCall:
             RawCallPayload({"url": "https://api.example.com/data"}),
             error=RawCallPayload({"error": "connection_refused", "code": 503}),
             latency_ms=5000.0,
+            coordination_token=_leader_token(repo),
         )
         assert call.status == CallStatus.ERROR
         assert call.error_json is not None
@@ -1217,7 +1350,7 @@ class TestRecordOperationCall:
     def test_get_operation_calls_returns_ordered_list(self) -> None:
         """get_operation_calls returns calls ordered by call_index."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         for i in range(3):
             repo.record_operation_call(
@@ -1226,6 +1359,7 @@ class TestRecordOperationCall:
                 CallStatus.SUCCESS,
                 RawCallPayload({"request": i}),
                 RawCallPayload({"response": i}),
+                coordination_token=_leader_token(repo),
             )
 
         calls = repo.get_operation_calls(op.operation_id)
@@ -1236,7 +1370,7 @@ class TestRecordOperationCall:
         """Operation calls auto-persist request/response to payload store."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, _fac, _tok = _make_repo_with_token(payload_store=store)
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         call = repo.record_operation_call(
             op.operation_id,
@@ -1244,6 +1378,7 @@ class TestRecordOperationCall:
             CallStatus.SUCCESS,
             RawCallPayload({"url": "https://example.com"}),
             RawCallPayload({"body": "response data"}),
+            coordination_token=_leader_token(repo),
         )
         # Both refs should be set when payload store is available
         assert call.request_ref is not None
@@ -1261,7 +1396,7 @@ class TestCompleteNodeStateSuccessFailure:
     def test_complete_with_success_reason(self) -> None:
         """complete_node_state with success_reason serializes it to JSON."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
 
         success_reason: TransformSuccessReason = {"action": "classified", "fields_modified": ["category"]}
         completed = repo.complete_node_state(
@@ -1270,6 +1405,7 @@ class TestCompleteNodeStateSuccessFailure:
             output_data={"x": 1, "category": "A"},
             duration_ms=10.0,
             success_reason=success_reason,
+            member_token=_leader_token(repo).membership,
         )
         assert isinstance(completed, NodeStateCompleted)
         assert completed.success_reason_json is not None
@@ -1278,7 +1414,7 @@ class TestCompleteNodeStateSuccessFailure:
     def test_complete_rejects_success_reason_without_action(self) -> None:
         """Tier 1 success_reason writes require an action string."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
 
         with pytest.raises(ValueError, match=r"success_reason.*action"):
             repo.complete_node_state(
@@ -1287,12 +1423,13 @@ class TestCompleteNodeStateSuccessFailure:
                 output_data={"x": 1},
                 duration_ms=10.0,
                 success_reason={"fields_added": ["x"]},  # type: ignore[typeddict-item]
+                member_token=_leader_token(repo).membership,
             )
 
     def test_complete_rejects_success_reason_with_non_string_action(self) -> None:
         """Tier 1 success_reason action must be a string."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
 
         with pytest.raises(ValueError, match=r"success_reason.*action.*str"):
             repo.complete_node_state(
@@ -1301,62 +1438,53 @@ class TestCompleteNodeStateSuccessFailure:
                 output_data={"x": 1},
                 duration_ms=10.0,
                 success_reason={"action": 123},  # type: ignore[typeddict-item]
+                member_token=_leader_token(repo).membership,
             )
 
     def test_complete_failed_requires_error(self) -> None:
         """FAILED status without error raises ValueError."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match="FAILED node state requires error details"):
-            repo.complete_node_state(
-                state.state_id,
-                NodeStateStatus.FAILED,
-                duration_ms=5.0,
-            )
+            repo.complete_node_state(state.state_id, NodeStateStatus.FAILED, duration_ms=5.0, member_token=_leader_token(repo).membership)
 
     def test_complete_completed_requires_output_data(self) -> None:
         """COMPLETED status without output_data raises ValueError."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match="COMPLETED node state requires output_data"):
             repo.complete_node_state(
-                state.state_id,
-                NodeStateStatus.COMPLETED,
-                duration_ms=5.0,
+                state.state_id, NodeStateStatus.COMPLETED, duration_ms=5.0, member_token=_leader_token(repo).membership
             )
 
     def test_complete_with_open_status_raises(self) -> None:
         """Cannot complete a node state with OPEN status."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match="Cannot complete a node state with status OPEN"):
             repo.complete_node_state(
                 state.state_id,
                 NodeStateStatus.OPEN,  # type: ignore[call-overload]  # Intentionally testing invalid status
                 duration_ms=5.0,
+                member_token=_leader_token(repo).membership,
             )
 
     def test_complete_requires_duration_ms(self) -> None:
         """duration_ms is required when completing a node state."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         with pytest.raises(ValueError, match="duration_ms is required"):
             repo.complete_node_state(
-                state.state_id,
-                NodeStateStatus.COMPLETED,
-                output_data={"y": 2},
+                state.state_id, NodeStateStatus.COMPLETED, output_data={"y": 2}, member_token=_leader_token(repo).membership
             )
 
     def test_complete_failed_with_execution_error(self) -> None:
         """complete_node_state with FAILED status and ExecutionError records error JSON."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         error = ExecutionError(exception="division by zero", exception_type="ZeroDivisionError")
         result = repo.complete_node_state(
-            state.state_id,
-            NodeStateStatus.FAILED,
-            error=error,
-            duration_ms=2.0,
+            state.state_id, NodeStateStatus.FAILED, error=error, duration_ms=2.0, member_token=_leader_token(repo).membership
         )
         assert isinstance(result, NodeStateFailed)
         assert result.error_json is not None
@@ -1371,7 +1499,7 @@ class TestCompleteNodeStateSuccessFailure:
     def test_get_node_state_returns_open_state(self) -> None:
         """get_node_state returns the correct NodeStateOpen for an open state."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"x": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"x": 1}, member_token=_leader_token(repo).membership)
         fetched = repo.get_node_state(state.state_id)
         assert fetched is not None
         assert isinstance(fetched, NodeStateOpen)
@@ -1389,7 +1517,7 @@ class TestRecordRoutingEvent:
     def test_record_routing_event_rejects_edge_from_different_run(self) -> None:
         """A routing event must not connect a node state to another run's edge."""
         db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
             run_id="run-2",
@@ -1419,7 +1547,7 @@ class TestRecordRoutingEvent:
         )
 
         with pytest.raises(LandscapeRecordError, match="same run"):
-            repo.record_routing_event(state.state_id, edge.edge_id, RoutingMode.MOVE)
+            repo.record_routing_event(state.state_id, edge.edge_id, RoutingMode.MOVE, member_token=_leader_token(repo).membership)
 
         with db.connection() as conn:
             rows = conn.execute(select(routing_events_table.c.event_id)).all()
@@ -1429,7 +1557,7 @@ class TestRecordRoutingEvent:
     def test_routing_events_schema_rejects_cross_run_direct_insert(self) -> None:
         """The routing_events table must enforce same-run state/edge ownership."""
         db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
             run_id="run-2",
@@ -1480,7 +1608,7 @@ class TestRecordRoutingEvent:
     def test_record_routing_event_basic(self) -> None:
         """Record a single routing event and verify all fields."""
         _db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1490,11 +1618,7 @@ class TestRecordRoutingEvent:
             edge_id="edge-1",
         )
 
-        event = repo.record_routing_event(
-            state.state_id,
-            "edge-1",
-            RoutingMode.MOVE,
-        )
+        event = repo.record_routing_event(state.state_id, "edge-1", RoutingMode.MOVE, member_token=_leader_token(repo).membership)
         assert event.state_id == state.state_id
         assert event.edge_id == "edge-1"
         assert event.mode == RoutingMode.MOVE
@@ -1505,7 +1629,7 @@ class TestRecordRoutingEvent:
     def test_record_routing_event_with_reason(self) -> None:
         """Routing event with reason stores reason_hash."""
         _db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1517,10 +1641,7 @@ class TestRecordRoutingEvent:
 
         reason: ConfigGateReason = {"condition": "row['x'] > 0", "result": "true"}
         event = repo.record_routing_event(
-            state.state_id,
-            "edge-1",
-            RoutingMode.MOVE,
-            reason=reason,
+            state.state_id, "edge-1", RoutingMode.MOVE, reason=reason, member_token=_leader_token(repo).membership
         )
         assert event.reason_hash is not None
 
@@ -1528,7 +1649,7 @@ class TestRecordRoutingEvent:
         """Routing event with payload store persists reason to store."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1540,10 +1661,7 @@ class TestRecordRoutingEvent:
 
         reason: ConfigGateReason = {"condition": "row['x'] > 0", "result": "true"}
         event = repo.record_routing_event(
-            state.state_id,
-            "edge-1",
-            RoutingMode.MOVE,
-            reason=reason,
+            state.state_id, "edge-1", RoutingMode.MOVE, reason=reason, member_token=_leader_token(repo).membership
         )
         assert event.reason_ref is not None
         # Verify the payload was stored
@@ -1554,7 +1672,7 @@ class TestRecordRoutingEvent:
         """A caller cannot attach a missing or mismatched blob to an event."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1571,6 +1689,7 @@ class TestRecordRoutingEvent:
                 RoutingMode.MOVE,
                 reason={"condition": "x", "result": "true"},
                 reason_ref="0" * 64,
+                member_token=_leader_token(repo).membership,
             )
 
         with db.connection() as conn:
@@ -1583,6 +1702,7 @@ class TestRecordRoutingEvent:
             RoutingMode.MOVE,
             reason={"condition": "x", "result": "true"},
             reason_ref=exact_ref,
+            member_token=_leader_token(repo).membership,
         )
         assert event.reason_hash == exact_ref
         assert event.reason_ref == exact_ref
@@ -1590,7 +1710,7 @@ class TestRecordRoutingEvent:
     def test_supplied_reason_ref_requires_verifying_payload_store(self) -> None:
         """A ref cannot claim materialization when no backend can verify it."""
         db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1608,6 +1728,7 @@ class TestRecordRoutingEvent:
                 RoutingMode.MOVE,
                 reason=reason,
                 reason_ref=stable_hash(reason),
+                member_token=_leader_token(repo).membership,
             )
 
         with db.connection() as conn:
@@ -1617,7 +1738,7 @@ class TestRecordRoutingEvent:
         """An unhashable opaque ref is not authoritative routing evidence."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1629,10 +1750,7 @@ class TestRecordRoutingEvent:
 
         with pytest.raises(AuditIntegrityError, match="requires canonical reason bytes"):
             repo.record_routing_event(
-                state.state_id,
-                "edge-1",
-                RoutingMode.MOVE,
-                reason_ref="0" * 64,
+                state.state_id, "edge-1", RoutingMode.MOVE, reason_ref="0" * 64, member_token=_leader_token(repo).membership
             )
 
         with db.connection() as conn:
@@ -1642,7 +1760,7 @@ class TestRecordRoutingEvent:
         """A reason must be durable before its authoritative event can exist."""
         store = _FailingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1658,6 +1776,7 @@ class TestRecordRoutingEvent:
                 "edge-1",
                 RoutingMode.MOVE,
                 reason={"condition": "x", "result": "true"},
+                member_token=_leader_token(repo).membership,
             )
 
         with db.connection() as conn:
@@ -1667,7 +1786,7 @@ class TestRecordRoutingEvent:
         """Store-first may orphan a blob, but retry must reuse its exact ref."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1687,11 +1806,7 @@ class TestRecordRoutingEvent:
         )
         fac.data_flow.create_token("row-occupied", token_id="tok-occupied")
         occupied_state = repo.begin_node_state(
-            "tok-occupied",
-            "transform-1",
-            "run-1",
-            1,
-            {"name": "occupied"},
+            "tok-occupied", "transform-1", 1, {"name": "occupied"}, member_token=_leader_token(repo).membership
         )
         repo.record_routing_event(
             occupied_state.state_id,
@@ -1699,6 +1814,7 @@ class TestRecordRoutingEvent:
             RoutingMode.MOVE,
             event_id="occupied-event-id",
             routing_group_id="occupied-group",
+            member_token=_leader_token(repo).membership,
         )
         reason: ConfigGateReason = {"condition": "x", "result": "true"}
         expected_ref = stable_hash(reason)
@@ -1711,6 +1827,7 @@ class TestRecordRoutingEvent:
                 reason=reason,
                 event_id="occupied-event-id",
                 routing_group_id="retry-group",
+                member_token=_leader_token(repo).membership,
             )
 
         assert store.exists(expected_ref)
@@ -1724,6 +1841,7 @@ class TestRecordRoutingEvent:
             reason=reason,
             event_id="occupied-event-id",
             routing_group_id="retry-group",
+            member_token=_leader_token(repo).membership,
         )
 
         assert retried.reason_ref == expected_ref
@@ -1733,7 +1851,7 @@ class TestRecordRoutingEvent:
         """Repeating one decision must read back the durable event, not append."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1744,8 +1862,12 @@ class TestRecordRoutingEvent:
         )
         reason: ConfigGateReason = {"condition": "x", "result": "true"}
 
-        first = repo.record_routing_event(state.state_id, "edge-1", RoutingMode.MOVE, reason=reason)
-        retried = repo.record_routing_event(state.state_id, "edge-1", RoutingMode.MOVE, reason=reason)
+        first = repo.record_routing_event(
+            state.state_id, "edge-1", RoutingMode.MOVE, reason=reason, member_token=_leader_token(repo).membership
+        )
+        retried = repo.record_routing_event(
+            state.state_id, "edge-1", RoutingMode.MOVE, reason=reason, member_token=_leader_token(repo).membership
+        )
 
         assert retried == first
         with db.connection() as conn:
@@ -1757,7 +1879,7 @@ class TestRecordRoutingEvent:
         """The stable retry identity must never alias two routing decisions."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for edge_id in ("edge-a", "edge-b"):
             fac.data_flow.register_edge(
                 run_id="run-1",
@@ -1769,10 +1891,14 @@ class TestRecordRoutingEvent:
             )
         first_reason: ConfigGateReason = {"condition": "x", "result": "true"}
         divergent_reason: ConfigGateReason = {"condition": "y", "result": "true"}
-        first = repo.record_routing_event(state.state_id, "edge-a", RoutingMode.MOVE, reason=first_reason)
+        first = repo.record_routing_event(
+            state.state_id, "edge-a", RoutingMode.MOVE, reason=first_reason, member_token=_leader_token(repo).membership
+        )
 
         with pytest.raises(AuditIntegrityError, match="durable event differs"):
-            repo.record_routing_event(state.state_id, "edge-b", RoutingMode.MOVE, reason=divergent_reason)
+            repo.record_routing_event(
+                state.state_id, "edge-b", RoutingMode.MOVE, reason=divergent_reason, member_token=_leader_token(repo).membership
+            )
 
         with db.connection() as conn:
             rows = conn.execute(select(routing_events_table)).all()
@@ -1784,7 +1910,7 @@ class TestRecordRoutingEvent:
     def test_record_routing_events_multiple(self) -> None:
         """record_routing_events records multiple routes with shared group ID."""
         _db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1806,7 +1932,9 @@ class TestRecordRoutingEvent:
             RoutingSpec(edge_id="edge-a", mode=RoutingMode.COPY),
             RoutingSpec(edge_id="edge-b", mode=RoutingMode.COPY),
         ]
-        events = repo.record_routing_events(state.state_id, routes)
+        events = repo.record_routing_events(
+            state.state_id, routes, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
         assert len(events) == 2
         assert events[0].ordinal == 0
         assert events[1].ordinal == 1
@@ -1817,7 +1945,7 @@ class TestRecordRoutingEvent:
         """A retried fork must converge on the original ordered event set."""
         store = _TrackingPayloadStore()
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for edge_id in ("edge-a", "edge-b"):
             fac.data_flow.register_edge(
                 run_id="run-1",
@@ -1833,8 +1961,20 @@ class TestRecordRoutingEvent:
         ]
         reason: ConfigGateReason = {"condition": "fork", "result": "true"}
 
-        first = repo.record_routing_events(state.state_id, routes, reason=reason)
-        retried = repo.record_routing_events(state.state_id, routes, reason=reason)
+        first = repo.record_routing_events(
+            state.state_id,
+            routes,
+            reason=reason,
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
+        )
+        retried = repo.record_routing_events(
+            state.state_id,
+            routes,
+            reason=reason,
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
+        )
 
         assert retried == first
         with db.connection() as conn:
@@ -1845,7 +1985,7 @@ class TestRecordRoutingEvent:
     def test_record_routing_events_rejects_edge_from_different_run(self) -> None:
         """Batch routing writes must roll back when any route targets another run."""
         db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1889,6 +2029,8 @@ class TestRecordRoutingEvent:
                     RoutingSpec(edge_id="edge-run-1", mode=RoutingMode.COPY),
                     RoutingSpec(edge_id="edge-run-2", mode=RoutingMode.COPY),
                 ],
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
 
         with db.connection() as conn:
@@ -1899,8 +2041,10 @@ class TestRecordRoutingEvent:
     def test_record_routing_events_empty_list_returns_empty(self) -> None:
         """record_routing_events with empty routes list returns empty list."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        events = repo.record_routing_events(state.state_id, [])
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        events = repo.record_routing_events(
+            state.state_id, [], member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
         assert events == []
 
     def test_record_routing_event_without_reason_reads_run_id_only_in_transaction(self) -> None:
@@ -1911,7 +2055,7 @@ class TestRecordRoutingEvent:
         redundant round trip.
         """
         _db, repo, fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         edge = fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -1935,7 +2079,7 @@ class TestRecordRoutingEvent:
         repo._ops.execute_fetchone = spy_fetchone  # type: ignore[method-assign]
         repo._ops.execute_fetchall = spy_fetchall  # type: ignore[method-assign]
         try:
-            event = repo.record_routing_event(state.state_id, edge.edge_id, RoutingMode.MOVE)
+            event = repo.record_routing_event(state.state_id, edge.edge_id, RoutingMode.MOVE, member_token=_leader_token(repo).membership)
         finally:
             repo._ops.execute_fetchone = original_fetchone  # type: ignore[method-assign]
             repo._ops.execute_fetchall = original_fetchall  # type: ignore[method-assign]
@@ -1953,7 +2097,7 @@ class TestRecordRoutingEvent:
         """
         store = _TrackingPayloadStore()
         _db, repo, fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for label in ("path-a", "path-b"):
             fac.data_flow.register_edge(
                 run_id="run-1",
@@ -1985,6 +2129,8 @@ class TestRecordRoutingEvent:
                     RoutingSpec(edge_id="edge-path-b", mode=RoutingMode.COPY),
                 ],
                 reason={"condition": "fork", "result": "true"},
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
         finally:
             repo._ops.execute_fetchone = original_fetchone  # type: ignore[method-assign]
@@ -2006,9 +2152,10 @@ class TestRegisterArtifact:
     def test_register_artifact_roundtrip(self) -> None:
         """Register an artifact and retrieve it via get_artifacts."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"x": 1})
+        state = repo.begin_node_state(tok, "sink-0", 2, {"x": 1}, member_token=_leader_token(repo).membership)
 
-        artifact = repo.register_artifact(
+        artifact = _register_artifact(
+            repo,
             run_id="run-1",
             state_id=state.state_id,
             sink_node_id="sink-0",
@@ -2030,9 +2177,10 @@ class TestRegisterArtifact:
     def test_register_artifact_with_idempotency_key(self) -> None:
         """Artifact with idempotency_key stores it for deduplication."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"x": 1})
+        state = repo.begin_node_state(tok, "sink-0", 2, {"x": 1}, member_token=_leader_token(repo).membership)
 
-        artifact = repo.register_artifact(
+        artifact = _register_artifact(
+            repo,
             run_id="run-1",
             state_id=state.state_id,
             sink_node_id="sink-0",
@@ -2061,10 +2209,11 @@ class TestRegisterArtifact:
     def test_register_artifact_rejects_raw_credential_bearing_uris(self, path_or_uri: str, match: str) -> None:
         """Artifact registration must enforce the ArtifactDescriptor URI secret guard."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"x": 1})
+        state = repo.begin_node_state(tok, "sink-0", 2, {"x": 1}, member_token=_leader_token(repo).membership)
 
         with pytest.raises(ValueError, match=match):
-            repo.register_artifact(
+            _register_artifact(
+                repo,
                 run_id="run-1",
                 state_id=state.state_id,
                 sink_node_id="sink-0",
@@ -2090,10 +2239,13 @@ class TestRegisterArtifact:
             schema_config=_DYNAMIC_SCHEMA,
         )
 
-        state0 = repo.begin_node_state(tok, "sink-0", "run-1", 2, {"x": 1})
-        state1 = repo.begin_node_state(tok, "sink-1", "run-1", 3, {"x": 1}, state_id="state-s1", attempt=1)
+        state0 = repo.begin_node_state(tok, "sink-0", 2, {"x": 1}, member_token=_leader_token(repo).membership)
+        state1 = repo.begin_node_state(
+            tok, "sink-1", 3, {"x": 1}, state_id="state-s1", attempt=1, member_token=_leader_token(repo).membership
+        )
 
-        repo.register_artifact(
+        _register_artifact(
+            repo,
             run_id="run-1",
             state_id=state0.state_id,
             sink_node_id="sink-0",
@@ -2102,7 +2254,8 @@ class TestRegisterArtifact:
             content_hash="h1",
             size_bytes=100,
         )
-        repo.register_artifact(
+        _register_artifact(
+            repo,
             run_id="run-1",
             state_id=state1.state_id,
             sink_node_id="sink-1",
@@ -2138,17 +2291,17 @@ class TestBatchLifecycleExtended:
     def test_complete_batch_with_non_terminal_status_raises(self) -> None:
         """complete_batch with non-terminal status raises AuditIntegrityError."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
 
         with pytest.raises(AuditIntegrityError, match="terminal status"):
-            repo.complete_batch(batch.batch_id, BatchStatus.DRAFT)
+            repo.complete_batch(batch.batch_id, BatchStatus.DRAFT, coordination_token=_leader_token(repo))
 
     def test_complete_batch_nonexistent_raises(self) -> None:
         """complete_batch for nonexistent batch raises AuditIntegrityError."""
         _db, repo, _fac, _tok = _make_repo_with_token()
         with pytest.raises(AuditIntegrityError, match="zero rows affected"):
-            repo.complete_batch("nonexistent-batch", BatchStatus.COMPLETED)
+            repo.complete_batch("nonexistent-batch", BatchStatus.COMPLETED, coordination_token=_leader_token(repo))
 
     def test_complete_batch_already_terminal_raises(self) -> None:
         """Cannot overwrite a terminal batch via complete_batch().
@@ -2158,20 +2311,32 @@ class TestBatchLifecycleExtended:
         completed batch to be silently rewritten (audit immutability violation).
         """
         _db, repo, _fac, tok = _make_repo_with_token()
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.complete_batch(batch.batch_id, BatchStatus.COMPLETED, trigger_type=TriggerType.COUNT, trigger_reason="c=1")
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        repo.complete_batch(
+            batch.batch_id,
+            BatchStatus.COMPLETED,
+            trigger_type=TriggerType.COUNT,
+            trigger_reason="c=1",
+            coordination_token=_leader_token(repo),
+        )
 
         with pytest.raises(AuditIntegrityError, match="already terminal"):
-            repo.complete_batch(batch.batch_id, BatchStatus.FAILED, trigger_type=TriggerType.TIMEOUT, trigger_reason="t=5")
+            repo.complete_batch(
+                batch.batch_id,
+                BatchStatus.FAILED,
+                trigger_type=TriggerType.TIMEOUT,
+                trigger_reason="t=5",
+                coordination_token=_leader_token(repo),
+            )
 
     def test_update_batch_status_basic(self) -> None:
         """update_batch_status transitions from DRAFT to EXECUTING."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
 
-        repo.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+        repo.update_batch_status(batch.batch_id, BatchStatus.EXECUTING, coordination_token=_leader_token(repo))
         updated = repo.get_batch(batch.batch_id)
         assert updated is not None
         assert updated.status == BatchStatus.EXECUTING
@@ -2179,29 +2344,37 @@ class TestBatchLifecycleExtended:
     def test_update_batch_status_terminal_raises(self) -> None:
         """Cannot update a batch that's already in terminal status."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.complete_batch(batch.batch_id, BatchStatus.COMPLETED, trigger_type=TriggerType.COUNT, trigger_reason="c=1")
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        repo.complete_batch(
+            batch.batch_id,
+            BatchStatus.COMPLETED,
+            trigger_type=TriggerType.COUNT,
+            trigger_reason="c=1",
+            coordination_token=_leader_token(repo),
+        )
 
         with pytest.raises(AuditIntegrityError, match="terminal status"):
-            repo.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+            repo.update_batch_status(batch.batch_id, BatchStatus.EXECUTING, coordination_token=_leader_token(repo))
 
     def test_update_batch_status_nonexistent_raises(self) -> None:
         """Updating a nonexistent batch raises AuditIntegrityError."""
         _db, repo, _fac, _tok = _make_repo_with_token()
         with pytest.raises(AuditIntegrityError, match="not found"):
-            repo.update_batch_status("nonexistent-batch", BatchStatus.EXECUTING)
+            repo.update_batch_status("nonexistent-batch", BatchStatus.EXECUTING, coordination_token=_leader_token(repo))
 
     def test_get_batches_with_filters(self) -> None:
         """get_batches filters by status and node_id."""
         _db, repo, _fac, tok = _make_repo_with_token()
 
         # Create batches for two different nodes
-        b1 = repo.create_batch("run-1", "agg-1", batch_id="batch-1")
-        repo.add_batch_member(b1.batch_id, tok, 0)
-        repo.complete_batch(b1.batch_id, BatchStatus.COMPLETED, trigger_type=TriggerType.COUNT, trigger_reason="c=1")
+        b1 = repo.create_batch("agg-1", batch_id="batch-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, b1.batch_id, tok, 0)
+        repo.complete_batch(
+            b1.batch_id, BatchStatus.COMPLETED, trigger_type=TriggerType.COUNT, trigger_reason="c=1", coordination_token=_leader_token(repo)
+        )
 
-        b2 = repo.create_batch("run-1", "agg-1", batch_id="batch-2")
+        b2 = repo.create_batch("agg-1", batch_id="batch-2", coordination_token=_leader_token(repo))
 
         # All batches for agg-1
         all_batches = repo.get_batches("run-1", node_id="agg-1")
@@ -2221,10 +2394,16 @@ class TestBatchLifecycleExtended:
         """get_incomplete_batches returns draft, executing, and failed batches."""
         _db, repo, _fac, tok = _make_repo_with_token()
 
-        b_draft = repo.create_batch("run-1", "agg-1", batch_id="batch-draft")
-        b_completed = repo.create_batch("run-1", "agg-1", batch_id="batch-done")
-        repo.add_batch_member(b_completed.batch_id, tok, 0)
-        repo.complete_batch(b_completed.batch_id, BatchStatus.COMPLETED, trigger_type=TriggerType.COUNT, trigger_reason="c=1")
+        b_draft = repo.create_batch("agg-1", batch_id="batch-draft", coordination_token=_leader_token(repo))
+        b_completed = repo.create_batch("agg-1", batch_id="batch-done", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, b_completed.batch_id, tok, 0)
+        repo.complete_batch(
+            b_completed.batch_id,
+            BatchStatus.COMPLETED,
+            trigger_type=TriggerType.COUNT,
+            trigger_reason="c=1",
+            coordination_token=_leader_token(repo),
+        )
 
         incomplete = repo.get_incomplete_batches("run-1")
         assert len(incomplete) == 1
@@ -2236,10 +2415,10 @@ class TestBatchLifecycleExtended:
         fac.data_flow.create_token("row-1", token_id="tok-2")
         fac.data_flow.create_token("row-1", token_id="tok-3")
 
-        batch = repo.create_batch("run-1", "agg-1")
-        repo.add_batch_member(batch.batch_id, "tok-3", 2)
-        repo.add_batch_member(batch.batch_id, tok, 0)
-        repo.add_batch_member(batch.batch_id, "tok-2", 1)
+        batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, batch.batch_id, "tok-3", 2)
+        _add_batch_member(repo, batch.batch_id, tok, 0)
+        _add_batch_member(repo, batch.batch_id, "tok-2", 1)
 
         members = repo.get_batch_members(batch.batch_id)
         assert len(members) == 3
@@ -2251,11 +2430,11 @@ class TestBatchLifecycleExtended:
         _db, repo, fac, tok = _make_repo_with_token()
         fac.data_flow.create_token("row-1", token_id="tok-2")
 
-        b1 = repo.create_batch("run-1", "agg-1", batch_id="batch-1")
-        repo.add_batch_member(b1.batch_id, tok, 0)
+        b1 = repo.create_batch("agg-1", batch_id="batch-1", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, b1.batch_id, tok, 0)
 
-        b2 = repo.create_batch("run-1", "agg-1", batch_id="batch-2")
-        repo.add_batch_member(b2.batch_id, "tok-2", 0)
+        b2 = repo.create_batch("agg-1", batch_id="batch-2", coordination_token=_leader_token(repo))
+        _add_batch_member(repo, b2.batch_id, "tok-2", 0)
 
         all_members = repo.get_all_batch_members_for_run("run-1")
         assert len(all_members) == 2
@@ -2268,7 +2447,7 @@ class TestBatchLifecycleExtended:
     def test_create_batch_with_explicit_attempt(self) -> None:
         """create_batch with explicit attempt number uses it."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        batch = repo.create_batch("run-1", "agg-1", attempt=5)
+        batch = repo.create_batch("agg-1", attempt=5, coordination_token=_leader_token(repo))
         assert batch.attempt == 5
 
 
@@ -2283,8 +2462,8 @@ class TestOperationQueries:
     def test_get_operations_for_run(self) -> None:
         """get_operations_for_run returns all operations ordered by started_at."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op1 = repo.begin_operation("run-1", "source-0", "source_load")
-        op2 = repo.begin_operation("run-1", "sink-0", "sink_write")
+        op1 = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
+        op2 = repo.begin_operation("sink-0", "sink_write", coordination_token=_leader_token(repo))
 
         ops = repo.get_operations_for_run("run-1")
         assert len(ops) == 2
@@ -2294,8 +2473,8 @@ class TestOperationQueries:
     def test_get_all_operation_calls_for_run(self) -> None:
         """get_all_operation_calls_for_run returns all operation-parented calls."""
         _db, repo, _fac, _tok = _make_repo_with_token()
-        op1 = repo.begin_operation("run-1", "source-0", "source_load")
-        op2 = repo.begin_operation("run-1", "sink-0", "sink_write")
+        op1 = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
+        op2 = repo.begin_operation("sink-0", "sink_write", coordination_token=_leader_token(repo))
 
         repo.record_operation_call(
             op1.operation_id,
@@ -2303,6 +2482,7 @@ class TestOperationQueries:
             CallStatus.SUCCESS,
             RawCallPayload({"url": "a"}),
             RawCallPayload({"resp": "a"}),
+            coordination_token=_leader_token(repo),
         )
         repo.record_operation_call(
             op2.operation_id,
@@ -2310,6 +2490,7 @@ class TestOperationQueries:
             CallStatus.SUCCESS,
             RawCallPayload({"url": "b"}),
             RawCallPayload({"resp": "b"}),
+            coordination_token=_leader_token(repo),
         )
 
         all_calls = repo.get_all_operation_calls_for_run("run-1")
@@ -2333,8 +2514,10 @@ class TestCallRecordingWithPayloadStore:
         """record_call auto-persists request and response to payload store."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, _fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         call = repo.record_call(
             state.state_id,
@@ -2343,6 +2526,8 @@ class TestCallRecordingWithPayloadStore:
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "test"}),
             RawCallPayload({"response": "classified"}),
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
         assert call.request_ref is not None
         assert call.response_ref is not None
@@ -2357,8 +2542,10 @@ class TestCallRecordingWithPayloadStore:
         """record_call with explicit request_ref/response_ref skips auto-persist."""
         store = FilesystemPayloadStore(tmp_path / "payloads")
         _db, repo, _fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         call = repo.record_call(
             state.state_id,
@@ -2369,6 +2556,8 @@ class TestCallRecordingWithPayloadStore:
             RawCallPayload({"response": "result"}),
             request_ref="existing-ref-123",
             response_ref="existing-ref-456",
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
         # Should use the provided refs, not auto-generate
         assert call.request_ref == "existing-ref-123"
@@ -2377,8 +2566,10 @@ class TestCallRecordingWithPayloadStore:
     def test_record_call_error_without_response(self) -> None:
         """record_call with error status and no response data."""
         _db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         call = repo.record_call(
             state.state_id,
@@ -2387,6 +2578,8 @@ class TestCallRecordingWithPayloadStore:
             CallStatus.ERROR,
             RawCallPayload({"prompt": "test"}),
             error=RawCallPayload({"error": "timeout"}),
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
         assert call.status == CallStatus.ERROR
         assert call.response_hash is None
@@ -2396,8 +2589,10 @@ class TestCallRecordingWithPayloadStore:
         """Failed call inserts must not leak request/response payload blobs."""
         store = _TrackingPayloadStore()
         _db, repo, _fac, _tok = _make_repo_with_token(payload_store=store)
+        state = repo.begin_node_state(_tok, "transform-1", 1, {}, member_token=_leader_token(repo).membership)
+        work_item = _work_item_for_state(repo, state.state_id)
 
-        with pytest.raises(LandscapeRecordError, match="database rejected audit write: IntegrityError"):
+        with pytest.raises(AuditIntegrityError, match="call parent state does not belong"):
             repo.record_call(
                 "missing-state",
                 0,
@@ -2405,6 +2600,8 @@ class TestCallRecordingWithPayloadStore:
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "bad"}),
                 RawCallPayload({"response": "bad"}),
+                member_token=_leader_token(repo).membership,
+                work_item=work_item,
             )
 
         assert store.store_calls == []
@@ -2414,13 +2611,14 @@ class TestCallRecordingWithPayloadStore:
         store = _TrackingPayloadStore()
         _db, repo, _fac, _tok = _make_repo_with_token(payload_store=store)
 
-        with pytest.raises(LandscapeRecordError, match="database rejected audit write: IntegrityError"):
+        with pytest.raises(AuditIntegrityError, match="call parent operation does not belong"):
             repo.record_operation_call(
                 "missing-operation",
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 RawCallPayload({"url": "https://example.com"}),
                 RawCallPayload({"status": 200}),
+                coordination_token=_leader_token(repo),
             )
 
         assert store.store_calls == []
@@ -2429,7 +2627,7 @@ class TestCallRecordingWithPayloadStore:
         """Failed routing-event inserts must not leak reason payloads."""
         store = _TrackingPayloadStore()
         _db, repo, _fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
 
         with pytest.raises(LandscapeRecordError, match=r"requires existing state_id=.*missing-edge"):
             repo.record_routing_event(
@@ -2437,6 +2635,7 @@ class TestCallRecordingWithPayloadStore:
                 "missing-edge",
                 RoutingMode.MOVE,
                 reason={"condition": "x", "result": "true"},
+                member_token=_leader_token(repo).membership,
             )
 
         assert store.store_calls == []
@@ -2445,7 +2644,7 @@ class TestCallRecordingWithPayloadStore:
         """Failed multi-routing inserts must not materialize the shared reason blob."""
         store = _TrackingPayloadStore()
         _db, repo, fac, tok = _make_repo_with_token(payload_store=store)
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
             run_id="run-1",
             from_node_id="transform-1",
@@ -2463,6 +2662,8 @@ class TestCallRecordingWithPayloadStore:
                     RoutingSpec(edge_id="missing-edge", mode=RoutingMode.COPY),
                 ],
                 reason={"condition": "fork", "result": "true"},
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
 
         assert store.store_calls == []
@@ -2738,9 +2939,6 @@ class TestDelegationSignatureAlignment:
         ),
         pytest.param("create_batch", lambda execution: execution.create_batch, ExecutionRepository.create_batch, id="create_batch"),
         pytest.param(
-            "add_batch_member", lambda execution: execution.add_batch_member, ExecutionRepository.add_batch_member, id="add_batch_member"
-        ),
-        pytest.param(
             "update_batch_status",
             lambda execution: execution.update_batch_status,
             ExecutionRepository.update_batch_status,
@@ -2768,12 +2966,6 @@ class TestDelegationSignatureAlignment:
             id="get_all_batch_members_for_run",
         ),
         pytest.param("retry_batch", lambda execution: execution.retry_batch, ExecutionRepository.retry_batch, id="retry_batch"),
-        pytest.param(
-            "register_artifact",
-            lambda execution: execution.register_artifact,
-            ExecutionRepository.register_artifact,
-            id="register_artifact",
-        ),
         pytest.param("get_artifacts", lambda execution: execution.get_artifacts, ExecutionRepository.get_artifacts, id="get_artifacts"),
         pytest.param(
             "begin_node_states_many",
@@ -2786,12 +2978,6 @@ class TestDelegationSignatureAlignment:
             lambda execution: execution.complete_aggregation_result,
             ExecutionRepository.complete_aggregation_result,
             id="complete_aggregation_result",
-        ),
-        pytest.param(
-            "complete_node_states_completed_many",
-            lambda execution: execution.complete_node_states_completed_many,
-            ExecutionRepository.complete_node_states_completed_many,
-            id="complete_node_states_completed_many",
         ),
         pytest.param(
             "get_max_node_state_attempts",
@@ -2903,8 +3089,10 @@ class TestResolvedPromptTemplateHashAnchor:
 
     def test_state_call_non_llm_hash_leaves_no_row(self) -> None:
         db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         # Non-LLM call carrying a (well-formed) hash violates the LLM-only rule.
         with pytest.raises(ValueError, match="only for CallType"):
@@ -2915,13 +3103,17 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
                 resolved_prompt_template_hash="a" * 64,
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
         assert self._calls_row_count(db) == 0
 
     def test_state_call_malformed_hash_leaves_no_row(self) -> None:
         db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         with pytest.raises(ValueError, match="64-character lowercase hex"):
             repo.record_call(
@@ -2931,12 +3123,14 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
                 resolved_prompt_template_hash="not-a-valid-sha256",
+                member_token=_leader_token(repo).membership,
+                work_item=_work_item_for_state(repo, state.state_id),
             )
         assert self._calls_row_count(db) == 0
 
     def test_operation_call_non_llm_hash_leaves_no_row(self) -> None:
         db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         with pytest.raises(ValueError, match="only for CallType"):
             repo.record_operation_call(
@@ -2945,12 +3139,13 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
                 resolved_prompt_template_hash="a" * 64,
+                coordination_token=_leader_token(repo),
             )
         assert self._calls_row_count(db) == 0
 
     def test_operation_call_malformed_hash_leaves_no_row(self) -> None:
         db, repo, _fac, _tok = _make_repo_with_token()
-        op = repo.begin_operation("run-1", "source-0", "source_load")
+        op = repo.begin_operation("source-0", "source_load", coordination_token=_leader_token(repo))
 
         with pytest.raises(ValueError, match="64-character lowercase hex"):
             repo.record_operation_call(
@@ -2959,14 +3154,17 @@ class TestResolvedPromptTemplateHashAnchor:
                 CallStatus.SUCCESS,
                 RawCallPayload({"prompt": "hello"}),
                 resolved_prompt_template_hash="ABC",
+                coordination_token=_leader_token(repo),
             )
         assert self._calls_row_count(db) == 0
 
     def test_valid_llm_hash_still_records(self) -> None:
         """A well-formed LLM hash records exactly one row (fix must not over-reject)."""
         db, repo, _fac, tok = _make_repo_with_token()
-        state = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"a": 1})
-        idx = repo.allocate_call_index(state.state_id)
+        state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
+        idx = repo.allocate_call_index(
+            state.state_id, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
+        )
 
         call = repo.record_call(
             state.state_id,
@@ -2975,6 +3173,8 @@ class TestResolvedPromptTemplateHashAnchor:
             CallStatus.SUCCESS,
             RawCallPayload({"prompt": "hello"}),
             resolved_prompt_template_hash="a" * 64,
+            member_token=_leader_token(repo).membership,
+            work_item=_work_item_for_state(repo, state.state_id),
         )
         assert call.resolved_prompt_template_hash == "a" * 64
         assert self._calls_row_count(db) == 1
