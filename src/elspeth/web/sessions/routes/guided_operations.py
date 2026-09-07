@@ -16,7 +16,6 @@ from uuid import UUID
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.errors import InvariantError
@@ -269,30 +268,23 @@ async def run_guided_reconciliation_mutation[T](
     try:
         result = await asyncio.shield(mutation_task)
     except asyncio.CancelledError as cancellation:
-        diagnostic_error: Exception | None = None
+        cleanup_diagnostics: list[tuple[BaseException, str]] = []
         try:
             await _join_shielded_task_after_cancellation(mutation_task)
         except BaseException as cleanup_error:
-            try:
-                _record_guided_cleanup_failure(cleanup_error, site="reconciliation_mutation", session_lease=session_lease)
-            except contract_errors.TIER_1_ERRORS as logger_error:
-                diagnostic_error = logger_error
+            cleanup_diagnostics.append((cleanup_error, "reconciliation_mutation"))
             cancellation.add_note(f"Guided reconciliation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
         close_task = asyncio.create_task(session_lease.close(), name="guided-reconciliation-session-close")
         try:
             await _join_shielded_task_after_cancellation(close_task)
         except BaseException as close_error:
-            try:
-                _record_guided_cleanup_failure(close_error, site="reconciliation_cancelled_close", session_lease=session_lease)
-            except contract_errors.TIER_1_ERRORS as logger_error:
-                if diagnostic_error is None:
-                    diagnostic_error = logger_error
-                else:
-                    diagnostic_error.add_note(f"Close diagnostic also failed with {type(logger_error).__name__}.")
+            cleanup_diagnostics.append((close_error, "reconciliation_cancelled_close"))
             cancellation.add_note(f"Guided reconciliation session cleanup also failed with {type(close_error).__name__}.")
-        if diagnostic_error is not None:
-            raise diagnostic_error from cancellation
-        raise cancellation from None
+        try:
+            raise cancellation from None
+        finally:
+            for error, site in cleanup_diagnostics:
+                _record_guided_cleanup_failure(error, site=site, session_lease=session_lease)
     except BaseException as primary:
         try:
             await session_lease.close()
@@ -344,6 +336,7 @@ class _GuidedOperationLeaseGuard:
         _traceback: object,
     ) -> bool:
         guard_error: BaseException | None = None
+        cleanup_diagnostics: list[tuple[BaseException, str]] = []
         guided_authority_lost = False
         if exc_value is None:
             fail_task = asyncio.create_task(
@@ -379,10 +372,7 @@ class _GuidedOperationLeaseGuard:
                 guided_authority_lost = True
             except BaseException as cleanup_error:
                 if cleanup_error is not exc_value:
-                    try:
-                        _record_guided_cleanup_failure(cleanup_error, site="guard_fail", session_lease=self.lease.session_lease)
-                    except contract_errors.TIER_1_ERRORS as logger_error:
-                        guard_error = logger_error
+                    cleanup_diagnostics.append((cleanup_error, "guard_fail"))
                     exc_value.add_note(f"Guided-operation failure cleanup also failed with {type(cleanup_error).__name__}.")
 
         close_task = asyncio.create_task(self.lease.close(), name="guided-operation-guard-close")
@@ -391,13 +381,7 @@ class _GuidedOperationLeaseGuard:
         except SessionOperationFenceLost as close_error:
             primary = exc_value or guard_error
             if primary is not None:
-                try:
-                    _record_guided_cleanup_failure(close_error, site="guard_close_fence_lost", session_lease=self.lease.session_lease)
-                except contract_errors.TIER_1_ERRORS as logger_error:
-                    if guard_error is None:
-                        guard_error = logger_error
-                    else:
-                        guard_error.add_note(f"Close diagnostic also failed with {type(logger_error).__name__}.")
+                cleanup_diagnostics.append((close_error, "guard_close_fence_lost"))
                 primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
             elif not guided_authority_lost:
                 raise
@@ -406,22 +390,20 @@ class _GuidedOperationLeaseGuard:
             if primary is None:
                 raise
             if close_error is not primary:
-                try:
-                    _record_guided_cleanup_failure(close_error, site="guard_close", session_lease=self.lease.session_lease)
-                except contract_errors.TIER_1_ERRORS as logger_error:
-                    if guard_error is None:
-                        guard_error = logger_error
-                    else:
-                        guard_error.add_note(f"Close diagnostic also failed with {type(logger_error).__name__}.")
+                cleanup_diagnostics.append((close_error, "guard_close"))
                 primary.add_note(f"Session-operation guided cleanup also failed with {type(close_error).__name__}.")
-        if guard_error is not None:
-            raise guard_error from None
-        caller_task = asyncio.current_task()
-        if exc_value is None and caller_task is not None and caller_task.cancelling() > 0:
-            # Normal route completion has no primary cancellation to re-raise.
-            # The shielded joins still owe cancellation received during cleanup.
-            raise asyncio.CancelledError
-        return False
+        try:
+            if guard_error is not None:
+                raise guard_error from None
+            caller_task = asyncio.current_task()
+            if exc_value is None and caller_task is not None and caller_task.cancelling() > 0:
+                # Normal route completion has no primary cancellation to re-raise.
+                # The shielded joins still owe cancellation received during cleanup.
+                raise asyncio.CancelledError
+            return False
+        finally:
+            for error, site in cleanup_diagnostics:
+                _record_guided_cleanup_failure(error, site=site, session_lease=self.lease.session_lease)
 
 
 def guided_operation_lease_guard(
@@ -573,7 +555,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         try:
             return await asyncio.shield(reserve_task)
         except asyncio.CancelledError as cancellation:
-            diagnostic_error: Exception | None = None
+            cleanup_diagnostics: list[tuple[BaseException, str]] = []
             try:
                 cancellation_outcome = await _join_shielded_task_after_cancellation(reserve_task)
                 if isinstance(cancellation_outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
@@ -588,27 +570,21 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                     )
                     await _join_shielded_task_after_cancellation(fail_task)
             except BaseException as cleanup_error:
-                try:
-                    _record_guided_cleanup_failure(cleanup_error, site="reservation_cancelled_cleanup", session_lease=session_lease)
-                except contract_errors.TIER_1_ERRORS as logger_error:
-                    diagnostic_error = logger_error
+                cleanup_diagnostics.append((cleanup_error, "reservation_cancelled_cleanup"))
                 cancellation.add_note(f"Guided-operation reservation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
             try:
                 close_task = asyncio.create_task(session_lease.close(), name="guided-operation-cancelled-reserve-close")
                 await _join_shielded_task_after_cancellation(close_task)
             except BaseException as close_error:
-                try:
-                    _record_guided_cleanup_failure(close_error, site="reservation_cancelled_close", session_lease=session_lease)
-                except contract_errors.TIER_1_ERRORS as logger_error:
-                    if diagnostic_error is None:
-                        diagnostic_error = logger_error
-                    else:
-                        diagnostic_error.add_note(f"Close diagnostic also failed with {type(logger_error).__name__}.")
+                cleanup_diagnostics.append((close_error, "reservation_cancelled_close"))
                 cancellation.add_note(f"Session-operation reservation cancellation cleanup also failed with {type(close_error).__name__}.")
+            closed_lease = session_lease
             session_lease = None
-            if diagnostic_error is not None:
-                raise diagnostic_error from cancellation
-            raise cancellation from None
+            try:
+                raise cancellation from None
+            finally:
+                for error, site in cleanup_diagnostics:
+                    _record_guided_cleanup_failure(error, site=site, session_lease=closed_lease)
         except BaseException as primary:
             try:
                 await session_lease.close()

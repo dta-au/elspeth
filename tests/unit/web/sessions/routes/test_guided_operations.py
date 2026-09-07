@@ -203,7 +203,8 @@ async def test_acquire_reserve_race_releases_session_authority_before_join(monke
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_reserve_started_fails_guided_before_releasing_session(monkeypatch) -> None:
+@pytest.mark.parametrize("fatal_diagnostic", [False, True])
+async def test_cancellation_after_reserve_started_fails_guided_before_releasing_session(monkeypatch, fatal_diagnostic: bool) -> None:
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
     claimed = GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))
@@ -211,6 +212,15 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
     reserve_started = asyncio.Event()
     finish_reserve = asyncio.Event()
     events: list[str] = []
+    diagnostic_error = AuditIntegrityError("reservation logger integrity")
+
+    def fail_logging(*_args, **_kwargs):
+        assert session_lease.closed
+        events.append("diagnostic")
+        raise diagnostic_error
+
+    if fatal_diagnostic:
+        monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
 
     class CancellationService(_Service):
         async def reserve_guided_operation(self, **kwargs):
@@ -227,6 +237,8 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
             assert kwargs["session_operation_context"] is session_lease.context
             assert not session_lease.closed
             events.append("failed")
+            if fatal_diagnostic:
+                raise OSError("reservation cleanup failed")
             return GuidedOperationFailed(failure_code="request_cancelled")
 
     service = CancellationService([None])
@@ -248,10 +260,16 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
     task.cancel()
     finish_reserve.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert events == ["failed"]
+    if fatal_diagnostic:
+        with pytest.raises(AuditIntegrityError) as caught:
+            await task
+        assert caught.value is diagnostic_error
+        assert isinstance(caught.value.__context__, asyncio.CancelledError)
+        assert events == ["failed", "diagnostic"]
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == ["failed"]
     assert session_lease.closed
 
 
@@ -629,6 +647,37 @@ async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes
 
 
 @pytest.mark.asyncio
+async def test_guard_diagnostic_integrity_takes_priority_over_ordinary_proof_failure(monkeypatch) -> None:
+    proof_error = RuntimeError("proof failed")
+    diagnostic_error = AuditIntegrityError("diagnostic integrity failed")
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="proof-diagnostic", lease_token="secret", attempt=1)
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise proof_error
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise OSError("close failed")
+
+    def fail_logging(*_args, **_kwargs):
+        raise diagnostic_error
+
+    monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
+    lease = FailingLease(_context(session_id))
+    with pytest.raises(AuditIntegrityError) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            pass
+    assert caught.value is diagnostic_error
+    assert caught.value.__context__ is proof_error
+    assert lease.closed
+
+
+@pytest.mark.asyncio
 async def test_integrity_logger_failure_does_not_skip_guided_or_fork_close(monkeypatch) -> None:
     logger_error = AuditIntegrityError("logger integrity")
     calls = 0
@@ -662,7 +711,7 @@ async def test_integrity_logger_failure_does_not_skip_guided_or_fork_close(monke
             raise HTTPException(409, "primary")
     assert caught.value is logger_error
     assert lease.closed
-    assert "Close diagnostic also failed with AuditIntegrityError." in caught.value.__notes__
+    assert calls == 1  # Fatal emission escapes after both cleanup attempts.
 
     calls = 0
     child = FailingLease(_context(uuid4()))
