@@ -80,7 +80,10 @@ ROW_API_DYNAMIC_ACCESS = "row-api"
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
-_CarrierPath = tuple[str | int, ...]
+# None retains a computed dictionary write key without inventing its value.
+# API and macro carriers currently produce concrete paths; row carriers may
+# contain unknown segments, which must match both literal and computed reads.
+_CarrierPath = tuple[str | int | None, ...]
 _CarrierPathPattern = tuple[str | int | None, ...]
 _MacroAliases = dict[str, frozenset[str]]
 _MacroContainerAliases = dict[str, dict[_CarrierPath, frozenset[str]]]
@@ -385,6 +388,17 @@ def _record_dynamic_attribute_filter_access(
         _append_dynamic_access(dynamic_accesses, MAP_ATTRIBUTE_FILTER_DYNAMIC_ACCESS)
 
 
+@trust_boundary(
+    tier=3,
+    source="filter argument expressions in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns the requested explicit keyword or literal mapping value; absent or opaque splats "
+        "return None without fabricating a value; callers classify opaque splats with _has_unknown_kwarg_values"
+    ),
+    non_raising=True,
+)
 def _filter_keyword_value(node: Filter, key: str) -> Node | None:
     for keyword in node.kwargs:
         if keyword.key == key:
@@ -1213,6 +1227,17 @@ def _callblock_api_splat_targets(
     return targets
 
 
+@trust_boundary(
+    tier=3,
+    source="positional splat expression in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns items only for literal List or Tuple nodes; absent or opaque splats return an empty "
+        "inspectable subset; _has_unknown_star_values separately identifies opaque non-None splats"
+    ),
+    non_raising=True,
+)
 def _literal_star_values(node: Node | None) -> list[Node]:
     if isinstance(node, (List, Tuple)):
         return list(node.items)
@@ -1223,6 +1248,17 @@ def _has_unknown_star_values(node: Node | None) -> bool:
     return node is not None and not isinstance(node, (List, Tuple))
 
 
+@trust_boundary(
+    tier=3,
+    source="keyword splat expression and arbitrary mapping keys in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns True for opaque splats or any mapping key that is not a string literal Const; "
+        "returns False only for no splat or mappings whose keys are all statically inspectable strings"
+    ),
+    non_raising=True,
+)
 def _has_unknown_kwarg_values(node: Node | None) -> bool:
     if node is None:
         return False
@@ -1253,6 +1289,17 @@ def _literal_kwarg_values(node: DictNode) -> dict[str, Node]:
     return values
 
 
+@trust_boundary(
+    tier=3,
+    source="attribute expression in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "classifies tracked row API attribute references as get or row-api; other syntactic forms "
+        "return None, the explicit no-match result; no expression is evaluated or coerced"
+    ),
+    non_raising=True,
+)
 def _row_api_dynamic_access_kind(
     node: Node,
     namespaces: frozenset[str],
@@ -1455,7 +1502,7 @@ def _carrier_path_matches_pattern_prefix(entry_path: _CarrierPath, path_pattern:
     if len(entry_path) < len(path_pattern):
         return False
     return all(
-        pattern_segment is None or pattern_segment == entry_segment
+        entry_segment is None or pattern_segment is None or pattern_segment == entry_segment
         for entry_segment, pattern_segment in zip(entry_path, path_pattern, strict=False)
     )
 
@@ -1491,7 +1538,7 @@ def _carrier_pattern_has_child_path(paths: frozenset[_CarrierPath], path_pattern
 
 
 def _carrier_path_has_child(entry_path: _CarrierPath, path: _CarrierPath) -> bool:
-    return len(entry_path) > len(path) and entry_path[: len(path)] == path and isinstance(entry_path[len(path)], int)
+    return _carrier_path_has_pattern_child(entry_path, path)
 
 
 def _carrier_path_has_pattern_child(entry_path: _CarrierPath, path_pattern: _CarrierPathPattern) -> bool:
@@ -1518,6 +1565,18 @@ def _merge_macro_names(name_sets: Iterable[frozenset[str]]) -> frozenset[str]:
     return frozenset(names)
 
 
+@trust_boundary(
+    tier=3,
+    source="container expression and arbitrary mapping keys in a parsed user-authored Jinja template",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "tracks contained row objects using literal string keys or None wildcard keys; unknown "
+        "mapping keys retain their row values; unrecognized expressions contribute no container paths, "
+        "and direct row expressions are classified separately by _node_is_row_object_expression"
+    ),
+    non_raising=True,
+)
 def _row_object_container_paths(
     node: Node,
     namespaces: frozenset[str],
@@ -1533,21 +1592,28 @@ def _row_object_container_paths(
         base_name, path = access_path
         entries = row_container_aliases.get(base_name)
         if entries:
-            return {entry_path[len(path) :] for entry_path in entries if entry_path[: len(path)] == path}
+            return {
+                entry_path[len(path) :]
+                for entry_path in entries
+                if len(entry_path) > len(path) and _carrier_path_matches_pattern_prefix(entry_path, path)
+            }
     dynamic_access_pattern = _row_api_dynamic_container_access_pattern(node)
     if dynamic_access_pattern is not None:
         base_name, path_pattern = dynamic_access_pattern
         entries = row_container_aliases.get(base_name)
         if entries:
             return {
-                entry_path[len(path_pattern) :] for entry_path in entries if _carrier_path_matches_pattern_prefix(entry_path, path_pattern)
+                entry_path[len(path_pattern) :]
+                for entry_path in entries
+                if len(entry_path) > len(path_pattern) and _carrier_path_matches_pattern_prefix(entry_path, path_pattern)
             }
     if isinstance(node, DictNode):
         paths: set[_CarrierPath] = set()
         for pair in node.items:
-            if not (isinstance(pair.key, Const) and isinstance(pair.key.value, str)):
-                continue
-            dict_key_path: _CarrierPath = (pair.key.value,)
+            if isinstance(pair.key, Const) and isinstance(pair.key.value, str):
+                dict_key_path: _CarrierPath = (pair.key.value,)
+            else:
+                dict_key_path = (None,)
             if _node_is_row_object_expression(pair.value, namespaces, row_collection_aliases, row_container_aliases):
                 paths.add(dict_key_path)
             paths.update(
@@ -1589,7 +1655,7 @@ def _row_object_container_access_matches(
         base_name, path = access_path
         if not path:
             return False
-        return path in row_container_aliases.get(base_name, frozenset())
+        return any(_carrier_path_matches_pattern(entry_path, path) for entry_path in row_container_aliases.get(base_name, frozenset()))
     dynamic_access_pattern = _row_api_dynamic_container_access_pattern(node)
     if dynamic_access_pattern is None:
         return False

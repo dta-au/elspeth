@@ -450,6 +450,46 @@ class TestExtractJinja2Fields:
         assert result.dynamic_accesses == ("row-api",)
         assert result.has_dynamic_access is True
 
+    @pytest.mark.parametrize(
+        "template",
+        (
+            "{% set box = {selector: row} %}{{ box[selector].to_dict() }}",
+            "{% set box = {selector: row} %}{{ box['chosen'].to_dict() }}",
+            "{% set box = {selector: {'r': row}} %}{{ box[selector].r.to_dict() }}",
+            "{% set box = {selector: {'r': row}} %}{% set inner = box['chosen'] %}{{ inner.r.to_dict() }}",
+            "{% set box = {selector: [row]} %}{% for r in box['chosen'] %}{{ r.to_dict() }}{% endfor %}",
+            "{% set box = {selector: [row]} %}{% for r in box[selector] %}{{ r.to_dict() }}{% endfor %}",
+            "{% set box = {selector: row} %}{% macro leak(r) %}{{ r.to_dict() }}{% endmacro %}{{ leak(box[selector]) }}",
+            "{% set box = {7: row} %}{{ box[7].to_dict() }}",
+        ),
+    )
+    def test_computed_key_row_carrier_writes_remain_visible(self, template: str) -> None:
+        """An unknown write key must survive until a later whole-row read."""
+        from elspeth.core.templates import DYNAMIC_ROW_FIELD, extract_jinja2_field_usage, extract_jinja2_fields_with_details
+
+        usage = extract_jinja2_field_usage(template)
+
+        assert usage.fields == frozenset()
+        assert usage.dynamic_accesses == ("row-api",)
+        assert extract_jinja2_fields_with_details(template) == {DYNAMIC_ROW_FIELD: ["row_api_dynamic"]}
+
+    @pytest.mark.parametrize(
+        ("template", "expected_fields"),
+        (
+            ("{% set unused = {selector: row} %}{{ row.text }}", frozenset({"text"})),
+            ("{% set box = {selector: row.text} %}{{ box[selector] }}", frozenset({"text"})),
+            ("{% set box = {selector: {'r': row, 'local': {'a': 'A'}}} %}{{ box[selector].local.get('a') }}", frozenset()),
+        ),
+    )
+    def test_computed_key_carriers_preserve_non_row_reads(self, template: str, expected_fields: frozenset[str]) -> None:
+        """Unknown keys do not make unused carriers or scalar siblings row reads."""
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        usage = extract_jinja2_field_usage(template)
+
+        assert usage.fields == expected_fields
+        assert usage.dynamic_accesses == ()
+
     def test_scalar_row_value_collection_alias_not_dynamic(self) -> None:
         """A list of declared row values is not a list of row objects."""
         from elspeth.core.templates import extract_jinja2_field_usage
@@ -799,6 +839,8 @@ class TestExtractJinja2Fields:
         (
             "{% set args = lookup.args %}{{ row.get(*args) }}",
             "{% set kwargs = lookup.kwargs %}{{ row.get(**kwargs) }}",
+            "{{ row.get(**{lookup.key: 'secret'}) }}",
+            "{{ row.get(**{7: 'secret'}) }}",
         ),
     )
     def test_row_get_unknown_splats_reported_by_usage(self, template: str) -> None:
@@ -850,6 +892,8 @@ class TestExtractJinja2Fields:
         "template",
         (
             "{% set opts = lookup.opts %}{{ row | attr(**opts) }}",
+            "{{ row | attr(**{lookup.key: 'to_dict'}) }}",
+            "{{ row | attr(**{7: 'to_dict'}) }}",
             "{% set opts = lookup.opts %}{{ [row] | map(**opts) | list }}",
             "{% set opts = lookup.opts %}{{ [row] | join(',', **opts) }}",
             "{% set args = lookup.args %}{{ [row] | selectattr(*args) | list }}",
