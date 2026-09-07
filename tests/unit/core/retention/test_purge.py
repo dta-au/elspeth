@@ -19,8 +19,10 @@ from elspeth.contracts import (
     RoutingMode,
     RunStatus,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     aggregation_result_outputs_table,
     aggregation_results_table,
@@ -32,6 +34,7 @@ from elspeth.core.landscape.schema import (
     operations_table,
     routing_events_table,
     rows_table,
+    run_coordination_table,
     runs_table,
     tokens_table,
 )
@@ -70,6 +73,13 @@ def _create_run(
             openrouter_catalog_source="bundled",
         )
     )
+    conn.execute(run_coordination_table.insert().values(run_id=run_id, updated_at=datetime.now(UTC)))
+
+
+def _create_purge_runs(db: LandscapeDB, *run_ids: str) -> None:
+    with db.write_connection() as conn:
+        for run_id in run_ids:
+            _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=datetime.now(UTC))
 
 
 def _create_node(
@@ -889,6 +899,29 @@ class TestPurgePayloads:
             assert run_record is not None
             grade = run_record.reproducibility_grade
         assert grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
+        with db.connection() as conn:
+            seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-replay-critical-purge")).one()
+        assert seat.leader_worker_id is None
+
+    def test_purge_reports_a_held_seat_without_releasing_its_owner(self, db: LandscapeDB) -> None:
+        store = MockPayloadStore()
+        ref = store.store(b"payload")
+        _create_purge_runs(db, "held")
+        with db.write_connection() as conn:
+            _create_node(conn, "held", "node-held", determinism=Determinism.NON_DETERMINISTIC)
+            _create_row(conn, "held", "node-held", "row-held", row_index=0, source_data_ref=ref)
+        coordination = RunCoordinationRepository(db.engine)
+        authority = coordination.acquire_export_leadership(
+            run_id="held", worker_id=mint_worker_id("held"), window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        )
+        result = PurgeManager(db, store).purge_payloads([ref])
+        assert result.grade_update_failures == ("held",)
+        leader = coordination.live_leader(run_id="held")
+        assert leader is not None
+        assert leader.leader_worker_id == authority.worker_id
+        with db.connection() as conn:
+            row = conn.execute(runs_table.select().where(runs_table.c.run_id == "held")).one()
+        assert row.reproducibility_grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
 
     def test_purge_payloads_counts_delete_false_as_skipped_not_failed(
         self,
@@ -929,13 +962,16 @@ class TestPurgePayloads:
         manager = PurgeManager(db, store)
 
         monkeypatch.setattr(manager, "_find_affected_run_ids", lambda refs: {"run-affected"} if refs else set())
+        _create_purge_runs(db, "run-affected")
 
         grade_updates: list[str] = []
 
-        def _record_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        def _record_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
             del db_obj
             assert deleted_refs == [ok_ref, exists_error_ref]
-            grade_updates.append(run_id)
+            grade_updates.append(coordination_token.run_id)
 
         monkeypatch.setattr("elspeth.core.retention.purge.update_grade_after_purge", _record_grade_update)
 
@@ -1038,11 +1074,12 @@ class TestPurgePayloads:
             return affected
 
         monkeypatch.setattr(manager, "_find_affected_run_ids", _mock_affected)
+        _create_purge_runs(db, "run-alpha", "run-beta", "run-gamma")
 
         grade_updates: list[str] = []
         monkeypatch.setattr(
             "elspeth.core.retention.purge.update_grade_after_purge",
-            lambda db_obj, run_id, *, deleted_refs=None: grade_updates.append(run_id),
+            lambda db_obj, *, coordination_token, deleted_refs=None: grade_updates.append(coordination_token.run_id),
         )
 
         all_refs = [
@@ -1198,6 +1235,7 @@ class TestPurgeGradeUpdateFailureResilience:
         manager = PurgeManager(db, store)
 
         # Simulate 3 affected runs
+        _create_purge_runs(db, "run-ok-1", "run-bad", "run-ok-2")
         monkeypatch.setattr(
             manager,
             "_find_affected_run_ids",
@@ -1206,8 +1244,11 @@ class TestPurgeGradeUpdateFailureResilience:
 
         grade_updates: list[str] = []
 
-        def _failing_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        def _failing_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
             del db_obj
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             if run_id == "run-bad":
                 raise OperationalError(f"Transient DB failure for run '{run_id}'", {}, Exception("locked"))
@@ -1245,7 +1286,12 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-corrupt"} if refs else set(),
         )
 
-        def _integrity_failure(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        _create_purge_runs(db, "run-corrupt")
+
+        def _integrity_failure(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             raise AuditIntegrityError(f"NULL reproducibility_grade for run {run_id} — audit data corruption")
 
@@ -1271,7 +1317,10 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-fail"} if refs else set(),
         )
 
-        def _transient_fail(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
+        _create_purge_runs(db, "run-fail")
+
+        def _transient_fail(db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None) -> None:
+            run_id = coordination_token.run_id
             assert deleted_refs == [ref]
             raise OperationalError(f"Transient failure for run '{run_id}'", {}, Exception("locked"))
 
@@ -1308,8 +1357,12 @@ class TestPurgeGradeUpdateFailureResilience:
             lambda refs: {"run-buggy"} if refs else set(),
         )
 
-        def _buggy_grade_update(db_obj: LandscapeDB, run_id: str, *, deleted_refs: list[str] | None = None) -> None:
-            del db_obj, run_id, deleted_refs
+        _create_purge_runs(db, "run-buggy")
+
+        def _buggy_grade_update(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            del db_obj, coordination_token, deleted_refs
             raise TypeError("bug in our own grade-update code")
 
         monkeypatch.setattr(
@@ -1319,6 +1372,9 @@ class TestPurgeGradeUpdateFailureResilience:
 
         with pytest.raises(TypeError, match="bug in our own grade-update code"):
             manager.purge_payloads([ref])
+        with db.connection() as conn:
+            seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-buggy")).one()
+        assert seat.leader_worker_id is None
 
 
 class TestPurgeUnboundedIN:

@@ -17,9 +17,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import RunStatus
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
 from elspeth.contracts.payload_store import PayloadStore
+from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.model_loaders import validate_run_lifecycle_row
 from elspeth.core.landscape.reproducibility import update_grade_after_purge
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     aggregation_result_outputs_table,
     aggregation_results_table,
@@ -388,7 +391,11 @@ class PurgeManager:
         )
 
         with self._db.connection() as conn:
-            result = conn.execute(all_runs_query)
+            result = conn.execute(
+                select(runs_table.c.run_id)
+                .where(runs_table.c.run_id.in_(all_runs_query))
+                .where(runs_table.c.status.in_(_PURGE_ELIGIBLE_RUN_STATUSES))
+            )
             return {row[0] for row in result}
 
     def purge_payloads(self, refs: list[str]) -> PurgeResult:
@@ -453,20 +460,32 @@ class PurgeManager:
         # irreversibly deleted — a transient DB failure for one run must not
         # prevent grade updates for the remaining runs.
         #
-        # We catch ONLY SQLAlchemyError: update_grade_after_purge operates on
-        # our own Tier-1 audit DB, so the only recoverable failure mode is
-        # database I/O (lock contention, connection loss). Every *semantic*
-        # anomaly it can detect is already raised as AuditIntegrityError (a
+        # Database I/O and a concurrent seat owner can prevent the update.
+        # Every semantic anomaly is raised as AuditIntegrityError (a
         # Tier-1 error that is NOT a SQLAlchemyError), which therefore
         # propagates uncaught and crashes the purge — corruption of our audit
         # trail must never be recorded as a recoverable "grade update failure".
         # Any other exception (TypeError, AttributeError, RuntimeError) is a bug
         # in our own code and likewise crashes rather than being swallowed.
         grade_update_failures: list[str] = []
+        coordination = RunCoordinationRepository(self._db.engine)
         for run_id in sorted(affected_run_ids):
             try:
-                update_grade_after_purge(self._db, run_id, deleted_refs=deleted_refs)
-            except SQLAlchemyError as exc:
+                authority = coordination.acquire_export_leadership(
+                    run_id=run_id,
+                    worker_id=mint_worker_id(run_id),
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                )
+                try:
+                    update_grade_after_purge(self._db, coordination_token=authority, deleted_refs=deleted_refs)
+                finally:
+                    coordination.release_seat(token=authority)
+            except (
+                SQLAlchemyError,
+                NonResumableRunError,
+                contract_errors.WriteLockHeldError,
+                contract_errors.RunLeadershipLostError,
+            ) as exc:
                 logger.warning(
                     "grade_update_failed",
                     run_id=run_id,

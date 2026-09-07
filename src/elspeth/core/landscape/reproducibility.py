@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import ColumnElement, CompoundSelect, select, union
 
 from elspeth.contracts import Determinism, ReproducibilityGrade
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     calls_table,
     node_states_table,
@@ -243,7 +245,9 @@ def _replay_critical_deleted_ref_query(
     )
 
 
-def update_grade_after_purge(db: "LandscapeDB", run_id: str, deleted_refs: Sequence[str] | None = None) -> None:
+def update_grade_after_purge(
+    db: "LandscapeDB", *, coordination_token: CoordinationToken, deleted_refs: Sequence[str] | None = None
+) -> None:
     """Degrade reproducibility grade after payload purge.
 
     After payloads are purged, replay-only runs can no longer be replayed IF
@@ -261,12 +265,16 @@ def update_grade_after_purge(db: "LandscapeDB", run_id: str, deleted_refs: Seque
 
     Args:
         db: LandscapeDB instance
-        run_id: Run ID to potentially degrade
+        coordination_token: Current authority for the run to potentially degrade.
         deleted_refs: Payload refs actually removed by the purge operation.
     """
-    # Read-then-write in one transaction: carry write intent so the WAL write
-    # lock is taken at BEGIN (no BUSY_SNAPSHOT upgrade hazard under peers).
-    with db.write_connection() as conn:
+    run_id = coordination_token.run_id
+    with fenced_leader_transaction(
+        db.engine,
+        token=coordination_token,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="update_grade_after_purge",
+    ) as conn:
         # Tier 1 validation: verify audit data integrity before mutation
         query = select(runs_table.c.reproducibility_grade).where(runs_table.c.run_id == run_id)
         result = conn.execute(query)

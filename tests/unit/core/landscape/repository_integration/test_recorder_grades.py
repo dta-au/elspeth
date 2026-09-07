@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import RunLeadershipLostError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import calls_table, node_states_table, rows_table, tokens_table
@@ -277,7 +278,7 @@ class TestReproducibilityGradeComputation:
         _insert_purged_call(db, run.run_id, node_id=node.node_id)
 
         # Simulate purge - grade should degrade because replay-critical payload is gone
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Check grade was degraded
         updated_run = factory.run_lifecycle.get_run(run.run_id)
@@ -316,7 +317,7 @@ class TestReproducibilityGradeComputation:
         assert completed_run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
         # Simulate purge - grade should NOT degrade
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Check grade unchanged
         updated_run = factory.run_lifecycle.get_run(run.run_id)
@@ -341,13 +342,17 @@ class TestReproducibilityGradeComputation:
 
     def test_update_grade_after_purge_nonexistent_run_raises(self) -> None:
         """update_grade_after_purge() crashes on nonexistent run — caller bug or corruption."""
+        from tests.fixtures.landscape import make_factory
+
         from elspeth.core.landscape.database import LandscapeDB
         from elspeth.core.landscape.reproducibility import update_grade_after_purge
 
         db = LandscapeDB.in_memory()
-
-        with pytest.raises(AuditIntegrityError, match="does not exist"):
-            update_grade_after_purge(db, "nonexistent_run_id")
+        factory = make_factory(db)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        token = replace(leader_coordination_token(factory, run.run_id), run_id="nonexistent_run_id")
+        with pytest.raises(RunLeadershipLostError):
+            update_grade_after_purge(db, coordination_token=token)
 
     def test_attributable_only_unchanged_after_purge(self) -> None:
         """ATTRIBUTABLE_ONLY remains unchanged after purge (already at lowest grade).
@@ -384,7 +389,7 @@ class TestReproducibilityGradeComputation:
         _insert_purged_call(db, run.run_id, node_id=node.node_id)
 
         # First purge: degrades REPLAY_REPRODUCIBLE → ATTRIBUTABLE_ONLY
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify it's ATTRIBUTABLE_ONLY
         run_after_first_purge = factory.run_lifecycle.get_run(run.run_id)
@@ -392,7 +397,7 @@ class TestReproducibilityGradeComputation:
         assert run_after_first_purge.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
 
         # Second purge: no-op, already at lowest grade
-        update_grade_after_purge(db, run.run_id)
+        update_grade_after_purge(db, coordination_token=leader_coordination_token(factory, run.run_id))
 
         run_after_second_purge = factory.run_lifecycle.get_run(run.run_id)
         assert run_after_second_purge is not None
