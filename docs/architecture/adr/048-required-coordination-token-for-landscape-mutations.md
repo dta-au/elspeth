@@ -503,7 +503,22 @@ verb accepts both, and neither type is ever spelled `| None`.
 `fenced_member_transaction` composes `begin_write` with `verify_membership_fence`
 as the first statement, in D7's **verify-UPDATE** form so the rowcount is the
 proof rather than an EXISTS subquery's snapshot (which under PostgreSQL READ
-COMMITTED would not hold the row lock). Rowcount 0 rolls the whole transaction
+COMMITTED would not hold the row lock).
+
+That last clause is **measured, not asserted**, because a lock claim cannot be
+proven on SQLite — one writer runs at a time there regardless, so a no-op lock
+and a correct one are indistinguishable at the assertion. Replacing the
+verify-UPDATE with the equivalent un-locked `SELECT` and running both forms:
+
+| form | 131 SQLite tests | PostgreSQL two-writer contention proof |
+|---|---|---|
+| verify-UPDATE (this design) | pass | pass |
+| `SELECT` snapshot (D7's warning) | **pass — the defect is invisible** | **fails**: both writers pass the fence, and the loser's payload CAS matches 0 rows and raises `AuditIntegrityError` |
+
+So the row lock is load-bearing and only the container suite can say so. Every
+membership-fence contention claim in this amendment rests on
+`tests/testcontainer/core/test_run_coordination_release_postgres.py`, repeated
+per race because a single green pass cannot be told from luck. Rowcount 0 rolls the whole transaction
 back and raises `RunMembershipLostError`, the sibling of `RunLeadershipLostError`,
 recording a `fence_refusal` event on a fresh connection exactly as the leader
 fence does. The refusal row carries `leader_epoch=NULL` — a member holds no epoch
@@ -755,6 +770,29 @@ whether that site passes `conn=`. Of the eleven `_database_ops` write callers,
 nine are run-scoped repositories that hold a token; **the only two with no run at
 all are the two `auth_audit_repository` sites**, so the relay's unfenced
 self-owned transaction is load-bearing for `auth_events` and for nothing else.
+
+### A5a. How the PluginContext admission survives ADR-032's ban on Protocols
+
+The gate admits a plugin's `ctx.<forwarder>()` call through two arms, and one of
+them is annotated with a Protocol. That looks, at first reading, like exactly the
+thing [ADR-032](032-validate-by-trust-domain.md) forbids — a structural type used
+as a security control. It is not, and the reason is worth stating in the
+architecture decision rather than leaving in a lane report:
+
+> **Arm (a) is a deferral, not a grant.** Admitting `ctx.<forwarder>()` on a
+> Protocol-annotated parameter does not certify anything — it moves the proof
+> obligation to whichever concrete class actually forwards to Landscape, and
+> that class's own call is scanned like any other. **Arm (b), which grants, is
+> keyed on a concrete owned class at an exact path.** A structural impostor
+> cannot launder an unfenced write through (a); it can only relocate where the
+> proof is demanded.
+
+So the Protocol never answers "is this writer authorised". It answers "is this
+call the end of the chain, or is there a further call still to prove?" — and the
+answer "there is a further call" is safe under structural typing, because an
+impostor that satisfies the Protocol still has to produce a concrete forwarder
+whose own Landscape call the scanner will demand a token from. ADR-032's rule is
+about the type that decides; this type decides nothing.
 
 ### A6. A defect class: key on the RESOLVED OWNER, never the method name
 

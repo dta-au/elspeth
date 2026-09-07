@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,7 +17,7 @@ from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
 from tests.helpers.state_engine import capture_state_engine_image
 
-from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
+from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken, WorkerMembershipToken, mint_worker_id
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -575,3 +575,206 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
         assert workers == {incumbent_id: "departed", successor_id: "active"}
     finally:
         db.close()
+
+
+_MEMBERSHIP_RACE_REPETITIONS = 8
+
+
+def _seed_run_with_follower(db: LandscapeDB, *, run_id: str) -> WorkerMembershipToken:
+    """A RUNNING run with a live leader seat and one admitted follower."""
+    _seed_run(db, run_id=run_id, now=NOW, status="running")
+    repo = RunCoordinationRepository(db.engine)
+    register_run_leader(repo, run_id=run_id, worker_id=mint_worker_id(run_id), window_seconds=300)
+    return repo.admit_follower(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        config_hash="config",
+        window_seconds=300,
+    )
+
+
+def _race_two_member_writers(
+    first_db: LandscapeDB,
+    first: Callable[[], object],
+    second_db: LandscapeDB,
+    second: Callable[[], object],
+) -> tuple[object, object]:
+    """Hold both threads at their membership verify-UPDATE, then release together.
+
+    The seam is the fence's own statement, so both writers have opened their
+    IMMEDIATE transaction and are about to contend for the SAME ``run_workers``
+    row. Under the D7 verify-UPDATE form one of them takes the row lock and the
+    other blocks until it commits; under a snapshot-only EXISTS predicate both
+    would read ``active`` and proceed. That difference is invisible on SQLite,
+    where one writer runs at a time regardless.
+    """
+    release = threading.Event()
+    reached = {"first": threading.Event(), "second": threading.Event()}
+    outcomes: dict[str, object] = {}
+
+    def pause_before_membership_update(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        _params: Any,
+        _context: Any,
+        _many: bool,
+    ) -> None:
+        contender = {"first-member": "first", "second-member": "second"}.get(threading.current_thread().name)
+        if contender is None or reached[contender].is_set():
+            return
+        normalized = " ".join(statement.upper().split())
+        if normalized.startswith("UPDATE RUN_WORKERS"):
+            reached[contender].set()
+            if not release.wait(timeout=15):
+                raise TimeoutError(f"{contender} timed out at the pre-fence race seam")
+
+    def invoke(name: str, operation: Callable[[], object]) -> None:
+        try:
+            outcomes[name] = operation()
+        except BaseException as exc:  # pragma: no cover - asserted by the caller
+            outcomes[name] = exc
+
+    threads = (
+        threading.Thread(target=invoke, args=("first", first), name="first-member"),
+        threading.Thread(target=invoke, args=("second", second), name="second-member"),
+    )
+    engines = (first_db.engine, second_db.engine)
+    for engine in engines:
+        event.listen(engine, "begin", _set_postgresql_transaction_timeouts)
+        event.listen(engine, "before_cursor_execute", pause_before_membership_update)
+    started: list[threading.Thread] = []
+    teardown_failure: str | None = None
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+        deadline = time.monotonic() + 15
+        while not all(gate.is_set() for gate in reached.values()):
+            exited_early = [name for name, gate in reached.items() if name in outcomes and not gate.is_set()]
+            assert not exited_early, f"member writers exited before the pre-fence race seam: {exited_early!r}"
+            if time.monotonic() >= deadline:
+                missing = [name for name, gate in reached.items() if not gate.is_set()]
+                raise AssertionError(f"member writers did not reach the pre-fence race seam: {missing!r}")
+            time.sleep(0.01)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=20)
+        assert all(not thread.is_alive() for thread in threads), "member writers did not finish within the bounded wait"
+    finally:
+        release.set()
+        for thread in started:
+            thread.join(timeout=20)
+        alive = [thread.name for thread in started if thread.is_alive()]
+        if alive:
+            teardown_failure = f"member writer teardown remained live after bounded joins: {alive!r}"
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", pause_before_membership_update)
+            event.remove(engine, "begin", _set_postgresql_transaction_timeouts)
+    assert teardown_failure is None, teardown_failure
+    return outcomes["first"], outcomes["second"]
+
+
+@pytest.mark.timeout(300)
+def test_postgresql_two_concurrent_departs_serialise_on_the_membership_fence(postgres_url: str) -> None:
+    """ADR-030 D4's second fence under real contention: exactly one departure wins.
+
+    Both threads hold the SAME valid ``WorkerMembershipToken`` and both fence on
+    the same ``run_workers`` row. The row lock the verify-UPDATE takes is what
+    makes the loser see ``departed`` rather than the ``active`` its own snapshot
+    began with, so the contract is: one ``worker_depart`` event, one
+    ``fence_refusal``, and NEITHER thread raising.
+
+    Repeated because a race cannot be told from luck in a single pass; each
+    repetition gets its own run so no state carries between them.
+    """
+    for repetition in range(_MEMBERSHIP_RACE_REPETITIONS):
+        run_id = f"member-fence-depart-race-{repetition}"
+        with ExitStack() as stack:
+            db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            first_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            second_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            member = _seed_run_with_follower(db, run_id=run_id)
+            first_repo = RunCoordinationRepository(first_db.engine)
+            second_repo = RunCoordinationRepository(second_db.engine)
+
+            def _depart_first(repo: RunCoordinationRepository = first_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            def _depart_second(repo: RunCoordinationRepository = second_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            first, second = _race_two_member_writers(first_db, _depart_first, second_db, _depart_second)
+
+            for name, outcome in (("first", first), ("second", second)):
+                assert not isinstance(outcome, BaseException), (
+                    f"repetition {repetition}: {name} depart raised {type(outcome).__name__}: {outcome!r} — "
+                    "the membership fence reifies its refusal as a no-op and must never surface a database error"
+                )
+            events = _coordination_events(db, run_id=run_id)
+            departs = [e for e in events if e["event_type"] == "worker_depart"]
+            refusals = [e for e in events if e["event_type"] == "fence_refusal"]
+            assert len(departs) == 1, f"repetition {repetition}: expected exactly one worker_depart, got {len(departs)}"
+            assert len(refusals) == 1, f"repetition {repetition}: expected exactly one fence_refusal, got {len(refusals)}"
+            assert json.loads(str(refusals[0]["context_json"])) == {"fence": "membership", "verb": "depart_worker"}
+            assert refusals[0]["leader_epoch"] is None, "a member holds no epoch"
+            with db.engine.connect() as conn:
+                status = conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)
+                ).scalar_one()
+            assert status == "departed", f"repetition {repetition}: the row ended {status!r}"
+
+
+@pytest.mark.timeout(300)
+def test_postgresql_heartbeat_racing_depart_never_leaves_a_departed_member_live(postgres_url: str) -> None:
+    """A beat and a departure contend for one row; the row never ends ``active``.
+
+    The dangerous interleaving is the beat committing its liveness extension
+    AFTER the departure, which would leave a departed identity looking fresh to
+    the leader's housekeeping sweep. The membership fence's row lock forbids it:
+    whichever writer takes the lock first, the other fences against the
+    committed state, not against its own opening snapshot.
+    """
+    for repetition in range(_MEMBERSHIP_RACE_REPETITIONS):
+        run_id = f"member-fence-beat-depart-race-{repetition}"
+        with ExitStack() as stack:
+            db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            beat_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            depart_db = stack.enter_context(closing(LandscapeDB.from_url(postgres_url)))
+            member = _seed_run_with_follower(db, run_id=run_id)
+            beat_repo = RunCoordinationRepository(beat_db.engine)
+            depart_repo = RunCoordinationRepository(depart_db.engine)
+
+            def _beat(repo: RunCoordinationRepository = beat_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.worker_heartbeat(member_token=token, window_seconds=300)
+
+            def _depart(repo: RunCoordinationRepository = depart_repo, token: WorkerMembershipToken = member) -> object:
+                return repo.depart_worker(member_token=token)
+
+            beat, departed = _race_two_member_writers(beat_db, _beat, depart_db, _depart)
+
+            for name, outcome in (("heartbeat", beat), ("depart", departed)):
+                assert not isinstance(outcome, BaseException), (
+                    f"repetition {repetition}: {name} raised {type(outcome).__name__}: {outcome!r}"
+                )
+            with db.engine.connect() as conn:
+                status = conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)
+                ).scalar_one()
+            assert status == "departed", (
+                f"repetition {repetition}: the member ended {status!r} — a beat must never revive or hold open a departed membership"
+            )
+            events = _coordination_events(db, run_id=run_id)
+            assert len([e for e in events if e["event_type"] == "worker_depart"]) == 1
+            beat_refusals = [
+                e for e in events if e["event_type"] == "fence_refusal" and json.loads(str(e["context_json"]))["verb"] == "worker_heartbeat"
+            ]
+            # Whichever order the lock granted: a beat that fenced FIRST reports
+            # active and leaves no refusal; a beat that fenced after the commit
+            # is refused and leaves exactly one. Both are correct; a beat that
+            # reported active AFTER the departure committed would be neither.
+            assert isinstance(beat, CoordinationSnapshot), f"heartbeat returned {beat!r}"
+            if beat.worker_active:
+                assert beat_refusals == [], "a beat that won the lock must not also record a refusal"
+            else:
+                assert len(beat_refusals) == 1, "a refused beat records exactly one fence_refusal"
