@@ -4,44 +4,7 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased
-
-### Changed
-
-- **Blob custody lock keyed in its own advisory-lock class.** The
-  PostgreSQL session-level lock a blob write holds across its reservation,
-  file write and finalize (`_blob_custody_session_lock`) now uses
-  `ELSPETH_BLOB_CUSTODY_LOCK_CLASSID` (`0x424C4F42`, "BLOB") instead of
-  sharing `ELSPETH_SESSIONS_LOCK_CLASSID` with the session-operation fence.
-  Session- and transaction-level advisory locks share one lock space, so
-  under the shared class every fence acquire, renew and release on a session
-  queued behind that session's filesystem persistence; on a multi-replica
-  deployment a renew starved past the lease window becomes a spurious
-  takeover. The transaction-scoped phase locks inside the reservation and
-  finalize transactions keep the sessions class. Pinned by the PostgreSQL
-  proof that a lease renew completes while a blob persist for the same
-  session is paused inside its rename
-  (`tests/testcontainer/web/test_blob_custody_lock_isolation_postgres.py`).
-  The class is internal to PostgreSQL advisory locking: no schema, bundle or
-  operator action. Replicas of different versions serialise custody on
-  different keys; every maintained platform's rollout contract is zero-overlap
-  replacement (`docs/reference/deployment-platforms.md`), and an overlap of
-  old and new replicas is outside it. elspeth-ee9861baf6.
-
-### Removed
-
-- **Composer pipeline recipes** — the `list_recipes` and
-  `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
-  slot-schema contracts behind them. The server-side prose-to-recipe matcher
-  had already been excised; what remained shipped two tool declarations in
-  every composer request and, across 141 sessions and 707 tool calls,
-  produced no pipeline. The `recipe.index` planner information class is
-  retired with them — it was still advertised to the planner as discoverable
-  while no tool could resolve it. Pipeline structure is authored by the
-  planner through `set_pipeline` and the graph-mutation tools, per the
-  standing composer invariant that the LLM does the job.
-
-## 0.8.0 - Release candidate (Unified lineage and production hardening)
+## 0.8.0 - 2026-09-07 (Unified lineage and production hardening)
 
 0.8.0 unifies ELSPETH's group-lineage and settlement model while carrying
 forward the production-path hardening prepared after 0.7.1. It adds
@@ -134,13 +97,13 @@ audit-integrity failure. Epoch 37 widens the auth provider CHECK constraints
 on `auth_events` and `run_attributions` to admit `vanguard` and `google`; the
 constraint only widens, but Landscape compares declared CHECK text against the
 reflected constraint structurally, so it is a schema change like any other and
-cuts over in the same service-stop window as session epoch 50. Epoch 38 gives
-`scheduler_events` an auto-incrementing `seq` primary key that is the
-authoritative replay order; `event_id` becomes a non-unique content digest of
-the transition. Database-stamped events tie on `recorded_at` inside one SQLite
-second or one PostgreSQL transaction, so the old `(recorded_at, event_id)` key
-replayed them in hash order and two identical transitions of one work item in
-one second collided on the primary key.
+cuts over in the same service-stop window as session epoch 52 — one window,
+two stores. Epoch 38 gives `scheduler_events` an auto-incrementing `seq`
+primary key that is the authoritative replay order; `event_id` becomes a
+non-unique content digest of the transition. Database-stamped events tie on
+`recorded_at` inside one SQLite second or one PostgreSQL transaction, so the
+old `(recorded_at, event_id)` key replayed them in hash order and two identical
+transitions of one work item in one second collided on the primary key.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
@@ -265,11 +228,18 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   unchanged.
 - **ADR numbering collisions are repaired** — two ADRs numbered 025 and two
   numbered 026 are renumbered to `034-audited-inline-blob-content` and
-  `035-audit-hash-raw-vs-stored-asymmetry`, leaving the record contiguously
-  numbered 000–038. Five new ADRs are accepted this release: 032 (validate by
-  trust domain), 033 (deferred-intent admission contract), 036 (Textract
-  profile-bound bucket), 037 (interpretation caps govern LLM churn only), and
-  038 (non-terminal ABANDONED path).
+  `035-audit-hash-raw-vs-stored-asymmetry`, so every ADR number again names
+  exactly one decision. The record now runs 000–048, with 044 and 045 unused.
+  Twelve new ADRs are accepted this release: 032 (validate by trust domain),
+  033 (deferred-intent admission contract), 036 (Textract profile-bound
+  bucket), 037 (interpretation caps govern LLM churn only), 038 (non-terminal
+  ABANDONED path), 039 (unconstrained text framing), 040 (Composer/runtime
+  validation posture), 041 (state-engine supported profiles), 042 (group
+  settlement vocabulary and observability), 043 (project tooling), 046 (audit
+  grade is a product characteristic), and 047 (Landscape database-clock
+  authority). One ships as **Proposed** — 048 (required coordination token for
+  Landscape mutations), whose remaining threading lands in 0.8.1. Both
+  coordination decisions are described below.
 - **Pluggable single sign-on and one identity substrate** (elspeth-07cd19ba73,
   design in `docs/specs/2026-09-02-pluggable-sso-design.md`) — the web service
   exchanges the authorization code itself as a confidential client, hands the
@@ -288,6 +258,70 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   retires its identity exactly as the web service does, so a re-created
   username starts with a fresh identity rather than inheriting the old one's
   admission and quota.
+- **Landscape custody, liveness and takeover decisions read the Landscape
+  database's clock** (ADR-047, elspeth-0ff11aa42e) — every lease deadline,
+  expiry comparison and takeover predicate under `core/landscape`,
+  `core/checkpoint` and the orchestrator used to be decided against whichever
+  process asked: either a `now` the caller passed into the repository verb, or
+  a process clock the repository read for itself. One process per Landscape
+  has one clock, so that was harmless; two or more replicas against one
+  Landscape are not. A replica whose clock runs ahead extends its own leader
+  seat further into the future than its peers believe, one whose clock runs
+  behind judges a live seat expired and takes it over, and nothing in the
+  schema or the fence can detect either, because every predicate compares a
+  stored deadline against a caller-supplied instant. The first leader fence,
+  worker liveness, scheduler leases and dispositions, barrier completion and
+  adoption, source-completion reconciliation, and sink-effect leases now take
+  their "now" from the Landscape database's own `CURRENT_TIMESTAMP` inside the
+  deciding transaction, after the locks that make the decision exclusive —
+  read once and bound into every predicate and deadline of that transaction, or
+  written in SQL at the leader fence itself. The `now` parameter is gone from
+  the coordination API and no injection seam replaces it; the absence of the
+  seam is the safety property. The Landscape and Sessions clocks remain
+  separate authorities that never cross: with the Sessions clock pinned to
+  2040, every Landscape family's written deadline still lands within a second
+  of Landscape database time, and a takeover cannot be won on the foreign
+  clock. Forensic timestamps (`created_at`, `recorded_at`) keep the process
+  clock — they are recorded, never compared.
+- **A Landscape mutation carries the authority it is written under**
+  (ADR-048, restoring ADR-030 D4's fence split; elspeth-43ddb79074) — a
+  mutation verb took `run_id: str`, a plain string minted by whoever called
+  it, so a replica that had lost leadership (evicted, drained, partitioned, or
+  resumed after a pause) still held a valid-looking run id and could still
+  write node states, outcomes, calls and the run's terminal status. Nothing in
+  the signature or the transaction could refuse it, because nothing in the
+  write path carried leadership. **This model is not complete in 0.8.0. It
+  completes in 0.8.1, and ADR-048 stays Proposed until it does.** What ships
+  here is the first tranche of it, and each piece stands on its own:
+  leadership travels as a value into the run-lifecycle, sink-effect,
+  checkpoint and audit-export verbs, which take a required, keyword-only,
+  exactly-typed `CoordinationToken`, put the verify-and-extend leader fence
+  first in the transaction that writes, and derive the run from the token
+  rather than from a second parameter that could disagree with it. A worker's
+  own liveness and departure writes take a distinct owned type,
+  `WorkerMembershipToken`, fenced against that worker's `run_workers`
+  registration in the same verify-UPDATE form so the row lock is held rather
+  than a snapshot read: requiring the leader token there would either stop a
+  follower making writes it legitimately makes, or hand it an authority it
+  does not hold, and one type meaning both would make that confusion
+  unprovable. A refused member write raises `RunMembershipLostError` with no
+  payload written and records a `fence_refusal` carrying no epoch, so the
+  ledger tells it apart from a leader refusal. The data-flow, execution and
+  scheduler repository families carry most of the threading that remains, and
+  a mutation they own is still written under a plain run id until 0.8.1
+  converts it. That remainder is measured rather than drifting: the four
+  frozen caller inventories are green, and the fencing gate names each
+  outstanding site instead of failing the build on it.
+- **Composer pipeline recipes are removed** — the `list_recipes` and
+  `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
+  slot-schema contracts behind them. The server-side prose-to-recipe matcher
+  had already been excised; what remained shipped two tool declarations in
+  every composer request and, across 141 sessions and 707 tool calls,
+  produced no pipeline. The `recipe.index` planner information class is
+  retired with them — it was still advertised to the planner as discoverable
+  while no tool could resolve it. Pipeline structure is authored by the
+  planner through `set_pipeline` and the graph-mutation tools, per the
+  standing composer invariant that the LLM does the job.
 
 ### Critical fixes
 
@@ -407,6 +441,42 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   and leaving the rewrite undeclared hid it from build-time validation (and
   from this check's ancestor walk, which would otherwise enforce a stale
   upstream type in both directions).
+- **A deposed leader could still clear the barrier markers its successor had
+  just set** (elspeth-ee18e446ff) — `reset_adoption_marker_to_pending`, the
+  crash-window recovery that clears `barrier_adopted_epoch` on BLOCKED coalesce
+  rows so the new leader's first intake re-adopts them properly, ran on a bare
+  write transaction. Its own docstring argued it needed no epoch fence because
+  a concurrent old-leader adoption attempt would fail the CAS — but that CAS
+  guards a different verb, and this one has none, so nothing it did was
+  protected by the sentence excusing it. One takeover is enough to break it: a
+  leader still inside journal restore, whose lease has lapsed and whose seat a
+  successor has taken, reaches the write with nothing to refuse it and clears
+  the markers under a live successor, leaving no refusal record. The second
+  instance is worse — leader A stalls in restore, B takes the seat at the next
+  epoch and begins adopting, and A's in-flight restore then resets exactly the
+  markers B has just set. The verb now takes the leader token and fences
+  first, so a deposed epoch is refused with zero mutation of the marker and a
+  durable `fence_refusal`; an empty work-item list still returns before the
+  fence, because there is no database effect to fence.
+- **Blob custody holds its own PostgreSQL advisory-lock class** — the
+  session-level lock a blob write holds across its reservation, file write and
+  finalize (`_blob_custody_session_lock`) now uses
+  `ELSPETH_BLOB_CUSTODY_LOCK_CLASSID` (`0x424C4F42`, "BLOB") instead of
+  sharing `ELSPETH_SESSIONS_LOCK_CLASSID` with the session-operation fence.
+  Session- and transaction-level advisory locks share one lock space, so
+  under the shared class every fence acquire, renew and release on a session
+  queued behind that session's filesystem persistence; on a multi-replica
+  deployment a renew starved past the lease window becomes a spurious
+  takeover. The transaction-scoped phase locks inside the reservation and
+  finalize transactions keep the sessions class. Pinned by the PostgreSQL
+  proof that a lease renew completes while a blob persist for the same
+  session is paused inside its rename
+  (`tests/testcontainer/web/test_blob_custody_lock_isolation_postgres.py`).
+  The class is internal to PostgreSQL advisory locking: no schema, bundle or
+  operator action. Replicas of different versions serialise custody on
+  different keys; every maintained platform's rollout contract is zero-overlap
+  replacement (`docs/reference/deployment-platforms.md`), and an overlap of
+  old and new replicas is outside it. elspeth-ee9861baf6.
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 

@@ -363,6 +363,38 @@ If this test fails for any output that ELSPETH produced, the contract is broken.
 
 ## 11. AUTHENTICATION AND IDENTITY (RC-5.2)
 
+> **§11 amendment (0.8.0, 7 September 2026):** the RC-5.2 statements below
+> remain accurate as a description of the RC-5.2 identity surface. Three things
+> changed in 0.8.0 and govern instead.
+>
+> **§11.1 — five providers, not three.** `local`, `oidc`, `entra`, `vanguard`
+> and `google` (`src/elspeth/contracts/auth.py:10`). The two added profiles
+> validate on the same surface as `oidc` with their own issuer derivation.
+>
+> **§11.1 — the bearer access-token path is deleted.** The legacy browser path
+> that consumed an IdP access token as a credential was removed in the identity
+> sprint. ELSPETH now verifies the **ID token** against the discovered issuer
+> and JWKS; the access token is used once to call userinfo and is then dropped,
+> never validated as a credential and never stored. The `token_use=access`
+> binding and the Entra optional group-claim assertion described below no
+> longer exist — `IdTokenClaims` carries a closed field set and deliberately
+> does not read IdP group or role claims
+> (`src/elspeth/web/auth/claims.py:65-107`).
+>
+> **§11.4 — one authorisation decision is now enforced.** The boundary below
+> still holds for organisational policy, with one exception: identity
+> administration requires the caller to hold an active deployment-wide `admin`
+> role, checked against the store per request and re-proved inside every
+> mutation's transaction (`src/elspeth/web/auth/identity_admin_routes.py:318-330`).
+> Separately, token issuance is gated on access state: `active` is the only
+> state a token is issued to, `pending` and `disabled` are refused, and an
+> unrecognised state is a refusal rather than a pass
+> (`src/elspeth/web/auth/sso.py:1136-1150`). The remaining `IdentityRole`
+> values (`approver`, `reviewer`, `user`, `curator`, and the rest of the
+> seven-value vocabulary) are **recorded, not enforced** — no code path gates
+> on them. ELSPETH still does not enforce general organisational authorisation
+> policy.
+
 ### 11.1 Provider Coverage
 
 **Promise:** Three authentication providers are supported, each with its declared validation surface.

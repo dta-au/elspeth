@@ -88,7 +88,10 @@ one index. Epoch 34 adds the unified-lineage groundwork tables
 groundwork: the tri-column `fork_group_id`/`expand_group_id`/`branch_name`
 discriminators are retired and `token_lineage_frames`/`lineage_path_json`
 become the sole lineage truth. Epoch 36 binds coalesce effects to their
-non-null lineage group. A Landscape store below epoch 36 is stale and must be recreated. When
+non-null lineage group. Epoch 37 widens the auth provider CHECK constraints on
+`auth_events` and `run_attributions`, and epoch 38 adds the
+`scheduler_events.seq` replay key that orders scheduler transitions. A
+Landscape store below epoch 38 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

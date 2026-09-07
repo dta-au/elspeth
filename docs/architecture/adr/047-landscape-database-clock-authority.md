@@ -1,7 +1,7 @@
 # ADR-047: Landscape Database-Clock Authority — Custody, Liveness, Expiry and Takeover Decisions Read the Landscape Database's Clock
 
 **Date:** 2026-09-05
-**Status:** Proposed (P4-C6, elspeth-0ff11aa42e; ruled EXECUTE under Q1(c), elspeth-d729c26729)
+**Status:** Accepted (P4-C6, elspeth-0ff11aa42e; ruled EXECUTE under Q1(c), elspeth-d729c26729; accepted at the 0.8.0 release — C6.0–C6.4 landed, the gate's four ids green at `-n 0`, programme ticket closed 2026-09-06)
 **Deciders:** ELSPETH maintainer
 **Review evidence:** the fail-closed gate `tests/unit/core/landscape/test_database_clock_authority.py` (4 red ids; corpus measured at p4/c `ccb98a293`: 180 distinct findings across 21 files); the Sessions-side precedent `_SessionOperationAuthorityRepository._database_now` / `_lock_fence_and_read_database_time`; ADR-030
 **Tags:** landscape, coordination, multi-replica, clock, fencing, related-adr-030

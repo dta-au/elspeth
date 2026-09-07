@@ -69,7 +69,12 @@ There is no safe speculative commit after `UNKNOWN`.
    records without exposing raw target, plan, or evidence JSON.
 4. Check the durable state, lease owner/generation/expiry, predecessor ID, and
    ordered attempts. A commit attempt left at `INTENT` after process loss is
-   converted to `response-lost` only under recovery authority.
+   converted to `response-lost` only under recovery authority — since 0.8.0
+   that means **leader-token authority**: `mark_response_lost` is leader-fenced
+   like every other sink-effect verb (ADR-048). Read the attempts by
+   `generation` first and `started_at` within it: `started_at` is a process
+   wall-clock and attempts change hands between workers on takeover, so across
+   generations the raw timestamp order can invert.
 5. Check the target using its native immutable metadata or **target-side
    ledger**. Do not infer absence from a network timeout, an empty cache, or a
    different credential view.
@@ -81,7 +86,7 @@ There is no safe speculative commit after `UNKNOWN`.
 | `RESERVED` | Resume normally. The adapter reuses a durable returned inspection or performs inspection, then persists the plan. |
 | `PREPARED`, no live lease | Resume normally. The coordinator acquires the lease and reconciles before any commit. |
 | `IN_FLIGHT`, lease live | Leave it alone. A second worker must not steal a live generation. |
-| `IN_FLIGHT`, lease expired | Resume through the coordinator. Lease takeover increments the generation and gives the new worker recovery authority. |
+| `IN_FLIGHT`, lease expired | Resume through the coordinator. Lease takeover increments the generation and gives the new worker recovery authority. Since 0.8.0 the takeover is leader-fenced *before* it reads lease state (`sink_effect_lifecycle.py:511-525`), so "the new worker" is necessarily the run's new **leader**; a follower is refused with `RunLeadershipLostError` whatever the lease says. Sink effects are leader-only work by design — ADR-030 D2 puts the sink-write phase among the roles belonging to a single elected leader — so the fence makes an existing rule enforceable rather than narrowing who may recover. "Expired" is judged on the Landscape database's clock, not the operator's host. |
 | A commit returned and its result is durable | Resume normally. The coordinator reuses the returned result and finalizes without another commit. |
 | Commit outcome is `response-lost` | Reconcile the exact stored plan. Continue only from the closed result below. |
 | Reconcile says `NOT_APPLIED` | The coordinator may make the one planned commit and finalize its exact result. |

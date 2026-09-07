@@ -349,8 +349,11 @@ Then open `http://localhost:5173`.
   an install hint.
 - The app refuses to start with the default
   `ELSPETH_WEB__SECRET_KEY=change-me-in-production` outside test mode.
-- The default auth provider is local auth. Use `--auth oidc` or `--auth entra`
-  with the matching `ELSPETH_WEB__*` settings for external identity providers.
+- The default auth provider is local auth. Use `--auth oidc`, `--auth entra`,
+  `--auth google`, or `--auth vanguard` with the matching `ELSPETH_WEB__*`
+  settings for external identity providers; see the
+  [Identity Providers guide](docs/guides/identity-providers.md) for what each
+  profile requires.
 - Local auth exposes `/api/auth/register` when
   `ELSPETH_WEB__REGISTRATION_MODE=open` or `email_verified`. The
   `email_verified` mode writes verification links to
