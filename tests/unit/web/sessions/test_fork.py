@@ -3627,8 +3627,8 @@ class TestForkEndpoint:
         primary = RuntimeError("disk I/O error during blob copy")
         cleanup = OSError("permission denied removing blob dir")
 
-        # Default raise_server_exceptions=True propagates the exact
-        # exception object so __notes__ is inspectable.
+        # The route maps the primary to a closed HTTP error. Inspect its
+        # retained notes and the independent operator cleanup record.
         client = TestClient(app)
 
         async def fail_copy_blobs_for_fork(*args: Any, **kwargs: Any) -> None:
@@ -3637,6 +3637,7 @@ class TestForkEndpoint:
         async def fail_cleanup_blobs_for_fork(*args: Any, **kwargs: Any) -> None:
             raise cleanup
 
+        operation_id = str(uuid.uuid4())
         with (
             patch.object(
                 blob_service,
@@ -3648,11 +3649,12 @@ class TestForkEndpoint:
                 "cleanup_blobs_for_fork",
                 new=fail_cleanup_blobs_for_fork,
             ),
+            structlog.testing.capture_logs() as logs,
         ):
             response = client.post(
                 f"/api/sessions/{session.id}/fork",
                 json={
-                    "operation_id": str(uuid.uuid4()),
+                    "operation_id": operation_id,
                     "from_message_id": str(msg.id),
                     "new_message_content": "Go edited",
                 },
@@ -3663,8 +3665,19 @@ class TestForkEndpoint:
         # RecoveryFailed[...] note identifies residual copied-blob custody.
         notes = primary.__notes__
         assert any("RecoveryFailed[OSError]" in note for note in notes), f"expected RecoveryFailed[OSError] note, got: {notes!r}"
-        assert any("permission denied removing blob dir" in note for note in notes)
+        assert all("permission denied removing blob dir" not in note for note in notes)
         assert any("fork blob cleanup failed" in note.lower() for note in notes)
+        records = [record for record in logs if record["event"] == "session.fork_blob_cleanup_failed"]
+        assert len(records) == 1
+        record = records[0]
+        assert record["session_id"] == str(session.id)
+        assert record["operation_id"] == operation_id
+        assert record["exc_class"] == "OSError"
+        child_id = record["child_session_id"]
+        assert child_id != str(session.id)
+        assert any(child_id in note for note in notes)
+        assert "permission denied removing blob dir" not in repr(records)
+        assert "permission denied removing blob dir" not in response.text
 
     @pytest.mark.asyncio
     async def test_fork_top_level_blob_ref_without_copied_blob_fails_closed(self, tmp_path) -> None:
