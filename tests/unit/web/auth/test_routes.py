@@ -1121,39 +1121,6 @@ class TestAuthConfigEndpoint:
         assert response.status_code == 200
         assert response.json()["registration_mode"] == "closed"
 
-    async def test_oidc_provider_publishes_no_idp_facts_to_the_browser(self) -> None:
-        """The browser learns WHERE to start a login and nothing else.
-
-        The code exchange is the backend's, as a confidential client (spec
-        D2), so the issuer, the client id and the IdP's two browser endpoints
-        are no longer the browser's business — and shipping them was how the
-        deleted browser-client path told the SPA to talk to the IdP directly.
-        """
-        provider = _FakeAuthProvider()
-        app = _create_test_app(provider, auth_provider_type="oidc", **_OIDC_FIELDS)
-
-        async with _client_for(app) as client:
-            response = await client.get("/api/auth/config")
-        assert response.status_code == 200
-        body = response.json()
-        assert body["provider"] == "oidc"
-        # No app.state.sso on this app: the SPA's SSO button is hidden by the
-        # same fact that makes the /sso/* routes refuse (test_sso_routes.py).
-        assert body["sso_start_url"] is None
-        assert set(body) == {"provider", "registration_mode", "sso_start_url"}
-        # Named individually as well as by the exact key set: these are the
-        # fields the response carried, and a reader has to see that their
-        # absence is the point rather than an oversight.
-        for deleted_key in (
-            "oidc_issuer",
-            "oidc_client_id",
-            "authorization_endpoint",
-            "token_endpoint",
-            "oidc_authorization_allowed_origins",
-            "oidc_audience_claim",
-        ):
-            assert deleted_key not in body
-
     async def test_config_endpoint_is_unauthenticated(self) -> None:
         """GET /api/auth/config must not require a Bearer token."""
         provider = _FakeAuthProvider()
@@ -1166,7 +1133,7 @@ class TestAuthConfigEndpoint:
 
     async def test_config_endpoint_is_not_cacheable(self) -> None:
         provider = _FakeAuthProvider()
-        app = _create_test_app(provider, auth_provider_type="oidc", **_OIDC_FIELDS)
+        app = _create_test_app(provider, auth_provider_type="local")
 
         async with _client_for(app) as client:
             response = await client.get("/api/auth/config")

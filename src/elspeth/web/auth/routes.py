@@ -19,6 +19,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 from elspeth.core.url_validation import validate_credential_safe_https_url
@@ -157,10 +158,8 @@ class AuthConfigResponse(_StrictResponse):
     registration_mode: str
     # The browser never learns the IdP's endpoints or the client id: the code
     # exchange is the backend's, as a confidential client (spec D2).
-    # Where the SPA's "Sign in with SSO" button navigates. ``None`` whenever
-    # the deployment is not wired for SSO — the same fact that makes the
-    # three ``/sso/*`` routes refuse — so the button is hidden by the
-    # condition that would make it fail, not by a separate guess.
+    # Where the SPA's "Sign in with SSO" button navigates. Only local-auth
+    # deployments omit it; nonlocal runtime wiring is required at startup.
     sso_start_url: str | None = None
 
 
@@ -186,55 +185,26 @@ def _auth_audit_recorder(request: Request) -> AuthAuditWriter:
 
 
 def _sso_runtime_if_wired(request: Request) -> SsoRuntime | None:
-    """The SSO runtime, or ``None`` when this deployment is not wired for it.
+    """Return the required nonlocal runtime, or None for local authentication.
 
-    ONE attribute, ONE owned type. ``app.state.sso`` is set by the app
-    factory when the provider is an IdP and every SSO setting resolved; the
-    routes and ``/config`` read it here and nowhere else. Absent, or present
-    but not an ``SsoRuntime``, means "not wired" — and that answer is the
-    same whether the process is genuinely local-auth or is running a build in
-    which the wiring has not landed yet. Nothing here reaches for a second
-    attribute or guesses.
+    The app factory rejects incomplete nonlocal wiring and lifespan resolves
+    ``app.state.sso`` before serving requests. Missing or invalid state is an
+    application contract failure, never an ordinary provider outage.
     """
     settings: WebSettings = request.app.state.settings
     if settings.auth_provider == "local":
         return None
-    try:
-        candidate = request.app.state.sso
-    except AttributeError:
-        # Absent IS the answer: this deployment is not wired. Returning the
-        # "not wired" value here is the refusal, not a swallowed error.
-        return None
-    if type(candidate) is not SsoRuntime:
-        return None
+    candidate = request.app.state.sso
+    if not isinstance(candidate, SsoRuntime):
+        raise FrameworkBugError("Nonlocal authentication requires app.state.sso to be an SsoRuntime")
     return candidate
 
 
-async def _sso_runtime(request: Request, *, stage: str) -> SsoRuntime:
-    """The SSO runtime for a ``/sso/*`` route, or the route's refusal.
-
-    Local auth: 404, the route does not exist for this deployment — same as
-    ``/login`` on an IdP deployment. An IdP provider with no runtime: 503
-    ``provider_unavailable`` WITH an audit row, because a browser reached an
-    SSO route on a deployment that says it does SSO and could not be served.
-    That is exactly the unwired state a build carries before its wiring
-    lands, and it fails closed rather than half-way.
-    """
-    settings: WebSettings = request.app.state.settings
-    if settings.auth_provider == "local":
-        raise HTTPException(status_code=404, detail="Not found")
+async def _sso_runtime(request: Request) -> SsoRuntime:
+    """Return the required SSO runtime; local deployments have no SSO route."""
     runtime = _sso_runtime_if_wired(request)
     if runtime is None:
-        _auth_audit_recorder(request).record_auth_failure(
-            request,
-            provider=settings.auth_provider,
-            failure_category="provider_unavailable",
-            failure_stage=stage,
-            user_id=None,
-            username=None,
-            exception_class=None,
-        )
-        raise HTTPException(status_code=503, detail="Single sign-on is not configured on this deployment")
+        raise HTTPException(status_code=404, detail="Not found")
     return runtime
 
 
@@ -578,12 +548,9 @@ def create_auth_router() -> APIRouter:
 
     # ── the SSO walk ─────────────────────────────────────────────────────
     #
-    # Three routes, one service (web/auth/sso.py). These are DARK until the
-    # app factory sets ``app.state.sso`` (identity sprint step C-wiring):
-    # until then every one of them refuses through ``_sso_runtime`` and
-    # ``/config`` reports ``sso_start_url: null``. The bodies below do no
-    # verification of their own — they read the request, hand it to the
-    # service, and write the audit rows the service leaves to them.
+    # Three routes, one service (web/auth/sso.py). Nonlocal deployments bind
+    # app.state.sso during startup. These routes read the request, hand it to
+    # the service, and write the audit rows the service leaves to them.
 
     @router.get("/sso/start")
     async def sso_start(
@@ -596,7 +563,7 @@ def create_auth_router() -> APIRouter:
         would be an open-redirect parameter on the one route guaranteed to
         be reachable unauthenticated. Anything supplied is ignored.
         """
-        runtime = await _sso_runtime(request, stage="sso_start")
+        runtime = await _sso_runtime(request)
         client = runtime.client
         redirect = authorization_redirect(
             authorization_endpoint=client.endpoints.authorization_endpoint,
@@ -623,7 +590,7 @@ def create_auth_router() -> APIRouter:
         clears the transaction cookie — a cookie that survived a failed
         callback would be a state the next login compares against.
         """
-        runtime = await _sso_runtime(request, stage="sso_callback")
+        runtime = await _sso_runtime(request)
         settings: WebSettings = request.app.state.settings
         client = runtime.client
         recorder = _auth_audit_recorder(request)
@@ -683,7 +650,7 @@ def create_auth_router() -> APIRouter:
         _rate_limit: None = Depends(check_auth_rate_limit),
     ) -> TokenResponse:
         """Trade the handoff code for the session token. The only place one is minted."""
-        runtime = await _sso_runtime(request, stage="sso_complete")
+        runtime = await _sso_runtime(request)
         settings: WebSettings = request.app.state.settings
         recorder = _auth_audit_recorder(request)
 

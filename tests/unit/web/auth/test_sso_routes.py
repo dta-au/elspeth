@@ -1,20 +1,14 @@
-"""The three SSO routes over the service — and what they do when nobody wired them.
+"""The three SSO routes over the service and their required runtime wiring.
 
 Spec §2. The service (``web/auth/sso.py``) is tested on its own; this file
 is about the ROUTE layer's obligations: reading the request, clearing the
 cookie on every callback outcome, ``no-store`` on the sensitive responses,
-the audit rows the service leaves to the route, and — first — refusing
-cleanly when ``app.state.sso`` is absent or is not an ``SsoRuntime``.
+the audit rows the service leaves to the route, and the owned runtime contract.
 
-That last obligation outlived the config-shaped route to it. Since step E an
-under-configured IdP deployment cannot exist: ``WebSettings`` refuses the
-shape, and ``build_sso_wiring`` returning ``None`` raises in the factory. What
-still reaches the routes unwired is the LIFECYCLE gap — ``app.state.sso`` is
-bound in the lifespan (``app.py``, ``resolve_sso_runtime``), not in
-``create_app``, so it is absent for every request served against an app whose
-startup has not run, which is exactly what ``ASGITransport`` does here. The
-routes must never assume a caller did the wiring, and must refuse closed
-rather than ``AttributeError`` when one did not.
+Nonlocal authentication requires lifespan startup to bind ``app.state.sso``
+before serving requests. The ASGITransport harness installs that binding
+explicitly because it does not run lifespan. A missing or wrong runtime is
+a broken application contract, not a provider outage or a local-auth mode.
 
 The walk runs through the real router against the in-process fake IdP, the
 real SQLite handoff store and the real session-token issuer. The audit
@@ -40,6 +34,7 @@ from sqlalchemy import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.providers import _mechanics
@@ -268,61 +263,46 @@ def idp() -> FakeIdP:
 
 
 # ==========================================================================
-# Unwired: the router mounted without a runtime behind it.
+# Required runtime wiring, with local authentication as the optional case.
 # ==========================================================================
 
 
-class TestUnwired:
-    """No ``app.state.sso``. The routes must refuse closed, never AttributeError.
-
-    The settings here are a fully wired ``oidc`` deployment — the unwiredness
-    is the missing runtime alone, which is the only half that remains
-    reachable. That is not a contrived state: the attribute is bound during
-    lifespan startup, so the window exists in the real app too.
-    """
+class TestRuntimeWiring:
+    """Nonlocal runtime defects propagate instead of looking like provider refusal."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("method", "path", "stage"),
+        ("method", "path"),
         [
-            ("GET", "/api/auth/sso/start", "sso_start"),
-            ("GET", "/api/auth/sso/callback", "sso_callback"),
-            ("POST", "/api/auth/sso/complete", "sso_complete"),
+            ("GET", "/api/auth/sso/start"),
+            ("GET", "/api/auth/sso/callback"),
+            ("POST", "/api/auth/sso/complete"),
+            ("GET", "/api/auth/config"),
         ],
     )
-    async def test_an_idp_deployment_without_the_runtime_refuses_with_503_and_an_audit_row(
-        self, method: str, path: str, stage: str
-    ) -> None:
+    async def test_missing_nonlocal_runtime_exposes_wiring_failure(self, method: str, path: str) -> None:
         recorder = _RecordingRecorder()
         async with _client(_app(recorder=recorder)) as client:
-            response = await client.request(method, path, json={"code": "x"} if method == "POST" else None)
-        assert response.status_code == 503
-        assert "not configured" in response.json()["detail"]
-        assert recorder.of("auth_failure") == [
-            {
-                "provider": "oidc",
-                "failure_category": "provider_unavailable",
-                "failure_stage": stage,
-                "user_id": None,
-                "username": None,
-                "exception_class": None,
-            }
-        ]
+            with pytest.raises(AttributeError, match="sso"):
+                await client.request(method, path, json={"code": "x"} if method == "POST" else None)
+        assert recorder.rows == []
 
     @pytest.mark.asyncio
-    async def test_a_wrong_typed_runtime_is_unwired_too(self) -> None:
-        """isinstance, not truthiness: an impostor on app.state is refused (ADR-032)."""
-        async with _client(_app(sso=object())) as client:
-            response = await client.get("/api/auth/sso/start")
-        assert response.status_code == 503
-
-    @pytest.mark.asyncio
-    async def test_config_reports_no_start_url_when_unwired(self) -> None:
-        """The SPA button is hidden by the same fact that makes the routes refuse."""
-        async with _client(_app()) as client:
-            response = await client.get("/api/auth/config")
-        assert response.status_code == 200
-        assert response.json()["sso_start_url"] is None
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/api/auth/sso/start"),
+            ("GET", "/api/auth/sso/callback"),
+            ("POST", "/api/auth/sso/complete"),
+            ("GET", "/api/auth/config"),
+        ],
+    )
+    async def test_wrong_nonlocal_runtime_exposes_framework_bug(self, method: str, path: str) -> None:
+        recorder = _RecordingRecorder()
+        async with _client(_app(sso=object(), recorder=recorder)) as client:
+            with pytest.raises(FrameworkBugError, match="SsoRuntime"):
+                await client.request(method, path, json={"code": "x"} if method == "POST" else None)
+        assert recorder.rows == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -384,10 +364,27 @@ class TestStart:
         assert parse_qs(urlsplit(response.headers["location"]).query)["redirect_uri"] == [REDIRECT_URI]
 
     @pytest.mark.asyncio
-    async def test_config_reports_the_start_url_when_wired(self, idp: FakeIdP) -> None:
+    async def test_config_reports_start_url_without_idp_facts_or_caching(self, idp: FakeIdP) -> None:
         async with _client(_app(sso=_runtime(idp, _Substrate(_engine())))) as client:
             response = await client.get("/api/auth/config")
-        assert response.json()["sso_start_url"] == f"{PUBLIC_BASE}/api/auth/sso/start"
+        assert response.status_code == 200
+        body = response.json()
+        assert body["provider"] == "oidc"
+        assert body["sso_start_url"] == f"{PUBLIC_BASE}/api/auth/sso/start"
+        assert set(body) == {"provider", "registration_mode", "sso_start_url"}
+        # The confidential client owns the exchange; the browser only learns
+        # where to begin login, never the IdP configuration or endpoints.
+        for forbidden_key in (
+            "oidc_issuer",
+            "oidc_client_id",
+            "authorization_endpoint",
+            "token_endpoint",
+            "oidc_authorization_allowed_origins",
+            "oidc_audience_claim",
+        ):
+            assert forbidden_key not in body
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Pragma"] == "no-cache"
 
 
 class TestTheWalk:
