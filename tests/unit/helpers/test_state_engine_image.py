@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
 import pytest
+from sqlalchemy import update
 from tests.fixtures.landscape import landscape_database_now, leader_coordination_token
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
@@ -22,7 +23,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import metadata
+from elspeth.core.landscape.schema import metadata, token_work_items_table
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _CATALOG_SHA256 = "0" * 64
@@ -158,6 +159,14 @@ def test_capture_is_exact_for_factory_database_and_explicit_url(seeded_run: _See
 
 
 def test_durable_image_reports_only_allowlisted_delta(seeded_run: _SeededRun) -> None:
+    # Force a distinct timestamp so the diff cannot depend on whether claim
+    # and heartbeat happen within the same SQLite database-clock second.
+    with seeded_run.db.engine.begin() as conn:
+        conn.execute(
+            update(token_work_items_table)
+            .where(token_work_items_table.c.work_item_id == seeded_run.work_item_id)
+            .values(updated_at=seeded_run.now - timedelta(seconds=1))
+        )
     before = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
     seeded_run.factory.scheduler.heartbeat_lease(
         run_id=seeded_run.run_id,
@@ -170,10 +179,11 @@ def test_durable_image_reports_only_allowlisted_delta(seeded_run: _SeededRun) ->
 
     delta = before.diff(after)
     assert delta.changed_tables == {"token_work_items"}
-    assert delta.changed_columns == {"token_work_items": {"lease_expires_at"}}
-    delta.assert_only({"token_work_items": {"lease_expires_at"}})
-    with pytest.raises(AssertionError, match="unexpected durable image delta"):
-        delta.assert_only({"token_work_items": {"updated_at"}})
+    assert delta.changed_columns == {"token_work_items": {"lease_expires_at", "updated_at"}}
+    delta.assert_only({"token_work_items": {"lease_expires_at", "updated_at"}})
+    for incomplete_columns in ({"updated_at"}, {"lease_expires_at"}):
+        with pytest.raises(AssertionError, match="unexpected durable image delta"):
+            delta.assert_only({"token_work_items": incomplete_columns})
 
 
 def test_capture_excludes_rows_owned_by_another_run(seeded_run: _SeededRun) -> None:
