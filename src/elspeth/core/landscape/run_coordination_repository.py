@@ -106,9 +106,22 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+
+def _bound_heartbeat_statement_waits(conn: Connection) -> None:
+    """Bound heartbeat and forensic writes without limiting pipeline payloads.
+
+    SQLite already applies a five-second busy timeout. PostgreSQL defaults
+    to unbounded waits; transaction-local limits let a blocked beat report
+    degradation and let its owner join the thread during shutdown.
+    """
+    if conn.dialect.name == "postgresql":
+        conn.exec_driver_sql("SET LOCAL lock_timeout = '5000ms'")
+        conn.exec_driver_sql("SET LOCAL statement_timeout = '5000ms'")
+
+
 # Run statuses the takeover CAS flips back to 'running' (§B.4). The
-# dead-leader RUNNING takeover arm is skipped by this predicate by
-# construction; terminal-success statuses are refused by the
+# dead-leader RUNNING takeover arm also clears prior finalization metadata;
+# terminal-success statuses are refused by the
 # immutable-success backstop below before the seat CAS runs.
 _TAKEOVER_FLIPPABLE_RUN_STATUSES = (RunStatus.FAILED.value, RunStatus.INTERRUPTED.value)
 
@@ -322,6 +335,7 @@ def _record_best_effort_event(
     """
     try:
         with begin_write(engine) as conn:
+            _bound_heartbeat_statement_waits(conn)
             record_coordination_event(
                 conn,
                 run_id=run_id,
@@ -427,6 +441,8 @@ def fenced_leader_transaction(
     (finalize / run-status / checkpoint / complete_barrier / ingest / repair
     sweep) wrap their existing transaction bodies in this.
     """
+    if not isinstance(token, CoordinationToken):
+        raise TypeError("leader fencing requires a CoordinationToken")
     try:
         with begin_write(engine) as conn:
             verify_and_extend_leader_fence(conn, token=token, window_seconds=window_seconds, verb=verb)
@@ -529,6 +545,8 @@ def fenced_member_transaction(
     keep their item-lease CAS (``expected_lease_owner``) as the payload's own
     WHERE — D4's third fence.
     """
+    if not isinstance(member_token, WorkerMembershipToken):
+        raise TypeError("membership fencing requires a WorkerMembershipToken")
     try:
         with begin_write(engine) as conn:
             verify_membership_fence(conn, member_token=member_token, verb=verb)
@@ -638,9 +656,8 @@ class RunCoordinationRepository:
            mutation and ``NonResumableRunError("run leadership is held by
            …")`` (the pinned refusal-before-mutation discipline);
         3. the run-status flip ``failed/interrupted → running`` (subsumes the
-           old ``update_run_status(RUNNING)`` first-durable-write at
-           resume.py:591; skipped by predicate on the dead-leader RUNNING
-           takeover arm);
+           old ``update_run_status(RUNNING)`` first-durable-write), clearing
+           prior finalization metadata even on dead-leader RUNNING takeover;
         4. identity-eviction of the deposed leader, unconditional — by
            identity, no heartbeat predicate (the expired seat IS the proof of
            lost custody); NO bulk follower eviction (§C.2 housekeeping is
@@ -750,14 +767,17 @@ class RunCoordinationRepository:
             )
         new_epoch = int(seat.leader_epoch) + 1
 
-        # The winner's run-status flip rides the same transaction (§B.4).
-        # Predicate-skipped on the dead-leader RUNNING takeover arm; terminal
-        # SUCCESS statuses were refused above by the immutable-success
-        # backstop before the seat CAS ran.
+        # The winner's run-status normalization rides the same transaction
+        # (§B.4). An inherited grade belongs to the prior attempt, including
+        # when that attempt left a stale grade on RUNNING. Terminal SUCCESS
+        # statuses were refused above before the seat CAS ran.
         conn.execute(
             update(runs_table)
-            .where(runs_table.c.run_id == run_id, runs_table.c.status.in_(_TAKEOVER_FLIPPABLE_RUN_STATUSES))
-            .values(status=RunStatus.RUNNING.value, completed_at=None)
+            .where(
+                runs_table.c.run_id == run_id,
+                runs_table.c.status.in_((*_TAKEOVER_FLIPPABLE_RUN_STATUSES, RunStatus.RUNNING.value)),
+            )
+            .values(status=RunStatus.RUNNING.value, completed_at=None, reproducibility_grade=None)
         )
 
         if prior_worker is not None and prior_worker != worker_id:
@@ -1117,8 +1137,9 @@ class RunCoordinationRepository:
     ) -> CoordinationSnapshot | WorkerMembershipLost:
         """Member-fenced worker-row beat + seat snapshot, one transaction (§A.3).
 
-        SLICE-4 CONSUMER: the dedicated heartbeat thread. The membership fence
-        is the first statement (ADR-030 D4); its refusal — this worker is no
+        SLICE-4 CONSUMER: the dedicated heartbeat thread. Lock the seat before
+        fencing membership, matching takeover and release order. No liveness
+        write precedes the membership fence; its refusal — this worker is no
         longer ``active`` (departed at finalize, or evicted) — is this verb's
         DECLARED outcome, ``WorkerMembershipLost``, requiring no further read:
         the thread latches its coordination-lost flag on THAT, never on a DB error, and the
@@ -1132,8 +1153,20 @@ class RunCoordinationRepository:
         outcome: registration precedes the heartbeat thread by construction,
         so a vanished row is audit corruption (``AuditIntegrityError``).
         """
+        if not isinstance(member_token, WorkerMembershipToken):
+            raise TypeError("worker heartbeat requires a WorkerMembershipToken")
         try:
-            with fenced_member_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
+            with begin_write(self._engine) as conn:
+                _bound_heartbeat_statement_waits(conn)
+                # Even followers take this lock: membership can be changed by
+                # leader-fenced finalization. SELECT FOR UPDATE is inert on
+                # SQLite, whose BEGIN IMMEDIATE already serializes writers.
+                locked_seat = conn.execute(
+                    select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == member_token.run_id).with_for_update()
+                ).one_or_none()
+                verify_membership_fence(conn, member_token=member_token, verb="worker_heartbeat")
+                if locked_seat is None:
+                    raise AuditIntegrityError(f"Run {member_token.run_id!r} has registered membership but no coordination seat")
                 database_now = read_landscape_transaction_time(conn)
                 role = conn.execute(
                     select(run_workers_table.c.role).where(
@@ -1173,6 +1206,15 @@ class RunCoordinationRepository:
                         "worker registration requires a seat created atomically by begin_run."
                     )
         except RunMembershipLostError:
+            _record_best_effort_event(
+                self._engine,
+                run_id=member_token.run_id,
+                event_type="fence_refusal",
+                worker_id=member_token.worker_id,
+                leader_epoch=None,
+                recorded_at=datetime.now(UTC),
+                context={"verb": "worker_heartbeat", "fence": "membership"},
+            )
             return WorkerMembershipLost(member_token=member_token)
         return CoordinationSnapshot(
             leader_worker_id=seat.leader_worker_id,

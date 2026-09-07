@@ -916,3 +916,41 @@ def test_heartbeat_and_window_constants_satisfy_sizing_rule() -> None:
     """window >= 4 * (beat + busy_timeout) by the §A.3 sizing rule."""
     busy_timeout_seconds = 5.0
     assert 4 * (DEFAULT_RUN_HEARTBEAT_SECONDS + busy_timeout_seconds) <= DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+
+
+def test_stop_timeout_reports_live_thread_and_skips_later_final_beat() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockedRepo(_StubRepo):
+        def worker_heartbeat(
+            self, *, member_token: WorkerMembershipToken, window_seconds: float
+        ) -> CoordinationSnapshot | WorkerMembershipLost:
+            entered.set()
+            assert release.wait(5), "test failed to release blocked heartbeat"
+            return super().worker_heartbeat(member_token=member_token, window_seconds=window_seconds)
+
+    repo = BlockedRepo()
+    repo.snapshot = _HEALTHY_SNAPSHOT
+    thread = RunHeartbeatThread(repo, member_token=_TOKEN, heartbeat_seconds=0.001, stop_timeout_seconds=0.05)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        with pytest.raises(TimeoutError, match=r"heartbeat.*did not stop"):
+            thread.stop()
+    finally:
+        release.set()
+        thread._thread.join(2)
+    thread.stop()
+    assert len(repo.worker_heartbeat_calls) == 1
+
+
+def test_stop_before_start_is_safe() -> None:
+    thread = _make_thread(_StubRepo())
+    thread.stop()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_stop_timeout_requires_finite_positive_budget(timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        RunHeartbeatThread(_StubRepo(), member_token=_TOKEN, stop_timeout_seconds=timeout)

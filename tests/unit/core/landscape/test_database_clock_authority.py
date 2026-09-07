@@ -3086,6 +3086,58 @@ def _first_fence_statement_is_effect_free(statement: ast.expr) -> bool:
     return True
 
 
+def _is_owned_token_refusal_before_fence(statement: ast.stmt, tree: ast.Module, owner: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Recognize only an effect-free nominal rejection before acquiring SQL authority."""
+    if not isinstance(statement, ast.If) or statement.orelse or len(statement.body) != 1:
+        return False
+    expected_test = ast.parse("not isinstance(token, CoordinationToken)", mode="eval").body
+    if ast.dump(statement.test) != ast.dump(expected_test):
+        return False
+    refusal = statement.body[0]
+    if not (
+        isinstance(refusal, ast.Raise)
+        and refusal.cause is None
+        and isinstance(refusal.exc, ast.Call)
+        and isinstance(refusal.exc.func, ast.Name)
+        and refusal.exc.func.id == "TypeError"
+        and not refusal.exc.keywords
+        and len(refusal.exc.args) == 1
+        and isinstance(refusal.exc.args[0], ast.Constant)
+        and isinstance(refusal.exc.args[0].value, str)
+    ):
+        return False
+    owned_import = any(
+        isinstance(candidate, ast.ImportFrom)
+        and candidate.level == 0
+        and candidate.module == "elspeth.contracts.coordination"
+        and any(alias.name == "CoordinationToken" and alias.asname is None for alias in candidate.names)
+        for candidate in tree.body
+    )
+    if not owned_import:
+        return False
+    for name in ("CoordinationToken", "isinstance", "TypeError"):
+        if _first_fence_dependency_is_rebound(tree, name, (owner,)):
+            return False
+        if any(
+            isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and candidate.name == name
+            for candidate in ast.walk(owner)
+        ):
+            return False
+        if any(
+            (isinstance(candidate, ast.ExceptHandler) and candidate.name == name)
+            or (isinstance(candidate, ast.Name) and isinstance(candidate.ctx, ast.Del) and candidate.id == name)
+            for candidate in ast.walk(tree)
+        ):
+            return False
+        if name != "CoordinationToken" and any(
+            (isinstance(candidate, ast.ImportFrom) and any((alias.asname or alias.name) == name for alias in candidate.names))
+            or (isinstance(candidate, ast.Import) and any((alias.asname or alias.name.split(".")[0]) == name for alias in candidate.names))
+            for candidate in ast.walk(tree)
+        ):
+            return False
+    return True
+
+
 def _first_fence_contract_violations(source: str) -> tuple[str, ...]:
     tree = ast.parse(source)
     problems: list[str] = []
@@ -3235,6 +3287,7 @@ def _first_fence_contract_violations(source: str) -> tuple[str, ...]:
                 preceding = statements[:index]
                 if any(
                     isinstance(statement, (ast.Return, ast.Raise, ast.If, ast.For, ast.AsyncFor, ast.While, ast.Match))
+                    and not _is_owned_token_refusal_before_fence(statement, tree, owner)
                     for statement in preceding
                 ):
                     unreachable_or_conditional = True
@@ -3454,6 +3507,56 @@ def fenced_leader_transaction(engine, *, token, window_seconds, verb):
 
 def test_first_fence_shape_accepts_exact_positive_control() -> None:
     assert _first_fence_contract_violations(_GOOD_FENCE_SOURCE) == ()
+
+
+_NOMINAL_FENCE_SOURCE = "from elspeth.contracts.coordination import CoordinationToken\n" + _GOOD_FENCE_SOURCE.replace(
+    "    with begin_write(engine) as conn:",
+    "    if not isinstance(token, CoordinationToken):\n"
+    "        raise TypeError('leader fencing requires a CoordinationToken')\n"
+    "    with begin_write(engine) as conn:",
+)
+
+
+def test_first_fence_accepts_owned_nominal_refusal_before_transaction() -> None:
+    assert _first_fence_contract_violations(_NOMINAL_FENCE_SOURCE) == ()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("from elspeth.contracts.coordination", "from attacker"),
+        ("from elspeth.contracts.coordination", "from .elspeth.contracts.coordination"),
+        ("from elspeth.contracts.coordination import CoordinationToken", ""),
+        ("not isinstance(token, CoordinationToken)", "isinstance(token, CoordinationToken)"),
+        ("not isinstance(token, CoordinationToken)", "not isinstance(other, CoordinationToken)"),
+        ("isinstance(token, CoordinationToken)", "isinstance(token, (CoordinationToken, object))"),
+        ("raise TypeError('leader fencing requires a CoordinationToken')", "return"),
+        ("raise TypeError('leader fencing requires a CoordinationToken')", "raise TypeError(attacker())"),
+        ("raise TypeError('leader fencing requires a CoordinationToken')", "attacker.execute(statement)\n        raise TypeError('bad')"),
+        ("    with begin_write(engine) as conn:", "    else:\n        attacker.execute(statement)\n    with begin_write(engine) as conn:"),
+        ("    if not isinstance", "    isinstance = attacker\n    if not isinstance"),
+        ("    if not isinstance", "    TypeError = attacker\n    if not isinstance"),
+        ("    if not isinstance", "    CoordinationToken = attacker\n    if not isinstance"),
+        ("    if not isinstance", "    def isinstance(*args):\n        return True\n    if not isinstance"),
+        ("    if not isinstance", "    class TypeError:\n        pass\n    if not isinstance"),
+        (
+            "    if not isinstance",
+            "    try:\n        attacker()\n    except Exception as CoordinationToken:\n        pass\n    if not isinstance",
+        ),
+        ("    if not isinstance", "    del CoordinationToken\n    if not isinstance"),
+        ("def fenced_leader_transaction(engine,", "def fenced_leader_transaction(engine, isinstance,"),
+    ],
+)
+def test_first_fence_rejects_nominal_refusal_impostors(old: str, new: str) -> None:
+    source = _NOMINAL_FENCE_SOURCE.replace(old, new)
+    assert source != _NOMINAL_FENCE_SOURCE
+    assert _first_fence_contract_violations(source)
+
+
+@pytest.mark.parametrize("name", ["isinstance", "TypeError", "CoordinationToken"])
+def test_first_fence_rejects_nominal_guard_module_rebinding(name: str) -> None:
+    assert _first_fence_contract_violations(_NOMINAL_FENCE_SOURCE + f"\n{name} = attacker\n")
+    assert _first_fence_contract_violations(_NOMINAL_FENCE_SOURCE + f"\nfrom attacker import {name}\n")
 
 
 def test_first_fence_shape_accepts_effect_free_dialect_specific_database_deadline_positive_control() -> None:

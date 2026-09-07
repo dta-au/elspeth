@@ -53,6 +53,7 @@ Design invariants enforced here:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -165,6 +166,10 @@ class RunHeartbeatThread:
     degraded_threshold:
         Number of consecutive busy failures before a ``heartbeat_degraded``
         event is recorded.
+    stop_timeout_seconds:
+        Maximum time shutdown waits for the thread. Exceeding this raises
+        ``TimeoutError`` so teardown cannot release a seat while a beat is
+        still in flight.
     """
 
     def __init__(
@@ -177,13 +182,17 @@ class RunHeartbeatThread:
         now_fn: Callable[[], datetime] | None = None,
         wait_fn: Callable[[float], bool] | None = None,
         degraded_threshold: int = _DEFAULT_DEGRADED_THRESHOLD,
+        stop_timeout_seconds: float = 30.0,
     ) -> None:
+        if not math.isfinite(stop_timeout_seconds) or stop_timeout_seconds <= 0:
+            raise ValueError("stop_timeout_seconds must be finite and positive")
         self._repo = repo
         self._token = member_token
         self._heartbeat_seconds = heartbeat_seconds
         self._window_seconds = window_seconds
         self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._degraded_threshold = degraded_threshold
+        self._stop_timeout_seconds = stop_timeout_seconds
 
         self._stop_event = threading.Event()
         self._skip_final_beat_event = threading.Event()
@@ -218,7 +227,7 @@ class RunHeartbeatThread:
         self._thread.start()
 
     def stop(self, *, final_beat: bool = True) -> None:
-        """Signal the thread to stop and block until it exits.
+        """Signal the thread to stop and join within the shutdown budget.
 
         Must be called (in a ``finally`` block) before every ``release_seat``
         call so that the thread cannot beat the seat after the release vacates
@@ -230,7 +239,15 @@ class RunHeartbeatThread:
         if not final_beat:
             self._skip_final_beat_event.set()
         self._stop_event.set()
-        self._thread.join()
+        if self._thread.ident is None:
+            return
+        self._thread.join(timeout=self._stop_timeout_seconds)
+        if self._thread.is_alive():
+            # Do not pretend the thread quiesced: callers must not release a
+            # seat that an in-flight beat could still extend. If the blocked
+            # call later returns, exit without starting another final beat.
+            self._skip_final_beat_event.set()
+            raise TimeoutError(f"run heartbeat for {self._token.run_id!r} did not stop within {self._stop_timeout_seconds}s")
 
     @property
     def coordination_lost(self) -> bool:

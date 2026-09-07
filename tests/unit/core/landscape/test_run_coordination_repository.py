@@ -327,6 +327,23 @@ class TestSeatMint:
 class TestAcquireRunLeadershipCAS:
     """§B.4: exactly one of two racers wins; the loser is side-effect-free."""
 
+    @pytest.mark.parametrize("status", ["failed", "interrupted", "running"])
+    def test_takeover_clears_prior_attempt_reproducibility_grade(
+        self, engine: Tier1Engine, repo: RunCoordinationRepository, status: str
+    ) -> None:
+        _seed_run(engine, status=status)
+        register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        with begin_write(engine) as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == RUN_ID).values(reproducibility_grade="full_reproducible"))
+        _expire_seat(engine)
+
+        repo.acquire_run_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+
+        with engine.connect() as conn:
+            run = conn.execute(select(runs_table.c.status, runs_table.c.reproducibility_grade).where(runs_table.c.run_id == RUN_ID)).one()
+        assert run.status == "running"
+        assert run.reproducibility_grade is None
+
     def test_takeover_of_expired_seat_bumps_epoch_and_flips_run_status(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="failed")
         leader_a = mint_worker_id(RUN_ID)
@@ -352,8 +369,8 @@ class TestAcquireRunLeadershipCAS:
         assert run.status == "running"
         assert run.completed_at is None
 
-    def test_dead_leader_running_takeover_arm_skips_status_flip(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
-        """RUNNING + expired seat: admissible takeover; the flip predicate skips."""
+    def test_dead_leader_running_takeover_preserves_running_status(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        """RUNNING + expired seat: admissible takeover retains its run status."""
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         _expire_seat(engine)
