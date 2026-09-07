@@ -15,6 +15,7 @@ from tempfile import TemporaryFile
 from typing import Any, BinaryIO, cast
 from uuid import uuid4
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_DERIVATION_VERSION,
@@ -66,28 +67,32 @@ logger = logging.getLogger(__name__)
 
 
 def _contain_cleanup_failure(action: Callable[[], object], description: str) -> None:
-    """Run a cleanup step, recording (never propagating) its failure.
+    """Record ordinary cleanup failures; preserve Tier-1 integrity failures.
 
     Two call topologies are legitimate, and only these two:
 
     1. While a primary export, cancellation, or process-control exception is
        already propagating — replacing it would obscure the recovery state,
-       so the cleanup failure is recorded (ERROR with traceback) and the
+       so an ordinary cleanup failure is recorded (ERROR with traceback) and the
        primary exception stays the outcome.
     2. Post-registration teardown of the private spool on the success path —
        the export is durably registered and its audit record exists, so a
-       temp-resource close failure must not fail the already-registered
+       ordinary temp-resource close failure must not fail the already-registered
        export (ratified: elspeth-1c31195f26,
-       test_spool_close_failure_does_not_fail_a_registered_export); it is
+       test_spool_close_failure_preserves_integrity_priority_after_registration); it is
        recorded loudly with the export identity in ``description``.
 
     Containment is never a substitute for recording: every call must pass a
     ``description`` specific enough to identify what was lost. Process-control
     exceptions raised *by* the cleanup itself (KeyboardInterrupt, SystemExit)
-    still propagate.
+    still propagate. Registered Tier-1 integrity/framework errors also
+    propagate in both topologies: successful registration cannot authorize
+    hiding corruption discovered during teardown.
     """
     try:
         action()
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except Exception:
         logger.exception("audit-export cleanup failed: %s", description)
 
@@ -437,7 +442,8 @@ def prepare_audit_export_snapshot(
         winner = registration.winner
     except BaseException:
         # The primary export, cancellation, or process-control exception is
-        # propagating; a cleanup failure is recorded, never substituted.
+        # propagating; ordinary cleanup failures are recorded rather than
+        # substituted. Tier-1 cleanup failures retain their crash priority.
         _contain_cleanup_failure(
             lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
             f"orphan marking for candidate {candidate_id}",
@@ -445,12 +451,12 @@ def prepare_audit_export_snapshot(
         _contain_cleanup_failure(spool.close, "spool close after candidate registration failure")
         raise
     # Success path: the export is durably registered and its audit record
-    # already exists, so a spool-close failure is post-success cleanup of a
+    # already exists, so an ordinary spool-close failure is post-success cleanup of a
     # private temp resource. Ratified semantic (elspeth-1c31195f26, pinned by
-    # test_spool_close_failure_does_not_fail_a_registered_export): contain it
+    # test_spool_close_failure_preserves_integrity_priority_after_registration): contain it
     # and record it loudly with the export identity — an already-registered
-    # export never fails on temp-file teardown, and the failure is never
-    # silent.
+    # export does not fail on ordinary temp-file teardown, and the failure is
+    # never silent. Tier-1 integrity failures still propagate.
     _contain_cleanup_failure(
         spool.close,
         f"spool close after successful registration of candidate {candidate_id} (run {run_id}); registered snapshot is unaffected",

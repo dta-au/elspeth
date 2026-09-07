@@ -23,6 +23,7 @@ from elspeth.contracts.audit_export import (
     RegisteredAuditExportContent,
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -358,13 +359,17 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         db.close()
 
 
-def test_spool_close_failure_does_not_fail_a_registered_export(
+@pytest.mark.parametrize(
+    "close_error",
+    [OSError("spool close failure"), AuditIntegrityError("spool integrity failed"), FrameworkBugError("spool invariant failed")],
+)
+def test_spool_close_failure_preserves_integrity_priority_after_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    close_error: Exception,
 ) -> None:
-    """A failing spool close is contained and recorded; the registered winner
-    still binds and returns (elspeth-1c31195f26)."""
+    """Ordinary close failures are contained; integrity failures still raise."""
     from elspeth.engine.orchestrator import audit_export_effects
 
     monkeypatch.chdir(tmp_path)
@@ -403,7 +408,8 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
             return self._inner.fileno()
 
         def close(self) -> None:
-            raise OSError("spool close failure")
+            self._inner.close()
+            raise close_error
 
     real_temporary_file = audit_export_effects.TemporaryFile
 
@@ -413,6 +419,17 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
     monkeypatch.setattr(audit_export_effects, "TemporaryFile", exploding_temporary_file)
     try:
         _insert_terminal_run(db)
+        if isinstance(close_error, AuditIntegrityError | FrameworkBugError):
+            with pytest.raises(type(close_error)) as raised:
+                prepare_audit_export_snapshot(
+                    db,
+                    coordination_token=leader_token_for(db, "run-export"),
+                    config=_config(),
+                    signing_key=None,
+                    content_store=store,
+                )
+            assert raised.value is close_error
+            return
         with caplog.at_level("ERROR"):
             snapshot = prepare_audit_export_snapshot(
                 db,
