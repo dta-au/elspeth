@@ -74,6 +74,7 @@ from .._helpers import (
     _composer_preferences_response,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _log_last_resort_diagnostic,
     _named_guided_custody_projection,
     _record_composer_runtime_preflight_telemetry,
     _request_plugin_policy_context,
@@ -566,7 +567,8 @@ async def update_composer_preferences(
                 to_mode=transition.current.trust_mode,
             )
         except Exception as telemetry_error:
-            slog.error(
+            _log_last_resort_diagnostic(
+                slog.error,
                 "composer_preferences_postcommit_telemetry_failed",
                 session_id=str(session.id),
                 exc_class=type(telemetry_error).__name__,

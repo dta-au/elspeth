@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict
+from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.contracts import (
@@ -26,6 +28,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationConflictError,
     GuidedOperationFailed,
     GuidedOperationFence,
+    GuidedOperationFenceLostError,
 )
 from elspeth.web.sessions.routes import guided_operations as guided_operations_module
 from elspeth.web.sessions.routes.guided_operations import (
@@ -36,6 +39,7 @@ from elspeth.web.sessions.routes.guided_operations import (
     raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
+from elspeth.web.sessions.routes.sessions import _close_fork_operation_leases
 from elspeth.web.sessions.schemas import ReenterGuidedRequest
 
 
@@ -558,6 +562,42 @@ async def test_guided_lease_guard_repeated_cancellation_fails_guided_before_exac
 
 
 @pytest.mark.asyncio
+async def test_guided_guard_cancellation_during_normal_exit_drains_and_propagates() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="cancel-close", lease_token="secret", attempt=1)
+    close_entered = asyncio.Event()
+    finish_close = asyncio.Event()
+
+    class ClosingLease(_Lease):
+        async def close(self) -> None:
+            close_entered.set()
+            await finish_close.wait()
+            await super().close()
+
+    class TerminalService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise GuidedOperationFenceLostError(fence)
+
+    lease = ClosingLease(_context(session_id))
+
+    async def run() -> None:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=TerminalService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            pass
+
+    task = asyncio.create_task(run())
+    await close_entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    finish_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lease.closed
+
+
+@pytest.mark.asyncio
 async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes() -> None:
     guard_factory = guided_operations_module.guided_operation_lease_guard
     session_id = uuid4()
@@ -586,6 +626,119 @@ async def test_guided_lease_guard_preserves_primary_with_sanitized_cleanup_notes
     assert "ValueError" in rendered_notes
     assert "GUIDED-CLEANUP-SECRET" not in rendered_notes
     assert "SESSION-CLEANUP-SECRET" not in rendered_notes
+
+
+@pytest.mark.asyncio
+async def test_integrity_logger_failure_does_not_skip_guided_or_fork_close(monkeypatch) -> None:
+    logger_error = AuditIntegrityError("logger integrity")
+    calls = 0
+
+    def fail_logging(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AuditIntegrityError("secondary logger integrity")
+        raise logger_error
+
+    monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="logger-failure", lease_token="secret", attempt=1)
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise OSError("close failure")
+
+    lease = FailingLease(_context(session_id))
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise OSError("cleanup failure")
+
+    with pytest.raises(AuditIntegrityError) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            raise HTTPException(409, "primary")
+    assert caught.value is logger_error
+    assert lease.closed
+    assert "Close diagnostic also failed with AuditIntegrityError." in caught.value.__notes__
+
+    calls = 0
+    child = FailingLease(_context(uuid4()))
+    parent = _Lease(_context(uuid4()))
+    with pytest.raises(AuditIntegrityError) as caught:
+        await _close_fork_operation_leases(child, parent, asyncio.CancelledError())
+    assert caught.value is logger_error
+    assert child.closed and parent.closed
+
+
+@pytest.mark.asyncio
+async def test_guided_cleanup_failures_reach_logs_when_http_response_omits_notes() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="http-cleanup", lease_token="secret", attempt=1)
+    context = _context(session_id)
+
+    class FailingLease(_Lease):
+        async def close(self) -> None:
+            raise OSError("PRIVATE-LEASE-DETAIL")
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise AuditIntegrityError("PRIVATE-INTEGRITY-DETAIL")
+
+    app = FastAPI()
+
+    @app.get("/guarded")
+    async def guarded() -> None:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(),
+            lease=GuidedOperationLease(fence=fence, session_lease=FailingLease(context)),
+        ):
+            raise HTTPException(409, "primary conflict")
+
+    with capture_logs() as logs:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/guarded")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "primary conflict"}
+    records = [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"]
+    assert [(entry["site"], entry["exc_class"]) for entry in records] == [
+        ("guard_fail", "AuditIntegrityError"),
+        ("guard_close", "OSError"),
+    ]
+    assert all(entry["session_id"] == str(session_id) for entry in records)
+    assert "PRIVATE-" not in repr(records)
+
+
+@pytest.mark.asyncio
+async def test_fork_reverse_close_failures_are_recorded_outside_http_exception_notes() -> None:
+    class FailingLease(_Lease):
+        async def close(self) -> None:
+            self.closed = True
+            raise OSError("PRIVATE-FORK-CLEANUP")
+
+    parent = FailingLease(_context(uuid4()))
+    child = FailingLease(_context(uuid4()))
+    app = FastAPI()
+
+    @app.get("/fork-failed")
+    async def fork_failed() -> None:
+        primary = HTTPException(409, "fork conflict")
+        try:
+            raise primary
+        finally:
+            await _close_fork_operation_leases(child, parent, primary)
+
+    with capture_logs() as logs:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/fork-failed")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "fork conflict"}
+    records = [entry for entry in logs if entry["event"] == "session.fork_lease_cleanup_failed"]
+    assert [entry["session_id"] for entry in records] == [child.context.fence.session_id, parent.context.fence.session_id]
+    assert all(entry["exc_class"] == "OSError" for entry in records)
+    assert "PRIVATE-FORK-CLEANUP" not in repr(records)
 
 
 @pytest.mark.asyncio

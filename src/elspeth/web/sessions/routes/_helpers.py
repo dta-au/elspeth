@@ -26,6 +26,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import insert
 from sqlalchemy.exc import SQLAlchemyError
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -240,12 +241,15 @@ def _log_last_resort_diagnostic(log_call: Callable[..., object], event: str, /, 
     so a first-party bug in diagnostic assembly crashes in the caller frame
     instead of being swallowed alongside the emission. Only the emission
     itself is guarded: logging is the channel of last resort — a
-    logging-stack failure has no lower channel to surface through, and it
-    must never displace the primary outcome the caller is about to raise or
-    return.
+    ordinary logging-stack failure must not displace the primary outcome.
+    Registered framework and audit integrity failures still escape.
     """
-    with contextlib.suppress(Exception):
+    try:
         log_call(event, **fields)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception:
+        return
 
 
 _REDACTED_SECRET_DETAIL = "<redacted-secret>"

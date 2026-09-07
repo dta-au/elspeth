@@ -35,6 +35,7 @@ from .._helpers import (
     _composition_proposal_response,
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
+    _log_last_resort_diagnostic,
     _proposal_event_response,
     _state_data_from_composer_state,
     _state_from_record,
@@ -87,6 +88,13 @@ async def _close_proposal_lease_before_commit(
     """Close a precommit lease without replacing the primary failure."""
     cleanup_error, cleanup_cancelled = await _drain_proposal_lease_close(lease)
     if cleanup_error is not None and cleanup_error is not primary:
+        _log_last_resort_diagnostic(
+            slog.error,
+            "composer_proposal_precommit_cleanup_failed",
+            session_id=lease.context.fence.session_id,
+            operation_id=lease.context.fence.operation_id,
+            exc_class=type(cleanup_error).__name__,
+        )
         primary.add_note(f"Composer proposal lease cleanup also failed with {type(cleanup_error).__name__}.")
     if cleanup_cancelled and not isinstance(primary, asyncio.CancelledError):
         primary.add_note("Composer proposal lease cleanup also observed request cancellation.")
@@ -103,7 +111,8 @@ async def _close_proposal_lease_after_commit(
     if cleanup_error is None:
         return cleanup_cancelled
     if isinstance(cleanup_error, Exception):
-        slog.error(
+        _log_last_resort_diagnostic(
+            slog.error,
             event,
             session_id=str(session_id),
             exc_class=type(cleanup_error).__name__,

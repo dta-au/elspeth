@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.web.blobs.protocol import (
     BlobContentMissingError,
     BlobError,
@@ -653,16 +654,30 @@ async def _close_fork_operation_leases(
 ) -> None:
     """Reverse-close without replacing a stale retry or cancellation."""
     first_close_error: BaseException | None = None
+    diagnostic_error: Exception | None = None
     for lease in (child, parent):
         if lease is None or lease.closed:
             continue
         try:
             await lease.close()
         except BaseException as close_error:
+            try:
+                _log_last_resort_diagnostic(
+                    slog.error,
+                    "session.fork_lease_cleanup_failed",
+                    session_id=lease.context.fence.session_id,
+                    operation_id=lease.context.fence.operation_id,
+                    exc_class=type(close_error).__name__,
+                )
+            except contract_errors.TIER_1_ERRORS as logger_error:
+                if diagnostic_error is None:
+                    diagnostic_error = logger_error
             if primary is not None:
                 primary.add_note(f"Fork lease reverse-close also failed with {type(close_error).__name__}.")
             elif first_close_error is None:
                 first_close_error = close_error
+    if diagnostic_error is not None:
+        raise diagnostic_error
     if first_close_error is not None:
         raise first_close_error
 
@@ -1160,8 +1175,7 @@ def register_session_routes(router: APIRouter) -> None:
                         # nobody. Leaked fork blobs are operator-actionable
                         # residue and get an explicit last-resort record.
                         primary_exc.add_note(
-                            f"RecoveryFailed[{type(cleanup_exc).__name__}]: fork blob cleanup failed for "
-                            f"child {staged.session.id} ({cleanup_exc})"
+                            f"RecoveryFailed[{type(cleanup_exc).__name__}]: fork blob cleanup failed for child {staged.session.id}"
                         )
                         _log_last_resort_diagnostic(
                             slog.error,

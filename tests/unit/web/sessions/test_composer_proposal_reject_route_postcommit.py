@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 from structlog.testing import capture_logs
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -20,6 +21,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.protocol import CompositionProposalRecord
 from elspeth.web.sessions.routes.composer import proposals as proposal_routes
+from elspeth.web.sessions.routes.composer import state as state_routes
 
 
 def _create_ordinary_proposal(
@@ -109,6 +111,83 @@ def test_committed_ordinary_reject_logs_cleanup_fault_without_masking_success(te
         "exc_class": "RuntimeError",
         "log_level": "error",
     } in logs
+
+
+def test_precommit_conflict_records_cleanup_failure_outside_http_exception_notes(test_client: TestClient, monkeypatch) -> None:
+    session, proposal = _create_ordinary_proposal(test_client)
+    route = f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject"
+    assert test_client.post(route, json={}).status_code == 200
+    original_close = SessionOperationLease.close
+
+    async def close_then_fail(lease: SessionOperationLease) -> None:
+        await original_close(lease)
+        raise RuntimeError("PRIVATE-CLEANUP-DETAIL")
+
+    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
+    with capture_logs() as logs:
+        response = test_client.post(route, json={})
+    assert response.status_code == 409
+    records = [entry for entry in logs if entry["event"] == "composer_proposal_precommit_cleanup_failed"]
+    assert len(records) == 1
+    assert records[0]["exc_class"] == "RuntimeError"
+    assert records[0]["session_id"] == session["id"]
+    assert "PRIVATE-CLEANUP-DETAIL" not in repr(records)
+    assert "PRIVATE-CLEANUP-DETAIL" not in response.text
+
+
+@pytest.mark.parametrize("integrity_failure", [False, True])
+def test_committed_reject_survives_cleanup_and_logger_failures(test_client: TestClient, monkeypatch, integrity_failure: bool) -> None:
+    session, proposal = _create_ordinary_proposal(test_client)
+    original_close = SessionOperationLease.close
+
+    async def close_then_fail(lease: SessionOperationLease) -> None:
+        await original_close(lease)
+        raise OSError("cleanup failed")
+
+    def fail_logging(*args, **kwargs) -> None:
+        if integrity_failure:
+            raise AuditIntegrityError("logging integrity failed")
+        raise RuntimeError("logging backend failed")
+
+    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
+    monkeypatch.setattr(proposal_routes.slog, "error", fail_logging)
+    if integrity_failure:
+        with pytest.raises(AuditIntegrityError, match="logging integrity failed"):
+            test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+        monkeypatch.undo()
+    response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+    if integrity_failure:
+        assert response.status_code == 409
+        return
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+
+
+def test_committed_preferences_survive_telemetry_and_logger_failures(test_client: TestClient, monkeypatch) -> None:
+    session = test_client.post("/api/sessions", json={"title": "preferences telemetry"}).json()
+    calls: list[str] = []
+
+    def fail_telemetry(*args, **kwargs) -> None:
+        calls.append("telemetry")
+        raise OSError("telemetry backend failed")
+
+    def fail_logging(*args, **kwargs) -> None:
+        calls.append("logging")
+        raise RuntimeError("logging backend failed")
+
+    monkeypatch.setattr(state_routes, "record_session_switched", fail_telemetry)
+    monkeypatch.setattr(state_routes.slog, "error", fail_logging)
+    current = test_client.get(f"/api/sessions/{session['id']}/composer/preferences").json()
+    target_mode = "explicit_approve" if current["trust_mode"] == "auto_commit" else "auto_commit"
+    response = test_client.patch(
+        f"/api/sessions/{session['id']}/composer/preferences",
+        json={"trust_mode": target_mode, "density_default": current["density_default"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["trust_mode"] == target_mode
+    persisted = test_client.get(f"/api/sessions/{session['id']}/composer/preferences")
+    assert persisted.json()["trust_mode"] == target_mode
+    assert calls == ["telemetry", "logging"]
 
 
 def test_committed_ordinary_accept_logs_cleanup_fault_without_masking_success(test_client: TestClient, monkeypatch) -> None:

@@ -127,8 +127,15 @@ def test_blob_cleanup_integrity_failure_propagates_instead_of_a_coded_terminal_f
     assert replay.json()["detail"]["failure_code"] == "integrity_error"
 
 
+class _UnrenderableCleanupError(OSError):
+    def __str__(self) -> str:
+        raise AuditIntegrityError("cleanup exception must not be rendered")
+
+
+@pytest.mark.parametrize("cleanup_error", [OSError("blob store unreachable"), _UnrenderableCleanupError()])
 def test_ordinary_cleanup_failure_still_surfaces_the_primary_coded_failure(
     composer_test_client: TestClient,
+    cleanup_error: OSError,
 ) -> None:
     """The contained arm is unchanged: a storage fault stays a note plus a log.
 
@@ -144,7 +151,7 @@ def test_ordinary_cleanup_failure_still_surfaces_the_primary_coded_failure(
     with (
         capture_logs() as cap_logs,
         patch.object(service, "settle_guided_fork_operation", side_effect=RuntimeError("settlement exploded")),
-        patch.object(blob_service, "cleanup_blobs_for_fork", side_effect=OSError("blob store unreachable")),
+        patch.object(blob_service, "cleanup_blobs_for_fork", side_effect=cleanup_error),
     ):
         response = client.post(
             f"/api/sessions/{session_id}/fork",
@@ -160,4 +167,4 @@ def test_ordinary_cleanup_failure_still_surfaces_the_primary_coded_failure(
     assert response.json()["detail"]["failure_code"] == "operation_failed"
     residue = [entry for entry in cap_logs if entry.get("event") == "session.fork_blob_cleanup_failed"]
     assert len(residue) == 1
-    assert residue[0]["exc_class"] == "OSError"
+    assert residue[0]["exc_class"] == type(cleanup_error).__name__
