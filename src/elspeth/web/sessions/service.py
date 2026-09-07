@@ -28,6 +28,7 @@ from sqlalchemy import ColumnElement, Connection, Engine, case, delete, desc, ex
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -7015,6 +7016,24 @@ class SessionServiceImpl:
         current_stage_attempted = False
         authority_uncertain = False
 
+        def record_secondary_failure(primary: BaseException, secondary: BaseException, *, phase: str) -> None:
+            # ASGI may discard request cancellation without rendering its notes.
+            # Record the recovery obligation using safe identifiers, never the
+            # filesystem exception's text, path, or traceback.
+            try:
+                self._log.error(
+                    "session_archive_secondary_failure",
+                    session_id=sid,
+                    operation_id=str(identity.operation_id),
+                    operation_epoch=identity.operation_epoch,
+                    phase=phase,
+                    error_type=type(secondary).__name__,
+                )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as logging_error:
+                primary.add_note(f"Session archive secondary-failure logging also failed with {type(logging_error).__name__}.")
+
         async def run_owned_phase[T](
             coroutine_factory: Callable[[], Coroutine[Any, Any, T]],
             *,
@@ -7057,6 +7076,7 @@ class SessionServiceImpl:
                     task.result()
                 except BaseException as phase_error:
                     cancellation.add_note(f"Session archive phase also failed with {type(phase_error).__name__}.")
+                    record_secondary_failure(cancellation, phase_error, phase=name)
                 raise
 
         async def checkpoint() -> None:
@@ -7258,20 +7278,26 @@ class SessionServiceImpl:
             )
         except BaseException as primary_error:
             if not lease.closed:
-                if data_dir is not None and current_obligation_may_exist and not authority_uncertain:
-                    try:
-                        await run_owned_phase(
-                            compensate_precommit,
-                            name="session-archive-quarantine-precommit-compensation",
-                        )
-                    except BaseException as compensation_error:
-                        if compensation_error is not primary_error:
-                            primary_error.add_note(f"Session archive compensation also failed with {type(compensation_error).__name__}.")
                 try:
-                    await lease.close()
-                except BaseException as close_error:
-                    if close_error is not primary_error:
-                        primary_error.add_note(f"Session archive lease cleanup also failed with {type(close_error).__name__}.")
+                    if data_dir is not None and current_obligation_may_exist and not authority_uncertain:
+                        try:
+                            await run_owned_phase(
+                                compensate_precommit,
+                                name="session-archive-quarantine-precommit-compensation",
+                            )
+                        except BaseException as compensation_error:
+                            if compensation_error is not primary_error:
+                                primary_error.add_note(
+                                    f"Session archive compensation also failed with {type(compensation_error).__name__}."
+                                )
+                                record_secondary_failure(primary_error, compensation_error, phase="precommit-compensation")
+                finally:
+                    try:
+                        await lease.close()
+                    except BaseException as close_error:
+                        if close_error is not primary_error:
+                            primary_error.add_note(f"Session archive lease cleanup also failed with {type(close_error).__name__}.")
+                            record_secondary_failure(primary_error, close_error, phase="lease-close")
             raise
 
     async def get_composer_preferences(self, session_id: UUID) -> ComposerSessionPreferencesRecord:
@@ -13967,6 +13993,22 @@ class SessionServiceImpl:
 
         worker = asyncio.create_task(self._run_sync(func))
         cancellation: asyncio.CancelledError | None = None
+
+        def record_cancelled_failure(primary: asyncio.CancelledError, failure: BaseException, *, phase: str) -> None:
+            # Request cancellation can hide a chained worker or projection
+            # error from ASGI's exception reporting. Emit only its class and
+            # the fixed phase; private payloads and exception text stay out.
+            try:
+                self._log.error(
+                    "session_post_commit_secondary_failure",
+                    phase=phase,
+                    error_type=type(failure).__name__,
+                )
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as logging_error:
+                primary.add_note(f"Session post-commit secondary-failure logging also failed with {type(logging_error).__name__}.")
+
         while not worker.done():
             try:
                 await asyncio.shield(worker)
@@ -13979,6 +14021,7 @@ class SessionServiceImpl:
             result = cast("T", worker.result())
         except BaseException as failure:
             if cancellation is not None:
+                record_cancelled_failure(cancellation, failure, phase="worker")
                 raise cancellation from failure
             raise
         try:
@@ -13988,6 +14031,7 @@ class SessionServiceImpl:
             # once observed — a projection bug must not silently discard it
             # (the task would complete "normally" after being cancelled).
             if cancellation is not None:
+                record_cancelled_failure(cancellation, projection_failure, phase="projection")
                 raise cancellation from projection_failure
             raise
         if cancellation is not None:
