@@ -58,6 +58,8 @@ CHECK_KINDS = (
     "replica-run-start",
     "replica-lease-takeover",
     "replica-progress",
+    "single-revision-fence-conflict",
+    "single-revision-progress",
     "resource-graph-cleanup",
     "testcontainer-run",
 )
@@ -110,9 +112,10 @@ def test_protected_command_wrappers_are_bounded_and_redacted() -> None:
         assert f"{helper}() {{" in capture, helper
     for marker in (
         "ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES=2097152",
-        "ulimit -f 4096",
+        'mkfifo "$scratch/stderr-pipe"',
+        "command_output_limit_exceeded",
         "timeout --signal=TERM --kill-after=5s",
-        "trap 'rm -f -- \"$stderr_file\"' RETURN",
+        'trap "$cleanup" EXIT',
         "chmod 600",
         "az_command_failed",
         "az_deployment_failed",
@@ -125,10 +128,37 @@ def test_protected_command_wrappers_are_bounded_and_redacted() -> None:
         "AZURE_CORE_ONLY_SHOW_ERRORS=true",
     ):
         assert marker in capture, marker
-    assert 'cat "$stderr_file"' not in capture
+    assert 'cat "$scratch/stderr"' not in capture
+    assert "ulimit -f" not in capture
     for script in _fences(capture, "bash"):
         assert "PGPASSWORD" not in script
     assert "never receives a connection URI on its command line" in " ".join(capture.split())
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_documented_capture_rejects_output_overflow_without_exposing_it(stream: str) -> None:
+    text = _text(ACCEPTANCE_RUNBOOK)
+    capture = text[text.index("### Protected command capture") : text.index("### Inputs")]
+    script = _fences(capture, "bash")[0]
+    redirect = " >&2" if stream == "stderr" else ""
+    script += "\nexport ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES=16\n"
+    script += f"protected_capture http expected_failure bash -c 'printf PRIVATE_OUTPUT_MUST_NOT_ESCAPE{redirect}'\n"
+    result = subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, timeout=10)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "command_output_limit_exceeded\n"
+
+
+def test_documented_capture_preserves_child_file_size_limit_and_failure_status() -> None:
+    text = _text(ACCEPTANCE_RUNBOOK)
+    capture = text[text.index("### Protected command capture") : text.index("### Inputs")]
+    script = _fences(capture, "bash")[0]
+    script += '\nbefore=$(ulimit -f)\nafter=$(protected_capture http expected_failure bash -c "ulimit -f")\n'
+    script += 'test "$before" = "$after"\nprotected_capture http expected_failure bash -c "exit 7"\n'
+    result = subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, timeout=10)
+    assert result.returncode == 7
+    assert result.stdout == ""
+    assert result.stderr == "expected_failure\n"
 
 
 def test_compatibility_record_is_byte_bound_to_the_live_derivation() -> None:

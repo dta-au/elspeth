@@ -137,24 +137,36 @@ protected_timeout_seconds() {
   printf '%s\n' "$ceiling"
 }
 
-protected_capture() {
-  local kind="$1" failure_class="$2"
+protected_capture() (
+  local kind="$1" failure_class="$2" seconds scratch cleanup stderr_reader status
   shift 2
-  local seconds stderr_file status
-  seconds=$(protected_timeout_seconds "$kind") || return 1
-  stderr_file=$(mktemp -p /tmp elspeth-capture.XXXXXX) || return 1
-  chmod 600 "$stderr_file" || { rm -f -- "$stderr_file"; return 1; }
-  trap 'rm -f -- "$stderr_file"' RETURN
+  seconds=$(protected_timeout_seconds "$kind") || exit 1
+  scratch=$(mktemp -d -p /tmp elspeth-capture.XXXXXX) || exit 1
+  printf -v cleanup 'rm -rf -- %q' "$scratch"
+  trap "$cleanup" EXIT
+  : >"$scratch/stderr"
+  chmod 600 "$scratch/stderr"
+  # Bound captured streams; an inherited file-size limit breaks Bicep's runtime.
+  mkfifo "$scratch/stderr-pipe"
+  head -c "$((ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES + 1))" <"$scratch/stderr-pipe" >"$scratch/stderr" &
+  stderr_reader=$!
   set +e
-  ( ulimit -f 4096; timeout --signal=TERM --kill-after=5s "$seconds" "$@" 2>"$stderr_file" ) \
-    | head -c "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES"
+  timeout --signal=TERM --kill-after=5s "$seconds" "$@" 2>"$scratch/stderr-pipe" \
+    | head -c "$((ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES + 1))" >"$scratch/stdout"
   status=${PIPESTATUS[0]}
+  wait "$stderr_reader"
   set -e
+  if test "$(wc -c <"$scratch/stdout")" -gt "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES" \
+    || test "$(wc -c <"$scratch/stderr")" -gt "$ELSPETH_COMMAND_OUTPUT_LIMIT_BYTES"; then
+    printf '%s\n' 'command_output_limit_exceeded' >&2
+    exit 1
+  fi
   if test "$status" -ne 0; then
     printf '%s\n' "$failure_class" >&2
-    return "$status"
+    exit "$status"
   fi
-}
+  cat "$scratch/stdout"
+)
 
 az_capture() { protected_capture az az_command_failed az "$@"; }
 az_deploy_capture() { protected_capture az-deploy az_deployment_failed az "$@"; }
@@ -264,6 +276,12 @@ venv Python and the provisioned inventory host, then constructs the shared
 testcontainer receipt. It does not accept an empty or skipped test run as
 evidence. Pre-prepared session IDs and a pre-existing testcontainer receipt
 are not prerequisites for `all`.
+
+The complete `all` sequence is environment, image copy, bootstrap, Jobs,
+PostgreSQL tests, production rollout and initial receipts, labelled workload,
+session preparation, **P1, P2, P4, P3**, `single-revision`, evidence, cleanup,
+then bundle validation. The final Single-revision pass is part of `all`,
+before evidence collection and deletion of the disposable resource group.
 
 ---
 
@@ -545,7 +563,7 @@ curl_capture "$LABEL_B_URL/api/system/status" | jq -e '.instance_id' >/dev/null
 ```
 
 Run the probes in the order **P1, P2, P4, P3** (P3 is destructive and last),
-then the single-revision `maxReplicas = 2` pass of P1 and P4a. Every receipt
+then the Single-revision `minReplicas = maxReplicas = 2` pass of P1 and P4a. Every receipt
 carries its `mechanism`, a closed enum: a receipt cannot claim more than the
 tree proves, and overclaiming is a schema violation rather than a convention.
 
@@ -554,7 +572,48 @@ tree proves, and overclaiming is a schema violation rather than a convention.
 | **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
 | **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. The receipt asserts that no `run_start_permits` row exists: the table has no writer, and the driver has no code path that could claim one | `session_operation_fence_execute` |
 | **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the live progress stream and the WebSocket ticket are owner-affine; the driver records the production sticky-session setting as the mitigation | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
-| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); wait past `session_operation_lease_seconds` (30) and the membership lease; then `az containerapp revision deactivate` on `rA`; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+| **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); observe the survivor before and after the session-operation and membership lease deadlines; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
+
+### Final Single-revision pass
+
+`scripts/acceptance.sh all` restores the partitioned runtime roles, then deploys
+`r<sha12>-single` in `Single` mode with `sticky` affinity and exactly two
+replicas. It creates fresh guided trial sessions and a fresh executable P4a
+session through the default ingress. Two persistent cookie clients discover
+distinct process UUIDs, and `/api/system/status` binds their revision and
+platform replica names to the live Azure inventory. P1 still requires at least
+20 fresh turn-token requests; P4a checks fresh messages, run status, output
+metadata and uploaded blob bytes across those clients.
+
+To run only this final stage before cleanup, retain the same `EVIDENCE_DIR`,
+inventory, verified Job reports, resolved workload parameter files and private
+`parameters/acceptance-env.json`. Set the common driver inputs above plus an
+existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`, `P1_INTENT`, `P1_BODY`, `PROBE_YAML`,
+`PROBE_SOURCE_BLOB` and `P4_MESSAGE_BODY`:
+
+```bash
+bash deploy/azure-container-apps/scripts/acceptance.sh single-revision
+```
+
+The standalone stage validates that bearer-token input before deployment. It
+uses the production runtime role. If an earlier P3 invocation was interrupted,
+complete the driver's `restore` stage first. It creates its own sessions and
+uses the default ingress URL.
+
+The private evidence directory contains `single-p1-trial-requests.json`,
+`prepared-single-p4-message.json`, `single-p1/` and `single-p4/` observations
+with each probe's `binding.json`, and these receipt artifacts:
+
+| Probe | Required receipt kind | Extracted receipt | Receipt-store digest |
+| --- | --- | --- | --- |
+| P1 | `single-revision-fence-conflict` | `single-p1.receipt.json` | `single-p1.receipt.sha256` |
+| P4a | `single-revision-progress` | `single-p4.receipt.json` | `single-p4.receipt.sha256` |
+
+The corresponding `.stream` files retain the facade output. Receipt-store
+subjects use the actual cookie-selected replica, and stored receipts remain
+bound to their candidate, revision and replica. Changing the deployment or
+probe inputs requires fresh evidence; a committed collector and passing local
+tests do not replace the live run or promote the platform support claim.
 
 ### P3 primary primitive: role revocation by self-termination
 
@@ -763,7 +822,8 @@ The facade validates the bundle of receipts (`verify-doctor-job`,
 `verify-storage-job`, `verify-blob-managed-identity`, `verify-log-analytics`,
 `verify-connection-budget`, `compatibility-record`, `revision-rollout`,
 `replica-fence-conflict`, `replica-run-start`, `replica-lease-takeover`,
-`replica-progress`, `resource-graph-cleanup`, `testcontainer-run` — the last
+`replica-progress`, `single-revision-fence-conflict`, `single-revision-progress`,
+`resource-graph-cleanup`, `testcontainer-run` — the last
 through the shared gate, which refuses the bundle without exactly one passing
 run) and writes the sanitized
 receipt to `docs/operator/evidence/azure-container-apps/0.8.0.json`. That

@@ -146,6 +146,16 @@ API flow appropriate to the change, and a console-log query by revision name
 without a new unhandled startup or runtime failure (Log Analytics lags by
 minutes).
 
+For the disposable acceptance, `scripts/acceptance.sh all` includes the final
+`single-revision` stage after the labelled P1/P2/P4/P3 probes. It deploys
+`r<sha12>-single` with sticky affinity and exactly two replicas, then runs fresh
+P1 and P4a probes through cookie clients on the default ingress. The standalone
+stage requires retained parameter/observer files and an existing acceptance
+bearer token before deployment. Inspect `single-p1.receipt.json` and
+`single-p4.receipt.json` and their actual replica bindings; implementation and
+local tests do not establish completed live acceptance. See the acceptance
+runbook's final Single-revision pass for the exact inputs and artifacts.
+
 ## Diagnosis loop
 
 1. Identify the failing layer: image copy, revision provisioning, Job

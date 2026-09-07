@@ -34,13 +34,13 @@ the operator procedures are the three runbooks
 | `main.bicep` | subscription | resource group + `environment.bicep`; tags the group with `elspeth.acceptance-run-id` when given |
 | `environment.bicep` | resource group | VNet (delegated infrastructure subnet + private-endpoint subnet, NSG allowing 445/2049), Log Analytics, user-assigned identity, four private DNS zones, Premium FileStorage account with the NFS share (`NoRootSquash`, encryption in transit off), StorageV2 account with the payload blob container (identity is Blob Data Contributor on that container only), Key Vault (RBAC, Secrets User for the identity), Flexible Server (password auth, both databases, private endpoint, optional operator firewall rule), the Container Apps environment (Log Analytics destination, NFS storage definition), and `AcrPull` on the **existing** registry |
 | `modules/registry-pull-role.bicep` | registry's resource group | the `AcrPull` assignment on the existing registry |
-| `workload.bicep` | resource group | the `elspeth-web` app (digest-pinned image, Key Vault secret references, NFS volume, startup/liveness/readiness probes, session affinity, scale, grace period) and the manual Jobs `provision-storage` (root image), `doctor-schema-init` (schema-owner URLs, `doctor deployment --init-schema --json`) and `doctor-runtime[-a|-b]` (runtime URLs, `doctor deployment --json`) |
+| `workload.bicep` | resource group | the `elspeth-web` app (digest-pinned image, Key Vault secret references, NFS volume, startup/liveness/readiness probes, session affinity, scale, grace period) and the manual Jobs `provision-storage` (root image), `doctor-schema-init` (schema-owner URLs, `doctor deployment --init-schema --json`), `doctor-runtime[-a|-b]` (runtime URLs, `doctor deployment --json`) and optional `verify-blob-managed-identity` (production source/sink lifecycles) |
 | `main.example.bicepparam` / `environment.example.bicepparam` | | production stack parameters |
 | `main.acceptance.bicepparam` | | disposable acceptance group: zone redundancy off, purge protection off, Burstable server with public access + operator firewall rule, 30-day retention |
 | `workload.production.bicepparam` | | `Single` mode, `sticky` affinity, 2–4 replicas, ceiling 210 s |
 | `workload.acceptance.bicepparam` | | `Multiple` mode, `none` affinity, 1 replica, `runtimeRoleLabel` a (deploy again with b) |
 | `kql/*.kql` | | doctor report by execution; run sentinel by replica; replica lifecycle; fence-conflict 409s — SHA-256 bound into the receipt; column names verified live, never pinned by a test |
-| `scripts/acceptance.sh` | | the stage driver (group → image copy → Jobs → rollout → probes → evidence → cleanup) |
+| `scripts/acceptance.sh` | | the stage driver (environment → image copy → bootstrap → Jobs → PostgreSQL tests → production rollout/receipts → labelled probes → Single-revision probes → evidence → cleanup → bundle validation) |
 
 Cold installation deploys `workload.bicep` with `deployWebApp=false` in
 Incremental mode before starting any Job. After storage provisioning and both
@@ -55,6 +55,16 @@ what-if. Redeployment reuses the retained file to preserve secret versions and
 configuration. `scripts/run-job.sh` waits on the exact newly started execution.
 The acceptance driver uses the landed probe facade; live evidence remains an
 operator-run acceptance requirement.
+
+The final `single-revision` stage deploys `r<sha12>-single` with `Single`
+revision mode, `sticky` affinity and exactly two replicas. Fresh P1 and P4a
+probes use persistent cookie clients through the default ingress, with process
+identities checked against the revision's replica inventory. It stores
+`single-p1.receipt.json` and `single-p4.receipt.json` under the private evidence
+directory and admits them to the receipt store. `all` includes this stage;
+the standalone stage requires the retained environment/Job evidence, resolved
+parameters, observer credentials and an existing acceptance bearer token.
+These executable checks do not constitute a completed live acceptance.
 
 For a fresh acceptance, `scripts/bootstrap-acceptance.sh` creates SQL roles and
 versioned Key Vault secrets from explicit operator-local secret files before
