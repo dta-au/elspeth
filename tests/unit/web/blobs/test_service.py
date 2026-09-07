@@ -4840,6 +4840,19 @@ class TestCleanupErrorDetail:
         error.add_note("second rollback failure")
         assert blob_service_module._cleanup_error_detail(error) == "primary failure\nfirst rollback failure\nsecond rollback failure"
 
+    @pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+    def test_notes_getter_integrity_failure_propagates(self, error_class) -> None:
+        integrity_failure = error_class("cleanup notes access failed")
+
+        class UnreadableNotesError(OSError):
+            @property
+            def __notes__(self) -> list[str]:
+                raise integrity_failure
+
+        with pytest.raises(error_class) as caught:
+            blob_service_module._cleanup_error_detail(UnreadableNotesError("primary failure"))
+        assert caught.value is integrity_failure
+
     @pytest.mark.parametrize("notes", ["not a note list", None, ("tuple note",), [42]])
     def test_malformed_notes_fail_loudly(self, notes) -> None:
         error = OSError("primary failure")
