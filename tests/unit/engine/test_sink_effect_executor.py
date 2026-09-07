@@ -54,7 +54,14 @@ from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sinks.document_sink import DocumentSink
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import expire_sink_effect_lease, make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import (
+    expire_sink_effect_lease,
+    leader_coordination_token,
+    leader_token_for,
+    make_factory,
+    make_landscape_db,
+    register_test_node,
+)
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.fixtures.stores import MockPayloadStore
 from tests.helpers.tree_gate import iter_gate_files
@@ -400,13 +407,16 @@ def test_committed_coordinator_seam_has_exact_durable_image_and_retry_converges(
                 factory=factory,
                 worker_id="worker-a",
                 fault_hook=stop_at_committed_boundary,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
 
         assert observed_images == [expected_image]
         assert _coordinator_durable_image(make_factory(db), run_id) == expected_image
 
         recovered_factory = make_factory(db)
-        recovered = SinkEffectCoordinator(factory=recovered_factory, worker_id="worker-a").execute(request, sink)
+        recovered = SinkEffectCoordinator(
+            factory=recovered_factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)
+        ).execute(request, sink)
 
         assert recovered.effect.state.value == "finalized"
         assert target.published_rows == [[{"ordinal": 0}]]
@@ -761,7 +771,7 @@ def test_result_derived_reconciliation_finalizes_exact_marker_partition() -> Non
         run_id, sink_id, members = _pipeline_members(factory, 2)
         sink = _ResultDerivedReconciledSink(_CumulativeTarget())
 
-        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members),
             sink,
         )
@@ -783,11 +793,13 @@ def test_replacing_successor_prepares_cumulative_predecessor_and_current_members
         target = _CumulativeTarget()
         sink = _CumulativeObservableSink(target)
 
-        SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(_execution_request(run_id, sink_id, members[:1]), sink)
-        recovered_factory = make_factory(db, payload_store=payload_store)
-        successor = SinkEffectCoordinator(factory=recovered_factory, worker_id="worker-b").execute(
-            _execution_request(run_id, sink_id, members[1:]), sink
+        SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+            _execution_request(run_id, sink_id, members[:1]), sink
         )
+        recovered_factory = make_factory(db, payload_store=payload_store)
+        successor = SinkEffectCoordinator(
+            factory=recovered_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)
+        ).execute(_execution_request(run_id, sink_id, members[1:]), sink)
 
         assert successor.effect.stream_sequence == 1
         assert target.published_rows == [[{"ordinal": 0}], [{"ordinal": 0}, {"ordinal": 1}]]
@@ -810,13 +822,13 @@ def test_append_mode_successor_preserves_pre_run_baseline(tmp_path: Path) -> Non
             "collision_policy": "append_or_create",
         }
 
-        SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[:1]), CSVSink(config)
         )
         assert target.read_text() == "ordinal\n99\n0\n"
 
         successor_factory = make_factory(db, payload_store=payload_store)
-        SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
+        SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[1:]), CSVSink(config)
         )
         assert target.read_text() == "ordinal\n99\n0\n1\n"
@@ -834,7 +846,7 @@ def test_predecessor_snapshot_excludes_diverted_members() -> None:
         run_id, sink_id, members = _pipeline_members(factory, 3)
         # Predecessor accepts ordinal 0 and diverts ordinal 1.
         first_sink = _ResultDerivedReconciledSink(_CumulativeTarget())
-        SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[:2]),
             first_sink,
         )
@@ -842,7 +854,7 @@ def test_predecessor_snapshot_excludes_diverted_members() -> None:
         target = _CumulativeTarget()
         successor_sink = _CumulativeObservableSink(target)
         successor_factory = make_factory(db, payload_store=payload_store)
-        SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
+        SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[2:]),
             successor_sink,
         )
@@ -911,7 +923,7 @@ def test_document_one_value_rule_refuses_across_sink_instances(tmp_path: Path) -
         }
 
         instance_a = inject_write_failure(DocumentSink(config))
-        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[:2]), instance_a
         )
         first_durable = factory.execution.sink_effects.get_members(first.effect.effect_id)
@@ -920,9 +932,9 @@ def test_document_one_value_rule_refuses_across_sink_instances(tmp_path: Path) -
 
         instance_b = inject_write_failure(DocumentSink(config))
         successor_factory = make_factory(db, payload_store=payload_store)
-        second = SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
-            _execution_request(run_id, sink_id, members[2:]), instance_b
-        )
+        second = SinkEffectCoordinator(
+            factory=successor_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)
+        ).execute(_execution_request(run_id, sink_id, members[2:]), instance_b)
 
         second_durable = successor_factory.execution.sink_effects.get_members(second.effect.effect_id)
         assert [member.prepared_disposition for member in second_durable] == ["diverted"]
@@ -938,10 +950,13 @@ def test_mixed_overlap_recovers_open_effect_and_executes_new_partition() -> None
         run_id, sink_id, members = _pipeline_members(factory, 4)
         target = _CumulativeTarget()
         sink = _CumulativeObservableSink(target)
-        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id))
 
         first = coordinator.execute(_execution_request(run_id, sink_id, members[:1]), sink)
-        opened = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:3], replacing_target=True)).new_effect
+        opened = factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, members[1:3], replacing_target=True),
+            coordination_token=leader_coordination_token(factory, run_id),
+        ).new_effect
         assert opened is not None and opened.predecessor_effect_id == first.effect.effect_id
 
         result = coordinator.execute(_execution_request(run_id, sink_id, members), sink)
@@ -978,11 +993,15 @@ def test_second_preparer_refuses_while_preparation_claim_is_live() -> None:
                     # Simulate a concurrent worker arriving mid-preparation:
                     # it must refuse before invoking any adapter method.
                     with pytest.raises(SinkEffectLeaseHeld, match="preparation"):
-                        SinkEffectCoordinator(factory=rival_factory, worker_id="worker-b").execute(request, rival_sink)
+                        SinkEffectCoordinator(
+                            factory=rival_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)
+                        ).execute(request, rival_sink)
                 return super().prepare_effect(inner_request, ctx)
 
         sink = _RacingSink(target)
-        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+            request, sink
+        )
 
         assert result.effect.state.value == "finalized"
         assert sink.prepare_calls == 1
@@ -1018,6 +1037,7 @@ def test_load_plan_rejects_missing_required_durable_fields(
                 factory=factory,
                 worker_id="worker-a",
                 fault_hook=fail_before_effect,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(
                 _execution_request(run_id, sink_id, members),
                 _CumulativeObservableSink(_CumulativeTarget()),
@@ -1088,6 +1108,7 @@ def test_preparation_claim_stays_live_while_adapter_installs_local_stage(
                     worker_id="worker-a",
                     lease_ttl=lease_ttl,
                     fault_hook=fail_before_effect,
+                    coordination_token=leader_token_for(db, run_id),
                 ).execute(request, CSVSink(sink_config))
             except BaseException as exc:
                 stale_errors.append(exc)
@@ -1105,6 +1126,7 @@ def test_preparation_claim_stays_live_while_adapter_installs_local_stage(
                 worker_id="worker-b",
                 lease_ttl=timedelta(seconds=1),
                 fault_hook=fail_before_effect,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, CSVSink(sink_config))
         except BaseException as exc:
             rival_errors.append(exc)
@@ -1145,15 +1167,19 @@ def test_mixed_overlap_waits_for_live_open_partition_before_executing_new() -> N
                 factory=factory,
                 worker_id="worker-a",
                 fault_hook=fail_before_effect,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(_execution_request(run_id, sink_id, members[:1]), sink)
         calls_before_wait = (sink.inspect_calls, sink.prepare_calls, sink.reconcile_calls, sink.commit_calls)
 
         with pytest.raises(SinkEffectLeaseHeld, match="live lease"):
-            SinkEffectCoordinator(factory=factory, worker_id="worker-b").execute(_execution_request(run_id, sink_id, members), sink)
+            SinkEffectCoordinator(factory=factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)).execute(
+                _execution_request(run_id, sink_id, members), sink
+            )
 
         assert (sink.inspect_calls, sink.prepare_calls, sink.reconcile_calls, sink.commit_calls) == calls_before_wait
         reserved_new = factory.execution.sink_effects.reserve(
-            _pipeline_request(run_id, sink_id, members, replacing_target=True)
+            _pipeline_request(run_id, sink_id, members, replacing_target=True),
+            coordination_token=leader_coordination_token(factory, run_id),
         ).open_effect_ids
         assert len(reserved_new) == 2
     finally:
@@ -1179,7 +1205,7 @@ def test_non_open_latest_state_refuses_before_sink_io(terminal_status: NodeState
         sink = _CumulativeObservableSink(_CumulativeTarget())
 
         with pytest.raises(ValueError, match="latest sink-node state must be open"):
-            SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+            SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
                 _execution_request(run_id, sink_id, members),
                 sink,
             )
@@ -1199,8 +1225,12 @@ def test_retry_reuses_durable_returned_inspection_without_second_provider_call()
         request = _execution_request(run_id, sink_id, members)
 
         with pytest.raises(RuntimeError, match="prepare failure"):
-            SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
-        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
+            SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+                request, sink
+            )
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+            request, sink
+        )
 
         assert result.effect.state.value == "finalized"
         assert sink.inspect_calls == 1
@@ -1227,8 +1257,9 @@ def test_same_generation_retry_closes_abandoned_commit_intent_before_new_call() 
                 factory=factory,
                 worker_id="worker-a",
                 fault_hook=fail_before_effect,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
-        SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
+        SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(request, sink)
 
         with db.read_only_connection() as conn:
             commits = conn.execute(
@@ -1263,9 +1294,12 @@ def test_precomputed_response_loss_reconciles_with_durable_diversion_partition()
                 factory=factory,
                 worker_id="worker-a",
                 fault_hook=lose_response_after_publication,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
 
-        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, sink)
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+            request, sink
+        )
 
         assert result.effect.state.value == "finalized"
         assert len(result.state_ids) == 1
@@ -1302,13 +1336,16 @@ def test_takeover_closes_stale_abandoned_intent_before_new_generation_call(
                 lease_ttl=lease_ttl,
                 fault_hook=fail_before_effect,
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
         clock.advance(lease_ttl.total_seconds() + 1)
         # The abandoned lease lapses on the Landscape database clock (ADR-047),
         # which the mock clock cannot move.
         (abandoned,) = factory.execution.sink_effects.get_effects_for_run(run_id)
         expire_sink_effect_lease(db.engine, abandoned.effect_id)
-        SinkEffectCoordinator(factory=factory, worker_id="worker-b", clock=clock).execute(request, sink)
+        SinkEffectCoordinator(factory=factory, worker_id="worker-b", clock=clock, coordination_token=leader_token_for(db, run_id)).execute(
+            request, sink
+        )
 
         with db.read_only_connection() as conn:
             commits = conn.execute(
@@ -1351,6 +1388,7 @@ def test_retry_consumes_returned_commit_without_another_reconcile(
                 lease_ttl=takeover_ttl if takeover else timedelta(seconds=30),
                 fault_hook=fail_after_return,
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
         if takeover:
             clock.advance(takeover_ttl.total_seconds() + 1)
@@ -1360,6 +1398,7 @@ def test_retry_consumes_returned_commit_without_another_reconcile(
             factory=factory,
             worker_id="worker-b" if takeover else "worker-a",
             clock=clock,
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, sink)
 
         assert sink.commit_calls == 1
@@ -1378,7 +1417,9 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
         target = _CumulativeTarget()
         sink = _CumulativeObservableSink(target)
         request = _execution_request(run_id, sink_id, members)
-        reserved = factory.execution.sink_effects.reserve(request.reservation).new_effect
+        reserved = factory.execution.sink_effects.reserve(
+            request.reservation, coordination_token=leader_coordination_token(factory, run_id)
+        ).new_effect
         assert reserved is not None
         inspection = SinkEffectInspection(
             mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
@@ -1406,12 +1447,16 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
             reserved.effect_id,
             owner="worker-a",
             ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-        factory.execution.sink_effects.complete_plan(reserved.effect_id, plan, claim=claim)
+        factory.execution.sink_effects.complete_plan(
+            reserved.effect_id, plan, claim=claim, coordination_token=leader_coordination_token(factory, run_id)
+        )
         lease = factory.execution.sink_effects.acquire_lease(
             reserved.effect_id,
             owner="worker-a",
             ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         reconciliation = SinkEffectReconcileResult.not_applied(evidence={"target": "not_applied"})
         attempt = factory.execution.sink_effects.begin_attempt(
@@ -1422,14 +1467,16 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
                 action=SinkEffectAttemptAction.RECONCILE,
                 call_kind=CallType.FILESYSTEM,
                 request_hash=SinkEffectCoordinator._reconcile_request_hash(plan),
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         factory.execution.sink_effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
                 evidence=encode_sink_effect_returned_result(reconciliation),
                 latency_ms=0.0,
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         if takeover:
             # worker-a's lease lapses on the Landscape database clock (ADR-047).
@@ -1438,6 +1485,7 @@ def test_retry_consumes_returned_reconcile_before_commit(takeover: bool) -> None
         SinkEffectCoordinator(
             factory=factory,
             worker_id="worker-b" if takeover else "worker-a",
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, sink)
 
         assert sink.reconcile_calls == 0
@@ -1497,6 +1545,7 @@ def test_fresh_executor_retry_publishes_once(seam: SinkEffectExecutionSeam) -> N
             worker_id="worker-a",
             lease_ttl=timedelta(seconds=30),
             fault_hook=fail_once,
+            coordination_token=leader_token_for(db, run_id),
         )
         with pytest.raises(SinkEffectInjectedFault):
             first.execute(request, DuplicateObservableSink(target))
@@ -1505,6 +1554,7 @@ def test_fresh_executor_retry_publishes_once(seam: SinkEffectExecutionSeam) -> N
             factory=make_factory(db),
             worker_id="worker-a",
             lease_ttl=timedelta(seconds=30),
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, DuplicateObservableSink(target))
 
         assert target.publication_count == 1
@@ -1544,7 +1594,9 @@ def test_unknown_reconciliation_never_commits() -> None:
         )
         target = DuplicateObservableTarget(publication_count=1, effect_id="f" * 64)
         with pytest.raises(Exception, match=r"UNKNOWN|unknown|divergent"):
-            SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(request, DuplicateObservableSink(target))
+            SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
+                request, DuplicateObservableSink(target)
+            )
         assert target.publication_count == 1
     finally:
         db.close()

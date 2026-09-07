@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         SinkProtocol,
         TokenInfo,
     )
+    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
     from elspeth.engine.orchestrator.ports import (
         CheckpointAfterSinkCallback,
@@ -140,6 +141,7 @@ class SinkFlushCoordinator:
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
         worker_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> DiversionCounts:
         """Write pending tokens to sinks using SinkExecutor.
@@ -163,6 +165,10 @@ class SinkFlushCoordinator:
                 checkpoint-progress callback for grouped batches whose pending outcome
                 carries a durable scheduler PENDING_SINK handoff (elspeth-107a29d02e).
                 When None, no scheduler terminalization is performed.
+            coordination_token: The processor's leader token (ADR-048), handed
+                to SinkExecutor so durable sink effects fence on it. None only
+                for a processor that holds no seat; the effect path then fails
+                closed inside SinkExecutor rather than writing unfenced.
         """
         from itertools import groupby
 
@@ -191,6 +197,7 @@ class SinkFlushCoordinator:
             run_id,
             factory=factory,
             worker_id=worker_id,
+            coordination_token=coordination_token,
             clock=self._clock,
             shutdown_event=ctx.shutdown_event,
             check_coordination_latch=check_coordination_latch,
@@ -363,6 +370,7 @@ class SinkFlushCoordinator:
             on_token_written_factory=on_token_written_factory,
             scheduler_terminalizer=scheduler_terminalizer,
             worker_id=(loop_ctx.processor.coordination_token.worker_id if loop_ctx.processor.coordination_token is not None else None),
+            coordination_token=loop_ctx.processor.coordination_token,
             check_coordination_latch=check_coordination_latch,
         )
         # ADR-019: failsink-mode diversions are TRANSIENT structural evidence;

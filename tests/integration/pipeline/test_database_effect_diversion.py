@@ -24,7 +24,7 @@ from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkE
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.sinks.database_sink import DatabaseSink, database_effect_ledger_table
 from tests.fixtures.base_classes import create_observed_contract, inject_write_failure
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 
 _SCHEMA = {"mode": "fixed", "fields": ["id: int", "name: str"]}
 _LEDGER = {
@@ -107,6 +107,7 @@ def test_constraint_diversion_discards_durably_without_audit_error(tmp_path: Pat
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             sink,  # type: ignore[arg-type]
             tokens,
@@ -184,6 +185,7 @@ def test_constraint_diversion_recovers_attribution_after_crash_before_finalize(t
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=fail_once,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 first_sink,  # type: ignore[arg-type]
                 tokens,
@@ -207,6 +209,7 @@ def test_constraint_diversion_recovers_attribution_after_crash_before_finalize(t
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,

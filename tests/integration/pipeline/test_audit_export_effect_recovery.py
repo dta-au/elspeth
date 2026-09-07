@@ -22,7 +22,7 @@ from elspeth.contracts.audit_export import (
     IterableBoundAuditExportContentReader,
     RegisteredAuditExportContent,
 )
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -188,6 +188,22 @@ def _insert_terminal_run(db: LandscapeDB, run_id: str = "run-export") -> None:
         # A run written by raw SQL has no seat; the export re-drive takes the
         # lapsed seat a crashed leader leaves (ADR-048 §4), so mint that image.
         insert_crashed_leader_seat(connection, run_id=run_id)
+
+
+def _export_seat(db: LandscapeDB, *, worker_id: str, run_id: str = "run-export") -> CoordinationToken:
+    """Take the export seat a direct ``execute_audit_export_effect`` acts under.
+
+    Production reaches that verb through ``resume_audit_export``, which claims
+    this same seat first (ADR-048 §4); a test that drives the verb directly
+    owes the same claim, so the token is read from the CAS rather than minted.
+    One seat covers a scenario's fault run and its re-drive: both act as the
+    same export worker.
+    """
+    return RecorderFactory(db).run_coordination.acquire_export_leadership(
+        run_id=run_id,
+        worker_id=worker_id,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    )
 
 
 def _config(**overrides: object) -> LandscapeExportSettings:
@@ -635,6 +651,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
         )
         target = _Target()
         injected = False
+        export_token = _export_seat(db, worker_id="audit-export-worker")
 
         def fail_once(observed: SinkEffectExecutionSeam) -> None:
             nonlocal injected
@@ -650,6 +667,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
                 sink_node_id=sink_node_id,
                 target_config={"path": "audit-export.json"},
                 worker_id="audit-export-worker",
+                coordination_token=export_token,
                 fault_hook=fail_once,
             )
 
@@ -675,6 +693,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
             sink_node_id=sink_node_id,
             target_config={"path": "audit-export.json"},
             worker_id="audit-export-worker",
+            coordination_token=export_token,
         )
 
         assert target.publication_count == 1
@@ -737,6 +756,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
         publications: list[Path] = []
         monkeypatch.setattr(_local_file_effects, "_after_replace", lambda path: publications.append(path))
 
+        export_token = _export_seat(db, worker_id="audit-export-json-worker")
         with pytest.raises(SinkEffectInjectedFault):
             execute_audit_export_effect(
                 factory=factory,
@@ -745,6 +765,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-json-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -759,6 +780,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-json-worker",
+            coordination_token=export_token,
         )
 
         assert output.read_bytes() == expected
@@ -806,6 +828,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
             lambda path: publications.append(path),
         )
 
+        export_token = _export_seat(db, worker_id="audit-export-csv-worker")
         with pytest.raises(SinkEffectInjectedFault):
             execute_audit_export_effect(
                 factory=factory,
@@ -814,6 +837,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
                 sink_node_id=sink_node_id,
                 target_config=sink_options,
                 worker_id="audit-export-csv-worker",
+                coordination_token=export_token,
                 fault_hook=lambda seam: (
                     (_ for _ in ()).throw(SinkEffectInjectedFault(seam))
                     if seam is SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE
@@ -828,6 +852,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
             sink_node_id=sink_node_id,
             target_config=sink_options,
             worker_id="audit-export-csv-worker",
+            coordination_token=export_token,
         )
 
         assert (target / _audit_export_bundle_effects.AUDIT_MANIFEST_NAME).read_bytes() == snapshot.reader.read_verified_signed_manifest()

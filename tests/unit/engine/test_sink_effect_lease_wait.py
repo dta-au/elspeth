@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import update
 
 from elspeth.contracts.audit import SinkEffect
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
@@ -36,7 +37,13 @@ from elspeth.engine.executors.sink_effects import (
     SinkEffectLeaseHeld,
     SinkEffectPredecessorPending,
 )
-from tests.fixtures.landscape import expire_sink_effect_lease, landscape_database_now, on_fresh_database_second
+from tests.fixtures.landscape import (
+    expire_sink_effect_lease,
+    landscape_database_now,
+    leader_coordination_token,
+    leader_token_for,
+    on_fresh_database_second,
+)
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 from tests.unit.engine.test_sink_effect_executor import _CumulativeObservableSink, _CumulativeTarget, _execution_request
@@ -132,6 +139,7 @@ def _held_effect(
             lease_ttl=lease_ttl,
             fault_hook=stop_before_publication,
             clock=clock,
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, sink)
     effect = factory.execution.sink_effects.get_effects_for_run(run_id)[0]
     assert effect.state is SinkEffectState.IN_FLIGHT
@@ -157,6 +165,7 @@ def test_foreign_lease_expires_then_waiter_reclaims_and_publishes_once(
             clock=clock,
             sleep=sleep,
             poll_interval=0.5,
+            coordination_token=leader_token_for(db, held.run_id),
         ).execute_with_lease_wait(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED
@@ -203,6 +212,7 @@ def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_
                 worker_id="lease-holder",
                 lease_ttl=lease_ttl,
                 fault_hook=stop_before_publication,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
 
     try:
@@ -219,6 +229,7 @@ def test_waiter_starting_inside_the_stamp_second_outlasts_the_lease_on_database_
             worker_id="lease-waiter",
             lease_ttl=lease_ttl,
             poll_interval=0.05,
+            coordination_token=leader_token_for(db, run_id),
         ).execute_with_lease_wait(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED
@@ -236,6 +247,7 @@ def test_waiter_reuses_peer_finalized_effect_without_publishing_again(
 ) -> None:
     lease_ttl = timedelta(seconds=5)
     db, factory, request, sink, target, clock = _held_effect(monkeypatch, lease_ttl=lease_ttl)
+    run_id = request.reservation.run_id
     peer_result: list[object] = []
 
     def finalize_from_peer() -> None:
@@ -247,6 +259,7 @@ def test_waiter_reuses_peer_finalized_effect_without_publishing_again(
                 worker_id="lease-holder",
                 lease_ttl=lease_ttl,
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
         )
 
@@ -259,6 +272,7 @@ def test_waiter_reuses_peer_finalized_effect_without_publishing_again(
             clock=clock,
             sleep=sleep,
             poll_interval=0.5,
+            coordination_token=leader_token_for(db, run_id),
         ).execute_with_lease_wait(request, sink)
 
         assert len(peer_result) == 1
@@ -282,8 +296,14 @@ def test_successor_waits_for_peer_to_finalize_predecessor_then_advances_stream_o
     sink = _CumulativeObservableSink(target)
     clock = MockClock(start=datetime.now(UTC).timestamp())
 
-    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    predecessor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    successor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
     assert predecessor is not None
     assert successor is not None
     assert successor.predecessor_effect_id == predecessor.effect_id
@@ -298,6 +318,7 @@ def test_successor_waits_for_peer_to_finalize_predecessor_then_advances_stream_o
                 factory=factory,
                 worker_id="predecessor-peer",
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(predecessor_request, sink)
         )
 
@@ -308,6 +329,7 @@ def test_successor_waits_for_peer_to_finalize_predecessor_then_advances_stream_o
                 factory=factory,
                 worker_id="immediate-successor",
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(successor_request, sink)
         assert target.published_rows == []
 
@@ -318,6 +340,7 @@ def test_successor_waits_for_peer_to_finalize_predecessor_then_advances_stream_o
             clock=clock,
             sleep=sleep,
             poll_interval=0.5,
+            coordination_token=leader_token_for(db, run_id),
         ).execute_with_lease_wait(successor_request, sink)
 
         assert len(peer_results) == 1
@@ -358,8 +381,14 @@ def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
     clock = MockClock(start=datetime.now(UTC).timestamp())
     monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
 
-    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    predecessor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    successor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
     assert predecessor is not None
     assert successor is not None
 
@@ -374,6 +403,7 @@ def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
                     worker_id="predecessor-peer",
                     lease_ttl=lease_ttl,
                     clock=clock,
+                    coordination_token=leader_token_for(db, run_id),
                 ).execute(predecessor_request, sink)
             )
             successor_claim.append(
@@ -381,6 +411,7 @@ def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
                     successor.effect_id,
                     owner="successor-holder",
                     ttl=lease_ttl,
+                    coordination_token=leader_coordination_token(factory, run_id),
                 )
             )
             return
@@ -390,6 +421,7 @@ def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
             owner=claim.owner,
             generation=claim.generation,
             ttl=lease_ttl,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
     sleep = _AdvanceSleep(clock, after_sleep=keep_successor_contended)
@@ -402,6 +434,7 @@ def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
                 clock=clock,
                 sleep=sleep,
                 poll_interval=0.5,
+                coordination_token=leader_token_for(db, run_id),
             ).execute_with_lease_wait(successor_request, sink)
 
         assert len(peer_result) == 1
@@ -423,8 +456,14 @@ def test_shutdown_interrupts_predecessor_wait_before_peer_finalization() -> None
     factory = make_factory(db)
     run_id, sink_id, members = _pipeline_members(factory, 2)
     successor_request = _execution_request(run_id, sink_id, members[1:])
-    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    predecessor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    successor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
     assert predecessor is not None
     assert successor is not None
     target = _CumulativeTarget()
@@ -441,6 +480,7 @@ def test_shutdown_interrupts_predecessor_wait_before_peer_finalization() -> None
                 poll_interval=0.5,
                 shutdown_event=shutdown,
                 make_shutdown_error=_shutdown_error,
+                coordination_token=leader_token_for(db, run_id),
             ).execute_with_lease_wait(successor_request, _CumulativeObservableSink(target))
 
         assert sleep.calls == [0.5]
@@ -462,8 +502,14 @@ def test_coordination_latch_interrupts_predecessor_wait_before_peer_finalization
     factory = make_factory(db)
     run_id, sink_id, members = _pipeline_members(factory, 2)
     successor_request = _execution_request(run_id, sink_id, members[1:])
-    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    predecessor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    successor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
     assert predecessor is not None
     assert successor is not None
     target = _CumulativeTarget()
@@ -503,6 +549,7 @@ def test_coordination_latch_interrupts_predecessor_wait_before_peer_finalization
                 sleep=sleep,
                 poll_interval=0.5,
                 check_coordination_latch=latch,
+                coordination_token=leader_token_for(db, run_id),
             ).execute_with_lease_wait(successor_request, _CumulativeObservableSink(target))
 
         assert latch_calls == 3
@@ -527,7 +574,8 @@ def test_successor_wait_traverses_multi_hop_predecessor_chain() -> None:
     requests = tuple(_execution_request(run_id, sink_id, members[index : index + 1]) for index in range(3))
     effects = tuple(
         factory.execution.sink_effects.reserve(
-            _pipeline_request(run_id, sink_id, members[index : index + 1], replacing_target=True)
+            _pipeline_request(run_id, sink_id, members[index : index + 1], replacing_target=True),
+            coordination_token=leader_coordination_token(factory, run_id),
         ).new_effect
         for index in range(3)
     )
@@ -552,6 +600,7 @@ def test_successor_wait_traverses_multi_hop_predecessor_chain() -> None:
                 factory=factory,
                 worker_id=f"predecessor-peer-{index}",
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(requests[index], sink)
         )
 
@@ -563,6 +612,7 @@ def test_successor_wait_traverses_multi_hop_predecessor_chain() -> None:
             clock=clock,
             sleep=sleep,
             poll_interval=0.5,
+            coordination_token=leader_token_for(db, run_id),
         ).execute_with_lease_wait(requests[2], sink)
 
         assert result.effect.effect_id == third.effect_id
@@ -586,8 +636,14 @@ def test_predecessor_disappearing_during_wait_fails_immediately(
     factory = make_factory(db)
     run_id, sink_id, members = _pipeline_members(factory, 2)
     successor_request = _execution_request(run_id, sink_id, members[1:])
-    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
-    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    predecessor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[:1], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
+    successor = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members[1:], replacing_target=True),
+        coordination_token=leader_coordination_token(factory, run_id),
+    ).new_effect
     assert predecessor is not None
     assert successor is not None
 
@@ -598,6 +654,7 @@ def test_predecessor_disappearing_during_wait_fails_immediately(
         factory=factory,
         worker_id="successor-waiter",
         sleep=refuse_sleep,
+        coordination_token=leader_token_for(db, run_id),
     )
     original_get_effect = coordinator._effects.get_effect
     predecessor_reads = 0
@@ -631,6 +688,7 @@ def test_live_lease_through_budget_reraises_original_exception_after_bounded_wai
             owner="lease-holder",
             generation=effect.generation,
             ttl=lease_ttl,
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
 
     sleep = _AdvanceSleep(clock, after_sleep=keep_peer_live)
@@ -643,6 +701,7 @@ def test_live_lease_through_budget_reraises_original_exception_after_bounded_wai
                 clock=clock,
                 sleep=sleep,
                 poll_interval=0.5,
+                coordination_token=leader_token_for(db, effect.run_id),
             ).execute_with_lease_wait(request, sink)
 
         assert type(captured.value) is SinkEffectLeaseHeld
@@ -679,6 +738,7 @@ def test_shutdown_interrupts_wait_before_reclaim(
                 poll_interval=0.5,
                 shutdown_event=shutdown,
                 make_shutdown_error=_shutdown_error,
+                coordination_token=leader_token_for(db, effect.run_id),
             ).execute_with_lease_wait(request, sink)
 
         current = factory.execution.sink_effects.get_effect(effect.effect_id)
@@ -717,6 +777,7 @@ def test_coordination_latch_interrupts_wait_before_reclaim(
                 sleep=sleep,
                 poll_interval=0.5,
                 check_coordination_latch=latch,
+                coordination_token=leader_token_for(db, effect.run_id),
             ).execute_with_lease_wait(request, sink)
 
         current = factory.execution.sink_effects.get_effect(effect.effect_id)
@@ -784,6 +845,7 @@ def test_coordination_latch_is_rechecked_immediately_before_payload_and_adapter_
             factory=factory,
             worker_id="guarded-worker",
             check_coordination_latch=latch,
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED
@@ -827,6 +889,7 @@ def test_corrupt_effect_state_during_authoritative_poll_fails_closed(
                 clock=clock,
                 sleep=sleep,
                 poll_interval=0.5,
+                coordination_token=leader_token_for(db, effect.run_id),
             ).execute_with_lease_wait(request, sink)
 
         assert target.publication_count == 0
@@ -859,12 +922,14 @@ def test_execution_heartbeat_prevents_takeover_during_blocked_publication(
         owner: str,
         generation: int,
         ttl: timedelta,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectLease:
         lease = original_heartbeat(
             effect_id,
             owner=owner,
             generation=generation,
             ttl=ttl,
+            coordination_token=coordination_token,
         )
         if commit_entered.is_set() and owner == "lease-holder":
             heartbeat_observed.set()
@@ -888,6 +953,7 @@ def test_execution_heartbeat_prevents_takeover_during_blocked_publication(
                 factory=factory,
                 worker_id="lease-holder",
                 lease_ttl=lease_ttl,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
         except BaseException as exc:
             holder_errors.append(exc)
@@ -903,6 +969,7 @@ def test_execution_heartbeat_prevents_takeover_during_blocked_publication(
                 worker_id="lease-waiter",
                 lease_ttl=lease_ttl,
                 poll_interval=0.05,
+                coordination_token=leader_token_for(db, run_id),
             ).execute_with_lease_wait(request, sink)
         assert target.publication_count == 0
     finally:
@@ -957,13 +1024,19 @@ def test_concurrent_preparation_claim_loser_enters_shared_wait_and_reuses_winner
         *,
         owner: str,
         ttl: timedelta,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectLease:
         claim_barrier.wait(timeout=5)
-        return original_claim(lifecycle, effect_id, owner=owner, ttl=ttl)
+        return original_claim(lifecycle, effect_id, owner=owner, ttl=ttl, coordination_token=coordination_token)
 
     monkeypatch.setattr(SinkEffectLifecycle, "claim_preparation", synchronized_claim)
     results: list[SinkEffectFinalizationResult] = []
     errors: list[BaseException] = []
+    # One seat read, bound before the workers start: both act for the same
+    # leader (ADR-048 — the token is a parameter, not a per-thread mint), and
+    # reading it inside the threads would race the repository's construction
+    # pragma probe rather than the contention this test is about.
+    coordination_token = leader_token_for(db, run_id)
 
     def execute(worker_id: str) -> None:
         try:
@@ -972,6 +1045,7 @@ def test_concurrent_preparation_claim_loser_enters_shared_wait_and_reuses_winner
                     factory=make_factory(db),
                     worker_id=worker_id,
                     poll_interval=0.01,
+                    coordination_token=coordination_token,
                 ).execute_with_lease_wait(request, sink)
             )
         except BaseException as exc:
@@ -1031,11 +1105,13 @@ def test_concurrent_execution_lease_acquire_loser_enters_shared_wait_and_reuses_
             return super().reconcile_effect(plan, ctx)
 
     sink = _BlockingReconcileSink(target)
-    setup = SinkEffectCoordinator(factory=factory, worker_id="setup-worker")
+    setup = SinkEffectCoordinator(factory=factory, worker_id="setup-worker", coordination_token=leader_token_for(db, run_id))
     setup._persist_pipeline_member_payloads(request.effect_input)
-    reserved = factory.execution.sink_effects.reserve(request.reservation).new_effect
+    reserved = factory.execution.sink_effects.reserve(
+        request.reservation, coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
     assert reserved is not None
-    setup._prepare(reserved, request, sink, setup._context(reserved))
+    setup._prepare(reserved, request, sink, setup._context(reserved), coordination_token=leader_token_for(db, run_id))
     prepared = factory.execution.sink_effects.get_effect(reserved.effect_id)
     assert prepared is not None and prepared.state is SinkEffectState.PREPARED
 
@@ -1047,13 +1123,19 @@ def test_concurrent_execution_lease_acquire_loser_enters_shared_wait_and_reuses_
         *,
         owner: str,
         ttl: timedelta,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectLease:
         acquire_barrier.wait(timeout=5)
-        return original_acquire(lifecycle, effect_id, owner=owner, ttl=ttl)
+        return original_acquire(lifecycle, effect_id, owner=owner, ttl=ttl, coordination_token=coordination_token)
 
     monkeypatch.setattr(SinkEffectLifecycle, "acquire_lease", synchronized_acquire)
     results: list[SinkEffectFinalizationResult] = []
     errors: list[BaseException] = []
+    # One seat read, bound before the workers start: both act for the same
+    # leader (ADR-048 — the token is a parameter, not a per-thread mint), and
+    # reading it inside the threads would race the repository's construction
+    # pragma probe rather than the contention this test is about.
+    coordination_token = leader_token_for(db, run_id)
 
     def execute(worker_id: str) -> None:
         try:
@@ -1062,6 +1144,7 @@ def test_concurrent_execution_lease_acquire_loser_enters_shared_wait_and_reuses_
                     factory=make_factory(db),
                     worker_id=worker_id,
                     poll_interval=0.01,
+                    coordination_token=coordination_token,
                 ).execute_with_lease_wait(request, sink)
             )
         except BaseException as exc:
@@ -1132,13 +1215,19 @@ def test_concurrent_expired_takeover_loser_waits_for_single_reclaim_publication(
         *,
         owner: str,
         ttl: timedelta,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectLease:
         takeover_barrier.wait(timeout=5)
-        return original_takeover(lifecycle, effect_id, owner=owner, ttl=ttl)
+        return original_takeover(lifecycle, effect_id, owner=owner, ttl=ttl, coordination_token=coordination_token)
 
     monkeypatch.setattr(SinkEffectLifecycle, "takeover_expired", synchronized_takeover)
     results: list[SinkEffectFinalizationResult] = []
     errors: list[BaseException] = []
+    # One seat read, bound before the workers start: both act for the same
+    # leader (ADR-048 — the token is a parameter, not a per-thread mint), and
+    # reading it inside the threads would race the repository's construction
+    # pragma probe rather than the takeover this test is about.
+    coordination_token = leader_token_for(db, held.run_id)
 
     def execute(worker_id: str) -> None:
         try:
@@ -1149,6 +1238,7 @@ def test_concurrent_expired_takeover_loser_waits_for_single_reclaim_publication(
                     lease_ttl=lease_ttl,
                     clock=clock,
                     poll_interval=0.01,
+                    coordination_token=coordination_token,
                 ).execute_with_lease_wait(request, sink)
             )
         except BaseException as exc:
@@ -1227,6 +1317,7 @@ def test_heartbeat_failure_after_last_inflight_check_fails_the_execution(
                 worker_id="late-heartbeat-holder",
                 lease_ttl=timedelta(seconds=30),
                 fault_hook=store_late_heartbeat_failure,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
     finally:
         db.close()
@@ -1252,6 +1343,7 @@ def test_execution_heartbeat_retires_before_its_own_successful_finalization(
 
     def heartbeat_only_after_finalize(
         self: sink_effects_module._SinkEffectLeaseHeartbeat,
+        coordination_token: CoordinationToken,
     ) -> None:
         nonlocal heartbeat_count
         heartbeat_count += 1
@@ -1271,6 +1363,7 @@ def test_execution_heartbeat_retires_before_its_own_successful_finalization(
                 owner=self._claim.owner,
                 generation=self._claim.generation,
                 ttl=self._ttl,
+                coordination_token=coordination_token,
             )
         except BaseException as exc:
             self._error = exc
@@ -1286,9 +1379,11 @@ def test_execution_heartbeat_retires_before_its_own_successful_finalization(
     def finalize_then_release_heartbeat(
         repository: SinkEffectRepository,
         finalize_request: SinkEffectFinalizeRequest,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         assert execution_heartbeat_ready.wait(timeout=5), "execution heartbeat never started"
-        result = original_finalize(repository, finalize_request)
+        result = original_finalize(repository, finalize_request, coordination_token=coordination_token)
         finalized.set()
         return result
 
@@ -1299,6 +1394,7 @@ def test_execution_heartbeat_retires_before_its_own_successful_finalization(
             factory=factory,
             worker_id="self-finalizing-heartbeat-holder",
             lease_ttl=timedelta(seconds=30),
+            coordination_token=leader_token_for(db, run_id),
         ).execute(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED
@@ -1328,6 +1424,10 @@ def test_peer_takeover_after_heartbeat_retirement_fences_finalization(
     monkeypatch.setattr(sink_effect_finalization, "now", clock.now_utc)
     original_stop = sink_effects_module._SinkEffectLeaseHeartbeat.stop
     rival_claims: list[SinkEffectLease] = []
+    # Read once here, not inside the retirement hook: the hook runs while the
+    # heartbeat thread is being retired, and a seat read there would race the
+    # repository's construction pragma probe.
+    coordination_token = leader_token_for(db, run_id)
 
     def stop_then_install_rival(
         heartbeat: sink_effects_module._SinkEffectLeaseHeartbeat,
@@ -1345,6 +1445,7 @@ def test_peer_takeover_after_heartbeat_retirement_fences_finalization(
                 heartbeat._claim.effect_id,
                 owner="terminal-rival",
                 ttl=lease_ttl,
+                coordination_token=coordination_token,
             )
         )
 
@@ -1361,6 +1462,7 @@ def test_peer_takeover_after_heartbeat_retirement_fences_finalization(
                 worker_id="retiring-heartbeat-holder",
                 lease_ttl=lease_ttl,
                 clock=clock,
+                coordination_token=leader_token_for(db, run_id),
             ).execute(request, sink)
 
         assert len(rival_claims) == 1

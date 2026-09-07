@@ -336,6 +336,7 @@ class RunLifecycleCoordinator:
                 audit_export_content_store=audit_export_content_store,
                 audit_export_content_store_resolver=audit_export_content_store_resolver,
                 worker_id=worker_id,
+                coordination_token=coordination_token,
             )
 
             factory.run_lifecycle.set_export_status(status=ExportStatus.COMPLETED, coordination_token=coordination_token)

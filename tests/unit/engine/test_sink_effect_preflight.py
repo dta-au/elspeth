@@ -1497,6 +1497,7 @@ def test_audit_export_preflights_fresh_sink_before_node_or_lifecycle_or_io() -> 
             audit_export_content_store=_AUDIT_CONTENT_STORE,  # type: ignore[arg-type]
             audit_export_content_store_resolver=_AUDIT_CONTENT_STORE_RESOLVER,
             worker_id="worker:run-1:test",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
         )
 
     assert "node_id" not in vars(sink)
@@ -1729,6 +1730,7 @@ def test_audit_export_requires_export_input_kind_and_rejects_pipeline_only_sink(
             audit_export_content_store=_AUDIT_CONTENT_STORE,  # type: ignore[arg-type]
             audit_export_content_store_resolver=_AUDIT_CONTENT_STORE_RESOLVER,
             worker_id="worker:run-1:test",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1),
         )
     assert "node_id" not in vars(sink)
     assert sink.on_start_calls == 0

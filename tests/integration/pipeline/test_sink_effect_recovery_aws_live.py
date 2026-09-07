@@ -542,6 +542,7 @@ def _write(
         factory=factory,
         worker_id=_WORKER_ID,
         sink_effect_fault_hook=fault_hook,
+        coordination_token=leader_coordination_token(factory, run_id),
     ).write(
         sink,  # type: ignore[arg-type]
         tokens,

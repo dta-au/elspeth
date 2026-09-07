@@ -24,7 +24,7 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from tests.fixtures.base_classes import create_observed_contract
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 
@@ -144,6 +144,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database
@@ -241,6 +242,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database
@@ -315,6 +317,7 @@ class TestSinkDurability:
             span_factory=SpanFactory(),
             run_id=run.run_id,
             factory=factory,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Create row and token in database

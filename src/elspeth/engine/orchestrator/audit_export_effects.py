@@ -35,6 +35,7 @@ from elspeth.contracts.audit_export import (
     derive_public_export_config_hash,
     derive_registry_key_hash,
 )
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
     AuditExportSignedManifestInput,
@@ -471,13 +472,18 @@ def execute_audit_export_effect(
     sink_node_id: str,
     target_config: Mapping[str, object],
     worker_id: str,
+    coordination_token: CoordinationToken,
     lease_ttl: timedelta = timedelta(minutes=5),
     fault_hook: Callable[[SinkEffectExecutionSeam], None] | None = None,
     clock: Clock = DEFAULT_CLOCK,
     sleep: Callable[[float], None] | None = None,
     poll_interval: float = 0.5,
 ) -> SinkEffectFinalizationResult:
-    """Reserve and execute one zero-member audit-export snapshot effect."""
+    """Reserve and execute one zero-member audit-export snapshot effect.
+
+    ``coordination_token`` is the export seat on the snapshot's source run
+    (ADR-048 §4): every sink-effect verb the coordinator drives fences on it.
+    """
     identity = compute_audit_export_effect_identity(
         snapshot,
         target_config,
@@ -503,6 +509,7 @@ def execute_audit_export_effect(
     coordinator = SinkEffectCoordinator(
         factory=factory,
         worker_id=worker_id,
+        coordination_token=coordination_token,
         lease_ttl=lease_ttl,
         fault_hook=fault_hook,
         clock=clock,

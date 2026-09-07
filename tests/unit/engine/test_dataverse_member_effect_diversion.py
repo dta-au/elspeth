@@ -32,7 +32,7 @@ from elspeth.engine.executors.sink_effects import (
 from elspeth.plugins.infrastructure.clients.dataverse import DataverseClientError, DataversePageResponse
 from elspeth.plugins.sinks.dataverse import DataverseSink
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 _CONFIG: dict[str, Any] = {
@@ -167,6 +167,7 @@ def test_row_data_error_member_diverts_durably_instead_of_retrying_forever() -> 
             factory=factory,
             worker_id="worker-a",
             lease_ttl=timedelta(minutes=5),
+            coordination_token=leader_token_for(db, run.run_id),
         ).execute(request, sink)
 
         # The group finalized: valid siblings landed, the rejected member did not.
@@ -218,6 +219,7 @@ def test_diverted_member_recovers_from_durable_result_without_repatching() -> No
                 worker_id="worker-a",
                 lease_ttl=timedelta(minutes=5),
                 fault_hook=fail_once,
+                coordination_token=leader_token_for(db, run.run_id),
             ).execute(request, first_sink)
             raise AssertionError("expected the injected fault to interrupt the first execution")
         except SinkEffectInjectedFault:
@@ -229,6 +231,7 @@ def test_diverted_member_recovers_from_durable_result_without_repatching() -> No
             factory=make_factory(db),
             worker_id="worker-a",
             lease_ttl=timedelta(minutes=5),
+            coordination_token=leader_token_for(db, run.run_id),
         ).execute(request, recovered_sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED

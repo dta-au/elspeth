@@ -25,7 +25,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import (
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionRequest
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 
@@ -142,6 +142,7 @@ def test_invalid_member_diverts_during_preparation_while_valid_siblings_continue
             factory=factory,
             worker_id="worker-a",
             lease_ttl=timedelta(minutes=5),
+            coordination_token=leader_token_for(db, run.run_id),
         ).execute(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED
@@ -183,6 +184,7 @@ def test_all_invalid_members_divert_without_wedging_the_batch() -> None:
             factory=factory,
             worker_id="worker-a",
             lease_ttl=timedelta(minutes=5),
+            coordination_token=leader_token_for(db, run.run_id),
         ).execute(request, sink)
 
         assert result.effect.state is SinkEffectState.FINALIZED

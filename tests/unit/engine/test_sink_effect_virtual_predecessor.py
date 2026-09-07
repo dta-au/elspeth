@@ -28,7 +28,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_e
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator
 from elspeth.plugins.sinks._remote_object_effects import RemoteObjectPreconditionError
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members
 from tests.unit.engine.test_sink_effect_executor import _execution_request
@@ -83,7 +83,7 @@ def test_successor_publishes_after_virtual_predecessor_on_absent_target() -> Non
 
         # Batch 1: every record exceeds the size cap and diverts, finalizing a
         # virtual NO_PUBLICATION effect whose artifact carries the empty hash.
-        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[:1]),
             _s3(store, max_record_chars=10),
         )
@@ -96,7 +96,9 @@ def test_successor_publishes_after_virtual_predecessor_on_absent_target() -> Non
         # Batch 2: accepted members must publish cleanly instead of wedging on
         # "declared predecessor remote object is absent".
         successor_factory = make_factory(db, payload_store=payload_store)
-        second = SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
+        second = SinkEffectCoordinator(
+            factory=successor_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)
+        ).execute(
             _execution_request(run_id, sink_id, members[1:]),
             _s3(store),
         )
@@ -124,7 +126,7 @@ def test_successor_replaces_existing_target_after_virtual_predecessor() -> None:
         existing_body = b'[{"id": "existing"}]'
         store.value = _Object(existing_body, '"etag-existing"', {})
 
-        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id)).execute(
             _execution_request(run_id, sink_id, members[:1]),
             _s3(store, max_record_chars=10),
         )
@@ -134,7 +136,9 @@ def test_successor_replaces_existing_target_after_virtual_predecessor() -> None:
         # Batch 2 must not wedge on "declared predecessor bytes do not match
         # remote metadata"; it replaces the object bound to its observed ETag.
         successor_factory = make_factory(db, payload_store=payload_store)
-        second = SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
+        second = SinkEffectCoordinator(
+            factory=successor_factory, worker_id="worker-b", coordination_token=leader_token_for(db, run_id)
+        ).execute(
             _execution_request(run_id, sink_id, members[1:]),
             _s3(store),
         )
@@ -159,7 +163,7 @@ def test_successor_publishes_after_chain_of_virtual_predecessors() -> None:
         factory = make_factory(db, payload_store=payload_store)
         run_id, sink_id, members = _pipeline_members(factory, 3)
         store = _S3Store()
-        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id))
 
         first = coordinator.execute(
             _execution_request(run_id, sink_id, members[:1]),
@@ -206,7 +210,7 @@ def test_real_publication_survives_inherited_no_publication_gap() -> None:
             [{"ordinal": 0}, {"ordinal": 1, "pad": "x" * 100}, {"ordinal": 2}],
         )
         store = _S3Store()
-        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id))
 
         first = coordinator.execute(
             _execution_request(run_id, sink_id, members[:1]),
@@ -287,7 +291,7 @@ def test_reaffirmed_genesis_preserves_predecessor_authority_for_changed_successo
         seed_etag = store.value.etag
         write_operation = "put" if sink_factory is _s3 else "upload"
 
-        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id))
         first = coordinator.execute(
             _execution_request(run_id, sink_id, members[:1]),
             sink_factory(store, overwrite=False),
@@ -336,7 +340,7 @@ def test_foreign_overwrite_after_inherited_gap_fails_predecessor_fence() -> None
             [{"ordinal": 0}, {"ordinal": 1, "pad": "x" * 100}, {"ordinal": 2}],
         )
         store = _S3Store()
-        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a")
+        coordinator = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run_id))
 
         first = coordinator.execute(
             _execution_request(run_id, sink_id, members[:1]),

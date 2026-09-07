@@ -5,7 +5,7 @@ from __future__ import annotations
 from elspeth.contracts import CallType
 from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAttemptRequest
 from elspeth.web.audit_readiness.service import load_sink_effect_diagnostic
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.unit.core.landscape.test_sink_effect_finalization import _prepared
 
 
@@ -22,9 +22,12 @@ def test_web_diagnostic_exposes_no_publication_and_response_loss_without_raw_bod
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=CallType.FILESYSTEM,
                 request_hash="f" * 64,
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
-        factory.execution.sink_effects.mark_response_lost(attempt.attempt_id)
+        factory.execution.sink_effects.mark_response_lost(
+            attempt.attempt_id, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
         diagnostic = load_sink_effect_diagnostic(db, effect.effect_id)
 

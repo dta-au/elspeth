@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 
 from elspeth.contracts import NodeStateStatus, NodeType, PendingOutcome, RoutingMode, TerminalOutcome, TerminalPath, TokenInfo
 from elspeth.contracts.audit import SinkEffect, SinkEffectMemberRecord, TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.diversion import RowDiversion
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -123,6 +124,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             factory=factory,
             worker_id="worker-a",
             sink_effect_fault_hook=fail_once,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
         ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=sink_id)
         with pytest.raises(SinkEffectInjectedFault):
@@ -147,6 +149,7 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             [token],
@@ -250,6 +253,7 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
                 sink_step=1,
                 scheduler_terminalizer=lost_terminalizer,
                 worker_id=leader.worker_id,
+                coordination_token=leader,
             )
 
         assert lost_terminalizer.calls == [(token.token_id,)]
@@ -477,6 +481,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         with pytest.raises(RuntimeError, match="between primary and failsink"):
@@ -515,6 +520,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_primary,  # type: ignore[arg-type]
             [accepted, diverted],
@@ -606,6 +612,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=stop_after_first_primary,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 primary,  # type: ignore[arg-type]
                 [first_token],
@@ -633,6 +640,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-b",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_primary,  # type: ignore[arg-type]
             [first_token, second_token],
@@ -710,6 +718,7 @@ def test_failsink_validation_rejection_terminalizes_states_and_outcomes(tmp_path
                 run.run_id,
                 factory=factory,
                 worker_id="worker-a",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 primary,  # type: ignore[arg-type]
                 [accepted, diverted],
@@ -795,6 +804,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=fail_once,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 first_sink,  # type: ignore[arg-type]
                 tokens[:1],
@@ -816,6 +826,7 @@ def test_retry_with_mixed_interrupted_and_fresh_members_progresses(tmp_path: Pat
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -882,12 +893,12 @@ def test_redrive_after_crash_before_reservation_recovers(
         original_reserve = SinkEffectReservation.reserve
         reserve_calls = 0
 
-        def crash_once(self: SinkEffectReservation, request: object) -> object:
+        def crash_once(self: SinkEffectReservation, request: object, *, coordination_token: CoordinationToken) -> object:
             nonlocal reserve_calls
             reserve_calls += 1
             if reserve_calls == 1:
                 raise RuntimeError("injected crash before sink-effect reservation")
-            return original_reserve(self, request)  # type: ignore[arg-type]
+            return original_reserve(self, request, coordination_token=coordination_token)  # type: ignore[arg-type]
 
         monkeypatch.setattr(SinkEffectReservation, "reserve", crash_once)
 
@@ -901,6 +912,7 @@ def test_redrive_after_crash_before_reservation_recovers(
                 run.run_id,
                 factory=factory,
                 worker_id="worker-a",
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 first_sink,  # type: ignore[arg-type]
                 tokens,
@@ -944,6 +956,7 @@ def test_redrive_after_crash_before_reservation_recovers(
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -1010,6 +1023,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             first_sink,  # type: ignore[arg-type]
             tokens[:2],
@@ -1044,6 +1058,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
                 factory=factory,
                 worker_id="worker-a",
                 sink_effect_fault_hook=fail_once,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             ).write(
                 second_sink,  # type: ignore[arg-type]
                 tokens[2:],
@@ -1066,6 +1081,7 @@ def test_recovery_batch_spanning_effects_keys_dispositions_by_effect_and_ordinal
             run.run_id,
             factory=recovered_factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(recovered_factory, run.run_id),
         ).write(
             recovered_sink,  # type: ignore[arg-type]
             tokens,
@@ -1121,6 +1137,7 @@ def test_all_diverted_primary_finalizes_virtual_no_publication_before_discard(tm
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             sink,  # type: ignore[arg-type]
             [token],
@@ -1173,6 +1190,7 @@ def test_reaffirmed_effect_finalizes_no_publication_without_lease_commit_or_reco
             run.run_id,
             factory=factory,
             worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         ).write(
             sink,  # type: ignore[arg-type]
             [token],
@@ -1248,6 +1266,7 @@ def _executor_for(
         factory=factory,
         worker_id="worker-a",
         sink_effect_fault_hook=fault_hook,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
 
 

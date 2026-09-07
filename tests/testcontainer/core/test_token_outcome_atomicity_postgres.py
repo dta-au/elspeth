@@ -126,7 +126,9 @@ def _reserve_open_effect_operation(factory: RecorderFactory, *, run_id: str, tok
         factory,
         (SinkEffectMemberCandidate(token_id=token_id, row={"value": 1}),),
     )
-    effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members)).new_effect
+    effect = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
     assert effect is not None
     operation = next(item for item in factory.execution.get_operations_for_run(run_id) if item.sink_effect_id == effect.effect_id)
     return operation.operation_id

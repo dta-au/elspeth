@@ -515,29 +515,40 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
     inventory so adding a fenced verb requires adding stale-token evidence.
     """
     expected = {
+        "acquire_lease",
         "adopt_blocked_barrier_item",
         "adopt_group_losses",
+        "begin_attempt",
+        "claim_preparation",
         "complete_barrier",
+        "complete_member_result",
+        "complete_plan",
         "complete_run",
         "create_checkpoint",
         "create_row_with_token",
         "delete_checkpoints",
         "evict_worker",
+        "finalize",
+        "heartbeat_lease",
         "ingest_row_with_initial_claim",
         "mark_pending_sink_terminal",
         "mark_pending_sink_terminal_many",
+        "mark_response_lost",
         "reconcile_source_completions_from_scheduler",
+        "record_attempt_result",
         "record_preflight_results",
         "record_readiness_check",
         "record_run_source",
         "record_secret_resolutions",
         "record_source_field_resolution",
         "recover_expired_leases",
+        "reserve",
         "reset_adoption_marker_to_pending",
         "set_export_failed_unless_completed",
         "set_export_pending_unless_completed",
         "set_export_status",
         "stage_escalation_loss",
+        "takeover_expired",
         "terminalize_pending_sinks_with_terminal_outcomes",
         "update_run_source_contract",
         "update_run_status",
@@ -652,6 +663,54 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "update_run_source_contract": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_run_lifecycle_verb_refused",
+        ),
+        # D8.5 sink-effect family (ADR-048): nine verbs share one parametrized
+        # arm; `reserve` and `finalize` need a real effect to reach the fence
+        # (both validate a witness before the write transaction opens), so
+        # each has its own.
+        "acquire_lease": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "begin_attempt": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "claim_preparation": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "complete_member_result": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "complete_plan": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "heartbeat_lease": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "mark_response_lost": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "record_attempt_result": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "takeover_expired": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_verb_refused",
+        ),
+        "reserve": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_reserve_refused",
+        ),
+        "finalize": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_sink_effect_finalize_refused",
         ),
     }
     assert set(retained_tests) == expected

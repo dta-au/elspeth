@@ -112,7 +112,9 @@ def _reserve_effect_operation(setup: RecorderSetup, *, token_id: str, suffix: st
         setup.factory,
         (SinkEffectMemberCandidate(token_id=token_id, row={"effect": suffix}),),
     )
-    effect = setup.factory.execution.sink_effects.reserve(_pipeline_request(setup.run_id, sink_node_id, members)).new_effect
+    effect = setup.factory.execution.sink_effects.reserve(
+        _pipeline_request(setup.run_id, sink_node_id, members), coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+    ).new_effect
     assert effect is not None
     operations = setup.factory.execution.get_operations_for_run(setup.run_id)
     operation = next(item for item in operations if item.sink_effect_id == effect.effect_id)
