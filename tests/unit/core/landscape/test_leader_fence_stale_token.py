@@ -15,7 +15,9 @@ Fenced verbs covered: ``complete_run``, ``update_run_status``,
 strict F1 arm and the legacy partial-release wrapper arm),
 ``ingest_row_with_initial_claim`` (woken-mid-ingest: atomic rollback, no
 orphan ``rows`` row), the fenced ``create_row_with_token`` arm,
-``recover_expired_leases``,
+``reset_adoption_marker_to_pending`` (the §E.3 crash-window reset: fenced
+because a SECOND takeover deposes a leader still inside ``restore_from_journal``
+— elspeth-ee18e446ff), ``recover_expired_leases``,
 ``terminalize_pending_sinks_with_terminal_outcomes``, and the §C.4 row-7
 per-terminalization-batch fences on ``mark_pending_sink_terminal``/``_many``.
 
@@ -754,6 +756,35 @@ class TestStaleTokenFenceRefusals:
         assert _work_item_row(db, token_id)["status"] == TokenWorkStatus.BLOCKED.value
         assert len(_fence_refusals(db, "complete_barrier")) == 1
 
+    def test_reset_adoption_marker_to_pending_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """elspeth-ee18e446ff: the §E.3 crash-window reset is fenced, not CAS-implied.
+
+        The two-takeover window this refuses: WE took the seat at this epoch and
+        adopted the row, then stalled inside ``restore_from_journal``; our lease
+        lapsed and a successor took over and is adopting. Our own takeover CAS
+        committed before any of that and gates nothing — only the fence can stop
+        the in-flight reset from clearing the successor's markers.
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
+        adoption = repo.adopt_blocked_barrier_item(
+            run_id=RUN_ID,
+            work_item_id=work_item_id,
+            token_id=token_id,
+            barrier_key="b1",
+            membership=None,
+            buffered_outcome=None,
+            coordination_token=token,
+        )
+        assert adoption.barrier_adopted_epoch == token.leader_epoch, "the marker this reset would clear must really be set"
+        adopted_row = _work_item_row(db, token_id)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError):
+            repo.reset_adoption_marker_to_pending(work_item_ids=[work_item_id], coordination_token=token)
+        assert _work_item_row(db, token_id) == adopted_row, "a deposed leader must not reset a live successor's adoption marker"
+        assert len(_fence_refusals(db, "reset_adoption_marker_to_pending")) == 1
+
     def test_recover_expired_leases_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)
         token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner="peer-worker")
@@ -1041,6 +1072,33 @@ class TestValidTokenFenceSemantics:
             ).scalar_one()
         assert after.replace(tzinfo=UTC) > before, "every fenced verb doubles as the seat heartbeat (verify-AND-EXTEND)"
         assert _fence_refusals(db, "create_checkpoint") == []
+
+    def test_reset_adoption_marker_to_pending_clears_the_marker(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The live-token arm: an undeposed leader's §E.3 reset still does its job."""
+        repo = TokenSchedulerRepository(db.engine)
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
+        repo.adopt_blocked_barrier_item(
+            run_id=RUN_ID,
+            work_item_id=work_item_id,
+            token_id=token_id,
+            barrier_key="b1",
+            membership=None,
+            buffered_outcome=None,
+            coordination_token=token,
+        )
+        assert _work_item_row(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
+        reset = repo.reset_adoption_marker_to_pending(work_item_ids=[work_item_id], coordination_token=token)
+        assert reset == 1
+        assert _work_item_row(db, token_id)["barrier_adopted_epoch"] is None, "the row is intake-pending again"
+        assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
+
+    def test_reset_adoption_marker_to_pending_empty_ids_never_reaches_the_fence(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """No ids means no database effect, so a deposed leader is not refused — there is nothing to refuse."""
+        repo = TokenSchedulerRepository(db.engine)
+        _bump_epoch(db)
+        assert repo.reset_adoption_marker_to_pending(work_item_ids=[], coordination_token=token) == 0
+        assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
 
     def test_complete_run_quiescence_predicate_refuses_residual_work(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """§D: a SUCCESS finalize over residual scheduler work is refused in-statement."""

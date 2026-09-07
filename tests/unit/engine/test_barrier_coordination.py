@@ -1029,7 +1029,7 @@ class TestRowUnionRecovery:
 
         scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
             work_item_ids=[row.work_item_id],
-            run_id="run-1",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
         row_union.restore_from_journal.assert_called_once_with(entries=[])
 
@@ -1083,7 +1083,7 @@ class TestRowUnionRecovery:
         row_union.reconcile_released_group.assert_not_called()
         scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
             work_item_ids=[row.work_item_id for row in rows],
-            run_id="run-1",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
         row_union.restore_from_journal.assert_called_once_with(entries=[])
 
@@ -1189,7 +1189,7 @@ class TestRowUnionRecovery:
         assert [call.kwargs["token_ids"] for call in released_calls] == [("tok-control",)]
         scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
             work_item_ids=["wi-tok-treatment"],
-            run_id="run-1",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
         row_union.restore_from_journal.assert_called_once_with(entries=[])
 
@@ -1297,7 +1297,7 @@ class TestRowUnionRecovery:
         scheduler.mark_blocked_barrier_terminal.assert_not_called()
         scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
             work_item_ids=[row.work_item_id],
-            run_id="run-1",
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
         row_union.restore_from_journal.assert_called_once_with(entries=[])
 

@@ -127,7 +127,12 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # D8.1 (elspeth-43ddb79074): e4471634… → e48a6829…, +2 identities: the export seat
 # (acquire_export_leadership / _acquire_export_leadership_on, ADR-048 §4) reads the
 # Landscape clock to judge the lapsed seat it takes. Re-derived from the printed output.
-_CLOCK_BOUNDARY_DIGEST = "e48a68291a14a54a2290ccc0fef344228d0bc2ea337285902595f29e16f26f06"
+# BARRIER-ADOPT (elspeth-ee18e446ff, ADR-030 D4): e48a6829… → ba944a5b…, +1 identity:
+# reset_adoption_marker_to_pending moved off a bare begin_write onto
+# fenced_leader_transaction, and every fence reads the Landscape clock to verify-and-
+# extend the seat — so fencing a verb makes it a clock boundary even when the verb's
+# own UPDATE writes no timestamp. Re-derived from the printed output.
+_CLOCK_BOUNDARY_DIGEST = "ba944a5b536c57c97165469b7d237ef72ccd0c3eb4b3bf24e665bbbcff137c74"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -244,6 +249,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_pending_sink_many"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_terminal"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.adopt_blocked_barrier_item"),
+        ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.reset_adoption_marker_to_pending"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_on"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_with_ready_children"),
