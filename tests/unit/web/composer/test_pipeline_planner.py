@@ -1768,6 +1768,12 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
+    # This tests audit identity, independent of catalog work or scheduling delay.
+    # Deadline enforcement has separate tests that retain the real loop clock.
+    loop = asyncio.get_running_loop()
+    fixed_time = loop.time()
+    monkeypatch.setattr(loop, "time", lambda: fixed_time)
+
     class _MutatingCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs: Any) -> _Response:
             kwargs["messages"][0]["content"] += "\nprovider-side mutation"

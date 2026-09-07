@@ -1,11 +1,14 @@
 """Tests for RAG query construction."""
 
 import os
+from collections.abc import Callable
 from concurrent.futures import Future
+from typing import Any
 
 import pytest
 
 from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.transforms.rag import query as rag_query
 from elspeth.plugins.transforms.rag.query import QueryBuilder
 
 
@@ -24,6 +27,30 @@ def _replace_regex_pool(builder: QueryBuilder, future: Future) -> None:
     assert builder._regex_pool is not None
     builder._regex_pool.shutdown(wait=False)
     builder._regex_pool = _RegexPoolFake(future)
+
+
+class _InlineRegexPool:
+    def submit(self, worker: Callable[..., Any], *args: object) -> Future:
+        future = Future()
+        try:
+            future.set_result(worker(*args))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+
+@pytest.fixture
+def regex_semantics_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests check extraction policy with the real regex worker. Process
+    # startup must not consume their regex budget under CI contention. Real
+    # isolation, backtracking timeout and pool lifecycle have separate tests.
+    def make_pool(**_kwargs: object) -> _InlineRegexPool:
+        return _InlineRegexPool()
+
+    monkeypatch.setattr(rag_query, "ProcessPoolExecutor", make_pool)
 
 
 # =============================================================================
@@ -134,7 +161,7 @@ class TestTemplateMode:
 
 
 class TestRegexMode:
-    def test_captures_first_group(self):
+    def test_captures_first_group(self, regex_semantics_pool):
         builder = QueryBuilder(
             query_field="text",
             query_pattern=r"issue:\s*(.+?)(?:\n|$)",
@@ -142,7 +169,7 @@ class TestRegexMode:
         result = builder.build({"text": "issue: payment failed\nother stuff"})
         assert result.query == "payment failed"
 
-    def test_full_match_when_no_groups(self):
+    def test_full_match_when_no_groups(self, regex_semantics_pool):
         builder = QueryBuilder(
             query_field="text",
             query_pattern=r"\w+@\w+\.\w+",
@@ -150,7 +177,7 @@ class TestRegexMode:
         result = builder.build({"text": "contact user@example.com for help"})
         assert result.query == "user@example.com"
 
-    def test_no_match_returns_error(self):
+    def test_no_match_returns_error(self, regex_semantics_pool):
         builder = QueryBuilder(
             query_field="text",
             query_pattern=r"issue:\s*(.+)",
@@ -159,7 +186,7 @@ class TestRegexMode:
         assert result.error is not None
         assert result.error["reason"] == "no_regex_match"
 
-    def test_non_participating_group_returns_error(self):
+    def test_non_participating_group_returns_error(self, regex_semantics_pool):
         """Optional capture group that didn't participate."""
         builder = QueryBuilder(
             query_field="text",

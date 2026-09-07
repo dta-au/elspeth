@@ -914,7 +914,10 @@ class TestShippedExamples:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=120,
+            # The launcher now runs five audited pipelines, each with a fresh
+            # CLI process. Preserve the former single-pipeline budget per run;
+            # 120 seconds total can expire during healthy progress under CI load.
+            timeout=5 * 120,
             check=False,
             env=launcher_env,
         )

@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from datetime import UTC, datetime, timedelta
 from itertools import count
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import Connection, func, select
 
 from elspeth.contracts import RunStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError
@@ -19,6 +20,7 @@ from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.data_flow import tokens as data_flow_tokens
 from elspeth.core.landscape.scheduler import barrier as scheduler_barrier
+from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions
 from elspeth.core.landscape.scheduler import queue as scheduler_queue
 from elspeth.core.landscape.scheduler import work_items as scheduler_work_items
 from elspeth.core.landscape.schema import (
@@ -186,6 +188,18 @@ def _install_repeat_run_identity_order(monkeypatch: pytest.MonkeyPatch, *, rever
     monkeypatch.setattr(scheduler_queue, "make_work_item_id", work_item_id)
     monkeypatch.setattr(scheduler_barrier, "make_work_item_id", work_item_id)
     monkeypatch.setattr(scheduler_work_items, "work_item_id", work_item_id)
+
+    def ordered_ready_values(**kwargs: Any) -> dict[str, object]:
+        values = scheduler_work_items.ready_work_item_values(**kwargs)
+        # Claims sort by created_at before work_item_id. SQLite stamps whole
+        # seconds, so a wall-clock tick between siblings would defeat the ID
+        # order above. Pin only the ordering key; availability and leases keep
+        # using database time. Barrier releases retain their emission ordering.
+        values["created_at"] = datetime(2020, 1, 1, tzinfo=UTC)
+        return values
+
+    monkeypatch.setattr(scheduler_queue, "ready_work_item_values", ordered_ready_values)
+    monkeypatch.setattr(scheduler_dispositions, "ready_work_item_values", ordered_ready_values)
 
 
 def _archive_repeat_run_files(case: HarnessCaseSpec, runtime_root: Path) -> Path:
@@ -651,6 +665,32 @@ def test_b2_composed_coalesces_raw_identity_converges_across_equivalent_runs(
     assert first_projection is not None and second_projection is not None
     assert _coalesce_contexts(first_projection) != _coalesce_contexts(second_projection)
     assert first_projection != second_projection
+
+
+def test_b2_composed_coalesces_identity_survives_enqueue_clock_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_identity_order = _install_repeat_run_identity_order
+    runs = count()
+
+    def install_with_different_clock_ticks(monkeypatch: pytest.MonkeyPatch, *, reverse: bool) -> None:
+        install_identity_order(monkeypatch, reverse=reverse)
+        run_index = next(runs)
+        ticks = count()
+
+        def enqueue_clock(_conn: Connection) -> datetime:
+            # First run ties every timestamp; the second crosses a SQLite
+            # second boundary on every read. Keep work eligible for live claims.
+            return datetime(2020, 1, 1, tzinfo=UTC) + timedelta(seconds=next(ticks) if run_index else 0)
+
+        monkeypatch.setattr(scheduler_queue, "read_landscape_transaction_time", enqueue_clock)
+        monkeypatch.setattr(scheduler_dispositions, "read_landscape_transaction_time", enqueue_clock)
+
+    monkeypatch.setattr(f"{__name__}._install_repeat_run_identity_order", install_with_different_clock_ticks)
+    test_b2_composed_coalesces_identical_arrival_order_has_identical_raw_identity(
+        "parallel-coalesces", "two-parallel-require-all", tmp_path, monkeypatch
+    )
 
 
 def _copy_composed_coalesce_fixture(
