@@ -257,6 +257,37 @@ class TestFatalIntegrityLatch:
         with pytest.raises(AuditIntegrityError, match="registry row vanished"):
             thread.check_and_raise()
 
+    @pytest.mark.parametrize("first_tier1", [True, False])
+    @pytest.mark.parametrize("first_degraded", [True, False])
+    @pytest.mark.parametrize("second_degraded", [True, False])
+    def test_first_fatal_identity_survives_later_failure(
+        self, first_tier1: bool, first_degraded: bool, second_degraded: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        first = AuditIntegrityError("first failure") if first_tier1 else RuntimeError("first failure")
+        later = RuntimeError("later failure") if first_tier1 else AuditIntegrityError("later failure")
+        repo = _StubRepo()
+        if first_degraded:
+            repo.side_effect = OperationalError("locked", None, None)
+            repo.degraded_exception = first
+        else:
+            repo.side_effect = first
+        thread = _make_thread(repo, degraded_threshold=1)
+        thread._step_beat()
+
+        if second_degraded:
+            repo.side_effect = OperationalError("locked", None, None)
+            repo.degraded_exception = later
+        else:
+            repo.side_effect = later
+        thread._step_beat()
+
+        with pytest.raises(type(first)) as raised:
+            thread.check_and_raise()
+        assert raised.value is first
+        assert any(record.exc_info is not None and record.exc_info[1] is later for record in caplog.records)
+
     def test_unexpected_exception_is_latched_and_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         """Programming errors reach the drain without killing the beat thread."""
         import logging

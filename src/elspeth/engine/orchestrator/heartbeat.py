@@ -258,6 +258,17 @@ class RunHeartbeatThread:
         if not self._skip_final_beat_event.is_set() and not self._coordination_lost_event.is_set():
             self._beat_once()
 
+    def _capture_fatal(self, exc: Exception) -> None:
+        """Publish the first fatal cause; later failures keep their own logs.
+
+        Only the beat thread writes this latch. The drain reads the exception
+        after the event is set, so its identity cannot change between the
+        publication check and the raise, even when another beat fails.
+        """
+        if not self._fatal_event.is_set():
+            self._fatal_exc = exc
+            self._fatal_event.set()
+
     def _beat_once(self) -> None:
         """Execute one heartbeat tick; NEVER raises.
 
@@ -335,8 +346,7 @@ class RunHeartbeatThread:
             # (elspeth-d0ce4e12af). The thread never raises on its own stack:
             # latch the exception and let check_and_raise() surface it at the
             # next drain boundary.
-            self._fatal_exc = exc
-            self._fatal_event.set()
+            self._capture_fatal(exc)
             logger.error(
                 "run_heartbeat: Tier-1 integrity failure for worker %r in run %r — failing closed at next drain boundary",
                 self._token.worker_id,
@@ -359,8 +369,7 @@ class RunHeartbeatThread:
         except Exception as exc:
             # Keep the heartbeat thread alive while making the owned-contract
             # failure authoritative at the next drain boundary.
-            self._fatal_exc = exc
-            self._fatal_event.set()
+            self._capture_fatal(exc)
             logger.error(
                 "run_heartbeat: unexpected error for worker %r in run %r — failing closed at next drain boundary",
                 self._token.worker_id,
@@ -385,8 +394,7 @@ class RunHeartbeatThread:
             # Programming and Tier-1 failures are not DB availability. The
             # caller is an exception handler, so re-raising here would kill
             # the beat thread instead of notifying its owner.
-            self._fatal_exc = exc
-            self._fatal_event.set()
+            self._capture_fatal(exc)
             logger.error("run_heartbeat: degraded event invariant failed", exc_info=exc)
 
     # ------------------------------------------------------------------
