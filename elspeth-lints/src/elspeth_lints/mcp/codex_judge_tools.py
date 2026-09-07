@@ -43,6 +43,13 @@ _SEARCH_EXCLUDED_DIRS = frozenset(
         ".mypy_cache",
         ".ruff_cache",
         ".hypothesis",
+        ".uv-cache",
+        ".e2e-data",
+        ".scratch",
+        ".weft",
+        ".benchmarks",
+        ".playwright-cli",
+        ".playwright-mcp",
     }
 )
 _SENSITIVE_ENV_NAMES = frozenset(

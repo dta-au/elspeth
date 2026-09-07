@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import elspeth_lints.mcp.codex_judge_tools as judge_tools
 from elspeth_lints.core.judge import AgentToolScope, build_readonly_tool_scope
 from elspeth_lints.mcp.codex_judge_tools import (
     _glob_files,
@@ -138,3 +139,45 @@ def test_whole_checkout_reader_keeps_secret_and_escape_guards(tmp_path: Path) ->
             _read_file(scope, {"file_path": path})
     assert json.loads(_grep_files(scope, {"pattern": "outside_evidence", "output_mode": "count"}))["count"] == 0
     assert json.loads(_glob_files(scope, {"pattern": "**/*"}))["files"] == []
+
+
+def test_tooling_artifacts_cannot_spend_the_codebase_search_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "src" / "elspeth"
+    source.mkdir(parents=True)
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=tmp_path / "config")
+    artifacts = (
+        ".mypy_cache",
+        ".uv-cache",
+        ".hypothesis",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".e2e-data",
+        ".scratch",
+        ".weft",
+        ".benchmarks",
+        ".playwright-cli",
+        ".playwright-mcp",
+    )
+    for directory in artifacts:
+        artifact = tmp_path / directory / "generated.txt"
+        artifact.parent.mkdir()
+        artifact.write_text("generated runtime evidence\n")
+    evidence = (
+        ".github/workflows/ci.yaml",
+        ".agents/skills/review/SKILL.md",
+        ".githooks/pre-commit",
+        ".claude/commands/review.md",
+        "src/elspeth/control.py",
+        "tests/unit/test_control.py",
+    )
+    for name in evidence:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("current code evidence\n")
+    monkeypatch.setattr(judge_tools, "_MAX_SCANNED_FILES", len(evidence) + 1)
+    result = json.loads(_grep_files(scope, {"pattern": "current code evidence", "output_mode": "files_with_matches"}))
+    assert result["files"] == sorted(str(tmp_path / name) for name in evidence)
+    assert result["scanned_files"] == len(evidence)
+    assert result["truncated"] is False
+    # Artifact exclusion is a search default, not a new read prohibition.
+    assert _read_file(scope, {"file_path": ".scratch/generated.txt"}) == "1: generated runtime evidence"
