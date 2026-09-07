@@ -50,6 +50,9 @@ export const SSO_FAILURE_MESSAGES = {
   sso_userinfo_invalid: "Single sign-on failed. Please try again.",
   sso_identity_disabled: "This account has been disabled. Contact an administrator.",
   sso_access_pending: "Your access is awaiting approval by an administrator.",
+  // R3. Deliberately says nothing about which address changed: whoever holds
+  // this subject now may not be the person the old address belonged to.
+  sso_identity_rebound: "This account needs an administrator's attention before you can sign in.",
   sso_handoff_invalid: "Single sign-on failed. Please try again.",
   provider_unavailable: "The identity provider is unavailable. Please try again later.",
 } as const;

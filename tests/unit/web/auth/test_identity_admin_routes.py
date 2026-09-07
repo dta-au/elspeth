@@ -169,6 +169,7 @@ def _pending(harness: _Harness, username: str) -> str:
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
         record_admission=lambda *_args: None,
+        record_rebound=lambda *_args: None,
     )
     assert outcome.record.access_state == "pending"
     return outcome.record.identity_id
@@ -181,6 +182,7 @@ def _active(harness: _Harness, username: str) -> str:
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
         record_admission=lambda *_args: None,
+        record_rebound=lambda *_args: None,
     )
     assert outcome.record.access_state == "active"
     return outcome.record.identity_id

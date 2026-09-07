@@ -23,7 +23,12 @@ from elspeth.web.auth.session_token import (
     LOCAL_AUDIENCE,
     SessionTokenIssuer,
 )
-from elspeth.web.coordination.identity_authority import IdentityRetired, RepositoryIdentityAuthority, local_identity_retirer
+from elspeth.web.coordination.identity_authority import (
+    IdentityRebound,
+    IdentityRetired,
+    RepositoryIdentityAuthority,
+    local_identity_retirer,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -140,6 +145,11 @@ def build_local_auth_provider(
         # exercise the Landscape retirement row that app.py records.
         return None
 
+    def _record_no_rebound(_outcome: IdentityRebound) -> None:
+        # Same decision again, and unreachable besides: this fixture is the
+        # LOCAL provider, which R3 excludes.
+        return None
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         return authority.ensure_identity(
             claims=claims,
@@ -147,6 +157,7 @@ def build_local_auth_provider(
             quota_tokens_per_day=quota_tokens_per_day,
             quota_storage_bytes=quota_storage_bytes,
             record_admission=_record_nothing,
+            record_rebound=_record_no_rebound,
         )
 
     return LocalAuthProvider(

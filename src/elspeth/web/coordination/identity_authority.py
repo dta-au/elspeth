@@ -101,6 +101,12 @@ _SERVICE_ROLES: Final = frozenset({"admin", "oversight"})
 # R7: the ancestor walk is bounded; a chain this long is refused as unprovable.
 _ANCESTOR_WALK_BOUND: Final = 64
 _LIST_LIMIT_MAX: Final = 200
+# R3/D32: the ``disable_reason`` an automatic rebound disable writes.  Named
+# rather than spelled at each site because ``enable_identity`` DISPATCHES on
+# it -- re-enabling a rebound is the one re-enable that rebases the identity's
+# email baseline -- and a literal that drifts between the writer and the
+# reader would silently stop rebasing and re-trip R3 on the next login.
+REBOUND_DISABLE_REASON: Final = "rebound"
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +234,19 @@ class RelationshipAlreadyRevoked(IdentityAuthorityRefusal):
 # ---------------------------------------------------------------------------
 
 
+@final
+class _AdminLockRequired(Exception):
+    """Attempt 1 discovered it needs a lock it may not take in this order.
+
+    PRIVATE CONTROL FLOW, never an outcome.  Raised and caught inside
+    ``ensure_identity``, which retries exactly once with the admin population
+    locked first; it is deliberately NOT an :class:`IdentityAuthorityRefusal`,
+    so no route's refusal handler can catch it and no caller can be handed it
+    as an error.  Carries no payload: attempt 2 re-reads everything under the
+    correct locks rather than trusting what attempt 1 saw before rolling back.
+    """
+
+
 def _require_nonblank(value: object, field_name: str) -> None:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{field_name} must be a nonblank exact string")
@@ -352,6 +371,31 @@ class IdentityDisabled:
     revoked_relationships: tuple[RelationshipEdge, ...]
     on_behalf_of: str | None
     console_request_id: str | None
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IdentityRebound:
+    """R3 saw the verified email behind a provider subject change, and disabled the row.
+
+    ``(provider, subject)`` is the identity key, so a provider that recycles
+    or re-points a subject hands its next holder this row's roles,
+    relationships and quota.  ``subject_email_at_first_seen`` is the baseline
+    that makes the change visible; this is what was found when it stopped
+    matching.
+
+    Constructed ONLY when the identity was actually disabled.  R5's carve-out
+    -- the last active human admin, where a disable would brick the container
+    into C2's lockout -- refuses the login and leaves the row ``active``, and
+    an ``identity_disabled`` event for it would assert a disable that did not
+    happen.  That case is audited by the ``auth_failure`` row the refused
+    login writes, carrying category ``sso_identity_rebound``.
+    """
+
+    record: IdentityRecord
+    previous_email: str
+    current_email: str
+    rebound_at: datetime
 
 
 @final
@@ -748,6 +792,38 @@ def _active_human_admin_count(holder_rows: Sequence[Any], now: datetime) -> int:
     return len({row.identity_id for row in holder_rows if _is_active(row.expires_at, row.revoked_at, now)})
 
 
+def _normalised_email(value: str) -> str:
+    """Compare addresses the way a person reads them, not byte for byte.
+
+    A provider that re-cases or pads an address has not rebound the subject,
+    and R3's consequence is a lockout: a false positive there costs someone
+    their access over a display change.  The domain is case-insensitive by
+    RFC and the local part is case-sensitive in principle only -- no IdP
+    issues two addresses that differ by case alone.
+    """
+    return value.strip().casefold()
+
+
+def _rebound_pair(*, baseline: str | None, current: str | None) -> tuple[str, str] | None:
+    """``(baseline, current)`` when ``current`` is a REBOUND of it, otherwise ``None``.
+
+    Three ways to be no rebound, each a real case rather than a defensive
+    guard: a row with no baseline has nothing to compare (a pre-provisioned
+    identity nobody has logged into yet -- the caller adopts one instead), a
+    login carrying no verified email is an ABSENT email rather than a changed
+    one, and a re-cased address is the same address.
+
+    Returning the PAIR rather than the new address is what lets the caller
+    name both without a fallback: a rebound cannot exist without a baseline,
+    and an ``or ""`` there would be unreachable code standing in for a proof.
+    """
+    if baseline is None or current is None:
+        return None
+    if _normalised_email(current) == _normalised_email(baseline):
+        return None
+    return (baseline, current)
+
+
 def _verified_actor(actor: IdentityAdminActor, actor_row: Any, actor_grants: Sequence[RoleGrant]) -> _VerifiedActor:
     """Refuse anything short of live admin authority, from the actor's row as re-read in the transaction."""
     if actor_row is None or actor_row.access_state != "active":
@@ -1028,6 +1104,7 @@ class RepositoryIdentityAuthority:
         quota_tokens_per_day: int | None,
         quota_storage_bytes: int | None,
         record_admission: RecordAdmission,
+        record_rebound: Callable[[IdentityRebound], None],
     ) -> EnsureIdentityOutcome:
         """Resolve ``(provider, subject)`` to its identity row, creating it once.
 
@@ -1052,18 +1129,57 @@ class RepositoryIdentityAuthority:
         measurement.  The residual is chosen deliberately: an over-recorded
         activation is a visible contradiction, an under-recorded one is
         invisible.
+
+        THIS IS ALSO R3's ENFORCEMENT POINT.  Every IdP login passes through
+        here holding both the stored ``subject_email_at_first_seen`` and the
+        email this login verified, under the target row's lock -- so it is
+        where a rebound can be noticed atomically with the row it concerns.
+        ``record_rebound`` fires inside the transaction under the same rule as
+        ``record_admission``, and is invoked ONLY when the identity was
+        actually disabled: R5's carve-out refuses the login without a state
+        change, and an ``identity_disabled`` event there would assert a
+        disable that did not happen.  Read ``rebound_refused`` on the outcome
+        rather than the returned ``access_state``; the two come apart exactly
+        in that carve-out.
         """
         claims = _require_claims(claims)
         if type(activate) is not bool:
             raise TypeError("activate must be a bool")
         try:
-            return self._ensure_identity_once(
-                claims=claims,
-                activate=activate,
-                quota_tokens_per_day=quota_tokens_per_day,
-                quota_storage_bytes=quota_storage_bytes,
-                record_admission=record_admission,
-            )
+            try:
+                return self._ensure_identity_once(
+                    claims=claims,
+                    activate=activate,
+                    quota_tokens_per_day=quota_tokens_per_day,
+                    quota_storage_bytes=quota_storage_bytes,
+                    record_admission=record_admission,
+                    record_rebound=record_rebound,
+                    lock_admin_population=False,
+                )
+            except _AdminLockRequired:
+                # R3 found a rebound on an identity holding deployment admin.
+                # Disabling it can lower R5's count, and that class of
+                # mutation must take the admin population BEFORE its own
+                # target row or two of them deadlock on each other's target
+                # (see _ADMIN_HOLDER_ROWS_FOR_UPDATE).  Attempt 1 already
+                # held the target, so its lock order was wrong and it rolled
+                # back having written nothing.  Retry with the population
+                # first.
+                #
+                # EXACTLY ONCE, and the bound is structural rather than a
+                # counter: attempt 2 passes ``lock_admin_population=True``,
+                # and that is the only branch that raises this.  A second
+                # raise is therefore unreachable rather than merely unlikely,
+                # so there is no loop here to livelock.
+                return self._ensure_identity_once(
+                    claims=claims,
+                    activate=activate,
+                    quota_tokens_per_day=quota_tokens_per_day,
+                    quota_storage_bytes=quota_storage_bytes,
+                    record_admission=record_admission,
+                    record_rebound=record_rebound,
+                    lock_admin_population=True,
+                )
         except IntegrityError:
             # WE LOST THE RACE.  Our transaction is fully rolled back, so if a
             # row for this natural key exists now, another login inserted it
@@ -1086,6 +1202,11 @@ class RepositoryIdentityAuthority:
             # ``activated_now`` is False and ``record_admission`` does NOT
             # fire: the winner wrote the activation pair, and a second one
             # would claim an administrator acted twice.
+            #
+            # ``rebound_refused`` is False for the same reason it is not
+            # re-evaluated here: this path exists because the row was created
+            # by another writer moments ago, so its baseline was taken from
+            # the very claims in hand and cannot already disagree with them.
             return EnsureIdentityOutcome(
                 record=IdentityRecord(
                     identity_id=winner.identity_id,
@@ -1097,6 +1218,7 @@ class RepositoryIdentityAuthority:
                 created=False,
                 activated_now=False,
                 quota_written=False,
+                rebound_refused=False,
             )
 
     def _ensure_identity_once(
@@ -1107,10 +1229,22 @@ class RepositoryIdentityAuthority:
         quota_tokens_per_day: int | None,
         quota_storage_bytes: int | None,
         record_admission: RecordAdmission,
+        record_rebound: Callable[[IdentityRebound], None],
+        lock_admin_population: bool,
     ) -> EnsureIdentityOutcome:
-        """One attempt.  Raises ``IntegrityError`` when another writer wins."""
+        """One attempt.  Raises ``IntegrityError`` when another writer wins.
+
+        ``lock_admin_population`` is attempt 2's flag, never a caller's
+        choice: it takes R5's population lock BEFORE the target row, which is
+        the order R3's disable needs and the order every login would pay for
+        if this were unconditional.  Attempt 1 runs without it and raises
+        :class:`_AdminLockRequired` if it turns out to be needed.
+        """
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            # FIRST, when taken at all -- before the target row, per the
+            # constant's ordering rule.
+            admin_holders = conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all() if lock_admin_population else None
             existing = conn.execute(
                 _IDENTITY_BY_NATURAL_KEY_FOR_UPDATE, {"provider": claims.provider, "subject": claims.subject}
             ).one_or_none()
@@ -1147,25 +1281,165 @@ class RepositoryIdentityAuthority:
                     created=True,
                     activated_now=activate,
                     quota_written=quota_written,
+                    # A row created THIS transaction took its baseline from
+                    # the claims in hand, so it cannot already disagree with
+                    # them. R3 has nothing to compare on a first sight.
+                    rebound_refused=False,
                 )
 
+            bound = _record_from_row(existing)
+            # ---- R3 (spec §Refusals): did the email behind this subject change?
+            #
+            # ``(provider, subject)`` is the identity key, so a provider that
+            # recycles or re-points a subject would otherwise hand its next
+            # holder this row's roles, relationships and quota in silence.
+            # ``subject_email_at_first_seen`` exists to make that visible.
+            #
+            # LOCAL AUTH IS EXCLUDED, and not as an optimisation.  Its subject
+            # IS the username, and freeing a username RETIRES its identity
+            # (``retire_identity``), so there is no recycling here to catch --
+            # while a local user who changes their email address would trip
+            # this on their next login and lock themselves out.  R3 is about a
+            # subject some IdP controls.
+            #
+            # An ALREADY-DISABLED row is skipped: there is nothing left to
+            # disable, ``admit`` refuses it anyway, and re-firing would restamp
+            # ``rebound_at`` on every attempt with a moment nothing was
+            # observed at.
+            baseline = _parsed_optional_text(
+                existing.subject_email_at_first_seen, identity_id=bound.identity_id, column="subject_email_at_first_seen"
+            )
+            considered = claims.provider != "local" and bound.access_state != "disabled"
+            rebound = _rebound_pair(baseline=baseline, current=claims.email) if considered else None
+
+            if rebound is None:
+                if considered and baseline is None and claims.email is not None:
+                    # ADOPT rather than trip.  A pre-provisioned row that
+                    # nobody has logged into has no baseline, and leaving it
+                    # NULL would exempt that identity from R3 forever -- the
+                    # admitted-in-advance cohort is exactly who an operator
+                    # thought about hardest.  Its first sight of a verified
+                    # email is now.
+                    conn.execute(
+                        update(identities_table)
+                        .where(identities_table.c.identity_id == bound.identity_id)
+                        .values(last_login_at=now, username=claims.username, subject_email_at_first_seen=claims.email)
+                    )
+                else:
+                    conn.execute(
+                        update(identities_table)
+                        .where(identities_table.c.identity_id == bound.identity_id)
+                        .values(last_login_at=now, username=claims.username)
+                    )
+                return EnsureIdentityOutcome(
+                    record=IdentityRecord(
+                        identity_id=bound.identity_id,
+                        provider=bound.provider,
+                        subject=bound.subject,
+                        username=claims.username,
+                        access_state=bound.access_state,
+                    ),
+                    created=False,
+                    activated_now=False,
+                    quota_written=False,
+                    rebound_refused=False,
+                )
+
+            # R5's carve-out.  Disabling the LAST active human admin over a
+            # rebound would brick the container into C2's lockout, which is a
+            # worse outcome than the one R3 is closing -- so that row keeps
+            # its state and only the login is refused.  Every other admin IS
+            # disabled, and that write can lower R5's count, so it needs the
+            # population lock attempt 1 may not take in this order.
+            # ``kind == "human"`` mirrors ``disable_identity``: R5 counts
+            # HUMAN admins, so a service identity is never protected -- that
+            # asymmetry is the container-sovereignty property. Without the
+            # term, a service row holding ``admin`` in a container with no
+            # human admin would satisfy ``count <= 1`` and be spared.
+            #
+            # UNREACHABLE TODAY, and deliberately kept: a service row is
+            # ``provider='service'``, which is not in ``AuthProviderType``, so
+            # no login's natural key can resolve to one. There is no test for
+            # it because a test would have to fabricate a row this code path
+            # cannot otherwise reach. It stays because it makes the predicate
+            # SAY what R5 means, rather than be accidentally right via a
+            # Literal enforced three layers away.
+            r5_protected = False
+            target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": bound.identity_id}).all(), now)
+            if existing.kind == "human" and _holds_deployment_admin(target_grants):
+                if admin_holders is None:
+                    raise _AdminLockRequired
+                r5_protected = _active_human_admin_count(admin_holders, now) <= 1
+
+            if r5_protected:
+                # ``rebound_at`` is still stamped: the observation happened,
+                # and an admin reading this row must see it. No
+                # ``identity_disabled`` event -- see IdentityRebound.
+                conn.execute(
+                    update(identities_table)
+                    .where(identities_table.c.identity_id == bound.identity_id)
+                    .values(last_login_at=now, username=claims.username, email=claims.email, rebound_at=now)
+                )
+                return EnsureIdentityOutcome(
+                    record=IdentityRecord(
+                        identity_id=bound.identity_id,
+                        provider=bound.provider,
+                        subject=bound.subject,
+                        username=claims.username,
+                        access_state=bound.access_state,
+                    ),
+                    created=False,
+                    activated_now=False,
+                    quota_written=False,
+                    rebound_refused=True,
+                )
+
+            # D32: state, not just a refused login.  Refusing the login alone
+            # leaves outstanding tokens refreshing for the whole refresh
+            # chain, and that window is what R3 exists to close.  The actor is
+            # ``system`` -- no administrator decided this -- so
+            # ``disabled_by_identity_id`` stays NULL, and the org-tree
+            # revocation cascade does NOT run: edge revocation is
+            # unrecoverable and this fires most often on a marriage or a
+            # rename.
             conn.execute(
                 update(identities_table)
-                .where(identities_table.c.identity_id == existing.identity_id)
-                .values(last_login_at=now, username=claims.username)
-            )
-            bound = _record_from_row(existing)
-            return EnsureIdentityOutcome(
-                record=IdentityRecord(
-                    identity_id=bound.identity_id,
-                    provider=bound.provider,
-                    subject=bound.subject,
+                .where(identities_table.c.identity_id == bound.identity_id)
+                .values(
+                    last_login_at=now,
                     username=claims.username,
-                    access_state=bound.access_state,
-                ),
+                    email=claims.email,
+                    rebound_at=now,
+                    access_state="disabled",
+                    disabled_at=now,
+                    disabled_by_identity_id=None,
+                    disable_reason=REBOUND_DISABLE_REASON,
+                )
+            )
+            disabled_record = IdentityRecord(
+                identity_id=bound.identity_id,
+                provider=bound.provider,
+                subject=bound.subject,
+                username=claims.username,
+                access_state="disabled",
+            )
+            # Inside the transaction, like the admission pair: a disable this
+            # trail cannot hold does not commit.
+            previous_email, current_email = rebound
+            record_rebound(
+                IdentityRebound(
+                    record=disabled_record,
+                    previous_email=previous_email,
+                    current_email=current_email,
+                    rebound_at=now,
+                )
+            )
+            return EnsureIdentityOutcome(
+                record=disabled_record,
                 created=False,
                 activated_now=False,
                 quota_written=False,
+                rebound_refused=True,
             )
 
     def retire_identity(
@@ -1530,11 +1804,43 @@ class RepositoryIdentityAuthority:
                 raise IdentityNotFound()
             if row.access_state != "disabled":
                 raise IdentityNotDisabled()
-            conn.execute(
-                update(identities_table)
-                .where(identities_table.c.identity_id == identity_id)
-                .values(access_state="active", disabled_at=None, disabled_by_identity_id=None, disable_reason=None)
-            )
+            if _parsed_optional_text(row.disable_reason, identity_id=identity_id, column="disable_reason") == REBOUND_DISABLE_REASON:
+                # R3's third binding: re-enabling a REBOUND rebases the
+                # baseline to the email that tripped it, or the very next
+                # login compares against the old address and disables the
+                # identity again, forever.  ``email`` is that address --
+                # the rebound write refreshed it, and a disabled row takes no
+                # further login writes.
+                #
+                # ``rebound_at`` is cleared with it.  It records the moment a
+                # comparison stopped matching, and rebasing the baseline ends
+                # that comparison; leaving the stamp would tell the next
+                # reader an unresolved rebound is outstanding when the
+                # administrator has just resolved it.  The history is in
+                # ``auth_events`` -- the ``identity_disabled`` row and this
+                # ``identity_enabled`` row -- which is where history belongs.
+                #
+                # Scoped to this reason on purpose: an ordinary administrative
+                # re-enable must NOT silently adopt whatever address the row
+                # currently carries as the trusted baseline.
+                conn.execute(
+                    update(identities_table)
+                    .where(identities_table.c.identity_id == identity_id)
+                    .values(
+                        access_state="active",
+                        disabled_at=None,
+                        disabled_by_identity_id=None,
+                        disable_reason=None,
+                        subject_email_at_first_seen=row.email,
+                        rebound_at=None,
+                    )
+                )
+            else:
+                conn.execute(
+                    update(identities_table)
+                    .where(identities_table.c.identity_id == identity_id)
+                    .values(access_state="active", disabled_at=None, disabled_by_identity_id=None, disable_reason=None)
+                )
             outcome = IdentityEnabled(
                 record=_record_from_row(row, access_state="active"),
                 actor_identity_id=verified.identity_id,
