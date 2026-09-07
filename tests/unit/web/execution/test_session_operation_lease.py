@@ -42,7 +42,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine, event, func, select
 from starlette.requests import Request
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.core.events import EventBus
 from elspeth.engine.orchestrator.core import Orchestrator
 from elspeth.web.async_workers import run_sync_in_worker
@@ -131,6 +131,7 @@ class _ControllableAuthority:
         self.release_calls: list[SessionOperationContext] = []
         self.renew_called = threading.Event()
         self.renew_error: BaseException | None = None
+        self.release_error: BaseException | None = None
 
     def compare_and_swap(self, context: SessionOperationContext) -> None:
         assert context is self.context
@@ -153,6 +154,8 @@ class _ControllableAuthority:
         self.release_calls.append(context)
         self.release_called.set()
         assert self.release_allowed.wait(timeout=2)
+        if self.release_error is not None:
+            raise self.release_error
 
 
 class _BlockedRenewalAuthority:
@@ -785,6 +788,45 @@ async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
     await asyncio.wait_for(shutdown, timeout=2)
     assert lease.closed
     assert authority.release_calls == [lease.context]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
+@pytest.mark.parametrize("peer_fails", [False, True])
+async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(error_type: type[Exception], peer_fails: bool) -> None:
+    service, _session_service, executor = _execution_service(asyncio.get_running_loop())
+    failed_lease, failed_authority = await _real_lease(_context(uuid4()))
+    cleanup_error = error_type("authority release failure")
+    failed_authority.release_error = cleanup_error
+    failed_authority.release_allowed.set()
+    worker: Future[object] = Future()
+    worker.set_result(None)
+    service._on_pipeline_done(cast(Any, worker), session_operation_lease=failed_lease)
+    with service._shutdown_events_lock:
+        failed_completion = next(iter(service._lease_completion_futures))
+    with pytest.raises(error_type) as completed_failure:
+        await asyncio.wait_for(asyncio.wrap_future(failed_completion), timeout=2)
+    assert completed_failure.value is cleanup_error
+
+    peer_lease, peer_authority = await _real_lease(_context(uuid4()))
+    peer_error = OSError("peer authority release unavailable")
+    if peer_fails:
+        peer_authority.release_error = peer_error
+    service._on_pipeline_done(cast(Any, worker), session_operation_lease=peer_lease)
+    await asyncio.wait_for(asyncio.to_thread(peer_authority.release_called.wait, 2), timeout=2)
+    shutdown = asyncio.create_task(service.shutdown())
+    try:
+        await asyncio.wait_for(asyncio.to_thread(executor.shutdown_started.wait, 2), timeout=2)
+        await asyncio.sleep(0)
+        assert not shutdown.done(), "a failed cleanup must not abandon a peer's authority release"
+    finally:
+        peer_authority.release_allowed.set()
+        with pytest.raises(ExceptionGroup) as shutdown_failure:
+            await asyncio.wait_for(shutdown, timeout=2)
+    expected_errors = {cleanup_error, peer_error} if peer_fails else {cleanup_error}
+    assert set(shutdown_failure.value.exceptions) == expected_errors
+    assert peer_lease.closed
+    assert peer_authority.release_calls == [peer_lease.context]
 
 
 def _function_node(owner: type[object], name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:

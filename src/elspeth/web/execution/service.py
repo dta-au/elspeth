@@ -1238,6 +1238,10 @@ class ExecutionServiceImpl:
         Worker shutdown paths still use _call_async() to persist terminal
         state on the main event loop, so blocking the loop here can strand
         those final updates.
+
+        Join every lease cleanup before surfacing failures, including failures
+        that completed before shutdown began. The lifespan caller propagates
+        the group after its own resource cleanup.
         """
         with self._shutdown_events_lock:
             events = list(self._shutdown_events.values())
@@ -1253,9 +1257,13 @@ class ExecutionServiceImpl:
                 completion_futures = tuple(self._lease_completion_futures)
             if not completion_futures:
                 break
-            await asyncio.gather(
+            outcomes = await asyncio.gather(
                 *(asyncio.wrap_future(completion) for completion in completion_futures),
+                return_exceptions=True,
             )
+            failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+            if failures:
+                raise BaseExceptionGroup("Execution lease cleanup failed", failures)
 
     async def execute(
         self,
@@ -3606,14 +3614,13 @@ class ExecutionServiceImpl:
             self._lease_completion_futures.add(completion)
 
         def _retire_completion(done: Future[None]) -> None:
-            with self._shutdown_events_lock:
-                self._lease_completion_futures.discard(done)
-            try:
-                completion_error = done.exception()
-            except FutureCancelledError:
-                slog.error("execution_lease_completion_cancelled")
-                return
-            if completion_error is not None:
+            # _LeaseCompletionFuture cannot be cancelled. Failed completions
+            # remain owned until shutdown observes their original exceptions.
+            completion_error = done.exception()
+            if completion_error is None:
+                with self._shutdown_events_lock:
+                    self._lease_completion_futures.discard(done)
+            else:
                 slog.error(
                     "execution_lease_completion_failed",
                     exc_type=type(completion_error).__name__,
