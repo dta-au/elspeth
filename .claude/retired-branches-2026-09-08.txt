@@ -1,0 +1,14 @@
+# Branches retired 2026-09-08 (content verified landed in release/0.8.0 @ f2f503c9a)
+# Recover with: git branch <name> <sha>
+48baf41ef6347fc565d5fd935f68f08a4373199f slot21-held
+a4fabf275f9c023a05cf8c2294726b6bdc80259d identity-sprint/phase2-auth-core-pre-s22
+a4fabf275f9c023a05cf8c2294726b6bdc80259d identity-sprint/phase2-auth-core-r2
+36ccee64f310b55ca257f84f9efd631924b34354 a2b-prerebase-36ccee64f
+c937f0ddc4516376c01a298c015cf235fe6e5672 backup-pre-rebase-c937f0ddc
+da6985272774faad64c5d61acab6010179c3127d p4/dlineage
+9d975e51573cf9ac4abe18ddccc067a75c55e018 p6b/3-hunk-prep
+0e671703f606c949ea500bd7701f55e37793472f fix/member-refusal-result
+493b763296a7366f22c1d55cbe036a273dbc4f00 lane/soft-type-burndown
+2080aed9a90c056576f55116ab16779010b9e56e p4/c-measure
+90b40c81a662ece1e34b547124ab449d168c5c89 p6/ci-test-marker
+e79fc236c32840919a2cdf4bac2501f25bfa0227 p6b/3-rebuilt
