@@ -31,7 +31,7 @@ from elspeth.contracts.scheduler import (
     TokenWorkStatus,
 )
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcome_guarded
-from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -1174,7 +1174,7 @@ class BarrierJournalRepository:
         self,
         *,
         work_item_ids: Sequence[str],
-        run_id: str,
+        coordination_token: CoordinationToken,
     ) -> int:
         """Reset ``barrier_adopted_epoch`` to NULL for crash-window BLOCKED rows.
 
@@ -1191,20 +1191,52 @@ class BarrierJournalRepository:
         read and this call — a non-matching count is logged but not fatal because
         the next intake pass will re-classify the row correctly).
 
-        Called from ``BarrierRecoveryCoordinator.restore_from_journal`` for holdless non-completed
-        rows (before ``restore_from_journal`` runs, so no executor state is
-        touched).  The operation is epoch-fence-free (it runs before the new
-        leader's first fenced verb and its safety derives from the takeover CAS
-        already having committed — any concurrent old-leader adoption attempt
+        Called from ``BarrierRecoveryCoordinator.restore_from_journal`` for
+        holdless non-completed rows, before any executor state is touched.
+
+        Leader-fenced (ADR-030 §D4, ADR-048). This verb previously ran on a bare
+        ``begin_write``, and its docstring argued confidently that it was
+        "epoch-fence-free" because "any concurrent old-leader adoption attempt
         would fail the CAS, and the new leader is the only actor with write
-        access at this point).
+        access at this point". That justification was a category error, and the
+        confidence is why it survived review:
+
+        * It pointed at the **adoption CAS**, which guards a DIFFERENT verb.
+          :meth:`adopt_blocked_barrier_item` is fenced and CASes
+          ``barrier_adopted_epoch NULL -> epoch``. THIS verb has no CAS at all,
+          so nothing it does is protected by the sentence that excused it.
+        * **ONE takeover is sufficient** to break it. A leader still inside
+          ``restore_from_journal`` whose lease has lapsed, and whose seat a
+          successor has taken, reaches this write with nothing to refuse it: it
+          clears markers under a live successor, with no ``fence_refusal``
+          event. The second, worse instance is a further takeover: leader A
+          holds epoch N, enters restore and stalls; B takes over at N+1 and
+          begins adopting; A's in-flight restore then resets the markers B has
+          just set. A's own takeover CAS committed long ago and gates nothing.
+        * "The new leader is the only actor with write access at this point"
+          was an assumption about TIMING stated as a property, with no code
+          enforcing it — a fail-open guard written in prose.
+
+        What enforces it now: ``fenced_leader_transaction`` is the FIRST
+        database effect after the empty-ids early return, so a stale epoch is
+        refused (``RunLeadershipLostError``) with ZERO mutation of the marker,
+        and the refusal is recorded as a ``fence_refusal`` event.
+
+        An empty ``work_item_ids`` returns before the fence: there is no
+        database effect to fence, so a caller with nothing to reset opens no
+        transaction, is not charged a seat verification, and is not refused.
         """
         if not work_item_ids:
             return 0
-        with begin_write(self._engine) as conn:
+        with fenced_leader_transaction(
+            self._engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="reset_adoption_marker_to_pending",
+        ) as conn:
             result = conn.execute(
                 update(token_work_items_table)
-                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.run_id == coordination_token.run_id)
                 .where(token_work_items_table.c.work_item_id.in_(list(work_item_ids)))
                 .where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value)
                 .values(barrier_adopted_epoch=None)

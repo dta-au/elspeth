@@ -533,6 +533,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_secret_resolutions",
         "record_source_field_resolution",
         "recover_expired_leases",
+        "reset_adoption_marker_to_pending",
         "set_export_failed_unless_completed",
         "set_export_pending_unless_completed",
         "set_export_status",
@@ -599,6 +600,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "recover_expired_leases": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_recover_expired_leases_refused",
+        ),
+        "reset_adoption_marker_to_pending": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_reset_adoption_marker_to_pending_refused",
         ),
         "stage_escalation_loss": (
             "tests/e2e/recovery/test_suspended_winner_fences.py",
