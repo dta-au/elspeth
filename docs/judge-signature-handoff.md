@@ -42,9 +42,13 @@ checkout, including tests, docs, scripts, configuration, and hidden tracked
 code such as `.github` and `.agents`, through a read-only MCP reader before
 ruling. Its working directory is the checkout root, so repository-relative
 test nodeids and pathless searches work. An externally located allowlist
-directory remains readable too. Codex searches skip dependency installations,
-Git metadata, caches, nested worktrees, and private signing scratch so those
-artifacts cannot exhaust the scan budget ahead of current evidence. Explicit
+directory remains readable too. Codex searches enumerate tracked files and
+new unignored working files through fixed read-only Git arguments, with
+fsmonitor hooks and optional locks disabled. Repository ignore rules keep
+runtime data, caches, and nested worktrees from exhausting the scan budget;
+tracked evidence stays searchable even under an ignored directory name.
+Unpacked trees and external allowlists use a filesystem walk that skips
+conventional tooling artifacts. Explicit
 in-scope reads remain available, except for Git administrative data and `.env`
 files (including `.env.*`); content is still secret-scrubbed.
 

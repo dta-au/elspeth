@@ -52,8 +52,10 @@ docs, scripts, configuration, and hidden tracked code, plus any external
 allowlist directory. The judge is a peer reviewer: give it real symbols and
 test nodeids and let it inspect their evidence. Tool paths start at the
 checkout root; finding keys remain relative to the scanner source root
-(normally `src/elspeth`). Searches skip dependency/cache trees, nested
-worktrees, and private signing scratch; explicit permitted reads still work.
+(normally `src/elspeth`). Codex searches tracked and new unignored files using
+fixed read-only Git enumeration; tracked evidence remains visible even under
+ignored directory names. Unpacked trees and external allowlists use an
+artifact-pruned walk. Explicit permitted reads still work for ignored files.
 Git administration and `.env` files remain excluded and returned content
 remains secret-scrubbed. Whole-codebase access does not grant write or key
 custody.

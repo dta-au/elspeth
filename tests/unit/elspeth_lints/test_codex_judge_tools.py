@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -99,7 +100,7 @@ def test_whole_checkout_search_reaches_evidence_without_searching_artifacts(tmp_
         "README.md",
     )
     artifacts = (
-        ".git/config",
+        "nested/.git/config",
         ".venv/vendor.py",
         "node_modules/pkg/index.js",
         ".claude/worktrees/old/tests/test_old.py",
@@ -181,3 +182,43 @@ def test_tooling_artifacts_cannot_spend_the_codebase_search_budget(tmp_path: Pat
     assert result["truncated"] is False
     # Artifact exclusion is a search default, not a new read prohibition.
     assert _read_file(scope, {"file_path": ".scratch/generated.txt"}) == "1: generated runtime evidence"
+
+
+def test_git_search_preserves_tracked_and_new_code_while_skipping_ignored_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    source = repo / "src" / "elspeth"
+    source.mkdir(parents=True)
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    tracked = repo / ".scratch" / "tracked_control.py"
+    tracked.parent.mkdir()
+    tracked.write_text("control_evidence\n")
+    subprocess.run(["git", "-C", str(repo), "add", str(tracked)], check=True, capture_output=True)
+    (repo / ".gitignore").write_text(".scratch/\ndata/*\n!data/skills/\n")
+    for number in range(12):
+        (tracked.parent / f"artifact{number}.txt").write_text("control_evidence\n")
+    test = repo / "tests" / "test_control.py"
+    test.parent.mkdir()
+    test.write_text("control_evidence\n")
+    skill = repo / "data" / "skills" / "control.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("control_evidence\n")
+    external = tmp_path / "external_allowlist"
+    external.mkdir()
+    (external / "rules.yaml").write_text("control_evidence\n")
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=external)
+    monkeypatch.setattr(judge_tools, "_MAX_SCANNED_FILES", 5)
+    result = json.loads(_grep_files(scope, {"pattern": "control_evidence", "output_mode": "files_with_matches"}))
+    assert result["files"] == sorted(str(path) for path in (tracked, test, skill))
+    assert result["scanned_files"] == 4
+    assert result["truncated"] is False
+    assert _read_file(scope, {"file_path": ".scratch/artifact0.txt"}) == "1: control_evidence"
+    assert json.loads(_grep_files(scope, {"path": str(external), "pattern": "control_evidence", "output_mode": "count"}))["count"] == 1
+
+
+def test_git_enumeration_failure_does_not_fall_back_to_ignored_artifacts(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    scope = AgentToolScope(allowed_roots=(tmp_path,), cwd=tmp_path, max_turns=4)
+    with pytest.raises(ValueError, match="cannot enumerate checkout evidence"):
+        _grep_files(scope, {"pattern": "anything", "output_mode": "count"})

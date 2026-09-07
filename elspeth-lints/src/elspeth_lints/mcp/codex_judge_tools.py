@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -155,7 +156,7 @@ def _glob_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
     _guard(scope, "Glob", {"path": raw_base, "pattern": pattern})
     base = _resolve(scope, raw_base)
     matches: list[str] = []
-    for candidate in _iter_files(base, pattern):
+    for candidate in _iter_files(base, pattern, repo_root=scope.cwd):
         resolved = Path(os.path.realpath(candidate))
         allowed, _reason = _tool_scope_decision(
             scope,
@@ -170,9 +171,47 @@ def _glob_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
     return json.dumps({"files": sorted(matches), "truncated": len(matches) >= _MAX_FILE_RESULTS})
 
 
-def _iter_files(base: Path, file_glob: str) -> Iterator[Path]:
+def _iter_files(base: Path, file_glob: str, *, repo_root: Path) -> Iterator[Path]:
     if base.is_file():
         yield base
+        return
+    if base.is_relative_to(repo_root) and (repo_root / ".git").exists():
+        # Fixed read-only Git enumeration admits tracked AND new unignored
+        # working code. Ignore rules exclude local runtime artifacts without
+        # hiding tracked evidence in unusually named or hidden directories.
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-C",
+                    str(repo_root),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    str(base.relative_to(repo_root)),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=30,
+                env={
+                    "PATH": os.defpath,
+                    "LC_ALL": "C",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                },
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("cannot enumerate checkout evidence with read-only Git") from exc
+        for raw in sorted(set(result.stdout.split(b"\0")) - {b""}):
+            candidate = repo_root / os.fsdecode(raw)
+            if candidate.is_relative_to(base) and _matches_glob(candidate.relative_to(base).parts, PurePath(file_glob).parts):
+                yield candidate
         return
     # Path.walk does not follow directory symlinks. Prune before traversal so
     # discarded artifacts cannot consume the scan budget ahead of real tests.
@@ -220,7 +259,7 @@ def _grep_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
     matched_files: list[str] = []
     match_count = 0
     scanned = 0
-    for candidate in _iter_files(base, file_glob):
+    for candidate in _iter_files(base, file_glob, repo_root=scope.cwd):
         if scanned >= _MAX_SCANNED_FILES:
             break
         resolved = Path(os.path.realpath(candidate))
