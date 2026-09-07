@@ -575,36 +575,49 @@ class ReplicaProbeDriver:
         observer: EvidenceObserver,
         client_factory: Callable[[str], AcceptanceHttpClient],
         clock: Callable[[], float] = time.monotonic,
+        pinned_clients: tuple[AcceptanceHttpClient, AcceptanceHttpClient] | None = None,
     ) -> None:
         self._controller = controller
         self._observer = observer
         self._client_factory = client_factory
         self._clock = clock
+        self._pinned_clients = pinned_clients
+        if pinned_clients is not None:
+            addresses = controller.replicas()
+            if pinned_clients[0] is pinned_clients[1] or any(
+                client.origin != address.origin for client, address in zip(pinned_clients, addresses, strict=True)
+            ):
+                raise AcceptanceInputError("pinned clients must be distinct and match ordered replica origins")
 
     def fire_pair(self, request: ProbeRequest, *, expected_statuses: set[int]) -> tuple[tuple[ReplicaResponse, ReplicaResponse], float]:
         """Send ``request`` to both replicas, released together; return the responses and the dispatch spread in ms."""
 
         first, second = self._controller.replicas()
-        if first.name == second.name or first.origin == second.origin:
+        if first.name == second.name or (first.origin == second.origin and self._pinned_clients is None):
             raise AcceptanceInputError("replica probes need two distinct replicas")
         barrier = threading.Barrier(2, timeout=30.0)
         sent_at: dict[str, float] = {}
 
-        def fire(address: ReplicaAddress) -> ReplicaResponse:
-            with self._client_factory(address.origin) as client:
-                client.authenticate(register=False)
-                barrier.wait()
-                sent_at[address.name] = self._clock()
-                status, instance_id, body = client.request_json_with_instance(
-                    request.method,
-                    request.path,
-                    expected_statuses=expected_statuses,
-                    json_body=request.json_body,
-                )
+        def send(address: ReplicaAddress, client: AcceptanceHttpClient) -> ReplicaResponse:
+            barrier.wait()
+            sent_at[address.name] = self._clock()
+            status, instance_id, body = client.request_json_with_instance(
+                request.method,
+                request.path,
+                expected_statuses=expected_statuses,
+                json_body=request.json_body,
+            )
             return replica_response_from_envelope(addressed_to=address.name, status=status, instance_id=instance_id, body=body)
 
+        def fire(address: ReplicaAddress, index: int) -> ReplicaResponse:
+            if self._pinned_clients is not None:
+                return send(address, self._pinned_clients[index])
+            with self._client_factory(address.origin) as client:
+                client.authenticate(register=False)
+                return send(address, client)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = (pool.submit(fire, first), pool.submit(fire, second))
+            futures = (pool.submit(fire, first, 0), pool.submit(fire, second, 1))
             responses = (futures[0].result(), futures[1].result())
         spread_ms = abs(sent_at[first.name] - sent_at[second.name]) * 1000.0
         return responses, spread_ms

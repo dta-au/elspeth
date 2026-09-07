@@ -45,6 +45,9 @@ if os.environ.get("FAIL_AT") and " ".join([name, *args]).startswith(os.environ["
     sys.exit(17)
 
 revision = "elspeth-web--r" + os.environ["CANDIDATE_SHA"][:12]
+revision_file = pathlib.Path(os.environ["COMMAND_LOG"]).with_suffix(".revision")
+if revision_file.exists():
+    revision = revision_file.read_text()
 app_id = "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/elspeth-acc-test/providers/Microsoft.App/containerApps/elspeth-web"
 if name == "date":
     import subprocess
@@ -72,6 +75,15 @@ elif name == "python":
         xml = next(arg.split("=", 1)[1] for arg in args if arg.startswith("--junitxml="))
         pathlib.Path(xml).write_text('<testsuite tests="1"><testcase name="proof"/></testsuite>')
         sys.exit(int(os.environ.get("PYTEST_EXIT", "0")))
+    elif module == "elspeth.web.azure_container_apps_single_revision":
+        directory = pathlib.Path(option("--evidence-dir"))
+        directory.mkdir(mode=0o700)
+        actual_revision = option("--revision")
+        (directory / "binding.json").write_text(json.dumps({
+            "container_app_id": app_id, "revision": actual_revision, "replica": actual_revision + "-replica2",
+        }))
+        emit({"probe": option("--probe")})
+        sys.exit(1 if option("--probe") == os.environ.get("FAIL_SINGLE_PROBE") else 0)
     elif module == "elspeth.web._acceptance_common.testcontainer_run":
         emit({"junit_sha256": "d" * 64})
     elif command == "verify-connection-budget":
@@ -143,6 +155,11 @@ elif args[:3] == ["deployment", "sub", "create"]:
         "postgresFqdn": "example.test",
     }
     emit({"properties": {"outputs": {key: {"value": value} for key, value in values.items()}}})
+elif args[:3] == ["deployment", "group", "create"]:
+    if "deployWebApp=true" in args and "activeRevisionsMode=Single" in args:
+        suffix = next(arg.split("=", 1)[1] for arg in args if arg.startswith("revisionSuffix="))
+        revision_file.write_text("elspeth-web--" + suffix)
+    emit({})
 elif args[:3] == ["acr", "manifest", "show-metadata"]:
     print(os.environ.get("ACR_DIGEST", os.environ["CANDIDATE_IMAGE_DIGEST"]))
 elif args[:3] == ["containerapp", "job", "start"]:
@@ -153,7 +170,12 @@ elif args[:4] == ["containerapp", "job", "logs", "show"]:
     report = [{"name": "session_schema", "ok": True, "detail": "ok"}]
     emit({"Log": json.dumps(report)})
 elif args[:2] == ["containerapp", "show"]:
-    emit({"id": app_id, "properties": {"configuration": {"ingress": {"fqdn": "app.example.test"}}}})
+    emit({"id": app_id, "properties": {
+        "latestReadyRevisionName": revision, "latestRevisionName": revision,
+        "configuration": {"activeRevisionsMode": "Single", "ingress": {
+            "fqdn": "app.example.test", "stickySessions": {"affinity": "sticky"},
+        }}, "template": {"scale": {"minReplicas": 2, "maxReplicas": 2}},
+    }})
 elif args[:3] == ["containerapp", "replica", "list"]:
     rev = option("--revision")
     emit([{"name": rev + "-replica1", "properties": {"runningState": "Running"}},
@@ -287,11 +309,14 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert result.returncode == 0, result.stderr
     commands = driver.commands()
     deployments = [command for command in commands if command[:4] == ["az", "deployment", "group", "create"]]
-    assert len(deployments) == 5
+    assert len(deployments) == 6
     assert "deployWebApp=false" in deployments[0]
     assert "deployWebApp=false" in deployments[1]
     assert "deployWebApp=true" in deployments[2]
     assert f"candidateSourceSha={SHA}" in deployments[2]
+    assert "activeRevisionsMode=Single" in deployments[-1]
+    assert "minReplicas=2" in deployments[-1] and "maxReplicas=2" in deployments[-1]
+    assert "stickySessionsAffinity=sticky" in deployments[-1]
     starts = [command[5] for command in commands if command[:4] == ["az", "containerapp", "job", "start"]]
     assert starts == ["provision-storage", "doctor-schema-init", "doctor-runtime-a", "doctor-runtime-b", "verify-blob-managed-identity"]
     first_job = command_index(commands, ["az", "containerapp", "job", "start"])
@@ -307,6 +332,20 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert len(p1_requests) == len({trial["session_id"] for trial in p1_requests}) == 20
     assert len({trial["body"]["operation_id"] for trial in p1_requests}) == 20
     assert all(trial["body"]["turn_token"] == "9" * 64 for trial in p1_requests)
+    single_requests = json.loads((driver.evidence / "single-p1-trial-requests.json").read_text())
+    single_sessions = {trial["session_id"] for trial in single_requests}
+    assert len(single_requests) == len(single_sessions) == 20
+    assert single_sessions.isdisjoint(trial["session_id"] for trial in p1_requests)
+    singles = [command for command in commands if "elspeth.web.azure_container_apps_single_revision" in command]
+    assert [command[command.index("--probe") + 1] for command in singles] == ["P1", "P4a"]
+    takeover = next(command for command in commands if "takeover" in command)
+    assert commands.index(takeover) < commands.index(deployments[-1]) < commands.index(singles[0])
+    single_store = next(
+        command for command in commands if "receipt-store" in command and str(driver.evidence / "single-p1.receipt.json") in command
+    )
+    assert single_store[single_store.index("--subject-id") + 1].endswith(f"r{SHA[:12]}-single-replica2")
+    single_preparation = [command for command in commands if command[0] == "curl" and "/prepared-single-" in " ".join(command)]
+    assert single_preparation and all(command[-1].startswith("https://app.example.test/") for command in single_preparation)
     storage = next(command for command in commands if "--owner-uid" in command)
     assert storage[storage.index("--owner-uid") + 1] == "1654"
     assert storage[storage.index("--mode") + 1] == "0700"
@@ -327,8 +366,10 @@ def test_weak_trials_fail_before_live_probe(driver: DriverRun, trials: str) -> N
     driver.environment["PROBE_TRIALS"] = trials
     # environment stage produces the inventory consumed by the staged probe.
     assert driver.run("environment").returncode == 0
+    assert driver.run("bootstrap").returncode == 0
     result = driver.run("probes")
     assert result.returncode != 0
+    assert "probe_trials_insufficient" in result.stderr or "integer_input_invalid" in result.stderr
     assert not any("replica-probes" in command for command in driver.commands())
 
 
@@ -514,3 +555,39 @@ def test_incomplete_metric_window_times_out_without_receipt(driver: DriverRun) -
     assert result.returncode != 0
     assert "connection_budget_evidence_timeout" in result.stderr
     assert not (driver.evidence / "connection-budget.receipt.json").exists()
+
+
+def test_single_revision_failed_probe_keeps_receipt_and_refuses_success(driver: DriverRun) -> None:
+    driver.environment["FAIL_SINGLE_PROBE"] = "P1"
+    result = driver.run("all")
+    assert result.returncode != 0
+    assert (driver.evidence / "single-p1.receipt.json").is_file()
+    assert (driver.evidence / "single-p4.receipt.json").is_file()
+    assert (driver.evidence / "resource-graph-cleanup.receipt.json").is_file()
+
+
+def test_single_revision_discovery_failure_cleans_up_without_receipt(driver: DriverRun) -> None:
+    driver.environment["FAIL_AT"] = "python -m elspeth.web.azure_container_apps_single_revision"
+    result = driver.run("all")
+    assert result.returncode != 0
+    assert not (driver.evidence / "single-p1.receipt.json").exists()
+    assert any(command[:3] == ["az", "group", "delete"] for command in driver.commands())
+
+
+def test_standalone_single_revision_requires_persisted_database_context(driver: DriverRun) -> None:
+    assert driver.run("environment").returncode == 0
+    before = driver.commands()
+    result = driver.run("single-revision")
+    assert result.returncode != 0
+    assert driver.commands() == before
+
+
+def test_standalone_single_revision_rejects_missing_auth_before_deployment(driver: DriverRun) -> None:
+    assert driver.run("environment").returncode == 0
+    assert driver.run("bootstrap").returncode == 0
+    del driver.environment["ELSPETH_ACCEPTANCE_BEARER_TOKEN"]
+    before = driver.commands()
+    result = driver.run("single-revision")
+    assert result.returncode != 0
+    assert "set existing acceptance bearer token" in result.stderr
+    assert driver.commands() == before

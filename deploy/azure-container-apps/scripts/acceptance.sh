@@ -102,6 +102,12 @@ require_inputs() {
   test ! -L "$EVIDENCE_DIR" && test "$(stat -c '%u:%a' "$EVIDENCE_DIR")" = "$(id -u):700" || fail evidence_directory_permissions
   RECEIPT_DIR="$EVIDENCE_DIR/receipts"
   REVISION_SUFFIX="r${CANDIDATE_SHA:0:12}"
+  load_resolved_workload_parameters
+}
+load_resolved_workload_parameters() {
+  WORKLOAD_PARAMETERS="${WORKLOAD_PARAMETERS:-$EVIDENCE_DIR/parameters/workload.parameters.json}"
+  WORKLOAD_A_PARAMETERS="${WORKLOAD_A_PARAMETERS:-$EVIDENCE_DIR/parameters/workload-a.parameters.json}"
+  WORKLOAD_B_PARAMETERS="${WORKLOAD_B_PARAMETERS:-$EVIDENCE_DIR/parameters/workload-b.parameters.json}"
 }
 preflight_all() {
   require_parameters "${MAIN_PARAMETERS:?set resolved local main parameters JSON}"
@@ -349,19 +355,20 @@ wait_http_ready() {
   done
 }
 stage_rollout() {
-  stage_workload production "" "$REVISION_SUFFIX"
+  local suffix="${1:-$REVISION_SUFFIX}"
+  stage_workload production "" "$suffix"
   local deadline=$((SECONDS + ELSPETH_JOB_WAIT_SECONDS)) health ready
   while :; do
     az_capture containerapp revision list --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
       --query '[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}' \
       >"$EVIDENCE_DIR/production-revisions.json"
-    if jq -e --arg revision "${APP_NAME}--${REVISION_SUFFIX}" \
+    if jq -e --arg revision "${APP_NAME}--${suffix}" \
       'length == 1 and .[0].name == $revision and .[0].traffic == 100 and .[0].state == "Running"' \
       "$EVIDENCE_DIR/production-revisions.json" >/dev/null; then break; fi
     test "$SECONDS" -lt "$deadline" || { fail revision_rollout_timeout; return 1; }
     sleep "$ELSPETH_POLL_SECONDS"
   done
-  bind_replica "${APP_NAME}--${REVISION_SUFFIX}" 2
+  bind_replica "${APP_NAME}--${suffix}" 2
   az_capture containerapp revision show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
     --revision "$REVISION" >"$EVIDENCE_DIR/candidate-revision.json"
   jq -e --arg image "$(candidate_image)" '.properties.template.containers
@@ -444,7 +451,7 @@ api_post() (
   trap "$cleanup" EXIT
   printf 'Authorization: Bearer %s\n' "$ELSPETH_ACCEPTANCE_BEARER_TOKEN" >"$scratch/header"
   curl_capture --header "@$scratch/header" --header 'Content-Type: application/json' \
-    --data-binary "@$body" --output "$out" "https://${APP_NAME}---a.${APP_DOMAIN}${path}"
+    --data-binary "@$body" --output "$out" "${PREPARATION_ORIGIN:-https://${APP_NAME}---a.${APP_DOMAIN}}${path}"
 )
 prepare_session() {
   local name="$1" yaml="${2:-}" session blob
@@ -459,14 +466,33 @@ prepare_session() {
   fi
   printf '%s\n' "$session"
 }
+prepare_guided_trials() {
+  local prefix="$1" trials="${PROBE_TRIALS:-20}" index session operation turn
+  positive_integer "$trials"
+  test "$trials" -ge 20 || fail probe_trials_insufficient
+  : >"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
+  for ((index=0; index<trials; index++)); do
+    session=$(prepare_session "${prefix}-${index}")
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    jq -n --arg operation "$operation" --arg intent "$P1_INTENT" \
+      '{operation_id:$operation,profile:"live",intent:$intent}' >"$EVIDENCE_DIR/${prefix}-${index}-start.json"
+    api_post "/api/sessions/${session}/guided/start" "$EVIDENCE_DIR/${prefix}-${index}-start.json" "$EVIDENCE_DIR/${prefix}-${index}-turn.json"
+    turn=$(jq -er '.next_turn.turn_token | select(test("^[0-9a-f]{64}$"))' "$EVIDENCE_DIR/${prefix}-${index}-turn.json")
+    operation=$(cat /proc/sys/kernel/random/uuid)
+    jq -c --arg session "$session" --arg operation "$operation" --arg turn "$turn" \
+      '{session_id:$session,body:(. + {operation_id:$operation,turn_token:$turn})}' "$P1_BODY" >>"$EVIDENCE_DIR/${prefix}-trial-requests.jsonl"
+  done
+  jq -s '.' "$EVIDENCE_DIR/${prefix}-trial-requests.jsonl" >"$EVIDENCE_DIR/${prefix}-trial-requests.json"
+}
 stage_prepare() {
+  PREPARATION_ORIGIN="https://${APP_NAME}---a.${APP_DOMAIN}"
   require_file "${PROBE_YAML:?set executable P2/P4 pipeline YAML}"
   require_file "${P3_YAML:?set long-running physical CSV sink pipeline YAML}"
   require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
   require_file "${P4_MESSAGE_BODY:?set a normal Composer message JSON to observe}"
   require_file "${P1_BODY:?set the guided action template JSON}"
   : "${P1_INTENT:?set guided acceptance intent}"
-  local trials="${PROBE_TRIALS:-20}" index token session operation turn
+  local trials="${PROBE_TRIALS:-20}" index token
   positive_integer "$trials"
   test "$trials" -ge 20 || fail probe_trials_insufficient
   if test -z "${ELSPETH_ACCEPTANCE_BEARER_TOKEN:-}"; then
@@ -480,21 +506,11 @@ stage_prepare() {
   P4_SESSION_ID=$(prepare_session p4 "$PROBE_YAML")
   api_post "/api/sessions/${P4_SESSION_ID}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-p4-message.json"
   : >"$EVIDENCE_DIR/p2-session-ids.txt"
-  : >"$EVIDENCE_DIR/p1-trial-requests.jsonl"
+  prepare_guided_trials p1
   for ((index=0; index<trials; index++)); do
-    session=$(prepare_session "p1-${index}")
-    operation=$(cat /proc/sys/kernel/random/uuid)
-    jq -n --arg operation "$operation" --arg intent "$P1_INTENT" \
-      '{operation_id:$operation,profile:"live",intent:$intent}' >"$EVIDENCE_DIR/p1-${index}-start.json"
-    api_post "/api/sessions/${session}/guided/start" "$EVIDENCE_DIR/p1-${index}-start.json" "$EVIDENCE_DIR/p1-${index}-turn.json"
-    turn=$(jq -er '.next_turn.turn_token | select(test("^[0-9a-f]{64}$"))' "$EVIDENCE_DIR/p1-${index}-turn.json")
-    operation=$(cat /proc/sys/kernel/random/uuid)
-    jq -c --arg session "$session" --arg operation "$operation" --arg turn "$turn" \
-      '{session_id:$session,body:(. + {operation_id:$operation,turn_token:$turn})}' "$P1_BODY" >>"$EVIDENCE_DIR/p1-trial-requests.jsonl"
     prepare_session "p2-${index}" "$PROBE_YAML" >>"$EVIDENCE_DIR/p2-session-ids.txt"
   done
   P1_TRIAL_REQUESTS="$EVIDENCE_DIR/p1-trial-requests.json"
-  jq -s '.' "$EVIDENCE_DIR/p1-trial-requests.jsonl" >"$P1_TRIAL_REQUESTS"
   P2_SESSION_IDS="$EVIDENCE_DIR/p2-session-ids.json"
   jq -Rsc 'split("\n") | map(select(length > 0))' "$EVIDENCE_DIR/p2-session-ids.txt" >"$P2_SESSION_IDS"
   jq -n --arg p3 "$P3_SESSION_ID" --arg p4 "$P4_SESSION_ID" \
@@ -548,6 +564,48 @@ stage_probes() {
   probe_receipt lease-takeover replica-lease-takeover --observation "$EVIDENCE_DIR/takeover-observation.json"
   restore_roles
   export PROBE_WINDOW_END
+  PROBE_WINDOW_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s\n' "$PROBE_WINDOW_END" >"$EVIDENCE_DIR/probe-window-end.txt"
+}
+single_revision_receipt() {
+  local probe="$1" kind="$2" name="$3"
+  shift 3
+  local status=0 directory="$EVIDENCE_DIR/${name}"
+  protected_capture probe single_revision_probe_failed "$PYTHON" -m elspeth.web.azure_container_apps_single_revision \
+    --probe "$probe" --app-json "$EVIDENCE_DIR/app.json" --replicas-json "$EVIDENCE_DIR/replicas-${REVISION}.json" \
+    --revision "$REVISION" --candidate-sha "$CANDIDATE_SHA" --scenario-id A --evidence-dir "$directory" \
+    "$@" >"$EVIDENCE_DIR/${name}.stream" || status=$?
+  # Discovery owns the selected cookie-pinned replica. Never substitute the
+  # first control-plane replica for the actual owner recorded by the probe.
+  CONTAINER_APP_ID=$(jq -er '.container_app_id' "$directory/binding.json")
+  REVISION=$(jq -er '.revision' "$directory/binding.json")
+  REPLICA=$(jq -er '.replica' "$directory/binding.json")
+  BINDING_ARGS=(--candidate-sha "$CANDIDATE_SHA" --scenario-id A --container-app-id "$CONTAINER_APP_ID" --revision "$REVISION" --replica "$REPLICA")
+  SUBJECT="${CONTAINER_APP_ID}/revisions/${REVISION}/replicas/${REPLICA}"
+  store_exec_receipt "$kind" "$name"
+  jq -n --arg app "$CONTAINER_APP_ID" --arg revision "$REVISION" --arg replica "$REPLICA" \
+    '{app:$app,revision:$revision,replica:$replica}' >"$EVIDENCE_DIR/binding.json"
+  if test "$status" -ne 0; then PROBE_FAILED=1; fi
+}
+stage_single_revision() {
+  : "${ELSPETH_ACCEPTANCE_BEARER_TOKEN:?set existing acceptance bearer token}"
+  : "${P1_INTENT:?set guided acceptance intent}"
+  require_file "${P1_BODY:?set guided action template JSON}"
+  require_file "${PROBE_YAML:?set executable P4 pipeline YAML}"
+  require_file "${PROBE_SOURCE_BLOB:?set inline source blob request JSON}"
+  require_file "${P4_MESSAGE_BODY:?set normal Composer message JSON}"
+  printf '{}\n' >"$EVIDENCE_DIR/empty-body.json"
+  stage_rollout "${REVISION_SUFFIX}-single"
+  az_capture containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >"$EVIDENCE_DIR/app.json"
+  PREPARATION_ORIGIN="https://$(jq -er '.properties.configuration.ingress.fqdn' "$EVIDENCE_DIR/app.json")"
+  prepare_guided_trials single-p1
+  local session
+  session=$(prepare_session single-p4 "$PROBE_YAML")
+  api_post "/api/sessions/${session}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-single-p4-message.json"
+  single_revision_receipt P1 replica-fence-conflict single-p1 \
+    --trial-requests "$EVIDENCE_DIR/single-p1-trial-requests.json" --trials "${PROBE_TRIALS:-20}"
+  single_revision_receipt P4a replica-progress single-p4 --session-id "$session"
+  unset PREPARATION_ORIGIN
   PROBE_WINDOW_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '%s\n' "$PROBE_WINDOW_END" >"$EVIDENCE_DIR/probe-window-end.txt"
 }
@@ -720,7 +778,20 @@ main() {
     workload-production) load_inventory; stage_rollout ;;
     workload-probes) stage_probe_workload ;;
     prepare) load_inventory; stage_prepare ;;
-    probes) load_inventory; trap on_exit EXIT; stage_probes; test "$PROBE_FAILED" = 0 ;;
+    probes)
+      : "${ELSPETH_ACCEPTANCE_BEARER_TOKEN:?set existing acceptance bearer token}"
+      load_inventory
+      load_database_environment
+      trap on_exit EXIT
+      stage_probes
+      test "$PROBE_FAILED" = 0
+      ;;
+    single-revision)
+      load_inventory
+      load_database_environment
+      stage_single_revision
+      test "$PROBE_FAILED" = 0
+      ;;
     evidence) load_inventory; stage_evidence ;;
     connection-budget) load_inventory; load_binding; stage_connection_budget ;;
     receipts) stage_receipts ;;
@@ -741,6 +812,7 @@ main() {
       stage_probe_workload
       stage_prepare
       stage_probes
+      stage_single_revision
       stage_evidence
       stage_cleanup
       facade bundle-validate --store-dir "$RECEIPT_DIR" --candidate-sha "$CANDIDATE_SHA" --scenario-id A >"$EVIDENCE_DIR/bundle.json"

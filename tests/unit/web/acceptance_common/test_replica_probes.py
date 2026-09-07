@@ -555,3 +555,22 @@ class TestDriver:
             transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"})),
         )
         assert client.request_json_with_instance("GET", "/api/health", expected_statuses={200}) == (200, None, {"status": "ok"})
+
+
+@pytest.mark.parametrize("invalid_pair", ["same_client", "wrong_order"])
+def test_pinned_clients_require_independent_ordered_origins(invalid_pair: str) -> None:
+    first_origin = "https://app---la.example.test"
+    second_origin = "https://app---lb.example.test"
+    credentials = AcceptanceCredentials(mode="bearer", bearer_token="test-token")
+    with (
+        AcceptanceHttpClient(origin=first_origin, credentials=credentials) as first,
+        AcceptanceHttpClient(origin=second_origin, credentials=credentials) as second,
+    ):
+        clients = (first, first) if invalid_pair == "same_client" else (second, first)
+        with pytest.raises(AcceptanceInputError, match="pinned clients must be distinct"):
+            ReplicaProbeDriver(
+                controller=_FakeController(ReplicaAddress("a", first_origin), ReplicaAddress("b", second_origin)),
+                observer=_FakeObserver(),
+                client_factory=lambda origin: first,
+                pinned_clients=clients,
+            )
