@@ -635,9 +635,13 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            coordination_token=leader_token_for(db, "run-export"),
+            coordination_token=export_token,
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -652,7 +656,6 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
         )
         target = _Target()
         injected = False
-        export_token = _export_seat(db, worker_id="audit-export-worker")
 
         def fail_once(observed: SinkEffectExecutionSeam) -> None:
             nonlocal injected
@@ -730,9 +733,13 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): the export seat is claimed first and
+        # every export write runs under it — see the csv scenario for why the
+        # crashed leader's token must not be used here.
+        export_token = _export_seat(db, worker_id="audit-export-json-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            coordination_token=leader_token_for(db, "run-export"),
+            coordination_token=export_token,
             config=_config(
                 format="json",
                 signing_mode="hmac_sha256" if signed else "unsigned",
@@ -757,7 +764,6 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
         publications: list[Path] = []
         monkeypatch.setattr(_local_file_effects, "_after_replace", lambda path: publications.append(path))
 
-        export_token = _export_seat(db, worker_id="audit-export-json-worker")
         with pytest.raises(SinkEffectInjectedFault):
             execute_audit_export_effect(
                 factory=factory,
@@ -804,9 +810,15 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
+        # Production order (ADR-048 §4): resume_audit_export CLAIMS the export
+        # seat first, and every export write then runs under it. Preparing under
+        # the CRASHED leader's token instead fences with that dead seat's own
+        # identity, and the fence's verify-and-extend then EXTENDS it — reviving
+        # the leader this scenario's takeover exists to depose.
+        export_token = _export_seat(db, worker_id="audit-export-csv-worker")
         snapshot = prepare_audit_export_snapshot(
             db,
-            coordination_token=leader_token_for(db, "run-export"),
+            coordination_token=export_token,
             config=_config(format="csv"),
             signing_key=None,
             content_store=store,
@@ -829,7 +841,6 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
             lambda path: publications.append(path),
         )
 
-        export_token = _export_seat(db, worker_id="audit-export-csv-worker")
         with pytest.raises(SinkEffectInjectedFault):
             execute_audit_export_effect(
                 factory=factory,

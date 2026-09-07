@@ -28,6 +28,7 @@ from elspeth.contracts import NodeType
 from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.identity import TokenInfo
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.engine.orchestrator import checkpointing
@@ -71,7 +72,12 @@ def _fire(coordinator: CheckpointCoordinator, path: str, token: CoordinationToke
         coordinator.checkpoint_interrupted_progress(_loop_ctx(), coordination_token=token)  # type: ignore[arg-type]
     elif path == "after_sink":
         factory = coordinator.make_checkpoint_after_sink_factory(_loop_ctx().processor, coordination_token=token)
-        factory("sink-0")(Mock())
+        # Specced against the exact type the callback declares. The callback
+        # deletes the argument unread, so an unspecced Mock would pass while
+        # admitting any object at all — the whole-tree mock-discipline gate
+        # refuses that, and it is right to: the spec is what keeps this call
+        # site honest if the signature ever gains a real use for the token.
+        factory("sink-0")(Mock(spec_set=TokenInfo))
     else:
         raise AssertionError(f"unknown path {path!r}")
 
