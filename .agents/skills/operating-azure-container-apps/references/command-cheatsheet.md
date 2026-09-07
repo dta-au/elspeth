@@ -15,6 +15,10 @@ export AZURE_CORE_OUTPUT=json
 : "${RESOURCE_GROUP:?export the resource group}"
 : "${CONTAINER_APP:?export the container app name}"
 : "${DEPLOY_REF:?export the user-selected branch, tag, or commit to deploy}"
+: "${WORKLOAD_PARAMETERS:?absolute path to the retained concrete workload ARM JSON}"
+OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
+mkdir -p "$OPERATOR_DIR"
+chmod 700 "$OPERATOR_DIR"
 
 DEPLOY_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
 test "$(git rev-parse HEAD)" = "$DEPLOY_SHA"
@@ -29,18 +33,18 @@ If `az account show` reports an expired session, the human runs
 ## 1. Discover the live app
 
 ```bash
-az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >live-app.json
+az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >"$OPERATOR_DIR/live-app.json"
 jq '{revision: .properties.latestReadyRevisionName,
      image: (.properties.template.containers[] | select(.name=="elspeth-web") | .image),
      mode: .properties.configuration.activeRevisionsMode,
      affinity: .properties.configuration.ingress.stickySessions.affinity,
      scale: .properties.template.scale,
      registry: .properties.configuration.registries[0].server,
-     identity: (.identity.userAssignedIdentities | keys[0])}' live-app.json
+     identity: (.identity.userAssignedIdentities | keys[0])}' "$OPERATOR_DIR/live-app.json"
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}"
 az containerapp replica list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "$(jq -r '.properties.latestReadyRevisionName' live-app.json)" --query '[].name'
+  --revision "$(jq -r '.properties.latestReadyRevisionName' "$OPERATOR_DIR/live-app.json")" --query '[].name'
 ```
 
 ## 2. Run targeted pre-deploy tests
@@ -58,7 +62,7 @@ export PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src"
 ## 3. Publish by digest (copy, never rebuild)
 
 ```bash
-ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' live-app.json)
+ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' "$OPERATOR_DIR/live-app.json")
 GHCR_DIGEST=$(docker buildx imagetools inspect "ghcr.io/dta-au/elspeth:sha-${DEPLOY_SHA}" --format '{{.Manifest.Digest}}')
 az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 docker buildx imagetools create --tag "${ACR_LOGIN_SERVER}/elspeth:sha-${DEPLOY_SHA}" "ghcr.io/dta-au/elspeth@${GHCR_DIGEST}"
@@ -69,11 +73,30 @@ CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 
 ## 4. Doctor Job with the candidate digest
 
+Prepare and review the concrete candidate parameters before any deployment.
+The tracked `.bicepparam` examples contain placeholders and cannot be used here.
+
 ```bash
-az containerapp job update --name doctor-runtime --resource-group "$RESOURCE_GROUP" --image "$CANDIDATE_IMAGE"
-EXECUTION=$(az containerapp job start --name doctor-runtime --resource-group "$RESOURCE_GROUP" --query name --output tsv)
-az containerapp job execution show --name doctor-runtime --resource-group "$RESOURCE_GROUP" \
-  --job-execution-name "$EXECUTION" --query properties.status --output tsv
+NEXT_WORKLOAD_PARAMETERS="$OPERATOR_DIR/workload-${DEPLOY_SHA}.parameters.json"
+test ! -e "$NEXT_WORKLOAD_PARAMETERS"
+jq --arg image "$CANDIDATE_IMAGE" --arg sha "$DEPLOY_SHA" '
+  .parameters.image.value = $image |
+  .parameters.candidateSourceSha.value = $sha |
+  .parameters.revisionSuffix.value = ("r" + $sha[0:12])
+' "$WORKLOAD_PARAMETERS" >"$NEXT_WORKLOAD_PARAMETERS"
+jq -e -f deploy/azure-container-apps/scripts/validate-workload-parameters.jq "$NEXT_WORKLOAD_PARAMETERS" >/dev/null
+az deployment group what-if --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep --parameters "@$NEXT_WORKLOAD_PARAMETERS"
+```
+
+Require only image and release identity changes; stop on storage, secret,
+identity, scale, probe or ingress changes. Then create/update Jobs only:
+
+```bash
+az deployment group create --name "elspeth-jobs-${DEPLOY_SHA:0:12}" --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$NEXT_WORKLOAD_PARAMETERS" --parameters deployWebApp=false --mode Incremental
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-runtime
 ```
 
 Require `Succeeded`. The Job runs `elspeth doctor deployment --json`.
@@ -82,7 +105,9 @@ Require `Succeeded`. The Job runs `elspeth doctor deployment --json`.
 
 ```bash
 az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --image "$CANDIDATE_IMAGE" --revision-suffix "${DEPLOY_SHA:0:12}"
+  --image "$CANDIDATE_IMAGE" --revision-suffix "r${DEPLOY_SHA:0:12}" \
+  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${DEPLOY_SHA}" \
+    "ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE=${DEPLOY_SHA}"
 ```
 
 ## 6. Prove the rollout
@@ -91,13 +116,13 @@ az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState,image:properties.template.containers[0].image}"
 az containerapp replica list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "${CONTAINER_APP}--${DEPLOY_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
+  --revision "${CONTAINER_APP}--r${DEPLOY_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
 ```
 
 ## 7. Public verification
 
 ```bash
-FQDN=$(jq -r '.properties.configuration.ingress.fqdn' live-app.json)
+FQDN=$(jq -r '.properties.configuration.ingress.fqdn' "$OPERATOR_DIR/live-app.json")
 curl --silent --fail-with-body "https://${FQDN}/api/health"
 curl --silent --fail-with-body "https://${FQDN}/api/ready" | jq -e '.ready == true'
 curl --silent --fail-with-body --dump-header - "https://${FQDN}/api/system/status" | grep -i '^X-Elspeth-Instance:'
@@ -106,10 +131,10 @@ curl --silent --fail-with-body --dump-header - "https://${FQDN}/api/system/statu
 ## 8. Logs
 
 ```bash
-WORKSPACE_ID=$(az containerapp env show --name "$(jq -r '.properties.environmentId | split("/") | last' live-app.json)" \
+WORKSPACE_ID=$(az containerapp env show --name "$(jq -r '.properties.environmentId | split("/") | last' "$OPERATOR_DIR/live-app.json")" \
   --resource-group "$RESOURCE_GROUP" --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId --output tsv)
 az monitor log-analytics query --workspace "$WORKSPACE_ID" --analytics-query \
-  "ContainerAppConsoleLogs_CL | where ContainerAppName_s == '${CONTAINER_APP}' and RevisionName_s == '${CONTAINER_APP}--${DEPLOY_SHA:0:12}' | project TimeGenerated, Log_s | order by TimeGenerated desc | take 100"
+  "ContainerAppConsoleLogs_CL | where ContainerAppName_s == '${CONTAINER_APP}' and RevisionName_s == '${CONTAINER_APP}--r${DEPLOY_SHA:0:12}' | project TimeGenerated, Log_s | order by TimeGenerated desc | take 100"
 az monitor log-analytics query --workspace "$WORKSPACE_ID" --analytics-query \
   "ContainerAppSystemLogs_CL | where ContainerAppName_s == '${CONTAINER_APP}' | project TimeGenerated, RevisionName_s, Log_s | order by TimeGenerated desc | take 50"
 ```

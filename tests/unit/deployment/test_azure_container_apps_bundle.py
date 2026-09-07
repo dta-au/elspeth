@@ -54,6 +54,12 @@ EXPECTED_FILES = {
     "kql/replica-lifecycle.kql",
     "kql/fence-conflict-409.kql",
     "scripts/acceptance.sh",
+    "scripts/resolve-workload-parameters.sh",
+    "scripts/validate-workload-parameters.jq",
+    "scripts/run-job.sh",
+    "scripts/bootstrap-roles.sql",
+    "scripts/bootstrap-acceptance-roles.sql",
+    "scripts/bootstrap-acceptance.sh",
 }
 
 TEMPLATES = ("main", "environment", "workload")
@@ -257,6 +263,8 @@ class _Evaluator:
         if name == "lambda":
             names = [self._eval(arg, scope) for arg in args[:-1]]
             return _Lambda([str(item) for item in names], args[-1])
+        if name == "if":
+            return self._eval(args[1] if self._eval(args[0], scope) else args[2], scope)
         values = [self._eval(arg, scope) for arg in args]
         return self._call(name, values, scope)
 
@@ -287,6 +295,12 @@ class _Evaluator:
                 return args[0] is None or len(args[0]) == 0
             case "equals":
                 return args[0] == args[1]
+            case "coalesce":
+                return next(arg for arg in args if arg is not None)
+            case "copyIndex":
+                return scope["copy_index"]
+            case "length":
+                return len(args[0])
             case "if":
                 return args[1] if args[0] else args[2]
             case "format":
@@ -702,7 +716,7 @@ def test_environment_states_the_storage_contract_once() -> None:
     (storage,) = environment["storages"]
     assert storage["kind"] == "NFS"
     assert storage["accessMode"] == "ReadWrite"
-    assert storage["name"] == "elspeth-nfs"
+    assert storage["name"] == "elspeth"
     assert "elspeth-file-storage" in str(storage["storageAccountName"]) or "fileStorage" in str(storage["storageAccountName"])
     assert environment["appLogsConfiguration"]["destination"] == "log-analytics"
     assert "logAnalytics" in str(environment["appLogsConfiguration"]["logAnalyticsWorkspaceResourceId"])
@@ -768,6 +782,62 @@ def test_environment_binds_identity_network_and_key_vault_shapes() -> None:
     }
 
 
+def test_expanded_avm_nfs_export_matches_the_created_physical_share() -> None:
+    """Follow the pinned module's child deployment to the actual ARM mount."""
+    files = _module_parameters("environment", "environment.example", "elspeth-file-storage")
+    environment = _module_resource("environment", "environment.example", "elspeth-environment")
+    template = environment["properties"]["template"]
+    parameters = _module_parameters("environment", "environment.example", "elspeth-environment")
+    # The deployed storage-account output is its input name. Resolve this
+    # runtime reference, then evaluate the nested AVM storage module unchanged.
+    parameters["storages"][0]["storageAccountName"] = files["name"]
+    evaluator = _Evaluator(template, parameters)
+    (deployment,) = [r for r in _resources(template) if r["type"] == "Microsoft.Resources/deployments" and "Storage" in r["name"]]
+    assert evaluator.value(deployment["copy"]["count"]) == 1
+    child_parameters = {
+        name: evaluator.value(value, {"copy_index": 0})["value"]
+        for name, value in deployment["properties"]["parameters"].items()
+        if name != "enableTelemetry"
+    }
+    child = deployment["properties"]["template"]
+    child_evaluator = _Evaluator(child, child_parameters)
+    (storage,) = [r for r in _resources(child) if r["type"] == "Microsoft.App/managedEnvironments/storages"]
+    mount = child_evaluator.value(storage["properties"]["nfsAzureFile"])
+    (share,) = files["fileServices"]["shares"]
+    assert mount["server"] == f"{files['name']}.file.core.windows.net"
+    assert mount["shareName"] == f"/{files['name']}/{share['name']}"
+
+
+@pytest.mark.parametrize("deploy_web_app", [False, True])
+def test_jobs_exist_without_deploying_the_app(deploy_web_app: bool) -> None:
+    template = _template("workload")
+    parameters = {**_parameters("workload.production"), "deployWebApp": deploy_web_app}
+    evaluator = _Evaluator(template, parameters)
+    deployed = {evaluator.value(resource["name"]) for resource in _resources(template) if evaluator.value(resource.get("condition", True))}
+    assert {"provision-storage-job", "doctor-schema-init-job", "doctor-runtime-job"} <= deployed
+    assert ("elspeth-web-app" in deployed) == deploy_web_app
+    if not deploy_web_app:
+        assert evaluator.value(template["outputs"]["containerAppResourceId"]["value"]) == ""
+        assert evaluator.value(template["outputs"]["containerAppFqdn"]["value"]) == ""
+
+
+def test_managed_identity_acceptance_job_runs_candidate_with_identity_only() -> None:
+    job = _module_parameters("workload", "workload.acceptance", "verify-blob-managed-identity-job")
+    assert "secrets" not in job
+    (container,) = job["containers"]
+    assert container["image"] == _parameters("workload.acceptance")["image"]
+    assert container["command"] == ["python", "-m", "elspeth.web.azure_blob_acceptance_job"]
+    environment = _env_map(container["env"])
+    assert environment["AZURE_TOKEN_CREDENTIALS"]["value"] == "ManagedIdentityCredential"
+    assert set(environment) == {
+        "AZURE_TOKEN_CREDENTIALS",
+        "AZURE_CLIENT_ID",
+        "ELSPETH_ACCEPTANCE_BLOB_ACCOUNT_URL",
+        "ELSPETH_ACCEPTANCE_BLOB_CONTAINER",
+        "ELSPETH_ACCEPTANCE_CANDIDATE_SHA",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Driver, queries, and the image publication contract in CI
 # ---------------------------------------------------------------------------
@@ -787,7 +857,6 @@ def test_acceptance_driver_routes_every_platform_call_through_protected_capture(
         assert f"{helper}() {{" in script, helper
     for stage in ("stage_environment", "stage_image", "stage_jobs", "stage_workload", "stage_probes", "stage_evidence", "stage_cleanup"):
         assert f"{stage}()" in script, stage
-    assert "facade_not_landed_6b5" in script
     assert 'test "$acr_digest" = "$CANDIDATE_IMAGE_DIGEST"' in script
     assert "docker buildx imagetools create" in script
     assert "sha256sum" in script

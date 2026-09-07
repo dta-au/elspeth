@@ -99,16 +99,16 @@ def test_azure_support_is_one_stop_before_start_linux_vm() -> None:
         "Front Door",
         "Azure Database for PostgreSQL",
         "persistent host storage",
-        "elspeth-b5d7aa5655",
     ):
         assert phrase in combined
 
     assert "azure-container-apps" in matrix
-    # The ACA Bicep bundle ships (P6b-1), but the support claim waits on the
-    # operator-run live acceptance (elspeth-5ec3befc1a), so the doc must still
-    # withhold the supported-target claim.
-    assert "not yet a supported target" in matrix
+    assert "runtime contract and" in matrix
+    assert "are implemented" in matrix
+    assert "Live Azure acceptance remains pending" in " ".join(matrix.split())
     assert "elspeth-5ec3befc1a" in matrix
+    assert "sanitized live receipt" in matrix
+    assert "| Azure Container Apps |" not in matrix
 
 
 def test_kubernetes_is_an_explicit_byo_zero_overlap_contract() -> None:

@@ -193,6 +193,70 @@ mkdir -p -m 0700 "$EVIDENCE_DIR"
 Raw Azure output stays under `$EVIDENCE_DIR` (mode 0700) outside the
 worktree; only sanitized receipts are committed.
 
+The executable driver uses concrete operator-local ARM JSON inputs. Compile
+the local completed environment parameters into `MAIN_PARAMETERS`; replace
+the sample registry identity, administrator login/password, region and IP
+allowlists before what-if. After the environment stage, resolve
+`WORKLOAD_PARAMETERS` with the cold-install resolver and inventory outputs.
+Copy that resolved file to `WORKLOAD_A_PARAMETERS` and
+`WORKLOAD_B_PARAMETERS`, replace the two runtime database secret URLs with
+the versioned URLs for the corresponding role, and set Multiple mode, none
+affinity, min/max replicas 1 and runtimeRoleLabel a/b. Keep schema-owner
+URLs distinct. Never pass a tracked placeholder example to a deployment.
+
+| Driver input | Required concrete value |
+| --- | --- |
+| `MAIN_PARAMETERS` | Local subscription-scope ARM parameter JSON with real environment inputs |
+| `WORKLOAD_PARAMETERS` | Local production ARM parameters from the cold-install resolver |
+| `WORKLOAD_A_PARAMETERS`, `WORKLOAD_B_PARAMETERS` | Local role-specific workload ARM parameters with pinned secret versions |
+| `COMPATIBILITY_RECORD` | Candidate-bound compatibility record; the driver produces `TESTCONTAINER_RECEIPT` against the provisioned Flexible Server |
+| `ELSPETH_ACCEPTANCE_PYTHON` | Existing venv Python; bind both worktree source roots with `PYTHONPATH` |
+| `P1_TRIAL_REQUESTS` | JSON file of at least 20 unique `{session_id, body}` guided requests, each with its freshly minted turn token |
+| `P2_SESSION_IDS` | JSON array of at least 20 unique fresh executable session IDs, one per trial |
+| `P4_SESSION_ID` | Prepared executable session for cross-replica progress |
+| `P3_SESSION_ID` | Prepared long-running session when running the probes stage separately |
+| `P3_SINK_PATH`, `P3_SINK_KEY_FIELD` | Operator-mounted shared NFS CSV path containing `{session_id}` and unique output row key; collector checks the exact persisted sink path |
+| `PG_MAX_CONNECTIONS`, `PG_APPROVED_BUDGET`, `PG_SAFETY_MARGIN` | Measured database limit and approved connection budget |
+| `SENTINEL_HASH` | Expected sentinel from the selected candidate |
+| `PROBE_YAML`, `P3_YAML` | Local executable P2/P4 YAML and a long-running CSV-sink P3 YAML for the `prepare` stage |
+| `PROBE_SOURCE_BLOB`, `PROBE_SOURCE_NAME` | Local CreateInlineBlobRequest JSON (`filename`, `content`, `mime_type`) and source mapping name (default `input`) |
+| `P4_MESSAGE_BODY` | Valid Composer message JSON asking for an explanation without changing pipeline structure |
+| `P1_INTENT`, `P1_BODY` | Initial guided intent and valid action template; `prepare` merges each fresh server turn token and a new operation ID |
+| `ACCEPTANCE_SECRET_DIR` | Private directory of the bootstrap password and application-secret files listed below |
+| `PGSSLROOTCERT` | Operator-host CA bundle for Flexible Server TLS verification |
+| `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on this disposable vault |
+
+The `all` path invokes `scripts/bootstrap-acceptance.sh` after environment and
+image publication. `ACCEPTANCE_SECRET_DIR` must contain four distinct password
+files (`elspeth-schema-owner-password`, `elspeth-runtime-password`,
+`elspeth-runtime-a-password`, `elspeth-runtime-b-password`) and the application
+value files `elspeth-secret-key`, `elspeth-shareable-link-signing-key`,
+`elspeth-fingerprint-key`, `elspeth-operator-metrics-bearer-token`. Optional
+Composer credentials use `COMPOSER_ENDPOINT_SECRET_NAME` and a file of that
+name. Files stay mode 0600 outside Git. The operator needs role-assignment
+permission and network access to PostgreSQL and Key Vault. The helper creates
+the four database roles, writes versioned secrets, and emits all three concrete
+workload parameter files and a private `acceptance-env.json` containing host
+observer credentials. That credential file is never receipt evidence. A failed
+bootstrap stops the driver and leaves only a private bounded error log; do not
+rerun the cold-only SQL against partially created roles without investigating.
+
+Use individual driver stages while establishing the environment, role grants,
+secret versions and probe fixtures. The `all` path runs `prepare` through the
+public API after rollout: it uploads the source and imports the supplied YAML
+into fresh sessions, including one session for each P2 trial. It writes
+`prepared-sessions.json` and `p2-session-ids.json` under the evidence directory.
+Use an existing acceptance bearer or the driver login/registration inputs.
+The standalone `probes` stage can consume the prepared session inputs listed
+above. The driver stops at the first
+failure; inspect retained evidence before resuming. Explicit cleanup remains
+available after failure; a failed probe never becomes a passing receipt.
+The `all` path runs the required PostgreSQL selection itself with the existing
+venv Python and the provisioned inventory host, then constructs the shared
+testcontainer receipt. It does not accept an empty or skipped test run as
+evidence. Pre-prepared session IDs and a pre-existing testcontainer receipt
+are not prerequisites for `all`.
+
 ---
 
 ## 1. Create the resource group and environment
@@ -202,14 +266,14 @@ az_capture account set --subscription "$AZURE_SUBSCRIPTION_ID"
 az_deploy_capture deployment sub what-if \
   --location "$AZURE_LOCATION" \
   --template-file deploy/azure-container-apps/main.bicep \
-  --parameters deploy/azure-container-apps/main.acceptance.bicepparam \
+  --parameters "@$MAIN_PARAMETERS" \
   --parameters resourceGroupName="$RESOURCE_GROUP" acceptanceRunId="$ACCEPTANCE_RUN_ID" \
   >"$EVIDENCE_DIR/what-if.json"
 az_deploy_capture deployment sub create \
   --name "elspeth-acc-${ACCEPTANCE_RUN_ID}" \
   --location "$AZURE_LOCATION" \
   --template-file deploy/azure-container-apps/main.bicep \
-  --parameters deploy/azure-container-apps/main.acceptance.bicepparam \
+  --parameters "@$MAIN_PARAMETERS" \
   --parameters resourceGroupName="$RESOURCE_GROUP" acceptanceRunId="$ACCEPTANCE_RUN_ID" \
   >"$EVIDENCE_DIR/deployment.json"
 jq -S '.properties.outputs' "$EVIDENCE_DIR/deployment.json" >"$EVIDENCE_DIR/inventory.json"
@@ -220,10 +284,13 @@ The resource group is tagged `elspeth.acceptance-run-id`. The environment
 deployment creates the virtual network, the Container Apps environment with
 an NFS storage definition, the Premium FileStorage account with its NFS share
 (`rootSquash: NoRootSquash`, encryption in transit off, private endpoint), the
-Flexible Server with both databases, two runtime roles and one schema-owner
-role, the Key Vault (RBAC, purge protection **off** for the disposable group),
+Flexible Server with both databases and its administrator login, the Key Vault
+(RBAC, purge protection **off** for the disposable group),
 the Log Analytics workspace and the user-assigned identity. The what-if
 output replaces the ECS plan review; its SHA-256 is bound into the receipt.
+Create the runtime and schema-owner roles and their grants before writing
+their Key Vault URL versions and starting the doctor Jobs; the Bicep database
+resources do not create application PostgreSQL roles.
 
 > **LIVE:** record the NFS share root's ownership and mode, the mount options
 > the platform applied (`mount | grep /mnt/elspeth` through `az_exec_capture`),
@@ -258,6 +325,16 @@ the app. Start it, poll its execution to a terminal state, and require
 execution name.
 
 ```bash
+for label in a b; do
+  if [[ "$label" == a ]]; then role_parameters=$WORKLOAD_A_PARAMETERS; else role_parameters=$WORKLOAD_B_PARAMETERS; fi
+  az_deploy_capture deployment group create --resource-group "$RESOURCE_GROUP" \
+    --name "elspeth-jobs-${label}" --mode Incremental \
+    --template-file deploy/azure-container-apps/workload.bicep \
+    --parameters "@$role_parameters" \
+    --parameters deployWebApp=false candidateSourceSha="$CANDIDATE_SHA" image="$CANDIDATE_IMAGE" \
+      runtimeRoleLabel="$label" >"$EVIDENCE_DIR/jobs-${label}.json"
+done
+
 run_job_to_completion() {
   local job="$1" execution status
   execution=$(az_capture containerapp job start --name "$job" --resource-group "$RESOURCE_GROUP" \
@@ -308,15 +385,16 @@ az_deploy_capture deployment group create \
   --name "elspeth-workload-${CANDIDATE_SHA:0:12}" \
   --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.production.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}" \
+  --parameters "@$WORKLOAD_PARAMETERS" \
+  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="r${CANDIDATE_SHA:0:12}" \
+    candidateSourceSha="$CANDIDATE_SHA" deployWebApp=true \
     composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
   >"$EVIDENCE_DIR/workload-production.json"
 az_capture containerapp revision list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}" \
   >"$EVIDENCE_DIR/revisions-production.json"
 az_capture containerapp replica list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
-  --revision "elspeth-web--${CANDIDATE_SHA:0:12}" >"$EVIDENCE_DIR/replicas-production.json"
+  --revision "elspeth-web--r${CANDIDATE_SHA:0:12}" >"$EVIDENCE_DIR/replicas-production.json"
 ```
 
 Proof of rollout (replaces the ECS `jq` gate): exactly one active revision at
@@ -433,17 +511,19 @@ through `ALTER DEFAULT PRIVILEGES` in
 # One deployment per runtime role: the label selects the role's URL secrets
 # and the doctor Job name (doctor-runtime-a / doctor-runtime-b).
 for label in a b; do
+  if [[ "$label" == a ]]; then role_parameters=$WORKLOAD_A_PARAMETERS; else role_parameters=$WORKLOAD_B_PARAMETERS; fi
   az_deploy_capture deployment group create \
     --name "elspeth-workload-probes-${CANDIDATE_SHA:0:12}-${label}" \
     --resource-group "$RESOURCE_GROUP" \
     --template-file deploy/azure-container-apps/workload.bicep \
-    --parameters deploy/azure-container-apps/workload.acceptance.bicepparam \
-    --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}-${label}" \
+    --parameters "@$role_parameters" \
+    --parameters image="$CANDIDATE_IMAGE" revisionSuffix="r${CANDIDATE_SHA:0:12}-${label}" \
+      candidateSourceSha="$CANDIDATE_SHA" deployWebApp=true \
       runtimeRoleLabel="$label" \
       composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" \
     >"$EVIDENCE_DIR/workload-probes-${label}.json"
   az_capture containerapp revision label add --name elspeth-web --resource-group "$RESOURCE_GROUP" \
-    --label "$label" --revision "elspeth-web--${CANDIDATE_SHA:0:12}-${label}"
+    --label "$label" --revision "elspeth-web--r${CANDIDATE_SHA:0:12}-${label}"
 done
 # Traffic weights and labels are application-scope changes: no new revision.
 az_capture containerapp ingress traffic set --name elspeth-web --resource-group "$RESOURCE_GROUP" \

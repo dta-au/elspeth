@@ -116,7 +116,9 @@ var blobStorageAccountName = toLower(take(replace('${namePrefix}bs${suffix}', '-
 var keyVaultName = take('${namePrefix}-kv-${suffix}', 24)
 var postgresServerName = '${namePrefix}-pg-${suffix}'
 var nfsShareName = 'elspeth'
-var nfsStorageName = 'elspeth-nfs'
+// AVM managed-environment 0.16.0 uses this name for BOTH the environment
+// storage alias and the physical /<account>/<share> NFS export path.
+var nfsStorageName = nfsShareName
 var payloadContainerName = 'elspeth-payloads'
 var registrySubscriptionId = split(containerRegistryResourceId, '/')[2]
 var registryResourceGroupName = split(containerRegistryResourceId, '/')[4]

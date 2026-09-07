@@ -11,10 +11,12 @@ never reaches a receipt.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
@@ -310,6 +312,272 @@ def test_cold_install_orders_storage_schema_runtime_before_traffic() -> None:
         "failureThreshold` at 10",
     ):
         assert phrase in normalized, phrase
+
+
+@pytest.mark.parametrize("failed_job", ["", "provision-storage", "doctor-schema-init", "doctor-runtime"])
+def test_cold_install_commands_create_dependencies_and_stop_on_failed_execution(tmp_path: Path, failed_job: str) -> None:
+    """Execute the actual runbook commands with stateful Azure API responses."""
+    output = tmp_path / "environment-outputs.json"
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    output.write_text(
+        json.dumps(
+            {
+                "environmentResourceId": {"type": "String", "value": prefix + "Microsoft.App/managedEnvironments/aca-env"},
+                "identityResourceId": {"type": "String", "value": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id"},
+                "nfsStorageName": {"value": "elspeth"},
+                "keyVaultName": {"value": "aca-vault"},
+            }
+        )
+    )
+    azure = tmp_path / "az"
+    azure.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+state = pathlib.Path(os.environ["OPERATOR_DIR"])
+with (state / "events.jsonl").open("a") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args[:3] == ["keyvault", "secret", "show"]:
+    name = args[args.index("--name") + 1]
+    print("https://aca-vault.vault.azure.net/secrets/" + name + "/" + "a" * 32)
+elif args[:3] == ["deployment", "group", "create"]:
+    if "deployWebApp=false" in args:
+        (state / "jobs-created").touch()
+    else:
+        assert (state / "doctor-runtime-succeeded").exists()
+        (state / "app-created").touch()
+elif args[:3] == ["containerapp", "job", "start"]:
+    assert (state / "jobs-created").exists(), "job was started before creation"
+    print("new-execution")
+elif args[:4] == ["containerapp", "job", "execution", "show"]:
+    assert args[args.index("--job-execution-name") + 1] == "new-execution"
+    name = args[args.index("--name") + 1]
+    failed = name == os.environ["FAILED_JOB"]
+    if not failed:
+        (state / (name + "-succeeded")).touch()
+    print("Failed" if failed else "Succeeded")
+elif args[:3] != ["deployment", "group", "what-if"]:
+    raise AssertionError(args)
+""")
+    azure.chmod(0o755)
+    candidate = "b" * 40
+    params = tmp_path / "workload.parameters.json"
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "OPERATOR_DIR": str(tmp_path),
+        "WORKLOAD_PARAMETERS": str(params),
+        "CANDIDATE_SHA": candidate,
+        "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
+        "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
+        "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
+        "RESOURCE_GROUP": "aca-live",
+        "FAILED_JOB": failed_job,
+    }
+    text = _text(COLD_INSTALL_RUNBOOK)
+    commands = "\n".join(_fences(text[text.index("## 5.") : text.index("## 9.")], "bash"))
+    result = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", commands], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    assert result.returncode == (1 if failed_job else 0), result.stderr
+    assert (tmp_path / "app-created").exists() == (not failed_job)
+    resolved = json.loads(params.read_text())["parameters"]
+    assert resolved["candidateSourceSha"]["value"] == candidate
+    assert all(set(entry) == {"value"} for entry in resolved.values())
+    assert resolved["environmentResourceId"]["value"] == prefix + "Microsoft.App/managedEnvironments/aca-env"
+    assert resolved["sessionDbUrlRuntimeSecretUrl"]["value"].endswith("/" + "a" * 32)
+    assert params.stat().st_mode & 0o777 == 0o600
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    starts = [args[args.index("--name") + 1] for args in events if args[:3] == ["containerapp", "job", "start"]]
+    jobs = ["provision-storage", "doctor-schema-init", "doctor-runtime"]
+    assert starts == (jobs[: jobs.index(failed_job) + 1] if failed_job else jobs)
+
+
+@pytest.mark.parametrize(
+    "parameter,value",
+    [
+        ("image", "registry.azurecr.io/elspeth:latest"),
+        ("candidateSourceSha", "0" * 40),
+        ("sessionDbUrlRuntimeSecretUrl", "https://aca-vault.vault.azure.net/secrets/runtime/latest"),
+        ("composerTransportIdleCeilingSeconds", 0),
+    ],
+)
+def test_parameter_validator_rejects_unresolved_configuration(tmp_path: Path, parameter: str, value: object) -> None:
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    inputs = {
+        "environmentResourceId": prefix + "Microsoft.App/managedEnvironments/aca-env",
+        "identityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id",
+        "nfsStorageName": "elspeth",
+        "containerAppName": "elspeth-web",
+        "image": "registry.azurecr.io/elspeth@sha256:" + "b" * 64,
+        "provisionStorageImage": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "c" * 64,
+        "candidateSourceSha": "d" * 40,
+        "revisionSuffix": "r" + "d" * 12,
+        "composerTransportIdleCeilingSeconds": 210,
+        "composerEndpointApiKeySecretUrl": "",
+        "minReplicas": 2,
+        "maxReplicas": 4,
+        "activeRevisionsMode": "Single",
+        "stickySessionsAffinity": "sticky",
+    }
+    for name in (
+        "sessionDbUrlRuntimeSecretUrl",
+        "landscapeUrlRuntimeSecretUrl",
+        "sessionDbUrlSchemaOwnerSecretUrl",
+        "landscapeUrlSchemaOwnerSecretUrl",
+        "secretKeySecretUrl",
+        "shareableLinkSigningKeySecretUrl",
+        "fingerprintKeySecretUrl",
+        "operatorMetricsBearerTokenSecretUrl",
+    ):
+        inputs[name] = "https://aca-vault.vault.azure.net/secrets/" + name.lower() + "/" + "e" * 32
+    path = tmp_path / "invalid.json"
+    command = ["jq", "-e", "-f", str(REPO_ROOT / "deploy/azure-container-apps/scripts/validate-workload-parameters.jq"), str(path)]
+    path.write_text(json.dumps({"parameters": {key: {"value": item} for key, item in inputs.items()}}))
+    assert subprocess.run(command, capture_output=True).returncode == 0
+    inputs[parameter] = value
+    path.write_text(json.dumps({"parameters": {key: {"value": item} for key, item in inputs.items()}}))
+    result = subprocess.run(command, capture_output=True)
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("fail_sql", [False, True])
+def test_acceptance_bootstrap_creates_role_secret_dependencies_and_protects_values(tmp_path: Path, fail_sql: bool) -> None:
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    password = "sensitive:+ /?password"
+    names = (
+        "elspeth-schema-owner-password",
+        "elspeth-runtime-password",
+        "elspeth-runtime-a-password",
+        "elspeth-runtime-b-password",
+        "elspeth-secret-key",
+        "elspeth-shareable-link-signing-key",
+        "elspeth-fingerprint-key",
+        "elspeth-operator-metrics-bearer-token",
+    )
+    for name in names:
+        (secrets / name).write_text(password)
+    inventory = tmp_path / "inventory.json"
+    prefix = "/subscriptions/12345678-1234-1234-1234-123456789abc/resourceGroups/aca-live/providers/"
+    inventory.write_text(
+        json.dumps(
+            {
+                key: {"type": "String", "value": value}
+                for key, value in {
+                    "postgresFqdn": "aca-pg.postgres.database.azure.com",
+                    "keyVaultName": "aca-vault",
+                    "environmentResourceId": prefix + "Microsoft.App/managedEnvironments/aca-env",
+                    "identityResourceId": prefix + "Microsoft.ManagedIdentity/userAssignedIdentities/aca-id",
+                    "nfsStorageName": "elspeth",
+                    "blobStorageAccountName": "acabls",
+                    "payloadContainerName": "elspeth-payloads",
+                    "identityClientId": "12345678-1234-1234-1234-123456789abc",
+                }.items()
+            }
+        )
+    )
+    main = tmp_path / "main.json"
+    main.write_text(
+        json.dumps(
+            {
+                "parameters": {
+                    "postgresAdministratorLogin": {"value": "aca_admin"},
+                    "postgresAdministratorPassword": {"value": password},
+                }
+            }
+        )
+    )
+    psql = tmp_path / "psql"
+    psql.write_text("""#!/usr/bin/env python3
+import os, pathlib, sys
+root = pathlib.Path(os.environ["FAKE_STATE"])
+assert os.environ["ELSPETH_RUNTIME_A_PASSWORD"] == "sensitive:+ /?password"
+assert sys.argv[-1].endswith("bootstrap-acceptance-roles.sql")
+print("sensitive:+ /?password", file=sys.stderr)
+if os.environ["FAIL_SQL"] == "true":
+    sys.exit(3)
+(root / "sql-done").touch()
+""")
+    psql.chmod(0o755)
+    az = tmp_path / "az"
+    az.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ["FAKE_STATE"])
+assert (root / "sql-done").exists()
+a = sys.argv[1:]
+with (root / "azure-argv.jsonl").open("a") as log:
+    log.write(json.dumps(a) + "\\n")
+if a[:2] == ["keyvault", "show"]:
+    print("/subscriptions/live/resourceGroups/live/providers/Microsoft.KeyVault/vaults/aca-vault")
+elif a[:3] == ["role", "assignment", "create"]:
+    (root / "role-done").touch()
+elif a[:3] == ["keyvault", "secret", "set"]:
+    assert (root / "role-done").exists()
+    name = a[a.index("--name") + 1]
+    value = pathlib.Path(a[a.index("--file") + 1]).read_text()
+    if "-url-" in name:
+        assert "sensitive%3A%2B%20%2F%3Fpassword" in value
+        assert not value.endswith("\\n")
+    (root / (name + ".uploaded")).touch()
+    print("https://aca-vault.vault.azure.net/secrets/" + name + "/" + "a" * 32)
+elif a[:3] == ["keyvault", "secret", "show"]:
+    name = a[a.index("--name") + 1]
+    assert (root / (name + ".uploaded")).exists()
+    print("https://aca-vault.vault.azure.net/secrets/" + name + "/" + "a" * 32)
+else:
+    raise AssertionError(a)
+""")
+    az.chmod(0o755)
+    output = tmp_path / "parameters"
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_STATE": str(tmp_path),
+        "MAIN_PARAMETERS": str(main),
+        "PGSSLROOTCERT": "/operator/trust.pem",
+        "BOOTSTRAP_PRINCIPAL_ID": "12345678-1234-1234-1234-123456789abc",
+        "BOOTSTRAP_PRINCIPAL_TYPE": "User",
+        "CANDIDATE_SHA": "b" * 40,
+        "CANDIDATE_IMAGE": "registry.azurecr.io/elspeth@sha256:" + "c" * 64,
+        "PROVISION_STORAGE_IMAGE": "mcr.microsoft.com/azurelinux/base/core@sha256:" + "d" * 64,
+        "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS": "210",
+        "FAIL_SQL": str(fail_sql).lower(),
+    }
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "deploy/azure-container-apps/scripts/bootstrap-acceptance.sh"), str(inventory), str(secrets), str(output)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == (3 if fail_sql else 0), result.stderr
+    assert password not in result.stdout + result.stderr
+    assert list(output.glob("bootstrap-private.*")) == []
+    if fail_sql:
+        assert not (tmp_path / "azure-argv.jsonl").exists()
+        assert not (output / "workload.parameters.json").exists()
+        assert (output / "bootstrap-error.log").stat().st_mode & 0o777 == 0o600
+    else:
+        assert password not in (tmp_path / "azure-argv.jsonl").read_text()
+        credentials_path = output / "acceptance-env.json"
+        assert credentials_path.stat().st_mode & 0o777 == 0o600
+        credentials = json.loads(credentials_path.read_text())
+        assert set(credentials) == {
+            "ELSPETH_ACCEPTANCE_PG_ADMIN_URL",
+            "ELSPETH_ACCEPTANCE_PG_RUNTIME_A_URL",
+            "ELSPETH_ACCEPTANCE_PG_RUNTIME_B_URL",
+            "ELSPETH_ACCEPTANCE_SESSION_DB_URL",
+            "ELSPETH_ACCEPTANCE_LANDSCAPE_URL",
+            "ELSPETH_TEST_POSTGRES_URL",
+        }
+        assert "elspeth_runtime_a:" in credentials["ELSPETH_ACCEPTANCE_PG_RUNTIME_A_URL"]
+        assert "elspeth_runtime_b:" in credentials["ELSPETH_ACCEPTANCE_PG_RUNTIME_B_URL"]
+        assert "/postgres?" in credentials["ELSPETH_TEST_POSTGRES_URL"]
+        assert all("sslrootcert=%2Foperator%2Ftrust.pem" in url for url in credentials.values())
+        for role in ("a", "b"):
+            parameters = json.loads((output / f"workload-{role}.parameters.json").read_text())["parameters"]
+            assert f"runtime-{role}/" in parameters["sessionDbUrlRuntimeSecretUrl"]["value"]
+            assert parameters["runtimeRoleLabel"]["value"] == role
+            assert parameters["verifyBlobManagedIdentity"]["value"] is True
+            assert parameters["blobAccountUrl"]["value"] == "https://acabls.blob.core.windows.net"
+            assert parameters["identityClientId"]["value"] == env["BOOTSTRAP_PRINCIPAL_ID"]
 
 
 def test_secret_rotation_cites_the_key_derivation_authority() -> None:

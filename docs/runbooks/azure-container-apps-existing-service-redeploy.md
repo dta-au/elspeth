@@ -64,20 +64,24 @@ export AZURE_CORE_OUTPUT=json
 CANDIDATE_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
 test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
 test -z "$(git status --porcelain)"
+: "${WORKLOAD_PARAMETERS:?absolute path to the concrete workload ARM JSON retained from cold install}"
+OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
+mkdir -p "$OPERATOR_DIR"
+chmod 700 "$OPERATOR_DIR"
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 ```
 
 ## 1. Capture the live deployment
 
 ```bash
-az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >live-app.json
-PREVIOUS_REVISION=$(jq -r '.properties.latestReadyRevisionName' live-app.json)
-PREVIOUS_IMAGE=$(jq -r '.properties.template.containers[] | select(.name=="elspeth-web") | .image' live-app.json)
-ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' live-app.json)
+az containerapp show --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" >"$OPERATOR_DIR/live-app.json"
+PREVIOUS_REVISION=$(jq -r '.properties.latestReadyRevisionName' "$OPERATOR_DIR/live-app.json")
+PREVIOUS_IMAGE=$(jq -r '.properties.template.containers[] | select(.name=="elspeth-web") | .image' "$OPERATOR_DIR/live-app.json")
+ACR_LOGIN_SERVER=$(jq -r '.properties.configuration.registries[0].server' "$OPERATOR_DIR/live-app.json")
 jq '{mode: .properties.configuration.activeRevisionsMode,
      affinity: .properties.configuration.ingress.stickySessions.affinity,
      scale: .properties.template.scale,
-     grace: .properties.template.terminationGracePeriodSeconds}' live-app.json
+     grace: .properties.template.terminationGracePeriodSeconds}' "$OPERATOR_DIR/live-app.json"
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}"
 ```
@@ -104,23 +108,43 @@ CANDIDATE_IMAGE="${ACR_LOGIN_SERVER}/elspeth@${ACR_DIGEST}"
 
 ## 3. Review the change with what-if
 
+Use the operator-local ARM JSON retained from installation, never the tracked
+`workload.production.bicepparam` compilation example. If that file is missing,
+recover the concrete parameter set from the last successful workload deployment
+(`az deployment group show --query properties.parameters`) into a new local ARM
+parameter envelope before continuing. Compare it to the captured app and Jobs;
+do not regenerate secret IDs from the latest Key Vault versions during redeploy.
+The local source parameter file remains the rollback reference. Prepare a new
+candidate file with only the image and release identity changed:
+
 ```bash
+NEXT_WORKLOAD_PARAMETERS="$OPERATOR_DIR/workload-${CANDIDATE_SHA}.parameters.json"
+test "$WORKLOAD_PARAMETERS" != "$NEXT_WORKLOAD_PARAMETERS"
+test ! -e "$NEXT_WORKLOAD_PARAMETERS"
+jq --arg image "$CANDIDATE_IMAGE" --arg sha "$CANDIDATE_SHA" '
+  .parameters.image.value = $image |
+  .parameters.candidateSourceSha.value = $sha |
+  .parameters.revisionSuffix.value = ("r" + $sha[0:12])
+' "$WORKLOAD_PARAMETERS" >"$NEXT_WORKLOAD_PARAMETERS"
+jq -e -f deploy/azure-container-apps/scripts/validate-workload-parameters.jq "$NEXT_WORKLOAD_PARAMETERS" >/dev/null
+jq -e --arg name "$CONTAINER_APP" '.parameters.containerAppName.value == $name' "$NEXT_WORKLOAD_PARAMETERS" >/dev/null
 az deployment group what-if --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.production.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}"
+  --parameters "@$NEXT_WORKLOAD_PARAMETERS"
 ```
 
-The only expected change is the container image and the revision suffix.
+The expected changes are the container image, revision suffix and candidate
+SHA in `ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE` and
+`ELSPETH_ACCEPTANCE_CANDIDATE_SHA` on the app and doctor Jobs.
 Any change to secrets, volumes, probes, scale or ingress is a stop.
 
 ## 4. Run the doctor Job with the candidate digest
 
 ```bash
-az containerapp job update --name doctor-runtime --resource-group "$RESOURCE_GROUP" --image "$CANDIDATE_IMAGE"
-EXECUTION=$(az containerapp job start --name doctor-runtime --resource-group "$RESOURCE_GROUP" --query name --output tsv)
-az containerapp job execution show --name doctor-runtime --resource-group "$RESOURCE_GROUP" \
-  --job-execution-name "$EXECUTION" --query properties.status --output tsv
+az deployment group create --name "elspeth-jobs-${CANDIDATE_SHA:0:12}" --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$NEXT_WORKLOAD_PARAMETERS" --parameters deployWebApp=false --mode Incremental
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-runtime
 ```
 
 The Job runs `elspeth doctor deployment --json`; require `Succeeded`. A
@@ -131,8 +155,9 @@ first; do not proceed to step 5.
 
 ```bash
 az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --image "$CANDIDATE_IMAGE" --revision-suffix "${CANDIDATE_SHA:0:12}" \
-  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${CANDIDATE_SHA}"
+  --image "$CANDIDATE_IMAGE" --revision-suffix "r${CANDIDATE_SHA:0:12}" \
+  --set-env-vars "ELSPETH_ACCEPTANCE_CANDIDATE_SHA=${CANDIDATE_SHA}" \
+    "ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE=${CANDIDATE_SHA}"
 ```
 
 ## 6. Prove the rollout
@@ -141,13 +166,18 @@ az containerapp update --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP
 az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState,image:properties.template.containers[0].image}"
 az containerapp replica list --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "${CONTAINER_APP}--${CANDIDATE_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
+  --revision "${CONTAINER_APP}--r${CANDIDATE_SHA:0:12}" --query '[].{name:name,state:properties.runningState}'
 ```
 
 Require exactly one active revision at 100 % whose image is
 `CANDIDATE_IMAGE`, `N` replicas `Running`, and the previous revision
 inactive. The platform's own readiness wait is the rollout primitive; the
 checks above are the proof.
+
+After successful verification, retain `NEXT_WORKLOAD_PARAMETERS` as the
+`WORKLOAD_PARAMETERS` input for the next redeploy. A configuration change uses
+the same reviewed concrete parameters with `deployWebApp=true`; the direct
+`az containerapp update` above is the image-only path.
 
 ## 7. Prove public behaviour and identity
 
@@ -179,7 +209,7 @@ az containerapp revision activate --name "$CONTAINER_APP" --resource-group "$RES
 az containerapp ingress traffic set --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
   --revision-weight "${PREVIOUS_REVISION}=100"
 az containerapp revision deactivate --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
-  --revision "${CONTAINER_APP}--${CANDIDATE_SHA:0:12}"
+  --revision "${CONTAINER_APP}--r${CANDIDATE_SHA:0:12}"
 ```
 
 Then repeat step 6 and step 7 against the previous revision.

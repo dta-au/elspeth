@@ -34,7 +34,8 @@ release-evidence controller.
 3. publish the image to the registry as a digest-preserving copy and pin the
    digest;
 4. put every secret in Key Vault as a versioned secret;
-5. run the `provision-storage` Job;
+5. resolve an operator-local workload parameter file, create Jobs with
+   `deployWebApp=false`, then run the `provision-storage` Job;
 6. run the `doctor-schema-init` Job with the schema-owner URLs;
 7. run the `doctor-runtime` Job with the runtime URLs;
 8. deploy `workload.bicep` in the production shape and prove the rollout; and
@@ -98,6 +99,10 @@ test "$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS" -le 240
 CANDIDATE_SHA=$(git rev-parse "${DEPLOY_REF}^{commit}")
 test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
 test -z "$(git status --porcelain)"
+OPERATOR_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/elspeth/azure-container-apps/${RESOURCE_GROUP}"
+mkdir -p "$OPERATOR_DIR"
+chmod 700 "$OPERATOR_DIR"
+export WORKLOAD_PARAMETERS="$OPERATOR_DIR/workload-${CANDIDATE_SHA}.parameters.json"
 az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 az account show --query '{subscription:id,tenant:tenantId,user:user.name}'
 ```
@@ -113,16 +118,36 @@ Stop if the registry's login server differs from `ACR_LOGIN_SERVER`.
 
 ## 2. Deploy the environment
 
+The PostgreSQL administrator password is required; the tracked empty fallback
+is only a compilation fixture. Copy the environment parameter example outside
+the checkout, change its `using` directive to the absolute path of this
+checkout's `environment.bicep`, and replace `containerRegistryResourceId` with
+the verified `ACR_RESOURCE_ID`. Set the actual administrator login and network
+configuration in that local file. Both the operator's SQL client and Key Vault
+client need access: run from a host on the private network (with private DNS),
+or explicitly configure the operator IP allowlists for the bootstrap window.
+Grant the operator Key Vault Secrets Officer separately from the runtime
+identity's Secrets User role. Never grant the runtime identity secret-write
+permission. Keep public database access disabled after bootstrap.
+
 ```bash
+: "${ELSPETH_POSTGRES_ADMIN_PASSWORD:?export the administrator password without printing it}"
+: "${ENVIRONMENT_PARAMETERS:?absolute path to the completed local environment bicepparam file}"
+bicep build-params "$ENVIRONMENT_PARAMETERS" --outfile "$OPERATOR_DIR/environment.parameters.json"
+jq -e --arg registry "$ACR_RESOURCE_ID" '
+  .parameters.containerRegistryResourceId.value == $registry and
+  (.parameters.containerRegistryResourceId.value | contains("00000000") | not) and
+  (.parameters.postgresAdministratorPassword.value | length > 0)
+' "$OPERATOR_DIR/environment.parameters.json" >/dev/null
 az deployment group what-if --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/environment.bicep \
-  --parameters deploy/azure-container-apps/environment.example.bicepparam \
-  --parameters containerRegistryResourceId="$ACR_RESOURCE_ID"
+  --parameters "@$OPERATOR_DIR/environment.parameters.json"
 az deployment group create --name elspeth-environment --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/environment.bicep \
-  --parameters deploy/azure-container-apps/environment.example.bicepparam \
-  --parameters containerRegistryResourceId="$ACR_RESOURCE_ID" \
-  --query properties.outputs >environment-outputs.json
+  --parameters "@$OPERATOR_DIR/environment.parameters.json" \
+  --query properties.outputs >"$OPERATOR_DIR/environment-outputs.json"
+rm -- "$OPERATOR_DIR/environment.parameters.json"
+unset ELSPETH_POSTGRES_ADMIN_PASSWORD
 ```
 
 The environment deployment creates the custom virtual network the NFS mount
@@ -156,6 +181,32 @@ does (facts §6.2). Deploy the `@sha256:` reference, never a tag.
 
 ## 4. Store secrets in Key Vault
 
+First create the application database roles on the empty Flexible Server.
+The environment template creates databases and the administrator, not these
+roles. From the private-network operator host, configure `PGHOST` from
+`postgresFqdn`, `PGUSER` to the administrator, `PGDATABASE=postgres`, and
+`PGSSLMODE=verify-full` with the operator's `PGSSLROOTCERT` trust bundle.
+Supply the administrator and new role passwords through the environment:
+
+```bash
+: "${PGHOST:?set the provisioned postgresFqdn}"
+: "${PGUSER:?set the Flexible Server administrator}"
+: "${PGPASSWORD:?export the administrator password}"
+: "${PGSSLROOTCERT:?set the operator PostgreSQL CA bundle path}"
+: "${ELSPETH_SCHEMA_OWNER_PASSWORD:?export a fresh schema-owner password}"
+: "${ELSPETH_RUNTIME_PASSWORD:?export a different fresh runtime password}"
+export PGDATABASE=postgres PGSSLMODE=verify-full
+psql --no-psqlrc --set=ON_ERROR_STOP=1 \
+  --file deploy/azure-container-apps/scripts/bootstrap-roles.sql \
+  >"$OPERATOR_DIR/bootstrap-roles.log" 2>&1
+```
+
+This cold-only script fails on existing roles. It makes the schema owner the
+database owner and grants the runtime only connection, schema usage and
+default data/sequence/function privileges on objects created by that owner.
+Run the schema-init doctor as that owner. Acceptance creates separate a/b
+runtime roles with the same grants before its role-specific Jobs.
+
 Create each secret as a versioned Key Vault secret and record the version id;
 the workload parameters reference `https://<vault>.vault.azure.net/secrets/<name>/<version>`.
 Required names: `elspeth-session-db-url-runtime`, `elspeth-landscape-url-runtime`,
@@ -165,25 +216,72 @@ Required names: `elspeth-session-db-url-runtime`, `elspeth-landscape-url-runtime
 `elspeth-operator-metrics-bearer-token`. PostgreSQL URLs use
 `sslmode=verify-full&sslrootcert=system`: the runtime image's CA store carries
 both Azure roots (facts §4.4). Never print a secret value.
+Store URL-escaped role passwords in those URLs; never put raw passwords into
+the shell command line. Clear `PGPASSWORD`, `ELSPETH_SCHEMA_OWNER_PASSWORD`
+and `ELSPETH_RUNTIME_PASSWORD` after storing their Key Vault versions.
+
+One executable handoff is a mode-0700 operator-local `SECRET_VALUE_DIR` with
+one mode-0600 UTF-8 file per required secret, named exactly as above. Populate
+these through the operator's secret manager; the following command uploads
+each file and captures only its version ID. Keep the directory outside Git:
+
+```bash
+: "${SECRET_VALUE_DIR:?absolute directory containing the selected secret value files}"
+KEY_VAULT_NAME=$(jq -er '.keyVaultName.value' "$OPERATOR_DIR/environment-outputs.json")
+for secret_name in elspeth-session-db-url-runtime elspeth-landscape-url-runtime \
+  elspeth-session-db-url-schema-owner elspeth-landscape-url-schema-owner \
+  elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key \
+  elspeth-operator-metrics-bearer-token; do
+  test -s "$SECRET_VALUE_DIR/$secret_name"
+  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$secret_name" \
+    --file "$SECRET_VALUE_DIR/$secret_name" --encoding utf-8 --query id --output tsv \
+    >"$OPERATOR_DIR/$secret_name.version"
+done
+unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD
+```
+
+If using a Composer endpoint key, upload its file in the same manner and
+export its secret name as `COMPOSER_ENDPOINT_SECRET_NAME` before step 5.
 
 ## 5. Provision storage
 
+Select and verify a root provisioner image digest independently of the runtime
+image, then materialise the workload parameters from environment outputs and
+the secret version IDs created in step 4. The resolver reads IDs only and
+rejects unresolved sample values. Retain this file for redeployment; it pins
+secret versions, identity, storage and production settings outside Git. Review
+any site-specific `extraEnvironment`, scale or sizing changes in that local
+file, then validate again before deploying.
+
 ```bash
-az containerapp job start --name provision-storage --resource-group "$RESOURCE_GROUP"
+: "${PROVISION_STORAGE_IMAGE:?export the verified digest-pinned root provisioner image}"
+export CANDIDATE_SHA CANDIDATE_IMAGE PROVISION_STORAGE_IMAGE
+bash deploy/azure-container-apps/scripts/resolve-workload-parameters.sh \
+  "$OPERATOR_DIR/environment-outputs.json" "$WORKLOAD_PARAMETERS"
+jq -e -f deploy/azure-container-apps/scripts/validate-workload-parameters.jq "$WORKLOAD_PARAMETERS" >/dev/null
+az deployment group what-if --resource-group "$RESOURCE_GROUP" \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$WORKLOAD_PARAMETERS" --parameters deployWebApp=false
+az deployment group create --name elspeth-jobs --resource-group "$RESOURCE_GROUP" --mode Incremental \
+  --template-file deploy/azure-container-apps/workload.bicep \
+  --parameters "@$WORKLOAD_PARAMETERS" --parameters deployWebApp=false
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" provision-storage
 ```
 
 The Job runs a digest-pinned root image (the runtime image is `USER 1654` and
 the platform offers no `runAsUser`) and creates `/mnt/elspeth/data`,
 `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads` as `1654:1654`, mode
-`0700`. Wait for `properties.status == Succeeded` with
-`az containerapp job execution list` before continuing.
+`0700`. The helper waits for `Succeeded` on the exact started execution and
+stops on failure or timeout. Jobs exist before this first execution; no app
+resource is deployed in the Jobs-only stage. Use Incremental mode throughout:
+Complete mode could delete an existing app when `deployWebApp=false`.
 
 > **LIVE:** the share root's ownership and mode after creation.
 
 ## 6. Initialize schemas
 
 ```bash
-az containerapp job start --name doctor-schema-init --resource-group "$RESOURCE_GROUP"
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-schema-init
 ```
 
 `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
@@ -193,7 +291,7 @@ repairable schemas; `STALE` is a stop, not a migration.
 ## 7. Prove runtime credentials
 
 ```bash
-az containerapp job start --name doctor-runtime --resource-group "$RESOURCE_GROUP"
+bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-runtime
 ```
 
 `doctor-runtime` runs `elspeth doctor deployment --json` with the runtime
@@ -206,9 +304,7 @@ Analytics by execution name (ingestion lags by minutes, facts §5.1).
 ```bash
 az deployment group create --name "elspeth-workload-${CANDIDATE_SHA:0:12}" --resource-group "$RESOURCE_GROUP" \
   --template-file deploy/azure-container-apps/workload.bicep \
-  --parameters deploy/azure-container-apps/workload.production.bicepparam \
-  --parameters image="$CANDIDATE_IMAGE" revisionSuffix="${CANDIDATE_SHA:0:12}" \
-    composerTransportIdleCeilingSeconds="$ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS"
+  --parameters "@$WORKLOAD_PARAMETERS" --parameters deployWebApp=true --mode Incremental
 ```
 
 Production shape: `activeRevisionsMode: Single`, `stickySessions.affinity:
@@ -227,7 +323,7 @@ FQDN=$(az containerapp show --name elspeth-web --resource-group "$RESOURCE_GROUP
 az containerapp revision list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
   --query "[?properties.active].{name:name,traffic:properties.trafficWeight,state:properties.runningState}"
 az containerapp replica list --name elspeth-web --resource-group "$RESOURCE_GROUP" \
-  --revision "elspeth-web--${CANDIDATE_SHA:0:12}" --query '[].name'
+  --revision "elspeth-web--r${CANDIDATE_SHA:0:12}" --query '[].name'
 curl --silent --fail-with-body "https://${FQDN}/api/health"
 curl --silent --fail-with-body "https://${FQDN}/api/ready" | jq -e '.ready == true'
 curl --silent --fail-with-body "https://${FQDN}/api/system/status" | jq '{deployment_target, frontend_build, instance_id}'

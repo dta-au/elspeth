@@ -119,7 +119,12 @@ testcontainer files for doctor, schema, startup and readiness. Run them with
 
 ### 4. Run the doctor Job with the candidate digest
 
-Point the `doctor-runtime` Job at the candidate digest, start it, and require
+Load the concrete operator-local `WORKLOAD_PARAMETERS` retained from cold
+install, create a new candidate file, validate it with
+`deploy/azure-container-apps/scripts/validate-workload-parameters.jq`, and run
+what-if. Never deploy the tracked placeholder example. Update Jobs using
+`deployWebApp=false` in Incremental mode and run `doctor-runtime` with
+`scripts/run-job.sh`, which waits on the exact execution it started. Require
 `Succeeded`. Classify a failure first: contract/config, Key Vault reference
 or version, PostgreSQL connectivity or TLS, schema state, NFS mount or
 ownership, identity role assignment (role assignments can take up to 24 h to
@@ -127,7 +132,9 @@ reach a cached token), or a missing image.
 
 ### 5. Roll the revision
 
-`az containerapp update --image <digest> --revision-suffix <sha12>`; then
+`az containerapp update --image <digest> --revision-suffix r<sha12>` with
+`ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE` and
+`ELSPETH_ACCEPTANCE_CANDIDATE_SHA` set to the full candidate SHA; then
 independently require one active revision at 100 % with the candidate image,
 `N` replicas `Running`, HTTP 200 on both probes, an `X-Elspeth-Instance`
 header and the expected `/api/system/status` facts.
@@ -166,6 +173,13 @@ Common interpretations:
 - `503 /api/ready` is a dependency/readiness failure, not a liveness failure.
 - A `504` after roughly four minutes is the ingress request timeout, not a
   platform failure of the deployment.
+- Fatal membership or orphan-sweeper failure must stop the actual host, drain
+  services, and let the platform replace the process. A cancelled lifespan
+  task with a still-serving Uvicorn main loop is a defect. Correlate process
+  exit and replica replacement with membership transitions, not health alone.
+- Membership generation and revision use the platform's
+  `CONTAINER_APP_REVISION`; image provenance uses the candidate SHA bound in
+  `ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE`. Never substitute the package version.
 
 ## Stop, resume, rollback, destroy
 

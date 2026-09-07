@@ -12,7 +12,21 @@ param environmentResourceId string
 param identityResourceId string
 
 @description('Name of the NFS storage definition on the environment.')
-param nfsStorageName string = 'elspeth-nfs'
+param nfsStorageName string = 'elspeth'
+
+@description('False creates/updates only the manual Jobs. Cold install runs these Jobs successfully before deploying the app. Always use Incremental deployment mode.')
+param deployWebApp bool = true
+
+@description('Create the disposable acceptance Blob managed-identity proof Job.')
+param verifyBlobManagedIdentity bool = false
+param blobAccountUrl string = ''
+param blobContainerName string = ''
+param identityClientId string = ''
+
+@description('Full source commit SHA of the digest-pinned candidate; binds membership and telemetry to the published release.')
+@minLength(40)
+@maxLength(40)
+param candidateSourceSha string
 
 @description('Container app name.')
 param containerAppName string = 'elspeth-web'
@@ -163,6 +177,14 @@ var schemaOwnerSecrets = concat(applicationSecrets, [
 // resolves to external-postgresql and refuses sqlite-single at config time.
 var contractEnvironment = [
   {
+    name: 'ELSPETH_WEB__OPERATOR_TELEMETRY_RELEASE'
+    value: candidateSourceSha
+  }
+  {
+    name: 'ELSPETH_ACCEPTANCE_CANDIDATE_SHA'
+    value: candidateSourceSha
+  }
+  {
     name: 'ELSPETH_WEB__DEPLOYMENT_TARGET'
     value: 'azure-container-apps'
   }
@@ -304,7 +326,7 @@ var webProbes = [
 // ---------------------------------------------------------------------------
 // The web app
 // ---------------------------------------------------------------------------
-module containerApp 'br/public:avm/res/app/container-app:0.23.0' = {
+module containerApp 'br/public:avm/res/app/container-app:0.23.0' = if (deployWebApp) {
   name: '${containerAppName}-app'
   params: {
     name: containerAppName
@@ -475,7 +497,64 @@ module doctorRuntimeJob 'br/public:avm/res/app/job:0.7.2' = {
   }
 }
 
-output containerAppResourceId string = containerApp.outputs.resourceId
-output containerAppFqdn string = containerApp.outputs.fqdn
+module verifyBlobManagedIdentityJob 'br/public:avm/res/app/job:0.7.2' = if (verifyBlobManagedIdentity) {
+  name: 'verify-blob-managed-identity-job'
+  params: {
+    name: 'verify-blob-managed-identity'
+    location: resourceGroup().location
+    tags: tags
+    environmentResourceId: environmentResourceId
+    workloadProfileName: 'Consumption'
+    triggerType: 'Manual'
+    manualTriggerConfig: {
+      parallelism: 1
+      replicaCompletionCount: 1
+    }
+    replicaRetryLimit: 0
+    replicaTimeout: 600
+    managedIdentities: managedIdentities
+    registries: registries
+    containers: [
+      {
+        name: 'verify-blob-managed-identity'
+        image: image
+        command: [
+          'python'
+          '-m'
+          'elspeth.web.azure_blob_acceptance_job'
+        ]
+        env: [
+          {
+            name: 'ELSPETH_ACCEPTANCE_BLOB_ACCOUNT_URL'
+            value: blobAccountUrl
+          }
+          {
+            name: 'ELSPETH_ACCEPTANCE_BLOB_CONTAINER'
+            value: blobContainerName
+          }
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: identityClientId
+          }
+          {
+            name: 'AZURE_TOKEN_CREDENTIALS'
+            value: 'ManagedIdentityCredential'
+          }
+          {
+            name: 'ELSPETH_ACCEPTANCE_CANDIDATE_SHA'
+            value: candidateSourceSha
+          }
+        ]
+        resources: {
+          cpu: json('0.5')
+          memory: '1Gi'
+        }
+      }
+    ]
+  }
+}
+
+output containerAppResourceId string = deployWebApp ? containerApp!.outputs.resourceId : ''
+output containerAppFqdn string = deployWebApp ? containerApp!.outputs.fqdn : ''
 output revisionName string = '${containerAppName}--${revisionSuffix}'
 output doctorRuntimeJobName string = 'doctor-runtime${jobSuffix}'

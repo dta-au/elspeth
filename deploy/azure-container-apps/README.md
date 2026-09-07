@@ -42,9 +42,27 @@ the operator procedures are the three runbooks
 | `kql/*.kql` | | doctor report by execution; run sentinel by replica; replica lifecycle; fence-conflict 409s — SHA-256 bound into the receipt; column names verified live, never pinned by a test |
 | `scripts/acceptance.sh` | | the stage driver (group → image copy → Jobs → rollout → probes → evidence → cleanup) |
 
-The `verify-blob-managed-identity` Job and the probe/receipt facade land with
-the acceptance package (6b-5); the driver's `probes` stage stops with a static
-class until then.
+Cold installation deploys `workload.bicep` with `deployWebApp=false` in
+Incremental mode before starting any Job. After storage provisioning and both
+doctors succeed, deploying with `deployWebApp=true` creates the app. The pinned
+managed-environment AVM uses the storage definition name as its physical NFS
+share name, so both are `elspeth`.
+
+`scripts/resolve-workload-parameters.sh` writes concrete operator-local ARM
+JSON from environment outputs, verified image digests and Key Vault version
+IDs. `scripts/validate-workload-parameters.jq` rejects placeholders before
+what-if. Redeployment reuses the retained file to preserve secret versions and
+configuration. `scripts/run-job.sh` waits on the exact newly started execution.
+The acceptance driver uses the landed probe facade; live evidence remains an
+operator-run acceptance requirement.
+
+For a fresh acceptance, `scripts/bootstrap-acceptance.sh` creates SQL roles and
+versioned Key Vault secrets from explicit operator-local secret files before
+Jobs start. It produces production and a/b workload parameter files plus a
+mode-0600 `acceptance-env.json` containing host observer credentials. That file
+is private operational configuration and must never enter a receipt or Git.
+The cold-only SQL scripts fail on existing roles; investigate a partial failure
+before retrying. The bootstrap commands have bounded execution time and output.
 
 ## Compile
 
@@ -70,6 +88,9 @@ against each parameter file, never on Bicep text.
   Door or other hop in front lowers it further.
 - `image` — the registry reference **by digest**, a digest-preserving copy of
   the GitHub Container Registry image (two builds never share a digest).
+- `candidateSourceSha` — the full source commit bound to that image, used by
+  membership and operator telemetry. Revision suffixes use `r<sha12>` so a
+  hexadecimal SHA beginning with a digit remains a valid Azure suffix.
 - `provisionStorageImage` — a digest-pinned root image; the runtime image is
   `USER 1654` and the platform offers no `runAsUser`.
 - Every secret URL — a **versioned** Key Vault reference.
