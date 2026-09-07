@@ -38,7 +38,7 @@ from typing import cast
 import pytest
 from sqlalchemy import create_engine, event, insert, select, update
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import (
@@ -653,6 +653,33 @@ class TestFencedLeaderTransaction:
 
 class TestWriteLockHeld:
     """§B.4 BUSY discrimination: a held write lock is NOT 'leadership held'."""
+
+    def test_unreadable_worker_roster_emits_diagnostic(
+        self, engine: Tier1Engine, repo: RunCoordinationRepository, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        failure = OperationalError("worker roster query", None, OSError("registry unavailable"))
+
+        def fail_connect() -> None:
+            raise failure
+
+        monkeypatch.setattr(engine, "connect", fail_connect)
+        assert repo._read_registered_workers(RUN_ID) == ()
+        record = next(record for record in caplog.records if "could not read run_workers roster" in record.message)
+        assert record.exc_info is not None
+        assert record.exc_info[1] is failure
+
+    def test_worker_roster_programmer_failure_propagates(
+        self, engine: Tier1Engine, repo: RunCoordinationRepository, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        failure = ValueError("broken connection adapter")
+
+        def fail_connect() -> None:
+            raise failure
+
+        monkeypatch.setattr(engine, "connect", fail_connect)
+        with pytest.raises(ValueError, match="broken connection adapter") as caught:
+            repo._read_registered_workers(RUN_ID)
+        assert caught.value is failure
 
     def test_acquire_raises_write_lock_held_with_structured_worker_forensics(
         self, engines: tuple[Tier1Engine, Tier1Engine], repo: RunCoordinationRepository

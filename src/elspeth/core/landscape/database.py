@@ -1248,7 +1248,11 @@ class LandscapeDB:
         uri_params: dict[str, str] = {}
 
         for key, raw_value in parsed.query.items():
-            value = raw_value if isinstance(raw_value, str) else raw_value[0]
+            # URL.query preserves repeated parameters as tuples. Selecting one
+            # occurrence would discard an authored connection/storage setting.
+            if not isinstance(raw_value, str):
+                raise ValueError("SQLCipher URL query parameters must occur exactly once")
+            value = raw_value
             if key in _CONNECT_KWARGS:
                 if key in ("check_same_thread", "uri"):
                     connect_kwargs[key] = value.lower() in ("true", "1", "yes")

@@ -15,6 +15,18 @@ sqlcipher3 = pytest.importorskip("sqlcipher3", reason="sqlcipher3 not installed 
 class TestSQLCipherCreateAndRead:
     """Basic CRUD operations on an encrypted database."""
 
+    @pytest.mark.parametrize(
+        "query",
+        ["timeout=1&timeout=2", "mode=rwc&mode=ro", "uri=true&uri=false", "cache=shared&cache=shared"],
+    )
+    def test_repeated_query_parameter_rejected_before_database_creation(self, tmp_path: Path, query: str) -> None:
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "ambiguous.db"
+        with pytest.raises(ValueError, match="SQLCipher URL query parameters must occur exactly once"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}?{query}", passphrase="test-repeated-query")
+        assert not db_path.exists()
+
     def test_sqlcipher_create_and_read(self, tmp_path: Path) -> None:
         from sqlalchemy import select
 
