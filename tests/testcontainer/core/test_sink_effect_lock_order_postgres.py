@@ -786,15 +786,18 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
     monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_token_locks", capture_token_locks)
     monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_state_locks", signal_state_locks)
 
+    takeover_token = leader_coordination_token(takeover_factory, built.run_id)
+    finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
         takeover = pool.submit(
             takeover_factory.execution.sink_effects.takeover_expired,
             built.effect_id,
             owner="worker-b",
             ttl=timedelta(seconds=30),
+            coordination_token=takeover_token,
         )
         assert takeover_locked.wait(timeout=5)
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request)
+        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
         assert finalizer_states_locked.wait(timeout=5)
         release_takeover.set()
         new_lease = takeover.result(timeout=10)
@@ -910,14 +913,17 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
     monkeypatch.setattr(lifecycle, "_after_effect_lock", capture_takeover_pid)
     monkeypatch.setattr(lifecycle, "_lock_effect", approaching_lock_effect)
 
+    finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
+    takeover_token = leader_coordination_token(takeover_factory, built.run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request)
+        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
         assert finalizer_holds_effect.wait(timeout=5)
         takeover = pool.submit(
             takeover_factory.execution.sink_effects.takeover_expired,
             built.effect_id,
             owner="worker-b",
             ttl=timedelta(seconds=30),
+            coordination_token=takeover_token,
         )
         assert takeover_approached.wait(timeout=5)
         release_finalizer.set()
@@ -998,14 +1004,16 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
         b_approached.set()
         return original_b_lock(conn, optimistic_effect, linked_effect_ids)
 
+    retry_a_token = leader_coordination_token(retry_a_factory, built.run_id)
+    retry_b_token = leader_coordination_token(retry_b_factory, built.run_id)
     monkeypatch.setattr(retry_a_factory.execution.sink_effects._finalization, "_after_effect_locks", pause_a_after_effect_locks)
     monkeypatch.setattr(b_finalization, "_after_effect_locks", capture_b_effect_locks)
     monkeypatch.setattr(b_finalization, "_lock_stream_and_effects", approaching_b_lock)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        retry_a = pool.submit(retry_a_factory.execution.sink_effects.finalize, built.request)
+        retry_a = pool.submit(retry_a_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_a_token)
         assert a_holds_effect.wait(timeout=5)
-        retry_b = pool.submit(retry_b_factory.execution.sink_effects.finalize, built.request)
+        retry_b = pool.submit(retry_b_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_b_token)
         assert b_approached.wait(timeout=5)
         # Retry B cannot finish while retry A holds the effect row lock: the
         # artifact winner is only readable behind the effect lock class.
