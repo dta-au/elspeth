@@ -1720,6 +1720,49 @@ _PLUGIN_CONTEXT_METHODS = frozenset(
     }
 )
 
+_NON_LANDSCAPE_RECEIVER_OWNERS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("elspeth.web.sessions.protocol.SessionServiceProtocol", "update_run_status"),
+        ("elspeth.web.composer.pipeline_planner._PlannerAttemptTrail", "begin_attempt"),
+    }
+)
+"""(resolved owner, method) pairs whose NAME collides with a Landscape verb and which are not one.
+
+``_mutation_callable_escapes`` is name-keyed and fail-closed: any attribute
+spelled like a Landscape verb on a receiver it cannot prove is a Landscape
+receiver becomes an ``unknown mutation receiver`` row.  That is the right
+default — the ``LLMAuditParent`` indirection in the LLM providers is exactly
+such a row and is REAL — but it also rows the Sessions service's own
+``update_run_status`` and the composer planner's own attempt trail, neither of
+which touches the Landscape.
+
+Admission is keyed on the receiver's **resolved owner**, never on its name, and
+never on the receiver resolving INTO an owned Landscape class.  An
+UNRESOLVABLE receiver is not admitted; it stays a row.  A rule that admitted
+every resolvable receiver would fail closed on the rows worth catching:
+``LLMAuditParent`` resolves perfectly well and MUST keep rowing until D8.3
+threads the token through it.
+
+**Why the pair and not the owner alone.**  ``SessionServiceProtocol`` declares
+85 methods.  Admitting the owner would silently admit every one of them that
+ever collides with a Landscape verb name, including a future ``complete_run``.
+Pinning the pair keeps the admission enumerable and bounds it to the two names
+measured here.
+
+**Why a ``Protocol`` annotation is sound HERE and is not an authority proof.**
+ADR-032 forbids a Protocol as a security or dispatch control because an
+impostor satisfies it structurally.  That argument is about granting authority.
+This constant grants none: it only declines to raise a false ``unknown
+receiver`` row, and it is reached ONLY after
+``_looks_like_landscape_receiver`` has already failed to prove the receiver.
+The inverted risk — a genuine Landscape write hiding behind a non-Landscape
+annotation — is bounded by ``test_non_landscape_receiver_owners_are_pinned_to_the_tree``,
+which re-derives every entry from the tree and asserts the owner is neither a
+``_MUTATION_APIS`` owner nor a module under ``src/elspeth/core/landscape/``.
+The blast radius is therefore exactly these two method names on these two
+owners.
+"""
+
 
 def _parameter_rebound(owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
     for child in _walk_same_scope(owner):
@@ -1822,6 +1865,89 @@ def _owner_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | N
         parent = getattr(scope, "_landscape_parent", None)
         scope = _lexical_scope(parent) if parent is not None else None
     return None
+
+
+def _self_attribute_owner_annotation(node: ast.Attribute, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    """Qualified annotation of ``self.<attr>`` when it is bound ONLY in ``__init__`` from one parameter.
+
+    Mirrors the binding discipline of ``_context_attribute_token_is_carried_by_value``:
+    a single ``__init__`` assignment from a plain annotated parameter that is never
+    rebound, with no ``setattr`` anywhere in the class.  Any other shape — a second
+    binding site, a rebinding, a computed value, a ``setattr`` — returns ``None`` and
+    the caller keeps its row.
+    """
+
+    located = _method_receiver(use)
+    if located is None or not isinstance(node.value, ast.Name) or node.value.id != located[1]:
+        return None
+    owner_class = located[0]
+    annotations: set[str] = set()
+    for member in ast.walk(owner_class):
+        if isinstance(member, ast.Call) and _call_name(member) == "setattr":
+            return None
+        if not isinstance(member, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            continue
+        targets = list(member.targets) if isinstance(member, ast.Assign) else [member.target]
+        for target in targets:
+            matches = [
+                child
+                for child in ast.walk(target)
+                if isinstance(child, ast.Attribute) and child.attr == node.attr and isinstance(child.value, ast.Name)
+            ]
+            if not matches:
+                continue
+            binder = _method_receiver(member)
+            if (
+                not isinstance(member, ast.Assign)
+                or target is not matches[0]
+                or len(matches) != 1
+                or binder is None
+                or binder[0] is not owner_class
+                or matches[0].value.id != binder[1]
+            ):
+                return None
+            init = _owner_function(member)
+            if init is None or init.name != "__init__" or not isinstance(member.value, ast.Name):
+                return None
+            parameter = next(
+                (
+                    argument
+                    for argument in (*init.args.posonlyargs, *init.args.args, *init.args.kwonlyargs)
+                    if argument.arg == member.value.id
+                ),
+                None,
+            )
+            if parameter is None or parameter.annotation is None or _parameter_rebound(init, parameter.arg):
+                return None
+            qualified = resolver.qualified_name(parameter.annotation, use=init)
+            if qualified is None:
+                return None
+            annotations.add(qualified)
+    return annotations.pop() if len(annotations) == 1 else None
+
+
+def _resolved_non_landscape_receiver_owner(node: ast.AST, method: str, resolver: _Resolver, *, use: ast.AST) -> str | None:
+    """Return the receiver's owner when it is a PINNED non-Landscape ``(owner, method)`` pair.
+
+    Two receiver shapes resolve: a ``Name`` bound to a parameter of the enclosing
+    function (``_Resolver.parameter`` walks out through nested scopes, which is how
+    the planner's closure reaches its enclosing ``trail`` parameter), and a
+    ``self.<attr>`` bound once in ``__init__``.  Everything else — a call result, a
+    subscript, a module global, an unannotated parameter — is UNRESOLVABLE and
+    returns ``None``, which keeps the row.  See ``_NON_LANDSCAPE_RECEIVER_OWNERS``.
+    """
+
+    qualified: str | None = None
+    if isinstance(node, ast.Name):
+        parameter = resolver.parameter(node.id, use)
+        if parameter is None or parameter.annotation is None:
+            return None
+        qualified = resolver.qualified_name(parameter.annotation, use=use)
+    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        qualified = _self_attribute_owner_annotation(node, resolver, use=use)
+    if qualified is None or (qualified, method) not in _NON_LANDSCAPE_RECEIVER_OWNERS:
+        return None
+    return qualified
 
 
 def _trusted_repository_construction(
@@ -2769,6 +2895,11 @@ def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
                     "text_writer",
                     "weakref",
                 }:
+                    continue
+                # A receiver whose RESOLVED OWNER is a pinned non-Landscape type is a
+                # method-name collision, not an unknown receiver.  Keyed on the owner,
+                # never the name; an unresolvable receiver falls through and rows.
+                if _resolved_non_landscape_receiver_owner(node.value, node.attr, resolver, use=node) is not None:
                     continue
                 if unit.path.startswith("src/elspeth/core/landscape/") or unit.path == _CHECKPOINT_PATH:
                     exact_fresh_creation_edge = (
@@ -5579,6 +5710,178 @@ def test_caller_authority_admits_a_context_that_carries_the_token_by_value_and_n
         ),
     )
     assert any("lacks one exact current token" in item for item in _caller_authority_violations([annotated_rebinder]))
+
+
+def test_non_landscape_receiver_owners_are_pinned_to_the_tree() -> None:
+    """Every admitted ``(owner, method)`` pair is re-derived from the tree, not asserted.
+
+    This is what bounds the ``Protocol`` exposure documented on
+    ``_NON_LANDSCAPE_RECEIVER_OWNERS``.  An entry survives only while the owner
+    really exists, really declares the method, is NOT a Landscape mutation owner,
+    and does not live under ``src/elspeth/core/landscape/``.  Move the class,
+    rename the method, or point an entry at a Landscape type and this fails.
+    """
+
+    units = {unit.path: unit for unit in _production_units()}
+    landscape_owners = {(api.path, api.owner) for api in _MUTATION_APIS}
+
+    assert _NON_LANDSCAPE_RECEIVER_OWNERS, "the admission table must not be empty"
+    for qualified, method in sorted(_NON_LANDSCAPE_RECEIVER_OWNERS):
+        module, _, owner = qualified.rpartition(".")
+        path = f"src/{module.replace('.', '/')}.py"
+
+        assert path in units, f"{qualified}: no production unit at {path}"
+        assert not path.startswith("src/elspeth/core/landscape/"), f"{qualified}: a Landscape module is never a non-Landscape owner"
+        assert (path, owner) not in landscape_owners, f"{qualified}: is a _MUTATION_APIS owner and cannot be admitted"
+
+        # The pair is only ever reached for a name the escape scanner rows.
+        assert method in _ALL_MUTATION_METHOD_NAMES, f"{qualified}.{method}: not a Landscape verb name, so the entry is dead"
+
+        declaration = next(
+            (node for node in units[path].tree.body if isinstance(node, ast.ClassDef) and node.name == owner),
+            None,
+        )
+        assert declaration is not None, f"{qualified}: no top-level class {owner} in {path}"
+        declared = {member.name for member in declaration.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert method in declared, f"{qualified}: {owner} does not declare {method}; the collision claim is stale"
+
+
+def test_unknown_receiver_admission_is_keyed_on_the_resolved_non_landscape_owner() -> None:
+    """A method-name collision is admitted by OWNER; anything unresolvable keeps its row.
+
+    Precision here means naming the owner, not demanding resolution.  The rejected
+    alternative — admitting every receiver that resolves — fails closed on exactly
+    the rows worth catching: ``LLMAuditParent`` resolves cleanly and is a REAL
+    unknown-receiver row that D8.3 must thread.
+    """
+
+    # (a) A parameter annotated with a pinned non-Landscape owner, reached from a
+    # nested closure the way the planner's attempt trail is.
+    planner = _parse_source(
+        "src/elspeth/web/composer/pipeline_planner.py",
+        textwrap.dedent(
+            """\
+            class _PlannerAttemptTrail:
+                def begin_attempt(self, **fields): ...
+
+            def _plan_pipeline_inner(*, trail: _PlannerAttemptTrail):
+                def begin_response_attempt():
+                    trail.begin_attempt(planner_call_ordinal=1)
+                return begin_response_attempt
+            """
+        ),
+    )
+    assert not any("unknown mutation receiver .begin_attempt" in item for item in _mutation_callable_escapes([planner]))
+
+    # (b) ``self.<attr>`` bound once in ``__init__`` from an annotated parameter.
+    service = _parse_source(
+        "src/elspeth/web/execution/service.py",
+        textwrap.dedent(
+            """\
+            from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+            class ExecutionServiceImpl:
+                def __init__(self, *, session_service: SessionServiceProtocol):
+                    self._session_service = session_service
+
+                def _fail(self, run_uuid):
+                    self._session_service.update_run_status(run_uuid, status="failed")
+            """
+        ),
+    )
+    assert not any("unknown mutation receiver .update_run_status" in item for item in _mutation_callable_escapes([service]))
+
+    # The admission is keyed on the PAIR. ``SessionServiceProtocol`` declares 85
+    # methods; admitting the owner would carry every future name collision with it.
+    other_method = _parse_source(service.path, service.source.replace("update_run_status", "complete_run"))
+    assert any("unknown mutation receiver .complete_run" in item for item in _mutation_callable_escapes([other_method]))
+
+    # An UNRESOLVABLE receiver stays a row even when it is NAMED like an admitted
+    # one and calls a real Landscape verb. This is the arm that separates an
+    # owner-keyed rule from a name-keyed one.
+    unresolvable_name = _parse_source(
+        planner.path,
+        textwrap.dedent(
+            """\
+            def build(factory):
+                trail = factory.make()
+                trail.begin_node_state(node="n")
+            """
+        ),
+    )
+    assert any("unknown mutation receiver .begin_node_state" in item for item in _mutation_callable_escapes([unresolvable_name]))
+
+    unresolvable_attribute = _parse_source(
+        service.path,
+        textwrap.dedent(
+            """\
+            class ExecutionServiceImpl:
+                def __init__(self, factory):
+                    self._session_service = factory.make()
+
+                def _fail(self, run_uuid):
+                    self._session_service.update_run_status(run_uuid, status="failed")
+            """
+        ),
+    )
+    assert any("unknown mutation receiver .update_run_status" in item for item in _mutation_callable_escapes([unresolvable_attribute]))
+
+    # An unannotated parameter proves nothing, whatever it is called.
+    untyped = _parse_source(planner.path, planner.source.replace("trail: _PlannerAttemptTrail", "trail"))
+    assert any("unknown mutation receiver .begin_attempt" in item for item in _mutation_callable_escapes([untyped]))
+
+    # A foreign owned type is not admitted merely because it resolves. This is the
+    # ``LLMAuditParent`` shape, and it must keep rowing until D8.3 threads it.
+    audit_parent = _parse_source(
+        "src/elspeth/plugins/transforms/llm/providers/gateway.py",
+        textwrap.dedent(
+            """\
+            from elspeth.plugins.transforms.llm.provider import LLMAuditParent
+
+            def _record(audit_parent: LLMAuditParent, recorder):
+                audit_parent.allocate_call_index(recorder)
+            """
+        ),
+    )
+    assert any("unknown mutation receiver .allocate_call_index" in item for item in _mutation_callable_escapes([audit_parent]))
+
+    # A receiver resolving INTO an owned Landscape class is never admitted here.
+    landscape_receiver = _parse_source(
+        service.path,
+        textwrap.dedent(
+            """\
+            from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
+
+            def run(store: RunLifecycleRepository, run_uuid):
+                store.update_run_status(run_uuid, status="failed")
+            """
+        ),
+    )
+    resolver = _resolver_for_unit(landscape_receiver)
+    receivers = [node for node in ast.walk(landscape_receiver.tree) if isinstance(node, ast.Attribute) and node.attr == "update_run_status"]
+    assert len(receivers) == 1
+    assert _resolved_non_landscape_receiver_owner(receivers[0].value, "update_run_status", resolver, use=receivers[0]) is None
+    assert _caller_authority_violations([landscape_receiver])
+
+    # Rebinding the attribute outside ``__init__``, or a ``setattr`` anywhere in the
+    # class, breaks the binding proof and restores the row.
+    rebound = _parse_source(
+        service.path,
+        service.source.replace(
+            "    def _fail(self, run_uuid):\n",
+            "    def retarget(self, other):\n        self._session_service = other\n\n    def _fail(self, run_uuid):\n",
+        ),
+    )
+    assert any("unknown mutation receiver .update_run_status" in item for item in _mutation_callable_escapes([rebound]))
+
+    setattr_class = _parse_source(
+        service.path,
+        service.source.replace(
+            "    def _fail(self, run_uuid):\n",
+            '    def retarget(self, other):\n        setattr(self, "_session_service", other)\n\n    def _fail(self, run_uuid):\n',
+        ),
+    )
+    assert any("unknown mutation receiver .update_run_status" in item for item in _mutation_callable_escapes([setattr_class]))
 
 
 def test_caller_authority_rejects_rebound_or_untyped_attribute_tokens() -> None:
