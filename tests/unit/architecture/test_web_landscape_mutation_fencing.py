@@ -419,7 +419,17 @@ _EXPECTED_DML_COUNT = 144
 # executes one inline UPDATE per owned disposition image (three sites) in
 # place of the one mapping-driven UPDATE. Write set unchanged; re-derived from
 # the gate's printed output on the rebased tree.
-_EXPECTED_DML_INVENTORY_SHA256 = "b8797993bf0a7bdbd851b0798055a3bbb2560281ebcfe70d4a2c52fdf780abde"
+# Then b8797993… → a76a88f5… (count 144, write set unchanged, elspeth-ee18e446ff):
+# BarrierJournalRepository.reset_adoption_marker_to_pending took a bare ``run_id``
+# and ran on ``begin_write``; it now takes the coordination token and runs inside
+# ``fenced_leader_transaction``, so its run_id predicate reads
+# ``coordination_token.run_id``. That one AST change moves exactly one site's
+# fingerprint, 37af8d10ee462eff → 8f538e40a9a91999 — the fence wrapper itself is
+# excluded from the fingerprint by ``_semantic_dml_boundary``, so this records the
+# statement change and not the fencing. Path, symbol, table, operation, ordinal
+# and authority are all unchanged. Attributed by scanning base f83011bb7 and the
+# merged tree with this same scanner: one site differs, no other.
+_EXPECTED_DML_INVENTORY_SHA256 = "a76a88f5d2d5445abc01c6cf59380087f68d55ee3ce65c036a52ba152a1de381"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
