@@ -406,6 +406,7 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # predicate (run_id, leader_worker_id, leader_epoch), so it is leader-scoped in
 # the code and the ADR-048 amendment classifies it that way.  Where the brief
 # and the code disagreed, the code won.
+_RUN_COORDINATION_PATH = "src/elspeth/core/landscape/run_coordination_repository.py"
 _MEMBER_SCOPED_METHOD_NAMES = frozenset(
     {
         "depart_worker",
@@ -421,7 +422,7 @@ _MEMBER_SCOPED_METHOD_NAMES = frozenset(
 )
 
 
-def _verb_authority_scope(method: str) -> str:
+def _verb_authority_scope(path: str, method: str) -> str:
     """The ONE authority class a verb may accept (ADR-030 D4, ADR-048 §1 as amended).
 
     A single classifier serves both sweeps -- the 90-API sweep and the DML
@@ -431,7 +432,19 @@ def _verb_authority_scope(method: str) -> str:
     90 owners: the member verbs are enumerated in
     ``_COORDINATION_MUTATION_METHOD_NAMES``, and a scope column on the facade
     tuple could never have reached them.
+
+    Keyed on the OWNING FILE as well as the name, never the name alone. This
+    project has been bitten three times by rules that keyed on a method name
+    across owned types (``begin_attempt``, ``heartbeat_lease``,
+    ``update_run_status``), and the collision is not hypothetical here:
+    ``_HeartbeatRepository.worker_heartbeat`` in the orchestrator is a
+    same-named Protocol declaration. Name-only keying would classify any such
+    definition MEMBER, and that is the DANGEROUS direction -- it would require
+    a leader-scoped verb to carry a follower's token, the narrow form of the
+    one-type-two-meanings hole ADR-048 rejected.
     """
+    if path != _RUN_COORDINATION_PATH:
+        return _LEADER_SCOPE
     return _MEMBER_SCOPE if method in _MEMBER_SCOPED_METHOD_NAMES else _LEADER_SCOPE
 
 
@@ -4077,7 +4090,7 @@ def _function_fence_violation(node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
     if parameter is None:
         return "missing explicit current token"
     resolver = _resolver_for_node(node)
-    scope = _verb_authority_scope(node.name)
+    scope = _verb_authority_scope(resolver.unit.path, node.name)
     expected_type = _AUTHORITY_QUALIFIED_BY_SCOPE[scope].rsplit(".", maxsplit=1)[-1]
     if not _is_exact_scoped_authority_annotation(parameter.annotation, scope=scope, resolver=resolver, use=node):
         return f"{scope}-scoped verb's token annotation is not {expected_type}"
@@ -6939,7 +6952,10 @@ def test_each_verb_class_accepts_exactly_one_authority_type_and_its_own_fence() 
         "    with fenced_member_transaction(engine, member_token=member_token, verb='depart_worker') as conn:\n"
         "        conn.execute(update(run_workers_table).where(run_workers_table.c.run_id == member_token.run_id))\n"
     )
-    admitted = _parse_source("src/elspeth/core/landscape/member_verbs.py", source)
+    # The fixture is parsed AT the coordination repository's own path, because
+    # member scope is keyed on the owning file. A fixture at any other path
+    # classifies leader-scoped, which is itself the guard working.
+    admitted = _parse_source(_RUN_COORDINATION_PATH, source)
     member_verb = next(node for node in ast.walk(admitted.tree) if isinstance(node, ast.FunctionDef))
     assert _function_fence_violation(member_verb) is None
 
@@ -6994,6 +7010,58 @@ def test_each_verb_class_accepts_exactly_one_authority_type_and_its_own_fence() 
     )
     wrong_type_verb = next(node for node in ast.walk(wrong_type_member.tree) if isinstance(node, ast.FunctionDef))
     assert "member-scoped verb's token annotation is not WorkerMembershipToken" in (_function_fence_violation(wrong_type_verb) or "")
+
+    # Scope is keyed on the OWNING FILE. Byte-identical source at any other
+    # path is leader-scoped, so a same-named method on another owned type
+    # cannot inherit membership semantics by its name alone. This is the arm
+    # that distinguishes owner-keying from name-keying, and the orchestrator's
+    # _HeartbeatRepository.worker_heartbeat Protocol is the live collision that
+    # makes it load-bearing rather than defensive.
+    foreign_owner = _parse_source("src/elspeth/core/landscape/execution_repository.py", source)
+    foreign_verb = next(node for node in ast.walk(foreign_owner.tree) if isinstance(node, ast.FunctionDef))
+    assert "leader-scoped verb's token annotation is not CoordinationToken" in (_function_fence_violation(foreign_verb) or "")
+
+    # A CALLER may never mint its own membership. admit_follower returns the
+    # token, so a legitimate mint site exists and a caller that constructs one
+    # inline is manufacturing authority rather than forwarding it. The leader
+    # type already had this witness; without the arm below the member type
+    # would have relied on the caller rule being type-agnostic rather than on
+    # anything having checked.
+    caller_source = (
+        "from elspeth.contracts.coordination import WorkerMembershipToken\n"
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\n"
+        "\n"
+        "def leave(repo: RunCoordinationRepository, *, member_token: WorkerMembershipToken):\n"
+        "    repo.depart_worker(member_token=member_token)\n"
+    )
+    forwarding_caller = _parse_source("src/elspeth/engine/orchestrator/follower.py", caller_source)
+    minting_caller = _parse_source(
+        forwarding_caller.path,
+        caller_source.replace(
+            "repo.depart_worker(member_token=member_token)",
+            "repo.depart_worker(member_token=WorkerMembershipToken(run_id='r', worker_id='w'))",
+        ),
+    )
+    minted_rows = [item for item in _coordination_caller_authority_violations([minting_caller]) if "leave .depart_worker" in item]
+    assert minted_rows == ["src/elspeth/engine/orchestrator/follower.py:5 leave .depart_worker lacks one exact current authority"]
+
+    # MEASURED, and recorded as the true state rather than the one that would
+    # read better: the coordination CALLER rule does not yet admit an exact
+    # member-token PARAMETER forward either -- the identical row appears for
+    # the legitimate caller above. So this pair does NOT yet discriminate
+    # minting from forwarding; it pins that minting is rejected, and pins that
+    # the forward is rejected too.
+    #
+    # That is fail-CLOSED and therefore safe: the member type is over-rejected,
+    # never admitted by accident, and these rows land in the coordination-caller
+    # sweep, which is red and burning down. It is not fixed here because
+    # admitting the forward is a caller-side rule change that belongs with the
+    # wave-2 lane that threads member verbs at their callers, and widening it
+    # blind would be the same shape as widening the annotation predicate.
+    # When that lane admits the forward it MUST delete the assertion below, and
+    # this test failing is how it finds out.
+    forwarded_rows = [item for item in _coordination_caller_authority_violations([forwarding_caller]) if "leave .depart_worker" in item]
+    assert forwarded_rows == minted_rows
 
 
 def test_shared_subordinate_helper_is_admitted_only_when_every_caller_edge_is_fenced() -> None:
@@ -7747,6 +7815,27 @@ def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_on
     temporary_wrapper = {"register_run_leader"}
     assert coordination_definitions - temporary_wrapper == _COORDINATION_MUTATION_METHOD_NAMES - temporary_wrapper
     assert coordination_definitions <= _COORDINATION_MUTATION_METHOD_NAMES
+
+    # Member scope is keyed on the OWNING FILE, never the bare method name, and
+    # the collision that makes that necessary is REAL rather than hypothetical:
+    # the orchestrator declares a same-named ``worker_heartbeat`` on its
+    # repository Protocol. Under name-only keying that definition would
+    # classify MEMBER, which is the dangerous direction -- a leader-scoped verb
+    # required to carry a follower's token. This asserts the collision still
+    # exists (so the guard is not silently protecting nothing) AND that scope
+    # resolution is unmoved by it.
+    module_level_fences = {"fenced_member_transaction", "verify_membership_fence"}
+    assert _MEMBER_SCOPED_METHOD_NAMES.issubset(_COORDINATION_MUTATION_METHOD_NAMES | module_level_fences)
+    foreign_definitions = sorted(
+        f"{path}:{symbol}"
+        for path, symbol in index
+        if path != coordination_path and symbol.rsplit(".", maxsplit=1)[-1] in _MEMBER_SCOPED_METHOD_NAMES
+    )
+    assert foreign_definitions == ["src/elspeth/engine/orchestrator/heartbeat.py:_HeartbeatRepository.worker_heartbeat"]
+    for path, symbol in index:
+        method = symbol.rsplit(".", maxsplit=1)[-1]
+        expected = _MEMBER_SCOPE if path == coordination_path and method in _MEMBER_SCOPED_METHOD_NAMES else _LEADER_SCOPE
+        assert _verb_authority_scope(path, method) == expected, f"{path}:{symbol} resolved the wrong authority scope"
 
 
 def test_landscape_dml_identity_and_write_set_are_frozen() -> None:
