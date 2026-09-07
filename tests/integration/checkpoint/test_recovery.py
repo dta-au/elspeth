@@ -27,8 +27,8 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
-from tests.fixtures.landscape import leader_coordination_token, make_factory
-from tests.helpers.checkpoint import checkpoint_draft
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, leader_token_for, make_factory
+from tests.helpers.checkpoint import create_checkpoint
 
 
 def _create_test_schema_contract() -> tuple[str, str, SchemaContract]:
@@ -59,13 +59,13 @@ def _create_checkpoint(
     graph: ExecutionGraph,
     barrier_scalars: BarrierScalars | None = None,
 ) -> Checkpoint:
-    return checkpoint_mgr.create_checkpoint(
-        draft=checkpoint_draft(
-            run_id=run_id,
-            sequence_number=sequence_number,
-            graph=graph,
-            barrier_scalars=barrier_scalars,
-        )
+    # Written under the run's own seat, read back (ADR-048 §5).
+    return create_checkpoint(
+        checkpoint_mgr,
+        run_id=run_id,
+        sequence_number=sequence_number,
+        graph=graph,
+        barrier_scalars=barrier_scalars,
     )
 
 
@@ -178,8 +178,8 @@ class TestCheckpointRecoveryIntegration:
         checkpoints = checkpoint_mgr.get_checkpoints(run_id)
         assert len(checkpoints) > 0
 
-        # Delete checkpoints (simulating run completion)
-        deleted_count = checkpoint_mgr.delete_checkpoints(run_id)
+        # Delete checkpoints (simulating run completion) under the run's seat
+        deleted_count = checkpoint_mgr.delete_checkpoints(coordination_token=leader_token_for(db, run_id))
         assert deleted_count > 0
 
         # Verify no checkpoints remain
@@ -219,7 +219,7 @@ class TestCheckpointRecoveryIntegration:
         assert len(cp_2) > 0
 
         # Deleting one run's checkpoints doesn't affect the other
-        checkpoint_mgr.delete_checkpoints(run_id_1)
+        checkpoint_mgr.delete_checkpoints(coordination_token=leader_token_for(db, run_id_1))
         assert len(checkpoint_mgr.get_checkpoints(run_id_1)) == 0
         assert len(checkpoint_mgr.get_checkpoints(run_id_2)) > 0
 
@@ -268,6 +268,9 @@ class TestCheckpointRecoveryIntegration:
                     openrouter_catalog_source="bundled",
                 )
             )
+            # A run written by raw SQL has no seat; leave the lapsed seat its
+            # crashed leader would have left so checkpoint writes read it back.
+            insert_crashed_leader_seat(conn, run_id=run_id)
 
             # Create node
             conn.execute(
@@ -521,7 +524,10 @@ class TestCheckpointTopologyHashAtomicity:
         factory.data_flow.create_token(row_id=row.row_id)
 
         with pytest.raises(TypeError, match="draft must be CheckpointDraft"):
-            checkpoint_mgr.create_checkpoint(draft=None)  # type: ignore[arg-type]
+            checkpoint_mgr.create_checkpoint(
+                draft=None,  # type: ignore[arg-type]
+                coordination_token=leader_coordination_token(factory, run.run_id),
+            )
 
 
 class TestResumeCheckpointCleanup:
@@ -631,11 +637,9 @@ class TestResumeCheckpointCleanup:
         from elspeth.engine.orchestrator import Orchestrator
 
         orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr)
-        # Checkpoint deletes fail closed without the run's leader token
-        # (elspeth-fab455790d); production early-exit paths bind it at
-        # run/resume start before any cleanup.
-        orchestrator._checkpoints.bind_coordination(leader_coordination_token(factory, run.run_id))
-        orchestrator._checkpoints.delete_checkpoints(run.run_id)
+        # Checkpoint deletes are leader-fenced (ADR-048 §3); production
+        # early-exit paths pass the seat begin_run minted, by value.
+        orchestrator._checkpoints.delete_checkpoints(coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify checkpoints are deleted
         with db.engine.connect() as conn:

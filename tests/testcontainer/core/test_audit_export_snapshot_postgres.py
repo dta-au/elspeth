@@ -10,6 +10,7 @@ from hashlib import sha256
 
 import pytest
 from sqlalchemy import func, select
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
@@ -68,6 +69,13 @@ def _seed_run(db: LandscapeDB) -> None:
                 openrouter_catalog_source="bundled",
             )
         )
+        # The registry write is leader-fenced (ADR-048 §2); a raw-SQL run has
+        # no seat, so leave the lapsed one a finished run's leader left.
+        insert_crashed_leader_seat(connection, run_id="pg-export")
+
+
+def _allow_any_signer_rotation(_existing_signer_key_id: str) -> None:
+    """The caller's rotation policy; this scenario does not exercise rotation."""
 
 
 class _MemoryContentStore:
@@ -186,21 +194,33 @@ def _candidate(store: _MemoryContentStore) -> AuditExportSnapshotCandidate:
 
 
 def test_postgres_concurrent_registry_cas_uses_distinct_backends_and_one_winner(postgres_db: LandscapeDB) -> None:
+    """Two live PostgreSQL backends race the registry; exactly one inserts.
+
+    ADR-048 moved the CAS inside the repository's own leader-fenced
+    transaction, so the two contenders no longer share the test's connection:
+    each holds its own observer session across the barrier (proving two
+    distinct backends are genuinely racing) and then calls the fenced verb,
+    whose verify-and-extend UPDATE on the seat row serialises them. The
+    outcome contract is unchanged — one insert, one winner, one row — and the
+    ``IntegrityError`` arm underneath stays as the durable backstop.
+    """
     _seed_run(postgres_db)
     store = _MemoryContentStore()
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
     candidate = _candidate(store)
+    token = leader_token_for(postgres_db, "pg-export")
     barrier = threading.Barrier(2)
     pids: list[int] = []
 
     def contender() -> tuple[bool, str]:
-        with postgres_db.engine.begin() as connection:
-            pids.append(int(connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()))
+        with postgres_db.engine.connect() as observer:
+            pids.append(int(observer.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()))
             barrier.wait(timeout=20)
-            registration = AuditExportSnapshotRepository().register_candidate(
-                connection,
+            registration = AuditExportSnapshotRepository(postgres_db.engine).register_candidate(
                 candidate,
+                coordination_token=token,
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,

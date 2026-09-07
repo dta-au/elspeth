@@ -15,7 +15,6 @@ from tempfile import TemporaryFile
 from typing import Any, BinaryIO, cast
 from uuid import uuid4
 
-from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_DERIVATION_VERSION,
@@ -91,21 +90,6 @@ def _contain_cleanup_failure(action: Callable[[], object], description: str) -> 
         action()
     except Exception:
         logger.exception("audit-export cleanup failed: %s", description)
-
-
-def _acquire_signer_lineage_authority(connection: Any, key: AuditExportSnapshotRegistryKey) -> None:
-    """Serialize the signer-policy recheck with registry insertion."""
-    if connection.dialect.name == "sqlite":
-        # ``LandscapeDB.write_connection`` already holds BEGIN IMMEDIATE.
-        return
-    if connection.dialect.name == "postgresql":
-        lineage = "\x1f".join((key.source_run_id, key.exporter_version, key.serialization_version, key.export_format.value))
-        connection.exec_driver_sql(
-            "SELECT pg_catalog.pg_advisory_xact_lock(%s, pg_catalog.hashtext(%s))",
-            (ELSPETH_AUDIT_EXPORT_LOCK_CLASSID, lineage),
-        )
-        return
-    raise RuntimeError(f"unsupported Landscape backend {connection.dialect.name!r}")
 
 
 def _required_limit(value: int | None, field_name: str) -> int:
@@ -310,16 +294,25 @@ def _read_limits(config: LandscapeExportSettings) -> AuditExportSnapshotReadLimi
 def prepare_audit_export_snapshot(
     db: LandscapeDB,
     *,
-    run_id: str,
+    coordination_token: CoordinationToken,
     config: LandscapeExportSettings,
     signing_key: bytes | None,
     content_store: AuditExportContentStore,
     content_store_resolver: AuditExportContentStoreResolver | None = None,
     repository: AuditExportSnapshotRepository | None = None,
 ) -> SinkEffectAuditExportSnapshotInput:
-    """Reuse or durably materialize one immutable export snapshot winner."""
+    """Reuse or durably materialize one immutable export snapshot winner.
+
+    ADR-048 §2/§3: the run being exported IS ``coordination_token.run_id``,
+    and the token arrives as a parameter of this call — carried by value from
+    the export seat ``acquire_export_leadership`` minted, or the run leader
+    seat the export phase already holds. It is never minted or re-read here.
+    Every registry write runs inside the repository's own leader-fenced
+    transaction, so no raw write connection is opened on this path.
+    """
     if type(config) is not LandscapeExportSettings:
         raise TypeError("config must be exact LandscapeExportSettings")
+    run_id = coordination_token.run_id
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
     # and rejects honest dynamic-attribute ones (ADR-032 rule 3). The binding
@@ -329,8 +322,12 @@ def prepare_audit_export_snapshot(
         raise TypeError("content_store must implement durable AuditExportContentStore")
     resolver = content_store_resolver or AuditExportContentStoreResolver()
     resolver.register(content_store)
-    snapshots = repository or AuditExportSnapshotRepository()
+    snapshots = repository or AuditExportSnapshotRepository(db.engine)
     key = _registry_key(run_id, config)
+
+    def _assert_signer_rotation_allowed(existing_signer_key_id: str) -> None:
+        """The export config's rotation policy, applied inside the fenced write."""
+        config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
 
     winner: AuditExportSnapshotWinner | None = None
     bundle: AuditExportSpooledBundle | None = None
@@ -383,6 +380,7 @@ def prepare_audit_export_snapshot(
     if winner is not None:
         return snapshots.bind_winner(
             winner,
+            coordination_token=coordination_token,
             content_store_resolver=resolver,
             limits=_read_limits(config),
             signed_manifest_verifier=verifier,
@@ -426,11 +424,14 @@ def prepare_audit_export_snapshot(
             signed_manifest_verifier=verifier,
             record_signature_verifier=record_verifier,
         )
-        with db.write_connection() as connection:
-            _acquire_signer_lineage_authority(connection, key)
-            for existing_signer_key_id in snapshots.find_lineage_signer_key_ids(connection, key):
-                config.assert_signer_rotation_allowed(existing_signer_key_id=existing_signer_key_id)
-            registration = snapshots.register_verified_candidate(connection, verified)
+        # The lineage lock, the signer-rotation recheck and the CAS insert all
+        # run inside the repository's leader-fenced transaction (ADR-048 §2),
+        # so no raw write connection is opened here.
+        registration = snapshots.register_verified_candidate(
+            verified,
+            coordination_token=coordination_token,
+            assert_signer_rotation_allowed=_assert_signer_rotation_allowed,
+        )
         if not registration.inserted:
             content_store.mark_candidate_orphans(candidate_id, descriptors)
         winner = registration.winner
@@ -457,6 +458,7 @@ def prepare_audit_export_snapshot(
 
     return snapshots.bind_winner(
         winner,
+        coordination_token=coordination_token,
         content_store_resolver=resolver,
         limits=_read_limits(config),
         signed_manifest_verifier=verifier,

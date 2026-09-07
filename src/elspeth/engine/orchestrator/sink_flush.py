@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import (
     GracefulShutdownError,
     OrchestrationInvariantError,
@@ -339,11 +340,16 @@ class SinkFlushCoordinator:
         edge_map: Mapping[tuple[NodeID, str], str],
         interrupted_by_shutdown: bool,
         *,
+        coordination_token: CoordinationToken,
         on_token_written_factory: _CheckpointFactory | None = None,
         scheduler_terminalizer: SchedulerTerminalizer | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> None:
         """Write all pending tokens to sinks and handle post-loop bookkeeping.
+
+        ``coordination_token`` is the leader token the calling drain holds;
+        it reaches the shutdown checkpoint as a parameter, by value
+        (ADR-048 §3).
 
         IMPORTANT: Aggregation flush and coalesce flush are NOT in this method.
         They stay inside the processing loop because they must execute inside
@@ -382,10 +388,7 @@ class SinkFlushCoordinator:
         # At this point: sink writes are done, and any buffered aggregation/coalesce
         # state that we intentionally preserved can be checkpointed for resume.
         if interrupted_by_shutdown:
-            self._checkpoints.checkpoint_interrupted_progress(
-                run_id=run_id,
-                loop_ctx=loop_ctx,
-            )
+            self._checkpoints.checkpoint_interrupted_progress(loop_ctx, coordination_token=coordination_token)
             raise GracefulShutdownError(
                 rows_processed=counters.rows_processed,
                 run_id=run_id,

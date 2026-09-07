@@ -142,7 +142,7 @@ class LeaderDrainCoordinator:
         # The resume path does NOT write this — it rebases onto the
         # persisted sequence (ResumeCoordinator.resume -> rebase_sequence).
         # Failures propagate: no baseline means the run cannot checkpoint.
-        self._checkpoints.checkpoint_run_start(run_id)
+        self._checkpoints.checkpoint_run_start(coordination_token=coordination_token)
 
         # 1. Register graph nodes and edges
         artifacts = register_graph_nodes_and_edges(factory, run_id, config, graph, coordination_token)
@@ -300,9 +300,12 @@ class LeaderDrainCoordinator:
                 artifacts.sink_id_map,
                 artifacts.edge_map,
                 loop_result.interrupted,
-                on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
+                on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                    run_ctx.processor, coordination_token=coordination_token
+                ),
                 scheduler_terminalizer=run_ctx.processor,
                 check_coordination_latch=check_coordination_latch,
+                coordination_token=coordination_token,
             )
 
             # 4b. ADR-030 multi-worker: after the leader's own sink writes are done
@@ -341,9 +344,12 @@ class LeaderDrainCoordinator:
                         artifacts.sink_id_map,
                         artifacts.edge_map,
                         interrupted_by_shutdown=False,
-                        on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
+                        on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                            run_ctx.processor, coordination_token=coordination_token
+                        ),
                         scheduler_terminalizer=run_ctx.processor,
                         check_coordination_latch=check_coordination_latch,
+                        coordination_token=coordination_token,
                     )
                     return True
 

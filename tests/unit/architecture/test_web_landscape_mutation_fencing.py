@@ -444,9 +444,10 @@ _EXPECTED_DML_COUNT = 151
 # _finalize_on and complete_plan, where a per-ordinal member UPDATE loop became one
 # executemany UPDATE (four rows removed, two added, and sink_effect_members/update
 # keeps surviving rows, so NO shape is removed). Re-derived by the merge writer on the
-# MERGED tree, not carried from the branch. The lane declared four added SHAPES and
-# none removed; this scan measured eleven added and four removed ROWS: the same fact
-# at two granularities, reconciled row by row before pinning.
+# MERGED tree, not carried from the branch, and the merged value equals the branch
+# value because the intervening tip delta touched no Python. The lane declared four
+# added SHAPES and none removed; this scan measured eleven added and four removed
+# ROWS: the same fact at two granularities, reconciled row by row before pinning.
 _EXPECTED_DML_INVENTORY_SHA256 = "b9ef22affdff788e2868cb27aca56d07083bc4813d5d9ad6024e0698b038975e"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {

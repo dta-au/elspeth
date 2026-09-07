@@ -46,8 +46,8 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
-from tests.helpers.checkpoint import checkpoint_draft
+from tests.fixtures.landscape import insert_crashed_leader_seat, make_landscape_db
+from tests.helpers.checkpoint import create_checkpoint
 from tests.helpers.run_coordination import register_run_leader
 
 
@@ -97,13 +97,13 @@ def _create_checkpoint(
     graph: ExecutionGraph,
     barrier_scalars: BarrierScalars | None = None,
 ) -> Checkpoint:
-    return checkpoint_manager.create_checkpoint(
-        draft=checkpoint_draft(
-            run_id=run_id,
-            sequence_number=sequence_number,
-            graph=graph,
-            barrier_scalars=barrier_scalars,
-        )
+    # Written under the run's own seat, read back (ADR-048 §5).
+    return create_checkpoint(
+        checkpoint_manager,
+        run_id=run_id,
+        sequence_number=sequence_number,
+        graph=graph,
+        barrier_scalars=barrier_scalars,
     )
 
 
@@ -114,8 +114,14 @@ def _insert_run(
     status: RunStatus | str,
     with_contract: bool = False,
     contract_json_override: str | None = None,
+    with_crashed_seat: bool = True,
 ) -> None:
     """Insert a ``runs`` row, plus a ``run_sources`` row when a contract is requested.
+
+    ``with_crashed_seat`` leaves the lapsed ``run_coordination`` seat a
+    crashed leader would have left (a raw-SQL run has none), so checkpoint
+    writes can read the seat back (ADR-048 §5); a test that mints its own
+    seat passes ``False``.
 
     ADR-025 §3 Decision 5 (G6): the schema contract lives exclusively on
     ``run_sources.schema_contract_json``; the run-level singleton columns
@@ -146,6 +152,8 @@ def _insert_run(
             openrouter_catalog_source="bundled",
         )
     )
+    if with_crashed_seat:
+        insert_crashed_leader_seat(conn, run_id=run_id)
 
     if schema_contract_json is not None:
         # Ensure the SOURCE node exists before writing run_sources (FK constraint).
@@ -348,7 +356,7 @@ def test_can_resume_rejects_running_run_with_live_seat(db: LandscapeDB, recovery
     from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 
     with db.write_connection() as conn:
-        _insert_run(conn, "run-running", status=RunStatus.RUNNING)
+        _insert_run(conn, "run-running", status=RunStatus.RUNNING, with_crashed_seat=False)
     # Register a live leader seat so the guard fires the refusal.
     leader_id = mint_worker_id("run-running")
     register_run_leader(

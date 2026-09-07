@@ -6,6 +6,11 @@ advisory-lock form with the classid reserved in
 ``src/elspeth/contracts/advisory_locks.py``, and every function must be
 ``pg_catalog``-qualified so a writable schema earlier in ``search_path``
 cannot shadow the lock protocol (elspeth-eb0fd1543a).
+
+ADR-048 relocated the lock from the orchestrator into the repository whose
+CAS it guards, so that it is taken on the same leader-fenced connection as
+the insert; this suite followed its subject from
+``tests/unit/engine/orchestrator/``.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts.advisory_locks import ELSPETH_AUDIT_EXPORT_LOCK_CLASSID
-from elspeth.engine.orchestrator.audit_export_effects import _acquire_signer_lineage_authority
+from elspeth.core.landscape.execution.audit_export_snapshots import _acquire_signer_lineage_authority
 
 
 def _key() -> SimpleNamespace:

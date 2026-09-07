@@ -48,7 +48,7 @@ from tests.fixtures.base_classes import (
 )
 from tests.fixtures.factories import wire_transforms
 from tests.fixtures.group_lineage import ensure_fork_group_record
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import make_landscape_db, reseat_crashed_leader
 from tests.fixtures.plugins import (
     CollectSink,
     ListSource,
@@ -778,7 +778,9 @@ class TestForkRecoveryInvariant:
             conn.commit()
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run.run_id)
-        # Create a checkpoint (required for recovery to work)
+        # Create a checkpoint (required for recovery to work) as the crashed
+        # leader's last act: the completed run vacated its seat on teardown.
+        reseat_crashed_leader(db, run.run_id)
         checkpoint_manager = CheckpointManager(db)
         create_checkpoint(
             checkpoint_manager,
@@ -1827,6 +1829,7 @@ class TestForkRecoveryInvariant:
             )
 
         # ── Resume ────────────────────────────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -2132,6 +2135,7 @@ class TestForkRecoveryInvariant:
         )
 
         # ── Create the checkpoint (F1: scalars only — no barrier blob) ──
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -2406,6 +2410,7 @@ class TestForkRecoveryInvariant:
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
         # ── Checkpoint + mark failed ──────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         create_checkpoint(
             checkpoint_mgr,
@@ -2694,6 +2699,7 @@ class TestForkRecoveryInvariant:
 
         _scrub_scheduler_work_for_outcomeless_tokens(db, run_id)
         # ── Resume ────────────────────────────────────────────────────────────
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
         create_checkpoint(
@@ -2943,6 +2949,7 @@ class TestForkRecoveryInvariant:
         # already has its terminal (or non-completed BUFFERED) record, so resume's
         # get_unprocessed_rows is empty → the all-rows-already-processed branch
         # reconstructs the cumulative counters from the intact audit trail.
+        reseat_crashed_leader(db, run_id)
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
         create_checkpoint(
@@ -3040,6 +3047,7 @@ class TestForkRecoveryInvariant:
         run_id = run_b1.run_id
         checkpoint_mgr = CheckpointManager(db)
         recovery_mgr = RecoveryManager(db, checkpoint_mgr)
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(checkpoint_mgr, run_id=run_id, sequence_number=1, barrier_scalars=None, graph=graph)
         with db.engine.connect() as conn:
             conn.execute(text("UPDATE runs SET status = 'failed' WHERE run_id = :run_id"), {"run_id": run_id})
@@ -3181,6 +3189,7 @@ class TestForkRecoveryInvariant:
         from elspeth.core.config import CheckpointSettings
 
         checkpoint_mgr = CheckpointManager(db)
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,
@@ -3634,6 +3643,7 @@ class TestForkRecoveryInvariant:
 
         # A checkpoint is the resume precondition (get_unprocessed_rows returns []
         # for a run with no checkpoint). F1: it carries scalars only — no blob.
+        reseat_crashed_leader(db, run_id)
         create_checkpoint(
             checkpoint_mgr,
             run_id=run_id,

@@ -825,7 +825,7 @@ class TestStaleTokenFenceRefusals:
         )
         _bump_epoch(db)
         with pytest.raises(RunLeadershipLostError):
-            manager.delete_checkpoints(RUN_ID, coordination_token=token)
+            manager.delete_checkpoints(coordination_token=token)
         with db.engine.connect() as conn:
             count = len(conn.execute(select(checkpoints_table.c.checkpoint_id)).all())
         assert count == 1, "a deposed leader must not destroy the new leader's resume anchors"

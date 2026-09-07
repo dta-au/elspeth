@@ -225,9 +225,6 @@ class TestCheckpointInterruptedProgress:
                 checkpoint_config=_checkpoint_config(),
             )
             coordinator.set_active_graph(make_graph_linear())
-            # Checkpoint writes fail closed without the run's leader token
-            # (elspeth-fab455790d); bind the seat begin_run minted.
-            coordinator.bind_coordination(leader_coordination_token(setup.factory, "run-test-123"))
 
             # Live executors with no latched triggers / no recorded losses
             # compose an empty BarrierScalars.
@@ -238,9 +235,11 @@ class TestCheckpointInterruptedProgress:
                 pending_tokens={"default": []},  # No pending tokens
             )
 
+            # The shutdown checkpoint is leader-fenced (ADR-048 §3): the seat
+            # begin_run minted travels in as a parameter, read back (§5).
             coordinator.checkpoint_interrupted_progress(
-                run_id="run-test-123",
-                loop_ctx=loop_ctx,
+                loop_ctx,
+                coordination_token=leader_coordination_token(setup.factory, "run-test-123"),
             )
 
             with setup.db.engine.connect() as conn:
@@ -278,7 +277,6 @@ class TestCheckpointInterruptedProgress:
                 checkpoint_config=_checkpoint_config(),
             )
             coordinator.set_active_graph(make_graph_linear())
-            coordinator.bind_coordination(leader_coordination_token(setup.factory, "run-latched"))
 
             processor = _BarrierScalarsProcessor(
                 BarrierScalars(
@@ -290,8 +288,8 @@ class TestCheckpointInterruptedProgress:
             loop_ctx = _LoopContextSlice(processor=processor, pending_tokens={"default": []})
 
             coordinator.checkpoint_interrupted_progress(
-                run_id="run-latched",
-                loop_ctx=loop_ctx,
+                loop_ctx,
+                coordination_token=leader_coordination_token(setup.factory, "run-latched"),
             )
 
             with setup.db.engine.connect() as conn:
@@ -334,8 +332,6 @@ class TestCheckpointInterruptedProgress:
             orchestrator._checkpoints._sequence_number = 0
             from elspeth.contracts.coordination import CoordinationToken
 
-            orchestrator._checkpoints.bind_coordination(CoordinationToken(run_id="run-x", worker_id="test-leader", leader_epoch=1))
-
             scalars = BarrierScalars(
                 aggregation={},
                 coalesce={("merge_1", "row-1"): CoalescePendingScalars(lost_branches={"branch_b": "transform_failed"})},
@@ -343,7 +339,12 @@ class TestCheckpointInterruptedProgress:
 
             processor = _BarrierScalarsProcessor(scalars)
 
-            factory = orchestrator._checkpoints.make_checkpoint_after_sink_factory("run-x", processor)
+            # The manager is a mock (no seat to read back); the factory captures
+            # the token the drain hands it, by value (ADR-048 §3).
+            factory = orchestrator._checkpoints.make_checkpoint_after_sink_factory(
+                processor,
+                coordination_token=CoordinationToken(run_id="run-x", worker_id="test-leader", leader_epoch=1),
+            )
             callback = factory("sink_0")
 
             token = TokenInfo(row_id="row-1", token_id="tok-1", row_data=make_row({"value": 1}))
@@ -388,7 +389,12 @@ class TestCheckpointInterruptedProgress:
             config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"})
 
             processor = _BarrierScalarsProcessor(BarrierScalars(aggregation={}, coalesce={}))
-            on_token_written_factory = orchestrator._checkpoints.make_checkpoint_after_sink_factory("run-x", processor)
+            from elspeth.contracts.coordination import CoordinationToken
+
+            on_token_written_factory = orchestrator._checkpoints.make_checkpoint_after_sink_factory(
+                processor,
+                coordination_token=CoordinationToken(run_id="run-x", worker_id="test-leader", leader_epoch=1),
+            )
 
             scheduler_token = TokenInfo(row_id="row-1", token_id="tok-scheduler", row_data=make_row({"value": 1}))
             generated_token = TokenInfo(row_id="row-2", token_id="tok-generated", row_data=make_row({"value": 2}))
@@ -464,10 +470,6 @@ class TestCheckpointInterruptedProgress:
             orchestrator._checkpoints._sequence_number = 0
             from elspeth.contracts.coordination import CoordinationToken
 
-            orchestrator._checkpoints.bind_coordination(
-                CoordinationToken(run_id="run-lost-branches", worker_id="test-leader", leader_epoch=1)
-            )
-
             scalars = BarrierScalars(
                 aggregation={},
                 coalesce={
@@ -481,8 +483,8 @@ class TestCheckpointInterruptedProgress:
             loop_ctx = _LoopContextSlice(processor=processor, pending_tokens={"default": []})
 
             orchestrator._checkpoints.checkpoint_interrupted_progress(
-                run_id="run-lost-branches",
-                loop_ctx=loop_ctx,
+                loop_ctx,
+                coordination_token=CoordinationToken(run_id="run-lost-branches", worker_id="test-leader", leader_epoch=1),
             )
 
             orchestrator._checkpoints._checkpoint_manager.create_checkpoint.assert_called_once()
