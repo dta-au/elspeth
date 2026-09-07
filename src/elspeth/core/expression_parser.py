@@ -211,6 +211,17 @@ class _ExpressionValidator(ast.NodeVisitor):
         """
         return isinstance(node, ast.Constant) and node.value is None
 
+    @trust_boundary(
+        tier=3,
+        source="one expression node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "returns True only for an allowed name, an allowed-name.get call, or a subscript chain "
+            "rooted in either; other syntax returns False; call arguments are validated separately by visit_Call; never raises"
+        ),
+        non_raising=True,
+    )
     def _is_allowed_derived(self, node: ast.expr) -> bool:
         """Check if node is an allowed name or derived from allowed name access.
 
@@ -273,6 +284,17 @@ class _ExpressionValidator(ast.NodeVisitor):
         """Reject slice syntax."""
         self.errors.append("Slice syntax (e.g., [1:3]) is forbidden")
 
+    @trust_boundary(
+        tier=3,
+        source="one Attribute node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "records a validation error in self.errors unless the receiver is a bare allowed name "
+            "and the attribute is get in call-function context; visits the receiver; never raises on malformed syntax"
+        ),
+        non_raising=True,
+    )
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Allow only .get method access on allowed names when called."""
         if isinstance(node.value, ast.Name) and node.value.id in self._allowed_names:
