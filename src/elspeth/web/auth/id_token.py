@@ -126,7 +126,8 @@ def _compared_string(value: object) -> str | None:
     suppresses=("R1",),
     invariant=(
         "raises AuthenticationError unless iss and sub are non-blank strings, aud is a non-empty string or list of strings, "
-        "exp and iat are numbers, and groups/roles are lists when present; nonce and azp are carried only as strings "
+        "exp and iat are numbers; groups and roles are ignored and never carried into the owned claims; "
+        "nonce and azp are carried only as strings "
         "(anything else reads as absent for the comparison that is their one authority); optional profile claims that "
         "are not visible strings read as None; never coerces a malformed document"
     ),
@@ -141,14 +142,11 @@ def parse_id_token_claims(payload: dict[str, Any]) -> IdTokenClaims:
     still whatever the IdP put there. This is the one place that turns that
     into :class:`IdTokenClaims`; nothing downstream sees the dict.
 
-    Membership-then-subscript rather than ``.get()``: this is IdP data, and
-    the absent case is a decision worth seeing.
+    Each claim is read directly from the external payload. Missing values
+    arrive as None at the claim-specific validator or optional projection.
     """
 
-    def claim(name: str) -> object:
-        return payload[name] if name in payload else None
-
-    raw_audience = claim("aud")
+    raw_audience = payload.get("aud")
     audience: str | tuple[str, ...]
     if type(raw_audience) is str and raw_audience:
         audience = raw_audience
@@ -158,23 +156,23 @@ def parse_id_token_claims(payload: dict[str, Any]) -> IdTokenClaims:
         raise AuthenticationError("Invalid token: aud claim is not a string or a list of strings")
 
     return IdTokenClaims(
-        issuer=required_string_claim(claim("iss"), name="iss", document="ID token"),
-        subject=required_string_claim(claim("sub"), name="sub", document="ID token"),
+        issuer=required_string_claim(payload.get("iss"), name="iss", document="ID token"),
+        subject=required_string_claim(payload.get("sub"), name="sub", document="ID token"),
         audience=audience,
-        issued_at=_numeric_date(claim("iat"), name="iat"),
-        expires_at=_numeric_date(claim("exp"), name="exp"),
-        nonce=_compared_string(claim("nonce")),
-        authorized_party=_compared_string(claim("azp")),
-        preferred_username=optional_string_claim(claim("preferred_username")),
-        name=optional_string_claim(claim("name")),
-        email=optional_string_claim(claim("email")),
-        email_verified=claim_is_exactly_true(claim("email_verified")),
-        tenant_id=optional_string_claim(claim("tid")),
-        hosted_domain=optional_string_claim(claim("hd")),
-        cognito_username=optional_string_claim(claim("cognito:username")),
-        given_name=optional_string_claim(claim("given_name")),
-        family_name=optional_string_claim(claim("family_name")),
-        abn=optional_string_claim(claim("abn")),
+        issued_at=_numeric_date(payload.get("iat"), name="iat"),
+        expires_at=_numeric_date(payload.get("exp"), name="exp"),
+        nonce=_compared_string(payload.get("nonce")),
+        authorized_party=_compared_string(payload.get("azp")),
+        preferred_username=optional_string_claim(payload.get("preferred_username")),
+        name=optional_string_claim(payload.get("name")),
+        email=optional_string_claim(payload.get("email")),
+        email_verified=claim_is_exactly_true(payload.get("email_verified")),
+        tenant_id=optional_string_claim(payload.get("tid")),
+        hosted_domain=optional_string_claim(payload.get("hd")),
+        cognito_username=optional_string_claim(payload.get("cognito:username")),
+        given_name=optional_string_claim(payload.get("given_name")),
+        family_name=optional_string_claim(payload.get("family_name")),
+        abn=optional_string_claim(payload.get("abn")),
     )
 
 
