@@ -5,7 +5,35 @@ Landscape mutation capability.  Its inventory is production-only and
 bidirectional: the canonical digests freeze every current DML construction and
 production call identity, while the structural checks reject authority aliases,
 callable escapes, raw write surfaces, cross-database access, and transactions
-whose first database effect is not the full Landscape leader-token fence.
+whose first database effect is not the fence THAT VERB'S AUTHORITY CLASS NAMES.
+
+TWO fences, one authority type each (ADR-030 D4, restored by the ADR-048
+amendment of 2026-09-07).  A verb is LEADER-scoped or MEMBER-scoped, and the
+scope decides both the exact concrete token type its signature must require and
+which fence it must enter:
+
+    LEADER  CoordinationToken       fenced_leader_transaction / fenced_write
+    MEMBER  WorkerMembershipToken   fenced_member_transaction
+
+The two are never interchangeable and no verb may accept both.  Crossing them
+is rejected in either direction, because a leader verb that accidentally
+accepted a follower's token would be unprovable -- the fail-open class this
+gate exists to close, and the reason ADR-048's one-type-two-meanings option was
+rejected.  Scope is keyed on the OWNING FILE as well as the method name: a
+same-named method on another owned type must not inherit membership semantics.
+
+``fenced_write`` is a thin WRAPPER over ``fenced_leader_transaction``; the tree
+had one fence under two names before the membership fence landed, and a reader
+of the trusted-fence set must not conclude two independent leader fences
+pre-existed.
+
+Each long-red id here is split into a PIN half and a VIOLATION-SWEEP half.  An
+inventory pin placed after a violations assert never executes while the
+baseline is red, and dormancy is indistinguishable from passing in a suite
+summary -- the fail-open-guard shape reproduced in a gate's own structure.  The
+halves are separate ids so a pin can fail on its own evidence while its sweep
+burns down.  Diagnostics that truncate say so: never re-derive a pin from a
+list that printed an elision notice.
 
 There is one deliberately narrow, non-release creation exception.  Until Task
 8B, ``RunLifecycleRepository.begin_run`` may create the run and epoch-1 leader
