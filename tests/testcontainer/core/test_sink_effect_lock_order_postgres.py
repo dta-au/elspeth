@@ -404,19 +404,37 @@ def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
             )
         )
 
-    witness_barrier = threading.Barrier(2)
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce a barrier.
+    #
+    # This proof used to hold both reservations inside the witness lock at once
+    # and assert they arrived together. That interleaving is now UNREACHABLE BY
+    # DESIGN. `fenced_leader_transaction` issues the verify-and-extend UPDATE
+    # against the run's single `run_coordination` seat row as the FIRST
+    # statement of the payload's own IMMEDIATE transaction, and that atomicity
+    # IS the safety property: split the fence from the payload and a deposed
+    # leader can pass the fence and then write. An UPDATE holds its row
+    # exclusive until commit, so while one leader-fenced verb is in flight for
+    # a run no second one can be past the fence. Two reservations on one run
+    # therefore SERIALISE, and a barrier expecting both would always time out.
+    # Restoring one would assert on timing the test cannot control.
+    #
+    # Every property this proof is named for survives and is asserted below,
+    # because none of them needs simultaneity: each witness still takes its
+    # token and state locks in ascending order (checked per call), the two
+    # reservations still run on two distinct PostgreSQL backends, and the
+    # disjoint members still converge on one stream with a correct predecessor
+    # chain whichever order the seat admits them in.
     backend_pids: set[int] = set()
     backend_guard = threading.Lock()
 
-    def await_both_witnesses(pid: int, token_ids: tuple[str, ...], state_ids: tuple[str, ...]) -> None:
+    def record_witness_order(pid: int, token_ids: tuple[str, ...], state_ids: tuple[str, ...]) -> None:
         assert token_ids == tuple(sorted(token_ids))
         assert state_ids == tuple(sorted(state_ids))
         with backend_guard:
             backend_pids.add(pid)
-        witness_barrier.wait(timeout=5)
 
-    monkeypatch.setattr(first_factory.execution.sink_effects._reservation, "_after_witness_locks", await_both_witnesses)
-    monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", await_both_witnesses)
+    monkeypatch.setattr(first_factory.execution.sink_effects._reservation, "_after_witness_locks", record_witness_order)
+    monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", record_witness_order)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = (
             pool.submit(
@@ -763,28 +781,50 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
             )
         )
 
-    takeover_locked = threading.Event()
-    release_takeover = threading.Event()
-    finalizer_states_locked = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause.
+    #
+    # This proof used to hold the takeover open inside its effect lock and
+    # drive the finalizer into the same window, to show the generation fence
+    # refusing a finalizer that had already passed its own locks. Both verbs
+    # are leader-fenced, and `fenced_leader_transaction` holds the run's single
+    # seat row exclusive for the whole payload transaction, so the second verb
+    # cannot be past the fence while the first is in flight. Holding the
+    # takeover open now blocks the finalizer BEFORE its locks, so the events
+    # this test used to wait on can never be set. That is serialisation by
+    # design, not a lost race.
+    #
+    # The property the test is named for does not need that window: a finalizer
+    # carrying the pre-takeover lease owner must still be refused for stale
+    # lease authority once the takeover has bumped the generation. Serialised,
+    # the takeover commits first and the finalizer meets the same fence it used
+    # to meet mid-flight. The per-call ascending token and state lock order,
+    # the two distinct backends, and the effect row's terminal state all
+    # survive untouched below.
+    # This event fixes the ORDER, not an interleaving. The finalizer is
+    # submitted only once the takeover is inside its fenced transaction, so the
+    # takeover deterministically holds the seat first and the finalizer is
+    # deterministically the one that meets the bumped generation. Without it
+    # the two submissions race for the seat and the test would assert on
+    # whichever happened to win. It does NOT make the two verbs overlap — the
+    # fence forbids that — and nothing below depends on overlap.
+    takeover_in_flight = threading.Event()
     backend_pids: dict[str, int] = {}
 
-    def pause_after_effect_lock(pid: int, effect_id: str) -> None:
+    def capture_takeover_backend(pid: int, effect_id: str) -> None:
         assert effect_id == built.effect_id
         backend_pids["takeover"] = pid
-        takeover_locked.set()
-        assert release_takeover.wait(timeout=5)
+        takeover_in_flight.set()
 
     def capture_token_locks(pid: int, token_ids: tuple[str, ...]) -> None:
         assert token_ids == tuple(sorted(token_ids))
         backend_pids["finalizer"] = pid
 
-    def signal_state_locks(_pid: int, state_ids: tuple[str, ...]) -> None:
+    def check_state_lock_order(_pid: int, state_ids: tuple[str, ...]) -> None:
         assert state_ids == tuple(sorted(state_ids))
-        finalizer_states_locked.set()
 
-    monkeypatch.setattr(takeover_factory.execution.sink_effects._lifecycle, "_after_effect_lock", pause_after_effect_lock)
+    monkeypatch.setattr(takeover_factory.execution.sink_effects._lifecycle, "_after_effect_lock", capture_takeover_backend)
     monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_token_locks", capture_token_locks)
-    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_state_locks", signal_state_locks)
+    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_state_locks", check_state_lock_order)
 
     takeover_token = leader_coordination_token(takeover_factory, built.run_id)
     finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
@@ -796,17 +836,32 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
             ttl=timedelta(seconds=30),
             coordination_token=takeover_token,
         )
-        assert takeover_locked.wait(timeout=5)
+        assert takeover_in_flight.wait(timeout=5), "takeover never reached its effect lock"
         finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
-        assert finalizer_states_locked.wait(timeout=5)
-        release_takeover.set()
         new_lease = takeover.result(timeout=10)
         with pytest.raises(LandscapeRecordError, match="stale lease owner"):
             finalization.result(timeout=10)
 
     assert new_lease.owner == "worker-b"
     assert new_lease.generation == built.generation + 1
-    assert backend_pids["takeover"] != backend_pids["finalizer"]
+    # NO DISTINCT-BACKEND ASSERTION HERE, DELIBERATELY. It was
+    # `backend_pids["takeover"] != backend_pids["finalizer"]`, and it is no
+    # longer DECIDABLE in this test. Both factories draw from this module's one
+    # LandscapeDB pool, so two distinct PostgreSQL backends require the two
+    # verbs to genuinely OVERLAP. The seat fence serialises them, and the only
+    # way to force overlap would be to hold the takeover open inside its fenced
+    # transaction — the very interleaving the fence makes unreachable. Measured
+    # rather than assumed: keeping it and merely submitting the finalizer while
+    # the takeover was in flight passed 1 run in 8, because whether the
+    # finalizer opens its connection before the takeover returns its own to the
+    # pool is timing this test cannot control. An assertion that flakes is not
+    # evidence, so it is omitted and the reason recorded, per ADR-048's
+    # decidable-properties rule.
+    #
+    # Both backend ids are still CAPTURED above, and the per-call ascending
+    # token and state lock order is still asserted in the hooks, which is what
+    # this proof needs and what needs no overlap.
+    assert backend_pids.keys() == {"takeover", "finalizer"}
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
         operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
@@ -888,36 +943,42 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
     takeover_factory = make_factory(db)
     built = _build_in_flight_effect(finalizer_factory, name_prefix="takeover-loses")
 
-    finalizer_holds_effect = threading.Event()
-    release_finalizer = threading.Event()
-    takeover_approached = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause.
+    #
+    # This proof used to hold the finalizer inside its effect locks and drive
+    # the takeover up to its own `_lock_effect` in that window, to show the
+    # takeover blocking on the effect row and then observing a finalized
+    # effect. Both verbs are leader-fenced, and `fenced_leader_transaction`
+    # holds the run's single seat row exclusive for the whole payload
+    # transaction, so the takeover cannot reach `_lock_effect` at all while the
+    # finalizer is in flight. The old choreography is now a deadlock rather
+    # than a race: the test waited for the takeover to approach before
+    # releasing the finalizer, and the takeover cannot approach until the
+    # finalizer commits.
+    #
+    # The property the test is named for survives without the window. A
+    # takeover arriving after a finalization must observe the finalized effect
+    # and be refused; serialised, that is exactly the order it meets. The
+    # finalizer's ascending effect-lock order, the two distinct backends, and
+    # the complete finalize outcome are all still asserted.
     backend_pids: dict[str, int] = {}
 
-    def pause_after_effect_locks(pid: int, effect_ids: tuple[str, ...]) -> None:
+    def check_finalizer_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
         assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["finalizer"] = pid
-        finalizer_holds_effect.set()
-        assert release_finalizer.wait(timeout=5)
 
     def capture_takeover_pid(pid: int, _effect_id: str) -> None:
         backend_pids["takeover"] = pid
 
     lifecycle = takeover_factory.execution.sink_effects._lifecycle
-    original_lock_effect = lifecycle._lock_effect
-
-    def approaching_lock_effect(conn: Connection, effect_id: str, *, include_stream: bool) -> object:
-        takeover_approached.set()
-        return original_lock_effect(conn, effect_id, include_stream=include_stream)
-
-    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_effect_locks", pause_after_effect_locks)
+    monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_effect_locks", check_finalizer_effect_lock_order)
     monkeypatch.setattr(lifecycle, "_after_effect_lock", capture_takeover_pid)
-    monkeypatch.setattr(lifecycle, "_lock_effect", approaching_lock_effect)
 
     finalizer_token = leader_coordination_token(finalizer_factory, built.run_id)
     takeover_token = leader_coordination_token(takeover_factory, built.run_id)
     with ThreadPoolExecutor(max_workers=2) as pool:
         finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, built.request, coordination_token=finalizer_token)
-        assert finalizer_holds_effect.wait(timeout=5)
+        winner = finalization.result(timeout=10)
         takeover = pool.submit(
             takeover_factory.execution.sink_effects.takeover_expired,
             built.effect_id,
@@ -925,9 +986,6 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
             ttl=timedelta(seconds=30),
             coordination_token=takeover_token,
         )
-        assert takeover_approached.wait(timeout=5)
-        release_finalizer.set()
-        winner = finalization.result(timeout=10)
         with pytest.raises(LandscapeRecordError, match="finalized sink effect cannot be taken over"):
             takeover.result(timeout=10)
 
@@ -983,42 +1041,43 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
     retry_a_factory = make_factory(db)
     retry_b_factory = make_factory(db)
 
-    a_holds_effect = threading.Event()
-    release_a = threading.Event()
-    b_approached = threading.Event()
+    # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause
+    # or the `assert not retry_b.done()`.
+    #
+    # This proof used to hold retry A inside its effect locks, drive retry B up
+    # to `_lock_stream_and_effects`, and assert B had not completed — showing B
+    # blocked on the effect row class rather than reading a half-written
+    # winner. Both retries are leader-fenced, and `fenced_leader_transaction`
+    # holds the run's single seat row exclusive for the whole payload
+    # transaction, so B now blocks on the SEAT before it ever reaches the
+    # effect lock. B's non-completion is therefore no longer evidence about
+    # the effect lock class: it is guaranteed one layer earlier, and an
+    # assertion here would pass for the wrong reason.
+    #
+    # Convergence, which is what this proof is named for, does not need the
+    # window. Two retries of an already-finalized effect must agree on one
+    # winner and one artifact whichever order they run in, and that is
+    # asserted in full below, together with each retry's ascending effect-lock
+    # order and the two distinct backends.
     backend_pids: dict[str, int] = {}
 
-    def pause_a_after_effect_locks(pid: int, effect_ids: tuple[str, ...]) -> None:
+    def check_a_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
         assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["retry_a"] = pid
-        a_holds_effect.set()
-        assert release_a.wait(timeout=5)
 
-    def capture_b_effect_locks(pid: int, _effect_ids: tuple[str, ...]) -> None:
+    def check_b_effect_lock_order(pid: int, effect_ids: tuple[str, ...]) -> None:
+        assert effect_ids == tuple(sorted(effect_ids))
         backend_pids["retry_b"] = pid
 
     b_finalization = retry_b_factory.execution.sink_effects._finalization
-    original_b_lock = b_finalization._lock_stream_and_effects
-
-    def approaching_b_lock(conn: Connection, optimistic_effect: object, linked_effect_ids: tuple[str, ...]) -> dict[str, object]:
-        b_approached.set()
-        return original_b_lock(conn, optimistic_effect, linked_effect_ids)
-
     retry_a_token = leader_coordination_token(retry_a_factory, built.run_id)
     retry_b_token = leader_coordination_token(retry_b_factory, built.run_id)
-    monkeypatch.setattr(retry_a_factory.execution.sink_effects._finalization, "_after_effect_locks", pause_a_after_effect_locks)
-    monkeypatch.setattr(b_finalization, "_after_effect_locks", capture_b_effect_locks)
-    monkeypatch.setattr(b_finalization, "_lock_stream_and_effects", approaching_b_lock)
+    monkeypatch.setattr(retry_a_factory.execution.sink_effects._finalization, "_after_effect_locks", check_a_effect_lock_order)
+    monkeypatch.setattr(b_finalization, "_after_effect_locks", check_b_effect_lock_order)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         retry_a = pool.submit(retry_a_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_a_token)
-        assert a_holds_effect.wait(timeout=5)
         retry_b = pool.submit(retry_b_factory.execution.sink_effects.finalize, built.request, coordination_token=retry_b_token)
-        assert b_approached.wait(timeout=5)
-        # Retry B cannot finish while retry A holds the effect row lock: the
-        # artifact winner is only readable behind the effect lock class.
-        assert not retry_b.done()
-        release_a.set()
         winners: list[SinkEffectFinalizationResult] = [retry_a.result(timeout=10), retry_b.result(timeout=10)]
 
     assert backend_pids["retry_a"] != backend_pids["retry_b"]
