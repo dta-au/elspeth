@@ -146,12 +146,15 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fenced_leader_transaction over one shared connection helper, so each reads the
 # Landscape clock to judge the seat it extends — boundaries purely because they fence,
 # since the snapshot and chunk rows they write carry no authority timestamp.
-# −1 identity: CheckpointManager._fenced_or_plain_write is DELETED with its method, so
+# -1 identity: CheckpointManager._fenced_or_plain_write is DELETED with its method, so
 # its row goes with it. THIS LANE IS THE ONLY ONE CARRYING A MINUS TERM: a mechanical
 # union of the row sets resurrects a row whose definition no longer exists, and the
 # gate then reports it as stale rather than as a merge artefact. Row set is therefore
-# UNION MINUS DELETIONS: 90 (tip at landing) + 2 − 1 = 91.
-_CLOCK_BOUNDARY_DIGEST = "81fd6c8f20c2dcdc6300aa8281766d9ea78a33ea5fc1e58d9e409a86e3a2fba7"
+# UNION MINUS DELETIONS: 90 (tip at landing) + 2 - 1 = 91, AST-counted on the rebased
+# tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
+# by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
+# this literal is not load-bearing and was resolved purely for readability.
+_CLOCK_BOUNDARY_DIGEST = "5ea9883f9b58a904ca3a949d15685667bd1902d36b00849c6fe48d86ef088067"
 
 
 def _name_has_clock_marker(name: str) -> bool:
