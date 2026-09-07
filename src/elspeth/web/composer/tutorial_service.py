@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+import structlog
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 
@@ -63,6 +64,8 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.titles import abandoned_tutorial_session_title
+
+slog = structlog.get_logger()
 
 _TUTORIAL_RUN_POLL_SECONDS = 0.25
 # Mirrors HELLO_WORLD_PENDING_SESSION_TITLE in the frontend tutorial copy
@@ -128,16 +131,19 @@ class _VerifiedArtifactBytes:
     content: bytes
 
 
-async def _close_tutorial_execute_lease_before_transfer(lease: SessionOperationLease) -> None:
+async def _close_tutorial_execute_lease_before_transfer(
+    lease: SessionOperationLease, *, cancellation: asyncio.CancelledError | None = None
+) -> None:
     """Join exact lease cleanup even when request cancellation repeats."""
     close_task = asyncio.create_task(
         lease.close(),
         name="tutorial-execution-pretransfer-lease-close",
     )
-    cancellation: asyncio.CancelledError | None = None
     while not close_task.done():
         try:
-            await asyncio.shield(close_task)
+            # Waiting observes completion without propagating the task's error
+            # or cancelling lease cleanup when the request is cancelled.
+            await asyncio.wait({close_task})
         except asyncio.CancelledError as error:
             if cancellation is None:
                 cancellation = error
@@ -149,6 +155,20 @@ async def _close_tutorial_execute_lease_before_transfer(lease: SessionOperationL
     except BaseException as close_error:
         if cancellation is None:
             raise
+        fence = lease.context.fence
+        try:
+            slog.error(
+                "execution_pretransfer_lease_close_failed",
+                session_id=fence.session_id,
+                operation_id=fence.operation_id,
+                operation_epoch=fence.operation_epoch,
+                error_type=type(close_error).__name__,
+                primary_error_type=type(cancellation).__name__,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_error:
+            cancellation.add_note(f"Lease-close failure logging also failed with {type(logging_error).__name__}.")
         cancellation.add_note(f"Tutorial execution pre-transfer lease close also failed with {type(close_error).__name__}.")
     if cancellation is not None:
         raise cancellation from None
@@ -333,6 +353,7 @@ async def _run_live_tutorial(
         lease_seconds=session_service.session_operation_lease_seconds,
     )
     transferred = False
+    cancellation: asyncio.CancelledError | None = None
     try:
         run_id = await execution_service.execute(
             session_id,
@@ -342,6 +363,9 @@ async def _run_live_tutorial(
             auth_provider_type=settings.auth_provider,
         )
         transferred = True
+    except asyncio.CancelledError as error:
+        cancellation = error
+        raise
     except UnresolvedInterpretationPlaceholderError as exc:
         # A pending interpretation review (e.g. the planner-authored LLM
         # prompt awaiting its Accept card) is a launch blocker in the
@@ -366,7 +390,7 @@ async def _run_live_tutorial(
         ) from exc
     finally:
         if not transferred:
-            await _close_tutorial_execute_lease_before_transfer(lease)
+            await _close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
     run_timeout_seconds = settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
     run_record = await _wait_for_terminal_run(
         session_service,

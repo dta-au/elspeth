@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
@@ -33,7 +34,94 @@ from elspeth.web.composer.tutorial_service import (
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
 from tests.fixtures.landscape import make_factory, make_landscape_db
-from tests.helpers.session_fences import RecordingSessionOperationAuthority
+from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["none", "simultaneous", "waiting", "prior"])
+@pytest.mark.parametrize("error_class", [None, RuntimeError, FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_outcome_is_independent_of_cancel_scheduling(timing, error_class) -> None:
+    failure = error_class("private cleanup detail") if error_class is not None else None
+    cancellation = asyncio.CancelledError("request cancelled") if timing == "prior" else None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closing_task: asyncio.Task[None] | None = None
+
+    class Lease:
+        context = make_execute_context(uuid4())
+        closed = False
+
+        async def close(self) -> None:
+            entered.set()
+            if timing == "waiting":
+                await release.wait()
+            if timing == "simultaneous":
+                assert closing_task is not None
+                closing_task.cancel()
+            self.closed = True
+            if failure is not None:
+                raise failure
+
+    lease = Lease()
+    with capture_logs() as logs:
+        closing_task = asyncio.create_task(
+            tutorial_service_module._close_tutorial_execute_lease_before_transfer(lease, cancellation=cancellation)
+        )
+        if timing == "waiting":
+            await entered.wait()
+            closing_task.cancel()
+            await asyncio.sleep(0)
+            assert not lease.closed
+            release.set()
+        if error_class in (FrameworkBugError, AuditIntegrityError) or (timing == "none" and failure is not None):
+            with pytest.raises(error_class) as caught:
+                await closing_task
+            assert caught.value is failure
+        elif timing != "none":
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await closing_task
+            if cancellation is not None:
+                assert caught.value is cancellation
+        else:
+            await closing_task
+    assert lease.closed
+    if error_class is RuntimeError and timing != "none":
+        assert logs == [
+            {
+                "event": "execution_pretransfer_lease_close_failed",
+                "session_id": lease.context.fence.session_id,
+                "operation_id": lease.context.fence.operation_id,
+                "operation_epoch": lease.context.fence.operation_epoch,
+                "error_type": "RuntimeError",
+                "primary_error_type": "CancelledError",
+                "log_level": "error",
+            }
+        ]
+    else:
+        assert logs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_class", [RuntimeError, FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_logging_preserves_integrity_priority(monkeypatch, error_class) -> None:
+    failure = error_class("private logging detail")
+    cancellation = asyncio.CancelledError("request cancelled")
+
+    class Lease:
+        context = make_execute_context(uuid4())
+
+        async def close(self) -> None:
+            raise OSError("private lease detail")
+
+    class Logger:
+        def error(self, event, **fields) -> None:
+            raise failure
+
+    monkeypatch.setattr(tutorial_service_module, "slog", Logger())
+    expected = asyncio.CancelledError if error_class is RuntimeError else error_class
+    with pytest.raises(expected) as caught:
+        await tutorial_service_module._close_tutorial_execute_lease_before_transfer(Lease(), cancellation=cancellation)
+    assert caught.value is (cancellation if error_class is RuntimeError else failure)
 
 
 @pytest.mark.asyncio
