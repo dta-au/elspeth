@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from elspeth.contracts import Determinism, TransformResult, propagate_contract
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError, TransformErrorReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ContentTrust
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
@@ -56,7 +58,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0996eb17570dff7a"
+    source_file_hash: str | None = "sha256:79ed8a9c575e117f"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -139,6 +141,8 @@ class RAGRetrievalTransform(BaseTransform):
                 *,
                 state_id: str,
                 token_id: str | None,
+                member_token: WorkerMembershipToken,
+                work_item: TokenWorkItem,
             ) -> list[RetrievalChunk]:
                 del query, top_k, min_score, state_id, token_id
                 return [
@@ -314,6 +318,8 @@ class RAGRetrievalTransform(BaseTransform):
                 self._rag_config.min_score,
                 state_id=ctx.state_id,
                 token_id=token_id,
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
             )
         except RetrievalError as e:
             if e.retryable:
@@ -466,14 +472,8 @@ class RAGRetrievalTransform(BaseTransform):
         count: int | None,
         message: str,
     ) -> None:
-        """Persist retrieval readiness facts when the context can write them.
-
-        The write goes through the context, which forwards the run's leader
-        token by value (ADR-048 §3); a plugin never holds a token itself. A
-        context with no audit writer or no token (a follower, a probe) records
-        nothing — the same skip the writer-less arm has always taken.
-        """
-        if ctx.landscape is not None and ctx.coordination_token is not None:
+        """Persist readiness for every audit-enabled leader or follower context."""
+        if ctx.landscape is not None:
             ctx.record_readiness_check(
                 name=self.name,
                 collection=collection,

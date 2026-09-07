@@ -53,7 +53,7 @@ from elspeth.contracts.errors import (
     RunLeadershipLostError,
     RunWorkerEvictedError,
 )
-from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkStatus
+from elspeth.contracts.scheduler import GroupLossSpec, SourceIngestSpec, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -598,31 +598,25 @@ class TestSuspendedWinnerFences:
         contested_sequence = 10
         payload = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 10}, _observed_contract({"id": 10})))
 
-        def _insert_for(row_id: str, token_id: str) -> Any:
-            def _do(conn: Any) -> Any:
-                return crashed.factory.data_flow.insert_row_with_token_on(
-                    conn,
-                    run_id=crashed.run_id,
-                    source_node_id=crashed.source_node_id,
-                    row_index=contested_sequence,
-                    data={"id": 10},
-                    source_row_index=contested_sequence,
-                    ingest_sequence=contested_sequence,
-                    row_id=row_id,
-                    token_id=token_id,
-                )
-
-            return _do
+        def source_for(row_id: str, token_id: str) -> SourceIngestSpec:
+            return SourceIngestSpec(
+                source_node_id=crashed.source_node_id,
+                row_index=contested_sequence,
+                data={"id": 10},
+                source_row_index=contested_sequence,
+                ingest_sequence=contested_sequence,
+                row_id=row_id,
+                token_id=token_id,
+            )
 
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.ingest_row_with_initial_claim(
                 coordination_token=token_old,
-                insert_row_and_token=_insert_for("row-stale", "token-stale"),
-                token_id="token-stale",
-                row_id="row-stale",
+                source=source_for("row-stale", "token-stale"),
+                data_flow=crashed.factory.data_flow,
+                execution=crashed.factory.execution,
                 node_id=crashed.journal_node_id,
                 step_index=crashed.journal_step_index,
-                ingest_sequence=contested_sequence,
                 row_payload_json=payload,
                 lease_owner=WORKER_OLD,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
@@ -641,12 +635,11 @@ class TestSuspendedWinnerFences:
         # Positive control: the current leader ingests at the SAME slot.
         _row, _token, work_item = crashed.repo.ingest_row_with_initial_claim(
             coordination_token=current,
-            insert_row_and_token=_insert_for("row-current", "token-current"),
-            token_id="token-current",
-            row_id="row-current",
+            source=source_for("row-current", "token-current"),
+            data_flow=crashed.factory.data_flow,
+            execution=crashed.factory.execution,
             node_id=crashed.journal_node_id,
             step_index=crashed.journal_step_index,
-            ingest_sequence=contested_sequence,
             row_payload_json=payload,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,

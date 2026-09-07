@@ -16,7 +16,9 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
@@ -442,8 +444,10 @@ class BedrockGuardrailsClient(AuditedClientBase):
         audit_salt: bytes,
         sdk_client: BedrockRuntimeClient | None = None,
         token_id: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> None:
-        super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id)
+        super().__init__(execution, state_id, run_id, telemetry_emit, token_id=token_id, member_token=member_token, work_item=work_item)
         if len(audit_salt) < 16:
             raise ValueError("audit_salt must contain at least 16 bytes")
         self._guardrail_identifier = guardrail_identifier

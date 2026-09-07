@@ -6,18 +6,55 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import bedrock
+from tests.fixtures.landscape import make_recorder_with_run, member_token_for
 from tests.unit.web.aws_ecs_acceptance.test_receipt_contracts import _plugin_policy_receipt
+
+
+@pytest.fixture
+def guardrail_authority() -> Iterator[tuple[WorkerMembershipToken, TokenWorkItem]]:
+    setup = make_recorder_with_run(run_id="guardrail-run")
+    try:
+        member = member_token_for(setup.db.engine, worker_id=setup.coordination_token.worker_id)
+        row, token = setup.data_flow.create_row_with_token(
+            setup.source_node_id,
+            0,
+            {"check": "bedrock-guardrails"},
+            coordination_token=setup.coordination_token,
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        work_item = setup.factory.scheduler.enqueue_ready_claimed(
+            member_token=member,
+            token_id=token.token_id,
+            row_id=row.row_id,
+            node_id=setup.source_node_id,
+            step_index=0,
+            ingest_sequence=0,
+            row_payload_json=serialize_row_payload(
+                PipelineRow({"check": "bedrock-guardrails"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+            ),
+            lease_owner=member.worker_id,
+            lease_seconds=300,
+        )
+        yield member, work_item
+    finally:
+        setup.db.close()
 
 
 def test_facade_reexports_bedrock_owners_by_identity() -> None:
@@ -362,7 +399,9 @@ def _web_policy_evidence() -> WebPluginPolicyEvidence:
     )
 
 
-def test_verify_bedrock_guardrails_uses_shared_profile_registry_and_reusable_checker_audit_first() -> None:
+def test_verify_bedrock_guardrails_uses_shared_profile_registry_and_reusable_checker_audit_first(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     env = _guardrail_env()
     settings = object()
     profiles = {
@@ -415,14 +454,17 @@ def test_verify_bedrock_guardrails_uses_shared_profile_registry_and_reusable_che
         settings_loader=lambda: settings,
         registry_factory=registry_factory,
         execution=Execution(),
+        member_token=guardrail_authority[0],
+        work_item=guardrail_authority[1],
         checker=checker,
         telemetry_emit=lambda _event: order.append("telemetry"),
-        run_id="guardrail-run",
         state_id="guardrail-state",
         now=lambda: datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC),
     )
 
     assert registry_inputs == [settings]
+    assert all(call["member_token"] is guardrail_authority[0] for call in checker_calls)
+    assert all(call["work_item"] is guardrail_authority[1] for call in checker_calls)
     assert resolved == [
         ("transform:aws_bedrock_prompt_shield", "prompt-approved"),
         ("transform:aws_bedrock_content_safety", "content-approved"),
@@ -472,17 +514,23 @@ def test_verify_bedrock_guardrails_uses_shared_profile_registry_and_reusable_che
         ({"ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION": "DRAFT"}, "guardrails_input"),
     ],
 )
-def test_verify_bedrock_guardrails_fails_closed_on_invalid_gate_or_fixture_inputs(updates: dict[str, str], check: str) -> None:
+def test_verify_bedrock_guardrails_fails_closed_on_invalid_gate_or_fixture_inputs(
+    updates: dict[str, str], check: str, guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem]
+) -> None:
     with pytest.raises(acceptance.AcceptanceCheckError, match=check):
         acceptance.verify_bedrock_guardrails(
             _guardrail_env(**updates),
             settings_loader=pytest.fail,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
 
 
-def test_verify_bedrock_guardrails_names_missing_live_inputs_exactly() -> None:
+def test_verify_bedrock_guardrails_names_missing_live_inputs_exactly(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     env = _guardrail_env()
     del env["ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT"]
     del env["ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT"]
@@ -493,6 +541,8 @@ def test_verify_bedrock_guardrails_names_missing_live_inputs_exactly() -> None:
             settings_loader=pytest.fail,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
 
     assert raised.value.missing == (
@@ -501,7 +551,9 @@ def test_verify_bedrock_guardrails_names_missing_live_inputs_exactly() -> None:
     )
 
 
-def test_verify_bedrock_guardrails_reports_absent_gate_env_as_missing_input() -> None:
+def test_verify_bedrock_guardrails_reports_absent_gate_env_as_missing_input(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     env = _guardrail_env()
     del env["ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"]
 
@@ -511,12 +563,16 @@ def test_verify_bedrock_guardrails_reports_absent_gate_env_as_missing_input() ->
             settings_loader=pytest.fail,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
 
     assert raised.value.missing == ("ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS",)
 
 
-def test_verify_bedrock_guardrails_defaults_alias_and_version_from_rendered_policy_env() -> None:
+def test_verify_bedrock_guardrails_defaults_alias_and_version_from_rendered_policy_env(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     env = _guardrail_env()
     for name in (
         "ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS",
@@ -555,6 +611,8 @@ def test_verify_bedrock_guardrails_defaults_alias_and_version_from_rendered_poli
         settings_loader=lambda: object(),
         registry_factory=lambda _settings: Registry(),
         execution=object(),
+        member_token=guardrail_authority[0],
+        work_item=guardrail_authority[1],
         checker=checker,
         now=lambda: datetime(2026, 7, 30, 1, 2, 3, tzinfo=UTC),
     )
@@ -567,7 +625,9 @@ def test_verify_bedrock_guardrails_defaults_alias_and_version_from_rendered_poli
     assert [control["guardrail_version"] for control in controls] == ["7", "11"]  # type: ignore[index]
 
 
-def test_verify_bedrock_guardrails_never_defaults_version_for_divergent_operator_alias() -> None:
+def test_verify_bedrock_guardrails_never_defaults_version_for_divergent_operator_alias(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     env = _guardrail_env(ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS="operator-divergent-alias")
     del env["ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION"]
 
@@ -577,12 +637,16 @@ def test_verify_bedrock_guardrails_never_defaults_version_for_divergent_operator
             settings_loader=pytest.fail,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
 
     assert raised.value.missing == ("ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION",)
 
 
-def test_verify_bedrock_guardrails_keeps_settings_code_for_genuine_settings_failures() -> None:
+def test_verify_bedrock_guardrails_keeps_settings_code_for_genuine_settings_failures(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     def settings_loader() -> object:
         raise RuntimeError("raw settings failure sentinel")
 
@@ -592,6 +656,8 @@ def test_verify_bedrock_guardrails_keeps_settings_code_for_genuine_settings_fail
             settings_loader=settings_loader,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
     assert "raw settings failure sentinel" not in str(raised.value)
 
@@ -614,7 +680,9 @@ def test_guardrail_live_owner_surfaces_named_check_failures_instead_of_settings_
     assert raised.value.missing == ("ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT",)
 
 
-def test_verify_bedrock_guardrails_rejects_aws_overrides_before_settings_load() -> None:
+def test_verify_bedrock_guardrails_rejects_aws_overrides_before_settings_load(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     raw = "raw-credential-endpoint-role-arn-sentinel"
     with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_aws_override") as raised:
         acceptance.verify_bedrock_guardrails(
@@ -622,11 +690,15 @@ def test_verify_bedrock_guardrails_rejects_aws_overrides_before_settings_load() 
             settings_loader=pytest.fail,
             registry_factory=pytest.fail,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
     assert raw not in str(raised.value)
 
 
-def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_failure() -> None:
+def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_failure(
+    guardrail_authority: tuple[WorkerMembershipToken, TokenWorkItem],
+) -> None:
     profile = SimpleNamespace(
         alias="prompt-approved",
         plugin="aws_bedrock_prompt_shield",
@@ -639,6 +711,8 @@ def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_fai
             settings_loader=object,
             registry_factory=lambda _settings: registry,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
         )
 
     profiles = {
@@ -660,6 +734,8 @@ def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_fai
             settings_loader=object,
             registry_factory=lambda _settings: registry,
             execution=object(),
+            member_token=guardrail_authority[0],
+            work_item=guardrail_authority[1],
             checker=checker,
         )
     assert "raw provider" not in str(raised.value)
@@ -757,7 +833,10 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
         acceptance.build_plugin_policy_acceptance(settings, env)
 
 
-def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure_mode", [None, "checker_failure", "claim_lost"])
+def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(
+    tmp_path: Path, failure_mode: str | None
+) -> None:
     from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
     from elspeth.plugins.transforms.aws.guardrails_live_check import run_guardrail_live_check
     from tests.unit.plugins.transforms.aws.test_guardrails_client import CONTENT_FILTERS, response
@@ -796,8 +875,10 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
             self.responses = iter(responses)
 
         def apply_guardrail(self, **_kwargs: object) -> object:
+            provider_calls.append(_kwargs)
             return next(self.responses)
 
+    provider_calls: list[dict[str, object]] = []
     sdks = iter(
         (
             SequencedSDK(response(), response(detected="PROMPT_ATTACK")),
@@ -815,6 +896,19 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     )
 
     def checker(**kwargs: object) -> object:
+        if failure_mode == "checker_failure":
+            raise RuntimeError("private checker failure")
+        if failure_mode == "claim_lost":
+            member = kwargs["member_token"]
+            work_item = kwargs["work_item"]
+            assert isinstance(member, WorkerMembershipToken)
+            assert isinstance(work_item, TokenWorkItem)
+            with LandscapeDB.from_url(database_url, create_tables=False) as database:
+                RecorderFactory.writable(database).scheduler.mark_terminal(
+                    member_token=member,
+                    work_item_id=work_item.work_item_id,
+                    expected_lease_owner=member.worker_id,
+                )
         return run_guardrail_live_check(**kwargs, sdk_client=next(sdks))  # type: ignore[arg-type]
 
     class Manager:
@@ -835,15 +929,39 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     manager = Manager()
     policy_evidence = _web_policy_evidence()
     policy_receipt = _plugin_policy_receipt(include_landscape=False)
-    receipt = acceptance.run_bedrock_guardrails_live(
-        _guardrail_env(),
-        settings_loader=lambda: settings,
-        registry_factory=lambda _settings: registry,
-        checker=checker,
-        telemetry_manager_factory=lambda _settings: manager,
-        policy_acceptance_factory=lambda _settings, _env: (policy_evidence, policy_receipt),
-        now=lambda: datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC),
-    )
+
+    def run_acceptance() -> dict[str, object]:
+        return acceptance.run_bedrock_guardrails_live(
+            _guardrail_env(),
+            settings_loader=lambda: settings,
+            registry_factory=lambda _settings: registry,
+            checker=checker,
+            telemetry_manager_factory=lambda _settings: manager,
+            policy_acceptance_factory=lambda _settings, _env: (policy_evidence, policy_receipt),
+            now=lambda: datetime(2026, 7, 14, 1, 2, 3, tzinfo=UTC),
+        )
+
+    if failure_mode is not None:
+        check = "guardrails_landscape" if failure_mode == "claim_lost" else "guardrails_live_check"
+        with pytest.raises(acceptance.AcceptanceCheckError, match=check):
+            run_acceptance()
+        assert provider_calls == []
+        assert manager.events == []
+        assert manager.closed is True
+        with LandscapeDB.from_url(database_url, create_tables=False) as database:
+            repositories = RecorderFactory.writable(database)
+            run = repositories.run_lifecycle.list_runs()[0]
+            outcomes = repositories.query.get_all_token_outcomes_for_run(run.run_id)
+        if failure_mode == "checker_failure":
+            assert run.status.value == "failed"
+            assert len(outcomes) == 1
+            assert outcomes[0].outcome.value == "failure"
+        else:
+            assert run.status.value == "running"
+            assert outcomes == []
+        return
+
+    receipt = run_acceptance()
 
     assert len(receipt["controls"]) == 2  # type: ignore[arg-type]
     assert receipt["plugin_policy"] == _plugin_policy_receipt()

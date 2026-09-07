@@ -28,8 +28,10 @@ import httpx
 from pydantic import BaseModel, field_validator, model_validator
 
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import CallStatus, CallType
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
@@ -228,6 +230,8 @@ class ChromaSearchProvider:
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
         count_start = time.monotonic()
         count_request = RawCallPayload({"query": query, "top_k": top_k, "collection": self._config.collection})
@@ -239,17 +243,17 @@ class ChromaSearchProvider:
             chromadb.errors.NotFoundError,
             chromadb.errors.AuthorizationError,
         ) as exc:
-            self._record_error(state_id, count_start, count_request, exc, retryable=False)
+            self._record_error(state_id, count_start, count_request, exc, retryable=False, member_token=member_token, work_item=work_item)
             raise RetrievalError(
                 f"Chroma count failed (permanent): {exc}",
                 retryable=False,
             ) from exc
         except chromadb.errors.ChromaError as exc:
-            self._record_error(state_id, count_start, count_request, exc, retryable=True)
+            self._record_error(state_id, count_start, count_request, exc, retryable=True, member_token=member_token, work_item=work_item)
             raise RetrievalError(f"Chroma count failed: {exc}", retryable=True) from exc
         except (ConnectionError, TimeoutError, OSError) as exc:
             # OS-level failures that bypass the ChromaDB SDK's own error wrapping
-            self._record_error(state_id, count_start, count_request, exc, retryable=True)
+            self._record_error(state_id, count_start, count_request, exc, retryable=True, member_token=member_token, work_item=work_item)
             raise RetrievalError(f"Chroma connection failed during count: {exc}", retryable=True) from exc
         if type(collection_count) is not int or collection_count < 0:
             error = RetrievalError(
@@ -257,7 +261,7 @@ class ChromaSearchProvider:
                 f"got {collection_count!r} ({type(collection_count).__name__}).",
                 retryable=False,
             )
-            self._record_error(state_id, count_start, count_request, error, retryable=False)
+            self._record_error(state_id, count_start, count_request, error, retryable=False, member_token=member_token, work_item=work_item)
             raise error
         if collection_count == 0:
             # The corpus is empty: no query() is issued and zero chunks are
@@ -268,8 +272,10 @@ class ChromaSearchProvider:
             # "retrieval never ran"; collection_count=0 further distinguishes
             # it from a populated query that simply matched nothing.
             empty_elapsed_ms = (time.monotonic() - count_start) * 1000
-            call_index = self._execution.allocate_call_index(state_id)
+            call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
             self._execution.record_call(
+                member_token=member_token,
+                work_item=work_item,
                 state_id=state_id,
                 call_index=call_index,
                 call_type=CallType.VECTOR,
@@ -297,17 +303,17 @@ class ChromaSearchProvider:
             chromadb.errors.NotFoundError,
             chromadb.errors.AuthorizationError,
         ) as exc:
-            self._record_error(state_id, start_time, request_payload, exc, retryable=False)
+            self._record_error(state_id, start_time, request_payload, exc, retryable=False, member_token=member_token, work_item=work_item)
             raise RetrievalError(
                 f"Chroma query failed (permanent): {exc}",
                 retryable=False,
             ) from exc
         except chromadb.errors.ChromaError as exc:
-            self._record_error(state_id, start_time, request_payload, exc, retryable=True)
+            self._record_error(state_id, start_time, request_payload, exc, retryable=True, member_token=member_token, work_item=work_item)
             raise RetrievalError(f"Chroma query failed: {exc}", retryable=True) from exc
         except (ConnectionError, TimeoutError, OSError) as exc:
             # OS-level failures that bypass the ChromaDB SDK's own error wrapping
-            self._record_error(state_id, start_time, request_payload, exc, retryable=True)
+            self._record_error(state_id, start_time, request_payload, exc, retryable=True, member_token=member_token, work_item=work_item)
             raise RetrievalError(f"Chroma connection failed: {exc}", retryable=True) from exc
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
@@ -319,15 +325,19 @@ class ChromaSearchProvider:
         try:
             chunks, skipped_items = self._parse_and_build_chunks(results, min_score)
         except RetrievalError as exc:
-            self._record_error(state_id, start_time, request_payload, exc, retryable=exc.retryable)
+            self._record_error(
+                state_id, start_time, request_payload, exc, retryable=exc.retryable, member_token=member_token, work_item=work_item
+            )
             raise
 
         chunks.sort(key=lambda c: c.score, reverse=True)
         self.last_skipped_count = len(skipped_items)
         self.last_skipped_reasons = skipped_items
 
-        call_index = self._execution.allocate_call_index(state_id)
+        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
         self._execution.record_call(
+            member_token=member_token,
+            work_item=work_item,
             state_id=state_id,
             call_index=call_index,
             call_type=CallType.VECTOR,
@@ -470,6 +480,8 @@ class ChromaSearchProvider:
         exc: Exception,
         *,
         retryable: bool,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> None:
         """Record a failed search call in the audit trail.
 
@@ -479,8 +491,10 @@ class ChromaSearchProvider:
         here because the caller is about to raise a RetrievalError).
         """
         elapsed_ms = (time.monotonic() - start_time) * 1000
-        call_index = self._execution.allocate_call_index(state_id)
+        call_index = self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
         self._execution.record_call(
+            member_token=member_token,
+            work_item=work_item,
             state_id=state_id,
             call_index=call_index,
             call_type=CallType.VECTOR,

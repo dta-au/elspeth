@@ -34,6 +34,8 @@ from elspeth.contracts.errors import (
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
+    RunLeadershipLostError,
+    RunMembershipLostError,
     RunWorkerEvictedError,
     SchedulerLeaseLostError,
     ZeroEmissionSuccessContractViolation,
@@ -139,6 +141,7 @@ def record_transform_error_with_routing(
     if divert is not None:
         divert_state_id, error_edge_id = divert
         execution.record_routing_event(
+            member_token=ctx.require_member_token(),
             state_id=divert_state_id,
             edge_id=error_edge_id,
             mode=RoutingMode.DIVERT,
@@ -224,7 +227,7 @@ class TransformExecutor:
         *,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         violation: DeclarationContractViolation | AggregateDeclarationContractViolation,
     ) -> None:
         """Persist the matching FAILED token_outcome for a run-ending violation.
@@ -279,7 +282,9 @@ class TransformExecutor:
 
         try:
             self._data_flow.record_token_outcome(
-                ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                ref=TokenRef(token_id=token.token_id, run_id=ctx.run_id),
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
                 error_hash=error_hash,
@@ -336,7 +341,7 @@ class TransformExecutor:
         transform: TransformProtocol,
         token: TokenInfo,
         input_dict: dict[str, Any],
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
     ) -> tuple[frozenset[str], frozenset[str]]:
         """Run pre-invocation checks before the transform executes.
@@ -422,7 +427,7 @@ class TransformExecutor:
                 inputs=PreEmissionInputs(
                     plugin=transform,
                     node_id=node_id,
-                    run_id=run_id,
+                    run_id=ctx.run_id,
                     row_id=token.row_id,
                     token_id=token.token_id,
                     input_row=token.row_data,
@@ -434,7 +439,7 @@ class TransformExecutor:
             self._record_terminal_contract_failure(
                 transform=transform,
                 token=token,
-                run_id=run_id,
+                ctx=ctx,
                 violation=violation,
             )
             raise
@@ -483,8 +488,9 @@ class TransformExecutor:
             # stale results from the previous attempt.
             waiter = adapter.register(token.token_id, state_id)
 
-            # Submit work - this returns immediately
-            batch_runtime.accept(token.row_data, ctx)
+            # Snapshot claim authority: a timed-out worker can finish after the
+            # scheduler restores this context or starts another claim.
+            batch_runtime.accept(token.row_data, ctx.for_contract(ctx.contract))
 
             # Block until THIS row's result arrives.
             #
@@ -516,7 +522,7 @@ class TransformExecutor:
         result: TransformResult,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
         static_contract: frozenset[str],
         effective_input_fields: frozenset[str],
@@ -545,7 +551,7 @@ class TransformExecutor:
                 inputs=PostEmissionInputs(
                     plugin=transform,
                     node_id=node_id,
-                    run_id=run_id,
+                    run_id=ctx.run_id,
                     row_id=token.row_id,
                     token_id=token.token_id,
                     input_row=token.row_data,
@@ -569,7 +575,7 @@ class TransformExecutor:
             self._record_terminal_contract_failure(
                 transform=transform,
                 token=token,
-                run_id=run_id,
+                ctx=ctx,
                 violation=violation,
             )
             raise
@@ -629,7 +635,7 @@ class TransformExecutor:
         result: TransformResult,
         transform: TransformProtocol,
         token: TokenInfo,
-        run_id: str,
+        ctx: PluginContext,
         node_id: str,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Extract output data + record contract evolution (success-audit phase, part 2).
@@ -676,7 +682,7 @@ class TransformExecutor:
             if self._data_flow is None:
                 raise OrchestrationInvariantError("TransformExecutor.data_flow is None but contract evolution requires DataFlowRepository")
             self._data_flow.update_node_output_contract(
-                run_id=run_id,
+                member_token=ctx.require_member_token(),
                 node_id=node_id,
                 contract=output_contract,
             )
@@ -772,7 +778,7 @@ class TransformExecutor:
                 self._execution,
                 token_id=token.token_id,
                 node_id=node_id,
-                run_id=ctx.run_id,
+                member_token=ctx.require_member_token(),
                 step_index=step,
                 input_data=input_dict,
                 # resume_attempt_offset is the generation base (run-1 max+1 for a re-driven token;
@@ -790,7 +796,7 @@ class TransformExecutor:
                 transform=transform,
                 token=token,
                 input_dict=input_dict,
-                run_id=ctx.run_id,
+                ctx=ctx,
                 node_id=node_id,
             )
 
@@ -818,6 +824,8 @@ class TransformExecutor:
                         state_id=guard.state_id,
                     )
                     duration_ms = (time.perf_counter() - start) * 1000
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     self._verify_ownership_before_terminal_audit(guard)
                     raise  # Tier 1 errors must crash — never record as row FAILED
@@ -865,7 +873,7 @@ class TransformExecutor:
                         result=result,
                         transform=transform,
                         token=token,
-                        run_id=ctx.run_id,
+                        ctx=ctx,
                         node_id=node_id,
                         static_contract=static_contract,
                         effective_input_fields=effective_input_fields,
@@ -892,7 +900,7 @@ class TransformExecutor:
                         result=result,
                         transform=transform,
                         token=token,
-                        run_id=ctx.run_id,
+                        ctx=ctx,
                         node_id=node_id,
                     )
 

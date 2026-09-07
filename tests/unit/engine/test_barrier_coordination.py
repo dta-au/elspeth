@@ -65,6 +65,7 @@ _NOW = datetime(2026, 7, 3, 12, 0, 0, tzinfo=UTC)
 _LIVE_ARRIVAL_MONOTONIC = 100.0
 _AGG_NODE = NodeID("agg-node")
 _COALESCE = CoalesceName("merge")
+_INTAKE_LEADER = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
 
 
 def _payload() -> str:
@@ -158,7 +159,8 @@ class RecordingAggregationExecutor:
         self.accepted: list[TokenInfo] = []
         self.accept_times: list[float] = []
 
-    def open_batch_membership(self, node_id: NodeID) -> tuple[str, int]:
+    def open_batch_membership(self, node_id: NodeID, *, coordination_token: CoordinationToken) -> tuple[str, int]:
+        assert coordination_token is _INTAKE_LEADER
         self.calls.append("open_batch")
         return ("batch-1", 0)
 
@@ -178,7 +180,15 @@ class RecordingCoalesceExecutor:
         self.accepted: list[str] = []
         self.arrival_times: list[float] = []
 
-    def accept(self, *, token: TokenInfo, coalesce_name: str, arrival_time: float) -> CoalesceOutcome:
+    def accept(
+        self,
+        *,
+        token: TokenInfo,
+        coalesce_name: str,
+        arrival_time: float,
+        coordination_token: CoordinationToken,
+    ) -> CoalesceOutcome:
+        assert coordination_token is _INTAKE_LEADER
         self.accepted.append(token.token_id)
         self.arrival_times.append(arrival_time)
         return self.outcome
@@ -318,7 +328,7 @@ def _make_coordinator(
     return BarrierIntakeCoordinator(
         run_id="run-1",
         scheduler=scheduler,
-        data_flow=SimpleNamespace(record_token_outcome=lambda **kwargs: None),
+        data_flow=SimpleNamespace(record_token_outcome_leader=lambda **kwargs: None),
         execution=SimpleNamespace(),
         barrier_restore_reads=restore_reads,
         aggregation_executor=aggregation_executor or RecordingAggregationExecutor(),
@@ -329,7 +339,7 @@ def _make_coordinator(
         aggregation_settings={_AGG_NODE: object()} if aggregation_executor is not None else {},
         coalesce_node_ids={_COALESCE: NodeID("coalesce-node")} if coalesce_executor is not None else {},
         branch_to_coalesce={},
-        coordination_token=SimpleNamespace(worker_id="leader-1", epoch=1),
+        coordination_token=_INTAKE_LEADER,
         scheduler_lease_owner="leader-1",
         live_barrier_holds=live_holds if live_holds is not None else {},
         resume_checkpoint_id=None,
@@ -662,6 +672,7 @@ class TestRowUnionLossReplay:
 
         assert row_union.notifications == [
             {
+                "coordination_token": _INTAKE_LEADER,
                 "row_union_name": "variant_union",
                 "fork_group_id": "fg-barrier-coordination-test",
                 "lost_branch": "control",
@@ -715,7 +726,15 @@ class TestGroupLossReplayAndRestore:
 
         coordinator.run_intake_pass(_ctx())
 
-        assert notified == [{"coalesce_name": "merge", "fork_group_id": "grp-1", "lost_branch": "path_a", "reason": "quarantined"}]
+        assert notified == [
+            {
+                "coordination_token": _INTAKE_LEADER,
+                "coalesce_name": "merge",
+                "fork_group_id": "grp-1",
+                "lost_branch": "path_a",
+                "reason": "quarantined",
+            }
+        ]
 
     def test_takeover_restore_seeds_executor_from_full_table_not_unadopted_subset(self) -> None:
         """Spec §6.2 stated requirement: takeover restore reads the FULL
@@ -1031,7 +1050,9 @@ class TestRowUnionRecovery:
             work_item_ids=[row.work_item_id],
             coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_failed_closure_holdless_group_resets_to_intake_instead_of_release_reconcile(self) -> None:
         # Crash window: _fail_pending committed FAILED node states (which have
@@ -1085,7 +1106,9 @@ class TestRowUnionRecovery:
             work_item_ids=[row.work_item_id for row in rows],
             coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_already_terminal_holdless_rows_journal_release_instead_of_reset(self) -> None:
         # elspeth-e18928f7cb: _fail_pending committed FAILED node states AND
@@ -1139,7 +1162,9 @@ class TestRowUnionRecovery:
         for call in released_calls:
             assert call.kwargs["barrier_key"] == "variant_union"
             assert call.kwargs["release_context"]["restore_reconcile"] is True
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_mixed_terminal_and_unrecorded_holdless_rows_split_release_and_reset(self) -> None:
         # Crash inside _fail_pending's per-entry loop: the first entry's
@@ -1191,7 +1216,9 @@ class TestRowUnionRecovery:
             work_item_ids=["wi-tok-treatment"],
             coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_late_arrival_residual_is_journal_released_not_replayed_as_group(self) -> None:
         # Crash window: a surplus branch token failed late after its group
@@ -1247,7 +1274,9 @@ class TestRowUnionRecovery:
         assert call.kwargs["release_context"]["late_arrival"] is True
         assert call.kwargs["release_context"]["restore_reconcile"] is True
         assert call.kwargs["release_context"]["scope_row_id"] == "row-1"
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_late_arrival_residual_without_terminal_outcome_resets_to_intake(self) -> None:
         # Narrower slice of the same window: the FAILED node state committed
@@ -1299,7 +1328,9 @@ class TestRowUnionRecovery:
             work_item_ids=[row.work_item_id],
             coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
         )
-        row_union.restore_from_journal.assert_called_once_with(entries=[])
+        row_union.restore_from_journal.assert_called_once_with(
+            entries=[], coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1)
+        )
 
     def test_residual_partition_preserves_genuine_released_group_reconcile(self) -> None:
         # A genuine post-release crash group (row-1: every branch row is still
@@ -1738,7 +1769,7 @@ class TestRowUnionRecovery:
         assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-1"
         assert execution.complete_node_state.call_args.kwargs["status"] is NodeStateStatus.FAILED
         assert execution.complete_node_state.call_args.kwargs["error"].failure_reason == "late_arrival_after_release"
-        data_flow.record_token_outcome.assert_called_once()
+        data_flow.record_token_outcome_leader.assert_called_once()
         scheduler.reset_adoption_marker_to_pending.assert_not_called()
 
     def test_adopted_partial_group_restores_executor_memory(self) -> None:

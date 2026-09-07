@@ -20,6 +20,7 @@ from typing import Any, Protocol
 import pytest
 
 from elspeth.contracts import TransformResult
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult
@@ -126,7 +127,7 @@ class _ProviderDouble:
             response_format=response_format,
         )
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, coordination_token: CoordinationToken, operation_id: str, model: str) -> None:
         pass
 
     def close(self) -> None:

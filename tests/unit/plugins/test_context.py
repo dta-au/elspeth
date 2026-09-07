@@ -8,6 +8,7 @@ from typing import Any
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from tests.fixtures.factories import make_source_context
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 def _call_result(
@@ -195,6 +196,7 @@ class TestValidationErrorRecording:
             config={},
             node_id="source_node",
             landscape=landscape,
+            **mock_audit_authority("test-run"),
         )
 
         token = ctx.record_validation_error(
@@ -207,7 +209,7 @@ class TestValidationErrorRecording:
         # Should have called landscape
         assert len(landscape.validation_error_calls) == 1
         call_kwargs = landscape.validation_error_calls[0]
-        assert call_kwargs["run_id"] == "test-run"
+        assert call_kwargs["coordination_token"] is ctx.require_coordination_token()
         assert call_kwargs["node_id"] == "source_node"
         assert call_kwargs["row_data"] == {"id": 42, "invalid": "data"}
         assert call_kwargs["error"] == "validation failed"
@@ -236,6 +238,7 @@ class TestValidationErrorRecording:
             config={},
             node_id="source_node",
             landscape=landscape,
+            **mock_audit_authority("test-run"),
         )
 
         violation = TypeMismatchViolation(
@@ -269,6 +272,7 @@ class TestValidationErrorRecording:
             config={},
             node_id="source_node",
             landscape=landscape,
+            **mock_audit_authority("test-run"),
         )
 
         ctx.record_validation_error(
@@ -391,6 +395,7 @@ class TestTransformErrorRecording:
             config={},
             node_id="transform_node",
             landscape=landscape,
+            **mock_audit_authority("test-run"),
         )
 
         token = ctx.record_transform_error(
@@ -533,7 +538,7 @@ class TestRecordCallTelemetryPayloadSnapshot:
         expected_request: dict[str, Any] = {"a": 1, "nested": {"x": 2}}
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash(expected_request),
                 response_hash=stable_hash({"ok": True}),
@@ -544,7 +549,8 @@ class TestRecordCallTelemetryPayloadSnapshot:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -581,7 +587,7 @@ class TestRecordCallTelemetryPayloadSnapshot:
             emitted_events.append(event)
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash({"prompt": "hi"}),
                 response_hash=stable_hash({"usage": {"prompt_tokens": 1, "completion_tokens": 2}}),
@@ -592,7 +598,8 @@ class TestRecordCallTelemetryPayloadSnapshot:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -623,8 +630,8 @@ class TestRecordCallTelemetryPayloadSnapshot:
 class TestRecordCallTelemetryTokenCorrelation:
     """Tests for token_id correlation in ExternalCallCompleted telemetry."""
 
-    def test_state_context_emits_token_id_when_token_present(self) -> None:
-        """Transform-context calls should include token_id for correlation."""
+    def test_operation_context_omits_token_id_when_context_has_token(self) -> None:
+        """Operation calls retain operation identity even when a token is present."""
         from typing import Any
 
         from elspeth.contracts.enums import CallStatus, CallType
@@ -638,10 +645,8 @@ class TestRecordCallTelemetryTokenCorrelation:
         def capture_telemetry(event):
             emitted_events.append(event)
 
-        # get_node_state must return an object with the authoritative token_id
-        # (record_call resolves token_id from state_id lookup, not ctx.token)
         landscape = _RecordingLandscape(
-            call_result=_call_result(call_id="call-001"),
+            operation_call_result=_call_result(call_id="call-001"),
             node_state=SimpleNamespace(token_id="tok-001"),
         )
 
@@ -657,7 +662,8 @@ class TestRecordCallTelemetryTokenCorrelation:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             token=token,
             telemetry_emit=capture_telemetry,
         )
@@ -672,7 +678,7 @@ class TestRecordCallTelemetryTokenCorrelation:
         )
 
         assert len(emitted_events) == 1
-        assert emitted_events[0].token_id == "tok-001"
+        assert emitted_events[0].token_id is None
 
     def test_operation_context_allows_missing_token_id(self) -> None:
         """Operation-context calls should be valid with token_id=None."""
@@ -692,6 +698,7 @@ class TestRecordCallTelemetryTokenCorrelation:
             run_id="test-run",
             config={},
             landscape=landscape,
+            **mock_audit_authority("test-run"),
             operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
@@ -740,7 +747,7 @@ class TestRecordCallTelemetryResponseHash:
         from elspeth.core.canonical import stable_hash
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash({"endpoint": "/empty"}),
                 response_hash=stable_hash({}),
@@ -751,7 +758,8 @@ class TestRecordCallTelemetryResponseHash:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",  # Required for call recording
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",  # Required for call recording
             telemetry_emit=capture_telemetry,
         )
 
@@ -789,7 +797,7 @@ class TestRecordCallTelemetryResponseHash:
         from elspeth.core.canonical import stable_hash
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash({"query": "SELECT * FROM empty_table"}),
                 response_hash=stable_hash({"rows": []}),
@@ -800,7 +808,8 @@ class TestRecordCallTelemetryResponseHash:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -831,7 +840,7 @@ class TestRecordCallTelemetryResponseHash:
             emitted_events.append(event)
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash({"method": "DELETE"}),
                 response_hash=stable_hash({"body": ""}),
@@ -842,7 +851,8 @@ class TestRecordCallTelemetryResponseHash:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -872,7 +882,7 @@ class TestRecordCallTelemetryResponseHash:
             emitted_events.append(event)
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash="abc123",
                 response_hash=None,  # No response recorded
@@ -883,7 +893,8 @@ class TestRecordCallTelemetryResponseHash:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -916,7 +927,7 @@ class TestRecordCallRawCallPayloadWrapping:
         from elspeth.contracts.plugin_context import PluginContext
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash="req-hash",
                 response_hash=None,
@@ -927,7 +938,8 @@ class TestRecordCallRawCallPayloadWrapping:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
         )
 
         ctx.record_call(
@@ -940,7 +952,7 @@ class TestRecordCallRawCallPayloadWrapping:
         )
 
         # Verify record_call was invoked with response_data=None (not wrapped)
-        call_kwargs = landscape.record_call_calls[0]
+        call_kwargs = landscape.record_operation_call_calls[0]
         assert call_kwargs["response_data"] is None
 
     def test_response_data_dict_wrapped_in_raw_call_payload(self) -> None:
@@ -950,7 +962,7 @@ class TestRecordCallRawCallPayloadWrapping:
         from elspeth.contracts.plugin_context import PluginContext
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-002",
                 request_hash="req-hash",
                 response_hash="resp-hash",
@@ -961,7 +973,8 @@ class TestRecordCallRawCallPayloadWrapping:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
         )
 
         ctx.record_call(
@@ -973,7 +986,7 @@ class TestRecordCallRawCallPayloadWrapping:
             status=CallStatus.SUCCESS,
         )
 
-        call_kwargs = landscape.record_call_calls[0]
+        call_kwargs = landscape.record_operation_call_calls[0]
         # response_data should be RawCallPayload, not a raw dict
         assert isinstance(call_kwargs["response_data"], RawCallPayload)
         assert call_kwargs["response_data"].to_dict() == {"key": "val"}
@@ -985,7 +998,7 @@ class TestRecordCallRawCallPayloadWrapping:
         from elspeth.contracts.plugin_context import PluginContext
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-003",
                 request_hash="req-hash",
                 response_hash=None,
@@ -996,7 +1009,8 @@ class TestRecordCallRawCallPayloadWrapping:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
         )
 
         ctx.record_call(
@@ -1008,7 +1022,7 @@ class TestRecordCallRawCallPayloadWrapping:
             status=CallStatus.SUCCESS,
         )
 
-        call_kwargs = landscape.record_call_calls[0]
+        call_kwargs = landscape.record_operation_call_calls[0]
         assert isinstance(call_kwargs["request_data"], RawCallPayload)
         assert call_kwargs["request_data"].to_dict() == {"endpoint": "/test"}
 
@@ -1026,7 +1040,7 @@ class TestRecordCallRawCallPayloadWrapping:
             emitted_events.append(event)
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-004",
                 request_hash="req-hash",
                 response_hash="resp-hash",
@@ -1037,7 +1051,8 @@ class TestRecordCallRawCallPayloadWrapping:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=capture_telemetry,
         )
 
@@ -1073,6 +1088,7 @@ class TestRecordCallRawCallPayloadWrapping:
             run_id="test-run",
             config={},
             landscape=landscape,
+            **mock_audit_authority("test-run"),
             operation_id="operation-001",
         )
 
@@ -1118,7 +1134,7 @@ class TestRecordCallFrozenData:
         emitted_events: list[Any] = []
 
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash({"prompt": "hi"}),
                 response_hash=stable_hash({"usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
@@ -1129,7 +1145,8 @@ class TestRecordCallFrozenData:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=emitted_events.append,
         )
 
@@ -1178,7 +1195,7 @@ class TestRecordCallFrozenData:
 
         expected_request = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
         landscape = _RecordingLandscape(
-            call_result=_call_result(
+            operation_call_result=_call_result(
                 call_id="call-001",
                 request_hash=stable_hash(expected_request),
                 response_hash=stable_hash({"ok": True}),
@@ -1189,7 +1206,8 @@ class TestRecordCallFrozenData:
             run_id="test-run",
             config={},
             landscape=landscape,
-            state_id="state-001",
+            **mock_audit_authority("test-run"),
+            operation_id="operation-001",
             telemetry_emit=emitted_events.append,
         )
 

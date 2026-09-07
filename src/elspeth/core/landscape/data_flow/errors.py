@@ -21,7 +21,9 @@ from elspeth.contracts import (
     ValidationErrorWithContract,
 )
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
@@ -31,7 +33,10 @@ from elspeth.core.landscape.data_flow.serialization import (
     canonical_or_recorded_hash,
     canonical_or_recorded_json,
 )
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import TransformErrorLoader, ValidationErrorLoader
+from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import rows_table, transform_errors_table, validation_errors_table
 
 if TYPE_CHECKING:
@@ -46,12 +51,14 @@ class ErrorAuditRepository:
 
     def __init__(
         self,
+        db: LandscapeConnectionProvider,
         ops: DatabaseOps,
         *,
         validation_error_loader: ValidationErrorLoader,
         transform_error_loader: TransformErrorLoader,
         ownership: RowTokenOwnership,
     ) -> None:
+        self._db = db
         self._ops = ops
         self._validation_error_loader = validation_error_loader
         self._transform_error_loader = transform_error_loader
@@ -59,13 +66,13 @@ class ErrorAuditRepository:
 
     def record_validation_error(
         self,
-        run_id: str,
         node_id: str | None,
         row_data: Any,
         error: str,
         schema_mode: str,
         destination: str,
         *,
+        coordination_token: CoordinationToken,
         row_id: str | None = None,
         contract_violation: ContractViolation | None = None,
     ) -> str:
@@ -87,6 +94,7 @@ class ErrorAuditRepository:
         Returns:
             error_id for tracking
         """
+        run_id = coordination_token.run_id
         error_id = f"verr_{generate_id()[:12]}"
 
         if row_id is not None:
@@ -118,41 +126,31 @@ class ErrorAuditRepository:
             expected_type = violation_record.expected_type
             actual_type = violation_record.actual_type
 
-        self._ops.execute_insert(
-            validation_errors_table.insert().values(
-                error_id=error_id,
-                run_id=run_id,
-                node_id=node_id,
-                row_id=row_id,
-                row_hash=row_hash,
-                row_data_json=row_data_json,
-                error=error,
-                schema_mode=schema_mode,
-                destination=destination,
-                created_at=now(),
-                violation_type=violation_type,
-                normalized_field_name=normalized_field_name,
-                original_field_name=original_field_name,
-                expected_type=expected_type,
-                actual_type=actual_type,
+        with fenced_leader_transaction(
+            self._db.engine, token=coordination_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="record_validation_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                validation_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=coordination_token.run_id,
+                    node_id=node_id,
+                    row_id=row_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error=error,
+                    schema_mode=schema_mode,
+                    destination=destination,
+                    created_at=now(),
+                    violation_type=violation_type,
+                    normalized_field_name=normalized_field_name,
+                    original_field_name=original_field_name,
+                    expected_type=expected_type,
+                    actual_type=actual_type,
+                ),
             )
-        )
 
         return error_id
-
-    def link_validation_error_to_row(
-        self,
-        *,
-        run_id: str,
-        error_id: str,
-        row_id: str,
-    ) -> None:
-        """Attach a persisted quarantine row to an existing validation error."""
-        # The ownership reads, row lock, and NULL->row_id CAS are one write
-        # transaction.  Splitting the read and update allowed two same-run
-        # linkers to observe NULL and silently overwrite one another.
-        with self._ops.write_connection() as conn:
-            self.link_validation_error_to_row_on(conn, run_id=run_id, error_id=error_id, row_id=row_id)
 
     def link_validation_error_to_row_on(
         self,
@@ -227,6 +225,9 @@ class ErrorAuditRepository:
         row_data: Mapping[str, object] | PipelineRow,
         error_details: TransformErrorReason,
         destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> str:
         """Record a transform processing error in the audit trail.
 
@@ -284,19 +285,25 @@ class ErrorAuditRepository:
         row_hash = canonical_or_recorded_hash(row_data)
         row_data_json = canonical_or_recorded_json(row_data)
 
-        self._ops.execute_insert(
-            transform_errors_table.insert().values(
-                error_id=error_id,
-                run_id=ref.run_id,
-                token_id=ref.token_id,
-                transform_id=transform_id,
-                row_hash=row_hash,
-                row_data_json=row_data_json,
-                error_details_json=error_details_json,
-                destination=destination,
-                created_at=now(),
+        if ref.run_id != member_token.run_id or ref.token_id != work_item.token_id:
+            raise AuditIntegrityError("record_transform_error: token reference does not belong to the claimed work item")
+        with fenced_item_transaction(
+            self._db.engine, member_token=member_token, work_item=work_item, verb="record_transform_error"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                transform_errors_table.insert().values(
+                    error_id=error_id,
+                    run_id=member_token.run_id,
+                    token_id=ref.token_id,
+                    transform_id=transform_id,
+                    row_hash=row_hash,
+                    row_data_json=row_data_json,
+                    error_details_json=error_details_json,
+                    destination=destination,
+                    created_at=now(),
+                ),
             )
-        )
 
         return error_id
 

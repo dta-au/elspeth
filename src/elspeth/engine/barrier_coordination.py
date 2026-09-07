@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import RowResult, TokenInfo, TransformProtocol
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierScalars, CoalescePendingScalars
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import BatchStatus, FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.freeze import deep_freeze
@@ -57,7 +58,6 @@ if TYPE_CHECKING:
         CommittedAggregationResidual,
         CommittedCoalesceResidual,
     )
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.config import AggregationSettings
     from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -314,7 +314,7 @@ class BarrierIntakeCoordinator:
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader fencing token, REQUIRED for the slice-3 adoption verbs."""
-        if self._coordination_token is None:
+        if not isinstance(self._coordination_token, CoordinationToken):
             raise OrchestrationInvariantError(
                 "Journal-first barrier intake requires the leader coordination token (ADR-030 §E.2): "
                 "adopt_blocked_barrier_item / adopt_group_losses are fenced verbs with no "
@@ -466,9 +466,8 @@ class BarrierIntakeCoordinator:
         # refused with ZERO durable mutation. Valid follower handoffs can be
         # rebuilt from the durable row even without a live stash entry.
         token, arrived_monotonic = self._intake_arrival(row)
-        batch_id, ordinal = self._aggregation_executor.open_batch_membership(node_id)
+        batch_id, ordinal = self._aggregation_executor.open_batch_membership(node_id, coordination_token=coordination_token)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -533,7 +532,6 @@ class BarrierIntakeCoordinator:
         # for invalid journal rows — see the aggregation arm).
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -544,6 +542,7 @@ class BarrierIntakeCoordinator:
         if not adoption.adopted:
             return None
         outcome = self._coalesce_executor.accept(
+            coordination_token=coordination_token,
             token=token,
             coalesce_name=str(coalesce_name),
             arrival_time=arrived_monotonic,
@@ -597,7 +596,6 @@ class BarrierIntakeCoordinator:
             )
             late_group_losses = self._take_pending_group_losses()
             released = self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
                 barrier_key=str(coalesce_name),
                 token_ids=(token.token_id,),
                 coordination_token=coordination_token,
@@ -707,7 +705,6 @@ class BarrierIntakeCoordinator:
         coordination_token = self._require_coordination_token()
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -718,6 +715,7 @@ class BarrierIntakeCoordinator:
         if not adoption.adopted:
             return None
         outcome = self._row_union_executor.accept(
+            coordination_token=coordination_token,
             token=token,
             row_union_name=str(row_union_name),
             arrival_time=arrived_monotonic,
@@ -731,7 +729,6 @@ class BarrierIntakeCoordinator:
                 closer_name=str(row_union_name), token=token, reason=outcome.failure_reason or "late_arrival_after_release"
             )
             released = self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
                 barrier_key=str(row_union_name),
                 token_ids=(token.token_id,),
                 coordination_token=coordination_token,
@@ -782,7 +779,6 @@ class BarrierIntakeCoordinator:
             # every held branch — this one included — holds a BLOCKED row.
             self._note_row_union_group_failed_from_token(closer_name=str(row_union_name), token=token, reason=outcome.failure_reason)
             self._scheduler.mark_blocked_barrier_terminal(
-                run_id=self._run_id,
                 barrier_key=str(row_union_name),
                 token_ids=tuple(consumed.token_id for consumed in outcome.consumed_tokens),
                 coordination_token=coordination_token,
@@ -849,7 +845,6 @@ class BarrierIntakeCoordinator:
         coordination_token = self._require_coordination_token()
         token, arrived_monotonic = self._intake_arrival(row)
         adoption = self._scheduler.adopt_blocked_barrier_item(
-            run_id=self._run_id,
             work_item_id=row.work_item_id,
             token_id=row.token_id,
             barrier_key=row.barrier_key,
@@ -1020,7 +1015,6 @@ class BarrierIntakeCoordinator:
             )
             if consumed_tokens:
                 self._scheduler.mark_blocked_barrier_terminal(
-                    run_id=self._run_id,
                     barrier_key=barrier_key,
                     token_ids=tuple(token.token_id for token in consumed_tokens),
                     coordination_token=self._require_coordination_token(),
@@ -1204,7 +1198,6 @@ class BarrierIntakeCoordinator:
             return dispositions
         coordination_token = self._require_coordination_token()
         self._scheduler.adopt_group_losses(
-            run_id=self._run_id,
             loss_ids=[loss.loss_id for loss in losses],
             coordination_token=coordination_token,
         )
@@ -1246,6 +1239,7 @@ class BarrierIntakeCoordinator:
                 if self._row_union_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                     continue
                 row_union_outcome = self._row_union_executor.notify_branch_lost(
+                    coordination_token=coordination_token,
                     row_union_name=loss.closer_name,
                     fork_group_id=loss.group_id,
                     lost_branch=loss.member_key,
@@ -1290,6 +1284,7 @@ class BarrierIntakeCoordinator:
             if self._coalesce_executor.has_recorded_branch_loss(loss.closer_name, loss.group_id, loss.member_key):
                 continue
             outcome = self._coalesce_executor.notify_branch_lost(
+                coordination_token=coordination_token,
                 coalesce_name=loss.closer_name,
                 fork_group_id=loss.group_id,
                 lost_branch=loss.member_key,
@@ -1563,7 +1558,6 @@ class BarrierIntakeCoordinator:
         that is the one-pass-per-drain-cycle latency the spec accepts."""
         coordination_token = self._require_coordination_token()
         self._scheduler.stage_escalation_loss(
-            run_id=self._run_id,
             spec=spec,
             frame_kind=frame_kind,
             declared_roster=binding.member_roster if frame_kind is FrameKind.FORK else None,
@@ -1670,6 +1664,11 @@ class BarrierRecoveryCoordinator:
         self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
         self._complete_committed_aggregation_output = complete_committed_aggregation_output
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        if not isinstance(self._coordination_token, CoordinationToken):
+            raise OrchestrationInvariantError("Barrier recovery requires the admitted leader token")
+        return self._coordination_token
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -1948,7 +1947,6 @@ class BarrierRecoveryCoordinator:
                     if failed_terminal_ids:
                         reconciled = [item for item in node_items if item.token_id in failed_terminal_ids]
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(node_id),
                             token_ids=tuple(item.token_id for item in reconciled),
                             coordination_token=self._coordination_token,
@@ -2110,7 +2108,6 @@ class BarrierRecoveryCoordinator:
                     # survived the crash. Journal-release it under this
                     # leader's coordination token, mirroring the live arm.
                     released = self._scheduler.mark_blocked_barrier_terminal(
-                        run_id=self._run_id,
                         barrier_key=str(item.barrier_key),
                         token_ids=(item.token_id,),
                         coordination_token=self._coordination_token,
@@ -2187,7 +2184,6 @@ class BarrierRecoveryCoordinator:
                 if terminal_ids:
                     for item in [i for i in row_union_holdless_items if i.token_id in terminal_ids]:
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(item.barrier_key),
                             token_ids=(item.token_id,),
                             coordination_token=self._coordination_token,
@@ -2348,7 +2344,6 @@ class BarrierRecoveryCoordinator:
                             else GroupSettlementReason.SCOPE_GROUP_FAILED.value
                         )
                         released = self._scheduler.mark_blocked_barrier_terminal(
-                            run_id=self._run_id,
                             barrier_key=str(coalesce_name_str),
                             token_ids=(item.token_id,),
                             coordination_token=self._coordination_token,
@@ -2526,7 +2521,9 @@ class BarrierRecoveryCoordinator:
                             arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds()),
                         )
                     )
-                release_outcome = self._row_union_executor.reconcile_released_group(entries=tuple(group_entries))
+                release_outcome = self._row_union_executor.reconcile_released_group(
+                    entries=tuple(group_entries), coordination_token=self._require_coordination_token()
+                )
                 self._commit_restored_row_union_outcome(release_outcome)
 
             restore_entries: list[RowUnionRestoreEntry] = []
@@ -2545,7 +2542,9 @@ class BarrierRecoveryCoordinator:
                         arrival_time=now_monotonic - max(0.0, (now - item.barrier_blocked_at).total_seconds()),
                     )
                 )
-            outcomes = self._row_union_executor.restore_from_journal(entries=restore_entries)
+            outcomes = self._row_union_executor.restore_from_journal(
+                entries=restore_entries, coordination_token=self._require_coordination_token()
+            )
             for outcome in outcomes:
                 self._commit_restored_row_union_outcome(outcome)
 

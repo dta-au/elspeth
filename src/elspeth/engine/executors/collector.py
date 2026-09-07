@@ -18,6 +18,7 @@ import structlog
 
 from elspeth.contracts import BatchTransformProtocol, PipelineRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -342,7 +343,7 @@ class CollectorExecutor:
         state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=ctx.require_member_token(),
             step_index=step,
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset,
@@ -809,7 +810,13 @@ class CollectorExecutor:
         scope = self._scopes[collector_name]
         group_id = key[1]
         if pending.lost and scope.policy == "require_all":
-            return self._fail_group(collector_name, key, pending, failure_reason="collector_missing_members")
+            return self._fail_group(
+                collector_name,
+                key,
+                pending,
+                failure_reason="collector_missing_members",
+                coordination_token=ctx.require_coordination_token(),
+            )
         if not pending.arrived:
             # best_effort, every member lost: engine closes WITHOUT the plugin
             # (spec §6.4 'all_members_lost'; not a failure under best_effort).
@@ -823,7 +830,15 @@ class CollectorExecutor:
             )
         return self._execute_flush(collector_name, key, pending, ctx)
 
-    def _fail_group(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, *, failure_reason: str) -> CollectorOutcome:
+    def _fail_group(
+        self,
+        collector_name: str,
+        key: tuple[str, str],
+        pending: _PendingGroup,
+        *,
+        failure_reason: str,
+        coordination_token: CoordinationToken,
+    ) -> CollectorOutcome:
         """require_all group failure: engine-performed, plugin never invoked (spec §6.4)."""
         group_id = key[1]
         consumed = tuple(entry.token for entry in sorted(pending.arrived.values(), key=lambda e: e.ordinal))
@@ -858,6 +873,7 @@ class CollectorExecutor:
             # an audit-trail bookkeeping concern, not a terminal-disposition
             # write, so it stays here regardless of who writes the outcome.
             self._execution.complete_node_state(
+                member_token=coordination_token.membership,
                 state_id=entry.state_id,
                 status=NodeStateStatus.FAILED,
                 error=error,
@@ -952,7 +968,7 @@ class CollectorExecutor:
             self._execution,
             token_id=pending.opener_token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=ctx.require_member_token(),
             step_index=step,
             input_data=batch_input,
             # C-1 (Task 7, META-14.1): was a literal attempt=0/
@@ -983,7 +999,13 @@ class CollectorExecutor:
                         exception_type="TransformError",
                     ),
                 )
-                return self._fail_group(collector_name, key, pending, failure_reason="collector_transform_error")
+                return self._fail_group(
+                    collector_name,
+                    key,
+                    pending,
+                    failure_reason="collector_transform_error",
+                    coordination_token=ctx.require_coordination_token(),
+                )
 
             if result.row is None and result.rows is None:
                 raise PluginContractViolation(
@@ -1017,7 +1039,7 @@ class CollectorExecutor:
                 members=tuple(entry.token for entry in surviving),
                 output_rows=output_rows,
                 node_id=node_id,
-                run_id=self._run_id,
+                coordination_token=ctx.require_coordination_token(),
                 group_id=group_id,
             )
 
@@ -1037,6 +1059,7 @@ class CollectorExecutor:
                     # it is the executor's own permanent responsibility, same class
                     # as Ruling 36's kept exceptions.
                     self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
                         state_id=entry.state_id,
                         status=NodeStateStatus.FAILED,
                         error=ExecutionError(
@@ -1046,7 +1069,8 @@ class CollectorExecutor:
                         ),
                         duration_ms=duration_ms,
                     )
-                    self._data_flow.record_token_outcome(
+                    self._data_flow.record_token_outcome_leader(
+                        coordination_token=ctx.require_coordination_token(),
                         ref=TokenRef(token_id=entry.token.token_id, run_id=self._run_id),
                         outcome=TerminalOutcome.FAILURE,
                         path=TerminalPath.QUARANTINED_AT_SOURCE,
@@ -1054,6 +1078,7 @@ class CollectorExecutor:
                     )
                 else:
                     self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
                         state_id=entry.state_id,
                         status=NodeStateStatus.COMPLETED,
                         output_data={},

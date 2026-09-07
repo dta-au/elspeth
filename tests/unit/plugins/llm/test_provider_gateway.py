@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
@@ -23,6 +23,8 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
@@ -45,6 +47,12 @@ _CONTRACT_HEADER = "X-ELSPETH-LLM-Gateway-Contract"
 _BODY_SENTINEL = "SENTINEL-do-not-leak-92f1a3"
 
 
+# Mock-only authority: these providers use FakeAuditRecorder, never a database.
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+_MEMBER_TOKEN = _LEADER_TOKEN.membership
+_WORK_ITEM = Mock(spec=TokenWorkItem)
+
+
 @dataclass
 class FakeAuditRecorder:
     call_indexes: list[int] = field(default_factory=list)
@@ -53,11 +61,11 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self.allocated_state_ids.append(state_id)
         return len(self.allocated_state_ids) - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self.allocated_operation_ids.append(operation_id)
         return len(self.allocated_operation_ids) - 1
 
@@ -194,6 +202,8 @@ class TestExecuteQueryHappyPath:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -224,7 +234,9 @@ class TestExecuteQueryHappyPath:
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_row(state_id="state-1", token_id="token-1"),
+                audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="token-1"
+                ),
             )
 
         assert any(call["status"] is CallStatus.SUCCESS for call in audit_recorder.calls)
@@ -251,7 +263,7 @@ class TestExecuteQueryHappyPath:
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
             )
 
         assert _BODY_SENTINEL not in str(exc_info.value)
@@ -268,6 +280,8 @@ class TestExecuteQueryHappyPath:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -285,6 +299,8 @@ class TestExecuteQueryHappyPath:
             temperature=0.0,
             max_tokens=None,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -308,6 +324,8 @@ class TestExecuteQueryHappyPath:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -326,6 +344,8 @@ class TestExecuteQueryHappyPath:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -349,6 +369,8 @@ class TestContractHeader:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -365,6 +387,8 @@ class TestContractHeader:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -416,6 +440,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -436,6 +462,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -453,6 +481,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -469,6 +499,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -491,6 +523,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -509,6 +543,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -529,6 +565,8 @@ class TestErrorCodeMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -608,6 +646,8 @@ class TestSuccessPathLeakGuard:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -631,6 +671,8 @@ class TestTransportErrors:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -646,6 +688,8 @@ class TestTransportErrors:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -677,6 +721,8 @@ class TestUsageHandling:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -692,6 +738,8 @@ class TestUsageHandling:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -719,6 +767,8 @@ class TestBlankContent:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -737,6 +787,8 @@ class TestBlankContent:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -761,6 +813,8 @@ class TestModelValidation:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -778,6 +832,8 @@ class TestModelValidation:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -799,6 +855,8 @@ class TestAuditRows:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                member_token=_MEMBER_TOKEN,
+                work_item=_WORK_ITEM,
                 state_id="state-1",
                 token_id="tok-1",
             ),
@@ -824,7 +882,7 @@ class TestAuditRows:
             model="standard",
             temperature=0.0,
             max_tokens=100,
-            audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
         )
 
         assert audit_recorder.calls == []
@@ -848,7 +906,7 @@ class TestAuditRows:
                 model="standard",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
             )
 
         assert audit_recorder.calls == []
@@ -881,6 +939,8 @@ class TestAuditRows:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -898,6 +958,8 @@ class TestAuditRows:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -932,7 +994,9 @@ class TestConstructorValidation:
 
 class TestClose:
     def test_close_clears_clients(self, provider: GatewayLLMProvider) -> None:
-        provider._get_http_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
+        provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="tok-1")
+        )
         assert len(provider._http_clients) == 1
         provider.close()
         assert len(provider._http_clients) == 0
@@ -951,7 +1015,7 @@ class TestRuntimePreflight:
     def test_preflight_succeeds_when_ready_and_completion_works(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_fails_when_readyz_reports_not_ready(self, provider: GatewayLLMProvider) -> None:
@@ -959,7 +1023,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(503, json=_readyz_body(ready=False), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_fails_when_contract_major_mismatched(self, provider: GatewayLLMProvider) -> None:
@@ -967,7 +1031,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(contract_major=2), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_fails_when_model_alias_absent(self, provider: GatewayLLMProvider) -> None:
@@ -975,7 +1039,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(model_aliases=["other-model"]), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_fails_when_required_capability_missing(
@@ -994,7 +1058,7 @@ class TestRuntimePreflight:
             return_value=httpx.Response(200, json=_readyz_body(capabilities=["text", "usage"]), headers={_CONTRACT_HEADER: "1"})
         )
         with pytest.raises(LLMClientError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_fails_when_readyz_ok_but_completion_fails(self, provider: GatewayLLMProvider) -> None:
@@ -1005,19 +1069,19 @@ class TestRuntimePreflight:
             return_value=_gateway_response(_error_body("upstream_unavailable"), status_code=503)
         )
         with pytest.raises(ServerError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_readyz_transport_error_raises_network_error(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(side_effect=httpx.ConnectError("refused"))
         with pytest.raises(NetworkError):
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
 
     @respx.mock
     def test_preflight_smoke_test_request_shape(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         route = respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         sent_body = json.loads(route.calls.last.request.content)
         assert sent_body["model"] == "standard"
         assert sent_body["max_tokens"] == 32
@@ -1028,14 +1092,14 @@ class TestRuntimePreflight:
         the completions path (fix-round-1 minor)."""
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body()))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
     def test_preflight_fails_when_readyz_contract_header_mismatched(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "2"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1048,7 +1112,7 @@ class TestRuntimePreflight:
         del body["capabilities"]
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1061,7 +1125,7 @@ class TestRuntimePreflight:
         del body["adapter"]
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
@@ -1079,14 +1143,14 @@ class TestRuntimePreflight:
         body["adapter"] = malformed_adapter
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=body, headers={_CONTRACT_HEADER: "1"}))
         with pytest.raises(LLMClientError) as exc_info:
-            provider.runtime_preflight(operation_id="op-1", model="standard")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert exc_info.value.retryable is False
 
     @respx.mock
     def test_preflight_captures_adapter_identity_as_forensic_metadata(self, provider: GatewayLLMProvider) -> None:
         respx.get(f"{_READYZ_ROOT}/readyz").mock(return_value=httpx.Response(200, json=_readyz_body(), headers={_CONTRACT_HEADER: "1"}))
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body(content="ok")))
-        provider.runtime_preflight(operation_id="op-1", model="standard")
+        provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="standard")
         assert provider._last_readyz_adapter_identity == {
             "name": "reference_v1_invoke",
             "version": "1.0.0",

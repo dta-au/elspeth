@@ -286,7 +286,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a7ec5ed8ed9cd12d"
+    source_file_hash: str | None = "sha256:ea3d3d1b406ad2aa"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -577,6 +577,8 @@ class BlobFetch(BaseTransform):
         safe_url = fingerprint_url(safe_request.original_url)
         limiter = self._limiter.get_limiter("blob_fetch")
         client = AuditedHTTPClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             execution=self._recorder,
             state_id=ctx.state_id,
             run_id=ctx.run_id,

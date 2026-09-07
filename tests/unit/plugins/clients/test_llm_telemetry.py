@@ -12,11 +12,14 @@ import pytest
 from elspeth.contracts import Call, CallStatus, CallType, TokenUsage
 from elspeth.contracts.call_data import LLMCallRequest, LLMCallResponse
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
     LLMClientError,
 )
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 @dataclass(slots=True)
@@ -116,10 +119,10 @@ class FakeCallRecorder:
         self.record_call_error: Exception | None = None
         self.record_call_observer: Callable[[dict[str, Any]], None] | None = None
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return next(self._call_counter)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return next(self._operation_call_counter)
 
     def record_call(
@@ -136,6 +139,8 @@ class FakeCallRecorder:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> Call:
         call_kwargs = {
             "state_id": state_id,
@@ -171,6 +176,7 @@ class FakeCallRecorder:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> Call:
         actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
         call_kwargs = {
@@ -237,6 +243,7 @@ class TestLLMClientErrorBranchTelemetry:
     def _run_expecting_error(self, response: ProviderResponse) -> list[ExternalCallCompleted]:
         events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=FakeCallRecorder(),
             state_id="state_123",
             underlying_client=fake_openai_client(response=response),
@@ -306,6 +313,7 @@ class TestLLMClientTelemetry:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -361,6 +369,7 @@ class TestLLMClientTelemetry:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -406,6 +415,7 @@ class TestLLMClientTelemetry:
             pass
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -440,6 +450,7 @@ class TestLLMClientTelemetry:
             call_order.append("telemetry")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -468,6 +479,7 @@ class TestLLMClientTelemetry:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -497,6 +509,7 @@ class TestLLMClientTelemetry:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -537,6 +550,7 @@ class TestLLMClientTelemetry:
             raise RuntimeError("Telemetry exporter failed!")
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,
@@ -578,6 +592,7 @@ class TestLLMClientTelemetry:
             emitted_events.append(event)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             underlying_client=openai_client,

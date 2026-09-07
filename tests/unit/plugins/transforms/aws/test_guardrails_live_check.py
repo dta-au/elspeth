@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 from structlog.testing import capture_logs
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.unit.plugins.transforms.aws.test_guardrails_client import (
     CONTENT_FILTERS,
     FakeExecution,
@@ -73,6 +74,7 @@ def _run(
     execution = FakeExecution()
     events: list[object] = []
     receipt = run_guardrail_live_check(
+        **mock_item_audit_authority("run-1"),
         profile=profile or _profile(),
         safe_text=safe_text,
         blocked_text=blocked_text,
@@ -204,6 +206,7 @@ def test_live_check_closes_owned_sdk_client_exactly_once(monkeypatch: pytest.Mon
 
     execution = FakeExecution()
     run_guardrail_live_check(
+        **mock_item_audit_authority("run-1"),
         profile=_profile(),
         safe_text="safe",
         blocked_text="blocked",
@@ -236,6 +239,7 @@ def test_owned_sdk_provider_close_failure_does_not_replace_success_receipt(monke
     )
     with capture_logs() as logs:
         receipt = run_guardrail_live_check(
+            **mock_item_audit_authority("run-1"),
             profile=_profile(),
             safe_text="safe",
             blocked_text="blocked",
@@ -268,6 +272,7 @@ def test_owned_sdk_close_bug_propagates(monkeypatch: pytest.MonkeyPatch) -> None
 
     with pytest.raises(RuntimeError, match="close bug"):
         run_guardrail_live_check(
+            **mock_item_audit_authority("run-1"),
             profile=_profile(),
             safe_text="safe",
             blocked_text="blocked",
@@ -298,6 +303,7 @@ def test_owned_sdk_close_failure_does_not_replace_sanitized_provider_error(monke
 
     with pytest.raises(GuardrailLiveCheckError) as exc_info:
         run_guardrail_live_check(
+            **mock_item_audit_authority("run-1"),
             profile=_profile(),
             safe_text="safe",
             blocked_text="blocked",

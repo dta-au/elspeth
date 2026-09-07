@@ -9,6 +9,7 @@ import pytest
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 class TestAuditedHTTPClient:
@@ -20,7 +21,7 @@ class TestAuditedHTTPClient:
 
         mock_execution = create_autospec(CallRecorder, instance=True)
         counter = itertools.count()
-        mock_execution.allocate_call_index.side_effect = lambda _: next(counter)
+        mock_execution.allocate_call_index.side_effect = lambda _, *, member_token, work_item: next(counter)
         return mock_execution
 
     def test_successful_post_records_to_audit_trail(self) -> None:
@@ -37,6 +38,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -79,6 +81,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -103,6 +106,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -133,6 +137,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -169,6 +174,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -231,6 +237,7 @@ class TestAuditedHTTPClient:
         with patch("httpx.Client") as mock_client_class:
             # Client 1 with credential A
             client1 = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution1,
                 state_id="state_1",
                 run_id="run_abc",
@@ -240,6 +247,7 @@ class TestAuditedHTTPClient:
 
             # Client 2 with credential B (different)
             client2 = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution2,
                 state_id="state_2",
                 run_id="run_abc",
@@ -285,6 +293,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -330,6 +339,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -356,6 +366,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -388,6 +399,7 @@ class TestAuditedHTTPClient:
         with patch("httpx.Client") as mock_client_class:
             # Both have slashes - would cause double slash with naive concat
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -418,6 +430,7 @@ class TestAuditedHTTPClient:
         with patch("httpx.Client") as mock_client_class:
             # Neither has slashes - would cause missing slash with naive concat
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -447,6 +460,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -471,6 +485,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -502,6 +517,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -528,6 +544,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -554,6 +571,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -579,6 +597,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -613,6 +632,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -647,6 +667,7 @@ class TestAuditedHTTPClient:
         with patch("httpx.Client") as mock_client_class:
             # Client has default timeout of 30s
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -674,6 +695,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -702,6 +724,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -727,6 +750,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -753,6 +777,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -786,6 +811,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -818,6 +844,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -850,6 +877,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -887,6 +915,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -927,6 +956,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -968,6 +998,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1010,6 +1041,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1054,6 +1086,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1088,6 +1121,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1122,6 +1156,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1157,6 +1192,7 @@ class TestAuditedHTTPClient:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1189,7 +1225,7 @@ class TestAuditedHTTPClientGet:
 
         mock_execution = create_autospec(CallRecorder, instance=True)
         counter = itertools.count()
-        mock_execution.allocate_call_index.side_effect = lambda _: next(counter)
+        mock_execution.allocate_call_index.side_effect = lambda _, *, member_token, work_item: next(counter)
         return mock_execution
 
     def test_successful_get_records_to_audit_trail(self) -> None:
@@ -1205,6 +1241,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1246,6 +1283,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1280,6 +1318,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1306,6 +1345,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1338,6 +1378,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1369,6 +1410,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1394,6 +1436,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1431,6 +1474,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1464,6 +1508,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1498,6 +1543,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1528,6 +1574,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1555,6 +1602,7 @@ class TestAuditedHTTPClientGet:
 
         with patch("httpx.Client") as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1605,6 +1653,7 @@ class TestAuditedHTTPClientGet:
         with patch("httpx.Client") as mock_client_class:
             mock_client_class.side_effect = [shared_client, ssrf_context]
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1674,6 +1723,7 @@ class TestAuditedHTTPClientGet:
         with patch("httpx.Client") as mock_client_class:
             mock_client_class.side_effect = [shared_client, ssrf_context]
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1720,6 +1770,7 @@ class TestAuditedHTTPClientGet:
         with patch("httpx.Client") as mock_client_class:
             mock_client_class.side_effect = [shared_client, ssrf_context]
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",
@@ -1778,6 +1829,7 @@ class TestAuditedHTTPClientGet:
         ):
             mock_client_class.side_effect = [shared_client, hop_context]
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=mock_execution,
                 state_id="state_123",
                 run_id="run_abc",

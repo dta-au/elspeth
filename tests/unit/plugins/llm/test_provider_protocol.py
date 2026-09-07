@@ -5,9 +5,12 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from enum import StrEnum
+from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
@@ -31,18 +34,26 @@ class _FormattingString(str):
 
 
 def test_llm_audit_parent_accepts_row_and_operation_forms() -> None:
-    row = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
-    operation = LLMAuditParent.for_operation(operation_id="operation-1")
+    token = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+    claim = Mock(spec=TokenWorkItem)
+    row = LLMAuditParent.for_row(state_id="state-1", token_id="token-1", member_token=token.membership, work_item=claim)
+    operation = LLMAuditParent.for_operation(operation_id="operation-1", coordination_token=token)
 
     assert row.client_kwargs() == {
         "state_id": "state-1",
         "token_id": "token-1",
         "operation_id": None,
+        "coordination_token": None,
+        "member_token": token.membership,
+        "work_item": claim,
     }
     assert operation.client_kwargs() == {
         "state_id": None,
         "token_id": None,
         "operation_id": "operation-1",
+        "coordination_token": token,
+        "member_token": None,
+        "work_item": None,
     }
 
 
@@ -319,7 +330,7 @@ class TestLLMProviderProtocol:
                     model=model,
                 )
 
-            def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+            def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
                 del operation_id, model
 
             def close(self) -> None:

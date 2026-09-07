@@ -20,7 +20,9 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, HTTPCallError, HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.security.web import (
     SSRFSafeRequest,
@@ -129,6 +131,9 @@ class AuditedHTTPClient(AuditedClientBase):
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         operation_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
         max_response_body_bytes: int | None = None,
     ) -> None:
         """Initialize audited HTTP client.
@@ -150,7 +155,18 @@ class AuditedHTTPClient(AuditedClientBase):
         """
         if max_response_body_bytes is not None and max_response_body_bytes <= 0:
             raise ValueError("max_response_body_bytes must be > 0 when configured")
-        super().__init__(execution, state_id, run_id, telemetry_emit, operation_id=operation_id, limiter=limiter, token_id=token_id)
+        super().__init__(
+            execution,
+            state_id,
+            run_id,
+            telemetry_emit,
+            operation_id=operation_id,
+            limiter=limiter,
+            token_id=token_id,
+            coordination_token=coordination_token,
+            member_token=member_token,
+            work_item=work_item,
+        )
         self._timeout = timeout
         self._base_url = base_url
         self._default_headers = headers or {}

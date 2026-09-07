@@ -8,6 +8,7 @@ import pytest
 
 from elspeth import __version__ as ENGINE_VERSION
 from elspeth.contracts import Determinism, NodeType
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -256,10 +257,10 @@ def test_register_nodes_with_landscape_uses_resolved_audit_metadata() -> None:
     graph = _Graph(_node_info("src", NodeType.SOURCE, plugin_name="csv", config={"source_name": "input"}))
     data_flow = _DataFlow()
     factory = SimpleNamespace(data_flow=data_flow)
+    coordination_token = CoordinationToken(run_id="run-1", worker_id="leader", leader_epoch=1)
 
     register_nodes_with_landscape(
         factory,
-        "run-1",
         graph,
         ["src"],
         {
@@ -270,11 +271,12 @@ def test_register_nodes_with_landscape_uses_resolved_audit_metadata() -> None:
             )
         },
         {NodeID("src"): schema_contract},
+        coordination_token=coordination_token,
     )
 
     assert data_flow.register_node_calls == [
         {
-            "run_id": "run-1",
+            "coordination_token": coordination_token,
             "node_id": "src",
             "plugin_name": "csv",
             "node_type": NodeType.SOURCE,

@@ -1,12 +1,11 @@
 """Measure every pin and violation set in the Landscape mutation-fencing gate.
 
 The gate in ``tests/unit/architecture/test_web_landscape_mutation_fencing.py``
-spends four test ids on ten distinct checks: four frozen inventory pins
+checks five frozen inventories
 (production callers, coordination callers, internal facade edges, subordinate
-Connection-helper edges) and five violation sets (caller authority, coordination
-caller authority, API authority, transaction order, escapes). Each test asserts
-several of them in sequence, so a red id reports only the FIRST check that
-fails and hides every check behind it.
+Connection-helper edges, and DML identities), the exact DML write shapes, and
+five violation sets (caller authority, coordination caller authority, API
+authority, transaction order, escapes).
 
 That makes the gate expensive to reason about during the ADR-048 token-threading
 burn-down: a lane that clears one assertion learns the next one's state only by
@@ -106,7 +105,7 @@ def measure(tree: Path) -> dict[str, Any]:
     units = gate._production_units()
     dml = gate.scan_dml_identities(units)
 
-    frozen_set_test = "test_landscape_production_caller_set_is_frozen"
+    caller_test = "test_every_landscape_production_caller_forwards_exact_authority"
     api_test = "test_every_landscape_mutation_api_requires_current_typed_authority"
     transaction_test = "test_every_landscape_dml_transaction_is_full_token_fenced_first"
     escape_test = "test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists"
@@ -128,6 +127,12 @@ def measure(tree: Path) -> dict[str, Any]:
     return {
         "tree": str(tree),
         "pins": {
+            "dml_identities": pin(
+                dml,
+                gate._canonical_digest(dml),
+                gate._EXPECTED_DML_COUNT,
+                gate._EXPECTED_DML_INVENTORY_SHA256,
+            ),
             "production_calls": pin(
                 production,
                 gate._canonical_digest(production),
@@ -153,9 +158,13 @@ def measure(tree: Path) -> dict[str, Any]:
                 gate._EXPECTED_SUBORDINATE_EDGE_SHA256,
             ),
         },
+        "write_shapes": {
+            "live": sorted({(site.table, site.operation) for site in dml}),
+            "pinned": sorted(gate._EXPECTED_DML_WRITE_SET),
+        },
         "violations": {
-            "caller_authority": violation(gate._caller_authority_violations(units), frozen_set_test),
-            "coordination_caller_authority": violation(gate._coordination_caller_authority_violations(units), frozen_set_test),
+            "caller_authority": violation(gate._caller_authority_violations(units), caller_test),
+            "coordination_caller_authority": violation(gate._coordination_caller_authority_violations(units), caller_test),
             "api_authority": violation(gate._api_authority_violations(units), api_test),
             "transaction_order": violation(gate._transaction_order_violations(units, dml), transaction_test),
             "escape": violation(escapes, escape_test),
@@ -205,6 +214,14 @@ def report(result: dict[str, Any], baseline: dict[str, Any] | None) -> None:
         if not matched:
             print(f"      live digest   {entry['live_digest']}")
             print(f"      pinned digest {entry['pinned_digest']}")
+    print()
+    shapes = result["write_shapes"]
+    live_shapes = {tuple(shape) for shape in shapes["live"]}
+    pinned_shapes = {tuple(shape) for shape in shapes["pinned"]}
+    print("DML WRITE SHAPES")
+    print(f"  {'ok ' if live_shapes == pinned_shapes else 'PIN'} live={len(live_shapes)} pinned={len(pinned_shapes)}")
+    print(f"      added={sorted(live_shapes - pinned_shapes)!r}")
+    print(f"      removed={sorted(pinned_shapes - live_shapes)!r}")
     print()
     print("VIOLATION SETS (a non-zero count fails its test and hides every check behind it)")
     for name, entry in result["violations"].items():

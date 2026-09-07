@@ -17,26 +17,25 @@ from unittest.mock import MagicMock, create_autospec
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Connection, select
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
-from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-from elspeth.contracts.coordination import DEFAULT_RUN_HEARTBEAT_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import (
+    DEFAULT_RUN_HEARTBEAT_SECONDS,
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    CoordinationToken,
+    WorkerMembershipToken,
+)
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
-from elspeth.core.checkpoint import manager as checkpoint_manager_module
-from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
+from elspeth.core.config import load_settings_from_yaml_string
+from elspeth.core.landscape import LandscapeDB, run_coordination_repository, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
-from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
-from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
-from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions_module
-from elspeth.core.landscape.scheduler import fencing as scheduler_fencing_module
-from elspeth.core.landscape.scheduler import queue as scheduler_queue_module
+from elspeth.core.landscape.execution import node_states as node_states_module
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_table,
@@ -146,10 +145,11 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
     def wait_for_follower_handoff(
         self: TokenSchedulerRepository,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         lease_owner: str,
         lease_seconds: int,
     ) -> Any:
+        run_id = member_token.run_id
         with db.engine.connect() as conn:
             role = conn.execute(
                 select(run_workers_table.c.role).where(
@@ -187,7 +187,7 @@ def _install_profile_leader_hooks(db: LandscapeDB, pause: Any, seam_value: str) 
                 time.sleep(0.01)
         return real_claim_ready(
             self,
-            run_id=run_id,
+            member_token=member_token,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
         )
@@ -224,18 +224,20 @@ def _install_profile_run_liveness() -> None:
     Shrinking the window without the cadence leaves the seat dead between the
     leader's last fenced write and the thread's first beat.
     """
-    run_lifecycle_repository.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    checkpoint_manager_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    token_repository_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    # ADR-048 D8.5: the sink-effect verbs fence too, and every fence EXTENDS
-    # the seat it verifies — a profile that shrinks the window everywhere else
-    # would still see the killed leader's seat held open by these three.
-    sink_effect_lifecycle_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    sink_effect_finalization_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
-    sink_effect_reservation_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _PROFILE_RUN_LIVENESS_SECONDS  # type: ignore[attr-defined]
+    patch = pytest.MonkeyPatch()
+    patch.setattr(run_lifecycle_repository, "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS", _PROFILE_RUN_LIVENESS_SECONDS)
+    real_fence = run_coordination_repository.verify_and_extend_leader_fence
+
+    def profile_fence(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
+        # Apply the profile at the shared authority primitive so a new writer
+        # cannot silently restore the 80-second product window. Preserve the
+        # real identity/epoch CAS and its transaction, only shorten its lease.
+        real_fence(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS, verb=verb)
+
+    patch.setattr(run_coordination_repository, "verify_and_extend_leader_fence", profile_fence)
+    # These two transaction-internal leader verbs import the primitive directly.
+    patch.setattr(token_repository_module, "verify_and_extend_leader_fence", profile_fence)
+    patch.setattr(node_states_module, "verify_and_extend_leader_fence", profile_fence)
 
     real_heartbeat_init = RunHeartbeatThread.__init__
 
@@ -585,15 +587,7 @@ def _run_cli_follower_until_seat_dead(
     )
     if result.exit_code != 2:
         raise AssertionError(f"CLI follower exited {result.exit_code}, expected seat-dead exit 2: {result.output}") from result.exception
-    # elspeth-5dd23f4df9: the seat-dead event names BOTH recovery verbs — the
-    # takeover (`elspeth resume`) and, for the run resume must refuse, the
-    # finalize (`elspeth abandon`); the console arm picks between them by
-    # consulting the shared gates.
-    if (
-        '"event": "seat_dead"' not in result.output
-        or f'"hint": "elspeth resume {run_id}"' not in result.output
-        or f'"abandon_hint": "elspeth abandon {run_id}"' not in result.output
-    ):
+    if '"event": "seat_dead"' not in result.output or "Use `elspeth resume" not in result.output:
         raise AssertionError(f"CLI follower omitted its seat-dead recovery evidence: {result.output}")
 
 
@@ -670,6 +664,11 @@ def _exercise_worker_profile(
             )
             ready = child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             assert ready.pid != os.getpid()
+            live, seat_deadline, database_now = _seat_liveness(database_url, run_id)
+            assert live and seat_deadline is not None
+            assert (seat_deadline.replace(tzinfo=UTC) - database_now).total_seconds() <= _PROFILE_RUN_LIVENESS_SECONDS, (
+                f"a writer escaped the profile liveness window: deadline={seat_deadline}, database_now={database_now}"
+            )
             child.kill()
             assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).was_killed
 

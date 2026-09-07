@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock, create_autospec
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from elspeth.contracts import RunStatus, SinkProtocol, SourceProtocol
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
@@ -17,9 +19,11 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings, SourceSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution import sink_effect_finalization, sink_effect_lifecycle
+from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import runs_table, token_work_items_table
+from elspeth.core.landscape.schema import runs_table, sink_effects_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.clock import MockClock
 from elspeth.engine.executors.sink_effects import (
@@ -32,6 +36,61 @@ from elspeth.plugins.sinks.json_sink import JSONSink
 from tests.fixtures.base_classes import as_sink, as_source, inject_write_failure
 from tests.fixtures.landscape import expire_sink_effect_lease
 from tests.fixtures.plugins import ListSource
+
+
+class _LeaseWaitClock:
+    """Pace mock polls while advancing a held lease on its database clock."""
+
+    def __init__(
+        self,
+        clock: MockClock,
+        effects: SinkEffectRepository,
+        effect_id: str,
+        expire_lease: Callable[[], None],
+    ) -> None:
+        self.clock = clock
+        self.effects = effects
+        self.effect_id = effect_id
+        self.expire_lease = expire_lease
+        self.poll_sleeps: list[float] = []
+        self.initial_remaining_validity: float | None = None
+        self.expiration_delay: float | None = None
+        self.expired = False
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0.0
+        if not self.poll_sleeps:
+            self.initial_remaining_validity = self.effects.lease_validity_seconds(self.effect_id)
+            # SQLite validity is measured at whole-second database time.
+            # Strict takeover crosses the next second after the deadline;
+            # a lease already expired between observation and sleep needs no wait.
+            self.expiration_delay = 0.0 if self.initial_remaining_validity is None else self.initial_remaining_validity + 1.0
+        self.poll_sleeps.append(seconds)
+        self.clock.advance(seconds)
+        assert self.expiration_delay is not None
+        if not self.expired and sum(self.poll_sleeps) >= self.expiration_delay:
+            self.expire_lease()
+            self.expired = True
+
+
+@pytest.mark.parametrize("remaining_validity", [0.0, 2.0])
+def test_lease_wait_clock_expires_at_observed_database_boundary(remaining_validity: float) -> None:
+    """Equality and a fresh lease both cross the next strict SQLite clock boundary."""
+    effects = create_autospec(SinkEffectRepository, instance=True)
+    effects.lease_validity_seconds.return_value = remaining_validity
+    expire_lease = Mock()
+    lease_clock = _LeaseWaitClock(MockClock(), effects, "effect", expire_lease)
+    boundary = remaining_validity + 1.0
+
+    while sum(lease_clock.poll_sleeps) < boundary:
+        expire_lease.assert_not_called()
+        lease_clock.sleep(0.25)
+
+    expire_lease.assert_called_once_with()
+    effects.lease_validity_seconds.assert_called_once_with("effect")
+    # Another poll cannot age the same lease twice.
+    lease_clock.sleep(0.25)
+    expire_lease.assert_called_once_with()
 
 
 def _pipeline(output: Path) -> tuple[PipelineConfig, ExecutionGraph]:
@@ -68,9 +127,11 @@ def _pipeline(output: Path) -> tuple[PipelineConfig, ExecutionGraph]:
     )
 
 
+@pytest.mark.parametrize("lease_expired_during_reopen", [False, True])
 def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserves_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lease_expired_during_reopen: bool,
 ) -> None:
     """A same-process injected response loss resumes once after DB reopen."""
     database_path = tmp_path / "audit.db"
@@ -79,24 +140,17 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
     database_url = f"sqlite:///{database_path}"
     lease_ttl = timedelta(seconds=2)
     clock = MockClock(start=datetime.now(UTC).timestamp())
-    poll_sleeps: list[float] = []
-    # The crashed attempt's lease lapses on the Landscape database clock
-    # (ADR-047), which the mock clock cannot move: once the resume has polled
-    # for a TTL, the deadline is written into the database's past exactly
-    # where it would have lapsed on the resume's own clock.
-    held_lease: list[tuple[LandscapeDB, str]] = []
+    held_lease: list[_LeaseWaitClock] = []
+    refresh_for_resume: Callable[[], None] | None = None
 
     def advance_clock(seconds: float) -> None:
-        assert seconds > 0.0
-        poll_sleeps.append(seconds)
-        clock.advance(seconds)
-        if held_lease and sum(poll_sleeps) >= lease_ttl.total_seconds():
-            lease_db, effect_id = held_lease.pop()
-            expire_sink_effect_lease(lease_db.engine, effect_id)
+        assert held_lease
+        held_lease[0].sleep(seconds)
 
     original_init = SinkEffectCoordinator.__init__
 
     def initialize_with_deterministic_lease(self: SinkEffectCoordinator, *args: Any, **kwargs: Any) -> None:
+        nonlocal refresh_for_resume
         kwargs.update(
             lease_ttl=lease_ttl,
             clock=clock,
@@ -104,6 +158,9 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
             poll_interval=0.25,
         )
         original_init(self, *args, **kwargs)
+        if refresh_for_resume is not None:
+            refresh_for_resume()
+            refresh_for_resume = None
 
     lost_response = False
     original_fault = SinkEffectCoordinator._fault
@@ -166,7 +223,36 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
     reopened_checkpoints = CheckpointManager(reopened)
     resumed_config, resumed_graph = _pipeline(output)
     try:
-        held_lease.append((reopened, effect_before.effect_id))
+        if lease_expired_during_reopen:
+            expire_sink_effect_lease(reopened.engine, effect_before.effect_id)
+
+        def expire_held_lease() -> None:
+            expire_sink_effect_lease(reopened.engine, effect_before.effect_id)
+
+        def refresh_foreign_lease_before_wait() -> None:
+            # Reopen and recovery may outlive the original lease under CI load.
+            # Set the test's live-foreign-lease precondition at the resumed sink
+            # coordinator, retaining all persisted execution authority.
+            with reopened.engine.begin() as connection:
+                database_now = read_landscape_transaction_time(connection)
+                refreshed = connection.execute(
+                    update(sink_effects_table)
+                    .where(sink_effects_table.c.effect_id == effect_before.effect_id)
+                    .where(sink_effects_table.c.lease_owner == effect_before.lease_owner)
+                    .where(sink_effects_table.c.generation == effect_before.generation)
+                    .where(sink_effects_table.c.state == SinkEffectState.IN_FLIGHT.value)
+                    .values(lease_heartbeat_at=database_now, lease_expires_at=database_now + lease_ttl)
+                )
+                assert refreshed.rowcount == 1
+
+        refresh_for_resume = refresh_foreign_lease_before_wait
+        lease_clock = _LeaseWaitClock(
+            clock,
+            RecorderFactory(reopened).execution.sink_effects,
+            effect_before.effect_id,
+            expire_held_lease,
+        )
+        held_lease.append(lease_clock)
         recovery = RecoveryManager(reopened, reopened_checkpoints)
         check = recovery.can_resume(run_id, resumed_graph)
         assert check.can_resume, check.reason
@@ -208,9 +294,11 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
             )
         assert scheduler_after == ("terminal",)
         assert reopened_checkpoints.get_latest_checkpoint(run_id) is None
+        poll_sleeps = lease_clock.poll_sleeps
         assert poll_sleeps
         assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
-        assert sum(poll_sleeps) <= lease_ttl.total_seconds() + 0.25
+        assert lease_clock.expiration_delay is not None
+        assert sum(poll_sleeps) <= lease_clock.expiration_delay + 0.25
         assert [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": "once"}]
     finally:
         reopened.close()

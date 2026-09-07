@@ -31,6 +31,7 @@ from elspeth.contracts import Determinism, TransformErrorReason, TransformResult
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.chat_parts import ChatMessage, ContentPart, ImagePart, TextPart, parts_hash
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
@@ -346,7 +347,9 @@ class SingleQueryStrategy:
             return _shutdown_requested_result()
 
         # 3. Call provider (EXTERNAL — errors classified by provider)
-        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
+        trace_parent = LLMAuditParent.for_row(
+            state_id=state_id, token_id=token_id, member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -548,9 +551,15 @@ class MultiQueryStrategy:
         token_id = ctx.token.token_id
         shutdown_event = ctx.shutdown_event
 
+        audit_parent = LLMAuditParent.for_row(
+            state_id=state_id, token_id=token_id, member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
+
         if self.executor is not None:
-            return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
-        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store)
+            return self._execute_parallel(
+                row, state_id, token_id, provider, tracer, shutdown_event, payload_store, audit_parent=audit_parent
+            )
+        return self._execute_sequential(row, state_id, token_id, provider, tracer, shutdown_event, payload_store, audit_parent=audit_parent)
 
     @dataclass(frozen=True, slots=True)
     class _QuerySuccess:
@@ -583,6 +592,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> _QuerySuccess | TransformResult:
         """Execute a single query within a multi-query row.
 
@@ -690,7 +701,7 @@ class MultiQueryStrategy:
         # Execute query
         query_max_tokens = spec.max_tokens or self.max_tokens
 
-        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
+        trace_parent = audit_parent
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -882,6 +893,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> TransformResult:
         """Execute queries sequentially (pool_size=1 fallback).
 
@@ -912,6 +925,7 @@ class MultiQueryStrategy:
                         tracer,
                         shutdown_event,
                         payload_store,
+                        audit_parent=audit_parent,
                     )
                     break  # success or non-retryable error result - exit retry loop
                 except LLMClientError as e:
@@ -1001,6 +1015,8 @@ class MultiQueryStrategy:
         tracer: LangfuseTracer,
         shutdown_event: threading.Event | None = None,
         payload_store: PayloadStore | None = None,
+        *,
+        audit_parent: LLMAuditParent,
     ) -> TransformResult:
         """Execute queries in parallel via PooledExecutor with AIMD retry.
 
@@ -1052,6 +1068,7 @@ class MultiQueryStrategy:
                 work["tracer"],
                 shutdown_event,
                 work["payload_store"],
+                audit_parent=audit_parent,
             )
             if isinstance(result, TransformResult):
                 return result  # Error passthrough
@@ -1187,7 +1204,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9d2acfb21a7717f5"
+    source_file_hash: str | None = "sha256:f96bcabaaaf9158f"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1372,8 +1389,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     finish_reason=FinishReason.STOP,
                 )
 
-            def runtime_preflight(self, *, operation_id: str, model: str) -> None:
-                del operation_id, model
+            def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
+                del operation_id, model, coordination_token
 
             def close(self) -> None:
                 return None
@@ -1735,7 +1752,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise FrameworkBugError("LLMTransform runtime_preflight requires an operation audit parent")
 
         try:
-            self._provider.runtime_preflight(operation_id=ctx.operation_id, model=self._model)
+            self._provider.runtime_preflight(
+                operation_id=ctx.operation_id, model=self._model, coordination_token=ctx.require_coordination_token()
+            )
         except LLMClientError as exc:
             raise RuntimePreflightFailedError(
                 plugin_name=self.name,

@@ -65,7 +65,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
-from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
+from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids_on
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.execution import (
@@ -1031,15 +1031,13 @@ class ExecutionRepository:
                 ).one_or_none()
                 if batch is None or batch.run_id != run_id or batch.aggregation_node_id != aggregation_node_id:
                     raise AuditIntegrityError("aggregation result receipt references a missing, foreign, or wrong-node batch")
-                member_ids = tuple(
-                    str(row.token_id)
-                    for row in conn.execute(
-                        select(batch_members_table.c.token_id)
-                        .where(batch_members_table.c.batch_id == batch_id)
-                        .where(batch_members_table.c.run_id == run_id)
-                        .order_by(batch_members_table.c.ordinal)
-                    )
-                )
+                batch_member_rows = conn.execute(
+                    select(batch_members_table.c.token_id)
+                    .where(batch_members_table.c.batch_id == batch_id)
+                    .where(batch_members_table.c.run_id == run_id)
+                    .order_by(batch_members_table.c.ordinal)
+                ).all()
+                member_ids = tuple(str(row.token_id) for row in batch_member_rows)
                 if member_ids != member_token_ids:
                     raise AuditIntegrityError("aggregation result receipt members do not match exact ordered batch membership")
                 if not existing_receipt_is_exact(conn, state=state, batch=batch):
@@ -1054,8 +1052,8 @@ class ExecutionRepository:
                     # batch_id across crash-retry (retry batches copy members
                     # but never rewrite immutable acceptance history), so the
                     # liveness proof binds against the durable retry lineage.
-                    lineage_batch_ids = batch_retry_lineage_ids(
-                        lambda query: conn.execute(query).one_or_none(),
+                    lineage_batch_ids = batch_retry_lineage_ids_on(
+                        conn,
                         batch_id=batch_id,
                         run_id=run_id,
                         aggregation_node_id=aggregation_node_id,
@@ -1095,8 +1093,8 @@ class ExecutionRepository:
                         context_after=context_after,
                         conn=conn,
                     )
-                    self.batches.complete_batch(
-                        coordination_token=coordination_token,
+                    self.batches.complete_batch_on(
+                        run_id=coordination_token.run_id,
                         batch_id=batch_id,
                         status=BatchStatus.COMPLETED,
                         trigger_type=trigger_type,
@@ -1107,7 +1105,7 @@ class ExecutionRepository:
                         aggregation_results_table.insert()
                         .values(
                             batch_id=batch_id,
-                            run_id=run_id,
+                            run_id=coordination_token.run_id,
                             aggregation_state_id=state_id,
                             output_mode=output_mode.value,
                             output_shape=output_shape,
@@ -1119,34 +1117,46 @@ class ExecutionRepository:
                     ).scalar_one()
                     if inserted_batch_id != batch_id:
                         raise AuditIntegrityError("aggregation result receipt INSERT returned the wrong batch identity")
-                    for ordinal, token_data_ref in enumerate(expected_refs):
-                        inserted_ordinal = conn.execute(
-                            aggregation_result_outputs_table.insert()
-                            .values(
-                                batch_id=batch_id,
-                                run_id=run_id,
-                                ordinal=ordinal,
-                                token_data_ref=token_data_ref,
+                    if expected_refs:
+                        inserted_ordinals = (
+                            conn.execute(
+                                aggregation_result_outputs_table.insert().returning(aggregation_result_outputs_table.c.ordinal),
+                                [
+                                    {
+                                        "batch_id": batch_id,
+                                        "run_id": coordination_token.run_id,
+                                        "ordinal": ordinal,
+                                        "token_data_ref": token_data_ref,
+                                    }
+                                    for ordinal, token_data_ref in enumerate(expected_refs)
+                                ],
                             )
-                            .returning(aggregation_result_outputs_table.c.ordinal)
-                        ).scalar_one()
-                        if inserted_ordinal != ordinal:
-                            raise AuditIntegrityError("aggregation result output INSERT returned the wrong ordinal")
-                    for ordinal, item in enumerate(receipt_members):
-                        inserted_ordinal = conn.execute(
-                            aggregation_result_members_table.insert()
-                            .values(
-                                batch_id=batch_id,
-                                run_id=run_id,
-                                ordinal=ordinal,
-                                token_id=item.member_ref.token_id,
-                                action=item.action.value,
-                                error_hash=item.error_hash,
+                            .scalars()
+                            .all()
+                        )
+                        if sorted(inserted_ordinals) != list(range(len(expected_refs))):
+                            raise AuditIntegrityError("aggregation result output INSERT returned the wrong ordinals")
+                    if receipt_members:
+                        inserted_ordinals = (
+                            conn.execute(
+                                aggregation_result_members_table.insert().returning(aggregation_result_members_table.c.ordinal),
+                                [
+                                    {
+                                        "batch_id": batch_id,
+                                        "run_id": coordination_token.run_id,
+                                        "ordinal": ordinal,
+                                        "token_id": item.member_ref.token_id,
+                                        "action": item.action.value,
+                                        "error_hash": item.error_hash,
+                                    }
+                                    for ordinal, item in enumerate(receipt_members)
+                                ],
                             )
-                            .returning(aggregation_result_members_table.c.ordinal)
-                        ).scalar_one()
-                        if inserted_ordinal != ordinal:
-                            raise AuditIntegrityError("aggregation result member INSERT returned the wrong ordinal")
+                            .scalars()
+                            .all()
+                        )
+                        if sorted(inserted_ordinals) != list(range(len(receipt_members))):
+                            raise AuditIntegrityError("aggregation result member INSERT returned the wrong ordinals")
                 write_body_completed = True
         except SQLAlchemyError as exc:
             # AuditIntegrityError from the probe's receipt comparison is a
@@ -1163,26 +1173,13 @@ class ExecutionRepository:
             error_type = LandscapePostCommitError if write_body_completed else LandscapeRecordError
             raise error_type(f"complete_aggregation_result failed for batch_id={batch_id}: {type(exc).__name__}: {exc}") from exc
         try:
-            with self._db.read_only_connection() as conn:
-                state = conn.execute(
-                    select(
-                        node_states_table.c.status,
-                        node_states_table.c.output_hash,
-                        node_states_table.c.duration_ms,
-                        node_states_table.c.success_reason_json,
-                        node_states_table.c.context_after_json,
-                    ).where(node_states_table.c.state_id == state_id)
-                ).one()
-                batch = conn.execute(
-                    select(
-                        batches_table.c.status,
-                        batches_table.c.aggregation_state_id,
-                        batches_table.c.trigger_type,
-                        batches_table.c.trigger_reason,
-                    ).where(batches_table.c.batch_id == batch_id)
-                ).one()
-                if not existing_receipt_is_exact(conn, state=state, batch=batch):  # pragma: no cover - receipt must exist
-                    raise AuditIntegrityError("aggregation result receipt disappeared after commit")
+            probe = self._probe_existing_aggregation_receipt(
+                state_id=state_id,
+                batch_id=batch_id,
+                receipt_is_exact=existing_receipt_is_exact,
+            )
+            if probe is not _ReceiptProbeOutcome.MATCH:
+                raise AuditIntegrityError("aggregation result receipt could not be read after commit")
         except (SQLAlchemyError, AuditIntegrityError) as exc:
             raise LandscapePostCommitError(f"aggregation result receipt {batch_id!r} failed exact post-commit readback") from exc
         return receipt

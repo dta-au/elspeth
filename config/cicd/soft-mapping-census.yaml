@@ -96,7 +96,7 @@ files:
     dict[str, Any]: 1
     dict[str, object]: 34
   src/elspeth/contracts/scheduler.py:
-    Mapping[str, object]: 1
+    Mapping[str, object]: 2
   src/elspeth/contracts/schema.py:
     Mapping[str, Any]: 7
     boundary: 4
@@ -136,17 +136,18 @@ files:
     dict[str, Any]: 2
   src/elspeth/core/landscape/auth_audit_repository.py:
     Mapping[str, object]: 7
-    dict[str, object]: 1
+    dict[str, object]: 2
   src/elspeth/core/landscape/data_flow/errors.py:
     Mapping[str, object]: 1
   src/elspeth/core/landscape/data_flow/graph.py:
     Mapping[str, object]: 1
     dict[str, object]: 1
   src/elspeth/core/landscape/data_flow/outcomes.py:
-    Mapping[str, object]: 2
+    Mapping[str, object]: 5
+    dict[str, object]: 2
   src/elspeth/core/landscape/data_flow/tokens.py:
-    Mapping[str, object]: 7
-    dict[str, object]: 1
+    Mapping[str, object]: 6
+    dict[str, object]: 2
   src/elspeth/core/landscape/data_flow_repository.py:
     Mapping[str, object]: 13
     dict[str, object]: 1
@@ -159,10 +160,10 @@ files:
   src/elspeth/core/landscape/execution/batches.py:
     dict[str, Any]: 1
   src/elspeth/core/landscape/execution/calls.py:
-    dict[str, object]: 5
+    dict[str, object]: 4
   src/elspeth/core/landscape/execution/node_states.py:
     Mapping[str, object]: 14
-    dict[str, object]: 4
+    dict[str, object]: 5
   src/elspeth/core/landscape/execution/operations.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/execution/sink_effect_attempt_results.py:
@@ -178,6 +179,7 @@ files:
   src/elspeth/core/landscape/execution/sink_effect_reservation.py:
     dict[str, object]: 1
   src/elspeth/core/landscape/execution/source_completion_recovery.py:
+    Mapping[str, object]: 1
     dict[str, object]: 3
   src/elspeth/core/landscape/execution_repository.py:
     Mapping[str, object]: 20
@@ -206,11 +208,14 @@ files:
     dict[str, Any]: 4
   src/elspeth/core/landscape/scheduler/barrier.py:
     Mapping[str, object]: 6
-    dict[str, object]: 3
+    dict[str, object]: 5
+  src/elspeth/core/landscape/scheduler/dispositions.py:
+    dict[str, object]: 1
   src/elspeth/core/landscape/scheduler/events.py:
-    Mapping[str, object]: 1
+    Mapping[str, object]: 2
   src/elspeth/core/landscape/scheduler/work_items.py:
-    dict[str, object]: 4
+    Mapping[str, object]: 1
+    dict[str, object]: 7
   src/elspeth/core/landscape/scheduler_repository.py:
     Mapping[str, object]: 2
     dict[str, object]: 1
@@ -1007,9 +1012,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 861
-  Mapping[str, object]: 285
+  Mapping[str, object]: 291
   MutableMapping[str, Any]: 13
   boundary: 64
   dict[str, Any]: 1141
-  dict[str, object]: 389
-  soft: 2689
+  dict[str, object]: 399
+  soft: 2705

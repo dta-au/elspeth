@@ -121,7 +121,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fb170fbf7b3b4a7b"
+    source_file_hash: str | None = "sha256:28f1e931824f9fc2"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -332,7 +332,7 @@ class LLMSource(BaseSource):
         if self._system_prompt:
             messages.append(ChatMessage(role="system", content=self._system_prompt))
         messages.append(ChatMessage(role="user", content=provider_prompt))
-        trace_parent = LLMAuditParent.for_operation(operation_id=operation_id)
+        trace_parent = LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=ctx.require_coordination_token())
         started_at = time.monotonic()
         try:
             result = provider.execute_query(

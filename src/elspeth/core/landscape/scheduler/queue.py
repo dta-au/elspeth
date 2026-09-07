@@ -8,19 +8,18 @@ in-transaction claim CAS. Extracted from ``TokenSchedulerRepository``
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
-from elspeth.core.landscape.database import Tier1Engine, begin_write
+from elspeth.contracts.scheduler import SchedulerEventType, SourceIngestSpec, TokenWorkItem, TokenWorkStatus
+from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
 from elspeth.core.landscape.scheduler.events import SchedulerEventStore
 from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.scheduler.work_items import (
@@ -36,6 +35,8 @@ from elspeth.core.landscape.schema import active_worker_fence_clause, token_work
 
 if TYPE_CHECKING:
     from elspeth.contracts.audit import Row, Token
+    from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+    from elspeth.core.landscape.execution_repository import ExecutionRepository
 
 
 class SchedulerQueueRepository:
@@ -49,7 +50,7 @@ class SchedulerQueueRepository:
     def enqueue_ready(
         self,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         token_id: str,
         row_id: str,
         node_id: str | None,
@@ -66,7 +67,6 @@ class SchedulerQueueRepository:
         coalesce_name: str | None = None,
         row_union_name: str | None = None,
         collector_name: str | None = None,
-        worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Persist a READY token continuation.
 
@@ -74,22 +74,11 @@ class SchedulerQueueRepository:
         workers that claim this row later must be able to rebuild the same
         ``TokenInfo`` and ``WorkItem`` without any live in-memory queue state.
 
-        ``worker_id`` (ADR-030 §G, slice 4): when provided, the membership fence
-        is checked BEFORE the idempotent INSERT — an evicted or departed caller
-        raises :class:`~elspeth.contracts.errors.RunWorkerEvictedError` rather
-        than inserting a READY row that no active worker will ever claim.  The
-        dedup path (``insert_work_item_idempotent`` returns ``False``) re-reads
-        the existing row without the fence to preserve idempotency on resume; the
-        fence only guards the FIRST write.
-
-        ``None`` preserves the unfenced legacy behavior for direct
-        repository-level callers (tests, tooling, barrier completion) that do not
-        carry a worker identity.  This verb stays Optional because several
-        important callers — ``complete_barrier`` (fires inside a larger
-        fenced transaction) and tests — legitimately have no registry row.
+        Membership authority is required even on an idempotent replay.
         """
+        run_id = member_token.run_id
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
-        with begin_write(self._engine) as conn:
+        with fenced_member_transaction(self._engine, member_token=member_token, verb="enqueue_ready") as conn:
             # The row becomes available at Landscape database time (ADR-047):
             # claim_ready admits it against that same clock, so a caller clock
             # — whole seconds behind or microseconds ahead of the database —
@@ -115,16 +104,6 @@ class SchedulerQueueRepository:
                 row_union_name=row_union_name,
                 collector_name=collector_name,
             )
-            # Membership fence (ADR-030 §G, slice 4): checked BEFORE the INSERT
-            # and BEFORE the reference validation — an evicted caller must not
-            # leave a READY orphan, and the fence is the outer guard (reference
-            # validation is an integrity check that assumes the caller is valid).
-            # Only applied when worker_id is provided (see docstring for who
-            # stays Optional).
-            if worker_id is not None:
-                fence_holds = conn.execute(select(active_worker_fence_clause(worker_id=worker_id, run_id=run_id))).scalar()
-                if not fence_holds:
-                    raise RunWorkerEvictedError(worker_id=worker_id, run_id=run_id)
             validate_work_item_references(
                 conn,
                 run_id=run_id,
@@ -157,7 +136,7 @@ class SchedulerQueueRepository:
     def enqueue_ready_claimed(
         self,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         token_id: str,
         row_id: str,
         node_id: str | None,
@@ -184,11 +163,9 @@ class SchedulerQueueRepository:
         claim UPDATE CAS so eviction between the entry check and claim rolls
         back the INSERT and both scheduler events.
 
-        Repository-only N=0/test callers must opt into the visibly unsafe
-        :meth:`enqueue_ready_claimed_legacy_unfenced` compatibility helper.
         """
         return self._enqueue_ready_claimed(
-            run_id=run_id,
+            member_token=member_token,
             token_id=token_id,
             row_id=row_id,
             node_id=node_id,
@@ -207,65 +184,12 @@ class SchedulerQueueRepository:
             coalesce_name=coalesce_name,
             row_union_name=row_union_name,
             collector_name=collector_name,
-            worker_id=lease_owner,
-        )
-
-    def enqueue_ready_claimed_legacy_unfenced(
-        self,
-        *,
-        run_id: str,
-        token_id: str,
-        row_id: str,
-        node_id: str | None,
-        step_index: int,
-        ingest_sequence: int,
-        row_payload_json: str,
-        lease_owner: str,
-        lease_seconds: int,
-        attempt: int = 1,
-        queue_key: str | None = None,
-        barrier_key: str | None = None,
-        on_success_sink: str | None = None,
-        join_group_id: str | None = None,
-        lineage_path: tuple[LineageFrame, ...] = (),
-        coalesce_node_id: str | None = None,
-        coalesce_name: str | None = None,
-        row_union_name: str | None = None,
-        collector_name: str | None = None,
-    ) -> TokenWorkItem:
-        """Compatibility enqueue-and-claim for N=0 fixtures with no registry.
-
-        This method is intentionally explicit and must not be used by a
-        production worker.  Coordinated leader ingest uses the separately
-        fenced :meth:`ingest_row_with_initial_claim` composition instead.
-        """
-        return self._enqueue_ready_claimed(
-            run_id=run_id,
-            token_id=token_id,
-            row_id=row_id,
-            node_id=node_id,
-            step_index=step_index,
-            ingest_sequence=ingest_sequence,
-            row_payload_json=row_payload_json,
-            lease_owner=lease_owner,
-            lease_seconds=lease_seconds,
-            attempt=attempt,
-            queue_key=queue_key,
-            barrier_key=barrier_key,
-            on_success_sink=on_success_sink,
-            join_group_id=join_group_id,
-            lineage_path=lineage_path,
-            coalesce_node_id=coalesce_node_id,
-            coalesce_name=coalesce_name,
-            row_union_name=row_union_name,
-            collector_name=collector_name,
-            worker_id=None,
         )
 
     def _enqueue_ready_claimed(
         self,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         token_id: str,
         row_id: str,
         node_id: str | None,
@@ -284,9 +208,11 @@ class SchedulerQueueRepository:
         row_union_name: str | None = None,
         collector_name: str | None = None,
         lineage_path: tuple[LineageFrame, ...] = (),
-        worker_id: str | None,
     ) -> TokenWorkItem:
-        with begin_write(self._engine) as conn:
+        run_id = member_token.run_id
+        if lease_owner != member_token.worker_id:
+            raise ValueError("enqueue lease owner must match membership token")
+        with fenced_member_transaction(self._engine, member_token=member_token, verb="enqueue_ready_claimed") as conn:
             row = self.enqueue_ready_claimed_on(
                 conn,
                 run_id=run_id,
@@ -308,7 +234,7 @@ class SchedulerQueueRepository:
                 coalesce_name=coalesce_name,
                 row_union_name=row_union_name,
                 collector_name=collector_name,
-                worker_id=worker_id,
+                worker_id=member_token.worker_id,
             )
         return item_from_mapping(row)
 
@@ -345,8 +271,8 @@ class SchedulerQueueRepository:
         events onto ONE connection with the rows/tokens inserts.  Standalone
         production callers pass ``worker_id``; the strict membership check is
         then the first database statement in this method and the claim UPDATE
-        rechecks membership.  ``None`` is reserved for the explicit legacy
-        helper and for ingest, whose leader-epoch CAS is the outer fence.
+        rechecks membership. ``None`` is reserved for ingest, whose
+        leader-epoch CAS is the outer fence.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
         # Available at the caller transaction's database time (ADR-047); the
@@ -420,12 +346,11 @@ class SchedulerQueueRepository:
         self,
         *,
         coordination_token: CoordinationToken,
-        insert_row_and_token: Callable[[Connection], tuple[Row, Token]],
-        token_id: str,
-        row_id: str,
+        source: SourceIngestSpec,
+        data_flow: DataFlowRepository,
+        execution: ExecutionRepository,
         node_id: str | None,
         step_index: int,
-        ingest_sequence: int,
         row_payload_json: str,
         lease_owner: str,
         lease_seconds: int,
@@ -442,9 +367,9 @@ class SchedulerQueueRepository:
         """Fenced leader INGEST (ADR-030 §C.4 row 9): one IMMEDIATE transaction.
 
         Composes (1) the verify-and-extend epoch fence, (2) the ``rows`` +
-        ``tokens`` inserts (via the injected ``insert_row_and_token``
-        callable, a closure over ``DataFlowRepository.insert_row_with_token_on``),
-        and (3) the initial enqueue-and-claim — on ONE connection. A stale
+        ``tokens`` inserts through the owned data-flow repository, (3) the
+        source completion state through the owned execution repository,
+        and (4) the initial enqueue-and-claim — on ONE connection. A stale
         epoch refuses the WHOLE ingest: the rows insert rolls back with
         everything else, so a deposed leader woken mid-ingest leaves no
         orphan ``rows`` row (crash-walk step 8). The UNIQUE
@@ -460,6 +385,21 @@ class SchedulerQueueRepository:
         clock by ``claim_ready``, so a leader whose clock ran fast can no
         longer enqueue work that its own next claim refuses as not-yet-due.
         """
+        # Execution's source-recovery component imports scheduler codecs;
+        # defer nominal dependency imports until their modules are initialized.
+        from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+        from elspeth.core.landscape.execution_repository import ExecutionRepository
+
+        if type(source) is not SourceIngestSpec:
+            raise TypeError("scheduler ingest requires a SourceIngestSpec")
+        if type(data_flow) is not DataFlowRepository:
+            raise TypeError("scheduler ingest requires an exact DataFlowRepository")
+        if type(execution) is not ExecutionRepository:
+            raise TypeError("scheduler ingest requires an exact ExecutionRepository")
+        if not isinstance(coordination_token, CoordinationToken):
+            raise TypeError("scheduler ingest requires a CoordinationToken")
+        if lease_owner != coordination_token.worker_id:
+            raise ValueError("ingest lease owner must match coordination token")
         run_id = coordination_token.run_id
         with fenced_leader_transaction(
             self._engine,
@@ -467,22 +407,39 @@ class SchedulerQueueRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="ingest_row_with_initial_claim",
         ) as conn:
-            row_record, token_record = insert_row_and_token(conn)
-            if row_record.row_id != row_id or token_record.token_id != token_id:
+            row_record, token_record = data_flow.insert_row_with_token_on(
+                conn,
+                coordination_token=coordination_token,
+                source_node_id=source.source_node_id,
+                row_index=source.row_index,
+                data=source.data,
+                source_row_index=source.source_row_index,
+                ingest_sequence=source.ingest_sequence,
+                row_id=source.row_id,
+                token_id=source.token_id,
+            )
+            if row_record.row_id != source.row_id or token_record.token_id != source.token_id:
                 raise AuditIntegrityError(
-                    f"Fenced ingest for run_id={run_id!r} inserted row_id={row_record.row_id!r} / "
-                    f"token_id={token_record.token_id!r} but the scheduler enqueue was declared for "
-                    f"row_id={row_id!r} / token_id={token_id!r}; the composed transaction would "
-                    "journal a cursor for identities it did not insert."
+                    f"Fenced ingest for run_id={run_id!r} returned row/token identities that differ from its SourceIngestSpec"
                 )
+            execution.record_completed_node_state_on(
+                conn,
+                coordination_token=coordination_token,
+                token_id=source.token_id,
+                node_id=source.source_node_id,
+                step_index=0,
+                input_data=source.data,
+                output_data=source.data,
+                duration_ms=0,
+            )
             scheduled = self.enqueue_ready_claimed_on(
                 conn,
                 run_id=run_id,
-                token_id=token_id,
-                row_id=row_id,
+                token_id=source.token_id,
+                row_id=source.row_id,
                 node_id=node_id,
                 step_index=step_index,
-                ingest_sequence=ingest_sequence,
+                ingest_sequence=source.ingest_sequence,
                 row_payload_json=row_payload_json,
                 lease_owner=lease_owner,
                 lease_seconds=lease_seconds,

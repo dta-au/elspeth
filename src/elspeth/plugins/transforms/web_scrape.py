@@ -488,7 +488,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3f7fcb93381553cf"
+    source_file_hash: str | None = "sha256:889d51ca07c0ba3d"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -971,6 +971,8 @@ class WebScrapeTransform(BaseTransform):
 
         # Create audited client (records to Landscape)
         client = AuditedHTTPClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             execution=self._recorder,
             state_id=ctx.state_id,
             run_id=ctx.run_id,

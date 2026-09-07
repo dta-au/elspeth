@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 import httpx
 from pydantic import BaseModel, field_validator, model_validator
 
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.security.web import (
     NetworkError,
@@ -236,8 +238,12 @@ class AzureSearchProvider:
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
-        response_data = self._execute_search(query, top_k, state_id=state_id, token_id=token_id)
+        response_data = self._execute_search(
+            query, top_k, state_id=state_id, token_id=token_id, member_token=member_token, work_item=work_item
+        )
         chunks, skipped_items = self._parse_response(response_data, min_score)
         # "Record what we didn't get" — skipped items are audit evidence.
         # Store on instance so callers (RAGRetrievalTransform) can include
@@ -259,11 +265,13 @@ class AzureSearchProvider:
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> dict[str, Any]:
         body = self._build_request_body(query, top_k)
 
         # Update per-call audit scoping on the shared client.
-        self._http_client.update_call_context(state_id, token_id)
+        self._http_client.update_call_context(state_id, token_id, member_token=member_token, work_item=work_item)
 
         try:
             try:

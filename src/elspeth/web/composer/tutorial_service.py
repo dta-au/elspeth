@@ -17,7 +17,7 @@ from uuid import UUID
 
 import structlog
 from fastapi import HTTPException, Request
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
 from elspeth.contracts import CallType
 from elspeth.contracts import errors as contract_errors
@@ -30,7 +30,6 @@ from elspeth.core.landscape.schema import (
     node_states_table,
     operations_table,
     rows_table,
-    runs_table,
     validation_errors_table,
 )
 from elspeth.web.async_workers import run_sync_in_worker
@@ -474,25 +473,12 @@ async def _wait_for_terminal_run(
 
 
 def _project_live_tutorial_output(settings: WebSettings, *, run_id: str, landscape_run_id: str, session_id: str) -> _LiveTutorialProjection:
-    # Despite the read-shaped name this is a WRITER surface: it stamps
-    # ``llm_call_count`` / ``seeded_from_cache`` / ``cache_key`` onto the run
-    # row (Tier-1 contract assertion below) in the same transaction as its
-    # projection SELECTs.  ``write_connection()`` declares the write intent
-    # so the transaction begins ``BEGIN IMMEDIATE`` (ADR-030 §D5) — a
-    # read-then-write shape on a DEFERRED BEGIN is exactly the
-    # SQLITE_BUSY_SNAPSHOT hazard the write-intent discipline closes.
     with (
         open_landscape_db(settings) as db,
-        db.write_connection() as conn,
+        db.read_only_connection() as conn,
     ):
         llm_call_count = _count_calls_for_run(conn, landscape_run_id)
         discarded_row_count = _count_discarded_rows(conn, landscape_run_id)
-        conn.execute(
-            update(runs_table)
-            .where(runs_table.c.run_id == landscape_run_id)
-            # Tier-1 contract assertion: live runs are non-cache-replay identity.
-            .values(llm_call_count=llm_call_count, seeded_from_cache=False, cache_key=None)
-        )
         source_hashes = tuple(
             row.source_data_hash
             for row in conn.execute(

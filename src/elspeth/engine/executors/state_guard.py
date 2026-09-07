@@ -27,6 +27,8 @@ from elspeth.contracts.enums import NodeStateStatus, OutputMode, TriggerType
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
     RunWorkerEvictedError,
     SchedulerLeaseLostError,
 )
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from elspeth.contracts import AggregationResultMember, PipelineRow
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
 
@@ -147,7 +150,7 @@ class NodeStateGuard:
             recorder,
             token_id=...,
             node_id=...,
-            run_id=...,
+            member_token=ctx.require_member_token(),
             step_index=...,
             input_data=...,
             auto_fail_phase="transform_execution",
@@ -170,6 +173,7 @@ class NodeStateGuard:
         "_enter_time",
         "_execution",
         "_input_data",
+        "_member_token",
         "_node_id",
         "_resume_checkpoint_id",
         "_run_id",
@@ -185,7 +189,7 @@ class NodeStateGuard:
         *,
         token_id: str,
         node_id: str,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         step_index: int,
         input_data: dict[str, Any],  # Row data (Tier 2 pipeline data)
         attempt: int = 0,
@@ -196,7 +200,8 @@ class NodeStateGuard:
         self._execution = execution
         self._token_id = token_id
         self._node_id = node_id
-        self._run_id = run_id
+        self._run_id = member_token.run_id
+        self._member_token = member_token
         self._step_index = step_index
         self._input_data = input_data
         self._attempt = attempt
@@ -215,7 +220,7 @@ class NodeStateGuard:
         self._state = self._execution.begin_node_state(
             token_id=self._token_id,
             node_id=self._node_id,
-            run_id=self._run_id,
+            member_token=self._member_token,
             step_index=self._step_index,
             input_data=self._input_data,
             attempt=self._attempt,
@@ -234,6 +239,11 @@ class NodeStateGuard:
             # complete(FAILED)-then-reraise path must stamp too, since the
             # caller's ctx.state_id is scope-restored during unwind.
             stamp_node_state_id(exc_val, self.state_id)
+
+        if isinstance(exc_val, (RunLeadershipLostError, RunMembershipLostError)):
+            # The repository refused before mutation. Preserve that verdict;
+            # a second write would use lost authority or mask the first refusal.
+            return
 
         if self._abandoned:
             if not isinstance(exc_val, (SchedulerLeaseLostError, RunWorkerEvictedError)):
@@ -263,6 +273,7 @@ class NodeStateGuard:
             )
             try:
                 self._execution.complete_node_state(
+                    member_token=self._member_token,
                     state_id=self.state_id,
                     status=NodeStateStatus.FAILED,
                     duration_ms=duration_ms,
@@ -306,6 +317,7 @@ class NodeStateGuard:
         )
         try:
             self._execution.complete_node_state(
+                member_token=self._member_token,
                 state_id=self.state_id,
                 status=NodeStateStatus.FAILED,
                 duration_ms=duration_ms,
@@ -407,6 +419,7 @@ class NodeStateGuard:
         try:
             if status is NodeStateStatus.COMPLETED:
                 self._execution.complete_node_state(
+                    member_token=self._member_token,
                     state_id=self.state_id,
                     status=NodeStateStatus.COMPLETED,
                     output_data=normalized_output,
@@ -421,6 +434,7 @@ class NodeStateGuard:
                 if success_reason is not None:
                     raise OrchestrationInvariantError("NodeStateGuard.complete(FAILED) does not accept success_reason.")
                 self._execution.complete_node_state(
+                    member_token=self._member_token,
                     state_id=self.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data=normalized_output,
@@ -439,7 +453,7 @@ class NodeStateGuard:
         self,
         *,
         batch_id: str,
-        run_id: str,
+        coordination_token: CoordinationToken,
         aggregation_node_id: str,
         trigger_type: TriggerType,
         output_mode: OutputMode,
@@ -456,7 +470,7 @@ class NodeStateGuard:
         try:
             self._execution.complete_aggregation_result(
                 batch_id=batch_id,
-                run_id=run_id,
+                coordination_token=coordination_token,
                 aggregation_node_id=aggregation_node_id,
                 state_id=self.state_id,
                 trigger_type=trigger_type,

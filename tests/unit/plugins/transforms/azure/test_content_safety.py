@@ -1346,7 +1346,7 @@ class TestContentSafetyInternalProcessing:
         row_data = {"content": "test", "id": 1}
         row = make_pipeline_row(row_data)
 
-        result = transform._process_single_with_state(row, "test-state-id")
+        result = transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
         assert result.status == "success"
         assert mock_httpx_client.post.call_count == 2
@@ -1372,7 +1372,7 @@ class TestContentSafetyInternalProcessing:
 
         row_data = {"content": "test", "id": 1}
         row = make_pipeline_row(row_data)
-        result = transform._process_single_with_state(row, "test-state-id")
+        result = transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
         assert result.status == "error"
         assert result.reason is not None
@@ -1404,7 +1404,7 @@ class TestContentSafetyInternalProcessing:
         row_data = {"content": "test", "id": 1}
         row = make_pipeline_row(row_data)
         with pytest.raises(PluginRetryableError, match="network error"):
-            transform._process_single_with_state(row, "test-state-id")
+            transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
 
 class TestResourceCleanup:

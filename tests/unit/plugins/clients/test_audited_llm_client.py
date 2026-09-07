@@ -11,7 +11,9 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -20,6 +22,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     LLMResponse,
     RateLimitError,
 )
+from tests.fixtures.mock_audit import mock_audit_authority
 
 _DEFAULT_USAGE = object()
 
@@ -106,7 +109,7 @@ class FakeExecutionRepository:
         self._next_index = 0
         self.recorded_calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, _state_id: str) -> int:
+    def allocate_call_index(self, _state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._next_index
         self._next_index += 1
         return call_index
@@ -321,6 +324,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -363,6 +367,7 @@ class TestAuditedLLMClient:
         msgs = [ChatMessage(role="user", content=(TextPart(text="t"), part))]
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -389,6 +394,7 @@ class TestAuditedLLMClient:
         emitted_events: list[ExternalCallCompleted] = []
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -412,6 +418,7 @@ class TestAuditedLLMClient:
         emitted_events: list[ExternalCallCompleted] = []
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -433,6 +440,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -472,6 +480,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception(provider_detail))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -517,6 +526,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(response=response)
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -536,6 +546,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("Rate limit exceeded (429)"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -559,6 +570,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("You have exceeded your rate limit"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -578,6 +590,7 @@ class TestAuditedLLMClient:
         openai_client = FakeOpenAIClient(exception=Exception("400 Bad Request: enumerate at least one item"))
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -602,6 +615,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -626,6 +640,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -648,6 +663,7 @@ class TestAuditedLLMClient:
         openai_client = self._create_mock_openai_client()
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -695,6 +711,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -753,6 +770,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -818,6 +836,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -887,6 +906,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -934,6 +954,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_123",
             run_id="run_abc",
@@ -971,6 +992,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_aggregate",
             run_id="run_aggregate",
@@ -1004,6 +1026,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_empty_choices",
             run_id="run_empty_choices",
@@ -1035,6 +1058,7 @@ class TestAuditedLLMClient:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_bad_model",
             run_id="run_bad_model",
@@ -1075,6 +1099,7 @@ class TestAuditedLLMClient:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_non_string_content",
             run_id="run_non_string_content",
@@ -1137,6 +1162,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_b41",
             run_id="run_b41",
@@ -1182,6 +1208,7 @@ class TestBug4_1_ContentExtractionRecordsBeforeReraising:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_b41_tel",
             run_id="run_b41_tel",
@@ -1219,6 +1246,7 @@ class TestContentFabrication:
     @staticmethod
     def _create_client(execution: FakeExecutionRepository, openai_client: FakeOpenAIClient) -> AuditedLLMClient:
         return AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_fab",
             run_id="run_fab",
@@ -1305,6 +1333,7 @@ class TestContentFabrication:
 
         emitted_events: list[ExternalCallCompleted] = []
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_fab",
             run_id="run_fab",
@@ -1403,6 +1432,7 @@ class TestModelDumpFailureRecordsCall:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_dump_fail",
             run_id="run_dump_fail",
@@ -1448,6 +1478,7 @@ class TestTier3UsageBoundary:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_float",
             run_id="run_float",
@@ -1478,6 +1509,7 @@ class TestTier3UsageBoundary:
         )
 
         client = AuditedLLMClient(
+            **mock_audit_authority(),
             execution=execution,
             state_id="state_bool",
             run_id="run_bool",

@@ -9,10 +9,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import (
     AuditedLLMClient,
@@ -33,6 +36,11 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
 
+# Mock-only authority: these providers use FakeAuditRecorder, never a database.
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+_MEMBER_TOKEN = _LEADER_TOKEN.membership
+_WORK_ITEM = Mock(spec=TokenWorkItem)
+
 
 @dataclass
 class FakeAuditRecorder:
@@ -41,11 +49,11 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self.allocated_state_ids.append(state_id)
         return len(self.allocated_state_ids) - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self.allocated_operation_ids.append(operation_id)
         return len(self.allocated_operation_ids) - 1
 
@@ -203,6 +211,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -225,6 +235,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -242,6 +254,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -260,6 +274,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -275,6 +291,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -290,6 +308,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -305,6 +325,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -320,6 +342,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -335,6 +359,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -351,6 +377,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -373,6 +401,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=None,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -398,6 +428,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=None,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -423,6 +455,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -444,6 +478,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -466,6 +502,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -490,7 +528,7 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
             )
 
         assert audit_recorder.calls == []
@@ -511,9 +549,15 @@ class TestClientCaching:
         provider = _make_provider(audit_recorder, telemetry_emit)
         provider._underlying_client = FakeUnderlyingAzureClient()
 
-        client1 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client2 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client3 = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-b", token_id="tok-2"))
+        client1 = provider._get_llm_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client2 = provider._get_llm_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client3 = provider._get_llm_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-b", token_id="tok-2")
+        )
 
         assert client1 is client2  # Same state_id → same client
         assert client1 is not client3  # Different state_id → different client
@@ -535,7 +579,9 @@ class TestClientCaching:
 
         def create_client() -> None:
             barrier.wait()
-            c = provider._get_llm_client(LLMAuditParent.for_row(state_id="state-race", token_id="tok-1"))
+            c = provider._get_llm_client(
+                LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-race", token_id="tok-1")
+            )
             with collect_lock:
                 clients.append(c)
 
@@ -558,7 +604,9 @@ class TestClientCaching:
         underlying_client = FakeUnderlyingAzureClient()
         provider._underlying_client = underlying_client
 
-        provider._get_llm_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
+        provider._get_llm_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="tok-1")
+        )
 
         assert len(provider._llm_clients) == 1
         provider.close()

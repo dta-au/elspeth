@@ -117,7 +117,7 @@ class _HeartbeatRepository(Protocol):
         self, *, member_token: WorkerMembershipToken, window_seconds: float
     ) -> CoordinationSnapshot | WorkerMembershipLost: ...
 
-    def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None: ...
+    def record_heartbeat_degraded(self, *, member_token: WorkerMembershipToken, failures: int, now: datetime) -> None: ...
 
 
 class RunHeartbeatThread:
@@ -473,8 +473,7 @@ class RunHeartbeatThread:
         """
         try:
             self._repo.record_heartbeat_degraded(
-                run_id=self._token.run_id,
-                worker_id=self._token.worker_id,
+                member_token=self._token,
                 failures=self._consecutive_busy,
                 now=self._now_fn(),
             )

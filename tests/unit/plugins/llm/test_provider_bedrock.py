@@ -22,6 +22,8 @@ from litellm.exceptions import (
 from litellm.types.utils import ModelResponse, Usage
 
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -38,6 +40,12 @@ MODEL = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
 DYNAMIC_SCHEMA = {"mode": "observed"}
 
 
+# Mock-only authority: these providers use FakeAuditRecorder, never a database.
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+_MEMBER_TOKEN = _LEADER_TOKEN.membership
+_WORK_ITEM = Mock(spec=TokenWorkItem)
+
+
 @dataclass
 class FakeAuditRecorder:
     allocated_state_ids: list[str | None] = field(default_factory=list)
@@ -45,11 +53,11 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self.allocated_state_ids.append(state_id)
         return len(self.allocated_state_ids) - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self.allocated_operation_ids.append(operation_id)
         return len(self.allocated_operation_ids) - 1
 
@@ -120,6 +128,8 @@ def _execute(provider: BedrockLLMProvider) -> Any:
         temperature=0.25,
         max_tokens=64,
         audit_parent=LLMAuditParent.for_row(
+            member_token=_MEMBER_TOKEN,
+            work_item=_WORK_ITEM,
             state_id="state-1",
             token_id="token-1",
         ),
@@ -132,7 +142,7 @@ def _execute_for_operation(provider: BedrockLLMProvider) -> Any:
         model=MODEL,
         temperature=0.25,
         max_tokens=64,
-        audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+        audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
     )
 
 
@@ -372,7 +382,7 @@ class TestBedrockProvider:
         )
 
         with patch("litellm.completion", side_effect=provider_error), pytest.raises(RateLimitError) as exc_info:
-            provider.runtime_preflight(operation_id="operation-1", model=MODEL)
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="operation-1", model=MODEL)
 
         escaping = exc_info.value
         assert str(escaping) == "Bedrock LLM request failed"

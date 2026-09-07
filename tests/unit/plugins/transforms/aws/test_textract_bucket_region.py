@@ -10,8 +10,11 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
     BucketRegionCoordinator,
     BucketRegionProof,
@@ -28,7 +31,7 @@ class FakeExecution:
     calls: list[dict[str, Any]] = field(default_factory=list)
     order: list[str] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "state-1"
         return len(self.calls)
 
@@ -59,6 +62,7 @@ def _client(response: object) -> tuple[HeadBucketClient, FakeExecution, list[Any
     events: list[Any] = []
     sdk = FakeS3SDK(response)
     client = HeadBucketClient(
+        **mock_item_audit_authority("run-1"),
         execution=execution,
         state_id="state-1",
         run_id="run-1",

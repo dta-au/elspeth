@@ -9,29 +9,39 @@ resume and explain.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine import Row as SQLAlchemyRow
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.dml import UpdateBase
+from sqlalchemy.sql.elements import TextClause
 
 from elspeth.contracts import (
+    AggregationParentDisposition,
     NodeType,
     TokenOutcome,
 )
 from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS, DISCARD_SINK_NAME, TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import BatchStatus, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.scheduler import BarrierTerminalOutcomeSpec, TokenWorkItem
 from elspeth.core.canonical import canonical_json
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
 from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     artifacts_table,
     batches_table,
@@ -44,13 +54,36 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 
-__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded", "record_terminal_outcome_guarded"]
+__all__ = [
+    "TokenOutcomeRepository",
+    "TokenOutcomeWrite",
+    "record_buffered_outcome_guarded",
+    "record_terminal_outcomes_guarded",
+]
 
 # IN-clause chunk size for token-id lock queries — stays under SQLite's
 # default 999 bound-parameter ceiling (the node_states.py convention) and
 # keeps each PostgreSQL extended-protocol statement far below its 32767
 # bind cap on large sink flushes.
 _TOKEN_ID_CHUNK_SIZE = 500
+
+
+@dataclass(frozen=True, slots=True)
+class TokenOutcomeWrite:
+    """One outcome's data for a caller-owned atomic batch."""
+
+    ref: TokenRef
+    outcome: TerminalOutcome | None
+    path: TerminalPath
+    sink_name: str | None = None
+    sink_node_id: str | None = None
+    artifact_id: str | None = None
+    batch_id: str | None = None
+    error_hash: str | None = None
+    context: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "context")
 
 
 class TokenOutcomeRepository:
@@ -69,7 +102,10 @@ class TokenOutcomeRepository:
         self._token_outcome_loader = token_outcome_loader
         self._ownership = ownership
 
-    def _execute_fetchone(self, query: Any, *, conn: Connection | None) -> Any | None:
+    def _execute_fetchone(self, query: Select[Any], *, conn: Connection | None) -> Any | None:
+        if not isinstance(query, Select):
+            raise TypeError("_execute_fetchone requires a SQLAlchemy Select")
+        self._refuse_mutating_select(query)
         if conn is None:
             return self._ops.execute_fetchone(query)
         try:
@@ -83,12 +119,21 @@ class TokenOutcomeRepository:
         return rows[0]
 
     @staticmethod
-    def _execute_lock_query(conn: Connection, query: Any, *, operation: str) -> list[Any]:
+    def _execute_lock_query(conn: Connection, query: Select[Any], *, operation: str) -> list[Any]:
         """Execute one PostgreSQL row-lock query with recorder-safe errors."""
+        if not isinstance(query, Select):
+            raise TypeError("_execute_lock_query requires a SQLAlchemy Select")
+        TokenOutcomeRepository._refuse_mutating_select(query)
         try:
             return list(conn.execute(query).fetchall())
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(f"{operation} failed — database rejected audit lock query: {type(exc).__name__}") from exc
+
+    @staticmethod
+    def _refuse_mutating_select(query: Select[Any]) -> None:
+        """Refuse writable CTEs and opaque SQL fragments inside a SELECT tree."""
+        if any(isinstance(fragment, (UpdateBase, TextClause)) for fragment in visitors.iterate(query)):
+            raise TypeError("Select query contains DML or raw SQL")
 
     def lock_token_outcome_dependencies(self, refs: Sequence[TokenRef], *, conn: Connection) -> None:
         """Take token locks first, in stable order, for composed outcome writes.
@@ -430,13 +475,81 @@ class TokenOutcomeRepository:
         outcome: TerminalOutcome | None,
         path: TerminalPath,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         sink_name: str | None = None,
         sink_node_id: str | None = None,
         artifact_id: str | None = None,
         batch_id: str | None = None,
         error_hash: str | None = None,
         context: Mapping[str, object] | None = None,
-        conn: Connection | None = None,
+    ) -> str:
+        """Record an item outcome only while the worker still owns its claim."""
+        if ref.run_id != member_token.run_id or ref.token_id != work_item.token_id:
+            raise AuditIntegrityError("record_token_outcome: token reference does not belong to the claimed work item")
+        with fenced_item_transaction(self._db.engine, member_token=member_token, work_item=work_item, verb="record_token_outcome") as conn:
+            return self.record_token_outcome_on(
+                ref,
+                outcome,
+                path,
+                conn=conn,
+                sink_name=sink_name,
+                sink_node_id=sink_node_id,
+                artifact_id=artifact_id,
+                batch_id=batch_id,
+                error_hash=error_hash,
+                context=context,
+            )
+
+    def record_token_outcome_leader(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        coordination_token: CoordinationToken,
+        sink_name: str | None = None,
+        sink_node_id: str | None = None,
+        artifact_id: str | None = None,
+        batch_id: str | None = None,
+        error_hash: str | None = None,
+        context: Mapping[str, object] | None = None,
+    ) -> str:
+        """Record a finalization outcome under the leader epoch fence."""
+        if ref.run_id != coordination_token.run_id:
+            raise AuditIntegrityError("record_token_outcome_leader: token reference does not belong to the authority's run")
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="record_token_outcome_leader",
+        ) as conn:
+            return self.record_token_outcome_on(
+                ref,
+                outcome,
+                path,
+                conn=conn,
+                sink_name=sink_name,
+                sink_node_id=sink_node_id,
+                artifact_id=artifact_id,
+                batch_id=batch_id,
+                error_hash=error_hash,
+                context=context,
+            )
+
+    def record_token_outcome_on(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        sink_name: str | None = None,
+        sink_node_id: str | None = None,
+        artifact_id: str | None = None,
+        batch_id: str | None = None,
+        error_hash: str | None = None,
+        context: Mapping[str, object] | None = None,
+        conn: Connection,
         dependencies_prelocked: bool = False,
     ) -> str:
         """Record a token's (outcome, path) audit terminal in the audit trail.
@@ -476,72 +589,166 @@ class TokenOutcomeRepository:
             batch_id=batch_id,
             error_hash=error_hash,
         )
-        # Canonicalization recursively normalizes caller-controlled data and
-        # can fail. Do it before taking SQLite's single writer slot (or before
-        # touching a caller-supplied transaction); only Tier-1 reads, witness
-        # locks, and the dependent INSERT belong inside the atomic boundary.
+        # Canonicalization can fail; prepare the context before the dependent
+        # audit INSERT so malformed data cannot leave a partial outcome.
         context_json = canonical_json(context) if context is not None else None
 
-        def _record_on(active_conn: Connection) -> str:
-            # Every Tier-1 read and the dependent insert use this exact
-            # transaction. Repository-owned calls enter through
-            # write_connection(), which is BEGIN IMMEDIATE on SQLite.
-            # Outcome inserts acquire a token FK lock even for pairs without a
-            # cross-table invariant. Make that dependency explicit and first
-            # for every repository-owned outcome transaction. Composed callers
-            # prelock their whole batch before any state/artifact mutations.
-            if not dependencies_prelocked:
-                self.lock_token_outcome_dependencies((ref,), conn=active_conn)
-            self._ownership.validate_token_run_ownership(ref, conn=active_conn)
-            self._refuse_abandonment_contradiction(ref, path=path, conn=active_conn)
-            self._validate_cross_table_invariants(
-                ref,
-                outcome,
-                path,
-                sink_name=sink_name,
-                sink_node_id=sink_node_id,
-                artifact_id=artifact_id,
-                conn=active_conn,
-                lock_witnesses=not dependencies_prelocked,
-            )
+        # Every Tier-1 read and the dependent insert use the caller's exact
+        # fenced transaction, which holds SQLite's writer slot.
+        # Outcome inserts acquire a token FK lock even for pairs without a
+        # cross-table invariant. Make that dependency explicit and first
+        # for every repository-owned outcome transaction. Composed callers
+        # prelock their whole batch before any state/artifact mutations.
+        if not dependencies_prelocked:
+            self.lock_token_outcome_dependencies((ref,), conn=conn)
+        self._ownership.validate_token_run_ownership(ref, conn=conn)
+        self._refuse_abandonment_contradiction(ref, path=path, conn=conn)
+        self._validate_cross_table_invariants(
+            ref,
+            outcome,
+            path,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+            conn=conn,
+            lock_witnesses=not dependencies_prelocked,
+        )
 
-            outcome_id = f"out_{generate_id()[:12]}"
-            completed = outcome is not None
-            stmt = token_outcomes_table.insert().values(
-                outcome_id=outcome_id,
-                run_id=ref.run_id,
-                token_id=ref.token_id,
-                outcome=outcome.value if outcome is not None else None,
-                path=path.value,
-                completed=1 if completed else 0,
-                recorded_at=now(),
-                sink_name=sink_name,
-                batch_id=batch_id,
-                error_hash=error_hash,
-                context_json=context_json,
-            )
-            try:
-                result = active_conn.execute(stmt)
-            except SQLAlchemyError as exc:
-                raise LandscapeRecordError(
-                    f"record_token_outcome failed for token_id={ref.token_id!r} — database rejected audit write: {type(exc).__name__}"
-                ) from exc
-            if result.rowcount == 0:
-                raise LandscapeRecordError(f"record_token_outcome: zero rows affected for token_id={ref.token_id!r} — audit write failed")
-            return outcome_id
-
-        if conn is not None:
-            return _record_on(conn)
+        outcome_id = f"out_{generate_id()[:12]}"
+        completed = outcome is not None
+        stmt = token_outcomes_table.insert().values(
+            outcome_id=outcome_id,
+            run_id=ref.run_id,
+            token_id=ref.token_id,
+            outcome=outcome.value if outcome is not None else None,
+            path=path.value,
+            completed=1 if completed else 0,
+            recorded_at=now(),
+            sink_name=sink_name,
+            batch_id=batch_id,
+            error_hash=error_hash,
+            context_json=context_json,
+        )
         try:
-            with self._db.write_connection() as active_conn:
-                return _record_on(active_conn)
-        except LandscapeRecordError:
-            raise
+            result = conn.execute(stmt)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"record_token_outcome failed for token_id={ref.token_id!r} "
-                f"— database rejected audit transaction boundary: {type(exc).__name__}"
+                f"record_token_outcome failed for token_id={ref.token_id!r} — database rejected audit write: {type(exc).__name__}"
             ) from exc
+        if result.rowcount == 0:
+            raise LandscapeRecordError(f"record_token_outcome: zero rows affected for token_id={ref.token_id!r} — audit write failed")
+        return outcome_id
+
+    def record_token_outcomes_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        outcomes: Sequence[TokenOutcomeWrite],
+        dependencies_prelocked: bool = False,
+    ) -> list[str]:
+        """Validate ordered outcomes and insert them on one fenced connection.
+
+        In-batch abandonment contradictions receive the same refusal as
+        sequential scalar writes. Duplicate completed outcomes remain database
+        constraint failures, rolling back the caller's entire transaction.
+        """
+        if not outcomes:
+            return []
+        if not dependencies_prelocked:
+            self.lock_token_outcome_dependencies(tuple(item.ref for item in outcomes), conn=conn)
+        values: list[dict[str, object]] = []
+        outcome_ids: list[str] = []
+        abandoned: set[str] = set()
+        completed: set[str] = set()
+        for item in outcomes:
+            ref = item.ref
+            if ref.run_id != run_id:
+                raise AuditIntegrityError("Token outcome belongs to another run")
+            self._validate_outcome_fields(
+                item.outcome,
+                item.path,
+                sink_name=item.sink_name,
+                batch_id=item.batch_id,
+                error_hash=item.error_hash,
+            )
+            context_json = canonical_json(item.context) if item.context is not None else None
+            self._ownership.validate_token_run_ownership(ref, conn=conn)
+            self._refuse_abandonment_contradiction(ref, path=item.path, conn=conn)
+            if item.path is TerminalPath.ABANDONED:
+                contradiction = ref.token_id in completed
+                description = "a completed terminal outcome"
+            else:
+                contradiction = ref.token_id in abandoned
+                description = "an ABANDONED outcome"
+            if contradiction:
+                raise AuditIntegrityError(
+                    f"Cannot record {item.path.value!r} for token {ref.token_id!r}: {description} already exists; "
+                    "decided-plus-abandoned history is forbidden (ADR-038)"
+                )
+            self._validate_cross_table_invariants(
+                ref,
+                item.outcome,
+                item.path,
+                sink_name=item.sink_name,
+                sink_node_id=item.sink_node_id,
+                artifact_id=item.artifact_id,
+                conn=conn,
+                lock_witnesses=not dependencies_prelocked,
+            )
+            outcome_id = f"out_{generate_id()[:12]}"
+            outcome_ids.append(outcome_id)
+            values.append(
+                {
+                    "outcome_id": outcome_id,
+                    "run_id": run_id,
+                    "token_id": ref.token_id,
+                    "outcome": item.outcome.value if item.outcome is not None else None,
+                    "path": item.path.value,
+                    "completed": 1 if item.outcome is not None else 0,
+                    "recorded_at": now(),
+                    "sink_name": item.sink_name,
+                    "batch_id": item.batch_id,
+                    "error_hash": item.error_hash,
+                    "context_json": context_json,
+                }
+            )
+            if item.path is TerminalPath.ABANDONED:
+                abandoned.add(ref.token_id)
+            if item.outcome is not None:
+                completed.add(ref.token_id)
+        try:
+            result = conn.execute(token_outcomes_table.insert(), values)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(f"record_token_outcomes_on failed — database rejected audit write: {type(exc).__name__}") from exc
+        if result.rowcount != len(values):
+            raise LandscapeRecordError("record_token_outcomes_on: zero rows or incomplete batch — audit write failed")
+        return outcome_ids
+
+    def record_parent_outcomes_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        dispositions: Sequence[AggregationParentDisposition],
+        batch_id: str | None = None,
+    ) -> None:
+        """Record prelocked coalesce or aggregation parents in one atomic batch."""
+        self.record_token_outcomes_on(
+            conn,
+            run_id=run_id,
+            outcomes=tuple(
+                TokenOutcomeWrite(
+                    ref=item.parent_ref,
+                    outcome=item.outcome,
+                    path=item.path,
+                    batch_id=batch_id if item.path is TerminalPath.BATCH_CONSUMED else None,
+                    error_hash=item.error_hash,
+                )
+                for item in dispositions
+            ),
+            dependencies_prelocked=True,
+        )
 
     def find_orphaned_transient_parents(self, run_id: str) -> list[SQLAlchemyRow[Any]]:
         """Find I1a parent tokens with no child token outcome witnesses."""
@@ -730,42 +937,51 @@ def record_buffered_outcome_guarded(
     return outcome_id
 
 
-def record_terminal_outcome_guarded(
+def record_terminal_outcomes_guarded(
     conn: Connection,
     *,
     run_id: str,
-    token_id: str,
-    outcome: TerminalOutcome,
-    path: TerminalPath,
+    outcomes: Sequence[BarrierTerminalOutcomeSpec],
     recorded_at: datetime,
-    error_hash: str | None = None,
-) -> str:
-    """Record one terminal outcome inside a caller-owned fenced transaction."""
-    TokenOutcomeRepository._validate_outcome_fields(
-        outcome,
-        path,
-        sink_name=None,
-        batch_id=None,
-        error_hash=error_hash,
-    )
-    outcome_id = f"out_{generate_id()[:12]}"
-    try:
-        result = conn.execute(
-            token_outcomes_table.insert().values(
-                outcome_id=outcome_id,
-                run_id=run_id,
-                token_id=token_id,
-                outcome=outcome.value,
-                path=path.value,
-                completed=1,
-                recorded_at=recorded_at,
-                error_hash=error_hash,
-            )
+) -> list[str]:
+    """Insert a barrier's terminal outcomes together on its fenced connection.
+
+    Validate every pair before executing the batch. The caller owns replay
+    reconciliation and the transaction, so a duplicate terminal or any other
+    database refusal rolls back the whole barrier completion.
+    """
+    values: list[dict[str, object]] = []
+    outcome_ids: list[str] = []
+    for item in outcomes:
+        TokenOutcomeRepository._validate_outcome_fields(
+            item.outcome,
+            item.path,
+            sink_name=None,
+            batch_id=None,
+            error_hash=item.error_hash,
         )
+        outcome_id = f"out_{generate_id()[:12]}"
+        outcome_ids.append(outcome_id)
+        values.append(
+            {
+                "outcome_id": outcome_id,
+                "run_id": run_id,
+                "token_id": item.token_id,
+                "outcome": item.outcome.value,
+                "path": item.path.value,
+                "completed": 1,
+                "recorded_at": recorded_at,
+                "error_hash": item.error_hash,
+            }
+        )
+    if not values:
+        return []
+    try:
+        result = conn.execute(token_outcomes_table.insert(), values)
     except SQLAlchemyError as exc:
         raise LandscapeRecordError(
-            f"record_terminal_outcome_guarded failed for token_id={token_id!r} — database rejected audit write: {type(exc).__name__}"
+            f"record_terminal_outcomes_guarded failed — database rejected audit write: {type(exc).__name__}"
         ) from exc
-    if result.rowcount == 0:
-        raise LandscapeRecordError(f"record_terminal_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
-    return outcome_id
+    if result.rowcount != len(values):
+        raise LandscapeRecordError("record_terminal_outcomes_guarded: incomplete batch — audit write failed")
+    return outcome_ids

@@ -154,10 +154,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-# +3 identities 2026-09-08 (3ab58f336, `elspeth abandon`): abandon.py's _resume_verdict,
-# abandon_leaderless_run and inspect_leaderless_run compare the leader lease; the literal
-# now holds 93 rows (counted), digest again re-derived by running the gate.
-_CLOCK_BOUNDARY_DIGEST = "fc948f2cbbf6566d2e85acf50cad18eced0450b28aff6fdb38161a65534a6a04"
+_CLOCK_BOUNDARY_DIGEST = "cc6179ddb3f44049a3abcdf675e2c6a5a219eded7049095440d0eec539518219"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -223,10 +220,34 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.get_resume_point"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
+        ("src/elspeth/core/landscape/data_flow/errors.py", "ErrorAuditRepository.record_validation_error"),
+        ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_edge"),
+        ("src/elspeth/core/landscape/data_flow/graph.py", "GraphAuditRepository.register_node"),
+        ("src/elspeth/core/landscape/data_flow/outcomes.py", "TokenOutcomeRepository.record_token_outcome_leader"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository._insert_child_tokens_on"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.coalesce_tokens"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.collect_tokens"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token"),
-        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token_transaction"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_token"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.expand_token"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.finalize_coalesce_effect"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.fork_token"),
+        ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.insert_row_with_token_on"),
+        ("src/elspeth/core/landscape/data_flow_repository.py", "DataFlowRepository.create_quarantine_row_with_token"),
         ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_candidate"),
         ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_verified_candidate"),
+        ("src/elspeth/core/landscape/execution/batches.py", "BatchRepository.complete_batch"),
+        ("src/elspeth/core/landscape/execution/batches.py", "BatchRepository.create_batch"),
+        ("src/elspeth/core/landscape/execution/batches.py", "BatchRepository.retry_batch"),
+        ("src/elspeth/core/landscape/execution/batches.py", "BatchRepository.update_batch_status"),
+        ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository._record_operation_call_payload_refs"),
+        ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository.allocate_operation_call_index"),
+        ("src/elspeth/core/landscape/execution/calls.py", "CallAuditRepository.record_operation_call"),
+        ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.begin_node_states_many"),
+        ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state"),
+        ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state_on"),
+        ("src/elspeth/core/landscape/execution/operations.py", "OperationRepository.begin_operation"),
+        ("src/elspeth/core/landscape/execution/operations.py", "OperationRepository.complete_operation"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._finalize_on"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._validate_effect_authority"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization.finalize"),
@@ -246,6 +267,8 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.takeover_expired"),
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
+        ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_result"),
+        ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row"),
@@ -262,9 +285,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "verify_and_extend_leader_fence"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.complete_run"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.finalize_run"),
-        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.update_run_status"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_preflight_results"),
-        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_readiness_check"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_run_source"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_secret_resolutions"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.record_source_field_resolution"),
@@ -272,13 +293,13 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.set_export_pending_unless_completed"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.set_export_status"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.update_run_source_contract"),
-        ("src/elspeth/core/landscape/scheduler/fencing.py", "fenced_write"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.update_run_status"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._terminalize_consumed_barrier_rows"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._transition_passthrough_pending_sink"),
+        ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.adopt_blocked_barrier_item"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.complete_barrier"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_pending_sink_many"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.mark_blocked_barrier_terminal"),
-        ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.adopt_blocked_barrier_item"),
         ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.reset_adoption_marker_to_pending"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition"),
         ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_on"),
@@ -296,6 +317,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
             "src/elspeth/core/landscape/scheduler/dispositions.py",
             "SchedulerDispositionRepository.terminalize_pending_sinks_with_terminal_outcomes",
         ),
+        ("src/elspeth/core/landscape/scheduler/fencing.py", "fenced_write"),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.adopt_group_losses"),
         ("src/elspeth/core/landscape/scheduler/group_losses.py", "GroupLossRepository.stage_escalation_loss"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository._rotate_expired_leases"),
@@ -305,15 +327,11 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.peer_active_leases"),
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.recover_expired_leases"),
-        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced"),
         ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_row_with_initial_claim"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_ready"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.recover_expired_leases"),
-        ("src/elspeth/engine/orchestrator/abandon.py", "_resume_verdict"),
-        ("src/elspeth/engine/orchestrator/abandon.py", "abandon_leaderless_run"),
-        ("src/elspeth/engine/orchestrator/abandon.py", "inspect_leaderless_run"),
         ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator.resume"),
     }
 )
@@ -570,7 +588,16 @@ def _mapping_items(
     if isinstance(node, ast.Call) and _terminal_name(node.func) == "dict":
         if node.args:
             return None
-        return tuple((keyword.arg, keyword.value) for keyword in node.keywords if keyword.arg is not None)
+        items = []
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                items.append((keyword.arg, keyword.value))
+                continue
+            nested = _mapping_items(keyword.value, assignments, seen=seen)
+            if nested is None:
+                return None
+            items.extend(nested)
+        return tuple(items)
     return None
 
 
@@ -597,6 +624,24 @@ def _targets_authority_table(node: ast.AST, assignments: dict[str, ast.expr] | N
         and _terminal_name(_resolved_expression(candidate.args[0], bindings)) in _AUTHORITY_TABLE_NAMES
         for candidate in ast.walk(node)
     )
+
+
+def _references_authority_table(node: ast.expr, assignments: dict[str, ast.expr], imports: dict[str, str]) -> bool:
+    for candidate in ast.walk(_resolved_expression(node, assignments)):
+        if not isinstance(candidate, ast.expr):
+            continue
+        resolved = _normalized_callable(candidate, assignments)
+        chain = _attribute_chain(resolved)
+        if chain is None:
+            continue
+        head, *tail = chain.split(".")
+        origin = ".".join((imports.get(head, head), *tail))
+        if origin in _AUTHORITY_TABLE_NAMES or any(
+            origin == f"elspeth.core.landscape.schema.{table}" or origin.startswith(f"elspeth.core.landscape.schema.{table}.")
+            for table in _AUTHORITY_TABLE_NAMES
+        ):
+            return True
+    return False
 
 
 def _resolved_expression(node: ast.expr, assignments: dict[str, ast.expr], *, seen: frozenset[str] = frozenset()) -> ast.expr:
@@ -776,16 +821,39 @@ def _raw_sql_database_clock(node: ast.Call, assignments: dict[str, ast.expr]) ->
     return statement is not None and bool(re.search(r"\b(?:current_timestamp|transaction_timestamp)\b", _sql_code_only(statement).lower()))
 
 
-def _is_sqlalchemy_statement_expression(node: ast.expr, assignments: dict[str, ast.expr]) -> bool:
+def _is_sqlalchemy_statement_expression(
+    node: ast.expr,
+    assignments: dict[str, ast.expr],
+    imports: dict[str, str],
+    parameters: set[str],
+    binding_scopes: Sequence[dict[str, list[ast.AST]]],
+    path: str,
+) -> bool:
     cursor = _resolved_expression(node, assignments)
     while isinstance(cursor, ast.Call) and isinstance(cursor.func, ast.Attribute) and isinstance(cursor.func.value, ast.Call):
         cursor = cursor.func.value
-    return isinstance(cursor, ast.Call) and _resolved_terminal(cursor.func, assignments) in {
-        "delete",
-        "insert",
-        "select",
-        "update",
-    }
+    if not isinstance(cursor, ast.Call):
+        return False
+    constructor = _normalized_callable(cursor.func, assignments)
+    if not _reference_bindings_are_proven(cursor.func, assignments, imports, binding_scopes, path):
+        return False
+    chain = _attribute_chain(constructor)
+    if chain is None:
+        return False
+    head, *tail = chain.split(".")
+    if head in parameters or any(chain == name or chain.startswith(f"{name}.") for name in assignments):
+        return False
+    origin = ".".join((imports.get(head, head), *tail))
+    if len(tail) == 1 and tail[0] in {"delete", "insert", "update"} and imports.get(head, "").startswith("elspeth.core.landscape.schema."):
+        return True
+    return origin in {
+        "sqlalchemy.delete",
+        "sqlalchemy.insert",
+        "sqlalchemy.select",
+        "sqlalchemy.update",
+        "sqlalchemy.dialects.sqlite.insert",
+        "sqlalchemy.dialects.postgresql.insert",
+    } or (head not in imports and chain in {"delete", "insert", "select", "update"})
 
 
 def _has_authority_deadline_write(
@@ -1199,6 +1267,300 @@ def _reachable_expression_nodes(node: ast.AST) -> Iterable[ast.AST]:
         yield from _reachable_expression_nodes(child)
 
 
+def _lexical_binding_sites(scope: ast.AST) -> dict[str, list[ast.AST]]:
+    """Collect every binding in this scope, including definitions in branches."""
+    bindings: dict[str, list[ast.AST]] = {}
+    assignment_scope = (
+        ast.FunctionDef(
+            name="<module>",
+            args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=scope.body,
+            decorator_list=[],
+        )
+        if isinstance(scope, ast.Module)
+        else scope
+    )
+    assignments = _local_assignments(assignment_scope) if isinstance(assignment_scope, (ast.FunctionDef, ast.AsyncFunctionDef)) else {}
+    # Mapping-value analysis folds subscript writes into a synthetic dict;
+    # retain namespace alias origins separately so that folding cannot erase
+    # ``namespace = globals(); namespace['dependency'] = replacement``.
+    namespace_aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for candidate in _scoped_nodes(scope):
+            targets = (
+                candidate.targets
+                if isinstance(candidate, ast.Assign)
+                else (candidate.target,)
+                if isinstance(candidate, ast.AnnAssign)
+                else ()
+            )
+            value = candidate.value if isinstance(candidate, (ast.Assign, ast.AnnAssign)) else None
+            if (
+                isinstance(value, ast.Call)
+                and _resolved_terminal(value.func, assignments) in {"globals", "locals", "vars"}
+                and not value.args
+            ) or (isinstance(value, ast.Name) and value.id in namespace_aliases):
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in namespace_aliases:
+                        namespace_aliases.add(target.id)
+                        changed = True
+
+    class BindingVisitor(ast.NodeVisitor):
+        def bind(self, name: str, node: ast.AST) -> None:
+            bindings.setdefault(name, []).append(node)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.bind(node.id, node)
+
+        def mutation(self, receiver: ast.expr, key: ast.expr | None, node: ast.AST) -> None:
+            if isinstance(receiver, ast.Name) and receiver.id in namespace_aliases:
+                self.bind((_resolved_mapping_key(key, assignments) or "*") if key is not None else "*", node)
+                return
+            resolved = _normalized_callable(receiver, assignments)
+            if isinstance(resolved, ast.Call) and _resolved_terminal(resolved.func, assignments) in {"globals", "locals", "vars"}:
+                if resolved.args:
+                    self.mutation(resolved.args[0], None, node)
+                else:
+                    self.bind((_resolved_mapping_key(key, assignments) or "*") if key is not None else "*", node)
+                return
+            chain = _attribute_chain(resolved)
+            if chain is not None:
+                self.bind(chain.split(".", 1)[0], node)
+            elif "sys.modules" in ast.unparse(resolved) or "__name__" in ast.unparse(resolved):
+                self.bind((_resolved_mapping_key(key, assignments) or "*") if key is not None else "*", node)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.mutation(node.value, ast.Constant(node.attr), node)
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node: ast.Subscript) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.mutation(node.value, node.slice, node)
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            function = _normalized_callable(node.func, assignments)
+            terminal = _terminal_name(function)
+            if terminal in {"exec", "eval"}:
+                self.bind("*", node)
+            elif terminal in {"setattr", "delattr", "setitem", "delitem"} and len(node.args) >= 2:
+                self.mutation(node.args[0], node.args[1], node)
+            elif isinstance(function, ast.Attribute) and terminal in {"__setitem__", "__delitem__"} and node.args:
+                self.mutation(function.value, node.args[0], node)
+            elif isinstance(function, ast.Attribute) and terminal == "update":
+                if node.args:
+                    for argument in node.args:
+                        items = _mapping_items(argument, assignments)
+                        if items is None:
+                            self.mutation(function.value, None, node)
+                        else:
+                            for key, _value in items:
+                                self.mutation(function.value, ast.Constant(key), node)
+                for keyword in node.keywords:
+                    self.mutation(function.value, ast.Constant(keyword.arg) if keyword.arg is not None else None, node)
+            self.generic_visit(node)
+
+        def visit_arg(self, node: ast.arg) -> None:
+            self.bind(node.arg, node)
+            self.generic_visit(node)
+
+        def definition_expressions(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for expression in (*node.decorator_list, *node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)):
+                self.visit(expression)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self.bind(alias.asname or alias.name.split(".")[0], node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                self.bind(alias.asname or alias.name, node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is scope:
+                self.generic_visit(node)
+            else:
+                self.bind(node.name, node)
+                self.definition_expressions(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is scope:
+                self.generic_visit(node)
+            else:
+                self.bind(node.name, node)
+                self.definition_expressions(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.bind(node.name, node)
+            for expression in (*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)):
+                self.visit(expression)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            for expression in (*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)):
+                self.visit(expression)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.name is not None:
+                self.bind(node.name, node)
+            self.generic_visit(node)
+
+        def visit_MatchAs(self, node: ast.MatchAs) -> None:
+            if node.name is not None:
+                self.bind(node.name, node)
+            self.generic_visit(node)
+
+        def visit_MatchStar(self, node: ast.MatchStar) -> None:
+            if node.name is not None:
+                self.bind(node.name, node)
+
+        def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+            if node.rest is not None:
+                self.bind(node.rest, node)
+            self.generic_visit(node)
+
+    BindingVisitor().visit(scope)
+    return bindings
+
+
+def _reference_bindings_are_proven(
+    reference: ast.expr,
+    assignments: dict[str, ast.expr],
+    imports: dict[str, str],
+    scopes: Sequence[dict[str, list[ast.AST]]],
+    path: str,
+    *,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
+    chain = _attribute_chain(reference)
+    if chain is None:
+        return False
+    head = chain.split(".", 1)[0]
+    if head in seen or any("*" in scope for scope in scopes):
+        return False
+    sites = next((scope[head] for scope in reversed(scopes) if head in scope), [])
+    if not sites:
+        return head not in imports
+    if len(sites) != 1:
+        return False
+    site = sites[0]
+    if isinstance(site, ast.ImportFrom):
+        origins = {f"{_relative_import_module(path, site)}.{alias.name}" for alias in site.names if (alias.asname or alias.name) == head}
+        return origins == {imports.get(head)}
+    if isinstance(site, ast.Import):
+        origins = {alias.name for alias in site.names if (alias.asname or alias.name.split(".")[0]) == head}
+        return origins == {imports.get(head)}
+    if isinstance(site, ast.Name) and isinstance(site.ctx, ast.Store) and head in assignments:
+        return _reference_bindings_are_proven(assignments[head], assignments, imports, scopes, path, seen=seen | {head})
+    return False
+
+
+def _connection_context_identities(records: tuple[_FunctionRecord, ...], sources: dict[str, str]) -> set[tuple[str, str]]:
+    """Prove context generators yield their transaction connection, plus relays.
+
+    A connection's construction is not an unresolved timestamp.  The proof
+    follows owned ``begin_write`` contexts and exact return relays; an
+    annotation or a function name alone cannot establish it.
+    """
+    proven: set[tuple[str, str]] = set()
+    module_bindings = {path: _lexical_binding_sites(ast.parse(source, filename=path)) for path, source in sources.items()}
+    local_bindings = {id(record.node): _lexical_binding_sites(record.node) for record in records}
+
+    def has_unique_module_binding(record: _FunctionRecord, name: str, *, imported: bool) -> bool:
+        if "*" in module_bindings[record.path]:
+            return False
+        sites = module_bindings[record.path].get(name, [])
+        if len(sites) != 1:
+            return False
+        if not imported:
+            return isinstance(sites[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+        site = sites[0]
+        if not isinstance(site, ast.ImportFrom):
+            return False
+        origins = {
+            f"{_relative_import_module(record.path, site)}.{alias.name}" for alias in site.names if (alias.asname or alias.name) == name
+        }
+        return origins == {dict(record.imports).get(name)}
+
+    for record in records:
+        if not has_unique_module_binding(record, record.symbol, imported=False):
+            continue
+        imports = dict(record.imports)
+        nodes = _scoped_nodes(record.node)
+        yields = [node for node in nodes if isinstance(node, (ast.Yield, ast.YieldFrom))]
+        if len(yields) != 1 or not isinstance(yields[0], ast.Yield) or not isinstance(yields[0].value, ast.Name):
+            continue
+        if _function_return_values(record.node):
+            continue
+        if not (
+            len(record.node.decorator_list) == 1
+            and isinstance(record.node.decorator_list[0], ast.Name)
+            and imports.get(record.node.decorator_list[0].id) == "contextlib.contextmanager"
+        ):
+            continue
+        connection_name = yields[0].value.id
+        contexts = [
+            node
+            for node in nodes
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.optional_vars, ast.Name)
+                and item.optional_vars.id == connection_name
+                and isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and imports.get(item.context_expr.func.id) == "elspeth.core.landscape.database.begin_write"
+                for item in node.items
+            )
+            and yields[0] in tuple(ast.walk(node))
+        ]
+        connection_bindings = local_bindings[id(record.node)].get(connection_name, [])
+        dependencies = {
+            local
+            for local, origin in record.imports
+            if origin in {"contextlib.contextmanager", "elspeth.core.landscape.database.begin_write"}
+        }
+        if (
+            len(contexts) == 1
+            and len(connection_bindings) == 1
+            and any(item.optional_vars is connection_bindings[0] for item in contexts[0].items)
+            and "*" not in local_bindings[id(record.node)]
+            and not dependencies & local_bindings[id(record.node)].keys()
+            and all(has_unique_module_binding(record, name, imported=True) for name in dependencies)
+        ):
+            proven.add((record.path, record.symbol))
+
+    changed = True
+    while changed:
+        changed = False
+        references = {f"{module}.{symbol}" for path, symbol in proven if (module := _module_name(path)) is not None}
+        for record in records:
+            identity = (record.path, record.symbol)
+            if identity in proven:
+                continue
+            if record.node.decorator_list or not has_unique_module_binding(record, record.symbol, imported=False):
+                continue
+            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scoped_nodes(record.node)):
+                continue
+            returns = _function_return_values(record.node)
+            imports = dict(record.imports)
+            module = _module_name(record.path)
+            if returns and all(
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and "*" not in local_bindings[id(record.node)]
+                and value.func.id not in local_bindings[id(record.node)]
+                and has_unique_module_binding(record, value.func.id, imported=value.func.id in imports)
+                and imports.get(value.func.id, f"{module}.{value.func.id}") in references
+                for value in returns
+            ):
+                proven.add(identity)
+                changed = True
+    return proven
+
+
 def _clock_returning_references(
     sources: dict[str, str],
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
@@ -1302,6 +1664,9 @@ def _clock_returning_references(
                 unresolved_identities.add(identity)
                 changed = True
 
+    # A relay that returns a source-proven connection context is not a clock
+    # wrapper. Keep process provenance (including call arguments) intact.
+    unresolved_identities.difference_update(_connection_context_identities(records, sources))
     database_identities = database_candidates - process_identities - unresolved_identities
 
     reexports: dict[str, str] = {}
@@ -1451,6 +1816,7 @@ class _ClockScanner(ast.NodeVisitor):
         self._instance_assignments: dict[str, ast.expr] = {}
         self._scope_assignments: dict[int, dict[str, ast.expr]] = {}
         self._assignment_stack: list[dict[str, ast.expr]] = []
+        self._binding_scopes = [_lexical_binding_sites(self._tree)]
         self._wrappers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         self._class_wrappers: dict[tuple[str, str], ast.FunctionDef | ast.AsyncFunctionDef] = {}
         self._node_classes: dict[int, str] = {}
@@ -2306,6 +2672,7 @@ class _ClockScanner(ast.NodeVisitor):
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self._symbol_stack.append(node.name)
         self._assignment_stack.append(self._scope_assignments.get(id(node), {}))
+        self._binding_scopes.append(_lexical_binding_sites(node))
         parameters = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
         all_parameters = {parameter.arg for parameter in parameters}
         if node.args.vararg is not None:
@@ -2335,6 +2702,7 @@ class _ClockScanner(ast.NodeVisitor):
         self._parameter_stack.pop()
         self._all_parameter_stack.pop()
         self._assignment_stack.pop()
+        self._binding_scopes.pop()
         self._symbol_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -2549,6 +2917,20 @@ class _ClockScanner(ast.NodeVisitor):
                         self._emit_authority_time_sources(value, detail=key)
 
         assignments = self._current_assignments(node)
+        if called == "on_conflict_do_update":
+            for keyword in node.keywords:
+                if keyword.arg == "set_":
+                    self._emit_execution_parameter_clocks(keyword.value, assignments, authority_table=True)
+        if (
+            called == "execute"
+            and node.args
+            and _is_sqlalchemy_statement_expression(
+                node.args[0], assignments, self._imports, set().union(*self._all_parameter_stack), self._binding_scopes, self._path
+            )
+        ):
+            authority_table = self._sensitive() and _references_authority_table(node.args[0], assignments, self._imports)
+            for payload in (*node.args[1:], *(keyword.value for keyword in node.keywords if keyword.arg == "parameters")):
+                self._emit_execution_parameter_clocks(payload, assignments, authority_table=authority_table)
         if _sqlalchemy_ordering_callable(node.func, assignments, node.args):
             compared = ast.copy_location(
                 ast.Tuple(elts=[*_bound_callable_arguments(node.func, assignments), *node.args], ctx=ast.Load()),
@@ -2571,7 +2953,9 @@ class _ClockScanner(ast.NodeVisitor):
             raw_terminal in {"exec_driver_sql", "execute"}
             and node.args
             and _static_sql_text(node.args[0], assignments) is None
-            and not _is_sqlalchemy_statement_expression(node.args[0], assignments)
+            and not _is_sqlalchemy_statement_expression(
+                node.args[0], assignments, self._imports, set().union(*self._all_parameter_stack), self._binding_scopes, self._path
+            )
         ):
             payload = ast.copy_location(
                 ast.Tuple(elts=list(node.args[1:]) + [keyword.value for keyword in node.keywords], ctx=ast.Load()),
@@ -2594,6 +2978,46 @@ class _ClockScanner(ast.NodeVisitor):
                 for argument_domain in self._clock_domains(argument) - {target_domain}:
                     self._emit(node, "cross-database-clock-forwarding", f"{argument_domain} -> {target_domain}")
         self.generic_visit(node)
+
+    def _emit_execution_parameter_clocks(
+        self,
+        payload: ast.expr,
+        assignments: dict[str, ast.expr],
+        *,
+        authority_table: bool,
+        seen: frozenset[str] = frozenset(),
+    ) -> None:
+        if isinstance(payload, ast.Name):
+            if payload.id in seen:
+                if authority_table:
+                    self._emit(payload, "dynamic-authority-mapping", "cyclic execution parameters")
+                return
+            seen = seen | {payload.id}
+        resolved = _resolved_expression(payload, assignments)
+        if isinstance(resolved, (ast.List, ast.Tuple)):
+            for item in resolved.elts:
+                self._emit_execution_parameter_clocks(item, assignments, authority_table=authority_table, seen=seen)
+            return
+        if isinstance(resolved, ast.ListComp):
+            self._emit_execution_parameter_clocks(resolved.elt, assignments, authority_table=authority_table, seen=seen)
+            return
+        unproven_dict = any(
+            isinstance(candidate, ast.Call)
+            and _terminal_name(candidate.func) == "dict"
+            and (
+                self._qualified(candidate.func) not in {"dict", "builtins.dict"}
+                or not _reference_bindings_are_proven(candidate.func, assignments, self._imports, self._binding_scopes, self._path)
+            )
+            for candidate in ast.walk(resolved)
+        )
+        items = None if unproven_dict else _mapping_items(resolved, assignments)
+        if items is None:
+            if authority_table:
+                self._emit(payload, "dynamic-authority-mapping", ast.unparse(payload))
+            return
+        for key, value in items:
+            if key in _AUTHORITY_DEADLINES and not (isinstance(value, ast.Constant) and value.value is None):
+                self._emit_authority_time_sources(value, detail=key)
 
     def _mapping_contains_clock(self, node: ast.expr, *, seen: frozenset[str] = frozenset()) -> bool:
         if isinstance(node, ast.Dict):
@@ -5712,6 +6136,382 @@ def harmless():
     assert (path, "harmless") not in {(boundary.path, boundary.symbol) for boundary in _discover_authority_boundaries({path: source})}
 
 
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+@pytest.mark.parametrize("import_form", ["alias", "module", "local-alias"])
+def test_dialect_insert_constructor_provenance_accepts_real_imports(dialect: str, import_form: str) -> None:
+    binding = (
+        f"from sqlalchemy.dialects.{dialect} import insert as dialect_insert"
+        if import_form != "module"
+        else f"from sqlalchemy.dialects import {dialect} as dialect"
+    )
+    constructor = "dialect.insert" if import_form == "module" else "dialect_insert"
+    local = "    build = dialect_insert\n" if import_form == "local-alias" else ""
+    constructor = "build" if local else constructor
+    source = f"""
+from datetime import datetime
+{binding}
+def claim_ready(conn):
+{local}    conn.execute(
+        {constructor}(group_losses_table).on_conflict_do_nothing(index_elements=['run_id']).returning(group_losses_table.c.loss_id),
+        [{{'recorded_at': datetime.now(), 'run_id': 'run'}}],
+    )
+"""
+    assert _scan_source(source) == ()
+
+
+@pytest.mark.parametrize(
+    "binding,parameters,setup",
+    [
+        ("from impostor import insert as dialect_insert", "", ""),
+        ("from sqlalchemy.dialects.sqlite import insert as dialect_insert", ", dialect_insert", ""),
+        ("from sqlalchemy.dialects.sqlite import insert as dialect_insert", "", "    dialect_insert = foreign\n"),
+        ("from sqlalchemy.dialects.sqlite import insert as dialect_insert", "", "    dialect_insert: object = foreign\n"),
+        ("", "", ""),
+    ],
+    ids=["foreign-import", "parameter-shadow", "assignment-shadow", "annotated-shadow", "name-only"],
+)
+def test_dialect_insert_constructor_provenance_rejects_impostors(binding: str, parameters: str, setup: str) -> None:
+    source = f"""
+{binding}
+def claim_ready(conn{parameters}):
+{setup}    conn.execute(dialect_insert(group_losses_table).returning(group_losses_table.c.loss_id), [{{'run_id': 'run'}}])
+"""
+    assert "dynamic-authority-raw-sql" in {violation.kind for violation in _scan_source(source)}
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+@pytest.mark.parametrize(
+    "statement,payload",
+    [
+        (".values(lease_expires_at=datetime.now())", ""),
+        ("", ", [{'lease_expires_at': datetime.now()}]"),
+        ("", ", parameters=[{'lease_expires_at': datetime.now()}]"),
+        ("", ", dict(**{'lease_expires_at': datetime.now()})"),
+        ("", ", dict(**dict(**{'lease_expires_at': datetime.now()}))"),
+        (".on_conflict_do_update(index_elements=['run_id'], set_={'lease_expires_at': datetime.now()})", ""),
+    ],
+    ids=["values", "executemany", "keyword-executemany", "dict-unpack", "nested-dict-unpack", "conflict-update"],
+)
+def test_dialect_insert_does_not_hide_process_deadlines(dialect: str, statement: str, payload: str) -> None:
+    source = f"""
+from datetime import datetime
+from sqlalchemy.dialects.{dialect} import insert as dialect_insert
+def claim_ready(conn):
+    conn.execute(dialect_insert(token_work_items_table){statement}{payload})
+"""
+    assert "process-clock-authority" in {violation.kind for violation in _scan_source(source)}
+
+
+@pytest.mark.parametrize("setup", ["", "    rows = [rows]\n"])
+def test_dialect_insert_refuses_unknown_or_cyclic_authority_parameters(setup: str) -> None:
+    source = f"""
+from sqlalchemy.dialects.sqlite import insert as dialect_insert
+def claim_ready(conn, rows):
+{setup}    conn.execute(dialect_insert(token_work_items_table), rows)
+"""
+    assert "dynamic-authority-mapping" in {violation.kind for violation in _scan_source(source)}
+
+
+def test_dialect_insert_accepts_explicit_database_deadline_parameters() -> None:
+    source = """
+from sqlalchemy import func
+from sqlalchemy.dialects.sqlite import insert as dialect_insert
+def claim_ready(conn):
+    conn.execute(dialect_insert(token_work_items_table), [{'lease_expires_at': func.current_timestamp()}])
+"""
+    assert _scan_source(source) == ()
+
+
+@pytest.mark.parametrize(
+    "binding,table,setup",
+    [
+        ("from elspeth.core.landscape.schema import token_work_items_table as items", "items", ""),
+        ("from elspeth.core.landscape import schema as tables", "tables.token_work_items_table", ""),
+        ("from elspeth.core.landscape.schema import token_work_items_table as items", "alias", "    alias = items\n"),
+    ],
+    ids=["import-alias", "module-alias", "local-alias"],
+)
+def test_dialect_insert_checks_unknown_parameters_with_aliased_authority_tables(binding: str, table: str, setup: str) -> None:
+    source = f"""
+from sqlalchemy.dialects.sqlite import insert as dialect_insert
+{binding}
+def claim_ready(conn, rows):
+{setup}    conn.execute(dialect_insert({table}), rows)
+"""
+    assert "dynamic-authority-mapping" in {violation.kind for violation in _scan_source(source)}
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "    def dialect_insert(table):\n        return foreign(table)\n",
+        "    class dialect_insert:\n        pass\n",
+        "    if flag:\n        def dialect_insert(table):\n            return foreign(table)\n",
+    ],
+    ids=["function", "class", "conditional-function"],
+)
+def test_dialect_insert_provenance_rejects_local_definitions(binding: str) -> None:
+    source = f"""
+from datetime import datetime
+from sqlalchemy.dialects.sqlite import insert as dialect_insert
+def claim_ready(conn):
+{binding}    conn.execute(dialect_insert(token_work_items_table), [{{'recorded_at': datetime.now()}}])
+"""
+    assert "dynamic-authority-raw-sql" in {violation.kind for violation in _scan_source(source)}
+
+
+@pytest.mark.parametrize(
+    "module,parameters,body",
+    [
+        ("", ", dict", ""),
+        ("from foreign import dict", "", ""),
+        ("", "", "    def dict(**kwargs):\n        return foreign()\n"),
+        ("", "", "    class dict:\n        pass\n"),
+    ],
+    ids=["parameter", "import", "function", "class"],
+)
+def test_dialect_insert_provenance_rejects_spoofed_dict_constructor(module: str, parameters: str, body: str) -> None:
+    source = f"""
+from sqlalchemy.dialects.sqlite import insert as dialect_insert
+{module}
+def claim_ready(conn{parameters}):
+{body}    conn.execute(dialect_insert(token_work_items_table), dict(recorded_at='audit'))
+"""
+    assert "dynamic-authority-mapping" in {violation.kind for violation in _scan_source(source)}
+
+
+def _connection_context_clock_sources() -> dict[str, str]:
+    return {
+        "src/elspeth/core/landscape/transaction_context.py": """
+from contextlib import contextmanager
+from elspeth.core.landscape.database import begin_write
+@contextmanager
+def transaction_context(engine):
+    with begin_write(engine) as conn:
+        yield conn
+""",
+        "src/elspeth/core/landscape/transaction_relay.py": """
+from elspeth.core.landscape.transaction_context import transaction_context
+def transaction_relay(engine):
+    return transaction_context(engine)
+""",
+        "src/elspeth/core/landscape/claim.py": """
+from datetime import datetime
+from sqlalchemy import update
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.transaction_relay import transaction_relay
+def claim_ready(engine):
+    with transaction_relay(engine) as conn:
+        conn.execute(update(token_work_items_table).values(lease_expires_at=read_landscape_transaction_time(conn)))
+""",
+    }
+
+
+def test_connection_context_provenance_does_not_become_an_unresolved_clock() -> None:
+    assert _scan_sources(_connection_context_clock_sources()) == ()
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("yield conn", "yield foreign()"),
+        ("yield conn", "conn = foreign()\n        yield conn"),
+        ("yield conn", "del conn\n        yield conn"),
+        ("from contextlib import contextmanager", "from foreign import contextmanager"),
+        ("from elspeth.core.landscape.database import begin_write", "from foreign import begin_write"),
+        ("def transaction_context(engine):", "def transaction_context(engine, begin_write):"),
+        ("@contextmanager", "begin_write = foreign\n@contextmanager"),
+        ("@contextmanager", "contextmanager = foreign\n@contextmanager"),
+    ],
+    ids=[
+        "foreign-yield",
+        "connection-rebound",
+        "connection-deleted",
+        "foreign-decorator",
+        "foreign-context",
+        "parameter-shadow",
+        "context-shadow",
+        "decorator-shadow",
+    ],
+)
+def test_connection_context_provenance_refuses_unproven_contexts(old: str, new: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] = sources[path].replace(old, new)
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+def test_connection_context_provenance_preserves_process_arguments() -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/claim.py"
+    sources[path] = sources[path].replace("transaction_relay(engine)", "transaction_relay(datetime.now())")
+    assert "process-clock-authority" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("def transaction_relay(engine):", "def transaction_relay(engine, transaction_context):"),
+        ("    return transaction_context(engine)", "    transaction_context = foreign\n    return transaction_context(engine)"),
+        ("def transaction_relay(engine):", "transaction_context = foreign\ndef transaction_relay(engine):"),
+        ("    return transaction_context(engine)", "    yield foreign()\n    return transaction_context(engine)"),
+    ],
+    ids=["parameter-shadow", "local-shadow", "module-shadow", "generator-relay"],
+)
+def test_connection_context_provenance_refuses_forged_relays(old: str, new: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_relay.py"
+    sources[path] = sources[path].replace(old, new)
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize("rebound", [False, True])
+def test_connection_context_provenance_checks_same_module_relay_binding(rebound: bool) -> None:
+    sources = _connection_context_clock_sources()
+    context_path = "src/elspeth/core/landscape/transaction_context.py"
+    relay_path = "src/elspeth/core/landscape/transaction_relay.py"
+    sources[relay_path] = sources[context_path] + "\ndef transaction_relay(engine):\n    return transaction_context(engine)\n"
+    if rebound:
+        sources[relay_path] += "\ntransaction_context = foreign\n"
+    violations = _scan_sources(sources)
+    if rebound:
+        assert "unresolved-clock-provenance" in {violation.kind for violation in violations}
+    else:
+        assert violations == ()
+
+
+@pytest.mark.parametrize(
+    "decorators",
+    ["@foreign\n@contextmanager", "@contextmanager\n@foreign", "@contextmanager\n@contextmanager"],
+    ids=["outer-decorator", "inner-decorator", "repeated-decorator"],
+)
+def test_connection_context_provenance_rejects_stacked_decorators(decorators: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] = sources[path].replace("@contextmanager", decorators)
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+def test_connection_context_provenance_rejects_decorated_relay() -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_relay.py"
+    sources[path] = sources[path].replace("def transaction_relay", "@foreign\ndef transaction_relay")
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "def begin_write(engine):\n        return foreign()",
+        "class begin_write:\n        pass",
+        "if engine:\n        def begin_write(engine):\n            return foreign()",
+        "import foreign as begin_write",
+        "from foreign import begin_write",
+        "try:\n        foreign()\n    except Exception as begin_write:\n        pass",
+        "match engine:\n        case {'context': begin_write}:\n            pass",
+        "(begin_write := foreign)",
+        "def helper(value=(begin_write := foreign)):\n        pass",
+        "@decorate(begin_write := foreign)\n    def helper():\n        pass",
+        "for begin_write in contexts:\n        pass",
+        "with foreign() as begin_write:\n        pass",
+    ],
+    ids=[
+        "function",
+        "class",
+        "conditional-function",
+        "import",
+        "from-import",
+        "exception",
+        "pattern",
+        "walrus",
+        "default-walrus",
+        "decorator-walrus",
+        "loop",
+        "context",
+    ],
+)
+def test_connection_context_provenance_rejects_every_local_dependency_binding(binding: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] = sources[path].replace("    with begin_write(engine)", f"    {binding}\n    with begin_write(engine)")
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize("conditional", [False, True])
+def test_connection_context_provenance_rejects_nested_relay_definitions(conditional: bool) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_relay.py"
+    binding = (
+        "    if engine:\n        def transaction_context(engine):\n            return foreign()\n"
+        if conditional
+        else "    def transaction_context(engine):\n        return foreign()\n"
+    )
+    sources[path] = sources[path].replace("    return transaction_context(engine)", binding + "    return transaction_context(engine)")
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize("shadow", ["begin_write", "transaction_context", "contextmanager"])
+def test_connection_context_provenance_rejects_conditional_module_definitions(shadow: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] += f"\nif flag:\n    def {shadow}(*args):\n        return foreign()\n"
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize("module", ["transaction_context", "transaction_relay"])
+def test_connection_context_provenance_refuses_wildcard_shadowing(module: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = f"src/elspeth/core/landscape/{module}.py"
+    sources[path] += "\nfrom foreign import *\n"
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "        def conn():\n            return foreign()\n",
+        "        class conn:\n            pass\n",
+        "        if flag:\n            def conn():\n                return foreign()\n",
+    ],
+    ids=["function", "class", "conditional-function"],
+)
+def test_connection_context_provenance_rejects_shadowed_yield_binding(binding: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] = sources[path].replace("        yield conn", binding + "        yield conn")
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "begin_write.__code__ = foreign.__code__",
+        "globals()['begin_write'] = foreign",
+        "globals()['contextmanager'] = foreign",
+        "alias = begin_write\nalias.__code__ = foreign.__code__",
+        "namespace = globals()\nnamespace['begin_write'] = foreign",
+        "setattr(begin_write, '__code__', foreign.__code__)",
+        "globals().update(begin_write=foreign)",
+        "globals().__setitem__('begin_write', foreign)",
+    ],
+    ids=[
+        "code",
+        "namespace-context",
+        "namespace-decorator",
+        "code-alias",
+        "namespace-alias",
+        "setattr",
+        "namespace-update",
+        "namespace-setitem",
+    ],
+)
+def test_connection_context_provenance_rejects_dependency_mutations(mutation: str) -> None:
+    sources = _connection_context_clock_sources()
+    path = "src/elspeth/core/landscape/transaction_context.py"
+    sources[path] = sources[path].replace("@contextmanager", mutation + "\n@contextmanager")
+    assert "unresolved-clock-provenance" in {violation.kind for violation in _scan_sources(sources)}
+
+
 def test_clock_authority_definition_inventory_is_closed_and_stable() -> None:
     live = _clock_boundary_inventory()
     identities = frozenset((boundary.path, boundary.symbol) for boundary in live)
@@ -5940,18 +6740,18 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         )
 
         row, scheduler_token = factory.data_flow.create_row_with_token(
-            run_id,
             source_node_id,
             0,
             {"id": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token,
         )
         row_payload = factory.scheduler.serialize_row_payload(
             PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         )
         work_item = factory.scheduler.enqueue_ready(
-            run_id=run_id,
+            member_token=token.membership,
             token_id=scheduler_token.token_id,
             row_id=row.row_id,
             node_id=source_node_id,
@@ -5962,7 +6762,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         landscape_before = database_now()
         claimed = call_with_legacy_now(
             factory.scheduler.claim_ready,
-            run_id=run_id,
+            member_token=token.membership,
             lease_owner=leader_worker_id,
             lease_seconds=30,
         )
@@ -5988,19 +6788,18 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             plugin_name="sink",
         )
         effect_payload = {"ordinal": 0}
-        effect_row = factory.data_flow.create_row(
-            run_id=run_id,
+        _, effect_token = factory.data_flow.create_row_with_token(
+            coordination_token=token,
             source_node_id=source_node_id,
             row_index=1,
             data=effect_payload,
             source_row_index=1,
             ingest_sequence=1,
         )
-        effect_token = factory.data_flow.create_token(effect_row.row_id)
         factory.execution.begin_node_state(
             token_id=effect_token.token_id,
             node_id=sink_node_id,
-            run_id=run_id,
+            member_token=token.membership,
             step_index=0,
             input_data=effect_payload,
         )

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import TokenInfo
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -15,6 +16,8 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.testing import make_field, make_row
 from tests.unit.engine.conftest import MockCoalesceExecutor
+
+_COORDINATION_TOKEN = CoordinationToken(run_id="run_001", worker_id="mock-worker", leader_epoch=1)
 
 
 class _CallRecord:
@@ -60,7 +63,7 @@ class _RecorderDouble:
 
 class _DataFlowDouble:
     def __init__(self) -> None:
-        self.record_token_outcome = _CallRecorder()
+        self.record_token_outcome_leader = _CallRecorder()
 
 
 class _SpanFactorySentinel:
@@ -83,10 +86,11 @@ def _coalesce_tokens_impl(
     parents: list[TokenInfo],
     merged_data: PipelineRow,
     node_id: NodeID,
-    run_id: str,
+    coordination_token: CoordinationToken,
     parent_completions: list[Any],
 ) -> tuple[TokenInfo, str]:
     assert len(parent_completions) == len(parents)
+    assert coordination_token is _COORDINATION_TOKEN
     merged = TokenInfo(
         row_id=parents[0].row_id,
         token_id="merged_001",
@@ -213,10 +217,10 @@ class TestCoalesceExecutorPipelineRow:
         )
 
         # Accept both tokens
-        outcome_a = executor.accept(token_a, "merge_point")
+        outcome_a = executor.accept(token_a, "merge_point", coordination_token=_COORDINATION_TOKEN)
         assert outcome_a.held is True  # Waiting for branch_b
 
-        outcome_b = executor.accept(token_b, "merge_point")
+        outcome_b = executor.accept(token_b, "merge_point", coordination_token=_COORDINATION_TOKEN)
         assert outcome_b.held is False  # Merge triggered
 
         # Should have called coalesce_tokens with PipelineRow containing merged contract
@@ -279,11 +283,11 @@ class TestCoalesceExecutorPipelineRow:
         )
 
         # Accept first token
-        executor.accept(token_a, "merge_point")
+        executor.accept(token_a, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
         # Accept second token should crash
         with pytest.raises(OrchestrationInvariantError, match="has no contract"):
-            executor.accept(token_b, "merge_point")
+            executor.accept(token_b, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
     def test_coalesce_merge_failure_returns_graceful_failure(self) -> None:
         """Contract merge failure should return graceful failure outcome.
@@ -353,10 +357,10 @@ class TestCoalesceExecutorPipelineRow:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
-        executor.accept(token_a, "merge_point")
+        executor.accept(token_a, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
         # Second accept triggers merge, which fails due to type conflict
-        outcome = executor.accept(token_b, "merge_point")
+        outcome = executor.accept(token_b, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
         # Outcome indicates failure, not held or merged
         assert outcome.failure_reason is not None
@@ -404,7 +408,7 @@ class TestCoalesceExecutorPipelineRow:
         )
 
         # Accept first token - should merge immediately with "first" policy
-        outcome = executor.accept(token_a, "merge_point")
+        outcome = executor.accept(token_a, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
         assert outcome.held is False
         assert outcome.merged_token is not None
@@ -452,8 +456,8 @@ class TestCoalesceExecutorPipelineRow:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork_001", member_key="branch_b"),),
         )
 
-        executor.accept(token_a, "merge_point")
-        executor.accept(token_b, "merge_point")
+        executor.accept(token_a, "merge_point", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(token_b, "merge_point", coordination_token=_COORDINATION_TOKEN)
 
         # Union merge: later branches override, all fields present
         call_kwargs = token_manager.coalesce_tokens.call_args.kwargs

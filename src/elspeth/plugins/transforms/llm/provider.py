@@ -27,6 +27,8 @@ from elspeth.contracts import Call, CallStatus, CallType
 from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 
@@ -35,6 +37,9 @@ class _AuditClientKwargs(TypedDict):
     state_id: str | None
     token_id: str | None
     operation_id: str | None
+    coordination_token: CoordinationToken | None
+    member_token: WorkerMembershipToken | None
+    work_item: TokenWorkItem | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +49,9 @@ class LLMAuditParent:
     state_id: str | None = None
     token_id: str | None = None
     operation_id: str | None = None
+    coordination_token: CoordinationToken | None = None
+    member_token: WorkerMembershipToken | None = None
+    work_item: TokenWorkItem | None = None
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -64,12 +72,27 @@ class LLMAuditParent:
             raise ValueError("operation audit parent requires a non-empty operation_id")
 
     @classmethod
-    def for_row(cls, *, state_id: str, token_id: str) -> LLMAuditParent:
-        return cls(state_id=state_id, token_id=token_id)
+    def for_row(cls, *, state_id: str, token_id: str, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> LLMAuditParent:
+        return cls(state_id=state_id, token_id=token_id, member_token=member_token, work_item=work_item)
 
     @classmethod
-    def for_operation(cls, *, operation_id: str) -> LLMAuditParent:
-        return cls(operation_id=operation_id)
+    def for_operation(cls, *, operation_id: str, coordination_token: CoordinationToken) -> LLMAuditParent:
+        return cls(operation_id=operation_id, coordination_token=coordination_token)
+
+    def _require_coordination_token(self) -> CoordinationToken:
+        if not isinstance(self.coordination_token, CoordinationToken):
+            raise RuntimeError("LLM operation audit parent lacks leader authority")
+        return self.coordination_token
+
+    def _require_member_token(self) -> WorkerMembershipToken:
+        if not isinstance(self.member_token, WorkerMembershipToken):
+            raise RuntimeError("LLM row audit parent lacks member authority")
+        return self.member_token
+
+    def _require_work_item(self) -> TokenWorkItem:
+        if not isinstance(self.work_item, TokenWorkItem):
+            raise RuntimeError("LLM row audit parent lacks its claimed work item")
+        return self.work_item
 
     @property
     def cache_key(self) -> str:
@@ -84,6 +107,9 @@ class LLMAuditParent:
             "state_id": self.state_id,
             "token_id": self.token_id,
             "operation_id": self.operation_id,
+            "coordination_token": self.coordination_token,
+            "member_token": self.member_token,
+            "work_item": self.work_item,
         }
 
     def tracing_metadata(self) -> dict[str, str]:
@@ -97,10 +123,10 @@ class LLMAuditParent:
     def allocate_call_index(self, recorder: CallRecorder) -> int:
         """Allocate the next semantic-call index under this parent."""
         if self.operation_id is not None:
-            return recorder.allocate_operation_call_index(self.operation_id)
+            return recorder.allocate_operation_call_index(self.operation_id, coordination_token=self._require_coordination_token())
         if self.state_id is None:
             raise RuntimeError("validated row parent lost state_id")
-        return recorder.allocate_call_index(self.state_id)
+        return recorder.allocate_call_index(self.state_id, member_token=self._require_member_token(), work_item=self._require_work_item())
 
     def record_call(
         self,
@@ -118,6 +144,7 @@ class LLMAuditParent:
         """Record a semantic call under this validated parent."""
         if self.operation_id is not None:
             return recorder.record_operation_call(
+                coordination_token=self._require_coordination_token(),
                 operation_id=self.operation_id,
                 call_index=call_index,
                 call_type=call_type,
@@ -131,6 +158,8 @@ class LLMAuditParent:
         if self.state_id is None:
             raise RuntimeError("validated row parent lost state_id")
         return recorder.record_call(
+            member_token=self._require_member_token(),
+            work_item=self._require_work_item(),
             state_id=self.state_id,
             call_index=call_index,
             call_type=call_type,
@@ -338,7 +367,7 @@ class LLMProvider(Protocol):
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult: ...
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Validate provider/model reachability before row processing."""
         ...
 

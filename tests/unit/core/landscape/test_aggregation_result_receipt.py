@@ -15,12 +15,21 @@ from elspeth.contracts.node_state_context import AggregationFlushContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
     aggregation_result_outputs_table,
     aggregation_results_table,
 )
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+
+
+def _add_batch_member(setup: RecorderSetup, batch_id: str, token_id: str, ordinal: int) -> None:
+    with fenced_leader_transaction(
+        setup.db.engine, token=setup.coordination_token, window_seconds=300, verb="test_receipt_membership"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal, expected_run_id=setup.run_id)
 
 
 def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -34,22 +43,24 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
         plugin_name="aggregator",
     )
     for ordinal in range(2):
-        setup.data_flow.create_row(
-            setup.run_id,
+        setup.data_flow.create_row_with_token(
             setup.source_node_id,
             ordinal,
             {"value": ordinal + 1},
             row_id=f"row-{ordinal}",
             source_row_index=ordinal,
             ingest_sequence=ordinal,
+            coordination_token=setup.coordination_token,
+            token_id=f"tok-{ordinal}",
         )
-        setup.data_flow.create_token(f"row-{ordinal}", token_id=f"tok-{ordinal}")
 
     execution = setup.execution
-    state = execution.begin_node_state("tok-0", "agg-1", setup.run_id, 0, {"value": 1}, state_id="state-1")
-    execution.create_batch(setup.run_id, "agg-1", batch_id="batch-1")
-    execution.add_batch_member("batch-1", "tok-0", ordinal=0)
-    execution.add_batch_member("batch-1", "tok-1", ordinal=1)
+    state = execution.begin_node_state(
+        "tok-0", "agg-1", 0, {"value": 1}, state_id="state-1", member_token=setup.coordination_token.membership
+    )
+    execution.create_batch("agg-1", batch_id="batch-1", coordination_token=setup.coordination_token)
+    _add_batch_member(setup, "batch-1", "tok-0", ordinal=0)
+    _add_batch_member(setup, "batch-1", "tok-1", ordinal=1)
     with setup.db.write_connection() as conn:
         for ordinal in range(2):
             record_buffered_outcome_guarded(
@@ -59,15 +70,15 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
                 batch_id="batch-1",
                 recorded_at=datetime.now(UTC),
             )
-    execution.update_batch_status("batch-1", BatchStatus.EXECUTING, state_id=state.state_id)
+    execution.update_batch_status("batch-1", BatchStatus.EXECUTING, state_id=state.state_id, coordination_token=setup.coordination_token)
 
-    real_complete_batch = execution.batches.complete_batch
+    real_complete_batch = execution.batches.complete_batch_on
 
     def fail_after_batch_completion(*args: object, **kwargs: object) -> object:
         real_complete_batch(*args, **kwargs)
         raise RuntimeError("injected failure after batch completion")
 
-    monkeypatch.setattr(execution.batches, "complete_batch", fail_after_batch_completion)
+    monkeypatch.setattr(execution.batches, "complete_batch_on", fail_after_batch_completion)
     output = PipelineRow({"total": 3}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     members = tuple(
         AggregationResultMember(
@@ -81,7 +92,6 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
     def complete(row: PipelineRow = output, *, duration_ms: float = 1.0) -> object:
         return execution.complete_aggregation_result(
             batch_id="batch-1",
-            run_id=setup.run_id,
             aggregation_node_id="agg-1",
             state_id=state.state_id,
             trigger_type=TriggerType.END_OF_SOURCE,
@@ -103,6 +113,7 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
                 row_end=2,
                 is_end_of_source=True,
             ),
+            coordination_token=setup.coordination_token,
         )
 
     with pytest.raises(RuntimeError, match="injected failure after batch completion"):
@@ -114,7 +125,7 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
         for table in (aggregation_results_table, aggregation_result_outputs_table, aggregation_result_members_table):
             assert conn.execute(select(func.count()).select_from(table)).scalar_one() == 0
 
-    monkeypatch.setattr(execution.batches, "complete_batch", real_complete_batch)
+    monkeypatch.setattr(execution.batches, "complete_batch_on", real_complete_batch)
     first = complete()
     second = complete()
     assert first == second
@@ -149,22 +160,24 @@ def test_completion_accepts_original_batch_acceptances_on_a_retry_batch() -> Non
         plugin_name="aggregator",
     )
     for ordinal in range(2):
-        setup.data_flow.create_row(
-            setup.run_id,
+        setup.data_flow.create_row_with_token(
             setup.source_node_id,
             ordinal,
             {"value": ordinal + 1},
             row_id=f"row-{ordinal}",
             source_row_index=ordinal,
             ingest_sequence=ordinal,
+            coordination_token=setup.coordination_token,
+            token_id=f"tok-{ordinal}",
         )
-        setup.data_flow.create_token(f"row-{ordinal}", token_id=f"tok-{ordinal}")
 
     execution = setup.execution
-    first_state = execution.begin_node_state("tok-0", "agg-1", setup.run_id, 0, {"value": 1}, state_id="state-1")
-    execution.create_batch(setup.run_id, "agg-1", batch_id="batch-1")
-    execution.add_batch_member("batch-1", "tok-0", ordinal=0)
-    execution.add_batch_member("batch-1", "tok-1", ordinal=1)
+    first_state = execution.begin_node_state(
+        "tok-0", "agg-1", 0, {"value": 1}, state_id="state-1", member_token=setup.coordination_token.membership
+    )
+    execution.create_batch("agg-1", batch_id="batch-1", coordination_token=setup.coordination_token)
+    _add_batch_member(setup, "batch-1", "tok-0", ordinal=0)
+    _add_batch_member(setup, "batch-1", "tok-1", ordinal=1)
     with setup.db.write_connection() as conn:
         for ordinal in range(2):
             record_buffered_outcome_guarded(
@@ -174,7 +187,9 @@ def test_completion_accepts_original_batch_acceptances_on_a_retry_batch() -> Non
                 batch_id="batch-1",
                 recorded_at=datetime.now(UTC),
             )
-    execution.update_batch_status("batch-1", BatchStatus.EXECUTING, state_id=first_state.state_id)
+    execution.update_batch_status(
+        "batch-1", BatchStatus.EXECUTING, state_id=first_state.state_id, coordination_token=setup.coordination_token
+    )
 
     # First flush attempt dies: FAILED node state + FAILED batch, then the
     # resume-side repair mints the retry batch with copied members.
@@ -183,23 +198,28 @@ def test_completion_accepts_original_batch_acceptances_on_a_retry_batch() -> Non
         status=NodeStateStatus.FAILED,
         duration_ms=1.0,
         error=ExecutionError(exception="injected flush crash", exception_type="RuntimeError"),
+        member_token=setup.coordination_token.membership,
     )
     execution.complete_batch(
         "batch-1",
         BatchStatus.FAILED,
         trigger_type=TriggerType.END_OF_SOURCE,
         state_id=first_state.state_id,
+        coordination_token=setup.coordination_token,
     )
-    retry = execution.retry_batch("batch-1")
+    retry = execution.retry_batch("batch-1", coordination_token=setup.coordination_token)
     assert retry.retry_of_batch_id == "batch-1"
 
-    resume_state = execution.begin_node_state("tok-0", "agg-1", setup.run_id, 0, {"value": 1}, state_id="state-2", attempt=1)
-    execution.update_batch_status(retry.batch_id, BatchStatus.EXECUTING, state_id=resume_state.state_id)
+    resume_state = execution.begin_node_state(
+        "tok-0", "agg-1", 0, {"value": 1}, state_id="state-2", attempt=1, member_token=setup.coordination_token.membership
+    )
+    execution.update_batch_status(
+        retry.batch_id, BatchStatus.EXECUTING, state_id=resume_state.state_id, coordination_token=setup.coordination_token
+    )
 
     output = PipelineRow({"total": 3}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     receipt = execution.complete_aggregation_result(
         batch_id=retry.batch_id,
-        run_id=setup.run_id,
         aggregation_node_id="agg-1",
         state_id=resume_state.state_id,
         trigger_type=TriggerType.END_OF_SOURCE,
@@ -228,6 +248,7 @@ def test_completion_accepts_original_batch_acceptances_on_a_retry_batch() -> Non
             row_end=2,
             is_end_of_source=True,
         ),
+        coordination_token=setup.coordination_token,
     )
 
     assert receipt.batch_id == retry.batch_id
@@ -250,22 +271,24 @@ def test_completion_refuses_buffered_acceptance_outside_the_retry_lineage() -> N
         node_type=NodeType.AGGREGATION,
         plugin_name="aggregator",
     )
-    setup.data_flow.create_row(
-        setup.run_id,
+    setup.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"value": 1},
         row_id="row-0",
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=setup.coordination_token,
+        token_id="tok-0",
     )
-    setup.data_flow.create_token("row-0", token_id="tok-0")
 
     execution = setup.execution
-    state = execution.begin_node_state("tok-0", "agg-1", setup.run_id, 0, {"value": 1}, state_id="state-1")
-    execution.create_batch(setup.run_id, "agg-1", batch_id="batch-a")
-    execution.create_batch(setup.run_id, "agg-1", batch_id="batch-b")
-    execution.add_batch_member("batch-a", "tok-0", ordinal=0)
+    state = execution.begin_node_state(
+        "tok-0", "agg-1", 0, {"value": 1}, state_id="state-1", member_token=setup.coordination_token.membership
+    )
+    execution.create_batch("agg-1", batch_id="batch-a", coordination_token=setup.coordination_token)
+    execution.create_batch("agg-1", batch_id="batch-b", coordination_token=setup.coordination_token)
+    _add_batch_member(setup, "batch-a", "tok-0", ordinal=0)
     with setup.db.write_connection() as conn:
         record_buffered_outcome_guarded(
             conn,
@@ -274,13 +297,12 @@ def test_completion_refuses_buffered_acceptance_outside_the_retry_lineage() -> N
             batch_id="batch-b",
             recorded_at=datetime.now(UTC),
         )
-    execution.update_batch_status("batch-a", BatchStatus.EXECUTING, state_id=state.state_id)
+    execution.update_batch_status("batch-a", BatchStatus.EXECUTING, state_id=state.state_id, coordination_token=setup.coordination_token)
 
     output = PipelineRow({"total": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     with pytest.raises(AuditIntegrityError, match="within the batch retry lineage"):
         execution.complete_aggregation_result(
             batch_id="batch-a",
-            run_id=setup.run_id,
             aggregation_node_id="agg-1",
             state_id=state.state_id,
             trigger_type=TriggerType.END_OF_SOURCE,
@@ -308,6 +330,7 @@ def test_completion_refuses_buffered_acceptance_outside_the_retry_lineage() -> N
                 row_end=1,
                 is_end_of_source=True,
             ),
+            coordination_token=setup.coordination_token,
         )
 
     assert execution.get_node_state(state.state_id).status is NodeStateStatus.OPEN
@@ -326,36 +349,52 @@ def test_completion_rejects_member_with_buffered_history_and_terminal_outcome() 
         node_type=NodeType.AGGREGATION,
         plugin_name="aggregator",
     )
-    setup.data_flow.create_row(
-        setup.run_id,
+    setup.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"value": 1},
         row_id="row-0",
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=setup.coordination_token,
+        token_id="tok-0",
     )
-    setup.data_flow.create_token("row-0", token_id="tok-0")
 
     execution = setup.execution
-    state = execution.begin_node_state("tok-0", "agg-1", setup.run_id, 0, {"value": 1}, state_id="state-1")
-    execution.create_batch(setup.run_id, "agg-1", batch_id="batch-1")
-    execution.add_batch_member("batch-1", "tok-0", ordinal=0)
+    state = execution.begin_node_state(
+        "tok-0", "agg-1", 0, {"value": 1}, state_id="state-1", member_token=setup.coordination_token.membership
+    )
+    execution.create_batch("agg-1", batch_id="batch-1", coordination_token=setup.coordination_token)
+    _add_batch_member(setup, "batch-1", "tok-0", ordinal=0)
     ref = TokenRef(token_id="tok-0", run_id=setup.run_id)
-    setup.data_flow.record_token_outcome(ref, None, TerminalPath.BUFFERED, batch_id="batch-1")
+    work_item = setup.factory.scheduler.enqueue_ready_claimed(
+        member_token=setup.coordination_token.membership,
+        token_id="tok-0",
+        row_id="row-0",
+        node_id="agg-1",
+        step_index=0,
+        ingest_sequence=0,
+        row_payload_json='{"value":1}',
+        lease_owner=setup.coordination_token.worker_id,
+        lease_seconds=300,
+    )
+    setup.data_flow.record_token_outcome(
+        ref, None, TerminalPath.BUFFERED, batch_id="batch-1", member_token=setup.coordination_token.membership, work_item=work_item
+    )
     setup.data_flow.record_token_outcome(
         ref,
         TerminalOutcome.TRANSIENT,
         TerminalPath.BATCH_CONSUMED,
         batch_id="batch-1",
+        member_token=setup.coordination_token.membership,
+        work_item=work_item,
     )
-    execution.update_batch_status("batch-1", BatchStatus.EXECUTING, state_id=state.state_id)
+    execution.update_batch_status("batch-1", BatchStatus.EXECUTING, state_id=state.state_id, coordination_token=setup.coordination_token)
 
     output = PipelineRow({"total": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     with pytest.raises(AuditIntegrityError, match="already have terminal outcomes"):
         execution.complete_aggregation_result(
             batch_id="batch-1",
-            run_id=setup.run_id,
             aggregation_node_id="agg-1",
             state_id=state.state_id,
             trigger_type=TriggerType.END_OF_SOURCE,
@@ -383,6 +422,7 @@ def test_completion_rejects_member_with_buffered_history_and_terminal_outcome() 
                 row_end=1,
                 is_end_of_source=True,
             ),
+            coordination_token=setup.coordination_token,
         )
 
     assert execution.get_node_state(state.state_id).status is NodeStateStatus.OPEN

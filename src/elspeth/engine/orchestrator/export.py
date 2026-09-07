@@ -254,7 +254,7 @@ def export_landscape(
         existing_node = factory.data_flow.get_node(sink.node_id, run_id)
         if existing_node is None:
             factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 node_id=sink.node_id,
                 plugin_name=sink.name,
                 node_type=NodeType.SINK,

@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 from pydantic import Field
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
@@ -114,7 +115,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9516e48630df9db5"
+    source_file_hash: str | None = "sha256:84f7dd1379fd9f43"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
@@ -226,9 +227,10 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Analyze field via Prompt Shield API for attack detection."""
-        analysis = self._analyze_prompt(value, state_id, token_id=token_id)
+        analysis = self._analyze_prompt(value, state_id, token_id=token_id, ctx=ctx)
 
         if analysis["user_prompt_attack"] or analysis["document_attack"]:
             return TransformResult.error(
@@ -247,6 +249,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> dict[str, bool]:
         """Call Azure Prompt Shield API.
 
@@ -258,7 +261,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
         Respects self._analysis_type to avoid double API cost when only one
         analysis path is needed.
         """
-        http_client = self._get_http_client(state_id, token_id=token_id)
+        http_client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
 
         url = f"{self._endpoint}/contentsafety/text:shieldPrompt?api-version={self.API_VERSION}"
 

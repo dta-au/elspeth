@@ -139,7 +139,6 @@ class QuarantineRouter:
         # Create a token for the quarantined row using specialized method
         # (quarantine rows don't have contracts - they failed validation)
         quarantine_token = processor.token_manager.create_quarantine_token(
-            run_id=run_id,
             source_node_id=source_id,
             row_index=row_index,
             source_row_index=source_row_index,
@@ -149,7 +148,7 @@ class QuarantineRouter:
             # ADR-030 §C.4 row 9: the quarantine arm is an ingest-adjacent
             # durable rows write — it rides the leader epoch fence (rows +
             # token in ONE fenced transaction).
-            coordination_token=processor.coordination_token,
+            coordination_token=loop_ctx.ctx.require_coordination_token(),
         )
 
         # Record source node_state (step_index=0) for quarantine audit lineage.
@@ -171,12 +170,13 @@ class QuarantineRouter:
         source_state = factory.execution.begin_node_state(
             token_id=quarantine_token.token_id,
             node_id=source_id,
-            run_id=run_id,
+            member_token=loop_ctx.ctx.require_member_token(),
             step_index=0,
             input_data=quarantine_data,
             quarantined=True,
         )
         factory.execution.complete_node_state(
+            member_token=loop_ctx.ctx.require_member_token(),
             state_id=source_state.state_id,
             status=NodeStateStatus.FAILED,
             duration_ms=0,
@@ -201,6 +201,7 @@ class QuarantineRouter:
                 f"in from_plugin_instances()."
             ) from exc
         factory.execution.record_routing_event(
+            member_token=loop_ctx.ctx.require_member_token(),
             state_id=source_state.state_id,
             edge_id=quarantine_edge_id,
             mode=RoutingMode.DIVERT,

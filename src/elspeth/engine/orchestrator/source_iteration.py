@@ -398,7 +398,7 @@ class SourceIterationDriver:
         )
 
         if not schema_contract_recorded:
-            record_schema_contract(factory, run_id, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
+            record_schema_contract(factory, source_id, ctx, active_source=active_source, coordination_token=coordination_token)
 
         if source_exhausted and not interrupted_by_shutdown:
             self._lifecycle_recorder.record_run_source_lifecycle(
@@ -738,7 +738,6 @@ class SourceIterationDriver:
                         # Record schema contract on first VALID row (quarantined rows don't populate contract)
                         if not schema_contract_recorded and record_schema_contract(
                             factory,
-                            run_id,
                             source_id,
                             ctx,
                             active_source=active_source,

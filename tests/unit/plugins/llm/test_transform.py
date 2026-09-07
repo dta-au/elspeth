@@ -17,6 +17,8 @@ import pytest
 
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import RuntimePreflightFailedError
+from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -37,6 +39,7 @@ from elspeth.plugins.transforms.llm.provider import (
     UnrecognizedFinishReason,
 )
 from elspeth.testing import make_field, make_pipeline_row
+from tests.fixtures.factories import make_context
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,14 +101,12 @@ def _make_row(data: dict[str, Any] | None = None) -> PipelineRow:
     return make_pipeline_row(data or {"text": "hello"})
 
 
-def _make_ctx() -> SimpleNamespace:
-    """Create a minimal transform context double."""
-    return SimpleNamespace(
+def _make_ctx() -> PluginContext:
+    """Create an explicitly authorized mock transform context."""
+    return make_context(
         state_id="state-123",
         run_id="run-123",
-        token=SimpleNamespace(token_id="token-1"),
-        shutdown_event=None,
-        payload_store=None,
+        token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
     )
 
 
@@ -253,19 +254,22 @@ class TestTransformProperties:
 
     def test_runtime_preflight_delegates_to_provider_with_operation_parent(self) -> None:
         transform, mock_provider = _make_transform_with_mock_provider()
-        ctx = SimpleNamespace(operation_id="op-runtime-preflight")
+        ctx = make_context()
+        ctx.operation_id = "op-runtime-preflight"
 
         transform.runtime_preflight(ctx)
 
         mock_provider.runtime_preflight.assert_called_once_with(
             operation_id="op-runtime-preflight",
             model="gpt-4o",
+            coordination_token=ctx.require_coordination_token(),
         )
 
     def test_runtime_preflight_wraps_provider_failure(self) -> None:
         transform, mock_provider = _make_transform_with_mock_provider()
         mock_provider.runtime_preflight.side_effect = LLMClientError("401 unauthorized", retryable=False)
-        ctx = SimpleNamespace(operation_id="op-runtime-preflight")
+        ctx = make_context()
+        ctx.operation_id = "op-runtime-preflight"
 
         with pytest.raises(RuntimePreflightFailedError, match=r"pre_flight_failed.*401 unauthorized"):
             transform.runtime_preflight(ctx)

@@ -20,15 +20,17 @@ from typing import TYPE_CHECKING, Any
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.contexts import RateLimitRegistryProtocol
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.node_state_context import AggregationBatchContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType, TransformErrorReason
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.errors import ContractViolation
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.payload_store import PayloadStore
@@ -108,10 +110,13 @@ class PluginContext:
 
     # === Audit & Infrastructure ===
     landscape: PluginAuditWriter | None = None
-    # The run's current leader token, carried BY VALUE from the executor that
-    # built this context (ADR-048 §3). A plugin never constructs one; a
-    # context without one cannot write to the Landscape.
+    # Authority travels by value from the executor (ADR-048). Leaders also
+    # have membership; followers carry only their admitted membership.
+    # Writer-less contexts support inspection; audit methods require the
+    # concrete authority for their scope and never silently skip a write.
     coordination_token: CoordinationToken | None = None
+    member_token: WorkerMembershipToken | None = None
+    work_item: TokenWorkItem | None = None
     payload_store: PayloadStore | None = None
     rate_limit_registry: RateLimitRegistryProtocol | None = None
     concurrency_config: RuntimeConcurrencyConfig | None = None
@@ -186,6 +191,8 @@ class PluginContext:
         operation_id: str | None = None,
         telemetry_emit: Callable[[Any], None] | None = None,
         coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
         _pending_quarantine_validation_errors: list[tuple[str, str]] | None = None,
         _config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -203,6 +210,18 @@ class PluginContext:
         self._config = deep_freeze(raw_config)
         self.landscape = landscape
         self.coordination_token = coordination_token
+        if coordination_token is not None and type(coordination_token) is not CoordinationToken:
+            raise TypeError("coordination_token must be a CoordinationToken")
+        if member_token is not None and type(member_token) is not WorkerMembershipToken:
+            raise TypeError("member_token must be a WorkerMembershipToken")
+        if coordination_token is not None:
+            if member_token is not None and member_token != coordination_token.membership:
+                raise FrameworkBugError("PluginContext leader and member identities disagree")
+            member_token = coordination_token.membership
+        if member_token is not None and member_token.run_id != run_id:
+            raise FrameworkBugError("PluginContext membership belongs to a different run")
+        self.member_token = member_token
+        self.work_item = work_item
         self.payload_store = payload_store
         self.rate_limit_registry = rate_limit_registry
         self.concurrency_config = concurrency_config
@@ -243,8 +262,28 @@ class PluginContext:
             operation_id=self.operation_id,
             telemetry_emit=self.telemetry_emit,
             coordination_token=self.coordination_token,
+            member_token=self.member_token,
+            work_item=self.work_item,
             _pending_quarantine_validation_errors=self._pending_quarantine_validation_errors,
         )
+
+    def require_coordination_token(self) -> CoordinationToken:
+        """Return the executor's leader authority, refusing a read-only context."""
+        if not isinstance(self.coordination_token, CoordinationToken):
+            raise FrameworkBugError("Plugin audit write requires the executor's leader token")
+        return self.coordination_token
+
+    def require_member_token(self) -> WorkerMembershipToken:
+        """Return the worker's admitted authority without acquiring or inventing it."""
+        if not isinstance(self.member_token, WorkerMembershipToken):
+            raise FrameworkBugError("Plugin audit write requires the executor's member token")
+        return self.member_token
+
+    def require_work_item(self) -> TokenWorkItem:
+        """Return the actual scheduler claim bound to this plugin invocation."""
+        if not isinstance(self.work_item, TokenWorkItem):
+            raise FrameworkBugError("Row audit write requires the executor's claimed work item")
+        return self.work_item
 
     def record_readiness_check(
         self,
@@ -255,7 +294,7 @@ class PluginContext:
         count: int | None,
         message: str,
     ) -> None:
-        """Record a provider readiness check under the run's leader token (ADR-048 §3).
+        """Record provider readiness under the worker's admitted membership.
 
         The token is forwarded by value from the executor that built this
         context; a context without one cannot write, and that is the intended
@@ -263,12 +302,12 @@ class PluginContext:
         """
         from elspeth.contracts import FrameworkBugError
 
-        if self.landscape is None or self.coordination_token is None:
+        if self.landscape is None or self.member_token is None:
             raise FrameworkBugError(
-                f"record_readiness_check() called without landscape or leader token. "
+                f"record_readiness_check() called without landscape or member token. "
                 f"Context state: run_id={self.run_id}, node_id={self.node_id}, "
                 f"landscape={'set' if self.landscape is not None else 'None'}, "
-                f"coordination_token={'set' if self.coordination_token is not None else 'None'}. "
+                f"member_token={'set' if self.member_token is not None else 'None'}. "
                 f"This is a framework bug — the executor must inject both before plugin on_start()."
             )
         self.landscape.record_readiness_check(
@@ -277,7 +316,7 @@ class PluginContext:
             reachable=reachable,
             count=count,
             message=message,
-            coordination_token=self.coordination_token,
+            member_token=self.require_member_token(),
         )
 
     @staticmethod
@@ -312,9 +351,9 @@ class PluginContext:
     ) -> Call | None:
         """Record an external API call to the audit trail and emit telemetry.
 
-        Provides a convenient way for plugins to record external calls
-        without managing call indices manually. Routes to the appropriate
-        recorder method based on whether state_id or operation_id is set.
+        Records source/sink operation calls without manually managing call
+        indices. Row calls are recorded by audited clients with their
+        member token and claimed work item.
 
         After recording to Landscape (the legal record), emits an
         ExternalCallCompleted telemetry event for operational visibility.
@@ -332,7 +371,7 @@ class PluginContext:
             The recorded Call, or None if landscape not configured
 
         Raises:
-            FrameworkBugError: If neither or both of state_id and operation_id are set
+            FrameworkBugError: If the context lacks an operation parent or leader authority
         """
         from elspeth.contracts import FrameworkBugError
 
@@ -344,83 +383,19 @@ class PluginContext:
                 f"This is a framework bug — orchestrator must inject landscape before plugin execution."
             )
 
-        # Enforce XOR: exactly one of state_id or operation_id must be set
-        has_state = self.state_id is not None
-        has_operation = self.operation_id is not None
-
-        if has_state and has_operation:
-            raise FrameworkBugError(
-                f"record_call() called with BOTH state_id and operation_id set. "
-                f"state_id={self.state_id}, operation_id={self.operation_id}. "
-                f"This is a framework bug - context should have exactly one parent."
-            )
-
-        if not has_state and not has_operation:
-            raise FrameworkBugError(
-                f"record_call() called without state_id or operation_id. "
-                f"Context state: run_id={self.run_id}, node_id={self.node_id}. "
-                f"This is a framework bug - context should have been set by orchestrator/executor."
-            )
-
-        # Route to appropriate recorder method
-        if has_state:
-            # Delegate call_index allocation to centralized PluginAuditWriter.
-            # This ensures UNIQUE(state_id, call_index) when mixing ctx.record_call()
-            # with audited clients (AuditedLLMClient, AuditedHTTPClient), which also
-            # use recorder.allocate_call_index().
-            if self.state_id is None:
-                raise FrameworkBugError("record_call has_state=True but state_id is None")
-            call_index = self.landscape.allocate_call_index(self.state_id)
-
-            recorded_call = self.landscape.record_call(
-                state_id=self.state_id,
-                call_index=call_index,
-                call_type=call_type,
-                status=status,
-                request_data=RawCallPayload(request_data),
-                response_data=RawCallPayload(response_data) if response_data is not None else None,
-                error=RawCallPayload(error) if error is not None else None,
-                latency_ms=latency_ms,
-            )
-            parent_id: str = self.state_id
-        else:
-            # Operation call - recorder handles call index allocation
-            if self.operation_id is None:
-                raise FrameworkBugError("record_call has_operation=True but operation_id is None")
-            recorded_call = self.landscape.record_operation_call(
-                operation_id=self.operation_id,
-                call_type=call_type,
-                status=status,
-                request_data=RawCallPayload(request_data),
-                response_data=RawCallPayload(response_data) if response_data is not None else None,
-                error=RawCallPayload(error) if error is not None else None,
-                latency_ms=latency_ms,
-            )
-            parent_id = self.operation_id
-
-        # Resolve token_id from authoritative state_id lookup BEFORE telemetry.
-        # This is a data integrity check — FrameworkBugError must NOT be swallowed
-        # by the telemetry error handler below.
-        # Resolve from state_id, not from self.token_id which may be stale.
-        token_id = None
-        if has_state:
-            if self.state_id is None:
-                raise FrameworkBugError("record_call has_state=True but state_id is None (token_id lookup)")
-            node_state = self.landscape.get_node_state(self.state_id)
-            if node_state is None:
-                raise FrameworkBugError(
-                    f"record_call() has state_id={self.state_id} but get_node_state() "
-                    f"returned None. This is a framework bug — state_id should always "
-                    f"resolve to a valid node_state."
-                )
-            token_id = node_state.token_id
-            # Validate that ctx.token (if set) is consistent with the authoritative source
-            if self.token is not None and self.token.token_id != token_id:
-                raise FrameworkBugError(
-                    f"record_call() token mismatch: ctx.token.token_id={self.token.token_id} "
-                    f"but node_state.token_id={token_id} for state_id={self.state_id}. "
-                    f"This is a framework bug — ctx.token is out of sync with state_id."
-                )
+        if self.state_id is not None or self.operation_id is None:
+            raise FrameworkBugError("PluginContext.record_call requires an operation parent; row clients own row-call recording")
+        recorded_call = self.landscape.record_operation_call(
+            operation_id=self.operation_id,
+            call_type=call_type,
+            status=status,
+            request_data=RawCallPayload(request_data),
+            response_data=RawCallPayload(response_data) if response_data is not None else None,
+            error=RawCallPayload(error) if error is not None else None,
+            latency_ms=latency_ms,
+            coordination_token=self.require_coordination_token(),
+        )
+        parent_id = self.operation_id
 
         # Emit telemetry AFTER successful Landscape recording
         # Wrapped in try/except to prevent telemetry failures from affecting callers
@@ -457,9 +432,9 @@ class PluginContext:
                     timestamp=datetime.now(UTC),
                     run_id=self.run_id,
                     # Use correct field based on context type
-                    state_id=self.state_id if has_state else None,
-                    operation_id=self.operation_id if has_operation else None,
-                    token_id=token_id,
+                    state_id=None,
+                    operation_id=self.operation_id,
+                    token_id=None,
                     call_type=call_type,
                     provider=provider,
                     status=status,
@@ -583,7 +558,7 @@ class PluginContext:
 
         # Record to landscape audit trail
         error_id = self.landscape.record_validation_error(
-            run_id=self.run_id,
+            coordination_token=self.require_coordination_token(),
             node_id=self.node_id,
             row_data=row,
             error=error,
@@ -636,6 +611,8 @@ class PluginContext:
             )
 
         error_id = self.landscape.record_transform_error(
+            member_token=self.require_member_token(),
+            work_item=self.require_work_item(),
             ref=TokenRef(token_id=token_id, run_id=self.run_id),
             transform_id=transform_id,
             row_data=row,
@@ -669,6 +646,7 @@ def plugin_context_scope(
     contract: SchemaContract | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
     state_id: str | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
     operation_id: str | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
+    work_item: TokenWorkItem | None | _ContextScopeUnset = _CONTEXT_SCOPE_UNSET,
 ) -> Iterator[PluginContext]:
     """Temporarily assign executor-owned metadata on a shared plugin context.
 
@@ -684,6 +662,7 @@ def plugin_context_scope(
     previous_contract = ctx.contract
     previous_state_id = ctx.state_id
     previous_operation_id = ctx.operation_id
+    previous_work_item = ctx.work_item
 
     if not isinstance(node_id, _ContextScopeUnset):
         ctx.node_id = node_id
@@ -699,6 +678,8 @@ def plugin_context_scope(
         ctx.state_id = state_id
     if not isinstance(operation_id, _ContextScopeUnset):
         ctx.operation_id = operation_id
+    if not isinstance(work_item, _ContextScopeUnset):
+        ctx.work_item = work_item
 
     try:
         yield ctx
@@ -717,3 +698,5 @@ def plugin_context_scope(
             ctx.state_id = previous_state_id
         if not isinstance(operation_id, _ContextScopeUnset):
             ctx.operation_id = previous_operation_id
+        if not isinstance(work_item, _ContextScopeUnset):
+            ctx.work_item = previous_work_item

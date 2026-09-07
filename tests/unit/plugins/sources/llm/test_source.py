@@ -71,7 +71,9 @@ def test_load_calls_provider_once_and_emits_one_transform_compatible_row(
     assert provider.calls == 1
     operation_id = source_context.operation_id
     assert operation_id is not None
-    assert provider.audit_parents == [LLMAuditParent.for_operation(operation_id=operation_id)]
+    assert provider.audit_parents == [
+        LLMAuditParent.for_operation(operation_id=operation_id, coordination_token=source_context.require_coordination_token())
+    ]
     assert provider.messages == [[ChatMessage(role="user", content="Summarise the audit topic.")]]
     assert provider.runtime_preflight_calls == 0
     assert len(rows) == 1
@@ -221,7 +223,9 @@ def test_provider_error_records_operation_parented_trace(
     assert operation_id is not None
     assert tracer.successes == []
     assert len(tracer.errors) == 1
-    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert tracer.errors[0]["prompt"] == "Summarise the audit topic."
     assert tracer.errors[0]["model"] == "openai/gpt-4o-mini"
     assert isinstance(tracer.errors[0]["latency_ms"], float)
@@ -284,7 +288,9 @@ def test_bad_provider_result_records_operation_parented_error_trace(
     assert operation_id is not None
     assert tracer.successes == []
     assert len(tracer.errors) == 1
-    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert tracer.errors[0]["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert tracer.errors[0]["prompt"] == "Summarise the audit topic."
     assert tracer.errors[0]["model"] == "served-model"
     assert isinstance(tracer.errors[0]["latency_ms"], float)
@@ -1025,7 +1031,9 @@ def test_success_records_operation_parented_trace_with_served_result_details(
     assert tracer.errors == []
     assert len(tracer.successes) == 1
     trace = tracer.successes[0]
-    assert trace["parent"] == LLMAuditParent.for_operation(operation_id=operation_id)
+    assert trace["parent"] == LLMAuditParent.for_operation(
+        operation_id=operation_id, coordination_token=source_context.require_coordination_token()
+    )
     assert trace["prompt"] == "Summarise the audit topic."
     assert trace["response_content"] == "A careful answer"
     assert trace["model"] == "served-model"
@@ -1063,6 +1071,7 @@ def test_source_does_not_re_guard_the_tracer_boundary(
 @pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
 def test_success_trace_does_not_suppress_unsuppressible_failures(
     source: LLMSource,
+    source_context: PluginContext,
     failure: BaseException,
 ) -> None:
     tracer = RecordingTracer()
@@ -1073,7 +1082,7 @@ def test_success_trace_does_not_suppress_unsuppressible_failures(
         pytest.raises(type(failure)),
     ):
         source._trace_success(
-            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            parent=LLMAuditParent.for_operation(operation_id="operation-1", coordination_token=source_context.require_coordination_token()),
             prompt="prompt",
             response_content="response",
             model="served-model",
@@ -1085,6 +1094,7 @@ def test_success_trace_does_not_suppress_unsuppressible_failures(
 @pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
 def test_error_trace_does_not_suppress_unsuppressible_failures(
     source: LLMSource,
+    source_context: PluginContext,
     failure: BaseException,
 ) -> None:
     tracer = RecordingTracer()
@@ -1095,7 +1105,7 @@ def test_error_trace_does_not_suppress_unsuppressible_failures(
         pytest.raises(type(failure)),
     ):
         source._trace_error(
-            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            parent=LLMAuditParent.for_operation(operation_id="operation-1", coordination_token=source_context.require_coordination_token()),
             prompt="prompt",
             error_message="provider failed",
             model="configured-model",

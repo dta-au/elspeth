@@ -37,6 +37,8 @@ from elspeth.contracts.errors import (
     FrameworkBugError,
     OrchestrationInvariantError,
     PluginContractViolation,
+    RunLeadershipLostError,
+    RunMembershipLostError,
     SinkDiversionReason,
     SinkTransactionalInvariantError,
 )
@@ -192,7 +194,7 @@ class SinkExecutor:
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader token every fenced sink-effect verb requires (ADR-048)."""
-        if self._coordination_token is None:
+        if not isinstance(self._coordination_token, CoordinationToken):
             raise OrchestrationInvariantError(
                 "effect-capable sink execution requires the run's coordination token: durable sink effects are "
                 "leader-fenced Landscape writes with no unfenced arm (ADR-048). Construct SinkExecutor with "
@@ -213,6 +215,7 @@ class SinkExecutor:
         per_token_ms = duration_ms / len(states)
         for _, state in states:
             self._execution.complete_node_state(
+                member_token=self._require_coordination_token().membership,
                 state_id=state.state_id,
                 status=NodeStateStatus.FAILED,
                 duration_ms=per_token_ms,
@@ -244,6 +247,8 @@ class SinkExecutor:
                 duration_ms=0.0,
                 error=cleanup_error,
             )
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS:
             raise  # Audit corruption during cleanup is higher priority than original error
         except Exception as cleanup_exc:
@@ -429,7 +434,7 @@ class SinkExecutor:
         this same ``except`` branch. This call is a third such write.
         """
         operation = self._execution.begin_operation(
-            run_id=self._run_id,
+            coordination_token=self._require_coordination_token(),
             node_id=sink_node_id,
             operation_type="sink_write",
             input_data=scrub_payload_for_audit({"sink_plugin": sink_name}),
@@ -438,6 +443,7 @@ class SinkExecutor:
         # interpolate row values, so it is scrubbed before it reaches the audit
         # trail, and an unrenderable message degrades to the (secret-free) type.
         self._execution.complete_operation(
+            coordination_token=self._require_coordination_token(),
             operation_id=operation.operation_id,
             status="failed",
             error=_render_exception(violation),
@@ -473,7 +479,8 @@ class SinkExecutor:
             if failing_row_id is not None:
                 context["failing_row_id"] = failing_row_id
             try:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
@@ -566,12 +573,12 @@ class SinkExecutor:
                         (
                             token.token_id,
                             sink_node_id,
-                            ctx.run_id,
                             step_in_pipeline,
                             row,
                         )
                         for token, row in zip(tokens, rows, strict=True)
-                    )
+                    ),
+                    coordination_token=self._require_coordination_token(),
                 )
                 all_states.extend(zip(tokens, opened_states, strict=True))
             else:
@@ -579,13 +586,15 @@ class SinkExecutor:
                     state = self._execution.begin_node_state(
                         token_id=token.token_id,
                         node_id=sink_node_id,
-                        run_id=ctx.run_id,
+                        member_token=self._require_coordination_token().membership,
                         step_index=step_in_pipeline,
                         input_data=input_dict,
                         attempt=token.resume_attempt_offset,
                         resume_checkpoint_id=token.resume_checkpoint_id,
                     )
                     all_states.append((token, state))
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS as e:
             if all_states:
                 self._best_effort_cleanup(all_states, e, "begin_node_state")
@@ -1144,12 +1153,14 @@ class SinkExecutor:
             reason: SinkDiversionReason = {"diversion_reason": f"effect-diversion:{reason_hash}"}
             if isinstance(current, NodeStateOpen):
                 self._execution.record_routing_event(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     edge_id=failsink_edge_id,
                     mode=RoutingMode.DIVERT,
                     reason=reason,
                 )
                 self._execution.complete_node_state(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data={"diverted_to": failsink_name, "reason_hash": reason_hash},
@@ -1234,6 +1245,7 @@ class SinkExecutor:
             current = self._execution.get_node_state(primary_state.state_id)
             if isinstance(current, NodeStateOpen):
                 self._execution.complete_node_state(
+                    member_token=self._require_coordination_token().membership,
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
                     output_data={"discarded": True, "reason": recovery_stable_reason},
@@ -1248,7 +1260,8 @@ class SinkExecutor:
             # failures, not transient failsink bookkeeping.
             existing = self._data_flow.get_token_outcome(token.token_id)
             if existing is None:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.SINK_DISCARDED,
@@ -1270,6 +1283,8 @@ class SinkExecutor:
             for token, _idx, _state in primary_divert_states:
                 try:
                     on_token_written(token)
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     raise
                 except Exception as exc:
@@ -1418,6 +1433,8 @@ class SinkExecutor:
                     raise AuditIntegrityError("durable effect partition disagrees with accepted primary tokens")
                 try:
                     on_token_written(token)
+                except (RunLeadershipLostError, RunMembershipLostError):
+                    raise
                 except contract_errors.TIER_1_ERRORS:
                     raise
                 except Exception as exc:

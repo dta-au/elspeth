@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import Insert, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, RowMapping
@@ -131,9 +131,7 @@ class ArtifactRepository:
             else:
                 # RETURNING is the cross-driver authority for insert-vs-conflict:
                 # psycopg may report rowcount=-1 even when the insert succeeds.
-                inserted_artifact_id = conn.execute(
-                    self._idempotent_insert(conn, values).returning(artifacts_table.c.artifact_id)
-                ).scalar_one_or_none()
+                inserted_artifact_id = self._idempotent_insert(conn, values)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"register_artifact failed for producer linkage — database rejected audit write: {type(exc).__name__}"
@@ -166,26 +164,28 @@ class ArtifactRepository:
         return self._artifact_loader.load(row)
 
     @staticmethod
-    def _idempotent_insert(conn: Connection, values: Mapping[str, Any]) -> Insert:
-        """Build the backend-native conflict-safe insert for the partial key."""
+    def _idempotent_insert(conn: Connection, values: Mapping[str, Any]) -> str | None:
+        """Execute the backend-native conflict-safe insert for the partial key."""
         if conn.dialect.name == "sqlite":
-            return (
+            return conn.execute(
                 sqlite_insert(artifacts_table)
                 .values(**values)
                 .on_conflict_do_nothing(
                     index_elements=[artifacts_table.c.run_id, artifacts_table.c.idempotency_key],
                     index_where=artifacts_table.c.idempotency_key.is_not(None),
                 )
-            )
+                .returning(artifacts_table.c.artifact_id)
+            ).scalar_one_or_none()
         if conn.dialect.name == "postgresql":
-            return (
+            return conn.execute(
                 postgresql_insert(artifacts_table)
                 .values(**values)
                 .on_conflict_do_nothing(
                     index_elements=[artifacts_table.c.run_id, artifacts_table.c.idempotency_key],
                     index_where=artifacts_table.c.idempotency_key.is_not(None),
                 )
-            )
+                .returning(artifacts_table.c.artifact_id)
+            ).scalar_one_or_none()
         raise LandscapeRecordError(
             f"register_artifact idempotency is unsupported for database dialect {conn.dialect.name!r}; refusing an unfenced insert"
         )

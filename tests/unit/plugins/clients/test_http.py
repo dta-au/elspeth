@@ -20,7 +20,10 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallError, HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 class _CallArgs:
@@ -63,13 +66,15 @@ class _ExecutionRepositoryFake:
         self._next_call_index = 0
         self.record_call = _CallRecorder(return_value=SimpleNamespace(call_id="call-1"))
 
-    def allocate_call_index(self, _state_id: str) -> int:
+    def allocate_call_index(self, _state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._next_call_index
         self._next_call_index += 1
         return call_index
 
-    def allocate_operation_call_index(self, _operation_id: str) -> int:
-        return self.allocate_call_index(_operation_id)
+    def allocate_operation_call_index(self, _operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        call_index = self._next_call_index
+        self._next_call_index += 1
+        return call_index
 
     def record_operation_call(self, **kwargs: Any) -> Any:
         return self.record_call(**kwargs)
@@ -96,6 +101,7 @@ def mock_telemetry_emit():
 def http_client(mock_execution, mock_telemetry_emit):
     """Create AuditedHTTPClient with mocked dependencies."""
     return AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=mock_execution,
         state_id="test-state-001",
         run_id="test-run-001",
@@ -285,6 +291,7 @@ def test_post_telemetry_failure_doesnt_corrupt_audit(http_client, mock_execution
 def test_post_telemetry_emits_token_id_when_configured(mock_execution, mock_telemetry_emit):
     """Telemetry event should include token_id when client has token context."""
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=mock_execution,
         state_id="test-state-001",
         run_id="test-run-001",
@@ -347,6 +354,7 @@ def test_post_with_network_error(http_client, mock_execution):
 def test_post_with_base_url(mock_execution, mock_telemetry_emit):
     """POST should properly join base_url with path."""
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=mock_execution,
         state_id="test-state",
         run_id="test-run",
@@ -464,6 +472,7 @@ def test_get_body_cap_streams_and_aborts_without_trusting_response_headers(
     headers = {"content-type": "text/plain", **response_headers}
     respx.get("https://api.example.com/huge").mock(return_value=httpx.Response(200, headers=headers, stream=stream))
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=mock_execution,
         state_id="test-state-001",
         run_id="test-run-001",
@@ -757,6 +766,7 @@ def test_rate_limiting_integration(mock_execution, mock_telemetry_emit):
     mock_limiter = _LimiterFake()
 
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=mock_execution,
         state_id="test-state",
         run_id="test-run",

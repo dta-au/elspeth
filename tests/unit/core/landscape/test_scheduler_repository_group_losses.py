@@ -21,7 +21,7 @@ import pytest
 from sqlalchemy import insert
 
 from elspeth.contracts import NodeType, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import GroupLossSpec
@@ -159,7 +159,7 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
     repo = TokenSchedulerRepository(db.engine)
     _seed_row_and_token(db, row_id="row-claim", token_id="tok-claim", source_row_index=10)
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         token_id="tok-claim",
         row_id="row-claim",
         node_id=NODE_ID,
@@ -167,7 +167,7 @@ def seeded_claimed_item(db: LandscapeDB, seat_token: CoordinationToken):
         ingest_sequence=10,
         row_payload_json=_payload_json(),
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER, lease_seconds=60)
+    claimed = repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER), lease_owner=WORKER, lease_seconds=60)
     assert claimed is not None
     return db, repo, claimed
 
@@ -206,7 +206,7 @@ def test_takeover_read_returns_full_table_regardless_of_adopted_epoch(seeded_run
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_a"), recorded_by="w1", now=_NOW)
         record_group_loss(conn, run_id=run_id, spec=_spec(member_key="path_b", token_id="tok_b"), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
-    repo.adopt_group_losses(run_id=run_id, loss_ids=[unadopted[0].loss_id], coordination_token=seat_token)
+    repo.adopt_group_losses(loss_ids=[unadopted[0].loss_id], coordination_token=seat_token)
     assert len(repo.list_unadopted_group_losses(run_id=run_id)) == 1
     assert len(repo.list_group_losses(run_id=run_id)) == 2  # FULL table
 
@@ -225,7 +225,7 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
         record_group_loss(conn, run_id=run_id, spec=_spec(), recorded_by="w1", now=_NOW)
     unadopted = repo.list_unadopted_group_losses(run_id=run_id)
     loss_id = unadopted[0].loss_id
-    marked_first = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=seat_token)
+    marked_first = repo.adopt_group_losses(loss_ids=[loss_id], coordination_token=seat_token)
     assert marked_first == 1
 
     # The adopt refreshed the seat from the DATABASE clock (ADR-047), so the
@@ -236,7 +236,7 @@ def test_adopt_group_losses_does_not_remark_an_already_adopted_row_under_a_new_e
         run_id=run_id, worker_id=f"{WORKER}-takeover", window_seconds=80.0
     )
     assert new_epoch_token.leader_epoch != seat_token.leader_epoch
-    marked_second = repo.adopt_group_losses(run_id=run_id, loss_ids=[loss_id], coordination_token=new_epoch_token)
+    marked_second = repo.adopt_group_losses(loss_ids=[loss_id], coordination_token=new_epoch_token)
     assert marked_second == 0
 
 
@@ -295,6 +295,7 @@ def test_mark_failed_records_every_staged_group_loss_in_one_transaction(seeded_c
         _spec(group_id="eg_outer", member_key=claimed.token_id, token_id=claimed.token_id, closer_name="page_stitcher"),
     )
     repo.mark_failed(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER),
         work_item_id=claimed.work_item_id,
         expected_lease_owner=claimed.lease_owner,
         group_losses=losses,

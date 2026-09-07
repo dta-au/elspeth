@@ -32,6 +32,7 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_audit_authority
 
 # A valid OpenRouter catalog model id. The litellm-derived catalog dropped the
 # retired ``anthropic/claude-3-opus``; OpenRouterConfig now rejects models not
@@ -514,6 +515,7 @@ class TestRowProcessingWithPipelining:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             token=token,
@@ -867,6 +869,7 @@ class TestMultiRowPipelining:
             for i, row in enumerate(rows):
                 token = make_token(f"row-{i}")
                 ctx = make_context(
+                    **mock_audit_authority("test-run"),
                     run_id="test-run",
                     state_id=f"state-{i}",
                     token=token,
@@ -903,7 +906,7 @@ class TestMultiRowPipelining:
     def test_connect_output_cannot_be_called_twice(self, collector: CollectorOutputPort, mock_recorder: _ExecutionRecorderDouble) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(make_config())
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -937,6 +940,7 @@ class TestHTTPSpecificBehavior:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             token=token,
@@ -1174,6 +1178,7 @@ class TestResourceCleanup:
         assert transform._recorder is None
 
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             state_id="test-state-id",
             landscape=mock_recorder,

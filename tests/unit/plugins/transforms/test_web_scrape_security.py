@@ -19,10 +19,13 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit import Call
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 class _RecordedCall:
@@ -45,6 +48,8 @@ class _RecordCallRecorder:
     def __call__(
         self,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         state_id: str,
         call_index: int,
         call_type: CallType,
@@ -92,7 +97,7 @@ class _AuditWriterDouble:
         self._call_index = 0
         self.record_call = _RecordCallRecorder()
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._call_index
         self._call_index += 1
         return call_index
@@ -174,6 +179,7 @@ def mock_ctx():
     """Create PluginContext with required attributes for security testing."""
     ctx = PluginContext(
         run_id="test-run-456",
+        **mock_item_audit_authority("test-run-456"),
         config={},
         landscape=_AuditWriterDouble(),
         payload_store=_PayloadStoreDouble(),

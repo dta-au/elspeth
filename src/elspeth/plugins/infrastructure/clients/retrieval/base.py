@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 
 
@@ -45,6 +47,8 @@ class RetrievalProvider(Protocol):
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
         """Execute a search query and return ranked results.
 

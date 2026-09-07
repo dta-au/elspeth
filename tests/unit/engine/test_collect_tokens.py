@@ -12,6 +12,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_field
 from tests.fixtures.landscape import make_recorder_with_run
+from tests.unit.engine.conftest import claim_token_for_manager, token_manager_leader
 from tests.unit.engine.conftest import make_test_step_resolver as _make_step_resolver
 
 
@@ -38,27 +39,27 @@ class TestCollectTokensPathAlgebra:
 
         manager, _factory, run_id, source_node_id = _make_manager_context()
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=SourceRow.valid({"original": "data"}, contract=_make_observed_contract("original"), source_row_index=0),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         members, group_id = manager.expand_token(
             parent_token=initial,
             expanded_rows=[{"item": 0}, {"item": 1}],
             output_contract=_make_observed_contract("item"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         released = manager.collect_tokens(
             members=members,
             output_rows=[_make_pipeline_row({"combined": True})],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
         assert len(released) == 1
@@ -75,18 +76,19 @@ class TestCollectTokensPathAlgebra:
 
         manager, _factory, run_id, source_node_id = _make_manager_context()
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=SourceRow.valid({}, contract=_make_observed_contract(), source_row_index=0),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         forked, _fork_group_id = manager.fork_token(
             parent_token=initial,
             branches=["a", "b"],
             node_id=NodeID("gate_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
         )
         branch_a, branch_b = forked
         members_a, group_a = manager.expand_token(
@@ -94,14 +96,14 @@ class TestCollectTokensPathAlgebra:
             expanded_rows=[{"x": 1}],
             output_contract=_make_observed_contract("x"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         members_b, _group_b = manager.expand_token(
             parent_token=branch_b,
             expanded_rows=[{"x": 2}],
             output_contract=_make_observed_contract("x"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         # Simulate a member whose innermost frame is NOT the closer's group —
@@ -111,8 +113,8 @@ class TestCollectTokensPathAlgebra:
                 members=[members_a[0], members_b[0]],
                 output_rows=[_make_pipeline_row({"combined": True})],
                 node_id=NodeID("collector_node"),
-                run_id=run_id,
                 group_id=group_a,
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
     def test_empty_output_mints_nothing_engine_side_but_mints_a_durable_empty_release(self) -> None:
@@ -125,27 +127,27 @@ class TestCollectTokensPathAlgebra:
 
         manager, factory, run_id, source_node_id = _make_manager_context()
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=SourceRow.valid({"original": "data"}, contract=_make_observed_contract("original"), source_row_index=0),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         members, group_id = manager.expand_token(
             parent_token=initial,
             expanded_rows=[{"item": 0}, {"item": 1}],
             output_contract=_make_observed_contract("item"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
         released = manager.collect_tokens(
             members=members,
             output_rows=[],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         assert released == ()
 
@@ -161,8 +163,8 @@ class TestCollectTokensPathAlgebra:
                 members=[],
                 output_rows=[],
                 node_id=NodeID("collector_node"),
-                run_id=run_id,
                 group_id="g-exp-1",
+                coordination_token=token_manager_leader(manager, run_id),
             )
 
 
@@ -176,19 +178,19 @@ class TestReleaseFactMeta38:
         from elspeth.contracts import SourceRow
 
         initial = manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=SourceRow.valid({"original": "data"}, contract=_make_observed_contract("original"), source_row_index=0),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         return manager.expand_token(
             parent_token=initial,
             expanded_rows=[{"item": 0}, {"item": 1}],
             output_contract=_make_observed_contract("item"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
 
     def test_release_row_writes_closes_group_id_and_openers_leave_it_null(self) -> None:
@@ -198,8 +200,8 @@ class TestReleaseFactMeta38:
             members=members,
             output_rows=[_make_pipeline_row({"combined": True})],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         release_group_id = child.lineage_path[-1].group_id
 
@@ -211,7 +213,13 @@ class TestReleaseFactMeta38:
         manager, factory, run_id, source_node_id = _make_manager_context()
         members, group_id = self._expand(manager, run_id, source_node_id)
         assert (
-            manager.collect_tokens(members=members, output_rows=[], node_id=NodeID("collector_node"), run_id=run_id, group_id=group_id)
+            manager.collect_tokens(
+                members=members,
+                output_rows=[],
+                node_id=NodeID("collector_node"),
+                group_id=group_id,
+                coordination_token=token_manager_leader(manager, run_id),
+            )
             == ()
         )
         rows = [r for r in factory.data_flow.get_group_records_for_run(run_id) if r["closes_group_id"] == group_id]
@@ -226,8 +234,8 @@ class TestReleaseFactMeta38:
             members=members,
             output_rows=[_make_pipeline_row({"combined": True})],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         release_group_id = child.lineage_path[-1].group_id
 
@@ -251,8 +259,8 @@ class TestReleaseFactMeta38:
             members=members,
             output_rows=[_make_pipeline_row({"combined": True})],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         release_group_id = child.lineage_path[-1].group_id
         assert manager._release_group_memo == {}, "the mint must not seed the memo"
@@ -280,12 +288,12 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
         from elspeth.contracts import SourceRow
 
         return manager.create_initial_token(
-            run_id=run_id,
             source_node_id=source_node_id,
             row_index=0,
             source_row=SourceRow.valid({"original": "data"}, contract=_make_observed_contract("original"), source_row_index=0),
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=token_manager_leader(manager, run_id),
         )
 
     def _expand_and_release(self, manager: TokenManager, parent: Any, run_id: str) -> tuple[Any, str]:
@@ -294,14 +302,14 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
             expanded_rows=[{"item": 0}, {"item": 1}],
             output_contract=_make_observed_contract("item"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         [release] = manager.collect_tokens(
             members=members,
             output_rows=[_make_pipeline_row({"combined": True})],
             node_id=NodeID("collector_node"),
-            run_id=run_id,
             group_id=group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         return release, group_id
 
@@ -313,7 +321,7 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
             expanded_rows=[{"page": 0}],
             output_contract=_make_observed_contract("page"),
             node_id=NodeID("outer_expand"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         inner_release, _inner_group_id = self._expand_and_release(manager, outer_members[0], run_id)
         assert [f.kind for f in inner_release.lineage_path] == [FrameKind.EXPAND, FrameKind.EXPAND]
@@ -323,8 +331,8 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
             members=[inner_release],
             output_rows=[_make_pipeline_row({"pages": 1})],
             node_id=NodeID("outer_collector"),
-            run_id=run_id,
             group_id=outer_group_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         # Truncated at the OUTER frame, through the inner release-group frame:
         # the outer release's only frame is its own release-group frame.
@@ -335,7 +343,13 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
     def test_releases_from_two_fork_branches_are_merged_by_the_coalesce(self) -> None:
         manager, _factory, run_id, source_node_id = _make_manager_context()
         initial = self._initial(manager, run_id, source_node_id)
-        branches, fork_group_id = manager.fork_token(parent_token=initial, branches=["a", "b"], node_id=NodeID("fork_node"), run_id=run_id)
+        branches, fork_group_id = manager.fork_token(
+            parent_token=initial,
+            branches=["a", "b"],
+            node_id=NodeID("fork_node"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
+        )
         releases = [self._expand_and_release(manager, branch, run_id)[0] for branch in branches]
         for release in releases:
             assert [f.kind for f in release.lineage_path] == [FrameKind.FORK, FrameKind.EXPAND]
@@ -345,7 +359,7 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
             parents=releases,
             merged_data=_make_pipeline_row({"merged": True}),
             node_id=NodeID("coalesce_node"),
-            run_id=run_id,
+            coordination_token=token_manager_leader(manager, run_id),
         )
         assert merged.lineage_path == ()
 
@@ -355,13 +369,19 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
         # not a release — the truncation refuses it at BOTH layers.
         manager, _factory, run_id, source_node_id = _make_manager_context()
         initial = self._initial(manager, run_id, source_node_id)
-        branches, _fork_group_id = manager.fork_token(parent_token=initial, branches=["a", "b"], node_id=NodeID("fork_node"), run_id=run_id)
+        branches, _fork_group_id = manager.fork_token(
+            parent_token=initial,
+            branches=["a", "b"],
+            node_id=NodeID("fork_node"),
+            member_token=token_manager_leader(manager, run_id).membership,
+            work_item=claim_token_for_manager(manager, initial, run_id),
+        )
         members, _scope = manager.expand_token(
             parent_token=branches[0],
             expanded_rows=[{"item": 0}],
             output_contract=_make_observed_contract("item"),
             node_id=NodeID("expand_node"),
-            run_id=run_id,
+            member_token=token_manager_leader(manager, run_id).membership,
         )
         # As the ANCHOR parent: the walk stops at the unreleased EXPAND frame,
         # which is not a FORK frame — refused (amendment 1 B: never
@@ -371,7 +391,7 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
                 parents=[members[0], branches[1]],
                 merged_data=_make_pipeline_row({"merged": True}),
                 node_id=NodeID("coalesce_node"),
-                run_id=run_id,
+                coordination_token=token_manager_leader(manager, run_id),
             )
         # As a NON-anchor parent: the truncation guard refuses the frame above.
         with pytest.raises(OrchestrationInvariantError, match="not a collector release group"):
@@ -379,5 +399,5 @@ class TestClosersTruncateThroughReleaseFramesMeta38:
                 parents=[branches[1], members[0]],
                 merged_data=_make_pipeline_row({"merged": True}),
                 node_id=NodeID("coalesce_node"),
-                run_id=run_id,
+                coordination_token=token_manager_leader(manager, run_id),
             )

@@ -22,8 +22,10 @@ import structlog
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
@@ -352,8 +354,12 @@ class _TextractAuditedClient(AuditedClientBase):
         max_response_bytes: int,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> None:
-        super().__init__(execution, state_id, run_id, telemetry_emit, limiter=limiter, token_id=token_id)
+        super().__init__(
+            execution, state_id, run_id, telemetry_emit, limiter=limiter, token_id=token_id, member_token=member_token, work_item=work_item
+        )
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
         self._region = region
@@ -443,6 +449,8 @@ class TextractClient(_TextractAuditedClient):
         max_response_bytes: int,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> None:
         super().__init__(
             execution,
@@ -453,6 +461,8 @@ class TextractClient(_TextractAuditedClient):
             max_response_bytes=max_response_bytes,
             limiter=limiter,
             token_id=token_id,
+            member_token=member_token,
+            work_item=work_item,
         )
         self._sdk_client = sdk_client
 
@@ -708,6 +718,8 @@ class TextractInlineClient(_TextractAuditedClient):
         max_response_bytes: int,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> None:
         super().__init__(
             execution,
@@ -718,6 +730,8 @@ class TextractInlineClient(_TextractAuditedClient):
             max_response_bytes=max_response_bytes,
             limiter=limiter,
             token_id=token_id,
+            member_token=member_token,
+            work_item=work_item,
         )
         self._sdk_client = sdk_client
 

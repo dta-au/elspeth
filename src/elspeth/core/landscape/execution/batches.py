@@ -22,7 +22,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.model_loaders import BatchLoader, BatchMemberLoader
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, verify_and_extend_leader_fence
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import batch_members_table, batches_table, tokens_table
 
 _TERMINAL_BATCH_STATUSES = frozenset({BatchStatus.COMPLETED, BatchStatus.FAILED})
@@ -205,7 +205,7 @@ class BatchRepository:
                 conn,
                 batches_table.insert().values(
                     batch_id=batch.batch_id,
-                    run_id=batch.run_id,
+                    run_id=coordination_token.run_id,
                     aggregation_node_id=batch.aggregation_node_id,
                     attempt=batch.attempt,
                     status=batch.status,
@@ -294,7 +294,34 @@ class BatchRepository:
         trigger_type: TriggerType | None = None,
         trigger_reason: str | None = None,
         state_id: str | None = None,
-        conn: Connection | None = None,
+    ) -> Batch:
+        """Complete a batch under the current leader's transaction."""
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="complete_batch",
+        ) as conn:
+            return self.complete_batch_on(
+                batch_id,
+                status,
+                conn=conn,
+                run_id=coordination_token.run_id,
+                trigger_type=trigger_type,
+                trigger_reason=trigger_reason,
+                state_id=state_id,
+            )
+
+    def complete_batch_on(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        conn: Connection,
+        run_id: str,
+        trigger_type: TriggerType | None = None,
+        trigger_reason: str | None = None,
+        state_id: str | None = None,
     ) -> Batch:
         """Complete a batch.
 
@@ -323,11 +350,11 @@ class BatchRepository:
         # WHERE clause (same TOCTOU-safe pattern as update_batch_status).
         terminal_values = [s.value for s in _TERMINAL_BATCH_STATUSES]
 
-        def _complete_on(active_conn: Connection) -> Any:
-            update_result = active_conn.execute(
+        try:
+            update_result = conn.execute(
                 batches_table.update()
                 .where(batches_table.c.batch_id == batch_id)
-                .where(batches_table.c.run_id == coordination_token.run_id)
+                .where(batches_table.c.run_id == run_id)
                 .where(batches_table.c.status.notin_(terminal_values))
                 .values(
                     status=status,
@@ -339,11 +366,11 @@ class BatchRepository:
             )
             if update_result.rowcount == 0:
                 # Distinguish "not found" from "already terminal".
-                existing = active_conn.execute(
+                existing = conn.execute(
                     select(batches_table.c.status, batches_table.c.run_id).where(batches_table.c.batch_id == batch_id)
                 ).fetchone()
                 if existing is not None:
-                    if existing.run_id != coordination_token.run_id:
+                    if existing.run_id != run_id:
                         raise AuditIntegrityError("Cannot complete a batch belonging to a foreign run")
                     raise AuditIntegrityError(
                         f"Cannot complete batch {batch_id}: current status {existing.status!r} is already terminal. "
@@ -352,25 +379,7 @@ class BatchRepository:
                 raise AuditIntegrityError(
                     f"complete_batch: zero rows affected for batch_id={batch_id} — target row does not exist (audit data corruption)"
                 )
-            return active_conn.execute(select(batches_table).where(batches_table.c.batch_id == batch_id)).fetchone()
-
-        try:
-            if conn is None:
-                with fenced_leader_transaction(
-                    self._db.engine,
-                    token=coordination_token,
-                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                    verb="complete_batch",
-                ) as active_conn:
-                    row = _complete_on(active_conn)
-            else:
-                verify_and_extend_leader_fence(
-                    conn,
-                    token=coordination_token,
-                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                    verb="complete_batch",
-                )
-                row = _complete_on(conn)
+            row = conn.execute(select(batches_table).where(batches_table.c.batch_id == batch_id)).fetchone()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"complete_batch failed for batch_id={batch_id} — database rejected audit update: {type(exc).__name__}: {exc}"
@@ -539,7 +548,7 @@ class BatchRepository:
             result = conn.execute(
                 batches_table.insert().values(
                     batch_id=new_batch_id,
-                    run_id=original.run_id,
+                    run_id=coordination_token.run_id,
                     aggregation_node_id=original.aggregation_node_id,
                     attempt=next_attempt,
                     retry_of_batch_id=original.batch_id,
@@ -554,18 +563,22 @@ class BatchRepository:
             member_rows = conn.execute(
                 select(batch_members_table).where(batch_members_table.c.batch_id == batch_id).order_by(batch_members_table.c.ordinal)
             ).fetchall()
-            for member_row in member_rows:
+            if member_rows:
                 member_result = conn.execute(
-                    batch_members_table.insert().values(
-                        batch_id=new_batch_id,
-                        run_id=original.run_id,
-                        token_id=member_row.token_id,
-                        ordinal=member_row.ordinal,
-                    )
+                    batch_members_table.insert(),
+                    [
+                        {
+                            "batch_id": new_batch_id,
+                            "run_id": coordination_token.run_id,
+                            "token_id": member_row.token_id,
+                            "ordinal": member_row.ordinal,
+                        }
+                        for member_row in member_rows
+                    ],
                 )
-                if member_result.rowcount == 0:
+                if member_result.rowcount not in (-1, len(member_rows)):
                     raise AuditIntegrityError(
-                        f"retry_batch: member INSERT affected zero rows (batch={new_batch_id}, token={member_row.token_id})"
+                        f"retry_batch: member INSERT affected {member_result.rowcount} rows for {len(member_rows)} members (batch={new_batch_id})"
                     )
 
             # 5. Read back the new batch for return

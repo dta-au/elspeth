@@ -223,10 +223,12 @@ class GateExecutor:
                 parent_token=token,
                 branches=fork_branches,
                 node_id=NodeID(node_id),
-                run_id=ctx.run_id,
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 row_data=token.row_data,
             )
             self._record_routing(
+                ctx=ctx,
                 state_id=state_id,
                 node_id=node_id,
                 action=action,
@@ -242,6 +244,7 @@ class GateExecutor:
         if destination.kind == RouteDestinationKind.SINK:
             route_action = RoutingAction.route(route_label, mode=mode, reason=reason)
             self._record_routing(
+                ctx=ctx,
                 state_id=state_id,
                 node_id=node_id,
                 action=route_action,
@@ -250,6 +253,7 @@ class GateExecutor:
         if destination.kind == RouteDestinationKind.PROCESSING_NODE:
             route_action = RoutingAction.route(route_label, mode=mode, reason=reason)
             self._record_routing(
+                ctx=ctx,
                 state_id=state_id,
                 node_id=node_id,
                 action=route_action,
@@ -319,7 +323,7 @@ class GateExecutor:
                 self._execution,
                 token_id=token.token_id,
                 node_id=node_id,
-                run_id=ctx.run_id,
+                member_token=ctx.require_member_token(),
                 step_index=step,
                 input_data=input_dict,
                 auto_fail_phase="gate_evaluation_routing",
@@ -365,6 +369,7 @@ class GateExecutor:
                             "DAG construction should have created an __error_{name}__ edge."
                         ) from missing_edge
                     self._execution.record_routing_event(
+                        member_token=ctx.require_member_token(),
                         state_id=guard.state_id,
                         edge_id=edge_id,
                         mode=RoutingMode.DIVERT,
@@ -482,6 +487,8 @@ class GateExecutor:
         state_id: str,
         node_id: str,
         action: "RoutingAction",
+        *,
+        ctx: PluginContext,
     ) -> None:
         """Record routing events for a routing action.
 
@@ -497,6 +504,7 @@ class GateExecutor:
                 raise MissingEdgeError(node_id=typed_node_id, label=dest) from exc
 
             self._execution.record_routing_event(
+                member_token=ctx.require_member_token(),
                 state_id=state_id,
                 edge_id=edge_id,
                 mode=action.mode,
@@ -513,6 +521,8 @@ class GateExecutor:
                 routes.append(RoutingSpec(edge_id=edge_id, mode=action.mode))
 
             self._execution.record_routing_events(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 state_id=state_id,
                 routes=routes,
                 reason=action.reason,

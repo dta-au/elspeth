@@ -16,7 +16,7 @@ from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.enums import NodeStateStatus, NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_token_for, make_factory
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -37,8 +37,9 @@ class TestTransformSuccessReasonAudit:
         """success_reason is stored in node_states table."""
         # Setup run
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        leader = leader_token_for(factory._db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -47,28 +48,27 @@ class TestTransformSuccessReasonAudit:
         )
         factory.data_flow.register_node(
             node_id="transform_1",
-            run_id=run.run_id,
+            coordination_token=leader,
             node_type=NodeType.TRANSFORM,
             plugin_name="field_tracking_transform",
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id=source.node_id,
             row_index=0,
             data={"amount": 100},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Create and complete node state with success_reason
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="transform_1",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"amount": 100},
         )
@@ -79,6 +79,7 @@ class TestTransformSuccessReasonAudit:
         }
 
         completed = factory.execution.complete_node_state(
+            member_token=leader.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"amount": 100, "processed": True, "amount_usd": 100.0},
@@ -99,8 +100,9 @@ class TestTransformSuccessReasonAudit:
     ) -> None:
         """success_reason_json is NULL when transform doesn't provide it."""
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        leader = leader_token_for(factory._db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -109,32 +111,32 @@ class TestTransformSuccessReasonAudit:
         )
         factory.data_flow.register_node(
             node_id="transform_1",
-            run_id=run.run_id,
+            coordination_token=leader,
             node_type=NodeType.TRANSFORM,
             plugin_name="passthrough",
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id=source.node_id,
             row_index=0,
             data={"x": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="transform_1",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"x": 1},
         )
 
         # Complete WITHOUT success_reason
         completed = factory.execution.complete_node_state(
+            member_token=leader.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"x": 1},
@@ -150,8 +152,9 @@ class TestTransformSuccessReasonAudit:
     ) -> None:
         """validation_warnings flow through to audit trail."""
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        leader = leader_token_for(factory._db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -160,26 +163,25 @@ class TestTransformSuccessReasonAudit:
         )
         factory.data_flow.register_node(
             node_id="transform_1",
-            run_id=run.run_id,
+            coordination_token=leader,
             node_type=NodeType.TRANSFORM,
             plugin_name="data_quality_transform",
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id=source.node_id,
             row_index=0,
             data={"amount": 950},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="transform_1",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"amount": 950},
         )
@@ -190,6 +192,7 @@ class TestTransformSuccessReasonAudit:
         }
 
         completed = factory.execution.complete_node_state(
+            member_token=leader.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"amount": 950},
@@ -210,8 +213,9 @@ class TestTransformSuccessReasonAudit:
     ) -> None:
         """success_reason survives write -> read via repository."""
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        leader = leader_token_for(factory._db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -220,26 +224,25 @@ class TestTransformSuccessReasonAudit:
         )
         factory.data_flow.register_node(
             node_id="transform_1",
-            run_id=run.run_id,
+            coordination_token=leader,
             node_type=NodeType.TRANSFORM,
             plugin_name="test_transform",
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id=source.node_id,
             row_index=0,
             data={"x": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="transform_1",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"x": 1},
         )
@@ -252,6 +255,7 @@ class TestTransformSuccessReasonAudit:
 
         # Write
         factory.execution.complete_node_state(
+            member_token=leader.membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"x": 1, "enrichment_score": 0.95},

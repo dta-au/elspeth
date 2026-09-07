@@ -91,8 +91,8 @@ class _StubRepo:
             raise AssertionError("_StubRepo.snapshot must be set before calling worker_heartbeat")
         return self.snapshot
 
-    def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
-        self.record_heartbeat_degraded_calls.append({"run_id": run_id, "worker_id": worker_id, "failures": failures, "now": now})
+    def record_heartbeat_degraded(self, *, member_token: WorkerMembershipToken, failures: int, now: datetime) -> None:
+        self.record_heartbeat_degraded_calls.append({"member_token": member_token, "failures": failures, "now": now})
         if self.degraded_exception is not None:
             raise self.degraded_exception
 
@@ -490,8 +490,7 @@ class TestHeartbeatDegraded:
         thread._step_beat()  # busy=3 — fires NOW
         assert len(repo.record_heartbeat_degraded_calls) == 1
         call_kwargs = repo.record_heartbeat_degraded_calls[0]
-        assert call_kwargs["run_id"] == _RUN_ID
-        assert call_kwargs["worker_id"] == _WORKER_ID
+        assert call_kwargs["member_token"] is _TOKEN
         assert call_kwargs["failures"] == 3
         assert isinstance(call_kwargs["now"], datetime)
 
@@ -563,8 +562,7 @@ class TestHeartbeatDegraded:
         thread._step_beat()
 
         call_kwargs = repo.record_heartbeat_degraded_calls[0]
-        assert call_kwargs["worker_id"] == _WORKER_ID
-        assert call_kwargs["run_id"] == _RUN_ID
+        assert call_kwargs["member_token"] is _TOKEN
 
 
 # ---------------------------------------------------------------------------

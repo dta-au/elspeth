@@ -17,11 +17,14 @@ import httpx
 import pytest
 
 from elspeth.contracts import Call, CallStatus, CallType, TransformResult
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .conftest import (
     chaosllm_azure_openai_responses,
@@ -44,10 +47,10 @@ class _ExecutionRepositoryDouble:
         self._operation_call_counter = itertools.count()
         self.recorded_calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return next(self._call_counter)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return next(self._operation_call_counter)
 
     def record_call(
@@ -61,6 +64,8 @@ class _ExecutionRepositoryDouble:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -91,12 +96,17 @@ class _ExecutionRepositoryDouble:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
     ) -> Call:
-        actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
+        actual_call_index = (
+            call_index
+            if call_index is not None
+            else self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+        )
         call_kwargs = {
             "operation_id": operation_id,
             "call_index": actual_call_index,
@@ -281,7 +291,7 @@ class TestRetryBehavior:
         ) as (_mock_client, call_count):
             # Large budget so retries complete quickly
             transform = LLMTransform(_make_config(max_capacity_retry_seconds=30))
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -336,7 +346,7 @@ class TestRetryBehavior:
         ):
             # Small budget so the test completes quickly
             transform = LLMTransform(_make_config(max_capacity_retry_seconds=1))
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -393,7 +403,7 @@ class TestRetryBehavior:
         ) as (_mock_client, call_count):
             # Large budget so retry completes quickly
             transform = LLMTransform(_make_config(max_capacity_retry_seconds=30))
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -454,7 +464,7 @@ class TestConcurrentRowProcessing:
 
         with chaosllm_azure_openai_responses(chaosllm_server, responses) as mock_client:
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=100)
 
@@ -518,7 +528,7 @@ class TestConcurrentRowProcessing:
             every_7th_fails,
         ):
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=100)
 
@@ -584,7 +594,7 @@ class TestConcurrentRowProcessing:
             _mock_azure_class,
         ):
             transform = LLMTransform(_make_config())
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -653,7 +663,7 @@ class TestSequentialFallback:
             # Large budget so the single retry completes immediately
             config = _make_config(max_capacity_retry_seconds=30)
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -710,7 +720,7 @@ class TestProviderClientLifecycle:
 
         with chaosllm_azure_openai_responses(chaosllm_server, responses) as _mock_client:
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=100)
 
@@ -779,7 +789,7 @@ class TestLLMErrorRetry:
             # Large budget so retries complete quickly
             config = _make_config(max_capacity_retry_seconds=30)
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -830,7 +840,7 @@ class TestLLMErrorRetry:
         ) as (_mock_client, call_count):
             config = _make_config()
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -921,7 +931,7 @@ class TestSequentialBoundedLocalRetry:
             # Use a large retry budget so the retry completes quickly in tests
             config = _make_config(max_capacity_retry_seconds=30)
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 
@@ -996,7 +1006,7 @@ class TestSequentialBoundedLocalRetry:
             # Very small budget - will exhaust almost immediately
             config = _make_config(max_capacity_retry_seconds=1)
             transform = LLMTransform(config)
-            init_ctx = make_context(landscape=mock_recorder)
+            init_ctx = make_context(**mock_audit_authority("test-run"), landscape=mock_recorder)
             transform.on_start(init_ctx)
             transform.connect_output(collector, max_pending=10)
 

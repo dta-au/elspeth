@@ -144,8 +144,11 @@ def track_operation(
         OperationHandle with the Operation object and mutable output_data field
     """
     scrubbed_input_data = scrub_payload_for_audit(input_data) if input_data is not None else None
+    coordination_token = ctx.require_coordination_token()
+    if coordination_token.run_id != run_id:
+        raise contract_errors.AuditIntegrityError("Operation authority does not match the requested run")
     operation = recorder.begin_operation(
-        run_id=run_id,
+        coordination_token=coordination_token,
         node_id=node_id,
         operation_type=operation_type,
         input_data=scrubbed_input_data,
@@ -183,6 +186,7 @@ def track_operation(
         try:
             scrubbed_output_data = scrub_payload_for_audit(handle.output_data) if handle.output_data is not None else None
             recorder.complete_operation(
+                coordination_token=coordination_token,
                 operation_id=operation.operation_id,
                 status=status,
                 output_data=scrubbed_output_data,

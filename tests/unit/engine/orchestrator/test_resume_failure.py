@@ -304,13 +304,13 @@ def test_real_payload_restore_failure_releases_reconstruction_seat(damage: str, 
     store = MockPayloadStore()
     setup = make_recorder_with_run(payload_store=store)
     factory, db, run_id = setup.factory, setup.db, setup.run_id
-    row = factory.data_flow.create_row(
-        run_id,
+    row, _token = factory.data_flow.create_row_with_token(
         setup.source_node_id,
         0,
         {"amount": "invalid" if damage == "schema" else 1},
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=setup.coordination_token,
     )
     assert row.source_data_ref is not None
     if damage == "missing":

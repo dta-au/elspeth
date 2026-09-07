@@ -9,8 +9,10 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.engine.batch_adapter import ExceptionResult
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.infrastructure.clients.llm import RateLimitError
@@ -20,6 +22,7 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .conftest import chaosllm_azure_openai_client
 
@@ -57,10 +60,10 @@ class _FakeAuditWriter:
         self._operation_call_indices: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return self._next_index(self._call_indices, state_id)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return self._next_index(self._operation_call_indices, operation_id)
 
     def get_node_state(self, _state_id: str) -> SimpleNamespace:
@@ -410,14 +413,14 @@ class TestLLMTransformAzurePipelining:
     def ctx(self, audit_writer: _FakeAuditWriter) -> PluginContext:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
-        return make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        return make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
     @pytest.fixture
     def transform(self, collector: CollectorOutputPort, audit_writer: _FakeAuditWriter) -> Generator[LLMTransform, None, None]:
         """Create and initialize LLMTransform with Azure provider and pipelining."""
         t = LLMTransform(_make_azure_config(prompt_template="Analyze: {{ row.text }}"))
         # Initialize with factory reference
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         t.on_start(init_ctx)
         # Connect output port
         t.connect_output(collector, max_pending=10)
@@ -569,6 +572,7 @@ class TestLLMTransformAzurePipelining:
         """
         token = make_token("row-1")
         ctx = PluginContext(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             config={},
             landscape=audit_writer,
@@ -590,6 +594,7 @@ class TestLLMTransformAzurePipelining:
     def test_process_row_missing_token_raises_runtime_error(self, audit_writer: _FakeAuditWriter, transform: LLMTransform) -> None:
         """Direct _process_row call with missing token must crash explicitly."""
         ctx = PluginContext(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             config={},
             landscape=audit_writer,
@@ -613,12 +618,12 @@ class TestLLMTransformAzurePipelining:
                 system_prompt="You are a helpful assistant.",
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -649,12 +654,12 @@ class TestLLMTransformAzurePipelining:
                 max_tokens=500,
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -681,12 +686,12 @@ class TestLLMTransformAzurePipelining:
                 response_field="analysis",
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(
@@ -730,7 +735,7 @@ class TestLLMTransformAzurePipelining:
     def test_connect_output_cannot_be_called_twice(self, collector: CollectorOutputPort, audit_writer: _FakeAuditWriter) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -797,12 +802,12 @@ class TestLLMTransformAzureIntegration:
                 """,
             )
         )
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server) as mock_client:
@@ -835,12 +840,12 @@ class TestLLMTransformAzureIntegration:
     ) -> None:
         """LLM calls are recorded via AuditedLLMClient."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
         token = make_token("row-1")
-        ctx = make_context(state_id="test-state-id", token=token, landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", token=token, landscape=audit_writer)
 
         try:
             with chaosllm_azure_openai_client(chaosllm_server):
@@ -874,7 +879,7 @@ class TestLLMTransformAzureConcurrency:
     ) -> None:
         """Multiple rows are emitted in submission order (FIFO)."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -889,6 +894,7 @@ class TestLLMTransformAzureConcurrency:
                 for i, row in enumerate(rows):
                     token = make_token(f"row-{i}")
                     ctx = make_context(
+                        **mock_audit_authority("test-run"),
                         run_id="test-run",
                         state_id=f"state-{i}",
                         token=token,
@@ -915,7 +921,7 @@ class TestLLMTransformAzureConcurrency:
         # Verify _recorder starts as None
         assert transform._recorder is None
 
-        ctx = make_context(state_id="test-state-id", landscape=audit_writer)
+        ctx = make_context(**mock_audit_authority("test-run"), state_id="test-state-id", landscape=audit_writer)
         transform.on_start(ctx)
 
         # Verify factory was captured
@@ -924,7 +930,7 @@ class TestLLMTransformAzureConcurrency:
     def test_close_clears_recorder(self, audit_writer: _FakeAuditWriter, collector: CollectorOutputPort) -> None:
         """close() clears factory reference."""
         transform = LLMTransform(_make_azure_config(prompt_template="{{ row.text }}"))
-        init_ctx = make_context(run_id="test", landscape=audit_writer)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=audit_writer)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 

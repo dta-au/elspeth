@@ -17,9 +17,11 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import CallPayload, LLMCallError, LLMCallRequest, LLMCallResponse, RawCallPayload
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import PluginRetryableError
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
@@ -307,6 +309,9 @@ class AuditedLLMClient(AuditedClientBase):
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
         operation_id: str | None = None,
+        coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
+        work_item: TokenWorkItem | None = None,
     ) -> None:
         """Initialize audited LLM client.
 
@@ -321,7 +326,18 @@ class AuditedLLMClient(AuditedClientBase):
             token_id: Optional token identity for telemetry correlation
             operation_id: Optional operation parent for runtime preflight calls
         """
-        super().__init__(execution, state_id, run_id, telemetry_emit, operation_id=operation_id, limiter=limiter, token_id=token_id)
+        super().__init__(
+            execution,
+            state_id,
+            run_id,
+            telemetry_emit,
+            operation_id=operation_id,
+            limiter=limiter,
+            token_id=token_id,
+            coordination_token=coordination_token,
+            member_token=member_token,
+            work_item=work_item,
+        )
         self._client = underlying_client
         self._provider = provider
 

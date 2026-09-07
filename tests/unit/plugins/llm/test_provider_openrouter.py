@@ -10,13 +10,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -38,6 +40,12 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 
 
+# Mock-only authority: these providers use FakeAuditRecorder, never a database.
+_LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="leader-1", leader_epoch=1)
+_MEMBER_TOKEN = _LEADER_TOKEN.membership
+_WORK_ITEM = Mock(spec=TokenWorkItem)
+
+
 @dataclass
 class FakeAuditRecorder:
     call_indexes: list[int] = field(default_factory=list)
@@ -46,13 +54,13 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     operation_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self.allocated_state_ids.append(state_id)
         if self.call_indexes:
             return self.call_indexes.pop(0)
         return len(self.allocated_state_ids) - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self.allocated_operation_ids.append(operation_id)
         return len(self.allocated_operation_ids) - 1
 
@@ -266,6 +274,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -284,7 +294,7 @@ class TestExecuteQuery:
         audit_recorder: FakeAuditRecorder,
         telemetry_emit: FakeTelemetryEmit,
     ) -> None:
-        parent = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
+        parent = LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="token-1")
         client = FakeHTTPClient(
             response=_make_http_response(),
             close_error=RuntimeError("close failed"),
@@ -311,7 +321,7 @@ class TestExecuteQuery:
         provider: OpenRouterLLMProvider,
         telemetry_emit: FakeTelemetryEmit,
     ) -> None:
-        parent = LLMAuditParent.for_operation(operation_id="operation-1")
+        parent = LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1")
         client = FakeHTTPClient(
             response=_make_error_response(503, body='{"error": "SENTINEL-provider-body"}'),
             close_error=RuntimeError("close failed"),
@@ -348,7 +358,7 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
             )
 
         assert audit_recorder.calls == []
@@ -371,7 +381,7 @@ class TestExecuteQuery:
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
-                    audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                    audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
                 )
 
         assert audit_recorder.calls == []
@@ -395,6 +405,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=None,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -420,6 +432,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -446,6 +460,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -472,6 +488,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -495,6 +513,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -526,6 +546,8 @@ class TestExecuteQuery:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
@@ -555,6 +577,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -583,6 +607,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -597,6 +623,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -614,6 +642,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -645,6 +675,8 @@ class TestExecuteQuery:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -668,6 +700,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -682,6 +716,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -697,6 +733,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -712,6 +750,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -726,6 +766,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -740,6 +782,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -754,6 +798,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -772,6 +818,8 @@ class TestHTTPErrorMapping:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
@@ -800,6 +848,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -824,6 +874,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -845,6 +897,8 @@ class TestHTTPErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    member_token=_MEMBER_TOKEN,
+                    work_item=_WORK_ITEM,
                     state_id="state-1",
                     token_id="tok-1",
                 ),
@@ -866,9 +920,15 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        client1 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client2 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
-        client3 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-b", token_id="tok-2"))
+        client1 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client2 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-a", token_id="tok-1")
+        )
+        client3 = provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-b", token_id="tok-2")
+        )
 
         assert client1 is client2
         assert client1 is not client3
@@ -891,7 +951,9 @@ class TestClientCaching:
 
         def create_client() -> None:
             barrier.wait()
-            c = provider._get_http_client(LLMAuditParent.for_row(state_id="state-race", token_id="tok-1"))
+            c = provider._get_http_client(
+                LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-race", token_id="tok-1")
+            )
             with collect_lock:
                 clients.append(c)
 
@@ -916,7 +978,9 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        provider._get_http_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
+        provider._get_http_client(
+            LLMAuditParent.for_row(member_token=_MEMBER_TOKEN, work_item=_WORK_ITEM, state_id="state-1", token_id="tok-1")
+        )
         assert len(provider._http_clients) == 1
 
         provider.close()
@@ -960,7 +1024,7 @@ class TestRuntimePreflight:
         with patch("elspeth.plugins.transforms.llm.providers.openrouter.AuditedHTTPClient", autospec=True) as client_cls:
             client_cls.return_value = http_client
 
-            provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+            provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             request_body = http_client.last_post.kwargs["json"]
             assert "max_tokens" in request_body, (
@@ -983,7 +1047,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message
@@ -1003,7 +1067,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(RateLimitError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Rate limited" in message
@@ -1020,7 +1084,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(ServerError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "Server error (HTTP 500)" in message
@@ -1043,6 +1107,8 @@ class TestRuntimePreflight:
                     temperature=0.0,
                     max_tokens=100,
                     audit_parent=LLMAuditParent.for_row(
+                        member_token=_MEMBER_TOKEN,
+                        work_item=_WORK_ITEM,
                         state_id="state-1",
                         token_id="tok-1",
                     ),
@@ -1065,7 +1131,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert len(message) < 600, (
@@ -1084,7 +1150,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "authorization", "sk-or-v1-header-secret")
@@ -1102,7 +1168,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             _assert_provider_body_redacted(message, "application/sk-or-v1-header-secret", "sk-or-v1-header-secret")
@@ -1124,7 +1190,7 @@ class TestRuntimePreflight:
             client_cls.return_value = http_client
 
             with pytest.raises(LLMClientError) as exc_info:
-                provider.runtime_preflight(operation_id="op-1", model="gpt-4o")
+                provider.runtime_preflight(coordination_token=_LEADER_TOKEN, operation_id="op-1", model="gpt-4o")
 
             message = str(exc_info.value)
             assert "HTTP 400" in message

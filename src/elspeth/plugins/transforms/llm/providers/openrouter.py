@@ -29,6 +29,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
@@ -450,7 +451,9 @@ class OpenRouterLLMProvider:
                     error=cleanup_error,
                     suppressed=primary_error is not None,
                     logger=logger,
-                    **audit_parent.client_kwargs(),
+                    state_id=audit_parent.state_id,
+                    token_id=audit_parent.token_id,
+                    operation_id=audit_parent.operation_id,
                 )
                 if primary_error is None:
                     raise cleanup_error
@@ -530,12 +533,13 @@ class OpenRouterLLMProvider:
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,
         )
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited OpenRouter call under an operation parent."""
         http_client = AuditedHTTPClient(
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,
+            coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
             timeout=self._timeout,

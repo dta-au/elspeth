@@ -11,7 +11,6 @@ Coordinates:
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC
@@ -93,11 +92,7 @@ from elspeth.engine.token_traversal import (
 from elspeth.engine.work_items import WorkItem, WorkItemFactory, resolve_merged_branch_barrier
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine import Connection
-
     from elspeth.contracts import CommittedAggregationOutputReceipt, CommittedAggregationResidual, CommittedCoalesceResidual
-    from elspeth.contracts.audit import Row as AuditRow
-    from elspeth.contracts.audit import Token as AuditToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -148,6 +143,7 @@ from elspeth.contracts.scheduler import (
     BarrierEmission,
     BarrierTerminalOutcomeSpec,
     GroupLossSpec,
+    SourceIngestSpec,
     TokenWorkItem,
     TokenWorkStatus,
 )
@@ -733,10 +729,7 @@ class RowProcessor:
         self._coordination_token = coordination_token
         self._member_token = member_token
         self._run_coordination = run_coordination
-        # ADR-030 §G (slice 5): _scheduler_lease_owner_registered is True when
-        # the lease owner is a run_workers identity. Production paths pass the
-        # owner explicitly; direct tests often pass only the coordination token,
-        # whose worker_id is the same registered leader identity.
+        # Lease identity is the admitted worker carried by the authority.
         if (
             mode is ProcessorMode.LEADER
             and coordination_token is not None
@@ -747,11 +740,6 @@ class RowProcessor:
                 "ProcessorMode.LEADER requires scheduler_lease_owner to equal coordination_token.worker_id; "
                 "leader-fenced recovery derives caller identity from the token and must not hold leases under a second identity."
             )
-        resolved_scheduler_lease_owner = scheduler_lease_owner
-        if resolved_scheduler_lease_owner is None and coordination_token is not None:
-            resolved_scheduler_lease_owner = coordination_token.worker_id
-        self._scheduler_lease_owner_registered: bool = resolved_scheduler_lease_owner is not None
-        self._scheduler_lease_owner = resolved_scheduler_lease_owner or f"row-processor:{run_id}:{uuid.uuid4().hex}"
         # Explicit processor role (elspeth-577179bba1): follower-ness is a
         # STORED construction-time decision, never re-derived from the
         # coordination_token/run_coordination None-sentinels. On the follower
@@ -782,7 +770,7 @@ class RowProcessor:
                     "the §C.2 housekeeping/eviction sweep (leader-only). A follower holding the "
                     "coordination repository is the wrong-mode bug this flag exists to catch."
                 )
-            if not self._scheduler_lease_owner_registered:
+            if scheduler_lease_owner is None:
                 raise OrchestrationInvariantError(
                     "ProcessorMode.FOLLOWER requires an explicit scheduler_lease_owner: the "
                     "follower's registered run_workers identity IS its lease owner and "
@@ -800,11 +788,11 @@ class RowProcessor:
                     "ProcessorMode.FOLLOWER requires a WorkerMembershipToken: matching run and worker "
                     "identities do not make a leader token membership authority."
                 )
-            if member_token.run_id != run_id or member_token.worker_id != self._scheduler_lease_owner:
+            if member_token.run_id != run_id or member_token.worker_id != scheduler_lease_owner:
                 raise OrchestrationInvariantError(
                     "ProcessorMode.FOLLOWER requires member_token to name this processor's run and its "
                     f"scheduler_lease_owner: got member_token=({member_token.run_id!r}, {member_token.worker_id!r}) "
-                    f"for run_id={run_id!r}, scheduler_lease_owner={self._scheduler_lease_owner!r} (ADR-030 §A.1)."
+                    f"for run_id={run_id!r}, scheduler_lease_owner={scheduler_lease_owner!r} (ADR-030 §A.1)."
                 )
         elif member_token is not None:
             raise OrchestrationInvariantError(
@@ -812,6 +800,9 @@ class RowProcessor:
                 "coordination_token (CoordinationToken.membership), never carried alongside it. A leader "
                 "holding a follower's authority type is the wrong-mode bug this guard exists to catch."
             )
+        elif coordination_token is None or coordination_token.run_id != run_id:
+            raise OrchestrationInvariantError("ProcessorMode.LEADER requires leadership authority for this run")
+        self._scheduler_lease_owner = self._require_member_token().worker_id
         self._scheduler_lease_seconds = scheduler_lease_seconds
         if scheduler_heartbeat_seconds <= 0:
             raise OrchestrationInvariantError(f"scheduler_heartbeat_seconds must be positive, got {scheduler_heartbeat_seconds}")
@@ -922,10 +913,10 @@ class RowProcessor:
             span_factory=self._spans,
             run_coordination=run_coordination,
             coordination_token=coordination_token,
+            member_token=self._require_member_token(),
             scheduler_lease_owner=self._scheduler_lease_owner,
             scheduler_lease_seconds=scheduler_lease_seconds,
             scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
-            scheduler_lease_owner_registered=self._scheduler_lease_owner_registered,
             resume_checkpoint_id=self._resume_checkpoint_id,
             live_barrier_holds=self._live_barrier_holds,
             pending_group_losses=self._pending_group_losses,
@@ -1303,7 +1294,8 @@ class RowProcessor:
 
         for token in fctx.buffered_tokens:
             try:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
@@ -1543,7 +1535,8 @@ class RowProcessor:
                 "triggering_token_id": (fctx.triggering_token.token_id if fctx.triggering_token is not None else None),
             }
             try:
-                self._data_flow.record_token_outcome(
+                self._data_flow.record_token_outcome_leader(
+                    coordination_token=self._require_coordination_token(),
                     ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.UNROUTED,
@@ -1580,10 +1573,13 @@ class RowProcessor:
         transform_name: str,
         node_id: NodeID,
         path_label: str,
+        ctx: PluginContext,
     ) -> None:
         """Record DROPPED_BY_FILTER or raise AuditIntegrityError on recorder failure."""
         try:
             self._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.FILTER_DROPPED,
@@ -1603,10 +1599,13 @@ class RowProcessor:
         token: TokenInfo,
         gate_name: str,
         node_id: NodeID,
+        ctx: PluginContext,
     ) -> None:
         """Record terminal gate discard outcome or raise on audit failure."""
         try:
             self._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_DISCARDED,
@@ -1836,7 +1835,7 @@ class RowProcessor:
                     expanded_rows=[row.to_dict() for row in output_rows],
                     output_contract=output_contract,
                     node_id=fctx.node_id,
-                    run_id=self._run_id,
+                    member_token=self._require_member_token(),
                     parent_path=TerminalPath.BATCH_CONSUMED,
                     parent_batch_id=fctx.batch_id,
                     aggregation_parent_dispositions=parent_dispositions,
@@ -2296,7 +2295,7 @@ class RowProcessor:
             self._execution,
             token_id=token.token_id,
             node_id=node_id,
-            run_id=self._run_id,
+            member_token=self._require_member_token(),
             step_index=self.resolve_node_step(NodeID(node_id)),
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset + attempt,
@@ -2505,7 +2504,7 @@ class RowProcessor:
             self._execution.record_completed_node_state(
                 token_id=token.token_id,
                 node_id=effective_source_node_id,
-                run_id=self._run_id,
+                coordination_token=self._require_coordination_token(),
                 step_index=0,
                 input_data=input_data,
                 output_data=input_data,
@@ -2515,12 +2514,13 @@ class RowProcessor:
         source_state = self._execution.begin_node_state(
             token_id=token.token_id,
             node_id=effective_source_node_id,
-            run_id=self._run_id,
+            member_token=self._require_member_token(),
             step_index=0,
             input_data=input_data,
         )
         if status == NodeStateStatus.FAILED:
             self._execution.complete_node_state(
+                member_token=self._require_member_token(),
                 state_id=source_state.state_id,
                 status=NodeStateStatus.FAILED,
                 duration_ms=0,
@@ -2570,7 +2570,8 @@ class RowProcessor:
         )
         error_hash = compute_error_hash(f"{type(failure).__name__}:{effective_source_node_id}")
         try:
-            self._data_flow.record_token_outcome(
+            self._data_flow.record_token_outcome_leader(
+                coordination_token=self._require_coordination_token(),
                 ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
@@ -2718,54 +2719,31 @@ class RowProcessor:
     ) -> TokenWorkItem:
         """Drive the fenced leader INGEST verb for one source row (§C.4 row 9).
 
-        Composes the rows+tokens inserts (via the data-flow repository's
-        connection-accepting closure) with the initial enqueue-and-claim in
-        ONE epoch-fenced IMMEDIATE transaction. Scheduler fields come from
+        The scheduler composes source row, token and completion inserts with
+        the initial enqueue-and-claim in one epoch-fenced transaction.
+        Scheduler fields come from
         the shared work codec (deterministic work_item_id + strict field
         equality reconciliation downstream); ``ingest_sequence`` is passed
         explicitly because the row is inserted in this same transaction and
         is not yet resolvable.
         """
-        coordination_token = self._coordination_token
-        if coordination_token is None:
-            raise OrchestrationInvariantError(
-                "Fenced source ingest requires a coordination token; the unfenced arm must not reach this helper."
-            )
-        token = item.token
+        coordination_token = self._require_coordination_token()
         fields = self._work_codec.ready_fields(item, ingest_sequence=ingest_sequence)
-
-        def insert_row_and_token(conn: Connection) -> tuple[AuditRow, AuditToken]:
-            row_record, token_record = self._data_flow.insert_row_with_token_on(
-                conn,
-                run_id=self._run_id,
+        _row, _token_record, scheduled = self._scheduler.ingest_row_with_initial_claim(
+            coordination_token=coordination_token,
+            source=SourceIngestSpec(
                 source_node_id=str(source_node_id),
                 row_index=row_index,
                 data=data,
                 source_row_index=source_row_index,
-                ingest_sequence=ingest_sequence,
-                row_id=token.row_id,
-                token_id=token.token_id,
-            )
-            self._execution.record_completed_node_state_on(
-                conn,
-                token_id=token.token_id,
-                node_id=str(source_node_id),
-                run_id=self._run_id,
-                step_index=0,
-                input_data=data,
-                output_data=data,
-                duration_ms=0,
-            )
-            return row_record, token_record
-
-        _row, _token_record, scheduled = self._scheduler.ingest_row_with_initial_claim(
-            coordination_token=coordination_token,
-            insert_row_and_token=insert_row_and_token,
-            token_id=fields.token_id,
-            row_id=fields.row_id,
+                ingest_sequence=fields.ingest_sequence,
+                row_id=fields.row_id,
+                token_id=fields.token_id,
+            ),
+            data_flow=self._data_flow,
+            execution=self._execution,
             node_id=fields.node_id,
             step_index=fields.step_index,
-            ingest_sequence=fields.ingest_sequence,
             row_payload_json=fields.row_payload_json,
             lease_owner=self._scheduler_lease_owner,
             lease_seconds=self._scheduler_lease_seconds,
@@ -2866,7 +2844,6 @@ class RowProcessor:
                 # record (fenced when a coordination token is held) — but
                 # never a scheduler row.
                 self._token_manager.create_initial_token(
-                    run_id=self._run_id,
                     source_node_id=effective_source_node_id,
                     row_index=row_index,
                     source_row_index=source_row_index,
@@ -2874,7 +2851,7 @@ class RowProcessor:
                     source_row=source_row,
                     row_id=token.row_id,
                     token_id=token.token_id,
-                    coordination_token=self._coordination_token,
+                    coordination_token=self._require_coordination_token(),
                 )
                 self._record_source_boundary_failure(
                     token=token,
@@ -2894,40 +2871,15 @@ class RowProcessor:
             coalesce_name=coalesce_name,
         )
 
-        preclaimed: TokenWorkItem | None = None
-        if self._coordination_token is not None:
-            # Fenced leader INGEST (§C.4 row 9): rows insert + tokens insert
-            # + source COMPLETED evidence + initial enqueue-and-claim in ONE
-            # IMMEDIATE transaction; a stale epoch rolls the whole ingest
-            # back (no orphan rows row or unexplained scheduler admission).
-            preclaimed = self._ingest_source_row_with_initial_claim(
-                item=initial_item,
-                source_node_id=effective_source_node_id,
-                row_index=row_index,
-                source_row_index=source_row_index,
-                ingest_sequence=ingest_sequence,
-                data=pipeline_row.to_dict(),
-            )
-        else:
-            # Legacy unfenced arm (direct repository-level construction, no
-            # coordination token): rows+tokens in their own transaction; the
-            # drain performs the initial enqueue as before.
-            self._token_manager.create_initial_token(
-                run_id=self._run_id,
-                source_node_id=effective_source_node_id,
-                row_index=row_index,
-                source_row_index=source_row_index,
-                ingest_sequence=ingest_sequence,
-                source_row=source_row,
-                row_id=token.row_id,
-                token_id=token.token_id,
-            )
-            self._record_source_node_state(
-                token=token,
-                input_data=source_input,
-                status=NodeStateStatus.COMPLETED,
-                source_node_id=effective_source_node_id,
-            )
+        # Source ingest always uses the acquired leader's fenced transaction.
+        preclaimed = self._ingest_source_row_with_initial_claim(
+            item=initial_item,
+            source_node_id=effective_source_node_id,
+            row_index=row_index,
+            source_row_index=source_row_index,
+            ingest_sequence=ingest_sequence,
+            data=pipeline_row.to_dict(),
+        )
         return self._drain_work_queue(initial_item, ctx, preclaimed=preclaimed)
 
     def process_existing_row(
@@ -2974,6 +2926,7 @@ class RowProcessor:
         """
         # Create token for existing row (NOT a new row)
         token = self._token_manager.create_token_for_existing_row(
+            coordination_token=self._require_coordination_token(),
             row_id=row_id,
             row_data=row_data,
         )
@@ -3824,7 +3777,8 @@ class RowProcessor:
         terminal_reason = GroupSettlementReason.SCOPE_GROUP_FAILED.value if group_failed else failure_reason
         error_hash = compute_error_hash(terminal_reason) if outcome is TerminalOutcome.FAILURE else None
         for consumed in consumed_tokens:
-            self._data_flow.record_token_outcome(
+            self._data_flow.record_token_outcome_leader(
+                coordination_token=self._require_coordination_token(),
                 ref=TokenRef(token_id=consumed.token_id, run_id=self._run_id),
                 outcome=outcome,
                 path=path,
@@ -3926,6 +3880,7 @@ class RowProcessor:
         if self._row_union_executor is None:
             return []
         outcome = self._row_union_executor.notify_branch_lost(
+            coordination_token=self._require_coordination_token(),
             row_union_name=str(row_union_name),
             fork_group_id=frame.group_id,
             lost_branch=frame.member_key,
@@ -4001,6 +3956,7 @@ class RowProcessor:
             return []
 
         outcome = self._coalesce_executor.notify_branch_lost(
+            coordination_token=self._require_coordination_token(),
             coalesce_name=coalesce_name,
             fork_group_id=frame.group_id,
             lost_branch=frame.member_key,
@@ -4167,7 +4123,6 @@ class RowProcessor:
         prevents non-members from claiming, closing that race structurally).
         """
         repaired_source_states = self._execution.reconcile_source_completions_from_scheduler(
-            run_id=self._run_id,
             coordination_token=self._require_coordination_token(),
         )
         if repaired_source_states:
@@ -4279,7 +4234,6 @@ class RowProcessor:
                 f"Scheduler barrier terminalization received duplicate live token_ids for barrier_key={barrier_key!r}: {token_ids!r}"
             )
         terminalized_count = self._scheduler.mark_blocked_barrier_terminal(
-            run_id=self._run_id,
             barrier_key=barrier_key,
             token_ids=token_ids,
             coordination_token=self._require_coordination_token(),
@@ -4463,7 +4417,6 @@ class RowProcessor:
                 emitted_pending_sink.append(self._sink_emission_from_result(result))
 
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=str(node_id),
             consumed_token_ids=residual.member_token_ids,
             emitted_pending_sink=tuple(emitted_pending_sink),
@@ -4672,7 +4625,6 @@ class RowProcessor:
                 join_group_id=residual.result_join_group_id,
             )
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=str(coalesce_name),
             consumed_token_ids=residual.member_token_ids,
             emitted_pending_sink=(() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),)),
@@ -4782,7 +4734,6 @@ class RowProcessor:
 
         group_losses = tuple(self._pending_group_losses)
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=str(node_id),
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=tuple(emissions),
@@ -4871,7 +4822,6 @@ class RowProcessor:
         if not consumed_token_ids and merged_item is None and merged_sink_result is None:
             return
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=str(coalesce_name),
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),),
@@ -4910,7 +4860,6 @@ class RowProcessor:
         if not consumed_token_ids and not released_items:
             return
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=str(row_union_name),
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=(),
@@ -5135,7 +5084,6 @@ class RowProcessor:
         if not consumed_token_ids and not release.items and not release.sink_results:
             return
         self._scheduler.complete_barrier(
-            run_id=self._run_id,
             barrier_key=collector_barrier_key(str(collector_name), group_id),
             consumed_token_ids=consumed_token_ids,
             emitted_pending_sink=tuple(self._sink_emission_from_result(result) for result in release.sink_results),
@@ -5238,7 +5186,7 @@ class RowProcessor:
 
     def _require_coordination_token(self) -> CoordinationToken:
         """Return the authority required by every leader-fenced scheduler verb."""
-        if self._coordination_token is None:
+        if not isinstance(self._coordination_token, CoordinationToken):
             raise OrchestrationInvariantError(
                 "Leader-fenced scheduler operations require the coordination token (ADR-030): "
                 "lease recovery and barrier adoption have no unfenced production arm. "
@@ -5246,6 +5194,14 @@ class RowProcessor:
                 "binds it at begin_run (epoch 1) or at the resume takeover CAS."
             )
         return self._coordination_token
+
+    def _require_member_token(self) -> WorkerMembershipToken:
+        """Return the registered worker authority supplied at construction."""
+        if isinstance(self._coordination_token, CoordinationToken):
+            return self._coordination_token.membership
+        if not isinstance(self._member_token, WorkerMembershipToken):
+            raise OrchestrationInvariantError("RowProcessor requires registered worker membership")
+        return self._member_token
 
     def _run_barrier_intake_pass(self, ctx: PluginContext) -> tuple[list[RowResult], list[WorkItem]]:
         """One §E.2 intake pass, delegated to the barrier subsystem.
@@ -5345,7 +5301,6 @@ class RowProcessor:
     def mark_sink_bound_scheduler_terminal(self, token_id: str) -> None:
         """Terminalize scheduler work after sink outcome durability."""
         terminalized = self._scheduler.mark_pending_sink_terminal(
-            run_id=self._run_id,
             token_id=token_id,
             expected_lease_owner=self._scheduler_lease_owner,
             coordination_token=self._require_coordination_token(),
@@ -5359,7 +5314,6 @@ class RowProcessor:
     def mark_sink_bound_scheduler_terminal_many(self, token_ids: tuple[str, ...]) -> None:
         """Terminalize a durable sink batch after sink outcome durability."""
         terminalized = self._scheduler.mark_pending_sink_terminal_many(
-            run_id=self._run_id,
             token_ids=token_ids,
             expected_lease_owner=self._scheduler_lease_owner,
             coordination_token=self._require_coordination_token(),
@@ -5537,10 +5491,13 @@ class RowProcessor:
         current_token: TokenInfo,
         error_sink: str | None,
         child_items: list[WorkItem],
+        *,
+        ctx: PluginContext,
     ) -> _TransformTerminal:
         return self._token_traversal.handle_transform_error_status(
             transform_result,
             current_token,
             error_sink,
             child_items,
+            ctx=ctx,
         )

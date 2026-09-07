@@ -73,8 +73,8 @@ sink-bound
 otherwise
     ``mark_terminal`` / ``mark_failed``.
 
-Child continuations use the idempotent ``enqueue_ready`` (now membership-
-fenced with the follower's worker_id, task (e) in slice 5).
+Child continuations are inserted atomically by the membership-fenced
+``mark_*_with_ready_children`` dispositions of the current claim.
 
 Per-worker JSONL journal
 ------------------------
@@ -523,8 +523,8 @@ def build_follower_processor(
       distinction): it drives the item-layer CAS verbs, which fence on
       lease_owner, and the membership-fenced verbs, which fence on the token
     - ``scheduler_lease_owner=member_token.worker_id`` — the registered worker
-      identity IS the scheduler lease_owner (§A.1); also threads the membership
-      fence into ``enqueue_ready`` (task e, slice 5)
+      identity IS the scheduler lease_owner (§A.1); the member token fences
+      each claim and atomic disposition with its child continuations
 
     The coordination_token/run_coordination Nones remain correct ABSENCES; the
     explicit mode flag, not their None-ness, drives follower branch selection,
@@ -605,8 +605,8 @@ def build_follower_processor(
     # the combination fail-closed (member token present, leader token absent).
     #
     # The follower's run_workers row is required for the membership fence on
-    # enqueue_ready / claim_ready — the fence is keyed on scheduler_lease_owner,
-    # which equals member_token.worker_id here (§A.1).
+    # claim_ready and atomic dispositions with child continuations — the fence
+    # uses the admitted member_token, whose worker_id is scheduler_lease_owner.
     processor, _coalesce_node_map, _coalesce_executor = build_row_processor(
         graph=graph,
         config=config,

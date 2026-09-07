@@ -256,7 +256,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c5977c9db0ea2125"
+    source_file_hash: str | None = "sha256:4753a3d81bb7aace"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -420,13 +420,15 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         self._limiter = None
         self._payload_store = None
 
-    def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractInlineClient:
+    def _get_row_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None) -> TextractInlineClient:
         with self._row_clients_lock:
             if state_id in self._row_clients:
                 return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract inline transform used before on_start")
             client = TextractInlineClient(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 execution=self._recorder,
                 state_id=state_id,
                 run_id=self._run_id,
@@ -446,7 +448,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
         if ctx.token is None:
             raise FrameworkBugError("Amazon Textract inline batch processing requires token identity")
         try:
-            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
+            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id, ctx=ctx)
         finally:
             # The row client is created lazily at the SDK call, so a row that
             # was rejected before reaching it never registered one.
@@ -512,7 +514,9 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             )
         return payload_ref, content
 
-    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None) -> TransformResult:
+    def _process_single_with_state(
+        self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
+    ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract inline processing requires run, node, and token identity")
         if self._shutdown.is_set():
@@ -522,7 +526,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             return document
         payload_ref, content = document
 
-        client = self._get_row_client(state_id, token_id=token_id)
+        client = self._get_row_client(state_id, token_id=token_id, ctx=ctx)
         try:
             analysis = client.analyze_document(
                 document_bytes=content,
@@ -702,7 +706,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
             self._shutdown = threading.Event()
             state_id = ctx.state_id or "textract-inline-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-inline-invariant-probe-token"
-            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
         finally:
             self._recorder = prior_recorder
             self._run_id = prior_run_id

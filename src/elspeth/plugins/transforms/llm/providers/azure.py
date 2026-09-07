@@ -21,6 +21,7 @@ from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
@@ -210,12 +211,13 @@ class AzureLLMProvider:
             with self._llm_clients_lock:
                 self._llm_clients.pop(cache_key, None)
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited Azure OpenAI call under an operation parent."""
         client = AuditedLLMClient(
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,
+            coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
             underlying_client=self._get_underlying_client(),

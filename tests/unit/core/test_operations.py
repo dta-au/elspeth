@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.operations import track_operation
 from tests.fixtures.factories import make_context
@@ -28,14 +29,14 @@ class _FakeFactory:
     def begin_operation(
         self,
         *,
-        run_id: str,
+        coordination_token: CoordinationToken,
         node_id: str,
         operation_type: str,
         input_data: dict[str, Any] | None = None,
     ) -> _Operation:
         self.begin_calls.append(
             {
-                "run_id": run_id,
+                "coordination_token": coordination_token,
                 "node_id": node_id,
                 "operation_type": operation_type,
                 "input_data": input_data,
@@ -46,6 +47,7 @@ class _FakeFactory:
     def complete_operation(
         self,
         *,
+        coordination_token: CoordinationToken,
         operation_id: str,
         status: str,
         output_data: dict[str, Any] | None,
@@ -54,6 +56,7 @@ class _FakeFactory:
     ) -> None:
         self.complete_calls.append(
             {
+                "coordination_token": coordination_token,
                 "operation_id": operation_id,
                 "status": status,
                 "output_data": output_data,
@@ -67,7 +70,7 @@ class _FakeFactory:
 
 def test_track_operation_records_completed_status_and_output_data() -> None:
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
     assert ctx.operation_id is None
 
     with track_operation(
@@ -85,11 +88,13 @@ def test_track_operation_records_completed_status_and_output_data() -> None:
     assert factory.begin_calls[0]["input_data"] == {"source": "csv"}
     assert factory.complete_calls[0]["status"] == "completed"
     assert factory.complete_calls[0]["output_data"] == {"rows_loaded": 3}
+    assert factory.begin_calls[0]["coordination_token"] is ctx.coordination_token
+    assert factory.complete_calls[0]["coordination_token"] is ctx.coordination_token
 
 
 def test_track_operation_scrubs_structured_input_metadata_before_persisting() -> None:
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
     secret = "sk-or-v1-" + ("B" * 24)
 
     with track_operation(
@@ -118,7 +123,7 @@ def test_track_operation_scrubs_structured_input_metadata_before_persisting() ->
 
 def test_track_operation_scrubs_structured_output_metadata_before_persisting() -> None:
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
     token = "sk-" + ("C" * 24)
 
     with track_operation(
@@ -143,7 +148,7 @@ def test_track_operation_scrubs_structured_output_metadata_before_persisting() -
 
 def test_track_operation_marks_failed_for_exception() -> None:
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(ValueError, match="boom"),
@@ -167,7 +172,7 @@ def test_track_operation_marks_failed_for_base_exception() -> None:
         pass
 
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(_Fatal, match="stop-now"),
@@ -198,7 +203,7 @@ def test_track_operation_renders_informative_error_for_blank_base_exception_stri
     expected_error: str,
 ) -> None:
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(type(exc)),
@@ -223,7 +228,7 @@ def test_track_operation_falls_back_for_broken_exception_str_override() -> None:
             raise RuntimeError("boom")
 
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(_BrokenStrError),
@@ -255,7 +260,7 @@ def test_track_operation_scrubs_secret_bearing_error_before_persisting() -> None
     from elspeth.contracts.errors import RuntimePreflightFailedError
 
     factory = _FakeFactory()
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
     # Build the key-shaped value at runtime so the source carries no literal
     # secret for the repo secret-scan hook to flag (cf. tests/unit/contracts/
     # test_errors.py); the runtime value still matches an audit-scrub pattern.
@@ -285,7 +290,7 @@ def test_track_operation_scrubs_secret_bearing_error_before_persisting() -> None
 
 def test_track_operation_raises_db_error_if_completion_fails_after_success() -> None:
     factory = _FakeFactory(complete_error=RuntimeError("db write failed"))
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(RuntimeError, match="db write failed"),
@@ -305,7 +310,7 @@ def test_track_operation_raises_db_error_if_completion_fails_after_success() -> 
 
 def test_track_operation_does_not_mask_original_exception_when_completion_fails() -> None:
     factory = _FakeFactory(complete_error=RuntimeError("db write failed"))
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(ValueError, match="original failure"),
@@ -333,7 +338,7 @@ def test_track_operation_reraises_framework_bug_error_even_with_original_excepti
     from elspeth.contracts import FrameworkBugError
 
     factory = _FakeFactory(complete_error=FrameworkBugError("audit corruption"))
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(FrameworkBugError, match="audit corruption"),
@@ -355,7 +360,7 @@ def test_track_operation_reraises_audit_integrity_error_even_with_original_excep
     from elspeth.contracts.errors import AuditIntegrityError
 
     factory = _FakeFactory(complete_error=AuditIntegrityError("DB corrupted"))
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(AuditIntegrityError, match="DB corrupted"),
@@ -377,7 +382,7 @@ def test_track_operation_tier1_error_chains_original_exception() -> None:
     from elspeth.contracts import FrameworkBugError
 
     factory = _FakeFactory(complete_error=FrameworkBugError("corruption"))
-    ctx = make_context()
+    ctx = make_context(run_id="run-001")
 
     with (
         pytest.raises(FrameworkBugError) as exc_info,

@@ -52,9 +52,8 @@ from sqlalchemy import delete, insert, select
 
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -76,7 +75,15 @@ from elspeth.engine.processor import SCHEDULER_MAINTENANCE_INTERVAL, DAGTraversa
 from elspeth.engine.scheduler_drain import ProcessorMode
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
-from tests.fixtures.landscape import RecorderSetup, expire_lease, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    expire_leader_seat,
+    expire_lease,
+    leader_coordination_token,
+    make_recorder_with_run,
+    member_token_for,
+    register_test_node,
+)
 from tests.helpers.tree_gate import iter_gate_sources
 
 NODE_ID = "normalize"
@@ -114,7 +121,6 @@ class _RecordingScheduler:
             "mark_blocked",
             "heartbeat_lease",
             "enqueue_ready_claimed",
-            "enqueue_ready_claimed_legacy_unfenced",
             "enqueue_ready",
         }
     )
@@ -169,10 +175,6 @@ class _RecordingScheduler:
         self._record("enqueue_ready_claimed", kwargs)
         return self._inner.enqueue_ready_claimed(*args, **kwargs)
 
-    def enqueue_ready_claimed_legacy_unfenced(self, *args: Any, **kwargs: Any) -> Any:
-        self._record("enqueue_ready_claimed_legacy_unfenced", kwargs)
-        return self._inner.enqueue_ready_claimed_legacy_unfenced(*args, **kwargs)
-
     def enqueue_ready(self, *args: Any, **kwargs: Any) -> Any:
         self._record("enqueue_ready", kwargs)
         return self._inner.enqueue_ready(*args, **kwargs)
@@ -216,19 +218,23 @@ def _build(
     *,
     lease_owner: str | None,
     register_leader: str | None = LEADER_OWNER,
-    bind_leader_token: bool = False,
+    bind_leader_token: bool | None = None,
     bind_run_coordination: bool = False,
     heartbeat_seconds: int = 60,
     mode: ProcessorMode = ProcessorMode.LEADER,
     span_factory: SpanFactory | None = None,
+    setup: RecorderSetup | None = None,
 ) -> tuple[RowProcessor, _RecordingScheduler, RecorderSetup, MockClock]:
     """Real RowProcessor over a real scheduler DB behind the recording wrapper."""
-    setup = make_recorder_with_run(
-        run_id="run-drain-char",
-        source_node_id="source-1",
-        leader_worker_id=register_leader,
-    )
-    register_test_node(setup.data_flow, setup.run_id, NODE_ID)
+    if setup is None:
+        setup = make_recorder_with_run(
+            run_id="run-drain-char",
+            source_node_id="source-1",
+            leader_worker_id=register_leader,
+        )
+        register_test_node(setup.data_flow, setup.run_id, NODE_ID)
+    if mode is ProcessorMode.FOLLOWER and lease_owner is not None:
+        _register_worker(setup, lease_owner)
     clock = MockClock(start=1_750_000_000.0)
     spy = _RecordingScheduler(setup.factory.scheduler)
     processor = RowProcessor(
@@ -249,12 +255,16 @@ def _build(
         scheduler=cast(TokenSchedulerRepository, spy),
         scheduler_lease_owner=lease_owner,
         scheduler_heartbeat_seconds=heartbeat_seconds,
-        coordination_token=(leader_coordination_token(setup.factory, setup.run_id) if bind_leader_token else None),
+        coordination_token=(
+            leader_coordination_token(setup.factory, setup.run_id)
+            if bind_leader_token is True or (bind_leader_token is None and register_leader is not None and mode is ProcessorMode.LEADER)
+            else None
+        ),
         # ADR-030 D4 type split: a FOLLOWER carries exactly its membership
         # authority for its registered lease owner (harness construction — no
         # membership-fenced verb is reached from this processor yet).
         member_token=(
-            WorkerMembershipToken(run_id=setup.run_id, worker_id=lease_owner)
+            member_token_for(setup.db.engine, run_id=setup.run_id, worker_id=lease_owner)
             if mode is ProcessorMode.FOLLOWER and lease_owner is not None
             else None
         ),
@@ -265,14 +275,30 @@ def _build(
     return processor, spy, setup, clock
 
 
-def _ctx(setup: RecorderSetup) -> PluginContext:
-    return PluginContext(run_id=setup.run_id, config={}, landscape=None)
+def _ctx(setup: RecorderSetup, *, worker_id: str | None = None) -> PluginContext:
+    if worker_id is not None:
+        return PluginContext(
+            run_id=setup.run_id,
+            config={},
+            member_token=member_token_for(setup.db.engine, run_id=setup.run_id, worker_id=worker_id),
+        )
+    return PluginContext(run_id=setup.run_id, config={}, coordination_token=leader_coordination_token(setup.factory, setup.run_id))
 
 
 def _register_worker(setup: RecorderSetup, worker_id: str) -> None:
     """Register a run_workers identity so the membership fence admits its claims."""
     registered_at = datetime.now(UTC)
     with setup.db.engine.begin() as conn:
+        if (
+            conn.execute(
+                select(run_workers_table.c.worker_id).where(
+                    run_workers_table.c.run_id == setup.run_id,
+                    run_workers_table.c.worker_id == worker_id,
+                )
+            ).first()
+            is not None
+        ):
+            return
         conn.execute(
             insert(run_workers_table).values(
                 worker_id=worker_id,
@@ -300,7 +326,7 @@ def _enqueue_ready(
     staging a loss must enqueue one carrying the matching frame.
     """
     row, token = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
@@ -308,7 +334,7 @@ def _enqueue_ready(
         ingest_sequence=sequence,
     )
     item = scheduler.enqueue_ready(
-        run_id=setup.run_id,
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -323,7 +349,7 @@ def _enqueue_ready(
 
 def _unscheduled_work_item(setup: RecorderSetup, *, sequence: int, collector_name: CollectorName | None = None) -> WorkItem:
     row, token = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
@@ -354,9 +380,14 @@ def _park_pending_sink(
 ) -> tuple[str, TokenInfo]:
     """Claim a READY row under ``owner`` and park it PENDING_SINK (crash image)."""
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=sequence)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=owner, lease_seconds=300)
+    claimed = scheduler.claim_ready(
+        member_token=member_token_for(setup.db.engine, run_id=setup.run_id, worker_id=owner),
+        lease_owner=owner,
+        lease_seconds=300,
+    )
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_pending_sink(
+        member_token=member_token_for(setup.db.engine, run_id=setup.run_id, worker_id=owner),
         work_item_id=work_item_id,
         row_payload_json=_PAYLOAD,
         sink_name="default",
@@ -481,14 +512,9 @@ def test_recovery_drain_recovers_parked_pending_sinks_before_claiming_ready() ->
 
 
 def test_recovery_drain_requires_token_before_lease_recovery() -> None:
-    """A tokenless leader drain refuses before calling strict recovery."""
-    processor, spy, setup, _clock = _build(lease_owner=None, register_leader=None)
-
-    spy.calls.clear()
-    with pytest.raises(OrchestrationInvariantError, match="coordination token"):
-        processor.drain_scheduled_work(_ctx(setup))
-
-    assert spy.calls_for("recover_expired_leases") == []
+    """A tokenless leader cannot construct a processor or reach recovery."""
+    with pytest.raises(OrchestrationInvariantError, match="requires leadership authority"):
+        _build(lease_owner=None, register_leader=None)
 
 
 def test_barrier_intake_pass_entry_refuses_a_stale_pending_group_loss() -> None:
@@ -542,7 +568,7 @@ def test_sink_bound_result_parks_pending_sink_with_fenced_owner_and_tags_result(
     park = parks[0]
     assert park["work_item_id"] == work_item_id
     assert park["expected_lease_owner"] == LEADER_OWNER
-    assert park["worker_id"] == LEADER_OWNER, "registered lease owner must thread the membership fence"
+    assert park["member_token"] == leader_coordination_token(setup.factory, setup.run_id).membership
     assert park["sink_name"] == "default"
     assert park["outcome"] == TerminalOutcome.SUCCESS.value
     assert park["path"] == TerminalPath.DEFAULT_FLOW.value
@@ -576,7 +602,7 @@ def test_claimed_token_failure_marks_failed_with_fence() -> None:
     assert len(fails) == 1
     assert fails[0]["work_item_id"] == work_item_id
     assert fails[0]["expected_lease_owner"] == LEADER_OWNER
-    assert fails[0]["worker_id"] == LEADER_OWNER
+    assert fails[0]["member_token"] == leader_coordination_token(setup.factory, setup.run_id).membership
     assert spy.calls_for("mark_pending_sink") == []
     assert spy.calls_for("mark_terminal") == []
     status, _owner = _row_status(setup, work_item_id)
@@ -639,18 +665,9 @@ def test_failed_disposition_marks_row_span_error() -> None:
     assert events[0].exception_type == "RowResultError"
 
 
-def test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced() -> None:
-    """A non-sink terminal result drives mark_terminal; a build whose
-    constructor was given NO lease owner threads worker_id=None — the
-    unfenced disposition arm.
-
-    The auto-minted owner is registered in run_workers ONLY so the claim
-    fence (always active in these fixtures: begin_run registers a leader
-    unconditionally) admits the claim; the pin is that the DRAIN still
-    threads worker_id=None because the owner was not passed at construction.
-    """
-    processor, spy, setup, clock = _build(lease_owner=None, register_leader=None)
-    _register_worker(setup, processor._scheduler_lease_owner)
+def test_non_sink_terminal_uses_membership_derived_from_leader() -> None:
+    """An omitted lease owner derives the registered leader's membership."""
+    processor, spy, setup, clock = _build(lease_owner=None)
     work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
 
     def fake_process(**kwargs: Any) -> tuple[RowResult, list[Any]]:
@@ -664,10 +681,8 @@ def test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced() -
     terms = spy.calls_for("mark_terminal")
     assert len(terms) == 1
     assert terms[0]["work_item_id"] == work_item_id
-    # The auto-minted owner is the proven lease owner; the fence identity is
-    # None because the owner was never registered in run_workers.
     assert terms[0]["expected_lease_owner"] == processor._scheduler_lease_owner
-    assert terms[0]["worker_id"] is None
+    assert terms[0]["member_token"] == leader_coordination_token(setup.factory, setup.run_id).membership
     status, _owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.TERMINAL.value
 
@@ -780,7 +795,7 @@ def test_child_and_parent_disposition_roll_back_when_branch_loss_write_fails() -
     with (
         patch.object(processor, "_process_single_token", new=produce_child),
         patch(
-            "elspeth.core.landscape.scheduler.dispositions.record_group_loss",
+            "elspeth.core.landscape.scheduler.dispositions.record_group_losses",
             side_effect=RuntimeError("injected branch-loss write failure"),
         ),
         pytest.raises(RuntimeError, match="injected branch-loss write failure"),
@@ -879,6 +894,7 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
         parent_calls += 1
         payloads = ({"item": 1}, {"item": 2})
         children, _expand_group_id = setup.data_flow.expand_token(
+            member_token=kwargs["ctx"].require_member_token(),
             parent_ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
             row_id=token.row_id,
             child_payloads=payloads,
@@ -937,15 +953,19 @@ def test_expansion_restart_reuses_children_and_delivers_each_once() -> None:
             == 2
         )
 
-    # Model the successor process's lease reap through the repository's named
-    # crash-image adapter, then enter through the production recovery drain.
-    # The crashed parent's lease is aged into the database's past (ADR-047):
-    # advancing the process MockClock cannot expire a database-time lease.
+    # A real successor takes the expired leader seat, evicts the old leader,
+    # and recovers its expired item through the public fenced verb.
     clock.advance(1_000)
     expire_lease(setup.db.engine, parent_work_item_id)
-    recovered = setup.factory.scheduler.recover_expired_leases_legacy_unfenced(
+    expire_leader_seat(setup.db, setup.run_id)
+    successor = setup.factory.run_coordination.acquire_run_leadership(
         run_id=setup.run_id,
-        caller_owner="restart-reaper",
+        worker_id="restart-reaper",
+        window_seconds=300,
+    )
+    processor, spy, setup, clock = _build(lease_owner=successor.worker_id, setup=setup)
+    recovered = setup.factory.scheduler.recover_expired_leases(
+        coordination_token=successor,
     )
     assert recovered == 1
     with patch.object(processor, "_process_single_token", new=expand_parent_or_finish_child):
@@ -1046,12 +1066,12 @@ def test_handled_scheduler_lease_loss_marks_row_span_error() -> None:
     assert events[0].exception_type == "SchedulerLeaseLostError"
 
 
-@pytest.mark.parametrize("surviving_peer", [False, True], ids=["sole-row-deletion", "n-greater-than-zero-absence"])
+@pytest.mark.parametrize("surviving_peer", [False, True], ids=["leader-only", "with-follower-peer"])
 def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviving_peer: bool) -> None:
     """A heartbeat membership refusal is not a plugin-processing failure.
 
-    Deleting the claimant's registry row must propagate RunWorkerEvictedError
-    directly whether the run registry becomes empty or another member remains.
+    A successor evicting the claimant must propagate RunWorkerEvictedError
+    directly whether the registry also contains a surviving follower.
     The claimed item and both event planes stay byte-for-byte at the image
     observed immediately after deletion; no mark_* disposition follows.
     """
@@ -1075,9 +1095,12 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
                 reason="staged before membership loss",
             )
         )
-        with setup.db.engine.begin() as conn:
-            deleted = conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == LEADER_OWNER))
-        assert deleted.rowcount == 1
+        expire_leader_seat(setup.db, setup.run_id)
+        setup.factory.run_coordination.acquire_run_leadership(
+            run_id=setup.run_id,
+            worker_id="successor",
+            window_seconds=300,
+        )
         refused_image.append(_durable_claim_image(setup, work_item_id))
         clock.advance(61.0)
         processor._heartbeat_active_claim()
@@ -1086,7 +1109,7 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     spy.calls.clear()
     with (
         patch.object(processor, "_process_single_token", new=fake_process),
-        pytest.raises(RunWorkerEvictedError) as exc_info,
+        pytest.raises(RunMembershipLostError) as exc_info,
     ):
         processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
 
@@ -1094,7 +1117,13 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     assert exc_info.value.run_id == setup.run_id
     assert processor._pending_group_losses == []
     assert len(refused_image) == 1
-    assert _durable_claim_image(setup, work_item_id) == refused_image[0]
+    current_image = _durable_claim_image(setup, work_item_id)
+    assert current_image[:2] == refused_image[0][:2]
+    prior_event_ids = {event["event_id"] for event in refused_image[0][2]}
+    refusals = [event for event in current_image[2] if event["event_id"] not in prior_event_ids]
+    assert len(refusals) == 1
+    assert refusals[0]["event_type"] == "fence_refusal"
+    assert refusals[0]["worker_id"] == LEADER_OWNER
     assert len(spy.calls_for("heartbeat_lease")) == 1
     assert spy.calls_for("mark_failed") == []
     assert spy.calls_for("mark_terminal") == []
@@ -1102,6 +1131,32 @@ def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviv
     status, owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.LEASED.value
     assert owner == LEADER_OWNER
+
+
+def test_deleted_membership_is_corruption_and_cannot_mutate_claim() -> None:
+    """Physical removal of the permanent membership row fails as audit corruption."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, heartbeat_seconds=60)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+    refused_image: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
+
+    def delete_registration(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        with setup.db.engine.begin() as conn:
+            deleted = conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == LEADER_OWNER))
+        assert deleted.rowcount == 1
+        refused_image.append(_durable_claim_image(setup, work_item_id))
+        clock.advance(61.0)
+        processor._heartbeat_active_claim()
+        raise AssertionError("corrupt membership must refuse heartbeat")
+
+    with (
+        patch.object(processor, "_process_single_token", new=delete_registration),
+        pytest.raises(AuditIntegrityError, match="unregistered worker_id"),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert len(refused_image) == 1
+    assert _durable_claim_image(setup, work_item_id) == refused_image[0]
+    assert _row_status(setup, work_item_id) == (TokenWorkStatus.LEASED.value, LEADER_OWNER)
 
 
 def test_heartbeat_refreshes_active_claim_once_per_interval_and_is_noop_outside() -> None:
@@ -1126,7 +1181,7 @@ def test_heartbeat_refreshes_active_claim_once_per_interval_and_is_noop_outside(
     assert len(beats) == 1
     assert beats[0]["work_item_id"] == work_item_id
     assert beats[0]["lease_owner"] == LEADER_OWNER
-    assert beats[0]["membership_fenced"] is True
+    assert beats[0]["member_token"] == leader_coordination_token(setup.factory, setup.run_id).membership
 
     # After the drain the claim is no longer active: even a long-overdue
     # heartbeat writes nothing.
@@ -1223,7 +1278,7 @@ def test_production_maintenance_evicts_only_stale_same_run_follower() -> None:
     assert evicted_worker_ids == [same_run_target]
 
 
-def test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy() -> None:
+def test_immediate_enqueue_uses_registered_membership_for_explicit_and_derived_owner() -> None:
     registered, registered_spy, registered_setup, _clock = _build(lease_owner=LEADER_OWNER)
     registered_pending: dict[str, WorkItem] = {}
     registered_spy.calls.clear()
@@ -1238,19 +1293,19 @@ def test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_t
     assert registered_spy.verbs() == ["enqueue_ready_claimed"]
     assert registered_item.work_item_id in registered_pending
 
-    legacy, legacy_spy, legacy_setup, _clock = _build(lease_owner=None, register_leader=None)
-    legacy_pending: dict[str, WorkItem] = {}
-    legacy_spy.calls.clear()
+    derived, derived_spy, derived_setup, _clock = _build(lease_owner=None)
+    derived_pending: dict[str, WorkItem] = {}
+    derived_spy.calls.clear()
 
-    legacy_item = legacy._scheduler_drain.enqueue_work_item(
-        _unscheduled_work_item(legacy_setup, sequence=21),
-        legacy_pending,
+    derived_item = derived._scheduler_drain.enqueue_work_item(
+        _unscheduled_work_item(derived_setup, sequence=21),
+        derived_pending,
         claim_immediately=True,
     )
 
-    assert legacy_item.status is TokenWorkStatus.LEASED
-    assert legacy_spy.verbs() == ["enqueue_ready_claimed_legacy_unfenced"]
-    assert legacy_item.work_item_id in legacy_pending
+    assert derived_item.status is TokenWorkStatus.LEASED
+    assert derived_spy.verbs() == ["enqueue_ready_claimed"]
+    assert derived_item.work_item_id in derived_pending
 
 
 def test_enqueue_work_item_forwards_collector_name_claimed() -> None:
@@ -1357,21 +1412,17 @@ def test_drain_claims_forwards_collector_name_from_pending_items() -> None:
     assert captured["collector_name"] == CollectorName("stitch")
 
 
-def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned() -> None:
+def test_immediate_enqueue_requires_member_and_has_no_legacy_production_references() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     drain_path = repo_root / "src/elspeth/engine/scheduler_drain.py"
     drain_tree = ast.parse(drain_path.read_text(encoding="utf-8"), filename=str(drain_path))
     enqueue_method = next(node for node in ast.walk(drain_tree) if isinstance(node, ast.FunctionDef) and node.name == "enqueue_work_item")
-    route = next(
+    claim_call = next(
         node
         for node in ast.walk(enqueue_method)
-        if isinstance(node, ast.IfExp)
-        and isinstance(node.body, ast.Attribute)
-        and node.body.attr == "enqueue_ready_claimed"
-        and isinstance(node.orelse, ast.Attribute)
-        and node.orelse.attr == "enqueue_ready_claimed_legacy_unfenced"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "enqueue_ready_claimed"
     )
-    assert ast.unparse(route.test) == "self._scheduler_lease_owner_registered"
+    assert any(keyword.arg == "member_token" for keyword in claim_call.keywords)
 
     legacy_references: list[tuple[str, str]] = []
     for parsed in iter_gate_sources(repo_root / "src/elspeth"):
@@ -1387,10 +1438,7 @@ def test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinn
             assert isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef))
             legacy_references.append((str(source_path.relative_to(repo_root)), cursor.name))
 
-    assert sorted(legacy_references) == [
-        ("src/elspeth/core/landscape/scheduler_repository.py", "enqueue_ready_claimed_legacy_unfenced"),
-        ("src/elspeth/engine/scheduler_drain.py", "enqueue_work_item"),
-    ]
+    assert legacy_references == []
 
 
 def test_follower_build_skips_recovery_and_leader_without_token_refuses() -> None:
@@ -1407,14 +1455,10 @@ def test_follower_build_skips_recovery_and_leader_without_token_refuses() -> Non
     assert follower.reap_expired_peer_leases() == 0
     assert follower_spy.calls_for("recover_expired_leases") == [], "follower builds must never reap peer leases"
 
-    legacy, legacy_spy, _lsetup, _lclock = _build(lease_owner=None, register_leader=None)
-    with pytest.raises(OrchestrationInvariantError, match="coordination token"):
-        legacy.reap_expired_peer_leases()
-    assert legacy_spy.calls_for("recover_expired_leases") == []
+    with pytest.raises(OrchestrationInvariantError, match="requires leadership authority"):
+        _build(lease_owner=None, register_leader=None)
 
     # The old sentinel shape WITHOUT the explicit mode remains a LEADER-mode
     # build, but it cannot select an unfenced transaction from missing authority.
-    sentinel_shape, sentinel_spy, _ssetup, _sclock = _build(lease_owner="follower-1")
-    with pytest.raises(OrchestrationInvariantError, match="coordination token"):
-        sentinel_shape.reap_expired_peer_leases()
-    assert sentinel_spy.calls_for("recover_expired_leases") == []
+    with pytest.raises(OrchestrationInvariantError, match="requires leadership authority"):
+        _build(lease_owner="follower-1", bind_leader_token=False)

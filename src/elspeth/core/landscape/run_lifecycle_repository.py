@@ -13,11 +13,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Final, get_args
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
+    CallType,
     ContractAuditRecord,
     ExportStatus,
     NodeType,
@@ -32,6 +33,7 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
+    WorkerMembershipToken,
     mint_worker_id,
 )
 from elspeth.contracts.enums import TerminalPath
@@ -50,7 +52,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps, _safe_database_error_message
 from elspeth.core.landscape._helpers import now
-from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
@@ -61,13 +63,17 @@ from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     RunCoordinationRepository,
     fenced_leader_transaction,
+    fenced_member_transaction,
     record_coordination_events,
 )
 from elspeth.core.landscape.schema import (
     SOURCE_COMPLETE_LIFECYCLE_STATES,
     RunSourceLifecycleState,
+    calls_table,
     checkpoints_table,
+    node_states_table,
     nodes_table,
+    operations_table,
     preflight_results_table,
     run_attributions_table,
     run_sources_table,
@@ -156,7 +162,7 @@ _NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resuma
 
 # 64 lowercase hex chars — matches the canonical sha256 hex digest format
 # produced by ``hashlib.sha256(...).hexdigest()``. Used by the Tier-1
-# write-side guards in this module, ``write_repository.py``, and
+# write-side guards in this module and
 # ``web/execution/service.py`` to reject malformed snapshot ids that
 # would otherwise corrupt the audit trail without a downstream signal.
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
@@ -166,7 +172,7 @@ def is_valid_sha256_hex(value: str) -> bool:
     """Return True if ``value`` is exactly 64 lowercase hex chars.
 
     Canonical home for the sha256-hex shape check; imported by
-    ``write_repository.py`` and ``web/execution/service.py`` so all three
+    ``web/execution/service.py`` so both
     write-side guards reject the same out-of-domain values (empty,
     whitespace-only, non-hex strings, upper-case, wrong length).
     """
@@ -640,12 +646,24 @@ class RunLifecycleRepository:
         # The SUCCESS quiescence arm rides in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
         quiescence_clauses = [~residual_work_exists] if is_success_status else []
+        state_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(node_states_table, calls_table.c.state_id == node_states_table.c.state_id))
+            .where(node_states_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
+        operation_llm_calls = (
+            select(func.count())
+            .select_from(calls_table.join(operations_table, calls_table.c.operation_id == operations_table.c.operation_id))
+            .where(operations_table.c.run_id == run_id, calls_table.c.call_type == CallType.LLM.value)
+            .scalar_subquery()
+        )
         result = conn.execute(
             runs_table.update()
             .where(runs_table.c.run_id == run_id)
             .where(runs_table.c.status.notin_(terminal_values))
             .where(*quiescence_clauses)
-            .values(**values)
+            .values(**values, llm_call_count=state_llm_calls + operation_llm_calls)
         )
         if result.rowcount == 0:
             existing = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).fetchone()
@@ -835,14 +853,20 @@ class RunLifecycleRepository:
             "non_resumable_arms": non_resumable_arms,
             "incomplete_sources": incomplete_sources,
         }
-        for token_id in undecided_token_ids:
-            self._outcomes_repo.record_token_outcome(
-                TokenRef(token_id=str(token_id), run_id=run_id),
-                None,
-                TerminalPath.ABANDONED,
-                context=context,
-                conn=conn,
-            )
+        self._outcomes_repo.record_token_outcomes_on(
+            conn,
+            run_id=run_id,
+            outcomes=tuple(
+                TokenOutcomeWrite(
+                    TokenRef(token_id=str(token_id), run_id=run_id),
+                    None,
+                    TerminalPath.ABANDONED,
+                    context=context,
+                )
+                for token_id in undecided_token_ids
+            ),
+            dependencies_prelocked=True,
+        )
 
     def get_run(self, run_id: str) -> Run | None:
         """Get a run by ID.
@@ -1468,6 +1492,7 @@ class RunLifecycleRepository:
             values: dict[str, Any] = {"status": status.value}
             if status == RunStatus.RUNNING:
                 values["completed_at"] = None
+                values["reproducibility_grade"] = None
             result = conn.execute(
                 runs_table.update()
                 .where(runs_table.c.run_id == coordination_token.run_id)
@@ -1655,9 +1680,9 @@ class RunLifecycleRepository:
         reachable: bool,
         count: int | None,
         message: str,
-        coordination_token: CoordinationToken,
+        member_token: WorkerMembershipToken,
     ) -> None:
-        """Record a readiness check result in the audit trail.
+        """Record this worker's readiness check result in the audit trail.
 
         Called by transforms during on_start() after a provider readiness
         check passes. Records the collection state at startup time so
@@ -1666,7 +1691,7 @@ class RunLifecycleRepository:
         """
         row_data = {
             "result_id": generate_id(),
-            "run_id": coordination_token.run_id,
+            "run_id": member_token.run_id,
             "result_type": "readiness_check",
             "name": name,
             "result_json": canonical_json(
@@ -1675,16 +1700,16 @@ class RunLifecycleRepository:
                     "reachable": reachable,
                     "count": count,
                     "message": message,
+                    "worker_id": member_token.worker_id,
                 }
             ),
             "created_at": now(),
         }
 
         try:
-            with fenced_leader_transaction(
+            with fenced_member_transaction(
                 self._db.engine,
-                token=coordination_token,
-                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                member_token=member_token,
                 verb="record_readiness_check",
             ) as conn:
                 conn.execute(preflight_results_table.insert().values(**row_data))
@@ -1694,7 +1719,7 @@ class RunLifecycleRepository:
                     operation="record_readiness_check",
                     action="write",
                     exc=exc,
-                    context=f"run_id={coordination_token.run_id}",
+                    context=f"run_id={member_token.run_id}",
                 )
             ) from exc
 

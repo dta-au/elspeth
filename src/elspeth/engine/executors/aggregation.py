@@ -17,6 +17,7 @@ from elspeth.contracts import (
     TransformResult,
 )
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import (
     BatchStatus,
     NodeStateStatus,
@@ -27,6 +28,8 @@ from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     PluginContractViolation,
+    RunLeadershipLostError,
+    RunMembershipLostError,
 )
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.node_state_context import AggregationBatchContext, AggregationFlushContext
@@ -163,7 +166,9 @@ class AggregationExecutor:
         executor = AggregationExecutor(execution, span_factory, step_resolver, run_id)
 
         # Accept rows into batch
-        result = executor.buffer_row(node_id, token)
+        batch_id, ordinal = executor.open_batch_membership(node_id, coordination_token=coordination_token)
+        # The scheduler durably adopts the member before the memory accept.
+        executor.accept_adopted_row(node_id, token)
         # Engine uses TriggerEvaluator to decide when to flush
     """
 
@@ -220,13 +225,11 @@ class AggregationExecutor:
                 f"Configured nodes: {list(self._nodes.keys())}"
             ) from exc
 
-    def open_batch_membership(self, node_id: NodeID) -> tuple[str, int]:
+    def open_batch_membership(self, node_id: NodeID, *, coordination_token: CoordinationToken) -> tuple[str, int]:
         """Return ``(batch_id, next_ordinal)`` for the node's in-progress batch.
 
-        Creates the ``batches`` row on the FIRST member (ADR-030 §E.2 note:
-        this durable create happens in its own transaction BEFORE the fenced
-        adoption verb — a deposed leader can orphan one DRAFT batches row;
-        accepted residue, see ``adopt_blocked_barrier_item``). Does NOT mutate
+        Creates the ``batches`` row on the FIRST member in a leader-fenced
+        transaction before the separately fenced adoption verb. Does NOT mutate
         buffers or counters: the membership/BUFFERED writes belong to
         ``adopt_blocked_barrier_item`` and the memory mutation to
         ``accept_adopted_row`` after the adoption CAS succeeds.
@@ -237,7 +240,7 @@ class AggregationExecutor:
         node = self._get_node(node_id, "open_batch_membership")
         if node.batch_id is None:
             batch = self._execution.create_batch(
-                run_id=self._run_id,
+                coordination_token=coordination_token,
                 aggregation_node_id=node_id,
             )
             node.batch_id = batch.batch_id
@@ -256,7 +259,7 @@ class AggregationExecutor:
     ) -> None:
         """Feed one durably-adopted row into executor memory (ADR-030 §E.2).
 
-        Memory-only twin of the old ``buffer_row``: the durable writes
+        The durable writes
         (``batch_members`` + BUFFERED ``token_outcomes``) already committed
         inside ``adopt_blocked_barrier_item``'s fenced transaction — this
         method appends the buffer entry, advances the counters and anchors the
@@ -286,37 +289,6 @@ class AggregationExecutor:
         # Incremented exactly once per accepted row.
         node.accepted_count_total += 1
         node.trigger.record_accept(accept_time)
-
-    def buffer_row(
-        self,
-        node_id: NodeID,
-        token: TokenInfo,
-    ) -> None:
-        """Buffer a row for aggregation (legacy unfenced composition).
-
-        NOT the engine acceptance path: since ADR-030 §E.2 (slice 3) the
-        engine accepts barrier rows journal-first via
-        ``TokenSchedulerRepository.adopt_blocked_barrier_item`` (which owns
-        the ``batch_members`` + BUFFERED writes inside the leader-fenced
-        adoption transaction) followed by :meth:`accept_adopted_row`. This
-        composition keeps the pre-§E.2 single-call shape for executor-level
-        tests and diagnostics: batch creation, an UNfenced ``batch_members``
-        write, then the memory accept at live clock time.
-
-        Raises:
-            OrchestrationInvariantError: If node_id is not a configured aggregation.
-                This prevents silent data loss where rows are buffered but no
-                trigger evaluator exists to determine when to flush.
-        """
-        self._get_node(node_id, "buffer_row")
-        batch_id, ordinal = self.open_batch_membership(node_id)
-        # Record batch membership for audit trail
-        self._execution.add_batch_member(
-            batch_id=batch_id,
-            token_id=token.token_id,
-            ordinal=ordinal,
-        )
-        self.accept_adopted_row(node_id, token)
 
     def get_buffered_rows(self, node_id: NodeID) -> list[dict[str, Any]]:
         """Get currently buffered rows (does not clear buffer).
@@ -394,7 +366,7 @@ class AggregationExecutor:
             if contract is None:
                 raise OrchestrationInvariantError(
                     f"Token {token.token_id} has no contract - cannot reconstruct PipelineRow. "
-                    f"This indicates a bug in buffer_row() or checkpoint restore."
+                    f"This indicates a bug in accept_adopted_row() or checkpoint restore."
                 )
             pipeline_rows.append(PipelineRow(row_dict, contract))
 
@@ -452,6 +424,8 @@ class AggregationExecutor:
         try:
             result = transform.process(list(pipeline_rows), ctx)
             duration_ms = (time.perf_counter() - start) * 1000
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as exc:
@@ -505,6 +479,7 @@ class AggregationExecutor:
         trigger_type: TriggerType,
         window: _FlushWindow,
         buffered_tokens: Sequence[TokenInfo],
+        coordination_token: CoordinationToken,
     ) -> None:
         """Record successful node-state and batch completion."""
         self._validate_success_outputs(transform, result)
@@ -552,7 +527,7 @@ class AggregationExecutor:
             raise OrchestrationInvariantError("successful aggregation result lacks output_hash")
         guard.complete_aggregation_result(
             batch_id=batch_id,
-            run_id=self._run_id,
+            coordination_token=coordination_token,
             aggregation_node_id=str(node_id),
             trigger_type=trigger_type,
             output_mode=node.settings.output_mode,
@@ -577,6 +552,7 @@ class AggregationExecutor:
     def _complete_error_flush(
         self,
         *,
+        coordination_token: CoordinationToken,
         result: TransformResult,
         guard: NodeStateGuard,
         duration_ms: float,
@@ -593,6 +569,7 @@ class AggregationExecutor:
             ),
         )
         self._execution.complete_batch(
+            coordination_token=coordination_token,
             batch_id=batch_id,
             status=BatchStatus.FAILED,
             trigger_type=trigger_type,
@@ -602,6 +579,7 @@ class AggregationExecutor:
     def _fail_unfinalized_batch(
         self,
         *,
+        coordination_token: CoordinationToken,
         batch_id: str,
         trigger_type: TriggerType,
         state_id: str,
@@ -609,11 +587,14 @@ class AggregationExecutor:
         """Mark a failed flush's batch as FAILED or raise audit-integrity error."""
         try:
             self._execution.complete_batch(
+                coordination_token=coordination_token,
                 batch_id=batch_id,
                 status=BatchStatus.FAILED,
                 trigger_type=trigger_type,
                 state_id=state_id,
             )
+        except (RunLeadershipLostError, RunMembershipLostError):
+            raise
         except contract_errors.TIER_1_ERRORS:
             raise
         except (TypeError, AttributeError, KeyError, NameError):
@@ -675,6 +656,7 @@ class AggregationExecutor:
 
         # Step 1: Transition batch to "executing"
         self._execution.update_batch_status(
+            coordination_token=ctx.require_coordination_token(),
             batch_id=batch_id,
             status=BatchStatus.EXECUTING,
             trigger_type=trigger_type,
@@ -705,7 +687,7 @@ class AggregationExecutor:
                 self._execution,
                 token_id=snapshot.representative_token.token_id,
                 node_id=node_id,
-                run_id=ctx.run_id,
+                member_token=ctx.require_member_token(),
                 step_index=step,
                 input_data=batch_input,
                 attempt=snapshot.representative_token.resume_attempt_offset,
@@ -750,6 +732,7 @@ class AggregationExecutor:
                     if validate_success is not None:
                         validate_success(result, snapshot.buffered_tokens, batch_id)
                     self._complete_successful_flush(
+                        coordination_token=ctx.require_coordination_token(),
                         node_id=node_id,
                         node=node,
                         transform=transform,
@@ -765,6 +748,7 @@ class AggregationExecutor:
                 else:
                     self._spans.mark_error(aggregation_span, AggregationResultError())
                     self._complete_error_flush(
+                        coordination_token=ctx.require_coordination_token(),
                         result=result,
                         guard=guard,
                         duration_ms=duration_ms,
@@ -773,6 +757,8 @@ class AggregationExecutor:
                     )
                     batch_finalized = True
 
+            except (RunLeadershipLostError, RunMembershipLostError):
+                raise  # Ownership loss leaves this attempt for the new leader.
             except contract_errors.TIER_1_ERRORS:
                 raise  # Tier 1 errors must crash — skip batch cleanup
             except Exception:
@@ -781,6 +767,7 @@ class AggregationExecutor:
                 # (avoids double-write if complete_batch itself raised).
                 if not batch_finalized:
                     self._fail_unfinalized_batch(
+                        coordination_token=ctx.require_coordination_token(),
                         batch_id=batch_id,
                         trigger_type=trigger_type,
                         state_id=guard.state_id,

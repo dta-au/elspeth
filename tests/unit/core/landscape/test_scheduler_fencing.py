@@ -1,10 +1,10 @@
-"""Scheduler transaction helpers keep fenced and legacy authority explicit."""
+"""Scheduler transaction helpers require authority and expose no legacy escape."""
 
 from __future__ import annotations
 
 import ast
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,13 +43,6 @@ class _StrictFencedWrite(Protocol):
         *,
         coordination_token: CoordinationToken,
         verb: str,
-    ) -> AbstractContextManager[Connection]: ...
-
-
-class _LegacyUnfencedRecoveryWrite(Protocol):
-    def __call__(
-        self,
-        engine: Tier1Engine,
     ) -> AbstractContextManager[Connection]: ...
 
 
@@ -160,15 +153,6 @@ def _method_attribute_references(
 def _strict_fenced_write() -> _StrictFencedWrite:
     """The strict helper, resolved directly so a rename fails at attribute access."""
     return cast(_StrictFencedWrite, fencing.fenced_write)
-
-
-def _legacy_unfenced_recovery_write() -> _LegacyUnfencedRecoveryWrite:
-    """The recovery-specific legacy unfenced helper, resolved directly.
-
-    ``LEGACY_RECOVERY_HELPER`` still names this helper for the AST mutation
-    cases below; this direct access is what pins the helper's existence.
-    """
-    return cast(_LegacyUnfencedRecoveryWrite, fencing.legacy_unfenced_recover_expired_leases_write)
 
 
 def _resolved_parameter_annotation(method: FunctionType, parameter_name: str) -> object:
@@ -311,25 +295,6 @@ def test_required_coordination_parameter_rejects_wrong_runtime_binding(monkeypat
         _assert_required_coordination_parameter(cast(FunctionType, probe))
 
 
-# The ids reproduce the class-derived node ids of the previous
-# ``repository_type`` parametrization — see the proof-catalog note above.
-@pytest.mark.parametrize(
-    "method",
-    [
-        pytest.param(SchedulerLeaseRepository.recover_expired_leases_legacy_unfenced, id="SchedulerLeaseRepository"),
-        pytest.param(TokenSchedulerRepository.recover_expired_leases_legacy_unfenced, id="TokenSchedulerRepository"),
-    ],
-)
-def test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector(method: Callable[..., object]) -> None:
-    """The legacy API keeps its explicit name and offers no authority selector.
-
-    The explicit name is pinned twice over: this module fails to import if the
-    attribute below is renamed, and the AST reference tests assert the literal
-    ``LEGACY_RECOVERY_METHOD`` against the production call sites.
-    """
-    assert "coordination_token" not in inspect.signature(method).parameters
-
-
 def test_strict_helper_accepts_current_token_and_commits() -> None:
     db, token = _seed_leader()
     helper = _strict_fenced_write()
@@ -393,29 +358,6 @@ def test_strict_helper_refuses_stale_token_without_payload_mutation() -> None:
         )
 
 
-def test_recovery_specific_legacy_helper_is_plain_without_a_verb_selector() -> None:
-    db = make_landscape_db()
-    helper = _legacy_unfenced_recovery_write()
-    assert tuple(inspect.signature(helper).parameters) == ("engine",)
-
-    with helper(db.engine) as conn:
-        conn.execute(
-            insert(runs_table).values(
-                run_id=RUN_ID,
-                started_at=NOW,
-                config_hash="cfg",
-                settings_json="{}",
-                canonical_version="v1",
-                status=RunStatus.RUNNING.value,
-                openrouter_catalog_sha256="0" * 64,
-                openrouter_catalog_source="bundled",
-            )
-        )
-
-    with db.engine.connect() as conn:
-        assert conn.execute(select(runs_table.c.run_id)).scalar_one() == RUN_ID
-
-
 @pytest.mark.parametrize(
     "source",
     [
@@ -472,7 +414,7 @@ def test_legacy_helper_reference_is_isolated_to_named_legacy_adapter_across_pack
             )
         )
 
-    assert references == [("core/landscape/scheduler/leases.py", LEGACY_RECOVERY_METHOD)]
+    assert references == []
 
 
 def test_production_sources_do_not_call_legacy_recovery_adapter() -> None:
@@ -488,7 +430,7 @@ def test_production_sources_do_not_call_legacy_recovery_adapter() -> None:
             )
         )
 
-    assert references == [("core/landscape/scheduler_repository.py", LEGACY_RECOVERY_METHOD)]
+    assert references == []
 
 
 def test_scheduler_sources_have_no_optional_authority_transaction_selector() -> None:

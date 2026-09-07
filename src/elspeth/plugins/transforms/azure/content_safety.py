@@ -18,6 +18,7 @@ from typing import Any, TypedDict
 from pydantic import BaseModel, Field
 
 from elspeth.contracts import Determinism
+from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import (
     CapabilityDeclaration,
@@ -160,7 +161,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:437a1c362c8defea"
+    source_file_hash: str | None = "sha256:0827e5ac9b06e1df"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")
@@ -272,10 +273,11 @@ class AzureContentSafety(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Analyze field via Content Safety API and check thresholds."""
         try:
-            analysis = self._analyze_content(value, state_id, token_id=token_id)
+            analysis = self._analyze_content(value, state_id, token_id=token_id, ctx=ctx)
         except ValueError as e:
             # Unknown category from Azure — fail CLOSED (security transform).
             # Not retryable: the API response is structurally valid but contains
@@ -307,6 +309,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> dict[str, int]:
         """Call Azure Content Safety API.
 
@@ -314,7 +317,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
         Uses AuditedHTTPClient for automatic audit recording and telemetry emission.
         """
-        http_client = self._get_http_client(state_id, token_id=token_id)
+        http_client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
 
         url = f"{self._endpoint}/contentsafety/text:analyze?api-version={self.API_VERSION}"
 

@@ -21,6 +21,7 @@ from elspeth.plugins.transforms.azure.document_intelligence import (
     AzureDocumentIntelligence,
     AzureDocumentIntelligenceConfig,
 )
+from tests.fixtures.factories import make_context
 
 _ENDPOINT = "https://test.cognitiveservices.azure.com"
 OP = f"{_ENDPOINT}/documentintelligence/documentModels/prebuilt-layout/analyzeResults/abc?api-version=2024-11-30"
@@ -300,7 +301,7 @@ def test_get_http_client_builds_real_client_with_header_and_cap() -> None:
     t = _transform()
     t._recorder = Mock(spec_set=ExecutionRepository)
     t._run_id = "run-1"
-    client = t._get_http_client("state-1")
+    client = t._get_http_client("state-1", ctx=make_context(run_id="run-1"))
     try:
         assert client._default_headers["Ocp-Apim-Subscription-Key"] == "k"
         assert client._max_response_body_bytes == 50_000_000
@@ -376,7 +377,7 @@ def _run_with_fake(t: AzureDocumentIntelligence, fake: _FakeClient, row: Pipelin
     with t._http_clients_lock:
         t._http_clients["s1"] = fake
     try:
-        return t._process_single_with_state(row, "s1", token_id=None)
+        return t._process_single_with_state(row, "s1", ctx=make_context(), token_id=None)
     finally:
         with t._http_clients_lock:
             t._http_clients.pop("s1", None)
@@ -695,7 +696,7 @@ def test_real_client_streaming_lro_sends_apikey_and_overload() -> None:
         return_value=httpx.Response(200, json={"status": "succeeded", "analyzeResult": {"content": "# Real", "tables": [{"rowCount": 1}]}})
     )
 
-    result = t._process_single_with_state(_row(), "s-real", token_id=None)
+    result = t._process_single_with_state(_row(), "s-real", ctx=make_context(run_id="run-1"), token_id=None)
     try:
         assert result.status == "success"
         out = result.row.to_dict()

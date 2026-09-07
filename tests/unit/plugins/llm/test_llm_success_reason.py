@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import Mock
@@ -17,6 +16,8 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts.engine import BufferEntry
+from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -25,23 +26,11 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class _TokenDouble:
-    token_id: str
-
-
-@dataclass(slots=True)
-class _TransformContextDouble:
-    state_id: str
-    run_id: str
-    token: _TokenDouble
-    shutdown_event: None = None
 
 
 class _TracerDouble:
@@ -83,12 +72,12 @@ class _PooledExecutorDouble:
         self.execute_batch = execute_batch
 
 
-def _make_ctx() -> _TransformContextDouble:
-    """Minimal TransformContext double for LLM strategy execution."""
-    return _TransformContextDouble(
+def _make_ctx() -> PluginContext:
+    """Explicitly authorized mock context for LLM strategy execution."""
+    return make_context(
         state_id="state-123",
         run_id="run-123",
-        token=_TokenDouble(token_id="token-1"),
+        token=TokenInfo(row_id="row-1", token_id="token-1", row_data=make_pipeline_row({})),
     )
 
 

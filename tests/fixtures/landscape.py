@@ -596,7 +596,7 @@ def make_recorder_with_run(
     run = factory.run_lifecycle.begin_run(**begin_kwargs)
 
     register_kwargs: dict[str, Any] = {
-        "run_id": run.run_id,
+        "coordination_token": leader_coordination_token(factory, run.run_id),
         "plugin_name": source_plugin_name,
         "node_type": NodeType.SOURCE,
         "plugin_version": "1.0",
@@ -643,7 +643,7 @@ def register_test_node(
     Returns the node_id for convenience.
     """
     node = data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_token_for(data_flow._db, run_id),
         plugin_name=plugin_name,
         node_type=node_type,
         plugin_version="1.0",

@@ -308,7 +308,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:903f8009398889a4"
+    source_file_hash: str | None = "sha256:735d486db9b909c9"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -550,13 +550,15 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._recorder = None
         self._limiter = None
 
-    def _get_row_client(self, state_id: str, *, token_id: str | None) -> TextractClient:
+    def _get_row_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None) -> TextractClient:
         with self._row_clients_lock:
             if state_id in self._row_clients:
                 return self._row_clients[state_id]
             if self._recorder is None or self._sdk_client is None or not self._run_id:
                 raise FrameworkBugError("Amazon Textract transform used before on_start")
             client = TextractClient(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 execution=self._recorder,
                 state_id=state_id,
                 run_id=self._run_id,
@@ -576,7 +578,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         if ctx.token is None:
             raise FrameworkBugError("Amazon Textract batch processing requires token identity")
         try:
-            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id)
+            return self._process_single_with_state(row, ctx.state_id, token_id=ctx.token.token_id, ctx=ctx)
         finally:
             # The row client is created lazily at the SDK call, so a row that
             # was rejected before reaching it never registered one.
@@ -700,7 +702,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             digest.update(encoded)
         return digest.hexdigest()
 
-    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None) -> TransformResult:
+    def _process_single_with_state(
+        self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None
+    ) -> TransformResult:
         if not self._run_id or not self._node_id or token_id is None:
             raise FrameworkBugError("Amazon Textract processing requires run, node, and token identity")
         if self._shutdown.is_set():
@@ -712,7 +716,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         try:
             verification = self._bucket_region_coordinator.verify(
                 bucket,
-                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id),
+                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id, ctx=ctx),
             )
         except BucketRegionUnverifiedError as error:
             return TransformResult.error(
@@ -727,6 +731,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             key=key,
             version=version,
             verification=verification,
+            ctx=ctx,
         )
         return self._with_bucket_region_verification(result, verification)
 
@@ -740,6 +745,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         key: str,
         version: str | None,
         verification: BucketRegionVerification,
+        ctx: TransformContext,
     ) -> TransformResult:
         if verification.region != self._region:
             return TransformResult.error(
@@ -751,7 +757,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 retryable=False,
             )
         started_at = time.monotonic()
-        client = self._get_row_client(state_id, token_id=token_id)
+        client = self._get_row_client(state_id, token_id=token_id, ctx=ctx)
         request_token = self._client_request_token(
             run_id=self._run_id,
             node_id=self._node_id,
@@ -839,10 +845,12 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         result.success_reason["metadata"]["bucket_region_verification"] = evidence
         return result
 
-    def _verify_bucket_region_live(self, bucket: str, *, state_id: str, token_id: str) -> BucketRegionProof:
+    def _verify_bucket_region_live(self, bucket: str, *, ctx: TransformContext, state_id: str, token_id: str) -> BucketRegionProof:
         if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
             raise FrameworkBugError("Amazon Textract bucket verification used before on_start")
         return HeadBucketClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             execution=self._recorder,
             state_id=state_id,
             run_id=self._run_id,
@@ -1067,7 +1075,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._shutdown = threading.Event()
             state_id = ctx.state_id or "textract-invariant-probe-state"
             token_id = ctx.token.token_id if ctx.token is not None else "textract-invariant-probe-token"
-            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
         finally:
             self._recorder = prior_recorder
             self._run_id = prior_run_id

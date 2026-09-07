@@ -28,7 +28,8 @@ from elspeth.contracts.errors import ContractViolation, TransformErrorReason
 from elspeth.contracts.schema_contract import SchemaContract
 
 if TYPE_CHECKING:
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.scheduler import TokenWorkItem
     from elspeth.contracts.schema_contract import PipelineRow
 
 
@@ -41,9 +42,9 @@ class CallRecorder(Protocol):
     for type: ignore[arg-type] at plugin call sites.
     """
 
-    def allocate_call_index(self, state_id: str) -> int: ...
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int: ...
 
-    def allocate_operation_call_index(self, operation_id: str) -> int: ...
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int: ...
 
     def record_call(
         self,
@@ -59,6 +60,8 @@ class CallRecorder(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> Call: ...
 
     def record_operation_call(
@@ -75,6 +78,7 @@ class CallRecorder(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> Call: ...
 
 
@@ -91,9 +95,9 @@ class PluginAuditWriter(Protocol):
 
     # ── ExecutionRepository methods ──────────────────────────────────────
 
-    def allocate_call_index(self, state_id: str) -> int: ...
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int: ...
 
-    def allocate_operation_call_index(self, operation_id: str) -> int: ...
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int: ...
 
     def record_call(
         self,
@@ -109,6 +113,8 @@ class PluginAuditWriter(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> Call: ...
 
     def record_operation_call(
@@ -125,6 +131,7 @@ class PluginAuditWriter(Protocol):
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> Call: ...
 
     def get_node_state(self, state_id: str) -> NodeState | None: ...
@@ -140,6 +147,7 @@ class PluginAuditWriter(Protocol):
         routing_group_id: str | None = None,
         ordinal: int = 0,
         reason_ref: str | None = None,
+        member_token: WorkerMembershipToken,
     ) -> RoutingEvent:
         """Record one complete one-route decision; identity controls do not append."""
         ...
@@ -149,6 +157,9 @@ class PluginAuditWriter(Protocol):
         state_id: str,
         routes: list[RoutingSpec],
         reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RoutingEvent]:
         """Atomically record one complete fork/multi-destination decision."""
         ...
@@ -157,7 +168,6 @@ class PluginAuditWriter(Protocol):
 
     def record_validation_error(
         self,
-        run_id: str,
         node_id: str | None,
         row_data: Any,
         error: str,
@@ -165,6 +175,7 @@ class PluginAuditWriter(Protocol):
         destination: str,
         *,
         contract_violation: ContractViolation | None = None,
+        coordination_token: CoordinationToken,
     ) -> str: ...
 
     def record_transform_error(
@@ -174,13 +185,17 @@ class PluginAuditWriter(Protocol):
         row_data: Mapping[str, object] | PipelineRow,
         error_details: TransformErrorReason,
         destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> str: ...
 
     def update_node_output_contract(
         self,
-        run_id: str,
         node_id: str,
         contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
     ) -> None: ...
 
     def get_node_contracts(
@@ -203,5 +218,5 @@ class PluginAuditWriter(Protocol):
         reachable: bool,
         count: int | None,
         message: str,
-        coordination_token: CoordinationToken,
+        member_token: WorkerMembershipToken,
     ) -> None: ...

@@ -211,7 +211,12 @@ class _CollectorEnv:
         self.node_id = NodeID(register_test_node(self.factory.data_flow, self.run_id, "stitch", plugin_name="recording_stitch"))
         self.contract = _make_observed_contract("item")
         self.transform = _FakeCollectorTransform()
-        self.ctx = PluginContext(run_id=self.run_id, config={})
+        self.ctx = PluginContext(
+            run_id=self.run_id,
+            config={},
+            coordination_token=self.setup.coordination_token,
+            member_token=self.setup.coordination_token.membership,
+        )
         self.token_manager = TokenManager(self.factory.data_flow, step_resolver=lambda _node_id: 1)
         self._raw_executor = CollectorExecutor(
             self.factory.execution,
@@ -231,21 +236,22 @@ class _CollectorEnv:
 
     def _seed_opener(self) -> Any:
         self._row_counter += 1
-        row = self.factory.data_flow.create_row(
-            self.run_id,
+        _, token = self.factory.data_flow.create_row_with_token(
             self.setup.source_node_id,
             self._row_counter,
             {"seed": self._row_counter},
             source_row_index=self._row_counter,
             ingest_sequence=self._row_counter,
+            coordination_token=self.setup.coordination_token,
         )
-        return self.factory.data_flow.create_token(row_id=row.row_id)
+        return token
 
     def seed_group(self, *, count: int) -> tuple[list[TokenInfo], str]:
         """Seed a real EXPAND group via the production writer. Returns (members, group_id)."""
         opener = self._seed_opener()
         payloads = [{"item": i} for i in range(count)]
         children, group_id = self.factory.data_flow.expand_token(
+            member_token=self.setup.coordination_token.membership,
             parent_ref=TokenRef(token_id=opener.token_id, run_id=self.run_id),
             row_id=opener.row_id,
             child_payloads=payloads,
@@ -262,12 +268,20 @@ class _CollectorEnv:
 
     def seed_empty_group(self) -> str:
         opener = self._seed_opener()
-        return self.factory.data_flow.record_empty_expansion(TokenRef(token_id=opener.token_id, run_id=self.run_id))
+        return self.factory.data_flow.record_empty_expansion(
+            TokenRef(token_id=opener.token_id, run_id=self.run_id),
+            member_token=self.setup.coordination_token.membership,
+        )
 
     def reissue_with_new_token_id(self, original: TokenInfo) -> TokenInfo:
         """A durably-minted 'merged' token: fresh token_id, SAME frame (spec §5, arch minor 3)."""
         fresh_id = f"{original.token_id}-merged"
-        self.factory.data_flow.create_token(row_id=original.row_id, token_id=fresh_id, lineage_path=original.lineage_path)
+        self.factory.data_flow.create_token(
+            row_id=original.row_id,
+            token_id=fresh_id,
+            lineage_path=original.lineage_path,
+            coordination_token=self.setup.coordination_token,
+        )
         reissued = TokenInfo(row_id=original.row_id, token_id=fresh_id, row_data=original.row_data, lineage_path=original.lineage_path)
         self._all_members.append(reissued)
         return reissued
@@ -614,7 +628,21 @@ class TestArrivals:
         # the token's claim, not the durable record it points at.
         env = collector_env
         opener = env._seed_opener()
+        member_token = env.setup.coordination_token.membership
+        work_item = env.factory.scheduler.enqueue_ready_claimed(
+            member_token=member_token,
+            token_id=opener.token_id,
+            row_id=opener.row_id,
+            node_id=str(env.node_id),
+            step_index=1,
+            ingest_sequence=env._row_counter,
+            row_payload_json="{}",
+            lease_owner=member_token.worker_id,
+            lease_seconds=60,
+        )
         (branch,), fork_group_id = env.factory.data_flow.fork_token(
+            member_token=member_token,
+            work_item=work_item,
             parent_ref=TokenRef(token_id=opener.token_id, run_id=env.run_id),
             row_id=opener.row_id,
             branches=["path-a"],
@@ -1155,7 +1183,7 @@ class TestRestore:
         env.factory.execution.begin_node_state(
             token_id=members[1].token_id,
             node_id=str(env.node_id),
-            run_id=env.run_id,
+            member_token=env.setup.coordination_token.membership,
             step_index=1,
             input_data=members[1].row_data.to_dict(),
             attempt=0,
@@ -1318,7 +1346,7 @@ class TestRestore:
             env.factory.execution.begin_node_state(
                 token_id=member.token_id,
                 node_id=str(env.node_id),
-                run_id=env.run_id,
+                member_token=env.setup.coordination_token.membership,
                 step_index=1,
                 input_data=member.row_data.to_dict(),
                 attempt=0,
@@ -1386,7 +1414,7 @@ class TestRestore:
         env.factory.execution.begin_node_state(
             token_id=members[1].token_id,
             node_id=str(env.node_id),
-            run_id=env.run_id,
+            member_token=env.setup.coordination_token.membership,
             step_index=1,
             input_data=members[1].row_data.to_dict(),
             attempt=0,
@@ -1426,7 +1454,7 @@ class TestRestore:
         env.factory.execution.begin_node_state(
             token_id=record.opener_token_id,
             node_id=str(env.node_id),
-            run_id=env.run_id,
+            member_token=env.setup.coordination_token.membership,
             step_index=1,
             input_data={"batch_rows": []},
             attempt=0,
@@ -1554,13 +1582,19 @@ class TestRestore:
         state = env.factory.execution.begin_node_state(
             token_id=member.token_id,
             node_id=node_id,
-            run_id=env.run_id,
+            member_token=env.setup.coordination_token.membership,
             step_index=step_index,
             input_data=member.row_data.to_dict(),
             attempt=0,
             resume_checkpoint_id=None,
         )
-        env.factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={}, duration_ms=1.0)
+        env.factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.COMPLETED,
+            output_data={},
+            duration_ms=1.0,
+            member_token=env.setup.coordination_token.membership,
+        )
 
     def test_restore_treats_intermediate_node_completion_as_no_collector_evidence(self, collector_env: _CollectorEnv) -> None:
         # META-35 (elspeth-421d9004bb): a member that completed an ORDINARY
@@ -1621,12 +1655,14 @@ class TestCollectorInCollectorArrivalMeta38:
         outer_members, outer_group_id = env.seed_group(count=1)
         page = outer_members[0]
         inner_children, inner_group_id = env.factory.data_flow.expand_token(
+            member_token=env.setup.coordination_token.membership,
             parent_ref=TokenRef(token_id=page.token_id, run_id=env.run_id),
             row_id=page.row_id,
             child_payloads=[{"s": 0}, {"s": 1}],
             output_contract=env.contract,
         )
         committed = env.factory.data_flow.collect_tokens(
+            coordination_token=env.setup.coordination_token,
             member_refs=[TokenRef(token_id=c.token_id, run_id=env.run_id) for c in inner_children],
             group_id=inner_group_id,
             collector_node_id="collector-inner",
@@ -1687,12 +1723,14 @@ class TestCollectorInCollectorReleaseRestoresUnderTheOuterGroupMeta38:
         # Page B's inner scope closes at an inner collector and releases ONE
         # token back into the outer group's membership (page B's member key).
         inner_children, inner_group_id = env.factory.data_flow.expand_token(
+            member_token=env.setup.coordination_token.membership,
             parent_ref=TokenRef(token_id=page_b.token_id, run_id=env.run_id),
             row_id=page_b.row_id,
             child_payloads=[{"s": 0}],
             output_contract=env.contract,
         )
         committed = env.factory.data_flow.collect_tokens(
+            coordination_token=env.setup.coordination_token,
             member_refs=[TokenRef(token_id=inner_children[0].token_id, run_id=env.run_id)],
             group_id=inner_group_id,
             collector_node_id="collector-inner",

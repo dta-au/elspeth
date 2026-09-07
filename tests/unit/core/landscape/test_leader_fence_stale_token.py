@@ -51,7 +51,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.preflight import CommencementGateResult, PreflightResult
 from elspeth.contracts.results import ArtifactDescriptor
-from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStatus
+from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, SourceIngestSpec, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
@@ -806,13 +806,6 @@ class TestStaleTokenFenceRefusals:
                 id="record_preflight_results",
             ),
             pytest.param(
-                "record_readiness_check",
-                lambda lifecycle, token: lifecycle.record_readiness_check(
-                    name="probe", collection="docs", reachable=True, count=1, message="ok", coordination_token=token
-                ),
-                id="record_readiness_check",
-            ),
-            pytest.param(
                 "set_export_status",
                 lambda lifecycle, token: lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=token),
                 id="set_export_status",
@@ -1057,31 +1050,25 @@ class TestStaleTokenFenceRefusals:
     def test_ingest_woken_mid_ingest_atomic_rollback(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """§C.4 row 9: a deposed leader woken mid-ingest leaves NO orphan rows row."""
         repo = TokenSchedulerRepository(db.engine)
-        data_flow = RecorderFactory(db).data_flow
+        factory = RecorderFactory(db)
         _bump_epoch(db)
-
-        def insert_row_and_token(conn):  # type: ignore[no-untyped-def]
-            return data_flow.insert_row_with_token_on(
-                conn,
-                run_id=RUN_ID,
-                source_node_id=SOURCE_NODE_ID,
-                row_index=0,
-                data={"id": 1},
-                source_row_index=0,
-                ingest_sequence=0,
-                row_id="row-ingest",
-                token_id="token-ingest",
-            )
 
         with pytest.raises(RunLeadershipLostError):
             repo.ingest_row_with_initial_claim(
                 coordination_token=token,
-                insert_row_and_token=insert_row_and_token,
-                token_id="token-ingest",
-                row_id="row-ingest",
+                source=SourceIngestSpec(
+                    source_node_id=SOURCE_NODE_ID,
+                    row_index=0,
+                    data={"id": 1},
+                    source_row_index=0,
+                    ingest_sequence=0,
+                    row_id="row-ingest",
+                    token_id="token-ingest",
+                ),
+                data_flow=factory.data_flow,
+                execution=factory.execution,
                 node_id=NODE_ID,
                 step_index=1,
-                ingest_sequence=0,
                 row_payload_json=_payload_json(),
                 lease_owner=WORKER,
                 lease_seconds=60,

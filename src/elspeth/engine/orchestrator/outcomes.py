@@ -474,6 +474,7 @@ def handle_coalesce_timeouts(
         coalesce_name = CoalesceName(coalesce_name_str)
         timed_out = coalesce_executor.check_timeouts(
             coalesce_name=coalesce_name_str,
+            coordination_token=ctx.require_coordination_token(),
         )
         for outcome in timed_out:
             if _validate_coalesce_outcome(outcome):
@@ -555,7 +556,7 @@ def handle_row_union_timeouts(
 ) -> None:
     """Sweep row_union barriers for timed-out groups and fail them closed."""
     for row_union_name in row_union_executor.get_registered_names():
-        for outcome in row_union_executor.check_timeouts(row_union_name):
+        for outcome in row_union_executor.check_timeouts(row_union_name, coordination_token=ctx.require_coordination_token()):
             _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
 
 
@@ -566,7 +567,7 @@ def flush_row_union_pending(
     counters: ExecutionCounters,
 ) -> None:
     """Fail every incomplete row_union group closed at end-of-source (v1)."""
-    for outcome in row_union_executor.flush_pending():
+    for outcome in row_union_executor.flush_pending(coordination_token=ctx.require_coordination_token()):
         _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
 
 
@@ -593,7 +594,7 @@ def flush_coalesce_pending(
         counters: Mutable ExecutionCounters to update
         pending_tokens: Dict of sink_name -> tokens to append results to
     """
-    pending_outcomes = coalesce_executor.flush_pending()
+    pending_outcomes = coalesce_executor.flush_pending(coordination_token=ctx.require_coordination_token())
 
     for outcome in pending_outcomes:
         if _validate_coalesce_outcome(outcome):

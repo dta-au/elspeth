@@ -17,6 +17,7 @@ import pytest
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.engine.executors.state_guard import NodeStateGuard
@@ -79,7 +80,7 @@ def _make_guard(execution: _ExecutionFake) -> NodeStateGuard:
         execution=execution,
         token_id="tok-1",
         node_id="node-1",
-        run_id="run-1",
+        member_token=WorkerMembershipToken(run_id="run-1", worker_id="mock-worker"),
         step_index=0,
         input_data={},
         attempt=0,

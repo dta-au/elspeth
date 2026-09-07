@@ -48,7 +48,7 @@ from tests.fixtures.base_classes import (
 )
 from tests.fixtures.factories import wire_transforms
 from tests.fixtures.group_lineage import ensure_fork_group_record
-from tests.fixtures.landscape import make_landscape_db, reseat_crashed_leader
+from tests.fixtures.landscape import leader_token_for, make_landscape_db, member_token_for, register_test_worker, reseat_crashed_leader
 from tests.fixtures.plugins import (
     CollectSink,
     ListSource,
@@ -836,8 +836,9 @@ class TestForkRecoveryInvariant:
         factory = RecorderFactory(db, payload_store=payload_store)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        coordination_token = leader_token_for(db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=coordination_token,
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -845,15 +846,14 @@ class TestForkRecoveryInvariant:
             determinism=Determinism.DETERMINISTIC,
             schema_config=_OBSERVED_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
             source_node_id=source.node_id,
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={"items": [1, 2]},
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Build a real SchemaContract — the one the expand step would produce.
         output_contract = SchemaContract(
@@ -875,6 +875,7 @@ class TestForkRecoveryInvariant:
         ]
 
         children, expand_group_id = factory.data_flow.expand_token(
+            member_token=coordination_token.membership,
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             child_payloads=child_payloads,
@@ -961,16 +962,17 @@ class TestForkRecoveryInvariant:
         factory = RecorderFactory(db, payload_store=payload_store)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        coordination_token = leader_token_for(db, run.run_id)
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=coordination_token,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=_OBSERVED_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
             source_node_id=source.node_id,
             row_index=0,
             source_row_index=0,
@@ -1000,10 +1002,12 @@ class TestForkRecoveryInvariant:
         # create_token(..., lineage_frames=) seam to model the shape a real
         # fork_token would have produced.
         token_a = factory.data_flow.create_token(
+            coordination_token=coordination_token,
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="a"),),
         )
         token_b = factory.data_flow.create_token(
+            coordination_token=coordination_token,
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-grp", member_key="b"),),
         )
@@ -1022,6 +1026,7 @@ class TestForkRecoveryInvariant:
         }
 
         merged_token = factory.data_flow.coalesce_tokens(
+            coordination_token=coordination_token,
             parent_refs=[
                 TokenRef(token_id=token_a.token_id, run_id=run.run_id),
                 TokenRef(token_id=token_b.token_id, run_id=run.run_id),
@@ -1230,8 +1235,9 @@ class TestForkRecoveryInvariant:
         factory = RecorderFactory(db, payload_store=payload_store)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        coordination_token = leader_token_for(db, run.run_id)
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=coordination_token,
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -1239,15 +1245,14 @@ class TestForkRecoveryInvariant:
             determinism=Determinism.DETERMINISTIC,
             schema_config=_OBSERVED_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
             source_node_id=source_node.node_id,
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={"items": [1, 2]},
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Persist two expand children — both write token_data_ref (epoch 11 invariant).
         from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -1258,6 +1263,7 @@ class TestForkRecoveryInvariant:
             locked=True,
         )
         children, _expand_group_id = factory.data_flow.expand_token(
+            member_token=coordination_token.membership,
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             child_payloads=[{"name": "alpha"}, {"name": "beta"}],
@@ -1334,8 +1340,9 @@ class TestForkRecoveryInvariant:
         factory = RecorderFactory(db, payload_store=payload_store)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        coordination_token = leader_token_for(db, run.run_id)
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=coordination_token,
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -1345,8 +1352,8 @@ class TestForkRecoveryInvariant:
         )
 
         # Build a source row and source_row PipelineRow to use as the fork reference.
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
             source_node_id=source_node.node_id,
             row_index=0,
             source_row_index=0,
@@ -1403,9 +1410,9 @@ class TestForkRecoveryInvariant:
             locked=True,
         )
 
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
         expand_payload = {"item": "widget", "score": 0.95, "recorded_at": aware_dt}
         children, _expand_group_id = factory.data_flow.expand_token(
+            member_token=coordination_token.membership,
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             child_payloads=[expand_payload],
@@ -2090,8 +2097,10 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
+        register_test_worker(db, run_id=run_id, worker_id="test-harness")
+        seed_member = member_token_for(db.engine, worker_id="test-harness", run_id=run_id)
         scheduler_repo.enqueue_ready(
-            run_id=run_id,
+            member_token=seed_member,
             token_id=incomplete_branch.token_id,
             row_id=row_id,
             node_id=sibling_first_node,
@@ -2113,8 +2122,8 @@ class TestForkRecoveryInvariant:
         # (BarrierRecoveryCoordinator.restore_from_journal ← list_blocked_barrier_items).
         held_first_node = str(graph.get_transform_id_map()[branch_index_by_name[held_branch_name]])
         datetime.now(UTC)
-        held_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-            run_id=run_id,
+        held_item = scheduler_repo.enqueue_ready_claimed(
+            member_token=seed_member,
             token_id=held_branch.token_id,
             row_id=row_id,
             node_id=held_first_node,
@@ -2128,6 +2137,7 @@ class TestForkRecoveryInvariant:
             coalesce_name="merge",
         )
         scheduler_repo.mark_blocked(
+            member_token=seed_member,
             work_item_id=held_item.work_item_id,
             queue_key=None,
             barrier_key="merge",  # coalesce barrier_key == coalesce NAME (restore partition D1)
@@ -2193,7 +2203,7 @@ class TestForkRecoveryInvariant:
                    → sink 'output'
 
         CallRecordingTransform records one HTTP state call (calls.state_id set)
-        per invocation via ctx.record_call().  Being state-parented, the call
+        per invocation through the item-fenced audit writer. Being state-parented, the call
         inherits the resume_checkpoint_id of its parent node_state.
 
         Interruption: after a complete run, undo the barrier by deleting:
@@ -3545,7 +3555,6 @@ class TestForkRecoveryInvariant:
         AssertionError — "mixed-state row must NOT be excluded ...: unprocessed=[]"
         (the row is silently dropped → sink_b would be orphaned).
         """
-        from datetime import datetime
 
         from elspeth.contracts.schema_contract import PipelineRow
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -3621,9 +3630,10 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        datetime.now(UTC)
-        seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-            run_id=run_id,
+        register_test_worker(db, run_id=run_id, worker_id="test-harness")
+        seed_member = member_token_for(db.engine, worker_id="test-harness", run_id=run_id)
+        seeded_item = scheduler_repo.enqueue_ready_claimed(
+            member_token=seed_member,
             token_id=buffered_child.token_id,
             row_id=row_id,
             node_id=barrier_key_for_seed,
@@ -3635,6 +3645,7 @@ class TestForkRecoveryInvariant:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=buffered_child.fork_group_id, member_key="sink_a"),),
         )
         scheduler_repo.mark_blocked(
+            member_token=seed_member,
             work_item_id=seeded_item.work_item_id,
             queue_key=None,
             barrier_key=barrier_key_for_seed,
@@ -3930,12 +3941,13 @@ class TestForkRecoveryInvariant:
                 {"rid": row_id},
             ).scalar_one()
         scheduler_repo = RecorderFactory(db).scheduler
-        datetime.datetime.now(datetime.UTC)
+        register_test_worker(db, run_id=run_id, worker_id="test-harness")
+        seed_member = member_token_for(db.engine, worker_id="test-harness", run_id=run_id)
         for c in children:
             env = _envelope(c.token_data_ref)
             leaf_payload = _PipelineRow(dict(env["data"]), _SchemaContract.from_checkpoint(dict(env["contract"])))
-            seeded_item = scheduler_repo.enqueue_ready_claimed_legacy_unfenced(
-                run_id=run_id,
+            seeded_item = scheduler_repo.enqueue_ready_claimed(
+                member_token=seed_member,
                 token_id=c.token_id,
                 row_id=row_id,
                 node_id=str(agg_node_id),
@@ -3947,6 +3959,7 @@ class TestForkRecoveryInvariant:
                 lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=c.expand_group_id, member_key=c.token_id),),
             )
             scheduler_repo.mark_blocked(
+                member_token=seed_member,
                 work_item_id=seeded_item.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node_id),
@@ -4148,8 +4161,9 @@ class TestForkRecoveryInvariant:
         factory = RecorderFactory(db, payload_store=payload_store)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        coordination_token = leader_token_for(db, run.run_id)
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=coordination_token,
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -4157,13 +4171,18 @@ class TestForkRecoveryInvariant:
             determinism=Determinism.DETERMINISTIC,
             schema_config=_OBSERVED_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id, source_node_id=node.node_id, row_index=0, source_row_index=0, ingest_sequence=0, data={"seed": 1}
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=coordination_token,
+            source_node_id=node.node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            data={"seed": 1},
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
 
         # ── (1) EXPAND path: child token_data_ref envelope carries the full domain ──
         children, _expand_group_id = factory.data_flow.expand_token(
+            member_token=coordination_token.membership,
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             child_payloads=[dict(domain_payload)],
@@ -4179,15 +4198,18 @@ class TestForkRecoveryInvariant:
         # innermost shared FORK lineage frame on every parent — crafted here via
         # the create_token(..., lineage_frames=) seam.
         token_x = factory.data_flow.create_token(
+            coordination_token=coordination_token,
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="x"),),
         )
         token_y = factory.data_flow.create_token(
+            coordination_token=coordination_token,
             row_id=row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-join-balance-domain-grp", member_key="y"),),
         )
         ensure_fork_group_record(factory, run_id=run.run_id, group_id="fork-join-balance-domain-grp", opener_token_id=token_x.token_id)
         merged = factory.data_flow.coalesce_tokens(
+            coordination_token=coordination_token,
             parent_refs=[
                 TokenRef(token_id=token_x.token_id, run_id=run.run_id),
                 TokenRef(token_id=token_y.token_id, run_id=run.run_id),

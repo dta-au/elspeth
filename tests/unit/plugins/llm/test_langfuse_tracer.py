@@ -27,9 +27,12 @@ from elspeth.plugins.transforms.llm.langfuse import (
 )
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, LangfuseTracingConfig
+from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
 
-_ROW_PARENT = LLMAuditParent.for_row(state_id="state-1", token_id="tok-1")
-_OPERATION_PARENT = LLMAuditParent.for_operation(operation_id="operation-1")
+_ROW_PARENT = LLMAuditParent.for_row(**mock_item_audit_authority(), state_id="state-1", token_id="tok-1")
+_OPERATION_PARENT = LLMAuditParent.for_operation(
+    coordination_token=mock_audit_authority()["coordination_token"], operation_id="operation-1"
+)
 
 
 @dataclass

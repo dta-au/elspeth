@@ -1,19 +1,26 @@
 """Execution writes bind current authority to their actual persisted subjects."""
 
+import json
 from dataclasses import dataclass, replace
 
 import pytest
 from sqlalchemy import func, select
 
 from elspeth.contracts import BatchStatus, CallStatus, CallType, NodeStateStatus, NodeType, RoutingMode, RoutingSpec
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.engine import CoalesceParentCompletion
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError, SchedulerLeaseLostError
+from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.scheduler import TokenWorkItem
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
-from elspeth.core.landscape.schema import calls_table, node_states_table, operations_table, token_work_items_table
+from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
+from elspeth.core.landscape.schema import calls_table, node_states_table, operations_table, rows_table, token_work_items_table
 from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.fixtures.stores import MockPayloadStore
 
@@ -52,7 +59,7 @@ def _setup(*, payload_store: MockPayloadStore | None = None) -> _ExecutionSetup:
         node_id="transform",
         step_index=1,
         ingest_sequence=0,
-        row_payload_json='{"value":1}',
+        row_payload_json=serialize_row_payload(PipelineRow({"value": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))),
         lease_owner=member.worker_id,
         lease_seconds=300,
     )
@@ -337,3 +344,152 @@ def test_live_bulk_completion_helper_preserves_terminal_state_immutability() -> 
         )
     assert repo.get_node_state(second.state_id).status is NodeStateStatus.OPEN
     assert repo.get_node_state(state_id).output_hash == stable_hash({"value": 1})
+
+
+@pytest.mark.parametrize("operation_parent", [False, True])
+def test_independent_recorders_remap_only_owned_call_index_collisions(operation_parent: bool) -> None:
+    setup = _setup()
+    first = setup.recorder.execution
+    second = RecorderFactory(setup.recorder.db).execution
+    if operation_parent:
+        parent_id = first.begin_operation(
+            setup.recorder.source_node_id, "source_load", coordination_token=setup.recorder.coordination_token
+        ).operation_id
+        first_index = first.allocate_operation_call_index(parent_id, coordination_token=setup.recorder.coordination_token)
+        second_index = second.allocate_operation_call_index(parent_id, coordination_token=setup.recorder.coordination_token)
+        assert first_index == second_index == 0
+        first_call = first.record_operation_call(
+            parent_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"writer": 1}),
+            coordination_token=setup.recorder.coordination_token,
+            call_index=first_index,
+        )
+        second_call = second.record_operation_call(
+            parent_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"writer": 2}),
+            coordination_token=setup.recorder.coordination_token,
+            call_index=second_index,
+        )
+        with pytest.raises(LandscapeRecordError, match="database rejected"):
+            second.record_operation_call(
+                parent_id,
+                CallType.HTTP,
+                CallStatus.SUCCESS,
+                RawCallPayload({"writer": 3}),
+                coordination_token=setup.recorder.coordination_token,
+                call_index=0,
+            )
+    else:
+        parent_id = _state(setup)
+        first_index = first.allocate_call_index(parent_id, member_token=setup.member, work_item=setup.item)
+        second_index = second.allocate_call_index(parent_id, member_token=setup.member, work_item=setup.item)
+        assert first_index == second_index == 0
+        first_call = first.record_call(
+            parent_id,
+            first_index,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"writer": 1}),
+            member_token=setup.member,
+            work_item=setup.item,
+        )
+        second_call = second.record_call(
+            parent_id,
+            second_index,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"writer": 2}),
+            member_token=setup.member,
+            work_item=setup.item,
+        )
+        with pytest.raises(LandscapeRecordError, match="database rejected"):
+            second.record_call(
+                parent_id,
+                0,
+                CallType.HTTP,
+                CallStatus.SUCCESS,
+                RawCallPayload({"writer": 3}),
+                member_token=setup.member,
+                work_item=setup.item,
+            )
+    assert (first_call.call_index, second_call.call_index) == (0, 1)
+    with setup.recorder.db.read_only_connection() as conn:
+        assert conn.execute(select(calls_table.c.call_index).order_by(calls_table.c.call_index)).scalars().all() == [0, 1]
+
+
+def test_bulk_coalesce_completion_preserves_each_duration_and_context() -> None:
+    setup = _setup()
+    repo = setup.recorder.execution
+    first_id = _state(setup)
+    second_id = repo.begin_node_state(setup.item.token_id, "aggregate", 2, {}, member_token=setup.member).state_id
+    context = GateEvaluationContext(condition="value > 0", result="True", route_label="true")
+    parent_ref = TokenRef(setup.item.token_id, setup.recorder.run_id)
+    with fenced_leader_transaction(
+        setup.recorder.db.engine, token=setup.recorder.coordination_token, window_seconds=300, verb="test_coalesce_completion"
+    ) as conn:
+        repo.node_states.complete_coalesce_node_states_on(
+            conn,
+            run_id=setup.recorder.run_id,
+            merged_token_id="merged-child",
+            parent_completions=[
+                CoalesceParentCompletion(parent_ref, first_id, 12.0, context),
+                CoalesceParentCompletion(parent_ref, second_id, 25.0, None),
+            ],
+        )
+    first = repo.get_node_state(first_id)
+    second = repo.get_node_state(second_id)
+    assert first.status is second.status is NodeStateStatus.COMPLETED
+    assert (first.duration_ms, second.duration_ms) == (12.0, 25.0)
+    assert json.loads(first.context_after_json) == context.to_dict()
+    assert second.context_after_json is None
+    assert first.output_hash == second.output_hash == stable_hash({"merged_into": "merged-child"})
+
+
+@pytest.mark.parametrize("corrupt_second_source", [False, True])
+def test_source_reconciliation_batches_exact_witnesses_atomically(corrupt_second_source: bool) -> None:
+    setup = _setup()
+    row, token = setup.recorder.data_flow.create_row_with_token(
+        setup.recorder.source_node_id,
+        1,
+        {"value": 2},
+        source_row_index=1,
+        ingest_sequence=1,
+        coordination_token=setup.recorder.coordination_token,
+    )
+    setup.recorder.factory.scheduler.enqueue_ready_claimed(
+        member_token=setup.member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id="transform",
+        step_index=1,
+        ingest_sequence=1,
+        row_payload_json=serialize_row_payload(PipelineRow({"value": 2}, SchemaContract(mode="OBSERVED", fields=(), locked=True))),
+        lease_owner=setup.member.worker_id,
+        lease_seconds=300,
+    )
+    if corrupt_second_source:
+        with setup.recorder.db.write_connection() as conn:
+            conn.execute(rows_table.update().where(rows_table.c.row_id == row.row_id).values(source_data_hash="wrong-source-hash"))
+        with pytest.raises(AuditIntegrityError, match="scheduler payload hash"):
+            setup.recorder.execution.reconcile_source_completions_from_scheduler(coordination_token=setup.recorder.coordination_token)
+        with setup.recorder.db.read_only_connection() as conn:
+            assert conn.execute(select(func.count()).select_from(node_states_table)).scalar_one() == 0
+    else:
+        assert (
+            setup.recorder.execution.reconcile_source_completions_from_scheduler(coordination_token=setup.recorder.coordination_token) == 2
+        )
+        assert (
+            setup.recorder.execution.reconcile_source_completions_from_scheduler(coordination_token=setup.recorder.coordination_token) == 0
+        )
+        with setup.recorder.db.read_only_connection() as conn:
+            states = conn.execute(select(node_states_table)).all()
+        assert len(states) == 2
+        for state in states:
+            assert state.status == NodeStateStatus.COMPLETED.value
+            assert state.duration_ms == 0.0
+            assert state.started_at == state.completed_at
+            assert state.input_hash == state.output_hash

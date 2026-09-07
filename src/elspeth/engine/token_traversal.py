@@ -173,6 +173,8 @@ class TokenTraversalEngine:
             # scope, so preserve the fail-closed UNROUTED/barrier-loss behavior.
             error_hash = compute_error_hash(str(e), exception_type=type(e).__name__)
             self._processor._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
@@ -208,6 +210,7 @@ class TokenTraversalEngine:
                 current_token,
                 error_sink,
                 child_items,
+                ctx=ctx,
             )
 
         # 3. Track on_success for sink routing at end of chain
@@ -231,9 +234,10 @@ class TokenTraversalEngine:
                 if transform.creates_tokens:
                     self._processor._token_manager.record_empty_expansion(
                         current_token,
-                        self._processor._run_id,
+                        member_token=ctx.require_member_token(),
                     )
                 self._processor._record_dropped_by_filter_outcome(
+                    ctx=ctx,
                     token=current_token,
                     transform_name=transform.name,
                     node_id=node_id,
@@ -294,7 +298,7 @@ class TokenTraversalEngine:
                 # transform SUCCEEDED; the engine refuses the expansion), so
                 # route by the transform's own on_error — always non-None at
                 # runtime (TransformSettings requires it).
-                return self.handle_transform_error_status(refusal, current_token, transform.on_error, child_items)
+                return self.handle_transform_error_status(refusal, current_token, transform.on_error, child_items, ctx=ctx)
 
             # Deaggregation: create child tokens for each output row
             # NOTE: Parent EXPANDED outcome is recorded atomically in expand_token()
@@ -305,7 +309,7 @@ class TokenTraversalEngine:
                 expanded_rows=[r.to_dict() for r in transform_result.rows],
                 output_contract=output_contract,
                 node_id=node_id,
-                run_id=self._processor._run_id,
+                member_token=ctx.require_member_token(),
             )
 
             # A declared scope opener's children are bound members of an
@@ -385,6 +389,8 @@ class TokenTraversalEngine:
         current_token: TokenInfo,
         error_sink: str | None,
         child_items: list[WorkItem],
+        *,
+        ctx: PluginContext,
     ) -> _TransformTerminal:
         """Handle transform error status: quarantine (discard) or route to error sink.
 
@@ -422,6 +428,8 @@ class TokenTraversalEngine:
             branch_loss_reason = _branch_loss_reason(transform_result, default="quarantined")
             quarantine_error_hash = compute_error_hash(error_detail)
             self._processor._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
@@ -553,6 +561,7 @@ class TokenTraversalEngine:
                 outcome,
                 current_token,
                 child_items,
+                ctx=ctx,
             )
 
         # 4. Check if gate routed to a sink
@@ -580,6 +589,7 @@ class TokenTraversalEngine:
 
         if outcome.discarded:
             self._processor._record_gate_discarded_outcome(
+                ctx=ctx,
                 token=current_token,
                 gate_name=gate.name,
                 node_id=node_id,
@@ -784,6 +794,8 @@ class TokenTraversalEngine:
         outcome: GateOutcome,
         current_token: TokenInfo,
         child_items: list[WorkItem],
+        *,
+        ctx: PluginContext,
     ) -> _GateTerminal:
         """Terminalize one gate-expression failure without aborting the run."""
         failure = outcome.error
@@ -808,6 +820,8 @@ class TokenTraversalEngine:
                 exception_type=failure.exception_type,
             )
             self._processor._data_flow.record_token_outcome(
+                member_token=ctx.require_member_token(),
+                work_item=ctx.require_work_item(),
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.GATE_ERROR_DISCARDED,

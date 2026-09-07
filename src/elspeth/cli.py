@@ -4114,6 +4114,7 @@ def join(
             concurrency_config=follower_concurrency_config,
             shutdown_event=follower_shutdown_event,
             telemetry_emit=emit_follower_telemetry,
+            member_token=member_token,
         )
 
         # Call on_start for all transforms and sinks — mirrors the leader's

@@ -22,6 +22,7 @@ from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .conftest import (
     make_token,
@@ -419,6 +420,7 @@ class TestRowProcessingWithPipelining:
         """Create plugin context with landscape, state_id, and token."""
         token = make_token("row-1")
         return make_context(
+            **mock_audit_authority("run-123"),
             run_id="run-123",
             landscape=mock_recorder,
             state_id="state-123",
@@ -434,7 +436,7 @@ class TestRowProcessingWithPipelining:
         """Create and initialize LLMTransform with multi-query and pipelining."""
         t = LLMTransform(_make_config())
         # Initialize with recorder reference
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         t.on_start(init_ctx)
         # Replace provider with mock
         t._provider = _make_provider()
@@ -547,7 +549,7 @@ class TestRowProcessingWithPipelining:
             },
         )
         transform = LLMTransform(config)
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform._provider = _make_provider([{"score": 85, "rationale": "Looks consistent"}])
         transform.connect_output(collector, max_pending=10)
@@ -655,7 +657,7 @@ class TestRowProcessingWithPipelining:
     ) -> None:
         """connect_output() raises if called more than once."""
         transform = LLMTransform(_make_config())
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform.connect_output(collector, max_pending=10)
 
@@ -691,7 +693,7 @@ class TestMultiRowPipelining:
         config = _make_config()
 
         transform = LLMTransform(config)
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform._provider = _make_provider()
         transform.connect_output(collector, max_pending=10)
@@ -709,6 +711,7 @@ class TestMultiRowPipelining:
                 }
                 token = make_token(f"row-{i}")
                 ctx = make_context(
+                    **mock_audit_authority("run-123"),
                     run_id="run-123",
                     landscape=mock_recorder,
                     state_id=f"state-{i}",
@@ -736,6 +739,7 @@ class TestMultiRowPipelining:
         assert transform._recorder is None
 
         ctx = make_context(
+            **mock_audit_authority("test-run"),
             run_id="test-run",
             landscape=mock_recorder,
             state_id="test-state-id",
@@ -752,7 +756,7 @@ class TestMultiRowPipelining:
     ) -> None:
         """close() clears recorder reference and provider."""
         transform = LLMTransform(_make_config())
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform._provider = _make_provider()
         transform.connect_output(collector, max_pending=10)
@@ -791,7 +795,7 @@ class TestMultiQueryWithMockProvider:
         """
         config = _make_config(pool_size=4)
         transform = LLMTransform(config)
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform._provider = _make_provider([{"score": i, "rationale": f"R{i}"} for i in range(4)])
         transform.connect_output(collector, max_pending=10)
@@ -807,6 +811,7 @@ class TestMultiQueryWithMockProvider:
             }
             token = make_token("row-1")
             ctx = make_context(
+                **mock_audit_authority("run-123"),
                 run_id="run-123",
                 landscape=mock_recorder,
                 state_id="state-pool-001",
@@ -836,7 +841,7 @@ class TestMultiQueryWithMockProvider:
         del config["pool_size"]
 
         transform = LLMTransform(config)
-        init_ctx = make_context(run_id="test", landscape=mock_recorder)
+        init_ctx = make_context(**mock_audit_authority("test"), run_id="test", landscape=mock_recorder)
         transform.on_start(init_ctx)
         transform._provider = _make_provider([{"score": i, "rationale": f"R{i}"} for i in range(4)])
         transform.connect_output(collector, max_pending=10)
@@ -852,6 +857,7 @@ class TestMultiQueryWithMockProvider:
             }
             token = make_token("row-1")
             ctx = make_context(
+                **mock_audit_authority("run-123"),
                 run_id="run-123",
                 landscape=mock_recorder,
                 state_id="batch-seq-001",

@@ -7,13 +7,17 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.fixtures.factories import make_context
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 from elspeth.contracts import AuditCharacteristic, Determinism
 from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.aws.textract_client import (
@@ -352,6 +356,7 @@ def _run(transform: AWSTextractInlineAnalysis, row: PipelineRow | None = None):
     return transform._process_single_with_state(
         _row() if row is None else row,
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -782,7 +787,7 @@ def test_missing_payload_store_is_a_framework_bug_at_row_time() -> None:
 
 
 class _ProbeRecorder:
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         del state_id
         return 0
 
@@ -795,10 +800,10 @@ def test_forward_invariant_probe_runs_the_production_path_offline() -> None:
     transform = AWSTextractInlineAnalysis(_config())
     probe_rows = transform.forward_invariant_probe_rows(make_pipeline_row({"seed": "value"}))
     assert probe_rows[0]["blob_ref"] is not None
-    ctx = SimpleNamespace(
+    ctx = make_context(
         landscape=_ProbeRecorder(),
+        **mock_item_audit_authority("run-probe"),
         run_id="run-probe",
-        telemetry_emit=lambda _event: None,
         state_id=None,
         token=None,
     )

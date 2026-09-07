@@ -20,7 +20,6 @@ from tests.fixtures.landscape import make_recorder_with_run
 def claimed_item() -> Iterator[tuple[Tier1Engine, WorkerMembershipToken, TokenWorkItem]]:
     setup = make_recorder_with_run(leader_worker_id="item-writer")
     row, token = setup.factory.data_flow.create_row_with_token(
-        setup.run_id,
         setup.source_node_id,
         0,
         {"value": 1},
@@ -29,7 +28,7 @@ def claimed_item() -> Iterator[tuple[Tier1Engine, WorkerMembershipToken, TokenWo
         ingest_sequence=0,
     )
     item = setup.factory.scheduler.enqueue_ready_claimed(
-        run_id=setup.run_id,
+        member_token=setup.coordination_token.membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=setup.source_node_id,

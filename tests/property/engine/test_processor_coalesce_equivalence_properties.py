@@ -19,7 +19,7 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_row
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db
 
 
 @st.composite
@@ -45,8 +45,9 @@ def _make_processor(
     source_node_id = NodeID("source-0")
 
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination_token = leader_token_for(db, run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination_token,
         plugin_name="test-source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -79,6 +80,7 @@ def _make_processor(
         traversal=traversal,
         coalesce_executor=coalesce_executor,
         scheduler=factory.scheduler,
+        coordination_token=coordination_token,
     )
 
     return processor, coalesce_executor if coalesce_executor is not None else _CoalesceExecutorFake()

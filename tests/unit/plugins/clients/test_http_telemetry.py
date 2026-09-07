@@ -13,8 +13,11 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallRequest, HTTPCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 @dataclass(frozen=True)
@@ -30,10 +33,10 @@ class _RecordingExecution:
         self.record_call_calls: list[dict[str, Any]] = []
         self.record_call_effect: Callable[..., _RecordedCall] | Exception | None = None
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return next(self._call_counter)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return next(self._operation_call_counter)
 
     def record_call(
@@ -50,6 +53,8 @@ class _RecordingExecution:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> _RecordedCall:
         kwargs = {
             "state_id": state_id,
@@ -85,6 +90,7 @@ class _RecordingExecution:
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
+        coordination_token: CoordinationToken,
     ) -> _RecordedCall:
         return _RecordedCall()
 
@@ -118,6 +124,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -171,6 +178,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -211,6 +219,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -246,6 +255,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -281,6 +291,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -317,6 +328,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -348,6 +360,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -377,6 +390,7 @@ class TestHTTPClientTelemetry:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com",
@@ -418,6 +432,7 @@ class TestHTTPClientTelemetry:
         with patch("httpx.Client", autospec=True) as mock_client_class:
             # URL with embedded credentials
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api_user:super_secret_password@api.example.com:8443",
@@ -455,6 +470,7 @@ class TestHTTPClientTelemetry:
         with patch("httpx.Client", autospec=True) as mock_client_class:
             # URL without credentials
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_123",
                 base_url="https://api.example.com:443",
@@ -491,6 +507,7 @@ class TestHTTPClientPerCallTokenId:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_batch",
                 base_url="https://api.example.com",
@@ -516,6 +533,7 @@ class TestHTTPClientPerCallTokenId:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_single",
                 base_url="https://api.example.com",
@@ -538,6 +556,7 @@ class TestHTTPClientPerCallTokenId:
 
         with patch("httpx.Client", autospec=True) as mock_client_class:
             client = AuditedHTTPClient(
+                **mock_audit_authority(),
                 execution=execution,
                 state_id="state_err",
                 base_url="https://api.example.com",

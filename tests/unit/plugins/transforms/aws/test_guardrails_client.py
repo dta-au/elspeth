@@ -8,8 +8,11 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 from botocore.stub import Stubber
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.transforms.aws.guardrails_client import (
     ALL_USAGE_KEYS,
     BedrockGuardrailsClient,
@@ -29,7 +32,7 @@ class FakeExecution:
     order: list[str] = field(default_factory=list)
     fail_record: bool = False
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "state-1"
         return len(self.calls)
 
@@ -115,6 +118,7 @@ def response(
 
 def _client(sdk: Any, execution: FakeExecution, events: list[Any]) -> BedrockGuardrailsClient:
     return BedrockGuardrailsClient(
+        **mock_item_audit_authority("run-1"),
         execution=execution,
         state_id="state-1",
         run_id="run-1",
@@ -551,6 +555,7 @@ def test_invalid_response_metadata_fails_closed_without_private_value_leak() -> 
 
 def test_sdk_retry_configuration_has_one_owner() -> None:
     client = BedrockGuardrailsClient(
+        **mock_item_audit_authority("run-1"),
         execution=FakeExecution(),
         state_id="state-1",
         run_id="run-1",

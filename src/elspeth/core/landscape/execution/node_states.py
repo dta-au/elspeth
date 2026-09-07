@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Insert, bindparam, func, or_, select
+from sqlalchemy import bindparam, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
@@ -33,6 +33,7 @@ from elspeth.contracts import (
 from elspeth.contracts.advisory_locks import ELSPETH_ROUTING_GROUP_LOCK_CLASSID
 from elspeth.contracts.audit import validate_node_state_completion_fields
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.engine import CoalesceParentCompletion
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.hashing import repr_hash
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -350,36 +351,47 @@ class NodeStateRepository:
             )
         return True
 
-    def ensure_source_completed_node_state_on(
+    def record_source_completions_on(
         self,
         conn: Connection,
         *,
-        token_id: str,
-        source_node_id: str,
-        coordination_token: CoordinationToken,
-        source_data: Mapping[str, object],
-    ) -> bool:
-        """Insert a missing source completion or validate the exact existing witness."""
-        expected_hash = stable_hash(source_data)
-        if self.validate_existing_source_completed_node_state_on(
-            conn,
-            token_id=token_id,
-            source_node_id=source_node_id,
-            run_id=coordination_token.run_id,
-            expected_hash=expected_hash,
-        ):
-            return False
-        self.record_completed_node_state_on(
-            conn,
-            token_id=token_id,
-            node_id=source_node_id,
-            coordination_token=coordination_token,
-            step_index=0,
-            input_data=source_data,
-            output_data=source_data,
-            duration_ms=0,
-        )
-        return True
+        run_id: str,
+        entries: Sequence[tuple[str, str, Mapping[str, object]]],
+    ) -> int:
+        """Insert the validated missing source witnesses as one atomic batch."""
+        if not entries:
+            return 0
+        timestamp = now()
+        values: list[dict[str, object]] = []
+        for token_id, source_node_id, source_data in entries:
+            source_hash = stable_hash(source_data)
+            values.append(
+                {
+                    "state_id": generate_id(),
+                    "token_id": token_id,
+                    "node_id": source_node_id,
+                    "run_id": run_id,
+                    "step_index": 0,
+                    "attempt": 0,
+                    "status": NodeStateStatus.COMPLETED.value,
+                    "input_hash": source_hash,
+                    "output_hash": source_hash,
+                    "duration_ms": 0.0,
+                    "error_json": None,
+                    "success_reason_json": None,
+                    "context_after_json": None,
+                    "started_at": timestamp,
+                    "completed_at": timestamp,
+                }
+            )
+        inserted = conn.execute(node_states_table.insert().returning(node_states_table), values).all()
+        if len(inserted) != len(entries):
+            raise LandscapeRecordError("Source completion reconciliation inserted an incomplete witness set")
+        for row in inserted:
+            loaded = self._node_state_loader.load(row)
+            if loaded.status is not NodeStateStatus.COMPLETED:
+                raise LandscapeRecordError("Source completion reconciliation inserted a non-completed witness")
+        return len(inserted)
 
     def begin_node_states_many(
         self,
@@ -394,15 +406,6 @@ class NodeStateRepository:
         non-quarantined first attempt. Each token still receives its own
         node_states row; only the database round trips are batched.
         """
-        if not entries:
-            with fenced_leader_transaction(
-                self._db.engine,
-                token=coordination_token,
-                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                verb="begin_node_states_many",
-            ):
-                return []
-
         timestamp = now()
         states: list[NodeStateOpen] = []
         values: list[dict[str, object]] = []
@@ -441,6 +444,8 @@ class NodeStateRepository:
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="begin_node_states_many",
             ) as conn:
+                if not entries:
+                    return []
                 result = conn.execute(node_states_table.insert(), values)
                 if result.rowcount not in (-1, len(values)):
                     raise LandscapeRecordError(
@@ -541,8 +546,8 @@ class NodeStateRepository:
         # WHERE clause (same TOCTOU-safe pattern as complete_batch).
         terminal_values = [s.value for s in _TERMINAL_NODE_STATE_STATUSES]
 
-        def _complete_on(active_conn: Connection) -> Any:
-            update_result = active_conn.execute(
+        try:
+            update_result = conn.execute(
                 node_states_table.update()
                 .where(node_states_table.c.state_id == state_id)
                 .where(node_states_table.c.run_id == run_id)
@@ -559,7 +564,7 @@ class NodeStateRepository:
             )
             if update_result.rowcount == 0:
                 # Distinguish "not found" from "already terminal".
-                existing = active_conn.execute(
+                existing = conn.execute(
                     select(node_states_table.c.status, node_states_table.c.run_id).where(node_states_table.c.state_id == state_id)
                 ).fetchone()
                 if existing is not None:
@@ -572,10 +577,7 @@ class NodeStateRepository:
                 raise LandscapeRecordError(
                     f"complete_node_state: zero rows affected for state_id={state_id} — target row does not exist (audit data corruption)"
                 )
-            return active_conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
-
-        try:
-            row = _complete_on(conn)
+            row = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"complete_node_state failed for state_id={state_id} — database rejected audit update: {type(exc).__name__}: {exc}"
@@ -597,6 +599,7 @@ class NodeStateRepository:
         completions: Sequence[tuple[str, Mapping[str, object], float]],
         *,
         conn: Connection,
+        context_after_by_state: Mapping[str, NodeStateContext | None] | None = None,
     ) -> None:
         """Complete many node states as COMPLETED in one audit transaction.
 
@@ -622,6 +625,7 @@ class NodeStateRepository:
 
         params: list[dict[str, object]] = []
         for state_id, output_data, duration_ms in completions:
+            context_after = context_after_by_state[state_id] if context_after_by_state is not None else None
             validate_node_state_completion_fields(
                 NodeStateStatus.COMPLETED,
                 output_data_present=output_data is not None,
@@ -636,6 +640,7 @@ class NodeStateRepository:
                     "batch_output_hash": stable_hash(output_data),
                     "batch_duration_ms": duration_ms,
                     "batch_completed_at": timestamp,
+                    "batch_context_after_json": canonical_json(context_after.to_dict()) if context_after is not None else None,
                 }
             )
 
@@ -650,16 +655,16 @@ class NodeStateRepository:
                 duration_ms=bindparam("batch_duration_ms"),
                 error_json=None,
                 success_reason_json=None,
-                context_after_json=None,
+                context_after_json=bindparam("batch_context_after_json"),
                 completed_at=bindparam("batch_completed_at"),
             )
         )
 
-        def _complete_on(active_conn: Connection) -> list[Any]:
-            if active_conn.dialect.name == "postgresql":
+        try:
+            if conn.dialect.name == "postgresql":
                 for i in range(0, len(lock_state_ids), _STATE_ID_CHUNK_SIZE):
                     lock_chunk = lock_state_ids[i : i + _STATE_ID_CHUNK_SIZE]
-                    active_conn.execute(
+                    conn.execute(
                         select(node_states_table.c.state_id)
                         .where(node_states_table.c.state_id.in_(lock_chunk))
                         .order_by(node_states_table.c.state_id)
@@ -670,7 +675,7 @@ class NodeStateRepository:
             for i in range(0, len(state_ids), _STATE_ID_CHUNK_SIZE):
                 chunk = state_ids[i : i + _STATE_ID_CHUNK_SIZE]
                 before_rows.extend(
-                    active_conn.execute(
+                    conn.execute(
                         select(node_states_table.c.state_id, node_states_table.c.status).where(node_states_table.c.state_id.in_(chunk))
                     ).fetchall()
                 )
@@ -688,7 +693,7 @@ class NodeStateRepository:
                     "Terminal node states are immutable."
                 )
 
-            result = active_conn.execute(stmt, params)
+            result = conn.execute(stmt, params)
             if result.rowcount not in (-1, len(params)):
                 raise LandscapeRecordError(
                     f"complete_node_states_completed_many affected {result.rowcount} rows for {len(params)} states; "
@@ -697,11 +702,8 @@ class NodeStateRepository:
             after_rows: list[Any] = []
             for i in range(0, len(state_ids), _STATE_ID_CHUNK_SIZE):
                 chunk = state_ids[i : i + _STATE_ID_CHUNK_SIZE]
-                after_rows.extend(active_conn.execute(select(node_states_table).where(node_states_table.c.state_id.in_(chunk))).fetchall())
-            return after_rows
-
-        try:
-            after_rows = _complete_on(conn)
+                after_rows.extend(conn.execute(select(node_states_table).where(node_states_table.c.state_id.in_(chunk))).fetchall())
+            after_rows = after_rows
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
                 f"complete_node_states_completed_many failed for {len(params)} states — database rejected audit update: "
@@ -721,6 +723,29 @@ class NodeStateRepository:
                 raise LandscapePostCommitError(
                     f"NodeState {row.state_id} should be COMPLETED after batch completion but has status {loaded.status}"
                 )
+
+    def complete_coalesce_node_states_on(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        merged_token_id: str,
+        parent_completions: Sequence[CoalesceParentCompletion],
+    ) -> None:
+        """Complete coalesce parents with their individual timing and context."""
+        state_ids = [item.state_id for item in parent_completions]
+        if not state_ids:
+            return
+        states = conn.execute(
+            select(node_states_table.c.state_id, node_states_table.c.run_id).where(node_states_table.c.state_id.in_(state_ids))
+        ).all()
+        if len(states) != len(state_ids) or any(state.run_id != run_id for state in states):
+            raise AuditIntegrityError("Cannot complete missing or foreign coalesce parent states")
+        self.complete_node_states_completed_many(
+            [(item.state_id, {"merged_into": merged_token_id}, item.duration_ms) for item in parent_completions],
+            conn=conn,
+            context_after_by_state={item.state_id: item.context_after for item in parent_completions},
+        )
 
     def get_node_state(self, state_id: str) -> NodeState | None:
         """Get a node state by ID.
@@ -912,25 +937,16 @@ class NodeStateRepository:
         Returns:
             List of RoutingEvent models
         """
-        if not routes:
-            with fenced_item_transaction(
-                self._db.engine,
-                member_token=member_token,
-                work_item=work_item,
-                verb="record_routing_events",
-            ):
-                return []
-
         routing_group_id = self._default_routing_group_id(state_id)
         reason_hash = stable_hash(reason) if reason is not None else None
-        if reason is not None and self._payload_store is not None:
+        if routes and reason is not None and self._payload_store is not None:
             self._assert_routing_targets_recordable(
                 state_id=state_id,
                 edge_ids=tuple(route.edge_id for route in routes),
                 owner="record_routing_events",
             )
         reason_ref = self._materialize_routing_reason_before_insert(
-            reason=reason,
+            reason=reason if routes else None,
             reason_hash=reason_hash,
             supplied_reason_ref=None,
         )
@@ -955,6 +971,8 @@ class NodeStateRepository:
             work_item=work_item,
             verb="record_routing_events",
         ) as conn:
+            if not routes:
+                return []
             state_token_id = conn.execute(select(node_states_table.c.token_id).where(node_states_table.c.state_id == state_id)).scalar_one()
             if state_token_id != work_item.token_id:
                 raise AuditIntegrityError("record_routing_events: state does not belong to the claimed work item")
@@ -1061,26 +1079,25 @@ class NodeStateRepository:
         return reason_ref
 
     @staticmethod
-    def _routing_insert_statement(conn: Connection, values: dict[str, object]) -> Insert:
-        """Build a dialect-safe insert for the routing natural key."""
+    def _insert_routing_events_on(conn: Connection, values: Sequence[dict[str, object]]) -> int:
+        """Execute a dialect-safe insert for the routing natural key."""
         if conn.dialect.name == "postgresql":
             # Suppress only the idempotency key. An unrelated event_id or FK
             # collision is database corruption/programmer error and must keep
             # the ordinary LandscapeRecordError surface.
-            return (
-                postgresql_insert(routing_events_table)
-                .values(**values)
-                .on_conflict_do_nothing(
+            return conn.execute(
+                postgresql_insert(routing_events_table).on_conflict_do_nothing(
                     index_elements=[
                         routing_events_table.c.routing_group_id,
                         routing_events_table.c.ordinal,
                     ]
-                )
-            )
+                ),
+                list(values),
+            ).rowcount
         if conn.dialect.name == "sqlite":
             # BEGIN IMMEDIATE serializes the pre-read and INSERT. A plain
             # INSERT preserves the zero-row fail-closed invariant on SQLite.
-            return sqlite_insert(routing_events_table).values(**values)
+            return conn.execute(sqlite_insert(routing_events_table), list(values)).rowcount
         raise LandscapeRecordError(
             f"Routing event idempotency is unsupported for database dialect {conn.dialect.name!r}; refusing an ambiguous audit write"
         )
@@ -1274,10 +1291,14 @@ class NodeStateRepository:
                 state_id=state_id,
                 expected_count=0,
             )
-            for event, event_run_id in zip(events, run_ids, strict=True):
-                result = conn.execute(self._routing_insert_statement(conn, self._routing_event_values(event, run_id=event_run_id)))
-                if result.rowcount != 1 and conn.dialect.name != "postgresql":
-                    raise AuditIntegrityError(f"Failed to insert routing event {event.event_id} for state {state_id} - zero rows affected")
+            rowcount = self._insert_routing_events_on(
+                conn,
+                [self._routing_event_values(event, run_id=event_run_id) for event, event_run_id in zip(events, run_ids, strict=True)],
+            )
+            if rowcount != len(events) and conn.dialect.name != "postgresql":
+                raise AuditIntegrityError(
+                    f"Failed to insert routing events for state {state_id} - affected {rowcount} of {len(events)} rows"
+                )
 
             durable_rows = list(conn.execute(self._routing_state_decision_query(state_id)).fetchall())
             self._assert_group_is_state_owned(

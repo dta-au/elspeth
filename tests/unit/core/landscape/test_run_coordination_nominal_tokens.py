@@ -1,11 +1,16 @@
 """Structural token impostors cannot enter coordination transactions."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
+from elspeth.core.landscape.run_coordination_repository import (
+    RunCoordinationRepository,
+    fenced_leader_transaction,
+    fenced_member_transaction,
+)
 from tests.fixtures.landscape import make_landscape_db
 
 
@@ -28,5 +33,15 @@ def test_fence_rejects_structural_token_before_database_access(kind: str) -> Non
             else:
                 with fenced_leader_transaction(db.engine, token=token, window_seconds=80, verb="test"):
                     pytest.fail("structural leader token entered payload")
+    finally:
+        db.close()
+
+
+def test_heartbeat_degraded_rejects_structural_token_before_event_write() -> None:
+    db = make_landscape_db()
+    token: Any = _TokenImpostor()
+    try:
+        with pytest.raises(TypeError, match="requires a WorkerMembershipToken"):
+            RunCoordinationRepository(db.engine).record_heartbeat_degraded(member_token=token, failures=3, now=datetime.now(UTC))
     finally:
         db.close()

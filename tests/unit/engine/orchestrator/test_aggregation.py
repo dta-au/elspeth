@@ -21,6 +21,7 @@ import pytest
 
 from elspeth.contracts import PendingOutcome, RowResult, TokenInfo
 from elspeth.contracts.audit import Batch
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import BatchStatus, FrameKind, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -254,6 +255,8 @@ class TestFindAggregationTransform:
 class TestHandleIncompleteBatches:
     """Tests for crash recovery of incomplete batches."""
 
+    coordination_token = CoordinationToken(run_id="run-1", worker_id="resume-worker", leader_epoch=1)
+
     def test_executing_batch_marked_failed_then_retried(self) -> None:
         """EXECUTING batch (crash interrupted) -> failed -> retried."""
         batch = _make_batch(
@@ -270,7 +273,7 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [batch]
         recorder.retry_batch.return_value = retry_batch
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_called_once_with(
             "batch-123",
@@ -278,9 +281,10 @@ class TestHandleIncompleteBatches:
             trigger_type=TriggerType.COUNT,
             trigger_reason="count=2",
             state_id="state-123",
+            coordination_token=self.coordination_token,
         )
         recorder.update_batch_status.assert_not_called()
-        recorder.retry_batch.assert_called_once_with("batch-123")
+        recorder.retry_batch.assert_called_once_with("batch-123", coordination_token=self.coordination_token)
         assert mapping == {"batch-123": "batch-123-retry"}
 
     def test_failed_batch_retried(self) -> None:
@@ -293,11 +297,11 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [batch]
         recorder.retry_batch.return_value = retry_batch
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
-        recorder.retry_batch.assert_called_once_with("batch-456")
+        recorder.retry_batch.assert_called_once_with("batch-456", coordination_token=self.coordination_token)
         assert mapping == {"batch-456": "batch-456-retry"}
 
     def test_draft_batch_left_alone(self) -> None:
@@ -307,7 +311,7 @@ class TestHandleIncompleteBatches:
         recorder = _make_execution()
         recorder.get_incomplete_batches.return_value = [batch]
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
@@ -319,7 +323,7 @@ class TestHandleIncompleteBatches:
         recorder = _make_execution()
         recorder.get_incomplete_batches.return_value = []
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_not_called()
         recorder.update_batch_status.assert_not_called()
@@ -339,7 +343,7 @@ class TestHandleIncompleteBatches:
         recorder.get_incomplete_batches.return_value = [executing, failed, draft]
         recorder.retry_batch.side_effect = [retry_b1, retry_b2]
 
-        mapping = handle_incomplete_batches(recorder, "run-1")
+        mapping = handle_incomplete_batches(recorder, coordination_token=self.coordination_token)
 
         recorder.complete_batch.assert_called_once_with(
             "b1",
@@ -347,6 +351,7 @@ class TestHandleIncompleteBatches:
             trigger_type=None,
             trigger_reason=None,
             state_id=None,
+            coordination_token=self.coordination_token,
         )
         recorder.update_batch_status.assert_not_called()
         assert recorder.retry_batch.call_count == 2

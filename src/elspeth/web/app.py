@@ -253,12 +253,7 @@ def _finalize_orphaned_landscape_runs(
                 # (epoch+1) and finalize under that token; a seat that is
                 # still live means the run is NOT orphaned and is left alone.
                 try:
-                    coordination_token = repositories.run_coordination.acquire_run_leadership(
-                        run_id=landscape_run_id,
-                        worker_id=mint_worker_id(landscape_run_id),
-                        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                        entry_point="orphan-finalize",
-                    )
+                    coordination_token = _acquire_orphaned_run_leadership(repositories, run_id=landscape_run_id)
                 except NonResumableRunError:
                     structlog.get_logger().warning(
                         "orphan_landscape_run_leader_live",
@@ -276,6 +271,16 @@ def _finalize_orphaned_landscape_runs(
             operator_action="investigate audit-row absence",
         )
     return frozenset(complete_run_ids), frozenset(absent_run_ids)
+
+
+def _acquire_orphaned_run_leadership(repositories: RecorderFactory, *, run_id: str) -> CoordinationToken:
+    """Acquire the expired seat for one orphan reconciliation attempt."""
+    return repositories.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        entry_point="orphan-finalize",
+    )
 
 
 def _finalize_orphan_as_interrupted(repositories: RecorderFactory, *, coordination_token: CoordinationToken) -> None:

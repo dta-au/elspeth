@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -132,7 +134,6 @@ class SourceCompletionReconciler:
         history. Every ambiguity is an audit-integrity failure.
         """
         run_id = coordination_token.run_id
-        repaired = 0
         with fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
@@ -184,6 +185,7 @@ class SourceCompletionReconciler:
                 .all()
             )
 
+            missing: list[tuple[str, str, Mapping[str, object]]] = []
             for witness in witnesses:
                 token_id = str(witness["token_id"])
                 if witness["ingest_sequence"] != witness["row_ingest_sequence"]:
@@ -209,13 +211,5 @@ class SourceCompletionReconciler:
                         f"Source completion reconciliation for token {token_id!r} found scheduler payload hash {source_hash!r} "
                         f"but rows.source_data_hash is {source_data_hash!r}."
                     )
-                repaired += int(
-                    self._node_states.ensure_source_completed_node_state_on(
-                        conn,
-                        token_id=token_id,
-                        source_node_id=source_node_id,
-                        coordination_token=coordination_token,
-                        source_data=source_data,
-                    )
-                )
-        return repaired
+                missing.append((token_id, source_node_id, source_data))
+            return self._node_states.record_source_completions_on(conn, run_id=coordination_token.run_id, entries=missing)

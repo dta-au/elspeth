@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
@@ -36,6 +36,7 @@ from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
     run_coordination_table,
+    run_workers_table,
     runs_table,
     scheduler_events_table,
     token_outcomes_table,
@@ -50,17 +51,16 @@ def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch:
 
     engine, repo = _make_repo()
     _seed_three_blocked(engine, repo)
-    real_record = barrier_module.record_terminal_outcome_guarded
+    real_record = barrier_module.record_terminal_outcomes_guarded
     calls = 0
 
     def fail_during_second_outcome(*args: object, **kwargs: object) -> None:
         nonlocal calls
         calls += 1
         real_record(*args, **kwargs)
-        if calls == 2:
-            raise RuntimeError("injected terminal-outcome failure")
+        raise RuntimeError("injected terminal-outcome failure")
 
-    monkeypatch.setattr(barrier_module, "record_terminal_outcome_guarded", fail_during_second_outcome)
+    monkeypatch.setattr(barrier_module, "record_terminal_outcomes_guarded", fail_during_second_outcome)
     terminal_outcomes = tuple(
         BarrierTerminalOutcomeSpec(
             token_id=token_id,
@@ -72,7 +72,6 @@ def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch:
 
     with pytest.raises(RuntimeError, match="injected terminal-outcome failure"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
@@ -212,6 +211,17 @@ def _seed_run_grouped(
                 updated_at=now,
             )
         )
+        for worker_id in ("w1", "w-next", "w-ready", "w-merged", LEADER_WORKER_ID):
+            conn.execute(
+                insert(run_workers_table).values(
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    role="follower",
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=datetime.now(UTC) + timedelta(hours=1),
+                )
+            )
     return row_payload_json
 
 
@@ -226,7 +236,7 @@ def _enqueue_and_block(
 ) -> None:
     """Enqueue one READY item, claim it, and block it at the barrier."""
     item = repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w1"),
         token_id=token_id,
         row_id=row_id,
         node_id="normalize",
@@ -234,10 +244,11 @@ def _enqueue_and_block(
         ingest_sequence=ingest_sequence,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w1", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w1"), lease_owner="w1", lease_seconds=30)
     assert claimed is not None
     assert claimed.work_item_id == item.work_item_id
     repo.mark_blocked(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w1"),
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
@@ -306,7 +317,6 @@ def test_complete_barrier_consumes_and_emits_atomically() -> None:
     payload = _seed_three_blocked(engine, repo, extra_tokens=[("r-agg", "t-agg-out", 3)])
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[
@@ -363,7 +373,6 @@ def test_complete_barrier_refuses_partial_consumed_set() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"uncovered token_ids.*t3"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
@@ -380,7 +389,6 @@ def test_complete_barrier_refuses_consumed_tokens_missing_from_blocked_set() -> 
 
     with pytest.raises(AuditIntegrityError, match=r"missing token_ids.*t4"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3", "t4"],
             emitted_pending_sink=[],
@@ -403,7 +411,7 @@ def test_complete_barrier_crash_atomicity() -> None:
     payload = _seed_three_blocked(engine, repo, extra_tokens=[("r-dup", "t-dup", 3)])
     # Occupy the terminal lane identity for t-dup (attempt=1, node_id NULL).
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w1"),
         token_id="t-dup",
         row_id="r-dup",
         node_id=None,
@@ -416,7 +424,6 @@ def test_complete_barrier_crash_atomicity() -> None:
     # The strict insert wraps the in-txn IntegrityError into LandscapeRecordError.
     with pytest.raises(LandscapeRecordError):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[
@@ -448,7 +455,6 @@ def test_complete_barrier_passthrough_handoff_counts_toward_blocked_coverage() -
     blocked_row_before = dict(_row_for_token(engine, "t3"))
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2"],
         emitted_pending_sink=[
@@ -486,7 +492,6 @@ def test_complete_barrier_snapshot_equal_to_durable_is_n1_parity() -> None:
     _seed_three_blocked(engine, repo)
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
@@ -515,7 +520,6 @@ def test_complete_barrier_late_arrival_outside_snapshot_stays_blocked() -> None:
     payload = _seed_three_blocked(engine, repo, extra_tokens=[("r-next", "t-next", 3)])
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2"],
         emitted_pending_sink=[],
@@ -555,7 +559,6 @@ def test_complete_barrier_snapshot_minus_durable_is_tier1() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"no durable BLOCKED row.*t-ghost"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
@@ -574,7 +577,6 @@ def test_complete_barrier_consumed_outside_snapshot_is_tier1() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"outside its own intake snapshot.*t3"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],
@@ -593,7 +595,6 @@ def test_complete_barrier_handed_off_outside_snapshot_is_tier1() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"handed\s+off buffered token\(s\) outside its own intake snapshot.*t3"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[
@@ -622,7 +623,6 @@ def test_complete_barrier_snapshot_orphan_within_snapshot_is_tier1() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"uncovered token_ids.*t3"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
@@ -650,7 +650,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
 
     with pytest.raises(AuditIntegrityError, match=r"uncovered token_ids.*t3"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
@@ -661,7 +660,6 @@ def test_complete_barrier_explicit_none_snapshot_is_durable_universe_exhaustiven
     assert _statuses(engine, ["t1", "t2", "t3"]) == {TokenWorkStatus.BLOCKED.value}
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
@@ -685,7 +683,6 @@ def test_complete_barrier_leased_exclusion_token_id_parameter_is_deleted() -> No
 
     with pytest.raises(TypeError, match="leased_exclusion_token_id"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
@@ -702,7 +699,6 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
     payload = _seed_three_blocked(engine, repo, extra_tokens=[("r-next", "t-next", 3)])
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2", "t3"],
         emitted_pending_sink=[],
@@ -730,7 +726,9 @@ def test_complete_barrier_emitted_ready_inserts_ready_rows_with_enqueue_events()
     assert json.loads(emission_enqueues[0]["context_json"]) == {"barrier_key": BARRIER_KEY, "consumed_count": 3}
 
     # The emitted READY continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-next", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w-next"), lease_owner="w-next", lease_seconds=30
+    )
     assert claimed is not None
     assert claimed.token_id == "t-next"
 
@@ -768,7 +766,6 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
     )
 
     repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key="variant_union",
         consumed_token_ids=["held-a", "held-b"],
         emitted_pending_sink=[],
@@ -803,8 +800,8 @@ def test_complete_barrier_ready_emissions_claim_in_declared_tuple_order() -> Non
     )
 
     claimed = [
-        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
-        repo.claim_ready(run_id=RUN_ID, lease_owner="w-ready", lease_seconds=30),
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w-ready"), lease_owner="w-ready", lease_seconds=30),
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w-ready"), lease_owner="w-ready", lease_seconds=30),
     ]
     assert [item.token_id if item is not None else None for item in claimed] == ["token-a", "token-b"]
 
@@ -815,7 +812,6 @@ def test_complete_barrier_rejects_duplicate_consumed_token_ids() -> None:
 
     with pytest.raises(AuditIntegrityError, match="duplicate"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t1", "t2", "t3"],
             emitted_pending_sink=[],
@@ -832,7 +828,6 @@ def test_complete_barrier_rejects_consumed_token_also_emitted() -> None:
 
     with pytest.raises(AuditIntegrityError, match="both consumed and emitted"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[
@@ -864,7 +859,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
     payload = _seed_three_blocked(engine, repo)
 
     transitioned = repo.mark_blocked_barrier_pending_sink_many(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         handoffs={
             "t1": BlockedPendingSinkHandoff(
@@ -884,7 +878,6 @@ def test_wrappers_delegate_preserving_legacy_partial_release() -> None:
     assert json.loads(handoff_events[0]["context_json"]) == {"barrier_key": BARRIER_KEY}
 
     terminalized = repo.mark_blocked_barrier_terminal(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t2",),  # t3 left blocked: legacy partial release
         coordination_token=COORD_TOKEN,
@@ -935,7 +928,6 @@ def test_complete_barrier_scope_row_id_isolates_coalesce_group() -> None:
     _seed_two_coalesce_groups(engine, repo)
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=COALESCE_KEY,
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
@@ -957,7 +949,6 @@ def test_complete_barrier_scoped_group_still_catches_cross_group_consumed_token(
 
     with pytest.raises(AuditIntegrityError, match=r"missing token_ids.*t2a.*scope_row_id='r1'"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=COALESCE_KEY,
             consumed_token_ids=["t1a", "t1b", "t2a"],
             emitted_pending_sink=[],
@@ -976,7 +967,6 @@ def test_complete_barrier_scoped_group_still_catches_uncovered_blocked_row() -> 
 
     with pytest.raises(AuditIntegrityError, match=r"uncovered token_ids.*t1b.*scope_row_id='r1'"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=COALESCE_KEY,
             consumed_token_ids=["t1a"],
             emitted_pending_sink=[],
@@ -995,7 +985,6 @@ def test_complete_barrier_scope_row_id_requires_exhaustive_release() -> None:
 
     with pytest.raises(AuditIntegrityError, match="meaningless on the legacy partial-release arm"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=COALESCE_KEY,
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
@@ -1020,7 +1009,6 @@ def test_complete_barrier_combined_lanes_one_call() -> None:
     events_before = len(_events(engine))
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         consumed_token_ids=["t1", "t2"],
         emitted_pending_sink=[
@@ -1083,7 +1071,6 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
     payload = _seed_two_coalesce_groups(engine, repo, extra_tokens=[("r1", "t1-merged")])
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=COALESCE_KEY,
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
@@ -1113,7 +1100,9 @@ def test_complete_barrier_scoped_coalesce_fire_emits_merged_ready_child() -> Non
     assert len(enqueue_events) == 1
     assert json.loads(enqueue_events[0]["context_json"]) == {"barrier_key": COALESCE_KEY, "consumed_count": 2}
     # The merged continuation is claimable like any other.
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="w-merged", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="w-merged"), lease_owner="w-merged", lease_seconds=30
+    )
     assert claimed is not None
     assert claimed.token_id == "t1-merged"
 
@@ -1125,7 +1114,6 @@ def test_complete_barrier_scoped_fire_rejects_emission_outside_scope_group() -> 
 
     with pytest.raises(AuditIntegrityError, match="outside the scoped pending group"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=COALESCE_KEY,
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
@@ -1153,7 +1141,6 @@ def test_complete_barrier_snapshot_requires_exhaustive_release() -> None:
 
     with pytest.raises(AuditIntegrityError, match="meaningless on the legacy partial-release arm"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2"],
             emitted_pending_sink=[],
@@ -1175,7 +1162,6 @@ def test_complete_barrier_cross_group_snapshot_token_is_tier1() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"DIFFERENT row group.*t2a.*firing-group snapshot across row groups"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=COALESCE_KEY,
             consumed_token_ids=["t1a", "t1b"],
             emitted_pending_sink=[],
@@ -1197,7 +1183,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
     _seed_two_coalesce_groups(engine, repo)
 
     n = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=COALESCE_KEY,
         consumed_token_ids=["t1a", "t1b"],
         emitted_pending_sink=[],
@@ -1213,7 +1198,6 @@ def test_complete_barrier_snapshot_isolates_sibling_coalesce_group() -> None:
 
     # Group B then flushes with ITS snapshot, proving full two-group algebra.
     n2 = repo.complete_barrier(
-        run_id=RUN_ID,
         barrier_key=COALESCE_KEY,
         consumed_token_ids=["t2a", "t2b"],
         emitted_pending_sink=[],
@@ -1235,7 +1219,6 @@ def test_mark_blocked_barrier_terminal_release_context_merged_into_event() -> No
     _seed_three_blocked(engine, repo)
 
     released = repo.mark_blocked_barrier_terminal(
-        run_id=RUN_ID,
         barrier_key=BARRIER_KEY,
         token_ids=("t3",),
         coordination_token=COORD_TOKEN,
@@ -1270,7 +1253,6 @@ def test_complete_barrier_rejects_duplicate_ready_emissions() -> None:
 
     with pytest.raises(AuditIntegrityError, match="duplicate ready emissions"):
         repo.complete_barrier(
-            run_id=RUN_ID,
             barrier_key=BARRIER_KEY,
             consumed_token_ids=["t1", "t2", "t3"],
             emitted_pending_sink=[],

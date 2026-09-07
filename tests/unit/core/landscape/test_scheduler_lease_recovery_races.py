@@ -11,12 +11,12 @@ file-backed Tier-1 SQLite database (two engine handles on the same file —
     consistent attempt count — never a lost item, never a double-bump*. Three
     deterministic interleavings are pinned:
 
-    1. A claimant probing AFTER the sweep's per-row UPDATE has executed but
+    1. A claimant probing AFTER the sweep's batch UPDATE has executed but
        BEFORE the sweep transaction commits is excluded at its own ``BEGIN
        IMMEDIATE`` with the retryable "database is locked" error — the
        uncommitted READY row is unobservable by construction. After the
        sweep commits, the rotated attempt is claimable.
-    2. A peer sweeper attempting a competing recovery inside that same
+    2. A second connection using the same leader token attempting recovery inside that same
        window is likewise lock-excluded; the caller's sweep wins, and the
        peer's serialized retry returns 0 cleanly (records no event) — the
        attempt is bumped exactly once, never twice.
@@ -30,22 +30,22 @@ file-backed Tier-1 SQLite database (two engine handles on the same file —
     discipline (ADR-030 §D5): every scheduler write transaction now begins
     with ``BEGIN IMMEDIATE``, taking the single WAL write lock AT BEGIN. The
     old SELECT->UPDATE window — in which a second engine could COMMIT a
-    competing claim/recovery before the caller's first per-row UPDATE — no
+    competing claim/recovery before the caller's first batch UPDATE — no
     longer exists: a peer write transaction attempted inside that window is
     excluded at its own ``BEGIN IMMEDIATE`` with the retryable
     "database is locked" ``OperationalError`` (after its ``busy_timeout``
     poll). These tests therefore pin LOCK EXCLUSION inside the window plus
     the clean serialized loser path immediately after commit (recovery
     returns 0 / claim returns None — no ``AuditIntegrityError``, no double
-    bump). The CAS predicate on the per-row UPDATE remains as belt-and-braces
+    bump). The CAS predicate on the batch UPDATE remains as belt-and-braces
     and still serves same-connection interleavings; its
     ``lease_expires_at < now`` expiry leg is pinned directly by
     ``test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_lease``
     in tests/unit/core/test_multi_source_foundation.py.
 
 (d) Crash mid-``recover_expired_leases`` with multiple expired items. The
-    sweep runs in ONE ``engine.begin()`` transaction, so a crash after some
-    per-row UPDATEs have executed must roll back atomically: NOTHING is
+    sweep runs in ONE fenced write transaction, so a crash after the item,
+    scheduler-event or coordination-event batch must roll back atomically: NOTHING is
     recovered — no half-bumped item (attempt advanced but status still
     LEASED), no rotated ``work_item_id`` with stale status, no orphaned
     recovery event — and a repeated sweep then completes recovery for ALL
@@ -71,16 +71,21 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, event, insert, select, update
+from sqlalchemy import create_engine, delete, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
+    SchedulerLeaseLostError,
+)
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
-from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler.work_items import work_item_id
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -96,9 +101,9 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, on_fresh_database_second
-from tests.helpers.run_coordination import register_run_leader
 
 RUN_ID = "run-rc6-lease-races"
+_RECOVERY_TOKEN = CoordinationToken(run_id=RUN_ID, worker_id="sweeper", leader_epoch=2)
 # Forensic seed instant for rows/tokens/nodes. Never a lease decision input:
 # every deadline a test needs is written relative to the database clock.
 BASE = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
@@ -131,7 +136,7 @@ def _row_payload_json() -> str:
     return TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
 
-def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...]) -> None:
+def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...], *, leader_worker_id: str = "sweeper") -> None:
     """Insert the run, source/transform nodes, and one row per token."""
     with engine.begin() as conn:
         conn.execute(
@@ -163,6 +168,40 @@ def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...]) -> No
                     registered_at=BASE,
                 )
             )
+        for worker_id in (
+            "producer",
+            "worker-dead",
+            "dead-owner",
+            "old-owner",
+            "transform-owner",
+            "claimant",
+            "peer-claimant",
+            "first-worker",
+            "peer-worker",
+            "sweeper",
+            "redriver",
+            "sink-owner",
+            "leader",
+        ):
+            conn.execute(
+                insert(run_workers_table).values(
+                    worker_id=worker_id,
+                    run_id=RUN_ID,
+                    role="leader" if worker_id == leader_worker_id else "follower",
+                    status="active",
+                    registered_at=BASE,
+                    heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1),
+                )
+            )
+        conn.execute(
+            insert(run_coordination_table).values(
+                run_id=RUN_ID,
+                leader_worker_id=leader_worker_id,
+                leader_epoch=2 if leader_worker_id == "sweeper" else 1,
+                leader_heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1),
+                updated_at=BASE,
+            )
+        )
         for ingest_sequence, token_id in enumerate(token_ids):
             row_id = f"row-{ingest_sequence}"
             conn.execute(
@@ -187,11 +226,25 @@ def _seed_run_rows_tokens(engine: Tier1Engine, token_ids: tuple[str, ...]) -> No
             )
 
 
+def _handoff_to_recovery_leader(engine: Tier1Engine) -> None:
+    """Model takeover after the former leader's redrive claim, before the tested sweep."""
+    with engine.begin() as conn:
+        conn.execute(
+            update(run_coordination_table)
+            .where(run_coordination_table.c.run_id == RUN_ID)
+            .values(
+                leader_worker_id=_RECOVERY_TOKEN.worker_id,
+                leader_epoch=_RECOVERY_TOKEN.leader_epoch,
+                leader_heartbeat_expires_at=landscape_database_now(engine) + timedelta(hours=1),
+            )
+        )
+
+
 def _enqueue_tokens(repo: TokenSchedulerRepository, token_ids: tuple[str, ...]) -> dict[str, TokenWorkItem]:
     payload = _row_payload_json()
     return {
         token_id: repo.enqueue_ready(
-            run_id=RUN_ID,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
             token_id=token_id,
             row_id=f"row-{ingest_sequence}",
             node_id="normalize",
@@ -208,7 +261,9 @@ def _expire_leases(
 ) -> None:
     """Lease every enqueued token, then age each lease one second into the database's past."""
     for token_id in token_ids:
-        claimed = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=30)
+        claimed = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=lease_owner), lease_owner=lease_owner, lease_seconds=30
+        )
         assert claimed is not None
         assert claimed.token_id == token_id
         expire_lease(engine, claimed.work_item_id)
@@ -308,32 +363,27 @@ def _lower_busy_timeout(engine: Tier1Engine, ms: int = 100) -> None:
         raw.close()
 
 
-def test_named_legacy_adapter_preserves_pre_coordination_direct_harness_recovery(
+def test_recovery_without_durable_leader_seat_refuses_without_item_mutation(
     engines: tuple[Tier1Engine, Tier1Engine],
 ) -> None:
-    """The named legacy adapter remains available to direct harnesses that
-    have no coordination seat and must recover a crashed owner's lease.
-    """
+    """A direct harness cannot recover work without a durable leader seat."""
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
     _seed_run_rows_tokens(engine, ("token-0",))
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
     _expire_leases(engine, repo, ("token-0",))
-    with engine.connect() as conn:
+    with engine.begin() as conn:
+        conn.execute(delete(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID))
         assert conn.execute(select(run_coordination_table.c.run_id)).first() is None
-
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id=RUN_ID,
-        caller_owner="direct-harness-sweeper",
-    )
-
-    assert recovered == 1
+    before = (_work_item_states(engine), _event_counts(engine))
+    with pytest.raises(RunLeadershipLostError):
+        repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
+    assert (_work_item_states(engine), _event_counts(engine)) == before
     state = _work_item_states(engine)["token-0"]
-    assert state["status"] == TokenWorkStatus.READY.value
-    assert state["attempt"] == 2
-    assert state["lease_owner"] is None
-    assert state["work_item_id"] != original.work_item_id
-    assert _event_counts(engine)[SchedulerEventType.RECOVER_EXPIRED_LEASE.value] == 1
+    assert state["status"] == TokenWorkStatus.LEASED.value
+    assert state["attempt"] == 1
+    assert state["lease_owner"] == "worker-dead"
+    assert state["work_item_id"] == original.work_item_id
 
 
 def test_heartbeat_membership_fence_observes_eviction_committed_immediately_before_begin(
@@ -344,9 +394,9 @@ def test_heartbeat_membership_fence_observes_eviction_committed_immediately_befo
     The test hook runs before the heartbeat connection executes its
     ``BEGIN IMMEDIATE``. The peer can therefore commit the active-to-evicted
     transition first; the heartbeat then takes the writer lock and must refuse
-    without extending the lease or appending scheduler/coordination events.
+    without extending the lease or appending scheduler events. The separate
+    membership refusal event records why the operation was rejected.
     """
-    from elspeth.contracts.errors import RunWorkerEvictedError
 
     heartbeat_engine, eviction_engine = engines
     repo = TokenSchedulerRepository(heartbeat_engine)
@@ -363,7 +413,9 @@ def test_heartbeat_membership_fence_observes_eviction_committed_immediately_befo
             )
         )
     item = _enqueue_tokens(repo, ("token-0",))["token-0"]
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=300)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-a"), lease_owner="worker-a", lease_seconds=300
+    )
     assert claimed is not None
     before_item = _work_item_states(heartbeat_engine)["token-0"]
     before_events = _event_counts(heartbeat_engine)
@@ -388,13 +440,12 @@ def test_heartbeat_membership_fence_observes_eviction_committed_immediately_befo
         evicted.append(True)
 
     try:
-        with pytest.raises(RunWorkerEvictedError):
+        with pytest.raises(RunMembershipLostError):
             repo.heartbeat_lease(
-                run_id=RUN_ID,
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-a"),
                 work_item_id=item.work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=300,
-                membership_fenced=True,
             )
     finally:
         event.remove(heartbeat_engine, "before_cursor_execute", evict_before_heartbeat_begin)
@@ -404,14 +455,14 @@ def test_heartbeat_membership_fence_observes_eviction_committed_immediately_befo
     assert _event_counts(heartbeat_engine) == before_events
     with heartbeat_engine.connect() as conn:
         assert conn.execute(select(run_workers_table.c.status).where(run_workers_table.c.worker_id == "worker-a")).scalar_one() == "evicted"
-        assert (
-            tuple(
-                conn.execute(
-                    select(run_coordination_events_table.c.event_id).where(run_coordination_events_table.c.run_id == RUN_ID)
-                ).scalars()
-            )
-            == before_coordination_events
+        coordination_events = (
+            conn.execute(select(run_coordination_events_table).where(run_coordination_events_table.c.run_id == RUN_ID)).mappings().all()
         )
+        assert len(coordination_events) == len(before_coordination_events) + 1
+        assert tuple(row["event_id"] for row in coordination_events[:-1]) == before_coordination_events
+        refusal = coordination_events[-1]
+        assert (refusal["event_type"], refusal["worker_id"], refusal["leader_epoch"]) == ("fence_refusal", "worker-a", None)
+        assert refusal["context_json"] == '{"fence":"membership","verb":"heartbeat_lease"}'
 
 
 def test_ts03_and_aux01_claim_and_heartbeat_have_exact_durable_images(
@@ -424,7 +475,9 @@ def test_ts03_and_aux01_claim_and_heartbeat_have_exact_durable_images(
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
 
     before_claim = landscape_database_now(engine)
-    claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-a"), lease_owner="worker-a", lease_seconds=30
+    )
     after_claim = landscape_database_now(engine)
 
     assert claimed is not None
@@ -461,11 +514,10 @@ def test_ts03_and_aux01_claim_and_heartbeat_have_exact_durable_images(
     events_before_heartbeat = _scheduler_events(engine, "token-0")
     before_heartbeat = landscape_database_now(engine)
     expires_at = repo.heartbeat_lease(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-a"),
         work_item_id=original.work_item_id,
         lease_owner="worker-a",
         lease_seconds=60,
-        membership_fenced=True,
     )
     after_heartbeat = landscape_database_now(engine)
 
@@ -488,10 +540,14 @@ def test_ts04_and_ts06_sink_redrive_claim_and_recovery_preserve_complete_bundle(
 ) -> None:
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="redriver")
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=original.work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -504,7 +560,10 @@ def test_ts04_and_ts06_sink_redrive_claim_and_recovery_preserve_complete_bundle(
     pending_row = _work_item_row(engine, "token-0")
     expected_bundle = {name: pending_row[name] for name in _SINK_BUNDLE_COLUMNS}
 
-    claimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redriver", lease_seconds=30)
+    claimed = repo.claim_pending_sink(
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redriver", leader_epoch=1), lease_owner="redriver", lease_seconds=30
+    )
+    _handoff_to_recovery_leader(engine)
 
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
@@ -522,7 +581,7 @@ def test_ts04_and_ts06_sink_redrive_claim_and_recovery_preserve_complete_bundle(
     assert (claim_events[0]["from_attempt"], claim_events[0]["to_attempt"]) == (original.attempt, original.attempt)
 
     expire_lease(engine, original.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper")
+    recovered = repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
 
     assert recovered == 1
     recovered_row = _work_item_row(engine, "token-0")
@@ -564,7 +623,7 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
 ) -> None:
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="redriver")
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
     join_group_id = "join-coalesced-1"
     with engine.begin() as conn:
@@ -575,8 +634,12 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
             .values(join_group_id=join_group_id)
         )
 
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=original.work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -591,10 +654,11 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
     assert expected_bundle["join_group_id"] == join_group_id
 
     claimed = repo.claim_pending_sink(
-        run_id=RUN_ID,
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redriver", leader_epoch=1),
         lease_owner="redriver",
         lease_seconds=30,
     )
+    _handoff_to_recovery_leader(engine)
 
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
@@ -609,7 +673,7 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
 
     def sweep_at_exact_expiry(database_now: datetime) -> int:
         assert expire_lease(engine, original.work_item_id, seconds_ago=0) == database_now
-        return repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper")
+        return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
 
     assert on_fresh_database_second(engine, sweep_at_exact_expiry) == 0
     equality_row = _work_item_row(engine, "token-0")
@@ -620,9 +684,9 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
 
     expire_lease(engine, original.work_item_id, seconds_ago=1)
     assert (
-        repo.recover_expired_leases_legacy_unfenced(
-            run_id=RUN_ID,
-            caller_owner="sweeper",
+        repo.recover_expired_leases(
+            coordination_token=_RECOVERY_TOKEN,
+            stall_budget_seconds=0,
         )
         == 1
     )
@@ -640,21 +704,17 @@ def test_ts05_and_aux07_strict_transform_recovery_rotates_identity_under_exact_e
 ) -> None:
     engine, _ = engines
     scheduler = TokenSchedulerRepository(engine)
-    coordination = RunCoordinationRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="leader")
     original = _enqueue_tokens(scheduler, ("token-0",))["token-0"]
-    claimed = scheduler.claim_ready(run_id=RUN_ID, lease_owner="dead-owner", lease_seconds=30)
+    claimed = scheduler.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="dead-owner"), lease_owner="dead-owner", lease_seconds=30
+    )
     assert claimed is not None
     expire_lease(engine, claimed.work_item_id)
-    token = register_run_leader(
-        coordination,
-        run_id=RUN_ID,
-        worker_id="leader",
-        window_seconds=80,
-    )
+    token = CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1)
 
     database_before = landscape_database_now(engine)
-    recovered = scheduler.recover_expired_leases(coordination_token=token)
+    recovered = scheduler.recover_expired_leases(coordination_token=token, stall_budget_seconds=0)
     database_after = landscape_database_now(engine)
 
     assert recovered == 1
@@ -687,13 +747,18 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
 ) -> None:
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-transform", "token-sink"))
+    _seed_run_rows_tokens(engine, ("token-transform", "token-sink"), leader_worker_id="sink-owner")
     originals = _enqueue_tokens(repo, ("token-transform", "token-sink"))
-    transform_claim = repo.claim_ready(run_id=RUN_ID, lease_owner="transform-owner", lease_seconds=60)
-    sink_producer_claim = repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30)
+    transform_claim = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="transform-owner"), lease_owner="transform-owner", lease_seconds=60
+    )
+    sink_producer_claim = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30
+    )
     assert transform_claim is not None and transform_claim.token_id == "token-transform"
     assert sink_producer_claim is not None and sink_producer_claim.token_id == "token-sink"
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=originals["token-sink"].work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -704,10 +769,11 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
         expected_lease_owner="producer",
     )
     sink_claim = repo.claim_pending_sink(
-        run_id=RUN_ID,
+        coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="sink-owner", leader_epoch=1),
         lease_owner="sink-owner",
         lease_seconds=30,
     )
+    _handoff_to_recovery_leader(engine)
     assert sink_claim is not None
     before_events = {token_id: _scheduler_events(engine, token_id) for token_id in ("token-transform", "token-sink")}
 
@@ -718,7 +784,7 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
         assert expire_lease(engine, transform_claim.work_item_id, seconds_ago=0) == database_now
         assert expire_lease(engine, sink_claim.work_item_id, seconds_ago=0) == database_now
         rows_before = {token_id: _work_item_row(engine, token_id) for token_id in ("token-transform", "token-sink")}
-        return repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper"), rows_before
+        return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0), rows_before
 
     recovered, rows_before = on_fresh_database_second(engine, sweep_at_exact_expiry)
 
@@ -732,12 +798,13 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
 ) -> None:
     engine, _ = engines
     scheduler = TokenSchedulerRepository(engine)
-    coordination = RunCoordinationRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
-    token = register_run_leader(coordination, run_id=RUN_ID, worker_id="leader", window_seconds=80)
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="leader")
+    token = CoordinationToken(run_id=RUN_ID, worker_id="leader", leader_epoch=1)
     _insert_worker(engine, worker_id="live-owner")
     original = _enqueue_tokens(scheduler, ("token-0",))["token-0"]
-    claimed = scheduler.claim_ready(run_id=RUN_ID, lease_owner="live-owner", lease_seconds=30)
+    claimed = scheduler.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="live-owner"), lease_owner="live-owner", lease_seconds=30
+    )
     assert claimed is not None
     before_scheduler_events = _scheduler_events(engine, "token-0")
 
@@ -800,19 +867,23 @@ def test_aux02_heartbeat_loss_adds_only_lease_lost_evidence_after_recovery(
     repo = TokenSchedulerRepository(engine)
     _seed_run_rows_tokens(engine, ("token-0",))
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="old-owner", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="old-owner"), lease_owner="old-owner", lease_seconds=30
+        )
+        is not None
+    )
     expire_lease(engine, original.work_item_id)
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper") == 1
+    assert repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 1
     row_before = _work_item_row(engine, "token-0")
     events_before = _scheduler_events(engine, "token-0")
 
     with pytest.raises(SchedulerLeaseLostError):
         repo.heartbeat_lease(
-            run_id=RUN_ID,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="old-owner"),
             work_item_id=original.work_item_id,
             lease_owner="old-owner",
             lease_seconds=30,
-            membership_fenced=False,
         )
 
     assert _work_item_row(engine, "token-0") == row_before
@@ -836,9 +907,16 @@ def test_aux06_inactive_registered_workers_cannot_claim_either_lease_subtype(
     repo = TokenSchedulerRepository(engine)
     _seed_run_rows_tokens(engine, ("token-producer", "token-sink", "token-ready"))
     originals = _enqueue_tokens(repo, ("token-producer", "token-sink", "token-ready"))
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=originals["token-sink"].work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -849,6 +927,7 @@ def test_aux06_inactive_registered_workers_cannot_claim_either_lease_subtype(
         expected_lease_owner="producer",
     )
     repo.mark_terminal(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=originals["token-producer"].work_item_id,
         expected_lease_owner="producer",
     )
@@ -857,10 +936,14 @@ def test_aux06_inactive_registered_workers_cannot_claim_either_lease_subtype(
     before_sink = _work_item_row(engine, "token-sink")
     before_events = (_scheduler_events(engine, "token-ready"), _scheduler_events(engine, "token-sink"))
 
-    with pytest.raises(RunWorkerEvictedError):
-        repo.claim_ready(run_id=RUN_ID, lease_owner="inactive", lease_seconds=30)
-    with pytest.raises(RunWorkerEvictedError):
-        repo.claim_pending_sink(run_id=RUN_ID, lease_owner="inactive", lease_seconds=30)
+    with pytest.raises(RunMembershipLostError):
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="inactive"), lease_owner="inactive", lease_seconds=30)
+    with pytest.raises(RunLeadershipLostError):
+        repo.claim_pending_sink(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="inactive", leader_epoch=1),
+            lease_owner="inactive",
+            lease_seconds=30,
+        )
 
     assert _work_item_row(engine, "token-ready") == before_ready
     assert _work_item_row(engine, "token-sink") == before_sink
@@ -873,10 +956,14 @@ def test_ts06_recovery_refuses_malformed_sink_redrive_bundle_without_mutation(
 ) -> None:
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="redriver")
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=original.work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -886,7 +973,15 @@ def test_ts06_recovery_refuses_malformed_sink_redrive_bundle_without_mutation(
         error_message=None,
         expected_lease_owner="producer",
     )
-    assert repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redriver", lease_seconds=30) is not None
+    assert (
+        repo.claim_pending_sink(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redriver", leader_epoch=1),
+            lease_owner="redriver",
+            lease_seconds=30,
+        )
+        is not None
+    )
+    _handoff_to_recovery_leader(engine)
     expire_lease(engine, original.work_item_id)
     with engine.begin() as conn:
         conn.execute(
@@ -897,7 +992,7 @@ def test_ts06_recovery_refuses_malformed_sink_redrive_bundle_without_mutation(
     before = (_work_item_row(engine, "token-0"), _scheduler_events(engine, "token-0"))
 
     with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-        repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper")
+        repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
 
     assert (_work_item_row(engine, "token-0"), _scheduler_events(engine, "token-0")) == before
 
@@ -907,10 +1002,14 @@ def test_ts06_recovery_cas_rechecks_bundle_and_rolls_back_same_transaction_corru
 ) -> None:
     engine, _ = engines
     repo = TokenSchedulerRepository(engine)
-    _seed_run_rows_tokens(engine, ("token-0",))
+    _seed_run_rows_tokens(engine, ("token-0",), leader_worker_id="redriver")
     original = _enqueue_tokens(repo, ("token-0",))["token-0"]
-    assert repo.claim_ready(run_id=RUN_ID, lease_owner="producer", lease_seconds=30) is not None
+    assert (
+        repo.claim_ready(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"), lease_owner="producer", lease_seconds=30)
+        is not None
+    )
     repo.mark_pending_sink(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="producer"),
         work_item_id=original.work_item_id,
         row_payload_json=_row_payload_json(),
         sink_name="sink-a",
@@ -920,7 +1019,15 @@ def test_ts06_recovery_cas_rechecks_bundle_and_rolls_back_same_transaction_corru
         error_message=None,
         expected_lease_owner="producer",
     )
-    assert repo.claim_pending_sink(run_id=RUN_ID, lease_owner="redriver", lease_seconds=30) is not None
+    assert (
+        repo.claim_pending_sink(
+            coordination_token=CoordinationToken(run_id=RUN_ID, worker_id="redriver", leader_epoch=1),
+            lease_owner="redriver",
+            lease_seconds=30,
+        )
+        is not None
+    )
+    _handoff_to_recovery_leader(engine)
     expire_lease(engine, original.work_item_id)
     before = (_work_item_row(engine, "token-0"), _scheduler_events(engine, "token-0"))
     injected: list[bool] = []
@@ -937,7 +1044,7 @@ def test_ts06_recovery_cas_rechecks_bundle_and_rolls_back_same_transaction_corru
 
     try:
         with pytest.raises(AuditIntegrityError, match="complete durable sink bundle"):
-            repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="sweeper")
+            repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
     finally:
         event.remove(engine, "before_cursor_execute", corrupt_bundle_between_select_and_update)
 
@@ -949,7 +1056,7 @@ def test_claim_ready_probing_mid_sweep_is_lock_excluded_until_recovery_commits(
     engines: tuple[Tier1Engine, Tier1Engine],
 ) -> None:
     """Item (c), interleaving 1 — write-intent discipline: a concurrent
-    claimant that probes AFTER the sweep's per-row UPDATE has executed but
+    claimant that probes AFTER the sweep's batch UPDATE has executed but
     BEFORE the sweep transaction commits cannot even BEGIN its own write
     transaction. The sweep holds the WAL write lock from its ``BEGIN
     IMMEDIATE``, so the claimant's ``BEGIN IMMEDIATE`` polls busy_timeout and
@@ -975,16 +1082,20 @@ def test_claim_ready_probing_mid_sweep_is_lock_excluded_until_recovery_commits(
     def claimant_probes_mid_sweep(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
         if mid_sweep_outcomes or not _is_token_work_items_update(statement):
             return
-        # The sweep's per-row UPDATE has EXECUTED (the row is READY/attempt-2
+        # The sweep's batch UPDATE has EXECUTED (the row is READY/attempt-2
         # in the sweep's uncommitted transaction) but nothing is committed: a
         # worker on a separate engine probes for claimable work right now.
         try:
-            mid_sweep_outcomes.append(claim_repo.claim_ready(run_id=RUN_ID, lease_owner="claimant", lease_seconds=300))
+            mid_sweep_outcomes.append(
+                claim_repo.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="claimant"), lease_owner="claimant", lease_seconds=300
+                )
+            )
         except OperationalError as exc:
             mid_sweep_outcomes.append(exc)
 
     try:
-        recovered = sweep_repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper")
+        recovered = sweep_repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
     finally:
         event.remove(sweep_engine, "after_cursor_execute", claimant_probes_mid_sweep)
 
@@ -996,7 +1107,9 @@ def test_claim_ready_probing_mid_sweep_is_lock_excluded_until_recovery_commits(
     assert recovered == 1
 
     # After commit, the recovered item is claimable at the bumped attempt.
-    claimed = claim_repo.claim_ready(run_id=RUN_ID, lease_owner="claimant", lease_seconds=300)
+    claimed = claim_repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="claimant"), lease_owner="claimant", lease_seconds=300
+    )
     assert claimed is not None
     assert claimed.token_id == "token-0"
     assert claimed.attempt == 2, "Attempt bumped exactly once by the sweep"
@@ -1018,7 +1131,7 @@ def test_claim_ready_probing_mid_sweep_is_lock_excluded_until_recovery_commits(
 def test_peer_recovery_in_select_update_window_is_lock_excluded_and_loses_cleanly_after_commit(
     engines: tuple[Tier1Engine, Tier1Engine],
 ) -> None:
-    """Item (c), interleaving 2 — write-intent discipline: a peer sweeper
+    """Item (c), interleaving 2 — write-intent discipline: a second connection using the same leader token
     that tries to recover the same item inside the caller sweep's
     SELECT→UPDATE window is excluded at its own ``BEGIN IMMEDIATE`` (the
     caller holds the write lock from BEGIN), so the window in which a peer
@@ -1046,13 +1159,13 @@ def test_peer_recovery_in_select_update_window_is_lock_excluded_and_loses_cleanl
         if peer_outcomes or not _is_token_work_items_update(statement):
             return
         # Peer sweep attempts a competing recovery on a separate engine while
-        # the caller's sweep is between its SELECT and its per-row UPDATE.
+        # the caller's sweep is between its SELECT and its batch UPDATE.
         with pytest.raises(OperationalError, match="database is locked") as excinfo:
-            peer_repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="peer-sweeper")
+            peer_repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
         peer_outcomes.append(excinfo.value)
 
     try:
-        winner_recovered = sweep_repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper")
+        winner_recovered = sweep_repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
     finally:
         event.remove(sweep_engine, "before_cursor_execute", peer_recovers_mid_sweep)
 
@@ -1061,8 +1174,10 @@ def test_peer_recovery_in_select_update_window_is_lock_excluded_and_loses_cleanl
 
     # Serialized loser path after the commit: nothing left to recover (clean
     # 0, no event), and the rotated attempt is claimable by the peer.
-    assert peer_repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="peer-sweeper") == 0
-    peer_claim = peer_repo.claim_ready(run_id=RUN_ID, lease_owner="peer-claimant", lease_seconds=300)
+    assert peer_repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 0
+    peer_claim = peer_repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="peer-claimant"), lease_owner="peer-claimant", lease_seconds=300
+    )
     assert peer_claim is not None and peer_claim.attempt == 2
 
     states = _work_item_states(sweep_engine)
@@ -1101,11 +1216,15 @@ def test_peer_claim_in_select_update_window_is_lock_excluded_single_owner(
         if peer_outcomes or not _is_token_work_items_update(statement):
             return
         with pytest.raises(OperationalError, match="database is locked") as excinfo:
-            peer_repo.claim_ready(run_id=RUN_ID, lease_owner="peer-worker", lease_seconds=300)
+            peer_repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="peer-worker"), lease_owner="peer-worker", lease_seconds=300
+            )
         peer_outcomes.append(excinfo.value)
 
     try:
-        winner_claim = claim_repo.claim_ready(run_id=RUN_ID, lease_owner="first-worker", lease_seconds=300)
+        winner_claim = claim_repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="first-worker"), lease_owner="first-worker", lease_seconds=300
+        )
     finally:
         event.remove(claim_engine, "before_cursor_execute", peer_claims_mid_claim)
 
@@ -1114,7 +1233,12 @@ def test_peer_claim_in_select_update_window_is_lock_excluded_single_owner(
 
     # Serialized loser path: the peer's retry sees the committed lease and
     # returns None cleanly — never an AuditIntegrityError, never a steal.
-    assert peer_repo.claim_ready(run_id=RUN_ID, lease_owner="peer-worker", lease_seconds=300) is None
+    assert (
+        peer_repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="peer-worker"), lease_owner="peer-worker", lease_seconds=300
+        )
+        is None
+    )
 
     states = _work_item_states(claim_engine)
     assert len(states) == 1
@@ -1127,13 +1251,15 @@ def test_peer_claim_in_select_update_window_is_lock_excluded_single_owner(
     assert counts[SchedulerEventType.CLAIM_READY.value] == 1, "Only the winning claim recorded an event"
 
 
-@pytest.mark.parametrize("crash_before_update_number", [2, 3])
+@pytest.mark.parametrize(
+    "crash_after_statement", ["UPDATE TOKEN_WORK_ITEMS", "INSERT INTO SCHEDULER_EVENTS", "INSERT INTO RUN_COORDINATION_EVENTS"]
+)
 def test_crash_mid_sweep_rolls_back_atomically_and_repeat_sweep_completes(
     engines: tuple[Tier1Engine, Tier1Engine],
-    crash_before_update_number: int,
+    crash_after_statement: str,
 ) -> None:
     """Item (d): a crash partway through one ``recover_expired_leases`` sweep
-    over 3 expired items (after 1 or 2 per-row UPDATEs executed, before
+    over 3 expired items (after the item, scheduler-event, or coordination-event batch executed, before
     commit) rolls back the WHOLE single transaction. The durable journal shows
     every item in exactly one coherent state — here, with full rollback, ALL
     items untouched (LEASED, original owner/attempt/work_item_id) and ZERO
@@ -1148,22 +1274,25 @@ def test_crash_mid_sweep_rolls_back_atomically_and_repeat_sweep_completes(
     originals = _enqueue_tokens(repo, token_ids)
     _expire_leases(engine, repo, token_ids)
 
-    update_count = [0]
+    with engine.connect() as conn:
+        before_coordination_events = tuple(conn.execute(select(run_coordination_events_table)).all())
+    injected = []
 
-    @event.listens_for(engine, "before_cursor_execute")
+    @event.listens_for(engine, "after_cursor_execute")
     def crash_mid_sweep(conn, cursor, statement, parameters, context, executemany) -> None:  # type: ignore[no-untyped-def]
-        if not _is_token_work_items_update(statement):
+        if not statement.lstrip().upper().startswith(crash_after_statement):
             return
-        update_count[0] += 1
-        if update_count[0] == crash_before_update_number:
-            raise RuntimeError("simulated crash mid-recovery-sweep")
+        injected.append(True)
+        raise RuntimeError("simulated crash mid-recovery-sweep")
 
     try:
         with pytest.raises(RuntimeError, match="simulated crash mid-recovery-sweep"):
-            repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper")
+            repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
     finally:
-        event.remove(engine, "before_cursor_execute", crash_mid_sweep)
-    assert update_count[0] == crash_before_update_number, "Crash fired at the intended per-row UPDATE"
+        event.remove(engine, "after_cursor_execute", crash_mid_sweep)
+    assert injected == [True], "Crash fired after the intended batch statement"
+    with engine.connect() as conn:
+        assert tuple(conn.execute(select(run_coordination_events_table)).all()) == before_coordination_events
 
     # Atomic-or-idempotent, durable check. Each item must be in exactly one
     # coherent state: UNTOUCHED (rollback) or FULLY RECOVERED (committed) —
@@ -1193,14 +1322,14 @@ def test_crash_mid_sweep_rolls_back_atomically_and_repeat_sweep_completes(
 
     # The sweep is ONE transaction, so the rollback is total: the UPDATEs that
     # executed before the crash (and their recovery events) are undone.
-    assert untouched == list(token_ids), "Single-transaction sweep must roll back ALL per-row updates on crash"
+    assert untouched == list(token_ids), "Single-transaction sweep must roll back ALL batched item updates on crash"
     assert fully_recovered == []
     assert _event_counts(engine).get(SchedulerEventType.RECOVER_EXPIRED_LEASE.value, 0) == 0, (
         "No recovery event may survive for an unrecovered item"
     )
 
     # A repeated sweep completes recovery for every item.
-    assert repo.recover_expired_leases_legacy_unfenced(run_id=RUN_ID, caller_owner="resume-sweeper") == 3
+    assert repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0) == 3
     final_states = _work_item_states(engine)
     for token_id in token_ids:
         assert final_states[token_id]["status"] == TokenWorkStatus.READY.value

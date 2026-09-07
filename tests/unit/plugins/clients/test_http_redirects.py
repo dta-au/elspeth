@@ -17,9 +17,12 @@ import pytest
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import HTTPCallResponse
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients import http as http_client_module
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
+from tests.fixtures.mock_audit import mock_audit_authority
 
 
 @dataclass(frozen=True)
@@ -99,12 +102,12 @@ class FakeCallRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     next_call_index: int = 0
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         assert state_id == "test-state-001"
         self.next_call_index += 1
         return self.next_call_index
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         raise AssertionError(f"Unexpected operation call index allocation for {operation_id}")
 
     def record_call(self, **kwargs: Any) -> SimpleNamespace:
@@ -132,6 +135,7 @@ def http_client(monkeypatch):
     monkeypatch.setattr(http_client_module.httpx, "Client", client_factory)
 
     client = AuditedHTTPClient(
+        **mock_audit_authority(),
         execution=FakeCallRecorder(),
         state_id="test-state-001",
         run_id="test-run-001",

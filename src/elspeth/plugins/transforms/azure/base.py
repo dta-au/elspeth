@@ -276,6 +276,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             requested_state_id: str,
             *,
             token_id: str | None = None,
+            ctx: TransformContext,
         ) -> Any:
             del requested_state_id, token_id
             return client
@@ -286,6 +287,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 probe_rows[0],
                 state_id,
                 token_id=token_id,
+                ctx=ctx,
             )
         finally:
             if had_client_override:
@@ -313,7 +315,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         token_id = ctx.token.token_id if ctx.token is not None else None
 
         try:
-            return self._process_single_with_state(row, state_id, token_id=token_id)
+            return self._process_single_with_state(row, state_id, token_id=token_id, ctx=ctx)
         finally:
             # Clean up cached HTTP client for this state_id
             with self._http_clients_lock:
@@ -327,6 +329,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult:
         """Process a single row with explicit state_id.
 
@@ -377,6 +380,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 token_id=token_id,
                 retry_started_at=capacity_retry_started_at,
                 retry_deadline=capacity_retry_deadline,
+                ctx=ctx,
             )
             if violation is not None:
                 return violation
@@ -393,10 +397,11 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Run one Azure field analysis attempt and classify non-capacity failures."""
         try:
-            return self._analyze_field(value, field_name, state_id, token_id=token_id)
+            return self._analyze_field(value, field_name, state_id, token_id=token_id, ctx=ctx)
         except httpx.HTTPStatusError as e:
             status_code = e.response.status_code
             if is_capacity_error(status_code):
@@ -434,6 +439,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
         retry_started_at: float | None = None,
         retry_deadline: float | None = None,
     ) -> TransformResult | None:
@@ -447,7 +453,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 return self._capacity_retry_shutdown_result(started_at)
 
             try:
-                return self._analyze_field_once(value, field_name, state_id, token_id=token_id)
+                return self._analyze_field_once(value, field_name, state_id, token_id=token_id, ctx=ctx)
             except CapacityError as e:
                 if self._capacity_retry_shutdown.is_set():
                     return self._capacity_retry_shutdown_result(started_at)
@@ -503,6 +509,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None = None,
+        ctx: TransformContext,
     ) -> TransformResult | None:
         """Analyze a single field value. Subclasses must implement.
 
@@ -526,7 +533,7 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
             raise MalformedResponseError(f"Invalid JSON in {label}: {parse_error}")
         return data
 
-    def _get_http_client(self, state_id: str, *, token_id: str | None = None) -> Any:
+    def _get_http_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None = None) -> Any:
         """Get or create audited HTTP client for a state_id.
 
         Clients are cached to preserve call_index across retries.
@@ -542,6 +549,8 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
                 if self._recorder is None:
                     raise RuntimeError(f"{self.name}: recorder not initialized — call on_start() before processing")
                 self._http_clients[state_id] = AuditedHTTPClient(
+                    member_token=ctx.require_member_token(),
+                    work_item=ctx.require_work_item(),
                     execution=self._recorder,
                     state_id=state_id,
                     run_id=self._run_id,

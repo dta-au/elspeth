@@ -19,13 +19,17 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import (
+    CallStatus,
+    CallType,
     Determinism,
     ExportStatus,
+    NodeStateStatus,
     NodeType,
     ReproducibilityGrade,
     RunStatus,
     SecretResolutionInput,
 )
+from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.declaration_contracts import (
     DeclarationContract,
@@ -1223,6 +1227,63 @@ class TestCompleteRunCrashPath:
         assert run.status == RunStatus.COMPLETED
         assert run.reproducibility_grade == ReproducibilityGrade.FULL_REPRODUCIBLE
 
+    def test_completion_counts_both_llm_parent_types_and_excludes_other_calls_and_runs(self) -> None:
+        db, repo = _make_repo(run_id="counted-run")
+        factory = make_factory(db)
+        repo.begin_run(config={}, canonical_version="v1", run_id="foreign-run")
+        for run_id in ("counted-run", "foreign-run"):
+            authority = leader_token_for(db, run_id)
+            source_id = register_test_node(factory.data_flow, run_id, f"source-{run_id}", node_type=NodeType.SOURCE)
+            transform_id = register_test_node(factory.data_flow, run_id, f"transform-{run_id}")
+            row, token = factory.data_flow.create_row_with_token(
+                source_id, 0, {"value": 1}, source_row_index=0, ingest_sequence=0, coordination_token=authority
+            )
+            item = factory.scheduler.enqueue_ready_claimed(
+                member_token=authority.membership,
+                token_id=token.token_id,
+                row_id=row.row_id,
+                node_id=transform_id,
+                step_index=1,
+                ingest_sequence=0,
+                row_payload_json='{"value":1}',
+                lease_owner=authority.worker_id,
+                lease_seconds=300,
+            )
+            state = factory.execution.begin_node_state(token.token_id, transform_id, 1, {"value": 1}, member_token=authority.membership)
+            state_calls = [(CallType.LLM, CallStatus.SUCCESS)]
+            if run_id == "counted-run":
+                state_calls.extend([(CallType.LLM, CallStatus.ERROR), (CallType.HTTP, CallStatus.SUCCESS)])
+            for index, (call_type, call_status) in enumerate(state_calls):
+                factory.execution.record_call(
+                    state.state_id,
+                    index,
+                    call_type,
+                    call_status,
+                    RawCallPayload({"index": index}),
+                    member_token=authority.membership,
+                    work_item=item,
+                )
+            factory.execution.complete_node_state(
+                state.state_id, NodeStateStatus.COMPLETED, output_data={"value": 1}, duration_ms=1, member_token=authority.membership
+            )
+            factory.scheduler.mark_terminal(
+                member_token=authority.membership, work_item_id=item.work_item_id, expected_lease_owner=authority.worker_id
+            )
+            operation = factory.execution.begin_operation(source_id, "source_load", coordination_token=authority)
+            operation_calls = [CallType.LLM, CallType.FILESYSTEM] if run_id == "counted-run" else [CallType.LLM]
+            for call_type in operation_calls:
+                factory.execution.record_operation_call(
+                    operation.operation_id, call_type, CallStatus.SUCCESS, RawCallPayload({}), coordination_token=authority
+                )
+            factory.execution.complete_operation(operation.operation_id, "completed", duration_ms=1, coordination_token=authority)
+
+        assert repo.get_run("counted-run").llm_call_count is None
+        completed = repo.complete_run(RunStatus.COMPLETED, coordination_token=leader_token_for(db, "counted-run"))
+        assert completed.llm_call_count == 3
+        assert repo.get_run("foreign-run").llm_call_count is None
+        with db.read_only_connection() as conn:
+            assert conn.execute(select(runs_table.c.llm_call_count).where(runs_table.c.run_id == "counted-run")).scalar_one() == 3
+
     def test_double_completion_rejected(self) -> None:
         """Already-terminal run cannot be completed again.
 
@@ -1272,6 +1333,25 @@ class TestCompleteRunCrashPath:
 
 class TestUpdateRunStatus:
     """Direct tests for update_run_status transition guards."""
+
+    @pytest.mark.parametrize("terminal_status", [RunStatus.FAILED, RunStatus.INTERRUPTED])
+    def test_resuming_running_clears_the_previous_reproducibility_grade(self, terminal_status: RunStatus) -> None:
+        db, repo = _make_repo()
+        authority = leader_token_for(db, "run-1")
+        completed = repo.complete_run(
+            terminal_status,
+            coordination_token=authority,
+            reproducibility_grade=ReproducibilityGrade.FULL_REPRODUCIBLE,
+        )
+        assert completed.reproducibility_grade is ReproducibilityGrade.FULL_REPRODUCIBLE
+        assert completed.completed_at is not None
+        repo.update_run_status(RunStatus.RUNNING, coordination_token=authority)
+        resumed = repo.get_run("run-1")
+        assert resumed.status is RunStatus.RUNNING
+        assert resumed.reproducibility_grade is None
+        assert resumed.completed_at is None
+        with db.read_only_connection() as conn:
+            assert conn.execute(select(runs_table.c.reproducibility_grade).where(runs_table.c.run_id == "run-1")).scalar_one() is None
 
     def test_running_to_running_accepted(self) -> None:
         """Non-terminal to non-terminal transition is valid."""
@@ -1407,7 +1487,7 @@ class TestFinalizeRunEdgeCases:
         # Register a nondeterministic node via the factory (need DataFlowRepository)
         factory = make_factory(db)
         factory.data_flow.register_node(
-            run_id="nd-run",
+            coordination_token=leader_token_for(db, "nd-run"),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -1499,16 +1579,16 @@ class TestPreflightAuditWriteErrors:
             repo.record_preflight_results(preflight, coordination_token=_ghost_token())
 
     def test_record_readiness_check_missing_run_is_refused_by_the_fence(self) -> None:
-        """A run with no seat is refused before the readiness INSERT runs."""
+        """A worker with no registration is refused before the readiness INSERT."""
         _, repo = _make_repo()
-        with pytest.raises(RunLeadershipLostError):
+        with pytest.raises(AuditIntegrityError, match="unregistered worker"):
             repo.record_readiness_check(
                 name="probe",
                 collection="docs",
                 reachable=True,
                 count=1,
                 message="ok",
-                coordination_token=_ghost_token(),
+                member_token=_ghost_token().membership,
             )
 
     def test_record_readiness_check_normalizes_a_rejected_write(self) -> None:
@@ -1527,7 +1607,7 @@ class TestPreflightAuditWriteErrors:
                 reachable=True,
                 count=1,
                 message="ok",
-                coordination_token=leader_token_for(db, "run-1"),
+                member_token=leader_token_for(db, "run-1").membership,
             )
 
 
@@ -1719,17 +1799,16 @@ class TestCompleteRunDiagnosisOrder:
         factory = make_factory(db)
         source_node = register_test_node(factory.data_flow, "run-diag-residual", "src-1", node_type=NodeType.SOURCE)
         transform_node = register_test_node(factory.data_flow, "run-diag-residual", "t-1")
-        row = factory.data_flow.create_row(
-            run_id="run-diag-residual",
+        row, journal_token = factory.data_flow.create_row_with_token(
+            coordination_token=token,
             source_node_id=source_node,
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        journal_token = factory.data_flow.create_token(row_id=row.row_id)
         TokenSchedulerRepository(db.engine).enqueue_ready(
-            run_id="run-diag-residual",
+            member_token=token.membership,
             token_id=journal_token.token_id,
             row_id=row.row_id,
             node_id=transform_node,

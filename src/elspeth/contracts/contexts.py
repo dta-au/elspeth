@@ -28,11 +28,12 @@ if TYPE_CHECKING:
     from elspeth.contracts import Call, CallStatus, CallType
     from elspeth.contracts.audit_protocols import PluginAuditWriter
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.node_state_context import AggregationBatchContext
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import ValidationErrorToken
+    from elspeth.contracts.scheduler import TokenWorkItem
     from elspeth.contracts.schema_contract import SchemaContract
 
 
@@ -82,6 +83,8 @@ class SourceContext(Protocol):
       record_call() for external API calls (e.g., Azure Blob download)
     - Telemetry: telemetry_emit for operational visibility
     """
+
+    def require_coordination_token(self) -> CoordinationToken: ...
 
     @property
     def run_id(self) -> str: ...
@@ -133,6 +136,10 @@ class TransformContext(Protocol):
     - Recording: record_call() for external API calls (LLM, HTTP)
     - Checkpoint: get/set/clear_checkpoint for crash recovery (batch transforms)
     """
+
+    def require_member_token(self) -> WorkerMembershipToken: ...
+
+    def require_work_item(self) -> TokenWorkItem: ...
 
     @property
     def run_id(self) -> str: ...
@@ -232,6 +239,10 @@ class LifecycleContext(Protocol):
 
     @property
     def coordination_token(self) -> CoordinationToken | None: ...
+
+    def require_coordination_token(self) -> CoordinationToken: ...
+
+    def require_member_token(self) -> WorkerMembershipToken: ...
 
     def record_readiness_check(
         self,

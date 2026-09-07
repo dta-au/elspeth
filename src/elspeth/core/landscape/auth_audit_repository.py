@@ -5,12 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Literal, get_args
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.core.ids import generate_id
-from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._database_ops import DatabaseOps, _safe_database_error_message
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.schema import auth_events_table
 
 AuthAuditEventType = Literal[
@@ -90,8 +94,18 @@ def _bounded_principal(value: str | None) -> str | None:
 class AuthAuditRepository:
     """Record non-run-scoped web authentication events in Landscape."""
 
-    def __init__(self, ops: DatabaseOps) -> None:
-        self._ops = ops
+    def __init__(self, db: LandscapeDB) -> None:
+        self._db = db
+
+    def _insert_auth_events(self, values: list[dict[str, object]], *, context: str) -> None:
+        """Own the transaction for the closed, non-run auth_events table."""
+        try:
+            with self._db.write_connection() as conn:
+                DatabaseOps.execute_insert_on(conn, auth_events_table.insert().values(values), context=context)
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(
+                _safe_database_error_message(operation="record_auth_events", action="write", exc=exc, context=context)
+            ) from exc
 
     @staticmethod
     def _auth_event_values(
@@ -168,8 +182,8 @@ class AuthAuditRepository:
             metadata=metadata,
             identity_id=identity_id,
         )
-        self._ops.execute_insert(
-            auth_events_table.insert().values(**values),
+        self._insert_auth_events(
+            [values],
             context=f"record_auth_event event_type={event_type} outcome={outcome}",
         )
         return event_id
@@ -214,8 +228,8 @@ class AuthAuditRepository:
             user_agent=user_agent,
             metadata=token_metadata,
         )
-        self._ops.execute_insert(
-            auth_events_table.insert().values([login_values, token_values]),
+        self._insert_auth_events(
+            [login_values, token_values],
             context="record_login_success_and_token_issued",
         )
         return login_event_id, token_event_id

@@ -441,7 +441,7 @@ class RecorderFactory:
 
         # Composed repository for run lifecycle
         self._run_lifecycle = RunLifecycleRepository(db, ops, run_loader)
-        self._auth_audit = AuthAuditRepository(ops)
+        self._auth_audit = AuthAuditRepository(db)
 
         # Composed repository for execution recording
         self._execution = ExecutionRepository(

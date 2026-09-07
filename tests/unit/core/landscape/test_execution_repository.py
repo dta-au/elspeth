@@ -875,7 +875,7 @@ class TestRecordRoutingEventsRowcount:
 
         monkeypatch.setattr(run_coordination_repository, "begin_write", mock_connection)
 
-        with pytest.raises(AuditIntegrityError, match="zero rows affected"):
+        with pytest.raises(AuditIntegrityError, match="affected 0 of 1 rows"):
             repo.record_routing_events(
                 state.state_id, routes, member_token=_leader_token(repo).membership, work_item=_work_item_for_state(repo, state.state_id)
             )

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import structlog
 
 from elspeth.contracts.audit_protocols import CallRecorder
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.plugins.transforms.aws.guardrails_client import (
@@ -65,6 +67,8 @@ def run_guardrail_live_check(
     run_id: str,
     telemetry_emit: TelemetryEmitCallback,
     sdk_client: BedrockRuntimeClient | None = None,
+    member_token: WorkerMembershipToken,
+    work_item: TokenWorkItem,
 ) -> GuardrailLiveReceipt:
     """Run operator-approved safe/blocked cases and return no raw live data."""
     if profile.plugin not in _PLUGIN_POLICIES or len(profile.alias) > 64:
@@ -75,6 +79,8 @@ def run_guardrail_live_check(
     client: BedrockGuardrailsClient | None = None
     try:
         client = BedrockGuardrailsClient(
+            member_token=member_token,
+            work_item=work_item,
             execution=execution,
             state_id=state_id,
             run_id=run_id,

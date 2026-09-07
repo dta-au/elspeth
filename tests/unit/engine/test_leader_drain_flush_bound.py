@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.core.dag.bound_regions import derive_escalation_fixpoint_bound
 from elspeth.engine.orchestrator import leader_drain
@@ -64,7 +65,8 @@ class _NonConvergingCoalesceExecutor:
     a bare non-None sentinel is not enough, `flush_coalesce_pending` calls
     `flush_pending()` on it every iteration."""
 
-    def flush_pending(self) -> list[Any]:
+    def flush_pending(self, *, coordination_token: CoordinationToken) -> list[Any]:
+        assert coordination_token.run_id == "test-run"
         return []
 
 

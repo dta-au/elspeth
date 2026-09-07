@@ -119,6 +119,28 @@ def _bound_heartbeat_statement_waits(conn: Connection) -> None:
         conn.exec_driver_sql("SET LOCAL statement_timeout = '5000ms'")
 
 
+@contextmanager
+def fenced_heartbeat_transaction(engine: Tier1Engine, *, member_token: WorkerMembershipToken, verb: str) -> Iterator[Connection]:
+    """Lock the seat before checking membership, then admit heartbeat writes.
+
+    Heartbeats update both liveness records. Their lock order must match
+    takeover and finalization; ordinary member writes need only their own
+    membership fence. The caller records a refusal after this transaction
+    rolls back, preserving the heartbeat's declared loss outcome.
+    """
+    if not isinstance(member_token, WorkerMembershipToken):
+        raise TypeError("worker heartbeat requires a WorkerMembershipToken")
+    with begin_write(engine) as conn:
+        _bound_heartbeat_statement_waits(conn)
+        locked_seat = conn.execute(
+            select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == member_token.run_id).with_for_update()
+        ).one_or_none()
+        verify_membership_fence(conn, member_token=member_token, verb=verb)
+        if locked_seat is None:
+            raise AuditIntegrityError(f"Run {member_token.run_id!r} has registered membership but no coordination seat")
+        yield conn
+
+
 # Run statuses the takeover CAS flips back to 'running' (§B.4). The
 # dead-leader RUNNING takeover arm also clears prior finalization metadata;
 # terminal-success statuses are refused by the
@@ -1117,8 +1139,7 @@ class RunCoordinationRepository:
     def record_heartbeat_degraded(
         self,
         *,
-        run_id: str,
-        worker_id: str,
+        member_token: WorkerMembershipToken,
         failures: int,
         now: datetime,
     ) -> None:
@@ -1126,13 +1147,18 @@ class RunCoordinationRepository:
 
         Consumed by the slice-4 heartbeat thread after ``k`` consecutive busy
         failures, so a later eviction is diagnosable post-hoc as "could not
-        reach the DB" rather than "process died". Never raises.
+        reach the DB" rather than "process died". Database faults are best-effort;
+        invalid carrier types are programmer errors. This forensic event retains
+        its originating identity even after membership is lost, so it deliberately
+        does not require a live membership fence (ADR-048).
         """
+        if not isinstance(member_token, WorkerMembershipToken):
+            raise TypeError("heartbeat degradation requires a WorkerMembershipToken")
         _record_best_effort_event(
             self._engine,
-            run_id=run_id,
+            run_id=member_token.run_id,
             event_type="heartbeat_degraded",
-            worker_id=worker_id,
+            worker_id=member_token.worker_id,
             leader_epoch=None,
             recorded_at=now,
             context={"consecutive_busy_failures": failures},
@@ -1164,17 +1190,7 @@ class RunCoordinationRepository:
         if not isinstance(member_token, WorkerMembershipToken):
             raise TypeError("worker heartbeat requires a WorkerMembershipToken")
         try:
-            with begin_write(self._engine) as conn:
-                _bound_heartbeat_statement_waits(conn)
-                # Even followers take this lock: membership can be changed by
-                # leader-fenced finalization. SELECT FOR UPDATE is inert on
-                # SQLite, whose BEGIN IMMEDIATE already serializes writers.
-                locked_seat = conn.execute(
-                    select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == member_token.run_id).with_for_update()
-                ).one_or_none()
-                verify_membership_fence(conn, member_token=member_token, verb="worker_heartbeat")
-                if locked_seat is None:
-                    raise AuditIntegrityError(f"Run {member_token.run_id!r} has registered membership but no coordination seat")
+            with fenced_heartbeat_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
                 database_now = read_landscape_transaction_time(conn)
                 role = conn.execute(
                     select(run_workers_table.c.role).where(

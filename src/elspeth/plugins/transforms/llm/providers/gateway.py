@@ -50,6 +50,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.chat_parts import ChatMessage, audit_messages, wire_messages
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import ValueSource
@@ -636,7 +637,9 @@ class GatewayLLMProvider:
                     error=cleanup_error,
                     suppressed=primary_error is not None,
                     logger=logger,
-                    **audit_parent.client_kwargs(),
+                    state_id=audit_parent.state_id,
+                    token_id=audit_parent.token_id,
+                    operation_id=audit_parent.operation_id,
                 )
                 if primary_error is None:
                     raise cleanup_error
@@ -750,25 +753,26 @@ class GatewayLLMProvider:
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,
         )
 
-    def runtime_preflight(self, *, operation_id: str, model: str) -> None:
+    def runtime_preflight(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Validate gateway readiness, THEN run one bounded real completion.
 
         A readyz document alone is never accepted as proof of health (an
         explicit design requirement) — readiness only gates whether the
         second half (an actual authenticated completion) runs at all.
         """
-        self._check_readyz(operation_id=operation_id, model=model)
-        self._smoke_test_completion(operation_id=operation_id, model=model)
+        self._check_readyz(operation_id=operation_id, model=model, coordination_token=coordination_token)
+        self._smoke_test_completion(operation_id=operation_id, model=model, coordination_token=coordination_token)
 
     def _readyz_base_url(self) -> str:
         """The gateway root (``/readyz`` lives one level above ``/v1``)."""
         return self._base_url.removesuffix(GATEWAY_VERSIONED_BASE)
 
-    def _check_readyz(self, *, operation_id: str, model: str) -> None:
+    def _check_readyz(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         http_client = AuditedHTTPClient(
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,
+            coordination_token=coordination_token,
             run_id=self._run_id,
             telemetry_emit=self._telemetry_emit,
             timeout=self._timeout,
@@ -798,9 +802,10 @@ class GatewayLLMProvider:
         finally:
             http_client.close()
 
-    def _smoke_test_completion(self, *, operation_id: str, model: str) -> None:
+    def _smoke_test_completion(self, *, operation_id: str, model: str, coordination_token: CoordinationToken) -> None:
         """Run a minimal audited gateway completion under an operation parent."""
         http_client = AuditedHTTPClient(
+            coordination_token=coordination_token,
             execution=self._recorder,
             state_id=None,
             operation_id=operation_id,

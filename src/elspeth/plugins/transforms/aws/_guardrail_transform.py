@@ -203,6 +203,8 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
             raise FrameworkBugError("Bedrock Guardrail transform requires a state_id")
         token_id = ctx.token.token_id if ctx.token is not None else None
         client = BedrockGuardrailsClient(
+            member_token=ctx.require_member_token(),
+            work_item=ctx.require_work_item(),
             execution=self._recorder,
             state_id=ctx.state_id,
             run_id=self._run_id,

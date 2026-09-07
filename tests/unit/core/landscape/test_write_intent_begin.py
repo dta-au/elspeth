@@ -44,6 +44,7 @@ from elspeth.core.landscape.database import (
     begin_write,
     verify_sqlite_tier1_pragmas,
 )
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     SQLITE_SCHEMA_EPOCH,
@@ -52,6 +53,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from tests.helpers.run_coordination import register_run_leader
 
 BASE = datetime(2026, 6, 11, 12, 0, 0, tzinfo=UTC)
 RUN_ID = "run-write-intent"
@@ -234,11 +236,12 @@ class TestBeginMode:
                 conn.execute(insert(tokens_table).values(token_id="token-0", row_id="row-0", run_id=RUN_ID, created_at=BASE))
 
             repo = TokenSchedulerRepository(db.engine)
+            authority = register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_ID, worker_id="worker-1", window_seconds=80)
             payload = TokenSchedulerRepository.serialize_row_payload(
                 PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
             )
             repo.enqueue_ready(
-                run_id=RUN_ID,
+                member_token=authority.membership,
                 token_id="token-0",
                 row_id="row-0",
                 node_id="normalize",
@@ -248,18 +251,17 @@ class TestBeginMode:
             )
 
             trace = _attach_trace(db.engine)
-            claimed = repo.claim_ready(run_id=RUN_ID, lease_owner="worker-1", lease_seconds=30)
+            claimed = repo.claim_ready(member_token=authority.membership, lease_owner="worker-1", lease_seconds=30)
             assert claimed is not None
             assert "BEGIN IMMEDIATE" in _begin_statements(trace)
 
             # heartbeat_lease (manual conn.begin() shape) carries intent too.
             trace2 = _attach_trace(db.engine)
             repo.heartbeat_lease(
-                run_id=RUN_ID,
+                member_token=authority.membership,
                 work_item_id=claimed.work_item_id,
                 lease_owner="worker-1",
                 lease_seconds=30,
-                membership_fenced=False,
             )
             assert "BEGIN IMMEDIATE" in _begin_statements(trace2)
         finally:

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError, RetrievalNotReadyError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -95,6 +96,12 @@ class _TransformContextFake:
     def record_call(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
+    def require_member_token(self) -> WorkerMembershipToken:
+        return _LEADER_TOKEN.membership
+
+    def require_work_item(self) -> TokenWorkItem:
+        return _WORK_ITEM
+
 
 @dataclass
 class _TelemetrySinkFake:
@@ -105,6 +112,7 @@ class _TelemetrySinkFake:
 
 
 _LEADER_TOKEN = CoordinationToken(run_id="run-1", worker_id="worker:run-1:test", leader_epoch=1)
+_WORK_ITEM = Mock(spec=TokenWorkItem)
 
 
 @dataclass
@@ -119,11 +127,11 @@ class _LandscapeRecorderFake:
         reachable: bool,
         count: int | None,
         message: str,
-        coordination_token: CoordinationToken,
+        member_token: WorkerMembershipToken,
     ) -> None:
         self.readiness_checks.append(
             {
-                "run_id": coordination_token.run_id,
+                "run_id": member_token.run_id,
                 "name": name,
                 "collection": collection,
                 "reachable": reachable,
@@ -140,6 +148,7 @@ class _LifecycleContextFake:
     # Carried BY VALUE from the executor (ADR-048 §3); the fake models the
     # real PluginContext forwarder, so the transform never sees the token.
     coordination_token: CoordinationToken | None = field(default_factory=lambda: _LEADER_TOKEN)
+    member_token: WorkerMembershipToken | None = field(default_factory=lambda: _LEADER_TOKEN.membership)
     telemetry_emit: _TelemetrySinkFake = field(default_factory=_TelemetrySinkFake)
     rate_limit_registry: None = None
     node_id: str | None = None
@@ -149,15 +158,15 @@ class _LifecycleContextFake:
     shutdown_event: None = None
 
     def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
-        if self.landscape is None or self.coordination_token is None:
-            raise FrameworkBugError("record_readiness_check() called without landscape or leader token")
+        if self.landscape is None or self.member_token is None:
+            raise FrameworkBugError("record_readiness_check() called without landscape or member token")
         self.landscape.record_readiness_check(
             name=name,
             collection=collection,
             reachable=reachable,
             count=count,
             message=message,
-            coordination_token=self.coordination_token,
+            member_token=self.member_token,
         )
 
 
@@ -195,6 +204,8 @@ class _RetrievalProviderFake:
         *,
         state_id: str,
         token_id: str | None,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RetrievalChunk]:
         self.search_calls.append(
             {
@@ -792,6 +803,45 @@ class TestRAGTransformReadinessGuard:
             count=42,
             message="Collection 'my-index' has 42 documents",
         )
+
+    def test_follower_start_records_readiness_without_a_leader_token(self) -> None:
+        provider = self._make_mock_provider(count=42, collection="my-index")
+        ctx = _mock_lifecycle_ctx()
+        ctx.coordination_token = None
+        ctx.member_token = WorkerMembershipToken(run_id=ctx.run_id, worker_id="follower-2")
+        transform = _make_transform()
+
+        with patch.dict(
+            "elspeth.plugins.transforms.rag.transform.PROVIDERS",
+            {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+        ):
+            transform.on_start(ctx)
+
+        _assert_readiness_check(
+            ctx,
+            run_id="run-1",
+            name="rag_retrieval",
+            collection="my-index",
+            reachable=True,
+            count=42,
+            message="Collection 'my-index' has 42 documents",
+        )
+
+    def test_audit_enabled_start_without_membership_fails_closed(self) -> None:
+        provider = self._make_mock_provider()
+        ctx = _mock_lifecycle_ctx()
+        ctx.coordination_token = None
+        ctx.member_token = None
+        transform = _make_transform()
+
+        with (
+            patch.dict(
+                "elspeth.plugins.transforms.rag.transform.PROVIDERS",
+                {"azure_search": (AzureSearchProviderConfig, _ProviderFactoryFake(provider=provider))},
+            ),
+            pytest.raises(FrameworkBugError, match="member token"),
+        ):
+            transform.on_start(ctx)
 
     def test_empty_collection_raises(self) -> None:
         """on_start() raises RetrievalNotReadyError for empty collection."""

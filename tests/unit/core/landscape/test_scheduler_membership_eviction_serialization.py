@@ -33,6 +33,7 @@ from sqlalchemy.engine import Engine
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
@@ -150,7 +151,7 @@ def _enqueue_ready_item(engine: Tier1Engine, *, token_id: str = "tok-1") -> str:
         PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
         token_id=token_id,
         row_id=row_id,
         node_id="transform-1",
@@ -183,7 +184,11 @@ def _first_index(statements: list[str], *, startswith: str, contains: str) -> in
 
 
 def _assert_membership_lock_before_cas(statements: list[str], *, verb: str) -> None:
-    membership_read = _first_index(statements, startswith="SELECT", contains="FROM RUN_WORKERS")
+    membership_read = (
+        _first_index(statements, startswith="SELECT", contains="FROM RUN_WORKERS")
+        if verb == "claim_pending_sink"
+        else _first_index(statements, startswith="UPDATE RUN_WORKERS", contains="RUN_WORKERS")
+    )
     cas_update = _first_index(statements, startswith="UPDATE TOKEN_WORK_ITEMS", contains="TOKEN_WORK_ITEMS")
     assert membership_read < cas_update, (
         f"{verb} must lock the caller's run_workers membership row BEFORE its "
@@ -202,7 +207,9 @@ class TestMembershipFenceLockOrder:
         repo = TokenSchedulerRepository(engine)
 
         with _recorded_statements(engine) as statements:
-            item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
+            item = repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID), lease_owner=WORKER_ID, lease_seconds=300
+            )
         assert item is not None
         _assert_membership_lock_before_cas(statements, verb="claim_ready")
 
@@ -211,17 +218,18 @@ class TestMembershipFenceLockOrder:
         _seed(engine, worker_heartbeat_offset=timedelta(seconds=WINDOW))
         _enqueue_ready_item(engine)
         repo = TokenSchedulerRepository(engine)
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
+        item = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID), lease_owner=WORKER_ID, lease_seconds=300
+        )
         assert item is not None
 
         before = landscape_database_now(engine)
         with _recorded_statements(engine) as statements:
             renewed = repo.heartbeat_lease(
-                run_id=RUN_ID,
+                member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
                 work_item_id=item.work_item_id,
                 lease_owner=WORKER_ID,
                 lease_seconds=300,
-                membership_fenced=True,
             )
         assert_stamped_between(renewed, start=before, end=landscape_database_now(engine), offset=timedelta(seconds=300))
         _assert_membership_lock_before_cas(statements, verb="heartbeat_lease")
@@ -231,7 +239,9 @@ class TestMembershipFenceLockOrder:
         _seed(engine, worker_heartbeat_offset=timedelta(seconds=WINDOW))
         _enqueue_ready_item(engine)
         repo = TokenSchedulerRepository(engine)
-        item = repo.claim_ready(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
+        item = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID), lease_owner=WORKER_ID, lease_seconds=300
+        )
         assert item is not None
         # Promote the leased row to a complete durable PENDING_SINK bundle
         # (same promotion shape as the elspeth-28aaa36a62 ABA regression).
@@ -250,7 +260,11 @@ class TestMembershipFenceLockOrder:
             )
 
         with _recorded_statements(engine) as statements:
-            claimed = repo.claim_pending_sink(run_id=RUN_ID, lease_owner=WORKER_ID, lease_seconds=300)
+            claimed = repo.claim_pending_sink(
+                coordination_token=CoordinationToken(run_id=RUN_ID, worker_id=LEADER_ID, leader_epoch=1),
+                lease_owner=LEADER_ID,
+                lease_seconds=300,
+            )
         assert claimed is not None
         _assert_membership_lock_before_cas(statements, verb="claim_pending_sink")
 

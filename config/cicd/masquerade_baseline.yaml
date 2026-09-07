@@ -731,6 +731,69 @@ entries:
     sentinel default IS the root test, not a presence probe on an owned contract.
     No fallback behaviour: every walker terminates or raises when the link is missing.'
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _AuthorityProof._inspect_callback_suppliers
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 6190fee899d8fc48893bbd76e6960b9eb0b42e76b3af6673a8ea43b563415a19
+  - 6190fee899d8fc48893bbd76e6960b9eb0b42e76b3af6673a8ea43b563415a19
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _AuthorityProof._unpacked_callback_authority
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - d507781dd8a6cd425498f4ac2ec6fff67b4e4eb512fa4baf5b6fef0328f1e6d1
+  - d5e1c09d4b3afef3975e60209244e7441c7c40ef009edeb7839b876bba3b013a
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _AuthorityProof.assignment_origin
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - d5e1c09d4b3afef3975e60209244e7441c7c40ef009edeb7839b876bba3b013a
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _AuthorityProof.expression
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 052d5fbacfe0e59b1a1aeaea79e7970857239c1a908d054834bc703b88a090ac
+  - e5edf2247d65b9818da4d0b625e4438a932c7474a64faa29fbd60d859f02c78f
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _AuthorityProof.receiver
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 9572e06437e205c2b607d27099babe8b272a33c5e78bb338a19b90bfaf1e5390
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _Resolver.__init__
   kind: getattr
   occurrences: 1
@@ -809,6 +872,54 @@ entries:
     sentinel default IS the root test, not a presence probe on an owned contract.
     No fallback behaviour: every walker terminates or raises when the link is missing.'
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _admission_block
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7dc2e783fb5cf74eea9c2ee0a68f0191243850895071143c0b1dbebcbbcb71b8
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _admission_statement
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7f085537118f73bd5873efbee9048c257ad1bf42285a237b78d0d0849863a391
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _admission_unique_binding
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - d507781dd8a6cd425498f4ac2ec6fff67b4e4eb512fa4baf5b6fef0328f1e6d1
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _admitted_non_run_raw_write
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 568018cd0b16f967f512908f36a079585934e5b17637cfebb82f948577c4d8f7
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _ancestors
   kind: getattr
   occurrences: 2
@@ -834,6 +945,44 @@ entries:
     ELSPETH-owned types and the link is absent by design at the tree root, so the
     sentinel default IS the root test, not a presence probe on an owned contract.
     No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _authority_binding_origin
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 0820f84f7fb04c000d9e7c39c41b6ea73005526166771a6abb8eb10c6504db05
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  - d507781dd8a6cd425498f4ac2ec6fff67b4e4eb512fa4baf5b6fef0328f1e6d1
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _authority_return_body_is_visible
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 52edb5d44de1c8604aa10389bdfaeb72cd375bb946668a04cd67ed3c0e489380
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _callback_statement_dominates
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _has_repeating_ancestor
   kind: getattr
@@ -931,6 +1080,56 @@ entries:
     ELSPETH-owned types and the link is absent by design at the tree root, so the
     sentinel default IS the root test, not a presence probe on an owned contract.
     No fallback behaviour: every walker terminates or raises when the link is missing.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _receiver_binding_dominates
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _receiver_call_parameters
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 52edb5d44de1c8604aa10389bdfaeb72cd375bb946668a04cd67ed3c0e489380
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _receiver_callable_scopes
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 26c44958e8abd136af1f75a4cc797d3099bf1edca8e84a907ae0267cb350f921
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
+- path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
+  qualname: _receiver_method_is_unmodified
+  kind: getattr
+  occurrences: 3
+  probe_shapes:
+  - 2d0c992bb04df868afbbd06724e340a6b9adadf4430ce665dcd82a2810fbed79
+  - 6190fee899d8fc48893bbd76e6960b9eb0b42e76b3af6673a8ea43b563415a19
+  - 6190fee899d8fc48893bbd76e6960b9eb0b42e76b3af6673a8ea43b563415a19
+  classification: approved-introspection
+  justification: 'Reviewed ADR-048 source-provenance scanner introspection of stdlib
+    ast nodes: these probes read the scanner-attached _landscape_parent link to establish
+    lexical scope, dominating bindings, callback suppliers, or unchanged callable
+    receivers. The missing-link sentinel denotes the AST root and terminates or refuses
+    the proof; it does not supply fallback authority or probe an ELSPETH runtime contract.'
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _resolver_for_node
   kind: getattr

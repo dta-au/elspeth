@@ -29,6 +29,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
 )
 from elspeth.testing import make_field, make_pipeline_row, make_row
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 # Stable test IP used for all DNS resolution mocks
 _TEST_IP = "104.18.27.120"
@@ -120,6 +121,7 @@ def mock_ctx():
     # Create context
     ctx = PluginContext(
         run_id="test-run-456",
+        **mock_item_audit_authority("test-run-456"),
         config={},
         landscape=landscape,
         payload_store=payload_store,

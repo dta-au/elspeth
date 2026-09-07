@@ -17,7 +17,6 @@ the flat delegators.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.engine import Connection
@@ -38,10 +37,11 @@ from elspeth.contracts import (
     ValidationErrorRecord,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.engine import CoalesceParentCompletion, CommittedCollect
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.data_flow import (
@@ -65,6 +65,7 @@ from elspeth.core.landscape.model_loaders import (
     ValidationErrorLoader,
 )
 from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import ContractViolation
@@ -117,17 +118,14 @@ class DataFlowRepository:
             outcomes=self.outcomes,
             node_states=node_state_repository,
         )
-        self.graph = GraphAuditRepository(ops, node_loader=node_loader, edge_loader=edge_loader)
+        self.graph = GraphAuditRepository(db, ops, node_loader=node_loader, edge_loader=edge_loader)
         self.errors = ErrorAuditRepository(
+            db,
             ops,
             validation_error_loader=validation_error_loader,
             transform_error_loader=transform_error_loader,
             ownership=self.ownership,
         )
-
-    def write_connection(self) -> AbstractContextManager[Connection]:
-        """Open a caller-owned audit write transaction for composed repository verbs."""
-        return self._db.write_connection()
 
     # ── Tier-3 audit serialization (module functions in data_flow.serialization) ──
 
@@ -198,33 +196,8 @@ class DataFlowRepository:
     def _row_insert_values(row: Row) -> dict[str, object]:
         return RowTokenRepository._row_insert_values(row)
 
-    def create_row(
-        self,
-        run_id: str,
-        source_node_id: str,
-        row_index: int,
-        data: Mapping[str, object],
-        *,
-        source_row_index: int | None = None,
-        ingest_sequence: int | None = None,
-        row_id: str | None = None,
-        quarantined: bool = False,
-    ) -> Row:
-        """Create a source row record."""
-        return self.tokens.create_row(
-            run_id,
-            source_node_id,
-            row_index,
-            data,
-            source_row_index=source_row_index,
-            ingest_sequence=ingest_sequence,
-            row_id=row_id,
-            quarantined=quarantined,
-        )
-
     def create_row_with_token(
         self,
-        run_id: str,
         source_node_id: str,
         row_index: int,
         data: Mapping[str, object],
@@ -234,11 +207,10 @@ class DataFlowRepository:
         row_id: str | None = None,
         token_id: str | None = None,
         quarantined: bool = False,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> tuple[Row, Token]:
         """Create a source row and its initial token in one audit transaction."""
         return self.tokens.create_row_with_token(
-            run_id,
             source_node_id,
             row_index,
             data,
@@ -252,7 +224,6 @@ class DataFlowRepository:
 
     def create_quarantine_row_with_token(
         self,
-        run_id: str,
         source_node_id: str,
         row_index: int,
         data: Mapping[str, object],
@@ -260,13 +231,18 @@ class DataFlowRepository:
         source_row_index: int,
         ingest_sequence: int,
         validation_error_id: str | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
     ) -> tuple[Row, Token]:
         """Create a quarantine row/token and optional error link atomically."""
-        with self.tokens.create_row_with_token_transaction(coordination_token) as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="create_row_with_token",
+        ) as conn:
             row, token = self.tokens.insert_row_with_token_on(
                 conn,
-                run_id=run_id,
+                coordination_token=coordination_token,
                 source_node_id=source_node_id,
                 row_index=row_index,
                 data=data,
@@ -277,7 +253,7 @@ class DataFlowRepository:
             if validation_error_id is not None:
                 self.errors.link_validation_error_to_row_on(
                     conn,
-                    run_id=run_id,
+                    run_id=coordination_token.run_id,
                     error_id=validation_error_id,
                     row_id=row.row_id,
                 )
@@ -287,7 +263,7 @@ class DataFlowRepository:
         self,
         conn: Connection,
         *,
-        run_id: str,
+        coordination_token: CoordinationToken,
         source_node_id: str,
         row_index: int,
         data: Mapping[str, object],
@@ -300,7 +276,7 @@ class DataFlowRepository:
         """Connection-accepting rows+tokens insert: composes into the caller's transaction."""
         return self.tokens.insert_row_with_token_on(
             conn,
-            run_id=run_id,
+            coordination_token=coordination_token,
             source_node_id=source_node_id,
             row_index=row_index,
             data=data,
@@ -315,6 +291,7 @@ class DataFlowRepository:
         self,
         row_id: str,
         *,
+        coordination_token: CoordinationToken,
         token_id: str | None = None,
         lineage_path: tuple[LineageFrame, ...] = (),
         join_group_id: str | None = None,
@@ -322,6 +299,7 @@ class DataFlowRepository:
         """Create a token (row instance in DAG path)."""
         return self.tokens.create_token(
             row_id,
+            coordination_token=coordination_token,
             token_id=token_id,
             lineage_path=lineage_path,
             join_group_id=join_group_id,
@@ -333,12 +311,20 @@ class DataFlowRepository:
         row_id: str,
         branches: list[str],
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         step_in_pipeline: int | None = None,
         parent_lineage_path: tuple[LineageFrame, ...] | None = None,
     ) -> tuple[list[Token], str]:
         """Fork a token to multiple branches."""
         return self.tokens.fork_token(
-            parent_ref, row_id, branches, step_in_pipeline=step_in_pipeline, parent_lineage_path=parent_lineage_path
+            parent_ref,
+            row_id,
+            branches,
+            member_token=member_token,
+            work_item=work_item,
+            step_in_pipeline=step_in_pipeline,
+            parent_lineage_path=parent_lineage_path,
         )
 
     def load_lineage_paths(self, run_id: str, token_ids: Sequence[str]) -> dict[str, tuple[LineageFrame, ...]]:
@@ -351,6 +337,7 @@ class DataFlowRepository:
         row_id: str,
         merged_payload: Mapping[str, object],
         *,
+        coordination_token: CoordinationToken,
         coalesce_node_id: str | None = None,
         parent_state_ids: Sequence[str] | None = None,
         merged_contract: SchemaContract,
@@ -362,6 +349,7 @@ class DataFlowRepository:
             parent_refs,
             row_id,
             merged_payload,
+            coordination_token=coordination_token,
             coalesce_node_id=coalesce_node_id,
             parent_state_ids=parent_state_ids,
             merged_contract=merged_contract,
@@ -372,11 +360,12 @@ class DataFlowRepository:
     def finalize_coalesce_effect(
         self,
         *,
+        coordination_token: CoordinationToken,
         merged: Token,
         parent_completions: Sequence[CoalesceParentCompletion],
     ) -> None:
         """Atomically terminalize the parents of one materialized coalesce."""
-        self.tokens.finalize_coalesce_effect(merged=merged, parent_completions=parent_completions)
+        self.tokens.finalize_coalesce_effect(coordination_token=coordination_token, merged=merged, parent_completions=parent_completions)
 
     def expand_token(
         self,
@@ -384,6 +373,7 @@ class DataFlowRepository:
         row_id: str,
         child_payloads: Sequence[Mapping[str, object]],
         *,
+        member_token: WorkerMembershipToken,
         output_contract: SchemaContract,
         step_in_pipeline: int | None = None,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
@@ -396,6 +386,7 @@ class DataFlowRepository:
             parent_ref,
             row_id,
             child_payloads,
+            member_token=member_token,
             output_contract=output_contract,
             step_in_pipeline=step_in_pipeline,
             parent_path=parent_path,
@@ -411,6 +402,8 @@ class DataFlowRepository:
         collector_node_id: str,
         output_payloads: Sequence[Mapping[str, object]],
         output_contracts: Sequence[SchemaContract],
+        *,
+        coordination_token: CoordinationToken,
         step_in_pipeline: int | None = None,
         member_lineage_paths: Mapping[str, tuple[LineageFrame, ...]] | None = None,
     ) -> CommittedCollect:
@@ -421,13 +414,14 @@ class DataFlowRepository:
             collector_node_id,
             output_payloads,
             output_contracts,
+            coordination_token=coordination_token,
             step_in_pipeline=step_in_pipeline,
             member_lineage_paths=member_lineage_paths,
         )
 
-    def record_empty_expansion(self, parent_ref: TokenRef) -> str:
+    def record_empty_expansion(self, parent_ref: TokenRef, *, member_token: WorkerMembershipToken) -> str:
         """Mint the durable member_count=0 group record for a zero-row expansion."""
-        return self.tokens.record_empty_expansion(parent_ref)
+        return self.tokens.record_empty_expansion(parent_ref, member_token=member_token)
 
     def is_release_group(self, *, run_id: str, group_id: str) -> bool:
         """META-38: whether ``group_id`` is a collector RELEASE group (durable fact)."""
@@ -491,26 +485,56 @@ class DataFlowRepository:
         outcome: TerminalOutcome | None,
         path: TerminalPath,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         sink_name: str | None = None,
         sink_node_id: str | None = None,
         artifact_id: str | None = None,
         batch_id: str | None = None,
         error_hash: str | None = None,
         context: Mapping[str, object] | None = None,
-        conn: Connection | None = None,
     ) -> str:
         """Record a token's (outcome, path) audit terminal in the audit trail."""
         return self.outcomes.record_token_outcome(
             ref,
             outcome,
             path,
+            member_token=member_token,
+            work_item=work_item,
             sink_name=sink_name,
             sink_node_id=sink_node_id,
             artifact_id=artifact_id,
             batch_id=batch_id,
             error_hash=error_hash,
             context=context,
-            conn=conn,
+        )
+
+    def record_token_outcome_leader(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        coordination_token: CoordinationToken,
+        sink_name: str | None = None,
+        sink_node_id: str | None = None,
+        artifact_id: str | None = None,
+        batch_id: str | None = None,
+        error_hash: str | None = None,
+        context: Mapping[str, object] | None = None,
+    ) -> str:
+        """Record a leader-owned finalization outcome under the epoch fence."""
+        return self.outcomes.record_token_outcome_leader(
+            ref,
+            outcome,
+            path,
+            coordination_token=coordination_token,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+            batch_id=batch_id,
+            error_hash=error_hash,
+            context=context,
         )
 
     def find_orphaned_transient_parents(self, run_id: str) -> list[SQLAlchemyRow[Any]]:
@@ -543,12 +567,12 @@ class DataFlowRepository:
 
     def register_node(
         self,
-        run_id: str,
         plugin_name: str,
         node_type: NodeType,
         plugin_version: str,
         config: Mapping[str, object],
         *,
+        coordination_token: CoordinationToken,
         node_id: str | None = None,
         sequence: int | None = None,
         schema_hash: str | None = None,
@@ -560,11 +584,11 @@ class DataFlowRepository:
     ) -> Node:
         """Register a node in the execution graph."""
         return self.graph.register_node(
-            run_id,
             plugin_name,
             node_type,
             plugin_version,
             config,
+            coordination_token=coordination_token,
             node_id=node_id,
             sequence=sequence,
             schema_hash=schema_hash,
@@ -577,16 +601,16 @@ class DataFlowRepository:
 
     def register_edge(
         self,
-        run_id: str,
         from_node_id: str,
         to_node_id: str,
         label: str,
         mode: RoutingMode,
         *,
+        coordination_token: CoordinationToken,
         edge_id: str | None = None,
     ) -> Edge:
         """Register an edge in the execution graph."""
-        return self.graph.register_edge(run_id, from_node_id, to_node_id, label, mode, edge_id=edge_id)
+        return self.graph.register_edge(from_node_id, to_node_id, label, mode, coordination_token=coordination_token, edge_id=edge_id)
 
     def get_node(self, node_id: str, run_id: str) -> Node | None:
         """Get a node by its composite primary key (node_id, run_id)."""
@@ -616,48 +640,39 @@ class DataFlowRepository:
 
     def update_node_output_contract(
         self,
-        run_id: str,
         node_id: str,
         contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
     ) -> None:
         """Update a node's output_contract after first-row inference or schema evolution."""
-        self.graph.update_node_output_contract(run_id, node_id, contract)
+        self.graph.update_node_output_contract(node_id, contract, member_token=member_token)
 
     # ── Error recording (ErrorAuditRepository) ─────────────────────────────
 
     def record_validation_error(
         self,
-        run_id: str,
         node_id: str | None,
         row_data: Any,
         error: str,
         schema_mode: str,
         destination: str,
         *,
+        coordination_token: CoordinationToken,
         row_id: str | None = None,
         contract_violation: ContractViolation | None = None,
     ) -> str:
         """Record a validation error in the audit trail."""
         return self.errors.record_validation_error(
-            run_id,
             node_id,
             row_data,
             error,
             schema_mode,
             destination,
+            coordination_token=coordination_token,
             row_id=row_id,
             contract_violation=contract_violation,
         )
-
-    def link_validation_error_to_row(
-        self,
-        *,
-        run_id: str,
-        error_id: str,
-        row_id: str,
-    ) -> None:
-        """Attach a persisted quarantine row to an existing validation error."""
-        self.errors.link_validation_error_to_row(run_id=run_id, error_id=error_id, row_id=row_id)
 
     def record_transform_error(
         self,
@@ -666,9 +681,14 @@ class DataFlowRepository:
         row_data: Mapping[str, object] | PipelineRow,
         error_details: TransformErrorReason,
         destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> str:
         """Record a transform processing error in the audit trail."""
-        return self.errors.record_transform_error(ref, transform_id, row_data, error_details, destination)
+        return self.errors.record_transform_error(
+            ref, transform_id, row_data, error_details, destination, member_token=member_token, work_item=work_item
+        )
 
     def get_validation_errors_for_row(
         self,

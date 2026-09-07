@@ -294,7 +294,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:24c7e149d5bd98a5"
+    source_file_hash: str | None = "sha256:619e5be8ec8c07ce"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -430,13 +430,15 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         raise NotImplementedError(f"{self.__class__.__name__} uses row-level pipelining. Use accept() instead of process().")
 
-    def _get_http_client(self, state_id: str, *, token_id: str | None = None) -> Any:
+    def _get_http_client(self, state_id: str, *, ctx: TransformContext, token_id: str | None = None) -> Any:
         """Get or create the audited HTTP client for a state_id (cached for call_index continuity)."""
         with self._http_clients_lock:
             if state_id not in self._http_clients:
                 if self._recorder is None:
                     raise RuntimeError(f"{self.name}: recorder not initialized — call on_start() before processing")
                 self._http_clients[state_id] = AuditedHTTPClient(
+                    member_token=ctx.require_member_token(),
+                    work_item=ctx.require_work_item(),
                     execution=self._recorder,
                     state_id=state_id,
                     run_id=self._run_id,
@@ -467,14 +469,16 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
             raise RuntimeError("state_id is required for batch processing.")
         token_id = ctx.token.token_id if ctx.token is not None else None
         try:
-            return self._process_single_with_state(row, state_id, token_id=token_id)
+            return self._process_single_with_state(row, state_id, token_id=token_id, ctx=ctx)
         finally:
             with self._http_clients_lock:
                 client = self._http_clients.pop(state_id, None)
             if client is not None:
                 client.close()
 
-    def _process_single_with_state(self, row: PipelineRow, state_id: str, *, token_id: str | None = None) -> TransformResult:
+    def _process_single_with_state(
+        self, row: PipelineRow, state_id: str, *, ctx: TransformContext, token_id: str | None = None
+    ) -> TransformResult:
         """Submit the document, poll the LRO to completion, and enrich the row.
 
         ``capacity_deadline`` is a single per-row total-budget anchor shared by the
@@ -516,7 +520,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         started_at = time.monotonic()
         capacity_deadline = started_at + float(self._max_capacity_retry_seconds)
 
-        submission = self._submit(body, state_id, token_id=token_id, capacity_deadline=capacity_deadline, started_at=started_at)
+        submission = self._submit(body, state_id, token_id=token_id, capacity_deadline=capacity_deadline, started_at=started_at, ctx=ctx)
         if isinstance(submission, TransformResult):
             return submission
         operation_url, retry_after = submission
@@ -524,6 +528,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         analyze = self._poll(
             operation_url,
             state_id,
+            ctx=ctx,
             token_id=token_id,
             retry_after=retry_after,
             capacity_deadline=capacity_deadline,
@@ -599,10 +604,11 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None,
+        ctx: TransformContext,
         capacity_deadline: float,
         started_at: float,
     ) -> tuple[str, float | None] | TransformResult:
-        client = self._get_http_client(state_id, token_id=token_id)
+        client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
         url = self._analyze_url()
 
         def do_call() -> Any:
@@ -629,11 +635,12 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         state_id: str,
         *,
         token_id: str | None,
+        ctx: TransformContext,
         retry_after: float | None,
         capacity_deadline: float,
         started_at: float,
     ) -> Mapping[str, Any] | TransformResult:
-        client = self._get_http_client(state_id, token_id=token_id)
+        client = self._get_http_client(state_id, token_id=token_id, ctx=ctx)
         poll_deadline = started_at + self._poll_timeout_seconds
         # Floor the interval at poll_interval_seconds so a Tier-3 ``Retry-After: 0`` (or any
         # value below the configured floor) cannot spin a hot poll loop; cap at poll_max.
@@ -813,7 +820,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         with self._http_clients_lock:
             self._http_clients[state_id] = _ProbeClient()
         try:
-            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id)
+            return self._process_single_with_state(probe_rows[0], state_id, token_id=token_id, ctx=ctx)
         finally:
             with self._http_clients_lock:
                 client = self._http_clients.pop(state_id, None)

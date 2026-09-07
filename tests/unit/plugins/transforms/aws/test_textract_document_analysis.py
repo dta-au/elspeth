@@ -6,6 +6,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from tests.fixtures.factories import make_context
 
 from elspeth.contracts import AuditCharacteristic, Determinism
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentity, textract_profiled_binding_fingerprint
@@ -394,6 +395,7 @@ def _run(transform: AWSTextractDocumentAnalysis, row: PipelineRow | None = None)
     return transform._process_single_with_state(
         _row() if row is None else row,
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1267,6 +1269,7 @@ def test_bucket_mode_joins_row_key_under_prefix() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1282,6 +1285,7 @@ def test_bucket_mode_without_prefix_uses_row_key_directly() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1319,6 +1323,7 @@ def test_bucket_mode_rejects_non_relative_row_keys(row_key: str) -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": row_key}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1336,6 +1341,7 @@ def test_bucket_mode_rejects_overlong_joined_key() -> None:
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "k" * 30}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1353,6 +1359,7 @@ def test_bucket_mode_does_not_require_a_bucket_column_and_missing_key_fails() ->
     result = transform._process_single_with_state(
         make_pipeline_row({"unrelated": "value"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 
@@ -1393,6 +1400,7 @@ def test_profiled_bind_projects_call_record_identity_with_relative_key() -> None
     result = transform._process_single_with_state(
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
+        ctx=make_context(run_id="run-1"),
         token_id="token-1",
     )
 

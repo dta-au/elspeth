@@ -21,6 +21,7 @@ from elspeth.contracts import (
     NodeType,
     RoutingMode,
 )
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -29,6 +30,8 @@ from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.model_loaders import EdgeLoader, NodeLoader
+from elspeth.core.landscape.ports import LandscapeConnectionProvider
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
 from elspeth.core.landscape.schema import edges_table, nodes_table
 
 if TYPE_CHECKING:
@@ -46,23 +49,25 @@ class GraphAuditRepository:
 
     def __init__(
         self,
+        db: LandscapeConnectionProvider,
         ops: DatabaseOps,
         *,
         node_loader: NodeLoader,
         edge_loader: EdgeLoader,
     ) -> None:
+        self._db = db
         self._ops = ops
         self._node_loader = node_loader
         self._edge_loader = edge_loader
 
     def register_node(
         self,
-        run_id: str,
         plugin_name: str,
         node_type: NodeType,
         plugin_version: str,
         config: Mapping[str, object],
         *,
+        coordination_token: CoordinationToken,
         node_id: str | None = None,
         sequence: int | None = None,
         schema_hash: str | None = None,
@@ -92,6 +97,7 @@ class GraphAuditRepository:
         Returns:
             Node model
         """
+        run_id = coordination_token.run_id
         node_id = node_id or generate_id()
         audit_safe_config = sanitize_node_config_for_audit(config, plugin_name=plugin_name)
         config_json = canonical_json(audit_safe_config)
@@ -138,38 +144,42 @@ class GraphAuditRepository:
             schema_fields=schema_fields_list,
         )
 
-        self._ops.execute_insert(
-            nodes_table.insert().values(
-                node_id=node.node_id,
-                run_id=node.run_id,
-                plugin_name=node.plugin_name,
-                node_type=node.node_type,
-                plugin_version=node.plugin_version,
-                determinism=node.determinism,
-                config_hash=node.config_hash,
-                config_json=node.config_json,
-                source_file_hash=node.source_file_hash,
-                schema_hash=node.schema_hash,
-                sequence_in_pipeline=node.sequence_in_pipeline,
-                registered_at=node.registered_at,
-                schema_mode=node.schema_mode,
-                schema_fields_json=schema_fields_json,
-                input_contract_json=input_contract_json,
-                output_contract_json=output_contract_json,
-                output_contract_hash=output_contract_hash,
+        with fenced_leader_transaction(
+            self._db.engine, token=coordination_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="register_node"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                nodes_table.insert().values(
+                    node_id=node.node_id,
+                    run_id=coordination_token.run_id,
+                    plugin_name=node.plugin_name,
+                    node_type=node.node_type,
+                    plugin_version=node.plugin_version,
+                    determinism=node.determinism,
+                    config_hash=node.config_hash,
+                    config_json=node.config_json,
+                    source_file_hash=node.source_file_hash,
+                    schema_hash=node.schema_hash,
+                    sequence_in_pipeline=node.sequence_in_pipeline,
+                    registered_at=node.registered_at,
+                    schema_mode=node.schema_mode,
+                    schema_fields_json=schema_fields_json,
+                    input_contract_json=input_contract_json,
+                    output_contract_json=output_contract_json,
+                    output_contract_hash=output_contract_hash,
+                ),
             )
-        )
 
         return node
 
     def register_edge(
         self,
-        run_id: str,
         from_node_id: str,
         to_node_id: str,
         label: str,
         mode: RoutingMode,
         *,
+        coordination_token: CoordinationToken,
         edge_id: str | None = None,
     ) -> Edge:
         """Register an edge in the execution graph.
@@ -185,6 +195,7 @@ class GraphAuditRepository:
         Returns:
             Edge model
         """
+        run_id = coordination_token.run_id
         edge_id = edge_id or generate_id()
         timestamp = now()
 
@@ -198,17 +209,21 @@ class GraphAuditRepository:
             created_at=timestamp,
         )
 
-        self._ops.execute_insert(
-            edges_table.insert().values(
-                edge_id=edge.edge_id,
-                run_id=edge.run_id,
-                from_node_id=edge.from_node_id,
-                to_node_id=edge.to_node_id,
-                label=edge.label,
-                default_mode=edge.default_mode,
-                created_at=edge.created_at,
+        with fenced_leader_transaction(
+            self._db.engine, token=coordination_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="register_edge"
+        ) as conn:
+            self._ops.execute_insert_on(
+                conn,
+                edges_table.insert().values(
+                    edge_id=edge.edge_id,
+                    run_id=coordination_token.run_id,
+                    from_node_id=edge.from_node_id,
+                    to_node_id=edge.to_node_id,
+                    label=edge.label,
+                    default_mode=edge.default_mode,
+                    created_at=edge.created_at,
+                ),
             )
-        )
 
         return edge
 
@@ -380,9 +395,10 @@ class GraphAuditRepository:
 
     def update_node_output_contract(
         self,
-        run_id: str,
         node_id: str,
         contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
     ) -> None:
         """Update a node's output_contract after first-row inference or schema evolution.
 
@@ -406,8 +422,9 @@ class GraphAuditRepository:
             fail before mutation. The final UPDATE also compares the version
             read under the lock so a violated locking assumption fails closed.
         """
+        run_id = member_token.run_id
         candidate_hash = contract.version_hash()
-        with self._ops.write_connection() as conn:
+        with fenced_member_transaction(self._db.engine, member_token=member_token, verb="update_node_output_contract") as conn:
             row = conn.execute(
                 select(nodes_table.c.output_contract_json, nodes_table.c.output_contract_hash)
                 .where((nodes_table.c.run_id == run_id) & (nodes_table.c.node_id == node_id))
@@ -435,13 +452,17 @@ class GraphAuditRepository:
                 merged_contract = current_contract.merge_for_batch(contract)
 
             merged_hash = merged_contract.version_hash()
-            update_stmt = nodes_table.update().where((nodes_table.c.run_id == run_id) & (nodes_table.c.node_id == node_id))
-            if row.output_contract_hash is None:
-                update_stmt = update_stmt.where(nodes_table.c.output_contract_hash.is_(None))
-            else:
-                update_stmt = update_stmt.where(nodes_table.c.output_contract_hash == row.output_contract_hash)
+            previous_hash_matches = (
+                nodes_table.c.output_contract_hash.is_(None)
+                if row.output_contract_hash is None
+                else nodes_table.c.output_contract_hash == row.output_contract_hash
+            )
             result = conn.execute(
-                update_stmt.values(
+                nodes_table.update()
+                .where(nodes_table.c.run_id == member_token.run_id)
+                .where(nodes_table.c.node_id == node_id)
+                .where(previous_hash_matches)
+                .values(
                     output_contract_json=ContractAuditRecord.from_contract(merged_contract).to_json(),
                     output_contract_hash=merged_hash,
                 )

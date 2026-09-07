@@ -24,7 +24,8 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
 
 if TYPE_CHECKING:
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+    from elspeth.contracts.scheduler import TokenWorkItem
     from elspeth.contracts.schema_contract import PipelineRow
 
 
@@ -51,11 +52,11 @@ class PluginAuditWriterAdapter:
 
     # ── ExecutionRepository delegation ───────────────────────────────────
 
-    def allocate_call_index(self, state_id: str) -> int:
-        return self._execution.allocate_call_index(state_id)
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+        return self._execution.allocate_call_index(state_id, member_token=member_token, work_item=work_item)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
-        return self._execution.allocate_operation_call_index(operation_id)
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
+        return self._execution.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
 
     def record_call(
         self,
@@ -68,6 +69,8 @@ class PluginAuditWriterAdapter:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -81,6 +84,8 @@ class PluginAuditWriterAdapter:
             response_data,
             error,
             latency_ms,
+            member_token=member_token,
+            work_item=work_item,
             request_ref=request_ref,
             response_ref=response_ref,
             resolved_prompt_template_hash=resolved_prompt_template_hash,
@@ -96,6 +101,7 @@ class PluginAuditWriterAdapter:
         error: CallPayload | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
@@ -109,6 +115,7 @@ class PluginAuditWriterAdapter:
             response_data,
             error,
             latency_ms,
+            coordination_token=coordination_token,
             call_index=call_index,
             request_ref=request_ref,
             response_ref=response_ref,
@@ -125,6 +132,7 @@ class PluginAuditWriterAdapter:
         mode: RoutingMode,
         reason: RoutingReason | None = None,
         *,
+        member_token: WorkerMembershipToken,
         event_id: str | None = None,
         routing_group_id: str | None = None,
         ordinal: int = 0,
@@ -136,6 +144,7 @@ class PluginAuditWriterAdapter:
             edge_id,
             mode,
             reason,
+            member_token=member_token,
             event_id=event_id,
             routing_group_id=routing_group_id,
             ordinal=ordinal,
@@ -147,30 +156,33 @@ class PluginAuditWriterAdapter:
         state_id: str,
         routes: list[RoutingSpec],
         reason: RoutingReason | None = None,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> list[RoutingEvent]:
         """Atomically record every route in one complete fork decision."""
-        return self._execution.record_routing_events(state_id, routes, reason)
+        return self._execution.record_routing_events(state_id, routes, reason, member_token=member_token, work_item=work_item)
 
     # ── DataFlowRepository delegation ────────────────────────────────────
 
     def record_validation_error(
         self,
-        run_id: str,
         node_id: str | None,
         row_data: Any,
         error: str,
         schema_mode: str,
         destination: str,
         *,
+        coordination_token: CoordinationToken,
         contract_violation: ContractViolation | None = None,
     ) -> str:
         return self._data_flow.record_validation_error(
-            run_id,
             node_id,
             row_data,
             error,
             schema_mode,
             destination,
+            coordination_token=coordination_token,
             contract_violation=contract_violation,
         )
 
@@ -181,16 +193,28 @@ class PluginAuditWriterAdapter:
         row_data: Mapping[str, object] | PipelineRow,
         error_details: TransformErrorReason,
         destination: str,
+        *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
     ) -> str:
-        return self._data_flow.record_transform_error(ref, transform_id, row_data, error_details, destination)
+        return self._data_flow.record_transform_error(
+            ref,
+            transform_id,
+            row_data,
+            error_details,
+            destination,
+            member_token=member_token,
+            work_item=work_item,
+        )
 
     def update_node_output_contract(
         self,
-        run_id: str,
         node_id: str,
         contract: SchemaContract,
+        *,
+        member_token: WorkerMembershipToken,
     ) -> None:
-        self._data_flow.update_node_output_contract(run_id, node_id, contract)
+        self._data_flow.update_node_output_contract(node_id, contract, member_token=member_token)
 
     def get_node_contracts(
         self,
@@ -214,7 +238,7 @@ class PluginAuditWriterAdapter:
         reachable: bool,
         count: int | None,
         message: str,
-        coordination_token: CoordinationToken,
+        member_token: WorkerMembershipToken,
     ) -> None:
         self._run_lifecycle.record_readiness_check(
             name=name,
@@ -222,5 +246,5 @@ class PluginAuditWriterAdapter:
             reachable=reachable,
             count=count,
             message=message,
-            coordination_token=coordination_token,
+            member_token=member_token,
         )

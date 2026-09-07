@@ -49,6 +49,8 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import record_group_loss
 from elspeth.core.landscape.schema import (
     group_losses_table,
@@ -82,20 +84,18 @@ COALESCE_NODE = NodeID("coalesce::merge")
 MERGE = CoalesceName("merge")
 
 
-def _usurp_seat(db: LandscapeDB, clock: MockClock) -> None:
-    """In-DB takeover image (harness ``_usurp_seat``): epoch bump, live expiry."""
-    now = clock.now_utc()
+def _usurp_seat(db: LandscapeDB) -> None:
+    """Expire the incumbent, then mint the takeover through the real authority API."""
     with begin_write(db.engine) as conn:
+        expired = read_landscape_transaction_time(conn) - timedelta(seconds=1)
         conn.execute(
             update(run_coordination_table)
             .where(run_coordination_table.c.run_id == RUN_ID)
             .values(
-                leader_worker_id=USURPER,
-                leader_epoch=run_coordination_table.c.leader_epoch + 1,
-                leader_heartbeat_expires_at=now + timedelta(seconds=300),
-                updated_at=now,
+                leader_heartbeat_expires_at=expired,
             )
         )
+    RunCoordinationRepository(db.engine).acquire_run_leadership(run_id=RUN_ID, worker_id=USURPER, window_seconds=300)
 
 
 def _real_coalesce_executor(factory: Any, clock: MockClock, *, policy: str) -> CoalesceExecutor:
@@ -166,7 +166,11 @@ def _branch_token(branch: str, *, token_id: str | None = None, row_id: str = "ro
 
 def _arrive_via_intake(factory: Any, processor: Any, token: TokenInfo, *, ingest_sequence: int = 0) -> list[Any]:
     """One branch arrival on the live path: BLOCKED deposit + stash + intake."""
-    ctx = make_context(landscape=factory.plugin_audit_writer())
+    ctx = make_context(
+        landscape=factory.plugin_audit_writer(),
+        coordination_token=processor._require_coordination_token(),
+        member_token=processor._require_member_token(),
+    )
     _persist_blocked_scheduler_work(
         factory,
         processor,
@@ -368,7 +372,7 @@ class TestLateBranchRelease:
 
         # Leader B knows nothing in memory; the key is discovered from the
         # Landscape on the straggler's arrival (cache-miss path).
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
         processor_b = _coalesce_processor(factory, executor_b, clock)
         assert executor_b._completed_keys == {}
@@ -392,7 +396,7 @@ class TestLateBranchRelease:
         results = _arrive_via_intake(factory, processor_a, _branch_token("a"))
         assert results[0].scheduler_pending_sink is True
 
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="first")
         processor_b = _coalesce_processor(factory, executor_b, clock)
         clock.advance(2.0)
@@ -427,7 +431,11 @@ class TestLateBranchRelease:
             coalesce_name="merge",
         )
 
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
         late_results = processor.run_barrier_intake(ctx)
 
         assert [(r.outcome, r.path) for r in late_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
@@ -468,7 +476,7 @@ class TestLateBranchRelease:
             coalesce_name="merge",
         )
 
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="first")
         processor_b = _coalesce_processor(
             factory,
@@ -489,7 +497,11 @@ class TestLateBranchRelease:
         assert processor_b.has_blocked_barrier_work() is True
         assert ("merge", "fg-row-1") in executor_b._completed_keys
 
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor_b._require_coordination_token(),
+            member_token=processor_b._require_member_token(),
+        )
         late_results = processor_b.run_barrier_intake(ctx)
 
         assert [(r.outcome, r.path) for r in late_results] == [(TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
@@ -547,7 +559,7 @@ class TestLateBranchRelease:
 
         # Takeover: leader B restores. The §E.3a restore reconcile must
         # detect the adopted row against the completed key and release it.
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="first")
         # stamp_blocked_rows_adopted=False because b's row is ALREADY adopted;
         # the helper must NOT re-stamp (would increment epoch, confusing the check).
@@ -611,7 +623,7 @@ class TestLateBranchRelease:
         )
         assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.BLOCKED.value
 
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
         processor_b = _coalesce_processor(
             factory,
@@ -677,7 +689,7 @@ class TestLateBranchRelease:
 
         # Takeover: leader B restores. The crash-window recovery resets b's epoch
         # to NULL (intake-pending) and restore_from_journal sees only branch a.
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
         processor_b = _coalesce_processor(
             factory,
@@ -705,7 +717,11 @@ class TestLateBranchRelease:
         assert processor_b.has_blocked_barrier_work() is True
 
         # One intake pass: branch b is re-adopted and accepted → merge fires (require_all).
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor_b._require_coordination_token(),
+            member_token=processor_b._require_member_token(),
+        )
         merge_results = processor_b.run_barrier_intake(ctx)
         assert len(merge_results) == 1
         merged = merge_results[0]
@@ -733,7 +749,11 @@ class TestBranchLossReplay:
         # ONE leader intake pass: adopt-the-loss (journal-first) -> replay
         # through notify_branch_lost -> require_all fails the group NOW,
         # not at any timeout (none is configured — failure here proves it).
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
         results = processor.run_barrier_intake(ctx)
 
         assert len(results) == 1
@@ -757,7 +777,11 @@ class TestBranchLossReplay:
         assert held_results == []
         _record_foreign_loss(db, clock, factory, branch="b", token_id="tok-branch-b", reason="quarantined:boom")
 
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
         results = processor.run_barrier_intake(ctx)
 
         # The loss completes the best-effort group: merged child emitted as
@@ -810,7 +834,7 @@ class TestBranchLossReplay:
         (loss_row,) = _loss_rows(db)
         assert loss_row["adopted_epoch"] is None
 
-        _usurp_seat(db, clock)
+        _usurp_seat(db)
         executor_b = _real_coalesce_executor(factory, clock, policy="require_all")
         processor_b = _coalesce_processor(
             factory,
@@ -833,7 +857,11 @@ class TestBranchLossReplay:
         # then the coalesce flush resolves the must-fail group.
         config = MagicMock(spec=PipelineConfig)
         config.aggregation_settings = {}
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor_b._require_coordination_token(),
+            member_token=processor_b._require_member_token(),
+        )
         counters = ExecutionCounters()
         run_end_of_input_barrier_flush(
             config=config,

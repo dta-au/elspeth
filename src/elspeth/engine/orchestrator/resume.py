@@ -654,7 +654,7 @@ class ResumeCoordinator:
             )
 
             # Stage 3 — only the seat winner may rewrite incomplete batches.
-            batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot)
+            batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot, coordination_token=coordination_token)
 
             return ResumeState(
                 factory=snapshot.factory,
@@ -798,7 +798,9 @@ class ResumeCoordinator:
             entry_point="resume",
         )
 
-    def _repair_resume_batches(self, snapshot: _ResumeAuditSnapshot) -> tuple[Mapping[str, str], bool]:
+    def _repair_resume_batches(
+        self, snapshot: _ResumeAuditSnapshot, *, coordination_token: CoordinationToken
+    ) -> tuple[Mapping[str, str], bool]:
         """Durable post-CAS repair — runs strictly AFTER
         ``_acquire_resume_leadership`` (only the seat winner may rewrite retry
         batches).
@@ -812,7 +814,7 @@ class ResumeCoordinator:
         has zero unprocessed rows but must still run the processing path so the
         restored buffers flush, so the resume quiescence gate consults this flag.)
         """
-        batch_id_remap = handle_incomplete_batches(snapshot.factory.execution, snapshot.run_id)
+        batch_id_remap = handle_incomplete_batches(snapshot.factory.execution, coordination_token=coordination_token)
         has_restored_barrier_work = snapshot.recovery.count_blocked_barrier_items(snapshot.run_id) > 0
         return batch_id_remap, has_restored_barrier_work
 
@@ -1405,7 +1407,8 @@ class ResumeCoordinator:
 
 def handle_incomplete_batches(
     execution: ExecutionRepository,
-    run_id: str,
+    *,
+    coordination_token: CoordinationToken,
 ) -> dict[str, str]:
     """Find and handle incomplete batches for recovery.
 
@@ -1415,7 +1418,7 @@ def handle_incomplete_batches(
 
     Args:
         execution: ExecutionRepository for database operations
-        run_id: Run being recovered
+        coordination_token: Acquired leadership of the run being recovered
 
     Returns:
         Mapping of old_batch_id to new_batch_id for retried batches.
@@ -1425,7 +1428,7 @@ def handle_incomplete_batches(
     """
     from elspeth.contracts.enums import BatchStatus
 
-    incomplete = execution.get_incomplete_batches(run_id)
+    incomplete = execution.get_incomplete_batches(coordination_token.run_id)
     batch_id_mapping: dict[str, str] = {}
 
     for batch in incomplete:
@@ -1437,12 +1440,13 @@ def handle_incomplete_batches(
                 trigger_type=batch.trigger_type,
                 trigger_reason=batch.trigger_reason,
                 state_id=batch.aggregation_state_id,
+                coordination_token=coordination_token,
             )
-            retry = execution.retry_batch(batch.batch_id)
+            retry = execution.retry_batch(batch.batch_id, coordination_token=coordination_token)
             batch_id_mapping[batch.batch_id] = retry.batch_id
         elif batch.status == BatchStatus.FAILED:
             # Previous failure, retry
-            retry = execution.retry_batch(batch.batch_id)
+            retry = execution.retry_batch(batch.batch_id, coordination_token=coordination_token)
             batch_id_mapping[batch.batch_id] = retry.batch_id
         # DRAFT batches continue normally (collection resumes)
 

@@ -15,6 +15,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
+from tests.fixtures.mock_audit import mock_item_audit_authority
+
 chromadb = pytest.importorskip("chromadb")
 
 from elspeth.contracts.enums import CallStatus, CallType  # noqa: E402
@@ -39,7 +43,7 @@ class _FakeExecutionRecorder:
     call_indices: dict[str, int] = field(default_factory=dict)
     recorded_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         index = self.call_indices.get(state_id, 0)
         self.call_indices[state_id] = index + 1
         return index
@@ -299,6 +303,7 @@ class TestChromaSearchProvider:
             "programming languages",
             top_k=2,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -312,6 +317,7 @@ class TestChromaSearchProvider:
             "topic",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -329,6 +335,7 @@ class TestChromaSearchProvider:
             "exact match for the query text",
             top_k=10,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -336,6 +343,7 @@ class TestChromaSearchProvider:
             "exact match for the query text",
             top_k=10,
             min_score=0.9,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -347,6 +355,7 @@ class TestChromaSearchProvider:
             "retrieval",
             top_k=3,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -358,6 +367,7 @@ class TestChromaSearchProvider:
             "anything",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -386,6 +396,7 @@ class TestChromaSearchProvider:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -402,6 +413,7 @@ class TestChromaSearchProvider:
             "test content",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -490,6 +502,7 @@ class TestChromaSearchProvider:
             "document",
             top_k=5,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id=None,
         )
@@ -516,6 +529,7 @@ class TestChromaSearchProvider:
             "test",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -542,6 +556,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -553,6 +568,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -564,6 +580,7 @@ class TestChromaScoreNormalization:
             "test document",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="s1",
             token_id=None,
         )
@@ -601,6 +618,7 @@ class TestCallTypeCorrectness:
             "test",
             top_k=1,
             min_score=0.0,
+            **mock_item_audit_authority(),
             state_id="state-1",
             token_id="token-1",
         )
@@ -628,7 +646,7 @@ class TestTier3ResultBoundary:
             patch.object(provider._collection, "query", return_value={"ids": [["doc1"]]}),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_non_mapping_metadata_raises_retrieval_error(self):
         """A truthy non-mapping metadata from a corrupt index must become RetrievalError.
@@ -658,7 +676,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_none_inner_list_raises_retrieval_error(self):
         """If SDK returns None where inner list expected, should get RetrievalError."""
@@ -681,7 +699,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     def test_none_distances_raises_retrieval_error(self):
         """If SDK returns None for distances inner list, should get RetrievalError."""
@@ -704,7 +722,7 @@ class TestTier3ResultBoundary:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     @pytest.mark.parametrize(
         "results",
@@ -756,7 +774,7 @@ class TestTier3ResultBoundary:
             patch.object(provider._collection, "query", return_value=results),
             pytest.raises(RetrievalError, match=r"structure|metadata|document ID"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -848,7 +866,7 @@ class TestDistanceTypeValidation:
             ),
             pytest.raises(RetrievalError, match=r"non-numeric distance.*collection may need to be rebuilt"),
         ):
-            provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
 
 class TestPostQueryFailureAudit:
@@ -877,7 +895,7 @@ class TestPostQueryFailureAudit:
             patch.object(provider._collection, "query", return_value={"ids": [["doc1"]]}),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -908,7 +926,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -939,7 +957,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -965,7 +983,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1001,7 +1019,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError, match="mismatched"),
         ):
-            provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1037,7 +1055,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1066,7 +1084,7 @@ class TestPostQueryFailureAudit:
             ),
             pytest.raises(RetrievalError, match="metadata"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1098,7 +1116,7 @@ class TestDocTypeValidation:
                 "metadatas": [[{}, {}]],
             },
         ):
-            chunks = provider.search("test", top_k=2, min_score=0.0, state_id="s1", token_id=None)
+            chunks = provider.search("test", top_k=2, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
             # Non-string doc should be skipped; only "real doc" should appear
             assert all(isinstance(c.content, str) for c in chunks)
             assert len(chunks) == 1
@@ -1131,7 +1149,7 @@ class TestDocTypeValidation:
                 "metadatas": [[{}]],
             },
         ):
-            chunks = provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            chunks = provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert len(chunks) == 1
         assert provider.last_skipped_count == 0
@@ -1260,7 +1278,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(ConnectionError("refused"))
 
         with pytest.raises(RetrievalError) as exc_info:
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         # Must be retryable (transient infrastructure failure)
         assert exc_info.value.retryable is True
@@ -1275,7 +1293,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(chromadb.errors.NotFoundError("collection gone"))
 
         with pytest.raises(RetrievalError) as exc_info:
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         # NotFoundError is permanent
         assert exc_info.value.retryable is False
@@ -1290,7 +1308,7 @@ class TestCountErrorBoundary:
         provider._collection = _FailingCountCollection(TypeError("bad argument"))
 
         with pytest.raises(TypeError, match="bad argument"):
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
     @pytest.mark.parametrize("bad_count", [True, -1, 1.5, "1"])
     def test_malformed_count_is_audited_retrieval_error(self, bad_count: object) -> None:
@@ -1298,7 +1316,7 @@ class TestCountErrorBoundary:
         provider._collection = _RawCountCollection(bad_count)
 
         with pytest.raises(RetrievalError, match="count"):
-            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("query", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
@@ -1329,6 +1347,6 @@ class TestNegativeL2DistanceBoundary:
             ),
             pytest.raises(RetrievalError, match="negative"),
         ):
-            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+            provider.search("test", top_k=1, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR

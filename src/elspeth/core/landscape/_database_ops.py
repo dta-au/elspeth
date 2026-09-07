@@ -1,32 +1,23 @@
-"""Database operation helpers to reduce recorder boilerplate.
+"""Read snapshots and statements on caller-owned Landscape connections."""
 
-Consolidates read-only and write connection management for simple statements.
-"""
-
-from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
 from sqlalchemy import Executable
 from sqlalchemy.engine import Connection, Row
 from sqlalchemy.exc import SQLAlchemyError
 
-from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
+from elspeth.core.landscape.errors import LandscapeRecordError
 
 
-def _safe_database_error_message(
-    *,
-    operation: str,
-    action: str,
-    exc: SQLAlchemyError,
-    context: str = "",
-) -> str:
+def _safe_database_error_message(*, operation: str, action: str, exc: SQLAlchemyError, context: str = "") -> str:
     detail = f" ({context})" if context else ""
     return f"{operation} failed{detail} — database rejected audit {action}: {type(exc).__name__}"
 
 
 class DatabaseOpsConnectionProvider(Protocol):
-    """Connection surface required by database operation helpers."""
+    """Read connection surface required by database operation helpers."""
 
     @property
     def is_read_only(self) -> bool:
@@ -35,33 +26,21 @@ class DatabaseOpsConnectionProvider(Protocol):
     def read_only_connection(self) -> AbstractContextManager[Connection]:
         raise NotImplementedError
 
-    def write_connection(self) -> AbstractContextManager[Connection]:
-        raise NotImplementedError
-
 
 class ReadOnlyDatabaseOps:
-    """Helper for read-only database operations.
-
-    Uses the database's read-only connection path so query helpers cannot
-    mutate the audit store, even if a caller passes a write-capable statement.
-    """
+    """Queries execute through the database's enforced read-only connection."""
 
     def __init__(self, db: DatabaseOpsConnectionProvider) -> None:
         self._db = db
 
     def execute_fetchone(self, query: Executable) -> Row[Any] | None:
-        """Execute a single-row query.
-
-        Returns the row when exactly one matches, ``None`` when no rows match,
-        and raises ``LandscapeRecordError`` when multiple rows match.
-        """
+        """Return one row or None, refusing an ambiguous multi-row result."""
         try:
             with self._db.read_only_connection() as conn:
                 result = conn.execute(query)
                 rows = result.fetchmany(2)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(_safe_database_error_message(operation="execute_fetchone", action="query", exc=exc)) from exc
-
         if len(rows) > 1:
             raise LandscapeRecordError("execute_fetchone matched multiple rows — single-row audit query is ambiguous")
         if not rows:
@@ -82,8 +61,8 @@ class ReadOnlyDatabaseOps:
         try:
             with self._db.read_only_connection() as conn:
                 if conn.dialect.name == "sqlite" and self._db.is_read_only:
-                    # Read-only engines keep stock pysqlite autocommit for ordinary
-                    # inspectors; this multi-query boundary needs one stable snapshot.
+                    # Read-only engines use pysqlite autocommit for ordinary
+                    # inspectors; this multi-query boundary needs one snapshot.
                     conn.exec_driver_sql("BEGIN")
                 return [list(conn.execute(query).fetchall()) for query in queries]
         except SQLAlchemyError as exc:
@@ -91,15 +70,15 @@ class ReadOnlyDatabaseOps:
 
 
 class DatabaseOps(ReadOnlyDatabaseOps):
-    """Helper for common database operations.
+    """Statements require the transaction supplied by their authority owner.
 
-    Reduces boilerplate in recorder methods by centralizing
-    connection management.
+    This helper cannot open a write transaction. Run repositories supply a
+    fenced connection; non-run repositories own their closed table writes.
     """
 
     @staticmethod
     def execute_insert_on(conn: Connection, stmt: Executable, *, context: str = "") -> None:
-        """Execute on the caller's fenced connection without owning a transaction."""
+        """Execute on the caller's connection without owning a transaction."""
         try:
             result = conn.execute(stmt)
         except SQLAlchemyError as exc:
@@ -107,74 +86,5 @@ class DatabaseOps(ReadOnlyDatabaseOps):
                 _safe_database_error_message(operation="execute_insert_on", action="write", exc=exc, context=context)
             ) from exc
         if result.rowcount == 0:
-            raise LandscapeRecordError("execute_insert_on: zero rows affected — audit write failed")
-
-    @staticmethod
-    def execute_update_on(conn: Connection, stmt: Executable, *, context: str = "") -> None:
-        """Execute on the caller's fenced connection and require a target row."""
-        try:
-            result = conn.execute(stmt)
-        except SQLAlchemyError as exc:
-            raise LandscapeRecordError(
-                _safe_database_error_message(operation="execute_update_on", action="update", exc=exc, context=context)
-            ) from exc
-        if result.rowcount == 0:
-            raise LandscapeRecordNotFoundError("execute_update_on: zero rows affected — target row does not exist")
-
-    def execute_insert(self, stmt: Executable, *, context: str = "") -> None:
-        """Execute insert statement.
-
-        Args:
-            stmt: SQLAlchemy insert statement
-            context: Optional context string for error messages (e.g., table/operation name)
-
-        Raises:
-            LandscapeRecordError: If the write fails or zero rows are affected.
-        """
-        detail = f" ({context})" if context else ""
-        try:
-            with self._db.write_connection() as conn:
-                result = conn.execute(stmt)
-        except SQLAlchemyError as exc:
-            raise LandscapeRecordError(
-                _safe_database_error_message(operation="execute_insert", action="write", exc=exc, context=context)
-            ) from exc
-        if result.rowcount == 0:
-            raise LandscapeRecordError(
-                f"execute_insert: zero rows affected{detail} — audit write failed (missing parent row or constraint violation)"
-            )
-
-    @contextmanager
-    def write_connection(self) -> Iterator[Connection]:
-        """Expose one repository-owned write transaction.
-
-        Complex repository verbs use this when their correctness requires more
-        than one statement in the same write-intent transaction. Callers that
-        already own a transaction should continue passing its ``Connection``
-        through the repository API instead.
-        """
-        with self._db.write_connection() as conn:
-            yield conn
-
-    def execute_update(self, stmt: Executable, *, context: str = "") -> None:
-        """Execute update statement.
-
-        Args:
-            stmt: SQLAlchemy update statement
-            context: Optional context string for error messages (e.g., table/operation name)
-
-        Raises:
-            LandscapeRecordError: If the write fails or zero rows are affected.
-        """
-        detail = f" ({context})" if context else ""
-        try:
-            with self._db.write_connection() as conn:
-                result = conn.execute(stmt)
-        except SQLAlchemyError as exc:
-            raise LandscapeRecordError(
-                _safe_database_error_message(operation="execute_update", action="update", exc=exc, context=context)
-            ) from exc
-        if result.rowcount == 0:
-            raise LandscapeRecordNotFoundError(
-                f"execute_update: zero rows affected{detail} — target row does not exist (audit data corruption)"
-            )
+            detail = f" ({context})" if context else ""
+            raise LandscapeRecordError(f"execute_insert_on: zero rows affected{detail} — audit write failed")

@@ -30,7 +30,7 @@ import pytest
 # For node registration
 from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, WorkerMembershipToken
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
 from elspeth.contracts.engine import CommittedAggregationOutputReceipt
@@ -64,6 +64,7 @@ from elspeth.contracts.identity import (
 )
 from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
+from elspeth.contracts.scheduler import SourceIngestSpec, TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, CollectorName, GateName, NodeID, RowUnionName, SinkName
@@ -105,6 +106,7 @@ from tests.fixtures.landscape import (
     landscape_database_now,
     leader_coordination_token,
     make_recorder_with_run,
+    member_token_for,
 )
 
 # =============================================================================
@@ -159,13 +161,14 @@ def _persist_token_for_scheduler(
     try:
         factory.data_flow.resolve_row_ingest_sequence(token.row_id)
     except AuditIntegrityError:
-        factory.data_flow.create_row(
-            run_id=run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=source_node_id,
             row_index=ingest_sequence if row_index is None else row_index,
             source_row_index=ingest_sequence if source_row_index is None else source_row_index,
             ingest_sequence=ingest_sequence,
             row_id=token.row_id,
+            token_id=token.token_id if not token.lineage_path else None,
             data=token.row_data.to_dict(),
         )
     if factory.query.get_token(token.token_id) is None:
@@ -191,9 +194,28 @@ def _persist_token_for_scheduler(
         )
         factory.data_flow.create_token(
             token.row_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             token_id=token.token_id,
             lineage_path=lineage_path,
         )
+
+
+def _claim_processor_token(factory: RecorderFactory, token: TokenInfo, *, node_id: str, run_id: str = "test-run") -> TokenWorkItem:
+    """Give direct processor calls the durable claim normally supplied by the drain."""
+    _persist_token_for_scheduler(factory, token, run_id=run_id)
+    leader = leader_coordination_token(factory, run_id)
+    return factory.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token.token_id,
+        row_id=token.row_id,
+        node_id=node_id,
+        step_index=1,
+        ingest_sequence=factory.data_flow.resolve_row_ingest_sequence(token.row_id),
+        row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+        lineage_path=token.lineage_path,
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
 
 
 def _persist_blocked_scheduler_work(
@@ -223,25 +245,27 @@ def _persist_blocked_scheduler_work(
     fabricate an intake-pending deposit instead.
     """
     _persist_token_for_scheduler(factory, token, ingest_sequence=ingest_sequence)
-    item = processor._scheduler.enqueue_ready_claimed_legacy_unfenced(
-        run_id=processor.run_id,
+    member_token = processor._require_member_token()
+    item = processor._scheduler.enqueue_ready_claimed(
+        member_token=member_token,
         token_id=token.token_id,
         row_id=token.row_id,
         node_id=str(node_id),
         step_index=processor.resolve_node_step(node_id),
         ingest_sequence=factory.data_flow.resolve_row_ingest_sequence(token.row_id),
         row_payload_json=processor._scheduler.serialize_row_payload(token.row_data),
-        lease_owner="test-harness",
+        lease_owner=member_token.worker_id,
         lease_seconds=60,
         lineage_path=token.lineage_path,
         coalesce_name=coalesce_name,
         collector_name=collector_name,
     )
     processor._scheduler.mark_blocked(
+        member_token=member_token,
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=barrier_key,
-        expected_lease_owner="test-harness",
+        expected_lease_owner=member_token.worker_id,
     )
     if adopted:
         _stamp_blocked_rows_adopted(processor._scheduler, work_item_id=item.work_item_id)
@@ -457,7 +481,7 @@ def _make_processor(
     if mode is ProcessorMode.FOLLOWER:
         if scheduler_lease_owner is None:
             raise ValueError("_make_processor(mode=FOLLOWER) requires a registered scheduler_lease_owner")
-        member_token = WorkerMembershipToken(run_id=run_id, worker_id=scheduler_lease_owner)
+        member_token = member_token_for(factory._db.engine, run_id=run_id, worker_id=scheduler_lease_owner)
 
     coalesce_nodes = dict(coalesce_node_ids or {})
     traversal_steps = dict(node_step_map or {})
@@ -522,7 +546,7 @@ def _make_processor(
             node_type = NodeType.TRANSFORM
             plugin_name = "transform"
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name=str(plugin_name),
             node_type=node_type,
             plugin_version="1.0",
@@ -681,6 +705,22 @@ def _make_mock_transform(
 class TestConstructorErrorEdgeMap:
     """Tests for error edge map construction in __init__."""
 
+    @staticmethod
+    def _add_batch_member(factory: RecorderFactory, *, batch_id: str, token_id: str, ordinal: int) -> None:
+        """Seed audit membership through the live primitive under leader authority."""
+        from elspeth.core.landscape.execution.batches import add_batch_member_guarded
+        from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+
+        leader = leader_coordination_token(factory, "test-run")
+        with fenced_leader_transaction(factory._db.engine, token=leader, window_seconds=60, verb="test_batch_membership") as conn:
+            add_batch_member_guarded(
+                conn,
+                batch_id=batch_id,
+                token_id=token_id,
+                ordinal=ordinal,
+                expected_run_id=leader.run_id,
+            )
+
     def test_scheduler_repository_is_required(self) -> None:
         """RowProcessor must not expose the legacy in-memory drain path."""
         _, factory = _make_factory()
@@ -735,7 +775,10 @@ class TestConstructorErrorEdgeMap:
         """Fresh source-row drains should not run empty recovery sweeps per row."""
         _, factory = _make_factory()
         processor = _make_processor(factory, scheduler=factory.scheduler)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             # Slice 3 re-pin (token-bound fixture): a coordination-token-bound
@@ -778,7 +821,10 @@ class TestConstructorErrorEdgeMap:
         processor = _make_processor(factory)
         transform = _make_mock_transform()
         token = make_token_info(row_id="row-1", token_id="token-1", data={"value": 1})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         executor = create_autospec(TransformExecutor, instance=True)
         executor.execute_transform.return_value = (
             TransformResult.success(make_pipeline_row({"value": 1}), success_reason={"action": "test"}),
@@ -841,15 +887,18 @@ class TestConstructorErrorEdgeMap:
         db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="agg-transform",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
             config={},
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         tokens: list[TokenInfo] = []
         for ordinal, token_id in enumerate(["t1", "t2"]):
             payload = make_row({"value": ordinal})
@@ -857,39 +906,45 @@ class TestConstructorErrorEdgeMap:
             _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
             tokens.append(token)
             # Audit: membership + BUFFERED outcome + a node_state at attempt 0.
-            factory.execution.add_batch_member(batch_id=batch.batch_id, token_id=token_id, ordinal=ordinal)
-            factory.data_flow.record_token_outcome(
+            self._add_batch_member(factory, batch_id=batch.batch_id, token_id=token_id, ordinal=ordinal)
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=token_id, run_id="test-run"),
                 outcome=None,
                 path=TerminalPath.BUFFERED,
                 batch_id=batch.batch_id,
+                coordination_token=leader_coordination_token(factory, "test-run"),
             )
             factory.execution.begin_node_state(
                 token_id=token_id,
                 node_id=str(agg_node),
-                run_id="test-run",
                 step_index=1,
                 input_data=payload.to_dict(),
                 attempt=0,
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
             # Journal: production-shaped BLOCKED row (mark_blocked stamps
             # barrier_blocked_at; the old ensure_blocked path did not).
             factory.scheduler.enqueue_ready(
-                run_id="test-run",
                 token_id=token_id,
                 row_id=token.row_id,
                 node_id=str(agg_node),
                 step_index=1,
                 ingest_sequence=ordinal,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
-            claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
+            claimed = factory.scheduler.claim_ready(
+                lease_owner=_TEST_LEADER_WORKER_ID,
+                lease_seconds=60,
+                member_token=leader_coordination_token(factory, "test-run").membership,
+            )
             assert claimed is not None and claimed.token_id == token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key=str(agg_node),
-                expected_lease_owner="seeder",
+                expected_lease_owner=_TEST_LEADER_WORKER_ID,
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
             # The hold is two database seconds old at restore (ADR-047): the
             # restored trigger latch's elapsed age must cover the 1.5 s
@@ -946,23 +1001,23 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": 7})
         token = TokenInfo(row_id="row-ghost", token_id="tok-ghost", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
-        datetime.now(UTC)
-        ghost_item = factory.scheduler.enqueue_ready_claimed_legacy_unfenced(
-            run_id="test-run",
+        ghost_item = factory.scheduler.enqueue_ready_claimed(
             token_id="tok-ghost",
             row_id="row-ghost",
             node_id=None,
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
-            lease_owner="test-harness",
+            lease_owner=_TEST_LEADER_WORKER_ID,
             lease_seconds=60,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         factory.scheduler.mark_blocked(
             work_item_id=ghost_item.work_item_id,
             queue_key=None,
             barrier_key="ghost-barrier",
-            expected_lease_owner="test-harness",
+            expected_lease_owner=_TEST_LEADER_WORKER_ID,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         with pytest.raises(AuditIntegrityError, match="orphan barrier_key 'ghost-barrier'"):
@@ -988,26 +1043,30 @@ class TestConstructorErrorEdgeMap:
 
         db, factory = _make_factory()
         agg_node = NodeID("agg-1")
-        datetime.now(UTC)
         payload = make_row({"value": 9})
         token = TokenInfo(row_id="row-q", token_id="tok-q", row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=0)
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id="tok-q",
             row_id="row-q",
             node_id=None,
             step_index=0,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
+        claimed = factory.scheduler.claim_ready(
+            lease_owner=_TEST_LEADER_WORKER_ID,
+            lease_seconds=60,
+            member_token=leader_coordination_token(factory, "test-run").membership,
+        )
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key="queue-1",
             barrier_key=None,
-            expected_lease_owner="seeder",
+            expected_lease_owner=_TEST_LEADER_WORKER_ID,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         processor = _make_processor(
@@ -1068,13 +1127,13 @@ class TestConstructorErrorEdgeMap:
     @staticmethod
     def _register_aggregation_node(factory: RecorderFactory, agg_node: NodeID) -> None:
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="agg-transform",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
             config={},
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
     @staticmethod
@@ -1087,23 +1146,27 @@ class TestConstructorErrorEdgeMap:
         payload = make_row({"value": ordinal})
         token = TokenInfo(row_id=f"row-{ordinal}", token_id=token_id, row_data=payload)
         _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-        datetime.now(UTC)
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token_id,
             row_id=token.row_id,
             node_id=str(agg_node),
             step_index=1,
             ingest_sequence=ordinal,
             row_payload_json=factory.scheduler.serialize_row_payload(payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
+        claimed = factory.scheduler.claim_ready(
+            lease_owner=_TEST_LEADER_WORKER_ID,
+            lease_seconds=60,
+            member_token=leader_coordination_token(factory, "test-run").membership,
+        )
         assert claimed is not None and claimed.token_id == token_id
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key=str(agg_node),
-            expected_lease_owner="seeder",
+            expected_lease_owner=_TEST_LEADER_WORKER_ID,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         return token
 
@@ -1118,12 +1181,13 @@ class TestConstructorErrorEdgeMap:
     ) -> TokenInfo:
         """BLOCKED journal row + batch membership + BUFFERED outcome carrying batch_id."""
         token = self._seed_blocked_agg_row(factory, token_id=token_id, ordinal=ordinal, agg_node=agg_node)
-        factory.execution.add_batch_member(batch_id=batch_id, token_id=token_id, ordinal=ordinal)
-        factory.data_flow.record_token_outcome(
+        self._add_batch_member(factory, batch_id=batch_id, token_id=token_id, ordinal=ordinal)
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_id, run_id="test-run"),
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         return token
 
@@ -1138,13 +1202,23 @@ class TestConstructorErrorEdgeMap:
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        old_batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        old_batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         for ordinal, token_id in enumerate(["t1", "t2"]):
             self._seed_buffered_member(factory, token_id=token_id, ordinal=ordinal, agg_node=agg_node, batch_id=old_batch.batch_id)
         # Crash shape: flush died -> batch FAILED; resume's
         # handle_incomplete_batches creates the retry batch (members COPIED).
-        factory.execution.complete_batch(old_batch.batch_id, BatchStatus.FAILED)
-        retry_batch = factory.execution.retry_batch(old_batch.batch_id)
+        factory.execution.complete_batch(
+            old_batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
+        retry_batch = factory.execution.retry_batch(
+            old_batch.batch_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         assert retry_batch.batch_id != old_batch.batch_id
 
         processor = _make_processor(
@@ -1174,13 +1248,20 @@ class TestConstructorErrorEdgeMap:
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        failed_batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        failed_batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         for ordinal, token_id in enumerate(["t1", "t2"]):
             payload = make_row({"value": ordinal})
             token = TokenInfo(row_id=f"row-{ordinal}", token_id=token_id, row_data=payload)
             _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-            factory.execution.add_batch_member(batch_id=failed_batch.batch_id, token_id=token_id, ordinal=ordinal)
-        factory.execution.complete_batch(failed_batch.batch_id, BatchStatus.FAILED)
+            self._add_batch_member(factory, batch_id=failed_batch.batch_id, token_id=token_id, ordinal=ordinal)
+        factory.execution.complete_batch(
+            failed_batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         processor = _make_processor(
             factory,
@@ -1199,8 +1280,14 @@ class TestConstructorErrorEdgeMap:
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        batch_a = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
-        batch_b = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        batch_a = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
+        batch_b = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         self._seed_buffered_member(factory, token_id="t1", ordinal=0, agg_node=agg_node, batch_id=batch_a.batch_id)
         self._seed_buffered_member(factory, token_id="t2", ordinal=1, agg_node=agg_node, batch_id=batch_b.batch_id)
 
@@ -1221,13 +1308,17 @@ class TestConstructorErrorEdgeMap:
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         self._seed_buffered_member(factory, token_id="t1", ordinal=0, agg_node=agg_node, batch_id=batch.batch_id)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="t1", run_id="test-run"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
             batch_id=batch.batch_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         with pytest.raises(AuditIntegrityError, match="disagree about this token being buffered"):
@@ -1242,7 +1333,10 @@ class TestConstructorErrorEdgeMap:
         _db, factory = _make_factory()
         agg_node = NodeID("agg-1")
         self._register_aggregation_node(factory, agg_node)
-        old_batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
+        old_batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         self._seed_buffered_member(factory, token_id="t1", ordinal=0, agg_node=agg_node, batch_id=old_batch.batch_id)
 
         with pytest.raises(AuditIntegrityError, match="has no batches row"):
@@ -1259,8 +1353,14 @@ class TestConstructorErrorEdgeMap:
         other_node = NodeID("agg-2")
         self._register_aggregation_node(factory, agg_node)
         self._register_aggregation_node(factory, other_node)
-        own_batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
-        foreign_batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(other_node))
+        own_batch = factory.execution.create_batch(
+            aggregation_node_id=str(agg_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
+        foreign_batch = factory.execution.create_batch(
+            aggregation_node_id=str(other_node),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         self._seed_buffered_member(factory, token_id="t1", ordinal=0, agg_node=agg_node, batch_id=own_batch.batch_id)
 
         with pytest.raises(AuditIntegrityError, match="belongs to aggregation node"):
@@ -1289,7 +1389,10 @@ class TestTraversalNextNodeInvariants:
         """Processing nodes must have explicit next-node entries (None for terminal)."""
         _db, factory = _make_factory()
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         transform = _make_mock_transform()
         source_node = NodeID("source-0")
         transform_node = NodeID(transform.node_id)
@@ -1364,6 +1467,7 @@ class TestAuditStepResolutionInvariants:
             source_on_success="default",
             traversal=traversal,
             scheduler=factory.scheduler,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         assert processor._resolve_audit_step_for_node(source_node) == 0
@@ -1500,14 +1604,17 @@ class TestProcessRowNoTransforms:
         observed_at: datetime,
     ) -> tuple[Any, Any]:
         """Persist the exact legacy row/token + initial scheduler-claim image."""
+        from sqlalchemy import delete
+
+        from elspeth.core.landscape.schema import node_states_table
+
         coordination_token = leader_coordination_token(factory, "test-run")
         source_data = {"value": 42}
         pipeline_row = _make_source_row(source_data).to_pipeline_row()
 
-        def insert_pre_fix_ingress(conn: Any) -> tuple[Any, Any]:
-            return factory.data_flow.insert_row_with_token_on(
-                conn,
-                run_id="test-run",
+        _row, _token, work_item = factory.scheduler.ingest_row_with_initial_claim(
+            coordination_token=coordination_token,
+            source=SourceIngestSpec(
                 source_node_id="source-0",
                 row_index=0,
                 data=source_data,
@@ -1515,20 +1622,28 @@ class TestProcessRowNoTransforms:
                 ingest_sequence=0,
                 row_id=row_id,
                 token_id=token_id,
-            )
-
-        _row, _token, work_item = factory.scheduler.ingest_row_with_initial_claim(
-            coordination_token=coordination_token,
-            insert_row_and_token=insert_pre_fix_ingress,
-            token_id=token_id,
-            row_id=row_id,
+            ),
+            data_flow=factory.data_flow,
+            execution=factory.execution,
             node_id=None,
             step_index=1,
-            ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(pipeline_row),
             lease_owner=_TEST_LEADER_WORKER_ID,
             lease_seconds=300,
         )
+        # The live INGEST verb always includes the source completion. Delete
+        # only that witness to manufacture the historical crash image under
+        # test; a public callback must not be able to omit this evidence.
+        with factory._db.engine.begin() as conn:
+            removed = conn.execute(
+                delete(node_states_table).where(
+                    node_states_table.c.run_id == coordination_token.run_id,
+                    node_states_table.c.token_id == token_id,
+                    node_states_table.c.node_id == "source-0",
+                    node_states_table.c.step_index == 0,
+                )
+            )
+            assert removed.rowcount == 1
         return coordination_token, work_item
 
     @staticmethod
@@ -1545,7 +1660,10 @@ class TestProcessRowNoTransforms:
 
         processor = _make_processor(factory)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.process_row(
             row_index=0,
@@ -1567,7 +1685,10 @@ class TestProcessRowNoTransforms:
 
         processor = _make_processor(factory)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.process_row(
             row_index=0,
@@ -1589,7 +1710,10 @@ class TestProcessRowNoTransforms:
 
         processor = _make_processor(factory)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             patch.object(
@@ -1640,7 +1764,10 @@ class TestProcessRowNoTransforms:
         db, factory = _make_factory()
         processor = _make_processor(factory)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         class _SimulatedProcessDeath(BaseException):
             pass
@@ -1687,7 +1814,10 @@ class TestProcessRowNoTransforms:
         """A failure after the source-state insert rolls the whole ingress back."""
         db, factory = _make_factory()
         processor = _make_processor(factory)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             patch.object(factory.scheduler.queue, "enqueue_ready_claimed_on", side_effect=RuntimeError("injected TS-02 failure")),
@@ -1715,48 +1845,24 @@ class TestProcessRowNoTransforms:
     def test_source_completion_reconciliation_rejects_conflicting_state(self) -> None:
         """A fully witnessed TS-02 image never overwrites conflicting evidence."""
         _db, factory = _make_factory()
-        coordination_token = leader_coordination_token(factory, "test-run")
-        source_data = {"value": 42}
-        pipeline_row = _make_source_row(source_data).to_pipeline_row()
-
-        def insert_pre_fix_ingress(conn: Any) -> tuple[Any, Any]:
-            return factory.data_flow.insert_row_with_token_on(
-                conn,
-                run_id="test-run",
-                source_node_id="source-0",
-                row_index=0,
-                data=source_data,
-                source_row_index=0,
-                ingest_sequence=0,
-                row_id="row-conflicting-source-state",
-                token_id="token-conflicting-source-state",
-            )
-
-        factory.scheduler.ingest_row_with_initial_claim(
-            coordination_token=coordination_token,
-            insert_row_and_token=insert_pre_fix_ingress,
+        coordination_token, _work_item = self._seed_pre_fix_ts02_gap(
+            factory,
             token_id="token-conflicting-source-state",
             row_id="row-conflicting-source-state",
-            node_id=None,
-            step_index=1,
-            ingest_sequence=0,
-            row_payload_json=factory.scheduler.serialize_row_payload(pipeline_row),
-            lease_owner=_TEST_LEADER_WORKER_ID,
-            lease_seconds=300,
+            observed_at=landscape_database_now(factory._db.engine),
         )
         factory.execution.record_completed_node_state(
             token_id="token-conflicting-source-state",
             node_id="source-0",
-            run_id="test-run",
             step_index=0,
             input_data={"value": 999},
             output_data={"value": 999},
             duration_ms=0,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         with pytest.raises(AuditIntegrityError, match="conflicting audit evidence"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
 
@@ -1795,7 +1901,6 @@ class TestProcessRowNoTransforms:
 
         with pytest.raises(AuditIntegrityError, match="exactly two scheduler events"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
         with db.connection() as conn:
@@ -1831,7 +1936,6 @@ class TestProcessRowNoTransforms:
 
         with pytest.raises(AuditIntegrityError, match="exactly two scheduler events"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
         with db.connection() as conn:
@@ -1858,7 +1962,6 @@ class TestProcessRowNoTransforms:
 
         with pytest.raises(AuditIntegrityError, match="requires attempt=1"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
         with db.connection() as conn:
@@ -1878,11 +1981,11 @@ class TestProcessRowNoTransforms:
         factory.execution.record_completed_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="test-run",
             step_index=0,
             input_data={"value": 42},
             output_data={"value": 42},
             duration_ms=0,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         from sqlalchemy import select, update
@@ -1894,7 +1997,6 @@ class TestProcessRowNoTransforms:
 
         with pytest.raises(AuditIntegrityError, match="completed_at"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
         with db.connection() as conn:
@@ -1923,11 +2025,11 @@ class TestProcessRowNoTransforms:
         factory.execution.record_completed_node_state(
             token_id=token_id,
             node_id="source-0",
-            run_id="test-run",
             step_index=0,
             input_data={"value": 42},
             output_data={"value": 42},
             duration_ms=0,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         from sqlalchemy import update
@@ -1939,7 +2041,6 @@ class TestProcessRowNoTransforms:
 
         with pytest.raises(AuditIntegrityError, match="conflicting audit evidence"):
             factory.execution.reconcile_source_completions_from_scheduler(
-                run_id="test-run",
                 coordination_token=coordination_token,
             )
 
@@ -1951,7 +2052,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2007,20 +2111,23 @@ class TestProcessRowNoTransforms:
         """Multi-source boundary failures must be attributed to the row's source root."""
         db, factory = _make_factory()
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="secondary-source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         processor = _make_processor(
             factory,
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2090,7 +2197,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2111,7 +2221,7 @@ class TestProcessRowNoTransforms:
 
         with (
             patch("elspeth.engine.processor.run_boundary_checks", side_effect=_raise_source_boundary),
-            patch.object(factory.data_flow, "record_token_outcome", side_effect=LandscapeRecordError("token outcome DB down")),
+            patch.object(factory.data_flow, "record_token_outcome_leader", side_effect=LandscapeRecordError("token outcome DB down")),
             pytest.raises(
                 AuditIntegrityError,
                 match=r"Failed to record SourceGuaranteedFieldsViolation FAILED outcome for token .* on source boundary",
@@ -2137,7 +2247,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2158,7 +2271,7 @@ class TestProcessRowNoTransforms:
 
         with (
             patch("elspeth.engine.processor.run_boundary_checks", side_effect=_raise_source_boundary),
-            patch.object(factory.data_flow, "record_token_outcome", side_effect=ValueError("recorder bug")),
+            patch.object(factory.data_flow, "record_token_outcome_leader", side_effect=ValueError("recorder bug")),
             pytest.raises(ValueError, match="recorder bug"),
         ):
             processor.process_row(
@@ -2178,7 +2291,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2225,7 +2341,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2266,7 +2385,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def _raise_source_boundary(*args: Any, **kwargs: Any) -> None:
             violation = SourceGuaranteedFieldsViolation(
@@ -2327,7 +2449,10 @@ class TestProcessRowNoTransforms:
             source_plugin=self._source_plugin(declared_guaranteed_fields=frozenset({"customer_id"})),
         )
         source_row = _make_source_row({"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             patch(
@@ -2406,7 +2531,7 @@ class TestProcessRowNoTransforms:
         )
 
         with (
-            patch.object(factory.data_flow, "record_token_outcome") as mock_record_token_outcome,
+            patch.object(factory.data_flow, "record_token_outcome_leader") as mock_record_token_outcome,
             patch.object(processor, "_emit_token_completed", side_effect=RuntimeError("telemetry down")),
         ):
             processor._record_flush_violation(fctx, violation)
@@ -2464,7 +2589,7 @@ class TestProcessRowNoTransforms:
         )
 
         with (
-            patch.object(factory.data_flow, "record_token_outcome") as mock_record_token_outcome,
+            patch.object(factory.data_flow, "record_token_outcome_leader") as mock_record_token_outcome,
             patch.object(
                 processor,
                 "_emit_token_completed",
@@ -2519,7 +2644,7 @@ class TestProcessRowNoTransforms:
                 raise LandscapeRecordError("audit DB down")
 
         with (
-            patch.object(factory.data_flow, "record_token_outcome", side_effect=fail_on_second_record),
+            patch.object(factory.data_flow, "record_token_outcome_leader", side_effect=fail_on_second_record),
             pytest.raises(
                 AuditIntegrityError,
                 match=r"Failed to record FAILED outcome for token 'token-b'",
@@ -2610,7 +2735,20 @@ class TestProcessRowNoTransforms:
         processor = _make_processor(factory)
         transform = _make_mock_transform(node_id="filter-1", name="dropper")
         token = make_token_info(row_id="row-drop", token_id="token-drop", data={"value": 1})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "test-run"),
+            node_id="filter-1",
+            plugin_name="dropper",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=_DYNAMIC_SCHEMA,
+        )
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+            work_item=_claim_processor_token(factory, token, node_id="filter-1", run_id="test-run"),
+        )
 
         with (
             patch.object(
@@ -2679,7 +2817,7 @@ class TestProcessRowNoTransforms:
         invariant_failure = RuntimeError("wrong-run token ownership")
 
         with (
-            patch.object(factory.data_flow, "record_token_outcome", side_effect=invariant_failure),
+            patch.object(factory.data_flow, "record_token_outcome_leader", side_effect=invariant_failure),
             patch.object(processor, "_emit_token_completed") as mock_emit,
             pytest.raises(RuntimeError, match="wrong-run token ownership") as exc_info,
         ):
@@ -2715,7 +2853,10 @@ class TestProcessRowSingleTransform:
         transform = _make_mock_transform()
         _db, factory, processor = self._setup(transform)
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         output_data = make_row({"value": 10, "enriched": True})
         success_result = TransformResult.success(
@@ -2750,7 +2891,10 @@ class TestProcessRowSingleTransform:
         transform = _make_mock_transform(on_error="discard")
         _db, factory, processor = self._setup(transform)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         error_result = TransformResult.error(
             {"reason": "test_error"},
@@ -2787,7 +2931,10 @@ class TestProcessRowSingleTransform:
         transform = _make_mock_transform(on_error="errors")
         _db, factory, processor = self._setup(transform)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         error_result = TransformResult.error(
             {"reason": "test_error"},
@@ -2820,7 +2967,10 @@ class TestProcessRowSingleTransform:
         transform = _make_mock_transform()
         _db, factory, processor = self._setup(transform)
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with patch.object(
             processor._transform_executor,
@@ -2905,7 +3055,10 @@ class TestAggregationFailureMatrix:
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="passthrough")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
@@ -2922,7 +3075,7 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
-            patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
+            patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
         ):
             results = processor.process_row(
                 row_index=0,
@@ -2952,7 +3105,10 @@ class TestAggregationFailureMatrix:
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
@@ -2969,7 +3125,7 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
-            patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
+            patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
         ):
             results = processor.process_row(
                 row_index=0,
@@ -2995,7 +3151,10 @@ class TestAggregationFailureMatrix:
         """Passthrough flush requires rows list; rows=None is an invariant violation."""
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="passthrough")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         bad_result = SimpleNamespace(status="success", is_multi_row=True, rows=None)
@@ -3027,7 +3186,10 @@ class TestAggregationFailureMatrix:
         """Passthrough flush must return one output row per buffered input token."""
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="passthrough")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         mismatch_result = TransformResult.success_multi(
@@ -3071,7 +3233,10 @@ class TestAggregationFailureMatrix:
             output_mode="passthrough",
             node_to_next={NodeID("source-0"): agg_node, agg_node: downstream_node, downstream_node: None},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         result = TransformResult.success_multi(
             [make_row({"value": 11}, contract=_make_contract())],
@@ -3113,7 +3278,10 @@ class TestAggregationFailureMatrix:
     def test_timeout_flush_passthrough_terminal_returns_completed(self) -> None:
         """Timeout flush returns terminal COMPLETED results when no downstream/coalesce exists."""
         _db, factory, processor, transform, agg_node = self._setup_batch_processor(output_mode="passthrough")
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         result = TransformResult.success_multi(
             [make_row({"value": 11}, contract=_make_contract())],
@@ -3149,7 +3317,10 @@ class TestAggregationFailureMatrix:
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
         valid_buffered_token = make_token_info(row_id="row-a", token_id="token-valid", data={"value": 1})
         _persist_blocked_scheduler_work(factory, processor, valid_buffered_token, node_id=NodeID("agg-1"), barrier_key="agg-1")
@@ -3216,7 +3387,10 @@ class TestAggregationFailureMatrix:
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         # No quarantined_indices — all tokens are consumed normally.
@@ -3270,7 +3444,10 @@ class TestAggregationFailureMatrix:
         """Count-triggered batch output children must not use a quarantined triggering token as parent."""
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor(output_mode="transform")
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
         valid_buffered_token = make_token_info(row_id="row-a", token_id="token-valid", data={"value": 1})
         _persist_blocked_scheduler_work(factory, processor, valid_buffered_token, node_id=NodeID("agg-1"), barrier_key="agg-1")
@@ -3313,7 +3490,10 @@ class TestAggregationFailureMatrix:
     def test_transform_mode_timeout_flush_expands_from_non_quarantined_parent(self) -> None:
         """Timeout/end-of-source batch output children must not use a quarantined first buffered token as parent."""
         _db, factory, processor, transform, agg_node = self._setup_batch_processor(output_mode="transform")
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         quarantined_token = make_token_info(row_id="row-a", token_id="token-quarantined", data={"value": 1})
         valid_token = make_token_info(row_id="row-b", token_id="token-valid", data={"value": 2})
         _persist_blocked_scheduler_work(
@@ -3449,7 +3629,10 @@ class TestTransformModeOutcomeOrdering:
             expected_output_count=5,  # Will mismatch: transform returns 1 row
         )
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         # Transform returns 1 output row but expected_output_count=5 → RuntimeError
@@ -3498,7 +3681,10 @@ class TestTransformModeOutcomeOrdering:
         """
         _db, factory, processor, transform, _agg_node = self._setup_batch_processor()
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         captured: dict[str, TokenInfo] = {}
 
         flush_result = TransformResult.success(
@@ -3594,7 +3780,10 @@ class TestProcessRowGateBranching:
         """Config gate PROCESSING_NODE jumps should refresh inherited sink from jumped subchain."""
         _db, factory = _make_factory()
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         gate_node = NodeID("cfg-gate-1")
         expander_node = NodeID("expander-2")
@@ -3783,7 +3972,10 @@ class TestProcessRowGateBranching:
     def test_branch_to_sink_routing_applies_for_terminal_fork_children(self) -> None:
         """Branch-routed tokens bypassing coalesce should resolve sink via branch_to_sink."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = TokenInfo(
             row_id="row-1",
             token_id="token-branch-1",
@@ -3821,7 +4013,10 @@ class TestProcessRowGateBranching:
         With fix: children get current_node_id=None, skip the loop, resolve via _branch_to_sink.
         """
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         gate_node = NodeID("gate-1")
         transform_node = NodeID("transform-1")
@@ -3829,22 +4024,22 @@ class TestProcessRowGateBranching:
 
         # Register nodes for FK constraints
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="fork-gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             node_id="gate-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="downstream-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         # Config gate: forks on "true" (always fires)
@@ -3957,7 +4152,10 @@ class TestProcessRowMultiRowOutput:
         """Transform with creates_tokens=True returning multi-row → EXPANDED."""
         _db, factory = _make_factory()
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         contract = _make_contract()
         output_rows = [
@@ -4005,7 +4203,10 @@ class TestProcessRowMultiRowOutput:
         """Transform returning multi-row without creates_tokens=True → RuntimeError."""
         _db, factory = _make_factory()
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         contract = _make_contract()
         output_rows = [
@@ -4116,7 +4317,10 @@ class TestProcessRowMultiRowOutput:
         beyond this note.
         """
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         contract = _make_contract()
         output_rows = [
@@ -4202,7 +4406,10 @@ class TestProcessExistingRow:
 
         contract = _make_contract()
         row_data = make_row({"value": 42}, contract=contract)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # We need a pre-existing row. Create one via process_row first.
         source_row = _make_source_row({"value": 42})
@@ -4244,7 +4451,10 @@ class TestProcessToken:
         _db, factory = _make_factory()
 
         processor = _make_processor(factory)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # Create a token to process
         token = make_token_info(data={"value": 42})
@@ -4272,7 +4482,10 @@ class TestProcessToken:
             node_step_map={NodeID("coalesce::merge"): 1},
             node_to_next={NodeID("coalesce::merge"): None},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = make_token_info(data={"value": 42})
         _persist_token_for_scheduler(factory, token)
 
@@ -4303,7 +4516,10 @@ class TestProcessToken:
             node_to_next={NodeID("coalesce::merge"): NodeID("transform-1"), NodeID("transform-1"): None},
             node_to_plugin={NodeID("transform-1"): transform},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = make_token_info(data={"value": 42})
         _persist_token_for_scheduler(factory, token)
 
@@ -4342,7 +4558,10 @@ class TestDrainWorkQueueIterationGuard:
         _db, factory = _make_factory()
 
         processor = _make_processor(factory)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = make_token_info(data={"value": 1})
         _persist_token_for_scheduler(factory, token)
         produced = 0
@@ -4370,7 +4589,10 @@ class TestDrainWorkQueueIterationGuard:
         """The outer queue guard must not reject the largest supported legal fan-out."""
         _db, factory = _make_factory()
         processor = _make_processor(factory)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = make_token_info(data={"value": 1})
         _persist_token_for_scheduler(factory, token)
         supported_copies = 3
@@ -4415,32 +4637,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-ready",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-ready")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -4451,7 +4673,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         success_result = TransformResult.success(
             make_row({"value": 42, "resumed": True}),
             success_reason={"action": "resume_drain"},
@@ -4489,35 +4714,39 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-parked",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-parked")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         _register_test_worker(factory, "crashed-worker")
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="crashed-worker", lease_seconds=300)
+        claimed = factory.scheduler.claim_ready(
+            lease_owner="crashed-worker",
+            lease_seconds=300,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="crashed-worker"),
+        )
         assert claimed is not None
         persisted_error_hash = error_hash if error_hash is not None else "valid-before-corruption"
         factory.scheduler.mark_pending_sink(
@@ -4531,6 +4760,7 @@ class TestDurableSchedulerResumeDrain:
             # hash diverges from the originally-audited one.
             error_message="",
             expected_lease_owner="crashed-worker",
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="crashed-worker"),
         )
         if error_hash is None:
             from sqlalchemy import update
@@ -4561,7 +4791,10 @@ class TestDurableSchedulerResumeDrain:
 
         stored_hash = "deadbeefdeadbeef"
         _db, _factory, processor = self._seed_parked_on_error_pending_sink(error_hash=stored_hash)
-        ctx = make_context(landscape=_factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=_factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(_factory, "test-run"),
+        )
 
         results = processor.drain_scheduled_work(ctx)
 
@@ -4580,7 +4813,10 @@ class TestDurableSchedulerResumeDrain:
         """An ON_ERROR_ROUTED pending sink with no persisted error hash is
         audit corruption — replay must refuse rather than fabricate a hash."""
         _db, _factory, processor = self._seed_parked_on_error_pending_sink(error_hash=None)
-        ctx = make_context(landscape=_factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=_factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(_factory, "test-run"),
+        )
 
         with pytest.raises(AuditIntegrityError, match="pending_error_hash"):
             processor.drain_scheduled_work(ctx)
@@ -4593,38 +4829,38 @@ class TestDurableSchedulerResumeDrain:
         pending_sink under an evicted owner."""
         from sqlalchemy import select, update
 
-        from elspeth.contracts.errors import RunWorkerEvictedError
+        from elspeth.contracts.errors import RunMembershipLostError
         from elspeth.core.landscape.schema import run_workers_table, token_work_items_table
 
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-ready",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-ready")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4635,7 +4871,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         success_result = TransformResult.success(
             make_row({"value": 42, "resumed": True}),
             success_reason={"action": "resume_drain"},
@@ -4654,7 +4893,7 @@ class TestDurableSchedulerResumeDrain:
 
         with (
             patch.object(processor._transform_executor, "execute_transform", side_effect=executor_side_effect),
-            pytest.raises(RunWorkerEvictedError),
+            pytest.raises(RunMembershipLostError),
         ):
             processor.drain_scheduled_work(ctx)
 
@@ -4672,32 +4911,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-ready",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-ready")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -4707,7 +4946,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         success_result = TransformResult.success(
             make_row({"value": 42, "resumed": True}),
             success_reason={"action": "resume_drain"},
@@ -4749,32 +4991,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-pending",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-pending")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         first_processor = _make_processor(
@@ -4784,7 +5026,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         final_token = TokenInfo(
             row_id=row.row_id,
             token_id=token.token_id,
@@ -4835,32 +5080,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-outcomed-pending",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-outcomed-pending")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         crashed_processor = _make_processor(
@@ -4871,7 +5116,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         final_token = TokenInfo(
             row_id=row.row_id,
             token_id=token.token_id,
@@ -4886,11 +5134,12 @@ class TestDurableSchedulerResumeDrain:
         )
         with patch.object(crashed_processor, "_process_single_token", return_value=(sink_bound_result, [])):
             crashed_processor.drain_scheduled_work(ctx)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id="test-run"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="default",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         resumed_processor = _make_processor(
@@ -4937,37 +5186,41 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         pending_token_ids: list[str] = []
         for idx in range(3):
             source_payload = make_row({"value": idx})
-            row = factory.data_flow.create_row(
-                run_id="test-run",
+            row = factory.data_flow.create_row_with_token(
                 source_node_id="source-0",
                 row_index=idx,
                 source_row_index=idx,
                 ingest_sequence=idx,
                 data=source_payload.to_dict(),
-            )
+                coordination_token=leader_coordination_token(factory, "test-run"),
+            )[0]
             token_id = f"token-pending-{idx}"
             pending_token_ids.append(token_id)
-            token = factory.data_flow.create_token(row.row_id, token_id=token_id)
+            token = factory.data_flow.create_token(
+                row.row_id,
+                token_id=token_id,
+                coordination_token=leader_coordination_token(factory, "test-run"),
+            )
             factory.scheduler.enqueue_ready(
-                run_id="test-run",
                 token_id=token.token_id,
                 row_id=row.row_id,
                 node_id=str(transform_node),
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
 
         # Stage 1: fabricate the durable image left by a leader that drove the
@@ -4983,7 +5236,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def crashed_executor(*, transform, token, ctx, attempt=0):
             return (
@@ -5056,42 +5312,49 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         # Two pre-existing pending-sink rows representing a prior crash image.
         pre_existing_token_ids: list[str] = []
         for idx in range(2):
             source_payload = make_row({"value": idx})
-            row = factory.data_flow.create_row(
-                run_id="test-run",
+            row = factory.data_flow.create_row_with_token(
                 source_node_id="source-0",
                 row_index=idx,
                 source_row_index=idx,
                 ingest_sequence=idx,
                 data=source_payload.to_dict(),
-            )
+                coordination_token=leader_coordination_token(factory, "test-run"),
+            )[0]
             token_id = f"token-pre-{idx}"
             pre_existing_token_ids.append(token_id)
-            token = factory.data_flow.create_token(row.row_id, token_id=token_id)
+            token = factory.data_flow.create_token(
+                row.row_id,
+                token_id=token_id,
+                coordination_token=leader_coordination_token(factory, "test-run"),
+            )
             factory.scheduler.enqueue_ready(
-                run_id="test-run",
                 token_id=token.token_id,
                 row_id=row.row_id,
                 node_id=str(transform_node),
                 step_index=1,
                 ingest_sequence=idx,
                 row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # Stage 1: the first processor pushes the pre-existing rows to
         # PENDING_SINK before the simulated crash window.
@@ -5121,24 +5384,28 @@ class TestDurableSchedulerResumeDrain:
         # will process to completion (ending in PENDING_SINK durably and
         # emitting one sink-bound RowResult).
         fresh_payload = make_row({"value": 99})
-        fresh_row = factory.data_flow.create_row(
-            run_id="test-run",
+        fresh_row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=99,
             source_row_index=99,
             ingest_sequence=99,
             data=fresh_payload.to_dict(),
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         fresh_token_id = "token-fresh"
-        fresh_token = factory.data_flow.create_token(fresh_row.row_id, token_id=fresh_token_id)
+        fresh_token = factory.data_flow.create_token(
+            fresh_row.row_id,
+            token_id=fresh_token_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=fresh_token.token_id,
             row_id=fresh_row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(fresh_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         # Stage 3: a fresh recovery processor drains everything in one call.
@@ -5206,32 +5473,32 @@ class TestDurableSchedulerResumeDrain:
         clock = MockClock(start=1_700_000_000.0)
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 42})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-clock",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-clock")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5243,7 +5510,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             clock=clock,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         success_result = TransformResult.success(
             make_row({"value": 42, "resumed": True}),
             success_reason={"action": "resume_drain"},
@@ -5277,32 +5547,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 43})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-expired",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-expired")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         # The owner is registry-DEAD on the Landscape database clock (ADR-047):
         # its heartbeat lapsed more than the liveness grace window ago, so the
@@ -5314,9 +5584,9 @@ class TestDurableSchedulerResumeDrain:
             heartbeat_expires_at=landscape_database_now(db.engine) - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1),
         )
         claimed = factory.scheduler.claim_ready(
-            run_id="test-run",
             lease_owner="dead-worker",
             lease_seconds=1,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="dead-worker"),
         )
         assert claimed is not None and claimed.lease_expires_at is not None
         # The drain reconciles the row against its CLAIM_READY witness, so the
@@ -5332,7 +5602,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         success_result = TransformResult.success(
             make_row({"value": 43, "resumed": True}),
             success_reason={"action": "expired_lease_recovered"},
@@ -5364,32 +5637,32 @@ class TestDurableSchedulerResumeDrain:
         _db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 99})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-stranded",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-stranded")
         work_item = factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
@@ -5400,7 +5673,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             patch.object(processor, "_process_single_token", return_value=(None, [])),
@@ -5418,14 +5694,14 @@ class TestDurableSchedulerResumeDrain:
         """Direct branch sink routing must survive durable scheduler resume."""
         _db, factory = _make_factory()
         source_payload = make_row({"value": 44})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         token = TokenInfo(
             row_id=row.row_id,
             token_id="token-direct-branch",
@@ -5435,9 +5711,12 @@ class TestDurableSchedulerResumeDrain:
                 LineageFrame(kind=FrameKind.EXPAND, group_id="expand-1", member_key="direct"),
             ),
         )
-        factory.data_flow.create_token(row.row_id, token_id=token.token_id)
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id=token.token_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=None,
@@ -5446,6 +5725,7 @@ class TestDurableSchedulerResumeDrain:
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
             on_success_sink="source_sink",
             lineage_path=token.lineage_path,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         processor = _make_processor(
@@ -5454,7 +5734,10 @@ class TestDurableSchedulerResumeDrain:
             branch_to_sink={BranchName("direct"): "branch_sink"},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.drain_scheduled_work(ctx)
 
@@ -5469,32 +5752,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-failed",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-failed")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5510,7 +5793,10 @@ class TestDurableSchedulerResumeDrain:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with patch.object(processor, "_process_single_token", return_value=(failed_result, [])):
             results = processor.drain_scheduled_work(ctx)
@@ -5537,32 +5823,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-on-error-routed",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-on-error-routed")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default", on_error="errors")
         processor = _make_processor(
@@ -5581,7 +5867,10 @@ class TestDurableSchedulerResumeDrain:
             sink_name="errors",
             error=FailureInfo(exception_type="TransformError", message=f"provider failed: {raw_secret}"),
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with patch.object(processor, "_process_single_token", return_value=(routed_result, [])):
             results = processor.drain_scheduled_work(ctx)
@@ -5619,32 +5908,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-failed-tuple",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-failed-tuple")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5667,7 +5956,10 @@ class TestDurableSchedulerResumeDrain:
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="default",
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with patch.object(processor, "_process_single_token", return_value=((sibling_success, failed_result), [])):
             results = processor.drain_scheduled_work(ctx)
@@ -5688,32 +5980,32 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-claimed-success",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-claimed-success")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5736,7 +6028,10 @@ class TestDurableSchedulerResumeDrain:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with patch.object(processor, "_process_single_token", return_value=((sibling_failure, claimed_success), [])):
             results = processor.drain_scheduled_work(ctx)
@@ -5763,32 +6058,32 @@ class TestDurableSchedulerResumeDrain:
         _db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 46})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-crash",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-crash")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         transform = _make_mock_transform(node_id=str(transform_node), on_success="default")
         processor = _make_processor(
@@ -5798,7 +6093,10 @@ class TestDurableSchedulerResumeDrain:
             node_to_plugin={transform_node: transform},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         with (
             patch.object(processor, "_process_single_token", side_effect=ValueError("transform exploded")),
@@ -5817,22 +6115,22 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce:merge",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id=str(coalesce_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         token = TokenInfo(
             row_id=row.row_id,
@@ -5840,9 +6138,12 @@ class TestDurableSchedulerResumeDrain:
             row_data=source_payload,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-2", member_key="path_a"),),
         )
-        factory.data_flow.create_token(row.row_id, token_id=token.token_id)
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id=token.token_id,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(coalesce_node),
@@ -5852,6 +6153,7 @@ class TestDurableSchedulerResumeDrain:
             lineage_path=token.lineage_path,
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.accept.return_value = CoalesceOutcome(held=True, merged_token=None)
@@ -5864,7 +6166,10 @@ class TestDurableSchedulerResumeDrain:
             coalesce_on_success_map={CoalesceName("merge"): "merged_sink"},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.drain_scheduled_work(ctx)
 
@@ -5916,28 +6221,30 @@ class TestDurableSchedulerResumeDrain:
         Returns the row_id of the forked source row.
         """
         source_payload = make_row({"value": 45})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce:merge",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id=str(coalesce_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         factory.data_flow.create_token(
-            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+            row.row_id,
+            token_id="token-held-a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id="token-held-a",
             row_id=row.row_id,
             node_id=str(coalesce_node),
@@ -5947,6 +6254,7 @@ class TestDurableSchedulerResumeDrain:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         return str(row.row_id)
 
@@ -5977,7 +6285,10 @@ class TestDurableSchedulerResumeDrain:
             "coalesce_on_success_map": {CoalesceName("merge"): "merged_sink"},
         }
         processor1 = _make_processor(factory, coalesce_executor=arrange_executor, **processor_kwargs)
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor1.drain_scheduled_work(ctx)
         assert results == []
@@ -6070,13 +6381,18 @@ class TestDurableSchedulerResumeDrain:
         # Block the row through the production claim path WITHOUT the
         # accept()-written hold node_state (simulates a crash between adoption
         # CAS commit and accept() in _intake_adopt_coalesce_row).
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
+        claimed = factory.scheduler.claim_ready(
+            lease_owner="seeder",
+            lease_seconds=60,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="seeder"),
+        )
         assert claimed is not None
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner="seeder",
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="seeder"),
         )
 
         resumed_executor = self._make_real_coalesce_executor(factory, coalesce_node)
@@ -6113,13 +6429,13 @@ class TestDurableSchedulerResumeDrain:
         source_node = NodeID("source-0")
         agg_node = NodeID("agg-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="agg-transform",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
             config={},
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         transform = _make_mock_transform(node_id=str(agg_node), name="agg-transform", is_batch_aware=True)
         processor = _make_processor(
@@ -6138,7 +6454,10 @@ class TestDurableSchedulerResumeDrain:
             },
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.process_row(
             row_index=0,
@@ -6169,13 +6488,13 @@ class TestDurableSchedulerResumeDrain:
         source_node = NodeID("source-0")
         agg_node = NodeID("agg-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="agg-transform",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
             config={},
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         transform = _make_mock_transform(
             node_id=str(agg_node),
@@ -6200,7 +6519,10 @@ class TestDurableSchedulerResumeDrain:
             },
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         first_results = processor.process_row(
             row_index=0,
@@ -6213,17 +6535,16 @@ class TestDurableSchedulerResumeDrain:
         first_token_id = first_results[0].token.token_id
 
         stray_payload = make_row({"value": 99})
-        stray_row = factory.data_flow.create_row(
-            run_id="test-run",
+        stray_row, stray_token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=99,
             source_row_index=99,
             ingest_sequence=99,
             data=stray_payload.to_dict(),
+            token_id="stray-buffered-token",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        stray_token = factory.data_flow.create_token(stray_row.row_id, token_id="stray-buffered-token")
         stray_work = factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=stray_token.token_id,
             row_id=stray_row.row_id,
             node_id=str(agg_node),
@@ -6231,12 +6552,13 @@ class TestDurableSchedulerResumeDrain:
             ingest_sequence=99,
             row_payload_json=factory.scheduler.serialize_row_payload(stray_payload),
             barrier_key=str(agg_node),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         _register_test_worker(factory, "test-worker")
         stray_claim = factory.scheduler.claim_ready(
-            run_id="test-run",
             lease_owner="test-worker",
             lease_seconds=30,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="test-worker"),
         )
         assert stray_claim is not None
         assert stray_claim.work_item_id == stray_work.work_item_id
@@ -6245,6 +6567,7 @@ class TestDurableSchedulerResumeDrain:
             queue_key=None,
             barrier_key=str(agg_node),
             expected_lease_owner="test-worker",
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="test-worker"),
         )
 
         second_results = processor.process_row(
@@ -6347,7 +6670,10 @@ class TestDurableSchedulerResumeDrain:
             },
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         first_results = processor.process_row(
             row_index=0,
@@ -6469,41 +6795,41 @@ class TestDurableSchedulerResumeDrain:
         db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 1})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-peer-held",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-peer-held")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         # Peer worker A claims the row under its own lease_owner. Lease window
         # is wide enough that ``peer_active_leases`` sees it as unexpired.
         _register_test_worker(factory, "peer-worker-A")
         peer_claim = factory.scheduler.claim_ready(
-            run_id="test-run",
             lease_owner="peer-worker-A",
             lease_seconds=600,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="peer-worker-A"),
         )
         assert peer_claim is not None
         assert peer_claim.lease_owner == "peer-worker-A"
@@ -6517,7 +6843,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # No raise: peer lease is diagnostic, not a refusal.
         results = leader_processor.drain_scheduled_work(ctx)
@@ -6551,40 +6880,40 @@ class TestDurableSchedulerResumeDrain:
         _db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 1})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-stale-peer",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-stale-peer")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         # Crashed peer A held a short lease that has since expired.
         _register_test_worker(factory, "crashed-peer", heartbeat_expires_at=clock.now_utc() - timedelta(seconds=120))
         crashed_claim = factory.scheduler.claim_ready(
-            run_id="test-run",
             lease_owner="crashed-peer",
             lease_seconds=1,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="crashed-peer"),
         )
         assert crashed_claim is not None and crashed_claim.lease_expires_at is not None
         # The drain reconciles the row against its CLAIM_READY witness, so the
@@ -6607,7 +6936,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
             clock=clock,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         def executor_side_effect(*, transform, token, ctx, attempt=0):
             return (success_result, token, None)
@@ -6629,39 +6961,39 @@ class TestDurableSchedulerResumeDrain:
         _db, factory = _make_factory()
         transform_node = NodeID("transform-1")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="resume-transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id=str(transform_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         source_payload = make_row({"value": 1})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=source_payload.to_dict(),
+            token_id="token-self-held",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-self-held")
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(transform_node),
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(source_payload),
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         # The caller's lease_owner pre-claims the row before the drain entry.
         factory.scheduler.claim_ready(
-            run_id="test-run",
             lease_owner=_TEST_LEADER_WORKER_ID,
             lease_seconds=600,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id=_TEST_LEADER_WORKER_ID),
         )
 
         worker_processor = _make_processor(
@@ -6672,7 +7004,10 @@ class TestDurableSchedulerResumeDrain:
             scheduler=factory.scheduler,
             scheduler_lease_owner=_TEST_LEADER_WORKER_ID,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # peer_active_leases must return () because the only LEASED row is
         # owned by the caller; drain must not raise. It will reach the
@@ -6713,7 +7048,10 @@ class TestInnerTraversalCycleGuard:
             node_step_map={NodeID("source-0"): 0, s1: 1, s2: 2},
             structural_node_ids=frozenset({NodeID("source-0"), s1, s2}),
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = make_token_info(data={"value": 1})
 
         with pytest.raises(OrchestrationInvariantError, match=r"Inner traversal exceeded.*Possible cycle"):
@@ -6743,7 +7081,10 @@ class TestExecuteTransformNoRetry:
         _, factory, processor = self._setup()
         transform = _make_mock_transform()
         token = make_token_info(data={"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         expected_result = TransformResult.success(
             make_row({"value": 42}),
             success_reason={"action": "test"},
@@ -7004,12 +7345,12 @@ class TestExecuteTransformNoRetry:
         processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
         register_test_node(factory.data_flow, setup.run_id, "error-sink", node_type=NodeType.SINK, plugin_name="csv")
         factory.data_flow.register_edge(
-            run_id=setup.run_id,
             from_node_id="t1",
             to_node_id="error-sink",
             label="__error_0__",
             mode=RoutingMode.DIVERT,
             edge_id="error-edge-1",
+            coordination_token=leader_coordination_token(factory, setup.run_id),
         )
         transform = _make_mock_transform(node_id="t1", on_error="error-sink")
         token = make_token_info(data={"value": 42})
@@ -7022,16 +7363,18 @@ class TestExecuteTransformNoRetry:
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="t1",
-            run_id=setup.run_id,
             step_index=0,
             input_data=token.row_data.to_dict(),
             state_id="state-retryable-secret",
+            member_token=leader_coordination_token(factory, setup.run_id).membership,
         )
         ctx = make_context(
             run_id=setup.run_id,
             state_id="state-retryable-secret",
             token=token,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, setup.run_id),
+            work_item=_claim_processor_token(factory, token, node_id="t1", run_id=setup.run_id),
         )
         raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 
@@ -7066,6 +7409,12 @@ class TestExecuteTransformNoRetry:
         routing_reason_payload = json.loads(payload_store.retrieve(routing_events[0].reason_ref).decode("utf-8"))
         assert routing_reason_payload["error"] == "<redacted-secret>"
 
+        # Settle the direct executor's claim before taking an immutable export.
+        factory.scheduler.mark_failed(
+            member_token=ctx.require_member_token(),
+            work_item_id=ctx.require_work_item().work_item_id,
+            expected_lease_owner=ctx.require_member_token().worker_id,
+        )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
         export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
@@ -7109,12 +7458,12 @@ class TestExecuteTransformNoRetry:
         register_test_node(factory.data_flow, setup.run_id, "t1", node_type=NodeType.TRANSFORM, plugin_name="llm")
         register_test_node(factory.data_flow, setup.run_id, "error-sink", node_type=NodeType.SINK, plugin_name="csv")
         factory.data_flow.register_edge(
-            run_id=setup.run_id,
             from_node_id="t1",
             to_node_id="error-sink",
             label="__error_0__",
             mode=RoutingMode.DIVERT,
             edge_id="error-edge-1",
+            coordination_token=leader_coordination_token(factory, setup.run_id),
         )
         processor = _make_processor(
             factory,
@@ -7131,7 +7480,11 @@ class TestExecuteTransformNoRetry:
             row_index=0,
             source_row=_make_source_row(),
             transforms=[transform],
-            ctx=make_context(run_id=setup.run_id, landscape=factory.plugin_audit_writer()),
+            ctx=make_context(
+                run_id=setup.run_id,
+                landscape=factory.plugin_audit_writer(),
+                coordination_token=leader_coordination_token(factory, setup.run_id),
+            ),
             source_row_index=0,
             ingest_sequence=0,
         )
@@ -7197,12 +7550,12 @@ class TestExecuteTransformNoRetry:
         register_test_node(factory.data_flow, setup.run_id, "t1", node_type=NodeType.TRANSFORM, plugin_name="llm")
         register_test_node(factory.data_flow, setup.run_id, "error-sink", node_type=NodeType.SINK, plugin_name="csv")
         factory.data_flow.register_edge(
-            run_id=setup.run_id,
             from_node_id="t1",
             to_node_id="error-sink",
             label="__error_0__",
             mode=RoutingMode.DIVERT,
             edge_id="error-edge-1",
+            coordination_token=leader_coordination_token(factory, setup.run_id),
         )
         raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         api_key = "FAKE_TOKEN_PLACEHOLDER"
@@ -7244,6 +7597,8 @@ class TestExecuteTransformNoRetry:
             run_id=setup.run_id,
             token=token,
             landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, setup.run_id),
+            work_item=_claim_processor_token(factory, token, node_id="t1", run_id=setup.run_id),
         )
 
         result, _out_token, error_sink = processor._execute_transform_with_retry(
@@ -7289,6 +7644,12 @@ class TestExecuteTransformNoRetry:
         routing_reason_payload = json.loads(payload_store.retrieve(routing_events[0].reason_ref).decode("utf-8"))
         assert routing_reason_payload == result.reason
 
+        # Settle the direct executor's claim before taking an immutable export.
+        factory.scheduler.mark_failed(
+            member_token=ctx.require_member_token(),
+            work_item_id=ctx.require_work_item().work_item_id,
+            expected_lease_owner=ctx.require_member_token().worker_id,
+        )
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, setup.run_id))
         export_records = list(LandscapeExporter(setup.db).export_run(setup.run_id))
         transform_error_export = next(record for record in export_records if record["record_type"] == "transform_error")
@@ -7691,6 +8052,15 @@ class TestExecuteTransformWithRetry:
         )
         processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
         transform = _make_mock_transform(node_id="t1", on_error=on_error)
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "test-run"),
+            node_id="t1",
+            plugin_name="transform",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=_DYNAMIC_SCHEMA,
+        )
         token = make_token_info(
             data={"value": 42}, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),)
         )
@@ -7709,7 +8079,11 @@ class TestExecuteTransformWithRetry:
             outcome = processor._handle_transform_node(
                 transform=transform,
                 current_token=token,
-                ctx=make_context(),
+                ctx=make_context(
+                    work_item=_claim_processor_token(factory, token, node_id="t1", run_id="test-run"),
+                    landscape=factory.plugin_audit_writer(),
+                    coordination_token=leader_coordination_token(factory, "test-run"),
+                ),
                 node_id=NodeID("t1"),
                 child_items=[],
                 coalesce_node_id=NodeID("coalesce::merge"),
@@ -7729,6 +8103,7 @@ class TestExecuteTransformWithRetry:
             fork_group_id=token.fork_group_id,
             lost_branch=token.branch_name,
             reason="max_retries_exceeded",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         assert len(processor._pending_group_losses) == 1
 
@@ -7844,7 +8219,10 @@ class TestExecuteTransformWithRetry:
 
         transform = _make_mock_transform()
         token = make_token_info(data={"value": 42})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         result = processor._execute_transform_with_retry(
             transform=transform,
@@ -7871,7 +8249,10 @@ class TestExecuteTransformWithRetry:
 
         transform = _make_mock_transform()
         token = make_token_info()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         processor._execute_transform_with_retry(
             transform=transform,
@@ -7956,27 +8337,33 @@ class TestExecuteTransformWithRetry:
         )
         processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="csv",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="error-sink",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         factory.data_flow.register_edge(
-            run_id="test-run",
             from_node_id="t1",
             to_node_id="error-sink",
             label="__error_0__",
             mode=RoutingMode.DIVERT,
             edge_id="error-edge-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         token = make_token_info(data={"value": 42})
         _persist_token_for_scheduler(factory, token)
         shutdown_event = threading.Event()
         shutdown_event.set()
-        ctx = make_context(run_id="test-run", token=token, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id="test-run",
+            token=token,
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+            work_item=_claim_processor_token(factory, token, node_id="t1", run_id="test-run"),
+        )
         ctx.shutdown_event = shutdown_event
 
         with patch.object(processor._transform_executor, "execute_transform") as execute_transform:
@@ -8262,14 +8649,17 @@ class TestMaybeCoalesceToken:
             coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")},
             node_step_map={NodeID("coalesce::merge"): 2},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
         processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
             token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
         )
 
         with (
-            patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
+            patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
             # The intake path emits through the BarrierIntakeCoordinator's
             # construction-bound seam, not the processor attribute.
             patch.object(processor._barrier_intake, "_emit_token_completed") as emit_token_completed,
@@ -8296,16 +8686,20 @@ class TestMaybeCoalesceToken:
         consumption and the claim disposition is gone.
         """
         db, factory = _make_factory()
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={},
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"merged": True})
-        factory.data_flow.create_token(row.row_id, token_id="merged-1")
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id="merged-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = TokenInfo(
             row_id=row.row_id,
             token_id="token-1",
@@ -8323,7 +8717,10 @@ class TestMaybeCoalesceToken:
             node_step_map={NodeID("coalesce::merge"): 3},
             coalesce_on_success_map={CoalesceName("merge"): "output"},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
         processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
             token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
@@ -8362,16 +8759,20 @@ class TestMaybeCoalesceToken:
         the intake pass.
         """
         _, factory = _make_factory()
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={},
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"merged": True})
-        factory.data_flow.create_token(row.row_id, token_id="merged-1")
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id="merged-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = TokenInfo(
             row_id=row.row_id,
             token_id="token-1",
@@ -8389,7 +8790,10 @@ class TestMaybeCoalesceToken:
             node_step_map={NodeID("coalesce::merge"): 3},
             # Intentionally omit coalesce_on_success_map
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
         processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
             token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
@@ -8406,25 +8810,29 @@ class TestMaybeCoalesceToken:
         so the merged token and its row must exist in the audit DB.
         """
         db, factory = _make_factory()
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={},
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce:merge",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id="coalesce::merge",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"merged": True})
-        factory.data_flow.create_token(row.row_id, token_id="merged-1")
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id="merged-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         token = TokenInfo(
             row_id=row.row_id,
             token_id="token-1",
@@ -8442,7 +8850,10 @@ class TestMaybeCoalesceToken:
             node_step_map={NodeID("coalesce::merge"): 2},
             node_to_next={NodeID("coalesce::merge"): NodeID("transform-5")},
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         # Slice 3 re-pin (ADR-030 §E.2): the merge fires from the
         # journal-first intake, not from an in-claim accept.
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
@@ -8494,7 +8905,10 @@ class TestMaybeCoalesceToken:
             row_data=make_row({}),
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         _persist_blocked_scheduler_work(factory, processor, token, node_id=NodeID("coalesce::merge"), barrier_key="merge", adopted=False)
         processor._live_barrier_holds[token.token_id] = _LiveBarrierHold(
             token=token, barrier_key="merge", arrived_monotonic=processor._clock.monotonic()
@@ -8524,31 +8938,33 @@ class TestCompleteCoalesceMerge:
         db, factory = _make_factory()
         coalesce_node = NodeID("coalesce::merge")
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce:merge",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id=str(coalesce_node),
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         payload = make_row({"value": 7})
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data=payload.to_dict(),
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         # One held branch, BLOCKED at the coalesce barrier through the
         # production verbs (enqueue -> claim -> mark_blocked).
         factory.data_flow.create_token(
-            row.row_id, token_id="token-held-a", lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),)
+            row.row_id,
+            token_id="token-held-a",
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         datetime.now(UTC)
         factory.scheduler.enqueue_ready(
-            run_id="test-run",
             token_id="token-held-a",
             row_id=row.row_id,
             node_id=str(coalesce_node),
@@ -8558,14 +8974,20 @@ class TestCompleteCoalesceMerge:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
             coalesce_node_id=str(coalesce_node),
             coalesce_name="merge",
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
-        claimed = factory.scheduler.claim_ready(run_id="test-run", lease_owner="seeder", lease_seconds=60)
+        claimed = factory.scheduler.claim_ready(
+            lease_owner="seeder",
+            lease_seconds=60,
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="seeder"),
+        )
         assert claimed is not None and claimed.token_id == "token-held-a"
         factory.scheduler.mark_blocked(
             work_item_id=claimed.work_item_id,
             queue_key=None,
             barrier_key="merge",
             expected_lease_owner="seeder",
+            member_token=member_token_for(factory._db.engine, run_id="test-run", worker_id="seeder"),
         )
         held_token = TokenInfo(
             row_id=row.row_id,
@@ -8574,7 +8996,12 @@ class TestCompleteCoalesceMerge:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fork-1", member_key="path_a"),),
         )
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"value": 7})
-        factory.data_flow.create_token(row.row_id, token_id="merged-1", join_group_id="join-1")
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id="merged-1",
+            join_group_id="join-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         processor = _make_processor(
             factory,
@@ -8584,7 +9011,10 @@ class TestCompleteCoalesceMerge:
             coalesce_on_success_map={CoalesceName("merge"): "merged_sink"},
             scheduler=factory.scheduler,
         )
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         results = processor.complete_coalesce_merge(
             coalesce_name=CoalesceName("merge"),
@@ -8632,7 +9062,10 @@ class TestResumeIncompleteToken:
     def test_expanded_child_inside_coalesced_branch_resumes_after_expand_node(self) -> None:
         """An expanded branch child must resume after expand, not at branch entry."""
         _, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         branch_first_node = NodeID("branch-first")
@@ -8696,7 +9129,10 @@ class TestResumeIncompleteToken:
         row_union barrier had no resume-start node resolvable and raised.
         """
         _, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         branch_first_node = NodeID("branch-first")
         union_node = NodeID("row_union::variants")
@@ -9028,25 +9464,29 @@ class TestNotifyCoalesceOfLostBranch:
         in the audit DB.
         """
         db, factory = _make_factory()
-        row = factory.data_flow.create_row(
-            run_id="test-run",
+        row = factory.data_flow.create_row_with_token(
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             data={},
-        )
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )[0]
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce:merge",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id="coalesce::merge",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         merged_token = make_token_info(row_id=row.row_id, token_id="merged-1", data={"merged": True})
-        factory.data_flow.create_token(row.row_id, token_id="merged-1")
+        factory.data_flow.create_token(
+            row.row_id,
+            token_id="merged-1",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         coalesce = create_autospec(CoalesceExecutor, instance=True)
         coalesce.notify_branch_lost.return_value = CoalesceOutcome(
             held=False,
@@ -9217,7 +9657,10 @@ class TestRoutingInvariantFailures:
         """Terminal completion must not fall back when no sink can be resolved."""
         _db, factory = _make_factory()
         source_row = _make_source_row({"value": 10})
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         processor = _make_processor(
             factory,
@@ -9493,14 +9936,33 @@ class TestRowUnionBranchLossTelemetry:
             row_union_node_ids={RowUnionName("variants"): union_node},
             branch_to_row_union={BranchName("control"): RowUnionName("variants")},
         )
-        factory.data_flow.create_row("test-run", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="failed-token")
-        state = factory.execution.begin_node_state("failed-token", str(union_node), "test-run", 1, {"a": 1})
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
+        factory.data_flow.create_token(
+            "row-1",
+            token_id="failed-token",
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
+        state = factory.execution.begin_node_state(
+            "failed-token",
+            str(union_node),
+            1,
+            {"a": 1},
+            member_token=leader_coordination_token(factory, "test-run").membership,
+        )
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
             error=ExecutionError(exception="row_union_timeout", exception_type="RowUnionFailureReason"),
             duration_ms=1.0,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
         lost_token = make_token_info(
             row_id="row-1",
@@ -9529,7 +9991,10 @@ class TestTerminalDeaggregationSinkRouting:
         """Children of a terminal multi-row transform must route to transform's on_success."""
         _db, factory = _make_factory()
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         contract = _make_contract()
         output_rows = [
@@ -9591,7 +10056,10 @@ class TestTerminalDeaggregationSinkRouting:
         """Mid-chain multi-row expansion: children continue to downstream transforms."""
         _db, factory = _make_factory()
         source_row = _make_source_row()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         contract = _make_contract()
         output_rows = [
@@ -9675,7 +10143,10 @@ class TestCoalesceTraversalInvariant:
     def test_work_item_downstream_of_coalesce_raises_invariant_error(self) -> None:
         """A work item starting past the coalesce node must raise OrchestrationInvariantError."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         # Build DAG: source → transform → coalesce → downstream
         source_node = NodeID("source-0")
@@ -9685,22 +10156,22 @@ class TestCoalesceTraversalInvariant:
 
         # Register coalesce node for FK constraints
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id="coalesce-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="downstream",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="downstream-3",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         transform = _make_mock_transform(
@@ -9747,19 +10218,22 @@ class TestCoalesceTraversalInvariant:
     def test_work_item_at_coalesce_does_not_raise(self) -> None:
         """A work item starting exactly at the coalesce node should not raise."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         coalesce_node = NodeID("coalesce-1")
 
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="coalesce",
             node_type=NodeType.COALESCE,
             plugin_version="1.0",
             config={},
             node_id="coalesce-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         processor = _make_processor(
@@ -9797,7 +10271,10 @@ class TestCoalesceTraversalInvariant:
 class TestRowUnionTraversalInvariant:
     def test_work_item_downstream_of_row_union_raises_invariant_error(self) -> None:
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         source_node = NodeID("source-0")
         row_union_node = NodeID("row-union-1")
         downstream_node = NodeID("downstream-2")
@@ -9833,7 +10310,10 @@ class TestTerminalWorkItemInvariant:
     def test_none_current_node_without_sink_context_raises(self) -> None:
         """None current_node_id must not default to source_on_success silently."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         processor = _make_processor(factory, source_on_success="source_sink")
         token = make_token_info(data={"value": 1})
 
@@ -9847,7 +10327,10 @@ class TestTerminalWorkItemInvariant:
     def test_none_current_node_with_inherited_sink_is_allowed(self) -> None:
         """Explicit on_success_sink context allows terminal completion with None node."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         processor = _make_processor(factory, source_on_success="source_sink")
         token = make_token_info(data={"value": 1})
 
@@ -9884,19 +10367,22 @@ class TestGateSinkRoutingNotifiesCoalesce:
         sink name is durably recorded on the ROUTED token outcome instead).
         """
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
 
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="router-gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             node_id="gate-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         gate_config = GateSettings(
@@ -9970,24 +10456,28 @@ class TestGateSinkRoutingNotifiesCoalesce:
             fork_group_id="fg-path_a",
             lost_branch="path_a",
             reason="gate_routed_to_sink",
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
     def test_gate_sink_route_with_coalesce_failure_returns_sibling_results(self) -> None:
         """Gate sink routing that triggers coalesce failure returns sibling FAILED results."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
 
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="router-gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             node_id="gate-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         gate_config = GateSettings(
@@ -10075,19 +10565,22 @@ class TestGateSinkRoutingNotifiesCoalesce:
     def test_gate_sink_route_without_branch_skips_coalesce(self) -> None:
         """Gate sink routing a non-fork token does not attempt coalesce notification."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
 
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="router-gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             node_id="gate-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         gate_config = GateSettings(
@@ -10148,19 +10641,22 @@ class TestGateSinkRoutingNotifiesCoalesce:
     def test_gate_discard_records_terminal_discard_outcome(self) -> None:
         """Gate route target 'discard' records a terminal audit outcome without a sink."""
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
 
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="drop-gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
             config={},
             node_id="gate-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         gate_config = GateSettings(
@@ -10192,6 +10688,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             updated_token=token,
             discarded=True,
         )
+        ctx.work_item = _claim_processor_token(factory, token, node_id="gate-1")
 
         with (
             patch.object(processor._gate_executor, "execute_config_gate", return_value=discard_outcome),
@@ -10234,7 +10731,10 @@ class TestGateJumpPastCoalesceInvariant:
         This must raise because the token would never hit the coalesce barrier.
         """
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
@@ -10320,7 +10820,10 @@ class TestGateJumpPastCoalesceInvariant:
 
     def test_gate_jump_past_row_union_raises_invariant_error(self) -> None:
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
         row_union_node = NodeID("row-union::variant_union")
@@ -10382,7 +10885,10 @@ class TestGateJumpPastCoalesceInvariant:
         This is fine — the token still has to pass through the coalesce.
         """
         _db, factory = _make_factory()
-        ctx = make_context(landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, "test-run"),
+        )
 
         source_node = NodeID("source-0")
         gate_node = NodeID("gate-1")
@@ -10589,6 +11095,9 @@ class TestHandleTransformErrorStatusRoutedOnError:
                 current_token=token,
                 error_sink="error-sink",
                 child_items=[],
+                ctx=make_context(
+                    landscape=_factory.plugin_audit_writer(), coordination_token=leader_coordination_token(_factory, "test-run")
+                ),
             )
 
     def test_none_reason_with_error_sink_raises_invariant_error(self) -> None:
@@ -10618,6 +11127,9 @@ class TestHandleTransformErrorStatusRoutedOnError:
                 current_token=token,
                 error_sink="error-sink",
                 child_items=[],
+                ctx=make_context(
+                    landscape=_factory.plugin_audit_writer(), coordination_token=leader_coordination_token(_factory, "test-run")
+                ),
             )
 
     def test_valid_reason_routed_on_error_emits_routed_on_error_with_failure(
@@ -10646,6 +11158,7 @@ class TestHandleTransformErrorStatusRoutedOnError:
             current_token=token,
             error_sink="error-sink",
             child_items=[],
+            ctx=make_context(landscape=_factory.plugin_audit_writer(), coordination_token=leader_coordination_token(_factory, "test-run")),
         )
         result = terminal.result
         assert not isinstance(result, tuple)
@@ -10813,9 +11326,8 @@ class TestReadyEmissionEnqueueParity:
         enqueue_kwargs = dict(captured)
         enqueue_kwargs["available_at"] = pinned_now
         enqueue_kwargs.setdefault("attempt", 1)
-        # worker_id is an enqueue_ready-only membership-fence kwarg; strip it
-        # before projecting through the journal-row mapper which does not accept it.
-        enqueue_kwargs.pop("worker_id", None)
+        # Project the admitted authority into the journal's run identity.
+        enqueue_kwargs["run_id"] = enqueue_kwargs.pop("member_token").run_id
         values_from_enqueue = factory.scheduler._ready_work_item_values(**enqueue_kwargs)
 
         # Mirror _insert_ready_emission's emission -> values mapping exactly.
@@ -10947,13 +11459,13 @@ class TestPendingSinkAttemptOffsetSinkStepScoping:
 
         # Register a sink node so sink-step node_states satisfy the FK.
         factory.data_flow.register_node(
-            run_id="test-run",
             plugin_name="collect-sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "test-run"),
         )
 
         # Audited history: the PRODUCER step retried twice (attempts 0..2)...
@@ -10961,19 +11473,19 @@ class TestPendingSinkAttemptOffsetSinkStepScoping:
             factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=str(producer_node),
-                run_id="test-run",
                 step_index=1,
                 input_data={"value": 42},
                 attempt=attempt,
+                member_token=leader_coordination_token(factory, "test-run").membership,
             )
         # ...while the SINK step only opened attempt 0 (the crashed write).
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="sink-1",
-            run_id="test-run",
             step_index=sink_step,
             input_data={"value": 42},
             attempt=0,
+            member_token=leader_coordination_token(factory, "test-run").membership,
         )
 
         # Discriminator precondition: an UNSCOPED max over all steps WOULD

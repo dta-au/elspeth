@@ -39,6 +39,25 @@ class SchedulerEventType(StrEnum):
     MARK_BLOCKED_BARRIER_TERMINAL = "mark_blocked_barrier_terminal"
 
 
+@dataclass(frozen=True, slots=True)
+class SourceIngestSpec:
+    """Source identity and detached data for one atomic scheduler ingest."""
+
+    source_node_id: str
+    row_index: int
+    source_row_index: int
+    ingest_sequence: int
+    row_id: str
+    token_id: str
+    data: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        require_int(self.row_index, "row_index", min_value=0)
+        require_int(self.source_row_index, "source_row_index", min_value=0)
+        require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
+        freeze_fields(self, "data")
+
+
 @dataclass(frozen=True)
 class BatchMembershipSpec:
     """Aggregation-arm adoption payload: the ``batch_members`` row to write.

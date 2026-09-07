@@ -142,11 +142,11 @@ class GraphRegistrationService:
             # Register nodes with Landscape using graph's node IDs and actual plugin metadata
             register_nodes_with_landscape(
                 factory,
-                run_id,
                 graph,
                 execution_order,
                 audit_metadata_by_node,
                 source_contracts_by_node_id,
+                coordination_token=coordination_token,
             )
             self._record_declared_sources_ready(
                 factory=factory,
@@ -161,7 +161,7 @@ class GraphRegistrationService:
 
             for edge_info in graph.get_edges():
                 edge = factory.data_flow.register_edge(
-                    run_id=run_id,
+                    coordination_token=coordination_token,
                     from_node_id=edge_info.from_node,
                     to_node_id=edge_info.to_node,
                     label=edge_info.label,

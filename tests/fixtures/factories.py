@@ -19,12 +19,14 @@ from unittest.mock import Mock
 
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.coalesce_metadata import CoalesceMetadata
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.node_state_context import (
     PoolConfigSnapshot,
     PoolExecutionContext,
     PoolStatsSnapshot,
     QueryOrderEntry,
 )
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.core.dag.wiring import WiredTransform
 
 if TYPE_CHECKING:
@@ -125,6 +127,9 @@ def make_context(
     config: dict[str, Any] | None = None,
     landscape: Any | None = None,
     node_id: str | None = None,
+    coordination_token: CoordinationToken | None = None,
+    member_token: WorkerMembershipToken | None = None,
+    work_item: TokenWorkItem | None = None,
 ) -> PluginContext:
     """Build a PluginContext with sensible test defaults.
 
@@ -147,6 +152,32 @@ def make_context(
         # so that PluginContext.record_call() token consistency checks pass.
         landscape.get_node_state.return_value = SimpleNamespace(token_id=token.token_id)
 
+        # These values only reach a mock recorder. Real database contexts
+        # must receive authority read back from their registered run/claim.
+        if coordination_token is None and member_token is None:
+            coordination_token = CoordinationToken(run_id=run_id, worker_id="mock-worker", leader_epoch=1)
+        if member_token is None and coordination_token is not None:
+            member_token = coordination_token.membership
+        if work_item is None and member_token is not None:
+            timestamp = datetime.now(UTC)
+            work_item = TokenWorkItem(
+                work_item_id="mock-work-item",
+                run_id=run_id,
+                token_id=token.token_id,
+                row_id=token.row_id,
+                node_id=node_id,
+                step_index=0,
+                ingest_sequence=0,
+                row_payload_json="{}",
+                status=TokenWorkStatus.LEASED,
+                attempt=1,
+                available_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+                lease_owner=member_token.worker_id,
+                lease_expires_at=timestamp,
+            )
+
     return PluginContext(
         run_id=run_id,
         landscape=landscape,
@@ -154,6 +185,9 @@ def make_context(
         config=config or {},
         token=token,
         node_id=node_id,
+        coordination_token=coordination_token,
+        member_token=member_token,
+        work_item=work_item,
     )
 
 
@@ -190,6 +224,7 @@ def make_source_context(
         node_id=setup.source_node_id,
         config={},
         landscape=setup.factory.plugin_audit_writer(),
+        coordination_token=setup.coordination_token,
     )
 
 
@@ -241,13 +276,14 @@ def make_operation_context(
         )
         actual_node_id = node_id
 
-    op = setup.execution.begin_operation(setup.run_id, actual_node_id, operation_type)
+    op = setup.execution.begin_operation(actual_node_id, operation_type, coordination_token=setup.coordination_token)
     return PluginContext(
         run_id=setup.run_id,
         node_id=actual_node_id,
         config={},
         landscape=setup.factory.plugin_audit_writer(),
         operation_id=op.operation_id,
+        coordination_token=setup.coordination_token,
     )
 
 

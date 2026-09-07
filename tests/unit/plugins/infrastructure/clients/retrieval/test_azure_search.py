@@ -11,6 +11,8 @@ import httpx
 import pytest
 import respx
 
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
     AzureSearchProvider,
@@ -18,6 +20,7 @@ from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
 )
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 @dataclass
@@ -31,12 +34,12 @@ class _FakeExecutionRecorder:
     operation_call_indices: dict[str, int] = field(default_factory=dict)
     recorded_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         index = self.call_indices.get(state_id, 0)
         self.call_indices[state_id] = index + 1
         return index
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         index = self.operation_call_indices.get(operation_id, 0)
         self.operation_call_indices[operation_id] = index + 1
         return index
@@ -209,6 +212,7 @@ class TestAzureSearchProviderSearch:
                 "test query",
                 top_k=5,
                 min_score=0.0,
+                **mock_item_audit_authority(),
                 state_id="state-1",
                 token_id="token-1",
             )
@@ -230,6 +234,7 @@ class TestAzureSearchProviderSearch:
                 "test",
                 top_k=5,
                 min_score=0.5,
+                **mock_item_audit_authority(),
                 state_id="state-1",
                 token_id=None,
             )
@@ -240,7 +245,7 @@ class TestAzureSearchProviderSearch:
         provider = self._make_provider()
         with patch.object(provider, "_execute_search", side_effect=RetrievalError("bad json", retryable=False)):
             with pytest.raises(RetrievalError) as exc_info:
-                provider.search("test", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+                provider.search("test", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
             assert not exc_info.value.retryable
 
     def test_server_error_raises_retryable(self):
@@ -251,7 +256,7 @@ class TestAzureSearchProviderSearch:
             side_effect=RetrievalError("server error", retryable=True, status_code=500),
         ):
             with pytest.raises(RetrievalError) as exc_info:
-                provider.search("test", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+                provider.search("test", top_k=5, min_score=0.0, **mock_item_audit_authority(), state_id="s1", token_id=None)
             assert exc_info.value.retryable
             assert exc_info.value.status_code == 500
 
@@ -871,7 +876,7 @@ class TestExecuteSearchHTTP:
             respx.post(self.PINNED_SEARCH_URL).respond(status_code=status_code, json={"error": "Auth failed"})
 
             with pytest.raises(RetrievalError) as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
             assert not exc_info.value.retryable
             assert exc_info.value.status_code == status_code
@@ -885,7 +890,7 @@ class TestExecuteSearchHTTP:
             respx.post(self.PINNED_SEARCH_URL).respond(status_code=429, json={"error": "Rate limited"})
 
             with pytest.raises(RetrievalError) as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
             assert exc_info.value.retryable
             assert exc_info.value.status_code == 429
@@ -899,7 +904,7 @@ class TestExecuteSearchHTTP:
             respx.post(self.PINNED_SEARCH_URL).respond(status_code=500, json={"error": "Internal Server Error"})
 
             with pytest.raises(RetrievalError) as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
             assert exc_info.value.retryable
             assert exc_info.value.status_code == 500
@@ -917,7 +922,7 @@ class TestExecuteSearchHTTP:
         with respx.mock:
             respx.post(self.PINNED_SEARCH_URL).respond(status_code=200, json=response_body)
 
-            result = provider._execute_search("test query", top_k=5, state_id="s1", token_id="t1")
+            result = provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id="t1")
 
         assert result == response_body
 
@@ -936,7 +941,7 @@ class TestExecuteSearchHTTP:
         ):
             route = respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json=response_body))
 
-            result = provider._execute_search("test query", top_k=5, state_id="s1", token_id="t1")
+            result = provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id="t1")
 
         assert result == response_body
         assert credential.scopes == [("https://search.azure.com/.default",)]
@@ -959,7 +964,7 @@ class TestExecuteSearchHTTP:
             route = respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json={"value": []}))
 
             with pytest.raises(RetrievalError, match="Azure managed identity token acquisition failed") as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id="t1")
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id="t1")
 
         assert not exc_info.value.retryable
         assert exc_info.value.__cause__ is auth_error
@@ -980,8 +985,8 @@ class TestExecuteSearchHTTP:
         ):
             respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json=response_body))
 
-            provider._execute_search("first query", top_k=5, state_id="s1", token_id="t1")
-            provider._execute_search("second query", top_k=5, state_id="s2", token_id="t2")
+            provider._execute_search("first query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id="t1")
+            provider._execute_search("second query", top_k=5, **mock_item_audit_authority(), state_id="s2", token_id="t2")
             provider.close()
 
         credential_cls.assert_called_once_with()
@@ -997,6 +1002,7 @@ class TestExecuteSearchHTTP:
 
     def test_execute_search_updates_audit_context_with_token(self) -> None:
         provider = self._make_provider()
+        authority = mock_item_audit_authority()
         response_body = {
             "value": [
                 {"@search.score": 5.0, "content": "Result 1", "id": "doc1"},
@@ -1009,10 +1015,10 @@ class TestExecuteSearchHTTP:
         ):
             respx.post(self.PINNED_SEARCH_URL).respond(status_code=200, json=response_body)
 
-            result = provider._execute_search("test query", top_k=5, state_id="state-99", token_id="token-99")
+            result = provider._execute_search("test query", top_k=5, **authority, state_id="state-99", token_id="token-99")
 
         assert result == response_body
-        update_context.assert_called_once_with("state-99", "token-99")
+        update_context.assert_called_once_with("state-99", "token-99", **authority)
 
     def test_execute_search_uses_ssrf_pinned_post_connection(self) -> None:
         provider = self._make_provider()
@@ -1029,7 +1035,7 @@ class TestExecuteSearchHTTP:
             ip_route = respx.post(self.PINNED_SEARCH_URL).mock(return_value=httpx.Response(200, json=response_body))
             hostname_route = respx.post(self.SEARCH_URL).mock(return_value=httpx.Response(200, json={"value": []}))
 
-            result = provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+            result = provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert result == response_body
         assert ip_route.called, "Search POST must connect to the validated pinned IP"
@@ -1043,7 +1049,7 @@ class TestExecuteSearchHTTP:
             patch.object(provider._http_client, "request_ssrf_safe") as mock_request,
             pytest.raises(RetrievalError, match="blocked by SSRF validation") as exc_info,
         ):
-            provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+            provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert not exc_info.value.retryable
         mock_request.assert_not_called()
@@ -1063,7 +1069,7 @@ class TestExecuteSearchHTTP:
             respx.post(self.PINNED_SEARCH_URL).mock(side_effect=transport_error)
 
             with pytest.raises(RetrievalError, match="Search request failed") as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
         assert exc_info.value.retryable
         assert exc_info.value.__cause__ is transport_error
@@ -1081,6 +1087,6 @@ class TestExecuteSearchHTTP:
             )
 
             with pytest.raises(RetrievalError, match="Malformed JSON") as exc_info:
-                provider._execute_search("test query", top_k=5, state_id="s1", token_id=None)
+                provider._execute_search("test query", top_k=5, **mock_item_audit_authority(), state_id="s1", token_id=None)
 
             assert not exc_info.value.retryable

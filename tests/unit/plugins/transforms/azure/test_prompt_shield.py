@@ -1321,7 +1321,7 @@ class TestPromptShieldInternalProcessing:
         row_data = {"prompt": "test", "id": 1}
         row = make_pipeline_row(row_data)
 
-        result = transform._process_single_with_state(row, "test-state-id")
+        result = transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
         assert result.status == "success"
         assert mock_httpx_client.post.call_count == 2
@@ -1386,6 +1386,7 @@ class TestPromptShieldInternalProcessing:
             field_name: str,
             state_id: str,
             *,
+            ctx: Any,
             token_id: str | None = None,
         ) -> TransformResult | None:
             del value, state_id, token_id
@@ -1425,6 +1426,7 @@ class TestPromptShieldInternalProcessing:
         result = transform._process_single_with_state(
             make_pipeline_row({"first": "one", "second": "two"}),
             "state-id",
+            ctx=make_context(),
         )
 
         assert result.status == "error"
@@ -1459,6 +1461,7 @@ class TestPromptShieldInternalProcessing:
             field_name: str,
             state_id: str,
             *,
+            ctx: Any,
             token_id: str | None = None,
         ) -> TransformResult | None:
             del value, field_name, state_id, token_id
@@ -1485,7 +1488,7 @@ class TestPromptShieldInternalProcessing:
         monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time", _NoSleepAllowedTime())
         monkeypatch.setattr(transform, "_analyze_field_once", fake_analyze_once)
 
-        result = transform._analyze_field_with_capacity_retry("text", "prompt", "state-id")
+        result = transform._analyze_field_with_capacity_retry("text", "prompt", "state-id", ctx=make_context())
 
         assert result is not None
         assert result.status == "error"
@@ -1512,7 +1515,7 @@ class TestPromptShieldInternalProcessing:
 
         row_data = {"prompt": "test", "id": 1}
         row = make_pipeline_row(row_data)
-        result = transform._process_single_with_state(row, "test-state-id")
+        result = transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
         assert result.status == "error"
         assert result.reason is not None
@@ -1543,7 +1546,7 @@ class TestPromptShieldInternalProcessing:
         row_data = {"prompt": "test", "id": 1}
         row = make_pipeline_row(row_data)
         with pytest.raises(PluginRetryableError, match="network error"):
-            transform._process_single_with_state(row, "test-state-id")
+            transform._process_single_with_state(row, "test-state-id", ctx=ctx)
 
 
 class TestResourceCleanup:

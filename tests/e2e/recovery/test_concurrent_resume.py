@@ -58,10 +58,11 @@ from sqlalchemy import insert, select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import SchedulerEventType, SourceIngestSpec, TokenWorkStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     node_states_table,
     rows_table,
@@ -128,34 +129,29 @@ class TestMidClaimCrashResume:
         row_id = "row-source-completion-seam"
         token_id = "token-source-completion-seam"
 
-        def insert_pre_fix_ingress(conn: Any) -> tuple[Any, Any]:
-            # This closure is the exact pre-fix TS-02 body: row + token only.
-            # The process dies immediately after the composed scheduler verb
-            # commits and before its later standalone source-state insert.
-            return crashed.factory.data_flow.insert_row_with_token_on(
-                conn,
-                run_id=crashed.run_id,
-                source_node_id=crashed.source_node_id,
-                row_index=3,
-                data=data,
-                source_row_index=3,
-                ingest_sequence=3,
-                row_id=row_id,
-                token_id=token_id,
+        # Recreate the pre-fix crash image by omitting its later source-state
+        # write, while the real typed ingest atomically commits row/token/claim.
+        with patch.object(crashed.factory.execution, "record_completed_node_state_on", return_value=None) as source_completion:
+            _row, _token, admitted = crashed.repo.ingest_row_with_initial_claim(
+                coordination_token=old_token,
+                source=SourceIngestSpec(
+                    source_node_id=crashed.source_node_id,
+                    row_index=3,
+                    data=data,
+                    source_row_index=3,
+                    ingest_sequence=3,
+                    row_id=row_id,
+                    token_id=token_id,
+                ),
+                data_flow=crashed.factory.data_flow,
+                execution=crashed.factory.execution,
+                node_id=crashed.journal_node_id,
+                step_index=crashed.journal_step_index,
+                row_payload_json=crashed.repo.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
+                lease_owner=old_leader,
+                lease_seconds=1,
             )
-
-        _row, _token, admitted = crashed.repo.ingest_row_with_initial_claim(
-            coordination_token=old_token,
-            insert_row_and_token=insert_pre_fix_ingress,
-            token_id=token_id,
-            row_id=row_id,
-            node_id=crashed.journal_node_id,
-            step_index=crashed.journal_step_index,
-            ingest_sequence=3,
-            row_payload_json=crashed.repo.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-            lease_owner=old_leader,
-            lease_seconds=1,
-        )
+        source_completion.assert_called_once()
         assert admitted.status is TokenWorkStatus.LEASED and admitted.lease_expires_at is not None
         assert admitted.attempt == 1
         # The resume reconciles this initial claim against its CLAIM_READY
@@ -256,6 +252,8 @@ class TestMidClaimCrashResume:
         with (
             patch.object(ExecutionRepository, "reconcile_source_completions_from_scheduler", new=reconcile_then_crash),
             patch("elspeth.engine.orchestrator.resume.RunHeartbeatThread", _KilledProcessHeartbeat),
+            # A real process kill cannot execute the BaseException seat cleanup.
+            patch.object(RunCoordinationRepository, "release_seat", return_value=None) as killed_release,
             patch.object(transform_crash, "process", wraps=transform_crash.process) as crash_transform_process,
             pytest.raises(_CrashAfterSourceRepair),
         ):
@@ -265,6 +263,7 @@ class TestMidClaimCrashResume:
                 graph_crash,
                 payload_store=crashed.payload_store,
             )
+        killed_release.assert_called_once()
 
         # The repair transaction committed, but the process died before the
         # scheduler recovery sweep or any plugin call. A second public resume

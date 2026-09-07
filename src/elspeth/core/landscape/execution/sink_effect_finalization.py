@@ -34,7 +34,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
-from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -311,26 +311,30 @@ class SinkEffectFinalization:
         if operation_result.rowcount != 1:
             raise LandscapeRecordError("sink effect operation completion CAS lost")
 
-        outcome_ids: list[str] = []
         member_by_ordinal = {int(member.ordinal): member for member in members}
         state_ids = dict(current_state_ids)
-        for finalization_member in request.members:
-            durable_member = member_by_ordinal[finalization_member.ordinal]
-            outcome_ids.append(
-                self._outcomes.record_token_outcome(
-                    TokenRef(token_id=str(durable_member.token_id), run_id=str(effect.run_id)),
-                    finalization_member.outcome,
-                    finalization_member.path,
+        outcome_ids = self._outcomes.record_token_outcomes_on(
+            conn,
+            run_id=str(effect.run_id),
+            outcomes=[
+                TokenOutcomeWrite(
+                    ref=TokenRef(
+                        token_id=str(member_by_ordinal[finalization_member.ordinal].token_id),
+                        run_id=str(effect.run_id),
+                    ),
+                    outcome=finalization_member.outcome,
+                    path=finalization_member.path,
                     sink_name=finalization_member.sink_name,
                     sink_node_id=str(effect.sink_node_id),
                     artifact_id=artifact.artifact_id,
                     batch_id=finalization_member.batch_id,
                     error_hash=finalization_member.error_hash,
                     context=finalization_member.context,
-                    conn=conn,
-                    dependencies_prelocked=True,
                 )
-            )
+                for finalization_member in request.members
+            ],
+            dependencies_prelocked=True,
+        )
 
         # One executemany UPDATE stamps every member's final disposition; the
         # fencing gate forbids a DML construction inside a loop, and an

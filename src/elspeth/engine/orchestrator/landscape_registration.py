@@ -154,11 +154,12 @@ def resolve_source_contracts_by_node_id(
 
 def register_nodes_with_landscape(
     factory: RecorderFactory,
-    run_id: str,
     graph: ExecutionGraph,
     execution_order: list[str],
     audit_metadata_by_node: Mapping[NodeID, NodeAuditMetadata],
     source_contracts_by_node_id: Mapping[NodeID, SchemaContract | None],
+    *,
+    coordination_token: CoordinationToken,
 ) -> None:
     """Register each node in the execution graph with Landscape.
 
@@ -168,7 +169,7 @@ def register_nodes_with_landscape(
 
     Args:
         factory: RecorderFactory for audit trail.
-        run_id: Run identifier.
+        coordination_token: Acquired run leadership authority.
         graph: Execution graph (for node info lookup).
         execution_order: Topological ordering of node IDs.
         audit_metadata_by_node: Pre-resolved plugin/engine metadata by node ID.
@@ -200,7 +201,7 @@ def register_nodes_with_landscape(
                 raise FrameworkBugError(f"Source node '{node_id}' has no resolved output contract entry.") from exc
 
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=coordination_token,
             node_id=node_id,
             plugin_name=node_info.plugin_name,
             node_type=NodeType(node_info.node_type),  # Already lowercase
@@ -215,7 +216,6 @@ def register_nodes_with_landscape(
 
 def record_schema_contract(
     factory: RecorderFactory,
-    run_id: str,
     source_id: NodeID,
     ctx: PluginContext,
     *,
@@ -245,7 +245,7 @@ def record_schema_contract(
         coordination_token=coordination_token,
     )
     # Update source node's output_contract (was NULL at registration)
-    factory.data_flow.update_node_output_contract(run_id, source_id, schema_contract)
+    factory.data_flow.update_node_output_contract(source_id, schema_contract, member_token=coordination_token.membership)
     # Make contract available to transforms via context
     ctx.contract = schema_contract
     return True

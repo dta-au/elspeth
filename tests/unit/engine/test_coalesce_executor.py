@@ -23,11 +23,14 @@ import pytest
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.barrier_scalars import CoalescePendingScalars
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, GroupSettlementReason, NodeStateStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CoalesceCollisionError,
     OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
 )
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.identity import LineageFrame
@@ -49,6 +52,8 @@ from elspeth.engine.coalesce_executor import (
     build_coalesce_merge,
 )
 from elspeth.testing import make_field, make_row
+
+_COORDINATION_TOKEN = CoordinationToken(run_id="run_1", worker_id="mock-worker", leader_epoch=1)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -154,7 +159,7 @@ def _coalesce_tokens_impl(
     parents: list[TokenInfo],
     merged_data: PipelineRow,
     node_id: NodeID,
-    run_id: str,
+    coordination_token: CoordinationToken,
     **_kwargs: Any,
 ) -> tuple[TokenInfo, str]:
     join_group_id = f"join_{uuid4().hex[:8]}"
@@ -621,7 +626,7 @@ class TestAcceptBasics:
         executor, *_ = _make_executor()
         token = _make_token(branch_name="a")
         with pytest.raises(OrchestrationInvariantError, match="not registered"):
-            executor.accept(token, "nonexistent")
+            executor.accept(token, "nonexistent", coordination_token=_COORDINATION_TOKEN)
 
     def test_token_without_branch_raises(self):
         executor, *_ = _make_executor()
@@ -632,29 +637,29 @@ class TestAcceptBasics:
             row_data=make_row({"amount": 1}),
         )
         with pytest.raises(OrchestrationInvariantError, match="no branch_name"):
-            executor.accept(token, "merge")
+            executor.accept(token, "merge", coordination_token=_COORDINATION_TOKEN)
 
     def test_unexpected_branch_raises(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), "node_1")
         token = _make_token(branch_name="c")
         with pytest.raises(OrchestrationInvariantError, match="not in expected branches"):
-            executor.accept(token, "merge")
+            executor.accept(token, "merge", coordination_token=_COORDINATION_TOKEN)
 
     def test_duplicate_arrival_raises(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
         t1 = _make_token(branch_name="a", token_id="tok_1")
         t2 = _make_token(branch_name="a", token_id="tok_2")
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(OrchestrationInvariantError, match="Duplicate arrival"):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
     def test_first_token_held(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
         token = _make_token(branch_name="a")
-        outcome = executor.accept(token, "merge")
+        outcome = executor.accept(token, "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome.held is True
         assert outcome.merged_token is None
 
@@ -662,7 +667,7 @@ class TestAcceptBasics:
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(name="my_merge"), "node_1")
         token = _make_token(branch_name="a")
-        outcome = executor.accept(token, "my_merge")
+        outcome = executor.accept(token, "my_merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome.coalesce_name == "my_merge"
 
     def test_sibling_fork_groups_sharing_row_id_are_distinct_pending_groups(self):
@@ -699,12 +704,14 @@ class TestAcceptBasics:
         t_bl = _sibling_token("t-bl", "g-fork-b", "left")
         t_br = _sibling_token("t-br", "g-fork-b", "right")
 
-        o1 = executor.accept(t_al, "merge_x")
+        o1 = executor.accept(t_al, "merge_x", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
-        o2 = executor.accept(t_bl, "merge_x")  # OLD key: raises "Duplicate arrival for branch 'left'"
+        o2 = executor.accept(
+            t_bl, "merge_x", coordination_token=_COORDINATION_TOKEN
+        )  # OLD key: raises "Duplicate arrival for branch 'left'"
         assert o2.held is True
-        merged_a = executor.accept(t_ar, "merge_x")
-        merged_b = executor.accept(t_br, "merge_x")
+        merged_a = executor.accept(t_ar, "merge_x", coordination_token=_COORDINATION_TOKEN)
+        merged_b = executor.accept(t_br, "merge_x", coordination_token=_COORDINATION_TOKEN)
         assert merged_a.merged_token is not None
         assert merged_b.merged_token is not None
         assert merged_a.merged_token.token_id != merged_b.merged_token.token_id
@@ -726,17 +733,17 @@ class TestRequireAllPolicy:
 
     def test_two_branches_first_held_second_merges(self):
         executor, _, _, _, _ = self._setup()
-        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is False
         assert o2.merged_token is not None
 
     def test_three_branches(self):
         executor, _, _, _, _ = self._setup(branches=["a", "b", "c"])
-        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
-        o3 = executor.accept(_make_token(branch_name="c", token_id="t3"), "merge")
+        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o3 = executor.accept(_make_token(branch_name="c", token_id="t3"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is True
         assert o3.held is False
@@ -744,8 +751,8 @@ class TestRequireAllPolicy:
 
     def test_merged_token_in_outcome(self):
         executor, _, _, _, _ = self._setup()
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.merged_token is not None
         assert o.merged_token.row_id == "row_1"
         assert o.join_group_id is not None
@@ -754,15 +761,15 @@ class TestRequireAllPolicy:
         executor, _, _, _, _ = self._setup()
         t1 = _make_token(branch_name="a", token_id="t1")
         t2 = _make_token(branch_name="b", token_id="t2")
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         consumed_ids = {t.token_id for t in o.consumed_tokens}
         assert consumed_ids == {"t1", "t2"}
 
     def test_coalesce_metadata(self):
         executor, _, _, _, _ = self._setup()
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         md = o.coalesce_metadata
         assert md.policy == CoalescePolicy.REQUIRE_ALL
         assert md.merge_strategy == MergeStrategy.UNION
@@ -771,22 +778,22 @@ class TestRequireAllPolicy:
 
     def test_audit_begin_node_state_for_each_token(self):
         executor, execution, _, _, _ = self._setup()
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         # begin_node_state called once per accepted token
         assert execution.begin_node_state.call_count == 2
 
     def test_audit_complete_node_state_completed(self):
         executor, _, _, token_manager, _ = self._setup()
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         completions = token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]
         assert len(completions) == 2
 
     def test_audit_record_token_outcome_coalesced(self):
         executor, _, _, token_manager, _ = self._setup()
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         completions = token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]
         assert {item.parent_ref.token_id for item in completions} == {"t1", "t2"}
 
@@ -798,9 +805,13 @@ class TestRequireAllPolicy:
         executor.register_coalesce(settings, "node_1", output_schema=observed_contract)
         del executor._output_schemas["merge"]
 
-        executor.accept(_make_token(branch_name="a", token_id="t1", contract=observed_contract), "merge")
+        executor.accept(
+            _make_token(branch_name="a", token_id="t1", contract=observed_contract), "merge", coordination_token=_COORDINATION_TOKEN
+        )
         with pytest.raises(OrchestrationInvariantError, match=r"output schema.*merge"):
-            executor.accept(_make_token(branch_name="b", token_id="t2", contract=observed_contract), "merge")
+            executor.accept(
+                _make_token(branch_name="b", token_id="t2", contract=observed_contract), "merge", coordination_token=_COORDINATION_TOKEN
+            )
 
         assert tm.coalesce_tokens.call_count == 0
 
@@ -814,11 +825,11 @@ class TestRequireAllPolicy:
             output_schema=SchemaContract(mode="OBSERVED", fields=(), locked=False),
         )
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        outcome = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         assert outcome.merged_token is not None
-        assert data_flow.record_token_outcome.call_count == 0
+        assert data_flow.record_token_outcome_leader.call_count == 0
         completions = token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]
         assert {item.parent_ref.token_id for item in completions} == {"t1", "t2"}
 
@@ -832,22 +843,40 @@ class TestRequireAllPolicy:
             output_schema=SchemaContract(mode="OBSERVED", fields=(), locked=False),
         )
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        outcome = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         assert outcome.merged_token is not None
-        assert data_flow.record_token_outcome.call_count == 0
+        assert data_flow.record_token_outcome_leader.call_count == 0
         completions = token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]
         assert {item.parent_ref.token_id for item in completions} == {"t1", "t2"}
+
+    @pytest.mark.parametrize("membership_lost", [False, True])
+    def test_merge_authority_refusal_leaves_pending_attempt_without_failure_writes(self, membership_lost: bool) -> None:
+        executor, execution, data_flow, token_manager, _ = self._setup()
+        failure = (
+            RunMembershipLostError(run_id="run_1", worker_id="mock-worker", verb="coalesce_tokens")
+            if membership_lost
+            else RunLeadershipLostError(run_id="run_1", worker_id="mock-worker", leader_epoch=1, verb="coalesce_tokens")
+        )
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        token_manager.coalesce_tokens.side_effect = failure
+        with pytest.raises(type(failure)) as caught:
+            executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        assert caught.value is failure
+        execution.complete_node_state.assert_not_called()
+        data_flow.record_token_outcome_leader.assert_not_called()
+        assert executor._pending
 
     def test_token_manager_coalesce_tokens_called(self):
         executor, _, _, tm, _ = self._setup()
         t1 = _make_token(branch_name="a", token_id="t1")
         t2 = _make_token(branch_name="b", token_id="t2")
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         tm.coalesce_tokens.assert_called_once()
         kw = tm.coalesce_tokens.call_args.kwargs
+        assert kw["coordination_token"] is _COORDINATION_TOKEN
         assert kw["node_id"] == "node_1"
         parent_ids = {p.token_id for p in kw["parents"]}
         assert parent_ids == {"t1", "t2"}
@@ -864,7 +893,7 @@ class TestFirstPolicy:
         s = _settings(policy="first")
         executor.register_coalesce(s, "node_1")
         t = _make_token(branch_name="a", token_id="t1")
-        o = executor.accept(t, "merge")
+        o = executor.accept(t, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.held is False
         assert o.merged_token is not None
 
@@ -873,7 +902,7 @@ class TestFirstPolicy:
         s = _settings(policy="first")
         executor.register_coalesce(s, "node_1")
         t = _make_token(branch_name="a", token_id="t1")
-        o = executor.accept(t, "merge")
+        o = executor.accept(t, "merge", coordination_token=_COORDINATION_TOKEN)
         assert len(o.consumed_tokens) == 1
         assert o.consumed_tokens[0].token_id == "t1"
 
@@ -881,8 +910,8 @@ class TestFirstPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="first")
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.held is False
         assert o.failure_reason == "late_arrival_after_merge"
 
@@ -897,8 +926,8 @@ class TestQuorumPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="quorum", quorum_count=2)
         executor.register_coalesce(s, "node_1")
-        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is False
         assert o2.merged_token is not None
@@ -907,16 +936,16 @@ class TestQuorumPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="quorum", quorum_count=2)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
-        o = executor.accept(_make_token(branch_name="c", token_id="t3"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(_make_token(branch_name="c", token_id="t3"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.failure_reason == "late_arrival_after_merge"
 
     def test_quorum_of_one_triggers_like_first(self):
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b"], policy="quorum", quorum_count=1)
         executor.register_coalesce(s, "node_1")
-        o = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        o = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.held is False
         assert o.merged_token is not None
 
@@ -932,7 +961,7 @@ class TestBestEffortPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        o = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        o = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.held is True
 
     def test_merges_when_all_accounted_for(self):
@@ -940,9 +969,9 @@ class TestBestEffortPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Notify branch b lost
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.merged_token is not None
 
@@ -951,8 +980,8 @@ class TestBestEffortPolicy:
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is False
         assert o2.merged_token is not None
@@ -967,11 +996,11 @@ class TestLateArrival:
     def test_late_arrival_outcome(self):
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         # A new token with same row_id arriving at same coalesce is a late arrival
         late_token = _make_token(branch_name="a", token_id="t_late", row_id="row_1")
-        o = executor.accept(late_token, "merge")
+        o = executor.accept(late_token, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.held is False
         assert o.failure_reason == "late_arrival_after_merge"
 
@@ -981,12 +1010,12 @@ class TestLateArrival:
         settlement channel now."""
         executor, execution, data_flow, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         execution.reset_mock()
         data_flow.reset_mock()
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_1")
-        executor.accept(late, "merge")
+        executor.accept(late, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Should begin + complete with FAILED
         execution.begin_node_state.assert_called_once()
@@ -995,25 +1024,25 @@ class TestLateArrival:
         assert fail_call.kwargs["status"] == NodeStateStatus.FAILED
 
         # Must NOT record the terminal token outcome itself anymore.
-        assert data_flow.record_token_outcome.call_count == 0
+        assert data_flow.record_token_outcome_leader.call_count == 0
 
     def test_late_arrival_consumed_tokens(self):
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_1")
-        o = executor.accept(late, "merge")
+        o = executor.accept(late, "merge", coordination_token=_COORDINATION_TOKEN)
         assert len(o.consumed_tokens) == 1
         assert o.consumed_tokens[0].token_id == "t_late"
 
     def test_late_arrival_metadata_has_policy(self):
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_1")
-        o = executor.accept(late, "merge")
+        o = executor.accept(late, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.policy == CoalescePolicy.REQUIRE_ALL
         assert o.coalesce_metadata.reason is not None
 
@@ -1029,8 +1058,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert d["x"] == 1
@@ -1041,8 +1070,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         assert merged_data.to_dict()["shared"] == "from_b"
 
@@ -1051,8 +1080,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.union_field_collisions is not None
         assert "shared" in o.coalesce_metadata.union_field_collisions
 
@@ -1062,8 +1091,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.union_field_collisions is None
 
     def test_collision_tracks_all_contributing_branches(self):
@@ -1074,9 +1103,9 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"f": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"f": 2})
         t3 = _make_token(branch_name="c", token_id="t3", data={"f": 3})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
-        o = executor.accept(t3, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t3, "merge", coordination_token=_COORDINATION_TOKEN)
         collision_branches = o.coalesce_metadata.union_field_collisions["f"]
         assert "a" in collision_branches
         assert "b" in collision_branches
@@ -1094,9 +1123,9 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
         t3 = _make_token(branch_name="c", token_id="t3", data={"z": 3})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
-        o = executor.accept(t3, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t3, "merge", coordination_token=_COORDINATION_TOKEN)
         origins = o.coalesce_metadata.union_field_origins
         assert origins is not None
         assert origins["x"] == "a"
@@ -1110,8 +1139,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.union_field_collisions == {"shared": ("a", "b")}
         assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
         # Default last_wins: winner in merged data is the last branch.
@@ -1124,8 +1153,8 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "secret-from-a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "secret-from-b"})
 
-        executor.accept(t1, "merge")
-        outcome = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         serialized = outcome.coalesce_metadata.to_dict()
         serialized_json = json.dumps(serialized, sort_keys=True)
@@ -1145,9 +1174,9 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"f": "va"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"f": "vb"})
         t3 = _make_token(branch_name="c", token_id="t3", data={"f": "vc"})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
-        o = executor.accept(t3, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t3, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.union_field_collisions == {"f": ("a", "b", "c")}
         assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
 
@@ -1157,8 +1186,8 @@ class TestUnionMerge:
         executor.register_coalesce(_settings(branches=["a", "b"], merge="union"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1, "y": 2})
         t2 = _make_token(branch_name="b", token_id="t2", data={"z": 3})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         origins = o.coalesce_metadata.union_field_origins
         assert origins == {"x": "a", "y": "a", "z": "b"}
 
@@ -1182,8 +1211,8 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged = tm.coalesce_tokens.call_args.kwargs["merged_data"].to_dict()
         assert merged["shared"] == "from_b"
         assert o.coalesce_metadata.union_field_origins["shared"] == "b"
@@ -1203,8 +1232,8 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged = tm.coalesce_tokens.call_args.kwargs["merged_data"].to_dict()
         assert merged["shared"] == "from_a"
         # Origins reflect the winner.
@@ -1225,9 +1254,9 @@ class TestUnionMerge:
         t1 = _make_token(branch_name="a", token_id="t1", data={"f": "va"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"f": "vb"})
         t3 = _make_token(branch_name="c", token_id="t3", data={"f": "vc"})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
-        o = executor.accept(t3, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t3, "merge", coordination_token=_COORDINATION_TOKEN)
         merged = tm.coalesce_tokens.call_args.kwargs["merged_data"].to_dict()
         assert merged["f"] == "va"
         assert o.coalesce_metadata.union_field_origins["f"] == "a"
@@ -1254,9 +1283,9 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(CoalesceCollisionError) as exc_info:
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         # Metadata must be attached so the orchestrator's failure path
         # can persist value-independent collision provenance to the audit trail.
         md = exc_info.value.metadata
@@ -1275,8 +1304,8 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged = tm.coalesce_tokens.call_args.kwargs["merged_data"].to_dict()
         assert merged == {"x": 1, "y": 2}
         assert "union_field_collision_values" not in o.coalesce_metadata.to_dict()
@@ -1300,9 +1329,9 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Inspect complete_node_state calls: the failure cleanup handler must have
         # recorded at least one FAILED node state carrying the collision metadata.
@@ -1354,14 +1383,15 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # All consumed tokens must have terminal FAILED outcomes recorded
-        outcome_calls = data_flow.record_token_outcome.call_args_list
+        outcome_calls = data_flow.record_token_outcome_leader.call_args_list
         assert len(outcome_calls) == 2, f"expected record_token_outcome(FAILED) for both consumed tokens; got {len(outcome_calls)} calls"
         for c in outcome_calls:
+            assert c.kwargs["coordination_token"] is _COORDINATION_TOKEN
             assert c.kwargs["outcome"] == TerminalOutcome.FAILURE
             assert c.kwargs["path"] == TerminalPath.UNROUTED
             assert "error_hash" in c.kwargs
@@ -1386,14 +1416,14 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": "from_a"})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": "from_b"})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Capture the key before the failure
         assert len(executor._pending) == 1
         key = next(iter(executor._pending.keys()))
 
         with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # After failure, _pending should be empty
         assert key not in executor._pending, (
@@ -1427,15 +1457,15 @@ class TestUnionMerge:
 
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(AuditIntegrityError, match="audit DB unreadable mid-merge"):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # The compromised-DB path must record NOTHING further: no FAILED state
         # writes and no terminal-outcome writes from the cleanup handler.
         failed_calls = [c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED]
         assert failed_calls == [], "AuditIntegrityError path must not write FAILED states to a compromised audit DB"
-        assert data_flow.record_token_outcome.call_args_list == [], (
+        assert data_flow.record_token_outcome_leader.call_args_list == [], (
             "AuditIntegrityError path must not record terminal outcomes to a compromised audit DB"
         )
 
@@ -1460,9 +1490,9 @@ class TestUnionMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": 2})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(CoalesceCollisionError):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
     def test_union_collision_policy_with_best_effort_records_arrived_only(self):
         """best_effort with one lost branch: field_origins reflects arrived branches only.
@@ -1482,10 +1512,10 @@ class TestUnionMerge:
         )
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         # Advance clock past timeout so best_effort flushes with only `a` arrived.
         clock.advance(10.0)
-        outcomes = executor.check_timeouts("merge")
+        outcomes = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(outcomes) == 1
         outcome = outcomes[0]
         assert outcome.merged_token is not None
@@ -1518,12 +1548,12 @@ class TestUnionMerge:
         # Branch c never arrives (simulates lost/slow branch).
         t_b = _make_token(branch_name="b", token_id="t_b", data={"shared": "from_b", "only_b": 10})
         t_a = _make_token(branch_name="a", token_id="t_a", data={"shared": "from_a", "only_a": 20})
-        executor.accept(t_b, "merge")
-        executor.accept(t_a, "merge")
+        executor.accept(t_b, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t_a, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Advance past timeout — triggers best_effort flush with a and b arrived.
         clock.advance(10.0)
-        outcomes = executor.check_timeouts("merge")
+        outcomes = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(outcomes) == 1
         outcome = outcomes[0]
         assert outcome.merged_token is not None
@@ -1556,8 +1586,8 @@ class TestNestedMerge:
         executor.register_coalesce(_settings(merge="nested"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert d["a"] == {"x": 1}
@@ -1571,7 +1601,7 @@ class TestNestedMerge:
             "node_1",
         )
         t = _make_token(branch_name="a", token_id="t1", data={"x": 1})
-        executor.accept(t, "merge")
+        executor.accept(t, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert "a" in d
@@ -1583,8 +1613,8 @@ class TestNestedMerge:
         executor.register_coalesce(_settings(merge="nested"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1, "y": 2})
         t2 = _make_token(branch_name="b", token_id="t2", data={"z": 3})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert d["a"]["x"] == 1
@@ -1604,8 +1634,8 @@ class TestSelectMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 10})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 20})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert d == {"x": 10}
@@ -1624,8 +1654,8 @@ class TestSelectMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1")
         t2 = _make_token(branch_name="b", token_id="t2")
-        executor.accept(t1, "merge")
-        o = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.failure_reason == "select_branch_not_arrived"
 
     def test_select_ignores_other_branch_data(self):
@@ -1635,8 +1665,8 @@ class TestSelectMerge:
         executor.register_coalesce(s, "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"a_val": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"b_val": 2})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         d = merged_data.to_dict()
         assert d == {"b_val": 2}
@@ -1652,26 +1682,26 @@ class TestCheckTimeouts:
     def test_no_timeout_configured_returns_empty(self):
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(policy="require_all"), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        results = executor.check_timeouts("merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert results == []
 
     def test_not_expired_returns_empty(self):
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=10.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(5.0)  # Only 5s of 10s timeout
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert results == []
 
     def test_best_effort_expired_merges(self):
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=10.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(11.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].merged_token is not None
 
@@ -1680,10 +1710,10 @@ class TestCheckTimeouts:
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=10.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") in executor._pending
         clock.advance(11.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") not in executor._pending
 
     def test_quorum_expired_quorum_not_met_fails(self):
@@ -1695,9 +1725,9 @@ class TestCheckTimeouts:
             timeout_seconds=10.0,
         )
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(11.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].failure_reason == "quorum_not_met_at_timeout"
 
@@ -1705,9 +1735,9 @@ class TestCheckTimeouts:
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].failure_reason == "incomplete_branches"
 
@@ -1716,27 +1746,27 @@ class TestCheckTimeouts:
         s = _settings(policy="best_effort", timeout_seconds=10.0)
         executor.register_coalesce(s, "node_1")
         # First row arrives at t=100
-        executor.accept(_make_token(branch_name="a", token_id="t1", row_id="row_1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1", row_id="row_1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(8.0)  # t=108
         # Second row arrives at t=108
-        executor.accept(_make_token(branch_name="a", token_id="t2", row_id="row_2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t2", row_id="row_2"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(3.0)  # t=111 -- row_1 expired (11s > 10s), row_2 not (3s < 10s)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1  # Only row_1 expired
 
     def test_unregistered_coalesce_raises(self):
         executor, *_ = _make_executor()
         with pytest.raises(OrchestrationInvariantError, match="not registered"):
-            executor.check_timeouts("ghost")
+            executor.check_timeouts("ghost", coordination_token=_COORDINATION_TOKEN)
 
     def test_exact_timeout_boundary_triggers(self):
         """Timeout check fires when elapsed == timeout_seconds."""
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=10.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(10.0)  # Exactly 10s
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].merged_token is not None
 
@@ -1751,8 +1781,8 @@ class TestFlushPending:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        results = executor.flush_pending()
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].merged_token is not None
 
@@ -1761,9 +1791,9 @@ class TestFlushPending:
         executor, _, _, _, _ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Don't report any losses; flush should merge what's there
-        results = executor.flush_pending()
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].merged_token is not None
 
@@ -1776,8 +1806,8 @@ class TestFlushPending:
             timeout_seconds=60.0,
         )
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        results = executor.flush_pending()
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].failure_reason == "quorum_not_met"
 
@@ -1785,8 +1815,8 @@ class TestFlushPending:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        results = executor.flush_pending()
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].failure_reason == "incomplete_branches"
 
@@ -1803,16 +1833,16 @@ class TestFlushPending:
             first_arrival=100.0,
         )
         with pytest.raises(RuntimeError, match="Invariant violation"):
-            executor.flush_pending()
+            executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
 
     def test_flush_clears_completed_keys(self):
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert len(executor._completed_keys) == 1
-        executor.flush_pending()
+        executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(executor._completed_keys) == 0
 
     def test_flush_no_pending_returns_empty(self):
@@ -1820,7 +1850,7 @@ class TestFlushPending:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="require_all")
         executor.register_coalesce(s, "node_1")
-        results = executor.flush_pending()
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert results == []
 
     def test_flush_multiple_pending_rows(self):
@@ -1828,9 +1858,9 @@ class TestFlushPending:
         executor, _, _, _, _ = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1", row_id="r1"), "merge")
-        executor.accept(_make_token(branch_name="a", token_id="t2", row_id="r2"), "merge")
-        results = executor.flush_pending()
+        executor.accept(_make_token(branch_name="a", token_id="t1", row_id="r1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="a", token_id="t2", row_id="r2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 2
         for r in results:
             assert r.failure_reason == "incomplete_branches"
@@ -1845,13 +1875,13 @@ class TestNotifyBranchLost:
     def test_unregistered_coalesce_raises(self):
         executor, *_ = _make_executor()
         with pytest.raises(OrchestrationInvariantError, match="not registered"):
-            executor.notify_branch_lost("ghost", "row_1", "a", "reason")
+            executor.notify_branch_lost("ghost", "row_1", "a", "reason", coordination_token=_COORDINATION_TOKEN)
 
     def test_unknown_branch_raises(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), "node_1")
         with pytest.raises(OrchestrationInvariantError, match="not in expected branches"):
-            executor.notify_branch_lost("merge", "row_1", "c", "reason")
+            executor.notify_branch_lost("merge", "row_1", "c", "reason", coordination_token=_COORDINATION_TOKEN)
 
     def test_loss_notification_is_group_scoped(self):
         """spec §5 (arch-M1), Task 11 discriminator (plan Step 1 / review-prep
@@ -1875,10 +1905,10 @@ class TestNotifyBranchLost:
         )
         a_left = _make_token(row_id="row-1", branch_name="left", token_id="t-al", fork_group_id="g-a")
         b_left = _make_token(row_id="row-1", branch_name="left", token_id="t-bl", fork_group_id="g-b")
-        executor.accept(a_left, "merge_x")
-        executor.accept(b_left, "merge_x")
+        executor.accept(a_left, "merge_x", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(b_left, "merge_x", coordination_token=_COORDINATION_TOKEN)
 
-        outcome = executor.notify_branch_lost("merge_x", "g-a", "right", "quarantined")
+        outcome = executor.notify_branch_lost("merge_x", "g-a", "right", "quarantined", coordination_token=_COORDINATION_TOKEN)
 
         # best_effort with 2 of 3 branches accounted ("left" arrived, "right"
         # lost, "mid" still outstanding) does not resolve — group A stays
@@ -1900,8 +1930,8 @@ class TestNotifyBranchLost:
     def test_require_all_any_loss_fails(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], policy="require_all"), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.failure_reason is not None
         assert "branch_lost" in result.failure_reason
@@ -1910,7 +1940,7 @@ class TestNotifyBranchLost:
         """require_all: branch loss even before any arrivals triggers failure."""
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"], policy="require_all"), "node_1")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "branch_lost" in result.failure_reason
 
@@ -1919,9 +1949,9 @@ class TestNotifyBranchLost:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b"], policy="quorum", quorum_count=2)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # 2 branches, quorum=2, one lost -> max_possible=1 < quorum=2 -> fail
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "quorum_impossible" in result.failure_reason
 
@@ -1929,17 +1959,17 @@ class TestNotifyBranchLost:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="quorum", quorum_count=2)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Loss of c -> max_possible = 3-1=2 >= quorum_count=2. arrived=1 < 2. None.
-        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_best_effort_all_accounted_with_arrivals_merges(self):
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.merged_token is not None
 
@@ -1948,8 +1978,8 @@ class TestNotifyBranchLost:
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
         # Both lost, no arrivals
-        executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.failure_reason == "all_branches_lost"
 
@@ -1958,29 +1988,29 @@ class TestNotifyBranchLost:
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
         # One lost, two remaining
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_first_policy_returns_none(self):
         executor, *_ = _make_executor()
         s = _settings(policy="first")
         executor.register_coalesce(s, "node_1")
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_branch_arrived_then_lost_raises(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(OrchestrationInvariantError, match="already arrived"):
-            executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+            executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
 
     def test_branch_lost_before_any_arrivals(self):
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
         # No accept() yet; notify loss creates pending entry
-        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_error")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_error", coordination_token=_COORDINATION_TOKEN)
         # 3 branches, 1 lost, 0 arrived -> accounted=1 < 3 -> still waiting
         assert result is None
         # Verify pending entry was created
@@ -1989,10 +2019,10 @@ class TestNotifyBranchLost:
     def test_already_completed_returns_none(self):
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Key is now completed
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_duplicate_branch_loss_raises(self):
@@ -2000,9 +2030,9 @@ class TestNotifyBranchLost:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
-        executor.notify_branch_lost("merge", "row_1", "a", "first_reason")
+        executor.notify_branch_lost("merge", "row_1", "a", "first_reason", coordination_token=_COORDINATION_TOKEN)
         # Second loss notification for same branch updates the reason
-        result = executor.notify_branch_lost("merge", "row_1", "b", "second_reason")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "second_reason", coordination_token=_COORDINATION_TOKEN)
         # 3 branches, 2 lost, 0 arrived -> accounted=2 < 3 -> still waiting
         assert result is None
 
@@ -2078,9 +2108,9 @@ class TestContractHandling:
             # both tokens land in the SAME pending group, as the test intends.
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="row_1", member_key="b"),),
         )
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(OrchestrationInvariantError, match="has no contract"):
-            executor.accept(t2, "merge")
+            executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
     def test_union_contracts_merged(self):
         """Union merge should merge contracts from all branches."""
@@ -2100,8 +2130,8 @@ class TestContractHandling:
         )
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1}, contract=c_a)
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": "hi"}, contract=c_b)
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         mc = merged_data.contract
         assert mc.get_field("x") is not None
@@ -2137,8 +2167,8 @@ class TestContractHandling:
         )
         t1 = _make_token(branch_name="a", token_id="t1", data={"shared": 1, "a_only": "hi"}, contract=c_a)
         t2 = _make_token(branch_name="b", token_id="t2", data={"shared": 1, "b_only": 2.5}, contract=c_b)
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         mc = tm.coalesce_tokens.call_args.kwargs["merged_data"].contract
         for name in ("a_only", "b_only"):
             fc = mc.get_field(name)
@@ -2151,8 +2181,8 @@ class TestContractHandling:
         executor.register_coalesce(_settings(merge="nested"), "node_1")
         t1 = _make_token(branch_name="a", token_id="t1", data={"x": 1})
         t2 = _make_token(branch_name="b", token_id="t2", data={"y": 2})
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         mc = merged_data.contract
         assert mc.mode == "FIXED"
@@ -2182,8 +2212,8 @@ class TestContractHandling:
         )
         t1 = _make_token(branch_name="a", token_id="t1", data={"chosen": "yes"}, contract=c_a)
         t2 = _make_token(branch_name="b", token_id="t2", data={"ignored": 0}, contract=c_b)
-        executor.accept(t1, "merge")
-        executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
         merged_data = tm.coalesce_tokens.call_args.kwargs["merged_data"]
         assert merged_data.contract is c_a
 
@@ -2212,9 +2242,9 @@ class TestContractHandling:
         )
         t1 = _make_token(branch_name="a", token_id="t1", data={"value": 1}, contract=c_a)
         t2 = _make_token(branch_name="b", token_id="t2", data={"value": "x"}, contract=c_b)
-        executor.accept(t1, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
         # Second accept triggers merge, which fails due to type conflict
-        outcome = executor.accept(t2, "merge")
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Outcome indicates failure, not held or merged
         assert outcome.failure_reason is not None
@@ -2253,8 +2283,8 @@ class TestContractHandling:
         t1 = _make_token(branch_name="a", token_id="t1", data={"count": 42}, contract=c_a)
         t2 = _make_token(branch_name="b", token_id="t2", data={"count": "forty-two"}, contract=c_b)
 
-        executor.accept(t1, "merge")
-        outcome = executor.accept(t2, "merge")
+        executor.accept(t1, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(t2, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Graceful failure, not a crash
         assert outcome.failure_reason is not None
@@ -2276,10 +2306,10 @@ class TestAuditTrailDetails:
         executor, execution, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
         t = _make_token(branch_name="a", token_id="t1", data={"amount": 42})
-        executor.accept(t, "merge")
+        executor.accept(t, "merge", coordination_token=_COORDINATION_TOKEN)
         kw = execution.begin_node_state.call_args.kwargs
         assert kw["token_id"] == "t1"
-        assert kw["run_id"] == "run_1"
+        assert kw["member_token"] == _COORDINATION_TOKEN.membership
         assert kw["step_index"] == 5
         assert kw["input_data"]["amount"] == 42
 
@@ -2287,7 +2317,7 @@ class TestAuditTrailDetails:
         """begin_node_state should use the node_id from register_coalesce."""
         executor, execution, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "coalesce_node_42")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         kw = execution.begin_node_state.call_args.kwargs
         assert kw["node_id"] == "coalesce_node_42"
 
@@ -2295,9 +2325,9 @@ class TestAuditTrailDetails:
         """Completed node states should have a non-negative duration_ms."""
         executor, _, _, token_manager, clock = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(0.5)
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         durations = [item.duration_ms for item in token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]]
         assert len(durations) == 2
         assert all(d >= 0 for d in durations)
@@ -2310,8 +2340,8 @@ class TestAuditTrailDetails:
 
         executor, _, _, token_manager, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         for item in token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]:
             assert isinstance(item.context_after, CoalesceMetadata)
             assert "policy" in item.context_after.to_dict()
@@ -2320,25 +2350,25 @@ class TestAuditTrailDetails:
         """Completed node states have output_data with merged_into token ID."""
         executor, _, _, token_manager, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert len(token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]) == 2
 
     def test_record_token_outcome_has_join_group_id(self):
         """Token outcomes should include join_group_id from merged token."""
         executor, _, data_flow, token_manager, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
-        assert data_flow.record_token_outcome.call_count == 0
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        assert data_flow.record_token_outcome_leader.call_count == 0
         assert len(token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]) == 2
 
     def test_record_token_outcome_has_correct_token_ids(self):
         """Token outcomes should reference the original consumed token IDs."""
         executor, _, _, token_manager, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         token_ids = {item.parent_ref.token_id for item in token_manager.coalesce_tokens.call_args.kwargs["parent_completions"]}
         assert token_ids == {"t1", "t2"}
 
@@ -2346,9 +2376,9 @@ class TestAuditTrailDetails:
         """Coalesce metadata should include arrival_order with offset_ms."""
         executor, _, _, _, clock = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(0.2)
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         arrival_order = o.coalesce_metadata.arrival_order
         assert len(arrival_order) == 2
         assert arrival_order[0].branch == "a"
@@ -2360,17 +2390,17 @@ class TestAuditTrailDetails:
         """Coalesce metadata should include total wait_duration_ms."""
         executor, _, _, _, clock = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(1.5)
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o.coalesce_metadata.wait_duration_ms == pytest.approx(1500.0)
 
     def test_merge_metadata_branches_lost_empty_when_none_lost(self):
         """Branches_lost in metadata should be empty MappingProxy when all arrived."""
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert dict(o.coalesce_metadata.branches_lost) == {}
 
 
@@ -2454,16 +2484,16 @@ class TestMultiRowIsolation:
         """Tokens for different row_ids are tracked independently."""
         executor, _, _, _, _ = _make_executor()
         executor.register_coalesce(_settings(), "node_1")
-        o1 = executor.accept(_make_token(row_id="r1", branch_name="a", token_id="t1"), "merge")
-        o2 = executor.accept(_make_token(row_id="r2", branch_name="a", token_id="t2"), "merge")
+        o1 = executor.accept(_make_token(row_id="r1", branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(row_id="r2", branch_name="a", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is True
         # Complete r1
-        o3 = executor.accept(_make_token(row_id="r1", branch_name="b", token_id="t3"), "merge")
+        o3 = executor.accept(_make_token(row_id="r1", branch_name="b", token_id="t3"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o3.held is False
         assert o3.merged_token is not None
         # r2 still pending
-        o4 = executor.accept(_make_token(row_id="r2", branch_name="b", token_id="t4"), "merge")
+        o4 = executor.accept(_make_token(row_id="r2", branch_name="b", token_id="t4"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert o4.held is False
         assert o4.merged_token is not None
 
@@ -2474,8 +2504,8 @@ class TestMultiRowIsolation:
         s2 = _settings(name="m2", branches=["x", "y"])
         executor.register_coalesce(s1, "n1")
         executor.register_coalesce(s2, "n2")
-        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "m1")
-        o2 = executor.accept(_make_token(branch_name="x", token_id="t2"), "m2")
+        o1 = executor.accept(_make_token(branch_name="a", token_id="t1"), "m1", coordination_token=_COORDINATION_TOKEN)
+        o2 = executor.accept(_make_token(branch_name="x", token_id="t2"), "m2", coordination_token=_COORDINATION_TOKEN)
         assert o1.held is True
         assert o2.held is True
 
@@ -2490,9 +2520,9 @@ class TestFailPendingDetails:
         executor, execution, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         # Check that complete_node_state was called with FAILED
         fail_calls = [c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED]
         assert len(fail_calls) == 1
@@ -2504,19 +2534,19 @@ class TestFailPendingDetails:
         executor, _, data_flow, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        results = executor.check_timeouts("merge")
-        assert data_flow.record_token_outcome.call_count == 0
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
+        assert data_flow.record_token_outcome_leader.call_count == 0
         assert len(results) == 1
 
     def test_failure_metadata_includes_policy(self):
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         md = results[0].coalesce_metadata
         assert md.policy == CoalescePolicy.REQUIRE_ALL
         assert set(md.expected_branches) == {"a", "b"}
@@ -2525,19 +2555,19 @@ class TestFailPendingDetails:
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") in executor._pending
         clock.advance(6.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") not in executor._pending
 
     def test_failure_marks_key_completed(self):
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") in executor._completed_keys
 
     def test_failure_metadata_includes_lost_branches(self):
@@ -2545,7 +2575,7 @@ class TestFailPendingDetails:
         s = _settings(branches=["a", "b"], policy="require_all")
         executor.register_coalesce(s, "node_1")
         # Loss of b triggers require_all failure
-        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail", coordination_token=_COORDINATION_TOKEN)
         assert result.coalesce_metadata.branches_lost is not None
         assert "b" in result.coalesce_metadata.branches_lost
 
@@ -2554,18 +2584,18 @@ class TestFailPendingDetails:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="quorum", quorum_count=3)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Loss of b -> max_possible=2 < quorum=3 -> fail
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error", coordination_token=_COORDINATION_TOKEN)
         assert result.coalesce_metadata.quorum_required == 3
 
     def test_require_all_timeout_metadata_has_timeout_seconds(self):
         executor, _, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=8.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(9.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert results[0].coalesce_metadata.timeout_seconds == 8.0
 
     def test_failure_branches_arrived_in_metadata(self):
@@ -2573,10 +2603,10 @@ class TestFailPendingDetails:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b", "c"], policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         # require_all needs c, loss of c -> fail
-        result = executor.notify_branch_lost("merge", "row_1", "c", "error")
+        result = executor.notify_branch_lost("merge", "row_1", "c", "error", coordination_token=_COORDINATION_TOKEN)
         assert set(result.coalesce_metadata.branches_arrived) == {"a", "b"}
 
     def test_require_all_timeout_error_includes_timeout_ms(self):
@@ -2589,9 +2619,9 @@ class TestFailPendingDetails:
         executor, execution, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         # The error payload recorded via complete_node_state must have timeout_ms
         fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
         error = fail_call.kwargs["error"]
@@ -2603,8 +2633,8 @@ class TestFailPendingDetails:
         executor, execution, *_ = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.flush_pending()
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
         error = fail_call.kwargs["error"]
         assert error.timeout_ms is None
@@ -2636,7 +2666,7 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Loss of b triggers require_all failure
-        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail", coordination_token=_COORDINATION_TOKEN)
 
         assert result.coalesce_metadata.lost_branch_expected_fields is not None
         assert result.coalesce_metadata.lost_branch_expected_fields == {"b": ("field_z",)}
@@ -2649,7 +2679,7 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1")
 
         # Loss of b triggers require_all failure
-        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail", coordination_token=_COORDINATION_TOKEN)
 
         assert result.coalesce_metadata.lost_branch_expected_fields is None
 
@@ -2666,14 +2696,14 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Let c arrive first
-        executor.accept(_make_token(branch_name="c", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="c", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Lose branch a (no merge yet — still waiting)
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         assert result is None  # best_effort waits for all branches to be accounted for
 
         # Lose branch b — now all branches accounted for (1 arrived, 2 lost) -> merge
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_b")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_b", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.merged_token is not None
 
@@ -2695,9 +2725,9 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Branch a arrives
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Branch b is lost
-        result = executor.notify_branch_lost("merge", "row_1", "b", "diverted")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "diverted", coordination_token=_COORDINATION_TOKEN)
 
         # best_effort should merge after loss notification
         assert result is not None
@@ -2709,11 +2739,11 @@ class TestLostBranchExpectedFields:
         executor, *_ = _make_executor()
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=1.0)
         executor.register_coalesce(s, "node_1", {"a": ("field_x",), "b": ("field_y",)})
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         del executor._branch_expected_fields["merge"]
 
         with pytest.raises(OrchestrationInvariantError, match=r"branch expected fields.*merge"):
-            executor.notify_branch_lost("merge", "row_1", "b", "diverted")
+            executor.notify_branch_lost("merge", "row_1", "b", "diverted", coordination_token=_COORDINATION_TOKEN)
 
     def test_merge_metadata_no_lost_branches_has_none_expected_fields(self):
         """When no branches are lost, lost_branch_expected_fields is None."""
@@ -2726,8 +2756,8 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Both branches arrive
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        result = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        result = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Successful merge with no lost branches
         assert result.merged_token is not None
@@ -2743,7 +2773,7 @@ class TestLostBranchExpectedFields:
         }
         executor.register_coalesce(s, "node_1", branch_schemas)
 
-        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "upstream_fail", coordination_token=_COORDINATION_TOKEN)
 
         serialized = result.coalesce_metadata.to_dict()
         assert "lost_branch_expected_fields" in serialized
@@ -2763,15 +2793,15 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Branch a arrives
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Branch b is lost (accounted = 2, expected = 3, so no immediate merge)
-        result = executor.notify_branch_lost("merge", "row_1", "b", "diverted")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "diverted", coordination_token=_COORDINATION_TOKEN)
         assert result is None  # Not all accounted yet
 
         # Advance past timeout — this triggers merge via check_timeouts
         # (c never arrived, but best_effort merges with whatever we have)
         clock.advance(6.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
 
         # Should have one result with lost_branch_expected_fields
         assert len(results) == 1
@@ -2793,13 +2823,13 @@ class TestLostBranchExpectedFields:
         executor.register_coalesce(s, "node_1", branch_schemas)
 
         # Only branch a arrives
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Branch b is lost (accounted = 2/3, not all yet)
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error", coordination_token=_COORDINATION_TOKEN)
         assert result is None  # Not all accounted yet
 
         # Flush at end-of-source — best_effort merges with whatever we have
-        results = executor.flush_pending()
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
 
         # Should have one merge result with lost_branch_expected_fields for b
         assert len(results) == 1
@@ -2835,7 +2865,7 @@ class TestBestEffortTimeoutZeroArrivals:
         executor.register_coalesce(s, "node_1")
 
         # Lose branch "a" — this creates a pending entry with no arrivals
-        result_a = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result_a = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         # best_effort with 1 lost + 0 arrived < 2 total branches — still waiting
         assert result_a is None
 
@@ -2843,7 +2873,7 @@ class TestBestEffortTimeoutZeroArrivals:
         clock.advance(11.0)
 
         # check_timeouts should now detect the timed-out entry and fail it
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
 
         outcome = results[0]
@@ -2869,13 +2899,13 @@ class TestBestEffortTimeoutZeroArrivals:
         executor.register_coalesce(s, "node_1")
 
         # Accept token for branch "a"
-        outcome_a = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        outcome_a = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome_a.held is True
 
         # Advance clock past timeout (branch "b" never arrives)
         clock.advance(11.0)
 
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].merged_token is not None
         assert results[0].failure_reason is None
@@ -2896,17 +2926,17 @@ class TestBestEffortTimeoutZeroArrivals:
 
         # Lose branch "a" — creates pending, but _evaluate_after_loss returns None
         # because only 1/3 branches accounted for
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
         # Lose branch "b" — 2/3 accounted for, still waiting
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_b")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_b", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
         # Advance past timeout before branch "c" is lost or arrives
         clock.advance(6.0)
 
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         outcome = results[0]
         assert outcome.failure_reason == "best_effort_timeout_no_arrivals"
@@ -2924,13 +2954,13 @@ class TestBestEffortTimeoutZeroArrivals:
         executor.register_coalesce(s, "node_1")
 
         # Lose one branch (creates pending with 0 arrivals, 1 lost)
-        executor.notify_branch_lost("merge", "row_1", "a", "error")
+        executor.notify_branch_lost("merge", "row_1", "a", "error", coordination_token=_COORDINATION_TOKEN)
 
         # Verify it's in _pending before timeout
         assert ("merge", "row_1") in executor._pending
 
         clock.advance(4.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
 
         # After timeout, it MUST be gone from _pending (this was the bug)
         assert ("merge", "row_1") not in executor._pending
@@ -2959,8 +2989,12 @@ class TestLandscapeCompletedKeys:
         # Complete 3 coalesces — row_0 will be evicted from FIFO (max=2)
         for i in range(3):
             row_id = f"row_{i}"
-            executor.accept(_make_token(row_id=row_id, branch_name="a", token_id=f"t{i}_a"), "merge")
-            executor.accept(_make_token(row_id=row_id, branch_name="b", token_id=f"t{i}_b"), "merge")
+            executor.accept(
+                _make_token(row_id=row_id, branch_name="a", token_id=f"t{i}_a"), "merge", coordination_token=_COORDINATION_TOKEN
+            )
+            executor.accept(
+                _make_token(row_id=row_id, branch_name="b", token_id=f"t{i}_b"), "merge", coordination_token=_COORDINATION_TOKEN
+            )
 
         # row_0 was evicted from FIFO
         assert ("merge", "row_0") not in executor._completed_keys
@@ -2983,7 +3017,7 @@ class TestLandscapeCompletedKeys:
         # the group RELEASED (ADR-042 discriminator), so the reason is merge.
         execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
-        outcome = executor.accept(late, "merge")
+        outcome = executor.accept(late, "merge", coordination_token=_COORDINATION_TOKEN)
 
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
@@ -3107,7 +3141,7 @@ class TestNestedMergeContractLocked:
         executor.register_coalesce(s, NodeID("node_1"))
 
         t = _make_token(branch_name="a", token_id="t1", data={"x": 1})
-        o = executor.accept(t, "merge")
+        o = executor.accept(t, "merge", coordination_token=_COORDINATION_TOKEN)
 
         assert o.held is False
         assert o.merged_token is not None
@@ -3138,11 +3172,11 @@ class TestSelectBranchNotArrivedFailure:
         executor.register_coalesce(s, NodeID("node_1"))
 
         # Accept tokens for branches "a" and "b"
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Notify branch "c" (the select_branch) as lost — makes all accounted for
-        outcome = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        outcome = executor.notify_branch_lost("merge", "row_1", "c", "error_routed", coordination_token=_COORDINATION_TOKEN)
 
         # Merge triggers (3 accounted = 3 expected), but select_branch="c" not arrived
         assert outcome is not None
@@ -3249,7 +3283,9 @@ class TestRestoreFromJournal:
             now=_JOURNAL_T0 + timedelta(seconds=5),
         )
 
-        outcome = executor.accept(_make_token(branch_name="b", token_id="t2", data={"amount": 200}), "merge")
+        outcome = executor.accept(
+            _make_token(branch_name="b", token_id="t2", data={"amount": 200}), "merge", coordination_token=_COORDINATION_TOKEN
+        )
         assert outcome.held is False
         assert outcome.merged_token is not None
         assert outcome.failure_reason is None
@@ -3274,7 +3310,9 @@ class TestRestoreFromJournal:
         assert executor._pending[("merge", "row_1")].lost_branches == {"a": "error_routed"}
 
         # Accept remaining branch c — all 3 accounted for (1 lost + 2 arrived)
-        outcome = executor.accept(_make_token(branch_name="c", token_id="t2", data={"amount": 300}), "merge")
+        outcome = executor.accept(
+            _make_token(branch_name="c", token_id="t2", data={"amount": 300}), "merge", coordination_token=_COORDINATION_TOKEN
+        )
         assert outcome.held is False
         assert outcome.merged_token is not None
 
@@ -3297,7 +3335,9 @@ class TestRestoreFromJournal:
         assert pending.branches == {}
         assert pending.lost_branches == {"a": "error_routed"}
 
-        outcome = executor.accept(_make_token(row_id="row_1", branch_name="b", token_id="t2"), "merge")
+        outcome = executor.accept(
+            _make_token(row_id="row_1", branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN
+        )
         assert outcome.held is False
         assert outcome.merged_token is not None
 
@@ -3437,7 +3477,7 @@ class TestRestoreFromJournal:
         # Flavor resolved lazily: this group RELEASED, so the reason is merge.
         execution.has_released_group_for_node.return_value = True
         late = _make_token(branch_name="a", token_id="t_late", row_id="row_0")
-        outcome = executor.accept(late, "merge")
+        outcome = executor.accept(late, "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome.held is False
         assert outcome.failure_reason == "late_arrival_after_merge"
 
@@ -3445,7 +3485,7 @@ class TestRestoreFromJournal:
         # answers scope_group_failed (ADR-042 / spec §2).
         execution.has_released_group_for_node.return_value = False
         late_failed = _make_token(branch_name="a", token_id="t_late_failed", row_id="row_9")
-        failed_outcome = executor.accept(late_failed, "merge")
+        failed_outcome = executor.accept(late_failed, "merge", coordination_token=_COORDINATION_TOKEN)
         assert failed_outcome.held is False
         assert failed_outcome.failure_reason == "scope_group_failed"
 
@@ -3689,7 +3729,7 @@ class TestRestoreFromJournal:
         """Validation failures must not destroy the executor's in-memory state."""
         executor, *_ = _make_executor()
         executor.register_coalesce(_settings(branches=["a", "b"]), NodeID("co-1"))
-        executor.accept(_make_token(branch_name="a", token_id="t_live"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t_live"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") in executor._pending
 
         with pytest.raises(AuditIntegrityError):
@@ -3727,9 +3767,9 @@ class TestGetBarrierScalars:
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, NodeID("co-1"))
 
-        executor.accept(_make_token(row_id="row_1", branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(row_id="row_2", branch_name="a", token_id="t2"), "merge")
-        executor.notify_branch_lost("merge", "row_2", "b", "error_routed")
+        executor.accept(_make_token(row_id="row_1", branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(row_id="row_2", branch_name="a", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.notify_branch_lost("merge", "row_2", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
 
         scalars = executor.get_barrier_scalars()
         assert set(scalars) == {("merge", "row_2")}
@@ -3763,7 +3803,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="require_all")
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.held is False
         assert result.failure_reason is not None
@@ -3776,10 +3816,10 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="require_all")
         executor.register_coalesce(s, "node_1")
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
-        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "branch_lost" in result.failure_reason
         assert "c" in result.failure_reason
@@ -3792,8 +3832,8 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="require_all")
         executor.register_coalesce(s, "node_1")
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result.coalesce_metadata is not None
         assert result.coalesce_metadata.branches_lost == {"b": "error_routed"}
 
@@ -3807,7 +3847,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         # Lose one branch: max_possible = 3-1 = 2 < quorum_count=3
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "quorum_impossible" in result.failure_reason
         assert "need=3" in result.failure_reason
@@ -3820,7 +3860,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         # Lose one: max_possible = 4-1 = 3 >= 2, arrived=0 < 2 → wait
-        result = executor.notify_branch_lost("merge", "row_1", "d", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "d", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_quorum_one_arrival_one_loss_still_meets_quorum(self):
@@ -3836,15 +3876,15 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         # Accept one branch — quorum not met (1 < 2), held
-        outcome = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        outcome = executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome.held is True
 
         # Lose one branch — max_possible=2 >= 2 (still possible), arrived=1 < 2 → wait
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
         # Accept second branch — quorum met (2 >= 2), merge triggers via _should_merge
-        outcome2 = executor.accept(_make_token(branch_name="c", token_id="t2"), "merge")
+        outcome2 = executor.accept(_make_token(branch_name="c", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome2.held is False
         assert outcome2.merged_token is not None
 
@@ -3856,11 +3896,11 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Losing c means all 3 accounted for (2 arrived + 1 lost)
-        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "c", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert result.merged_token is not None
         assert result.failure_reason is None
@@ -3871,9 +3911,9 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c", "d"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         # Lose b: arrived=1 + lost=1 = 2 < 4 total → wait
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_best_effort_all_lost_no_arrivals_fails(self):
@@ -3882,8 +3922,8 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        executor.notify_branch_lost("merge", "row_1", "a", "error1")
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error2")
+        executor.notify_branch_lost("merge", "row_1", "a", "error1", coordination_token=_COORDINATION_TOKEN)
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error2", coordination_token=_COORDINATION_TOKEN)
 
         assert result is not None
         assert result.failure_reason == "all_branches_lost"
@@ -3897,11 +3937,11 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="first", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        result_a = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result_a = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         assert result_a is None
         assert ("merge", "row_1") in executor._pending
 
-        result_b = executor.notify_branch_lost("merge", "row_1", "b", "error_b")
+        result_b = executor.notify_branch_lost("merge", "row_1", "b", "error_b", coordination_token=_COORDINATION_TOKEN)
         assert result_b is not None
         assert result_b.held is False
         assert result_b.merged_token is None
@@ -3915,10 +3955,10 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="first", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
-        results = executor.flush_pending()
+        results = executor.flush_pending(coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].held is False
         assert results[0].merged_token is None
@@ -3931,11 +3971,11 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="first", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_a", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
         clock.advance(6.0)
-        results = executor.check_timeouts("merge")
+        results = executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         assert len(results) == 1
         assert results[0].held is False
         assert results[0].merged_token is None
@@ -3949,7 +3989,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="first")
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     # --- Edge cases ---
@@ -3963,7 +4003,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         # No accept() calls — no pending entry exists yet
         assert ("merge", "row_1") not in executor._pending
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash", coordination_token=_COORDINATION_TOKEN)
 
         # Pending entry must have been created
         assert ("merge", "row_1") in executor._pending
@@ -3979,7 +4019,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="require_all")
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "upstream_crash", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "branch_lost" in result.failure_reason
         # Key should be completed after failure
@@ -3992,9 +4032,9 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b", "c"], policy="best_effort", timeout_seconds=60.0)
         executor.register_coalesce(s, "node_1")
 
-        executor.notify_branch_lost("merge", "row_1", "a", "first_reason")
+        executor.notify_branch_lost("merge", "row_1", "a", "first_reason", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(OrchestrationInvariantError, match="already marked lost"):
-            executor.notify_branch_lost("merge", "row_1", "a", "second_reason")
+            executor.notify_branch_lost("merge", "row_1", "a", "second_reason", coordination_token=_COORDINATION_TOKEN)
 
     def test_lost_branch_that_already_arrived_raises_invariant_error(self):
         """A branch that already arrived cannot be reported as lost."""
@@ -4002,9 +4042,9 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="require_all")
         executor.register_coalesce(s, "node_1")
 
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         with pytest.raises(OrchestrationInvariantError, match="already arrived"):
-            executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+            executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
 
     def test_loss_for_already_completed_coalesce_returns_none(self):
         """If the coalesce already completed (merged), loss notification is a no-op."""
@@ -4013,19 +4053,19 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         # Complete the coalesce
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert ("merge", "row_1") in executor._completed_keys
 
         # Loss notification after completion is a no-op
-        result = executor.notify_branch_lost("merge", "row_1", "a", "late_error")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "late_error", coordination_token=_COORDINATION_TOKEN)
         assert result is None
 
     def test_loss_for_unregistered_coalesce_raises(self):
         """notify_branch_lost on unregistered coalesce raises OrchestrationInvariantError."""
         executor, *_ = _make_executor()
         with pytest.raises(OrchestrationInvariantError, match="not registered"):
-            executor.notify_branch_lost("ghost", "row_1", "a", "reason")
+            executor.notify_branch_lost("ghost", "row_1", "a", "reason", coordination_token=_COORDINATION_TOKEN)
 
     def test_loss_for_unknown_branch_raises(self):
         """notify_branch_lost with unknown branch name raises OrchestrationInvariantError."""
@@ -4034,7 +4074,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         with pytest.raises(OrchestrationInvariantError, match="not in expected branches"):
-            executor.notify_branch_lost("merge", "row_1", "z", "reason")
+            executor.notify_branch_lost("merge", "row_1", "z", "reason", coordination_token=_COORDINATION_TOKEN)
 
     def test_multiple_losses_then_final_arrival_merges(self):
         """best_effort: multiple losses followed by last arrival triggers merge."""
@@ -4043,14 +4083,13 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         executor.register_coalesce(s, "node_1")
 
         # Lose 3 branches
-        executor.notify_branch_lost("merge", "row_1", "a", "err1")
-        executor.notify_branch_lost("merge", "row_1", "b", "err2")
-        executor.notify_branch_lost("merge", "row_1", "c", "err3")
+        executor.notify_branch_lost("merge", "row_1", "a", "err1", coordination_token=_COORDINATION_TOKEN)
+        executor.notify_branch_lost("merge", "row_1", "b", "err2", coordination_token=_COORDINATION_TOKEN)
+        executor.notify_branch_lost("merge", "row_1", "c", "err3", coordination_token=_COORDINATION_TOKEN)
 
         # Accept the last branch — all 4 accounted for (3 lost + 1 arrived)
         outcome = executor.accept(
-            _make_token(branch_name="d", token_id="t1", data={"amount": 99}),
-            "merge",
+            _make_token(branch_name="d", token_id="t1", data={"amount": 99}), "merge", coordination_token=_COORDINATION_TOKEN
         )
         assert outcome.held is False
         assert outcome.merged_token is not None
@@ -4063,7 +4102,7 @@ class TestNotifyBranchLostEvaluateAfterLoss:
         s = _settings(branches=["a", "b"], policy="quorum", quorum_count=2)
         executor.register_coalesce(s, "node_1")
 
-        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed")
+        result = executor.notify_branch_lost("merge", "row_1", "a", "error_routed", coordination_token=_COORDINATION_TOKEN)
         assert result is not None
         assert "quorum_impossible" in result.failure_reason
 
@@ -4118,10 +4157,10 @@ class TestPrecomputedOutputSchema:
         token_b = _make_token(branch_name="b", token_id="t2", data={"x": None}, contract=contract_b)
 
         # Accept both tokens
-        outcome_a = executor.accept(token_a, "merge")
+        outcome_a = executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome_a.held is True  # Waiting for branch b
 
-        outcome_b = executor.accept(token_b, "merge")
+        outcome_b = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
         assert outcome_b.held is False  # Merge triggered
 
         # Verify contract matches DAG schema, not runtime merge
@@ -4178,8 +4217,8 @@ class TestPrecomputedOutputSchema:
         )
         token_a = _make_token(branch_name="a", token_id="t1", data={"present": 42}, contract=contract_a)
 
-        assert executor.accept(token_a, "merge").held is True
-        outcome = executor.notify_branch_lost("merge", "row_1", "b", "error_routed")
+        assert executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN).held is True
+        outcome = executor.notify_branch_lost("merge", "row_1", "b", "error_routed", coordination_token=_COORDINATION_TOKEN)
 
         assert outcome is not None
         assert outcome.merged_token is not None
@@ -4209,8 +4248,8 @@ class TestPrecomputedOutputSchema:
         token_a = _make_token(branch_name="a", token_id="t1", data={"amount": 100}, contract=contract)
         token_b = _make_token(branch_name="b", token_id="t2", data={"amount": 200}, contract=contract)
 
-        executor.accept(token_a, "merge")
-        outcome = executor.accept(token_b, "merge")
+        executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Should still work (runtime merge fallback)
         assert outcome.held is False
@@ -4272,8 +4311,8 @@ class TestOriginalNamePreservation:
         token_a = _make_token(branch_name="a", token_id="t1", data={"customer_id": "C1", "amount": 100.0}, contract=contract_a)
         token_b = _make_token(branch_name="b", token_id="t2", data={"customer_id": "C1", "amount": 200.0}, contract=contract_b)
 
-        executor.accept(token_a, "merge")
-        outcome = executor.accept(token_b, "merge")
+        executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Merged contract should preserve original names from branches
         merged = outcome.merged_token.row_data.contract
@@ -4329,8 +4368,8 @@ class TestOriginalNamePreservation:
         token_a = _make_token(branch_name="a", token_id="t1", data={"customer_id": "A_VALUE"}, contract=contract_a)
         token_b = _make_token(branch_name="b", token_id="t2", data={"customer_id": "B_VALUE"}, contract=contract_b)
 
-        executor.accept(token_a, "merge")
-        outcome = executor.accept(token_b, "merge")
+        executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Value should be B's (last_wins)
         assert outcome.merged_token.row_data["customer_id"] == "B_VALUE"
@@ -4387,8 +4426,8 @@ class TestObservedUnionCoalesce:
         token_a = _make_token(branch_name="a", token_id="t1", data={"x": 1}, contract=contract_a)
         token_b = _make_token(branch_name="b", token_id="t2", data={"x": 2}, contract=contract_b)
 
-        executor.accept(token_a, "merge")
-        outcome = executor.accept(token_b, "merge")
+        executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Merged contract should have fields from branches, not empty precomputed
         merged = outcome.merged_token.row_data.contract
@@ -4413,8 +4452,8 @@ class TestObservedUnionCoalesce:
         token_a = _make_token(branch_name="a", token_id="t1", data={"y": "hello"}, contract=contract)
         token_b = _make_token(branch_name="b", token_id="t2", data={"y": "world"}, contract=contract)
 
-        executor.accept(token_a, "merge")
-        outcome = executor.accept(token_b, "merge")
+        executor.accept(token_a, "merge", coordination_token=_COORDINATION_TOKEN)
+        outcome = executor.accept(token_b, "merge", coordination_token=_COORDINATION_TOKEN)
 
         # Should work (OBSERVED branches don't require precomputed)
         assert outcome.held is False
@@ -4432,9 +4471,9 @@ class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
         executor, execution, _, _, clock = _make_executor()
         s = _settings(policy="require_all", timeout_seconds=5.0)
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
         clock.advance(6.0)
-        executor.check_timeouts("merge")
+        executor.check_timeouts("merge", coordination_token=_COORDINATION_TOKEN)
         fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
         error = fail_call.kwargs["error"]
         assert error.failure_reason == "incomplete_branches"
@@ -4445,8 +4484,8 @@ class TestSurvivorHoldCarriesCauseAndDispositionMeta40:
         executor, execution, _, _, _ = _make_executor()
         s = _settings(policy="first")
         executor.register_coalesce(s, "node_1")
-        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge")
-        late = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge")
+        executor.accept(_make_token(branch_name="a", token_id="t1"), "merge", coordination_token=_COORDINATION_TOKEN)
+        late = executor.accept(_make_token(branch_name="b", token_id="t2"), "merge", coordination_token=_COORDINATION_TOKEN)
         assert late.failure_reason == GroupSettlementReason.LATE_ARRIVAL_AFTER_MERGE.value
         fail_call = next(c for c in execution.complete_node_state.call_args_list if c.kwargs.get("status") == NodeStateStatus.FAILED)
         error = fail_call.kwargs["error"]

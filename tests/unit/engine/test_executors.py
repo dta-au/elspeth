@@ -68,6 +68,7 @@ from elspeth.contracts import (
     TransformResult,
 )
 from elspeth.contracts.barrier_scalars import AggregationNodeScalars
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.enums import (
@@ -303,11 +304,10 @@ def _make_factory() -> MagicMock:
 
     batch_counter = 0
     batch_nodes: dict[str, str] = {}
-    batch_members: dict[str, list[SimpleNamespace]] = {}
 
-    def create_batch_side_effect(*, run_id: str, aggregation_node_id: str) -> SimpleNamespace:
+    def create_batch_side_effect(*, coordination_token: CoordinationToken, aggregation_node_id: str) -> SimpleNamespace:
         nonlocal batch_counter
-        del run_id
+        assert coordination_token == _AGGREGATION_LEADER
         batch_counter += 1
         batch_id = f"batch_{batch_counter:03d}"
         batch = SimpleNamespace(
@@ -317,13 +317,7 @@ def _make_factory() -> MagicMock:
             attempt=0,
         )
         batch_nodes[batch_id] = str(aggregation_node_id)
-        batch_members.setdefault(batch_id, [])
         return batch
-
-    def add_batch_member_side_effect(*, batch_id: str, token_id: str, ordinal: int) -> SimpleNamespace:
-        member = SimpleNamespace(batch_id=batch_id, token_id=token_id, ordinal=ordinal)
-        batch_members.setdefault(batch_id, []).append(member)
-        return member
 
     def get_batch_side_effect(batch_id: str) -> SimpleNamespace | None:
         node_id = batch_nodes.get(batch_id)
@@ -331,13 +325,8 @@ def _make_factory() -> MagicMock:
             return None
         return SimpleNamespace(batch_id=batch_id, aggregation_node_id=node_id)
 
-    def get_batch_members_side_effect(batch_id: str) -> list[SimpleNamespace]:
-        return sorted(batch_members.get(batch_id, []), key=lambda member: member.ordinal)
-
     factory.execution.create_batch.side_effect = create_batch_side_effect
-    factory.execution.add_batch_member.side_effect = add_batch_member_side_effect
     factory.execution.get_batch.side_effect = get_batch_side_effect
-    factory.execution.get_batch_members.side_effect = get_batch_members_side_effect
     return factory
 
 
@@ -931,7 +920,7 @@ class TestTransformExecutor:
         assert updated_token.row_data["value"] == "processed"
 
     def test_begin_node_state_called_with_correct_args(self) -> None:
-        """Recorder.begin_node_state called with token_id, node_id, run_id, step, dict input."""
+        """Node state creation carries the admitted member and row identity."""
         factory = _make_factory()
         executor = TransformExecutor(
             factory.execution, _make_span_factory(), _make_step_resolver({"node_1": 3}), data_flow=factory.data_flow
@@ -951,7 +940,7 @@ class TestTransformExecutor:
         kwargs = factory.execution.begin_node_state.call_args[1]
         assert kwargs["token_id"] == "tok_1"
         assert kwargs["node_id"] == "node_1"
-        assert kwargs["run_id"] == "test-run"
+        assert kwargs["member_token"] == ctx.require_member_token()
         assert kwargs["step_index"] == 3
         assert kwargs["attempt"] == 2
         assert isinstance(kwargs["input_data"], dict)
@@ -1130,7 +1119,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         result, updated_token, error_sink = executor.execute_transform(
             transform,
@@ -1152,7 +1142,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         _, _, error_sink = executor.execute_transform(
             transform,
@@ -1178,7 +1169,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         _, _, error_sink = executor.execute_transform(transform, token, ctx)
         assert error_sink == "discard"
@@ -1192,7 +1184,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         executor.execute_transform(transform, token, ctx)
 
@@ -1228,7 +1221,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         executor.execute_transform(transform, token, ctx)
 
@@ -1247,7 +1241,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="DIVERT edge"):
             executor.execute_transform(transform, token, ctx)
@@ -1266,7 +1261,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         order: list[str] = []
         ctx.record_transform_error = lambda **kwargs: order.append("transform_error")  # type: ignore[method-assign]
@@ -1377,7 +1373,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         executor.execute_transform(transform, token, ctx)
 
@@ -1391,7 +1388,8 @@ class TestTransformExecutor:
         error_reason: TransformErrorReason = {"reason": "content_filtered", "provider": "azure", "code": "CF-01"}  # type: ignore[typeddict-unknown-key]
         transform.process.return_value = TransformResult.error(reason=error_reason)
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         executor.execute_transform(transform, token, ctx)
 
@@ -1971,7 +1969,8 @@ class TestTransformExecutor:
         token = _make_token(contract=input_contract)
         transform = _make_transform(on_error="discard")
         transform.process.return_value = TransformResult.error(reason={"reason": "content_filtered"})
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
         ctx.state_id = "previous_state"
         ctx.node_id = "previous_node"
         ctx.contract = previous_contract
@@ -2086,7 +2085,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token(contract=contract)
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         _result, updated_token, _error_sink = executor.execute_transform(transform, token, ctx)
 
@@ -2132,7 +2132,8 @@ class TestTransformExecutor:
             reason={"reason": "test_error"},
         )
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="on_error=None"):
             executor.execute_transform(transform, token, ctx)
@@ -2148,7 +2149,8 @@ class TestTransformExecutor:
         object.__setattr__(result, "reason", None)
         transform.process.return_value = result
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         with pytest.raises(OrchestrationInvariantError, match="reason is None"):
             executor.execute_transform(transform, token, ctx)
@@ -2678,11 +2680,12 @@ class TestGateExecutor:
             on_error="gate_errors",
         )
 
+        ctx = make_context()
         outcome = executor.execute_config_gate(
             config,
             "cg_1",
             _make_token(contract=_make_contract()),
-            make_context(),
+            ctx,
         )
 
         assert outcome.sink_name == "gate_errors"
@@ -2693,6 +2696,7 @@ class TestGateExecutor:
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         assert failed_kwargs["error"].exception_type == "ExpressionEvaluationError"
         factory.execution.record_routing_event.assert_called_once_with(
+            member_token=ctx.require_member_token(),
             state_id="state_001",
             edge_id="edge_gate_error",
             mode=RoutingMode.DIVERT,
@@ -3245,6 +3249,16 @@ class TestDispatchResolvedDestinationPerVariant:
 # =============================================================================
 
 
+_AGGREGATION_LEADER = CoordinationToken(run_id="test-run", worker_id="mock-worker", leader_epoch=1)
+
+
+def _accept_adopted_aggregation_row(executor: AggregationExecutor, node_id: NodeID, token: TokenInfo) -> tuple[str, int]:
+    """Feed the executor side of adoption; scheduler persistence has its own tests."""
+    membership = executor.open_batch_membership(node_id, coordination_token=_AGGREGATION_LEADER)
+    executor.accept_adopted_row(node_id, token)
+    return membership
+
+
 class TestAggregationExecutor:
     """Tests for AggregationExecutor covering buffering, flush, and triggers."""
 
@@ -3287,17 +3301,17 @@ class TestAggregationExecutor:
         token = _make_token()
 
         with pytest.raises(OrchestrationInvariantError, match="not in aggregation_settings"):
-            executor.buffer_row(NodeID("unknown"), token)
+            _accept_adopted_aggregation_row(executor, NodeID("unknown"), token)
 
     def test_buffer_row_first_row_creates_batch(self) -> None:
         """First buffered row creates a new batch via execution repo."""
         executor, factory, nid = self._make_agg_executor()
         token = _make_token()
 
-        executor.buffer_row(nid, token)
+        _accept_adopted_aggregation_row(executor, nid, token)
 
         factory.execution.create_batch.assert_called_once_with(
-            run_id="test-run",
+            coordination_token=_AGGREGATION_LEADER,
             aggregation_node_id=nid,
         )
 
@@ -3305,31 +3319,61 @@ class TestAggregationExecutor:
         """Second row does not create a new batch."""
         executor, factory, nid = self._make_agg_executor()
 
-        executor.buffer_row(nid, _make_token(token_id="t1"))
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
 
         # Only one batch created
         assert factory.execution.create_batch.call_count == 1
 
-    def test_buffer_row_records_batch_member_with_ordinal(self) -> None:
-        """Each buffered row records a batch member with incrementing ordinal."""
-        executor, factory, nid = self._make_agg_executor()
+    def test_adopted_rows_advance_batch_member_ordinal(self) -> None:
+        """Each accepted adoption advances the next ordinal in the same batch."""
+        executor, _, nid = self._make_agg_executor()
 
-        executor.buffer_row(nid, _make_token(token_id="t1"))
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        first_batch, first_ordinal = _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
+        second_batch, second_ordinal = _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
 
-        calls = factory.execution.add_batch_member.call_args_list
-        assert len(calls) == 2
-        assert calls[0][1]["ordinal"] == 0
-        assert calls[1][1]["ordinal"] == 1
+        assert first_batch == second_batch
+        assert (first_ordinal, second_ordinal) == (0, 1)
 
     # --- get_buffered_rows / get_buffered_tokens ---
+
+    @pytest.mark.parametrize("membership_lost", [False, True])
+    @pytest.mark.parametrize("during_cleanup", [False, True])
+    def test_flush_authority_refusal_preserves_open_attempt(self, membership_lost: bool, during_cleanup: bool) -> None:
+        from elspeth.contracts.errors import RunLeadershipLostError, RunMembershipLostError
+
+        executor, factory, nid = self._make_agg_executor(count=1)
+        contract = _make_contract()
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        failure = (
+            RunMembershipLostError(run_id="test-run", worker_id="mock-worker", verb="complete_batch")
+            if membership_lost
+            else RunLeadershipLostError(run_id="test-run", worker_id="mock-worker", leader_epoch=1, verb="complete_batch")
+        )
+        transform = _make_aggregation_transform("agg_transform")
+        transform.process.return_value = TransformResult.success(
+            make_row({"value": "aggregated"}, contract=contract),
+            success_reason={"action": "aggregated"},
+        )
+        if during_cleanup:
+            factory.execution.complete_aggregation_result.side_effect = RuntimeError("receipt failed before authority expired")
+            factory.execution.complete_batch.side_effect = failure
+        else:
+            factory.execution.complete_aggregation_result.side_effect = failure
+
+        with pytest.raises(type(failure)) as caught:
+            executor.execute_flush(nid, transform, make_context(), TriggerType.COUNT)
+
+        assert caught.value is failure
+        factory.execution.complete_node_state.assert_not_called()
+        assert factory.execution.complete_batch.call_count == int(during_cleanup)
+        assert executor.get_buffer_count(nid) == 1
 
     def test_get_buffered_rows_returns_data(self) -> None:
         """get_buffered_rows returns the buffered row dicts."""
         executor, _, nid = self._make_agg_executor()
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2"))
 
         rows = executor.get_buffered_rows(nid)
         assert len(rows) == 2
@@ -3344,7 +3388,7 @@ class TestAggregationExecutor:
     def test_get_buffered_tokens_returns_tokens(self) -> None:
         """get_buffered_tokens returns TokenInfo objects."""
         executor, _, nid = self._make_agg_executor()
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
 
         tokens = executor.get_buffered_tokens(nid)
         assert len(tokens) == 1
@@ -3366,9 +3410,9 @@ class TestAggregationExecutor:
     def test_get_buffer_count_correct(self) -> None:
         executor, _, nid = self._make_agg_executor()
         assert executor.get_buffer_count(nid) == 0
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
         assert executor.get_buffer_count(nid) == 1
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
         assert executor.get_buffer_count(nid) == 2
 
     def test_get_buffer_count_unconfigured_raises(self) -> None:
@@ -3382,10 +3426,10 @@ class TestAggregationExecutor:
         """should_flush delegates to trigger evaluator (count=3, need 3 rows)."""
         executor, _, nid = self._make_agg_executor(count=3)
         assert executor.should_flush(nid) is False
-        executor.buffer_row(nid, _make_token(token_id="t1"))
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
         assert executor.should_flush(nid) is False
-        executor.buffer_row(nid, _make_token(token_id="t3"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t3"))
         assert executor.should_flush(nid) is True
 
     def test_should_flush_unconfigured_raises(self) -> None:
@@ -3397,13 +3441,13 @@ class TestAggregationExecutor:
 
     def test_get_trigger_type_returns_none_before_fire(self) -> None:
         executor, _, nid = self._make_agg_executor(count=10)
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
         assert executor.get_trigger_type(nid) is None
 
     def test_get_trigger_type_returns_count_after_fire(self) -> None:
         executor, _, nid = self._make_agg_executor(count=2)
-        executor.buffer_row(nid, _make_token(token_id="t1"))
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
         # should_flush() must be called first to evaluate triggers
         # (sets _last_triggered on the evaluator)
         assert executor.should_flush(nid) is True
@@ -3450,8 +3494,8 @@ class TestAggregationExecutor:
         contract = _make_contract()
 
         # Buffer two rows
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
 
         # Mock batch transform
         transform = _make_aggregation_transform("agg_transform")
@@ -3475,7 +3519,7 @@ class TestAggregationExecutor:
         factory.execution.complete_aggregation_result.assert_called_once()
         receipt_kwargs = factory.execution.complete_aggregation_result.call_args.kwargs
         assert receipt_kwargs["batch_id"] == "batch_001"
-        assert receipt_kwargs["run_id"] == "test-run"
+        assert receipt_kwargs["coordination_token"] is ctx.require_coordination_token()
         assert receipt_kwargs["aggregation_node_id"] == "agg_1"
         assert receipt_kwargs["state_id"] == "state_001"
         assert receipt_kwargs["trigger_type"] == TriggerType.COUNT
@@ -3502,8 +3546,8 @@ class TestAggregationExecutor:
         contract = _make_contract()
 
         # Buffer two rows
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
 
         # Mock batch transform
         transform = _make_aggregation_transform("agg_transform")
@@ -3540,7 +3584,7 @@ class TestAggregationExecutor:
 
         executor, factory, nid = self._make_agg_executor(count=1)
         contract = _make_contract()
-        executor.buffer_row(nid, _make_token(data={"count": "42"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"count": "42"}, token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.input_schema = StrictInputSchema
@@ -3568,7 +3612,7 @@ class TestAggregationExecutor:
 
         executor, factory, nid = self._make_agg_executor(count=1)
         contract = _make_contract()
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.output_schema = StrictOutputSchema
@@ -3597,7 +3641,7 @@ class TestAggregationExecutor:
         events: list[EngineSpanCompleted] = []
         spans = SpanFactory(telemetry_emit=events.append)
         executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1"))
         transform = _make_aggregation_transform("agg_transform")
         transform.output_schema = StrictOutputSchema
         transform.process.return_value = TransformResult.success(
@@ -3621,8 +3665,8 @@ class TestAggregationExecutor:
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.process.return_value = TransformResult.error(
@@ -3648,7 +3692,7 @@ class TestAggregationExecutor:
         events: list[EngineSpanCompleted] = []
         spans = SpanFactory(telemetry_emit=events.append)
         executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1"))
         transform = _make_aggregation_transform("agg_transform")
         transform.process.return_value = TransformResult.error(reason={"reason": "rejected"})
 
@@ -3670,8 +3714,8 @@ class TestAggregationExecutor:
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.process.side_effect = RuntimeError("transform crash")
@@ -3690,7 +3734,7 @@ class TestAggregationExecutor:
         contract = _make_contract()
         secret = "sk-" + ("a" * 32)
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.process.side_effect = RuntimeError(f"Authorization: Bearer {secret}")
@@ -3716,8 +3760,8 @@ class TestAggregationExecutor:
         executor, _factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"v": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"v": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": "b"}, token_id="t2", contract=contract))
 
         transform = _make_aggregation_transform("agg")
         transform.process.side_effect = RuntimeError("boom")
@@ -3770,7 +3814,7 @@ class TestAggregationExecutor:
 
         # === First flush: 3 rows ===
         for i, label in enumerate(("a", "b", "c"), start=1):
-            executor.buffer_row(nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
+            _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
 
         transform = _CapturingBatchTransform()
         _result, _tokens, flushed_batch_id = executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
@@ -3791,7 +3835,7 @@ class TestAggregationExecutor:
 
         # === Second flush: another 3 rows ===
         for i, label in enumerate(("d", "e", "f"), start=4):
-            executor.buffer_row(nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
+            _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
 
         executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
 
@@ -3812,8 +3856,8 @@ class TestAggregationExecutor:
         executor, _factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"v": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"v": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"v": "b"}, token_id="t2", contract=contract))
 
         transform = _make_aggregation_transform("agg")
         transform.process.side_effect = RuntimeError("boom")
@@ -3849,7 +3893,7 @@ class TestAggregationExecutor:
         ctx = make_context()
 
         for i, label in enumerate(("a", "b", "c"), start=1):
-            executor_a.buffer_row(nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
+            _accept_adopted_aggregation_row(executor_a, nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
 
         transform_a = _make_aggregation_transform("agg")
         transform_a.process.return_value = TransformResult.success(
@@ -3906,7 +3950,7 @@ class TestAggregationExecutor:
                 )
 
         for i, label in enumerate(("d", "e"), start=4):
-            executor_b.buffer_row(nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
+            _accept_adopted_aggregation_row(executor_b, nid, _make_token(data={"v": label}, token_id=f"t{i}", contract=contract))
 
         executor_b.execute_flush(nid, _CapturingBatchTransform(), ctx, TriggerType.COUNT)
 
@@ -3924,7 +3968,7 @@ class TestAggregationExecutor:
         executor, _factory, nid = self._make_agg_executor(count=1)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg")
         transform.process.return_value = TransformResult.success(
@@ -3948,7 +3992,7 @@ class TestAggregationExecutor:
 
     def test_get_batch_id_set_after_first_row(self) -> None:
         executor, _, nid = self._make_agg_executor()
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
         assert executor.get_batch_id(nid) == "batch_001"
 
     # --- check_flush_status ---
@@ -3961,8 +4005,8 @@ class TestAggregationExecutor:
         assert should_flush is False
         assert trigger is None
 
-        executor.buffer_row(nid, _make_token(token_id="t1"))
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
 
         should_flush, trigger = executor.check_flush_status(nid)
         assert should_flush is True
@@ -4006,7 +4050,7 @@ class TestAggregationExecutor:
         contract = _make_contract()
         token = _make_token(data={"value": "test"}, contract=contract)
 
-        executor.buffer_row(nid, token)
+        _accept_adopted_aggregation_row(executor, nid, token)
 
         buffered = executor.get_buffered_rows(nid)
         assert len(buffered) == 1
@@ -4021,7 +4065,7 @@ class TestAggregationExecutor:
         row_data = {"value": "test", "extra": "field", "number": 42}
         token = _make_token(data=row_data, contract=contract)
 
-        executor.buffer_row(nid, token)
+        _accept_adopted_aggregation_row(executor, nid, token)
 
         buffered = executor.get_buffered_rows(nid)
         assert buffered[0] == {"value": "test", "extra": "field", "number": 42}
@@ -4032,7 +4076,7 @@ class TestAggregationExecutor:
         contract = _make_contract()
         token = _make_token(data={"value": "test"}, contract=contract)
 
-        executor.buffer_row(nid, token)
+        _accept_adopted_aggregation_row(executor, nid, token)
 
         buffered_tokens = executor.get_buffered_tokens(nid)
         assert len(buffered_tokens) == 1
@@ -4167,7 +4211,7 @@ class TestAggregationExecutor:
         # Time passes before the next genuine batch starts — age must anchor
         # to the first accept, NOT the restore instant.
         clock.advance(30.0)
-        executor.buffer_row(nid, _make_token(token_id="t9"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t9"))
         assert node.trigger.get_age_seconds() == 0.0
         assert executor.should_flush(nid) is False  # count=2, one row, no stale latch
 
@@ -4395,16 +4439,16 @@ class TestAggregationExecutor:
         """
         executor, _, nid = self._make_agg_executor(count=10)
         assert executor.get_barrier_scalars() == {}
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
         assert executor.get_barrier_scalars() == {}
 
     def test_get_barrier_scalars_reads_live_trigger_latches(self) -> None:
         """A latched count trigger surfaces as AggregationNodeScalars for its node."""
         clock = MockClock(start=0.0)
         executor, _, nid = self._make_agg_executor(count=2, clock=clock)
-        executor.buffer_row(nid, _make_token(token_id="t1"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t1"))
         clock.advance(1.5)
-        executor.buffer_row(nid, _make_token(token_id="t2"))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(token_id="t2"))
         # should_flush() evaluates triggers, latching the count fire time
         assert executor.should_flush(nid) is True
 
@@ -4430,6 +4474,50 @@ class TestNodeStateGuard:
     failures left node_states permanently OPEN in the audit trail.
     """
 
+    @pytest.mark.parametrize("authority", ["leader", "member"])
+    def test_repository_authority_refusal_keeps_open_state_and_original_exception(self, authority: str) -> None:
+        from elspeth.contracts.errors import RunLeadershipLostError, RunMembershipLostError
+        from elspeth.engine.executors import NodeStateGuard
+
+        setup = make_recorder_with_run(source_node_id="source-0")
+        register_test_node(setup.data_flow, setup.run_id, "transform-1")
+        _, token = setup.data_flow.create_row_with_token(
+            setup.source_node_id,
+            0,
+            {"value": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
+        )
+        guard = NodeStateGuard(
+            setup.execution,
+            token_id=token.token_id,
+            node_id="transform-1",
+            member_token=setup.coordination_token.membership,
+            step_index=1,
+            input_data={"value": 1},
+            auto_fail_phase="transform_execution",
+        )
+        refused: list[Exception] = []
+        expected = RunLeadershipLostError if authority == "leader" else RunMembershipLostError
+        with pytest.raises(expected) as propagated, guard:
+            setup.factory.run_coordination.release_seat(token=setup.coordination_token)
+            try:
+                if authority == "leader":
+                    setup.execution.begin_operation(
+                        coordination_token=setup.coordination_token,
+                        node_id="transform-1",
+                        operation_type="source_load",
+                    )
+                else:
+                    guard.complete(NodeStateStatus.COMPLETED, output_data={"value": 1})
+            except expected as exc:
+                refused.append(exc)
+                raise
+
+        assert propagated.value is refused[0]
+        assert setup.execution.get_node_state(guard.state_id).status is NodeStateStatus.OPEN
+
     def test_auto_fail_phase_is_required_at_construction(self) -> None:
         """Every caller must name its guarded scope; there is no safe fallback."""
         from elspeth.engine.executors import NodeStateGuard
@@ -4440,7 +4528,7 @@ class TestNodeStateGuard:
                 factory.execution,
                 token_id="tok_1",
                 node_id="node_1",
-                run_id="run_1",
+                member_token=make_context(run_id="run_1").require_member_token(),
                 step_index=1,
                 input_data={"v": 1},
             )
@@ -4466,7 +4554,7 @@ class TestNodeStateGuard:
                 factory.execution,
                 token_id="tok_1",
                 node_id="node_1",
-                run_id="run_1",
+                member_token=make_context(run_id="run_1").require_member_token(),
                 step_index=1,
                 input_data={"v": 1},
                 auto_fail_phase=invalid_phase,
@@ -4491,7 +4579,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4516,7 +4604,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4544,7 +4632,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4565,7 +4653,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4592,7 +4680,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4615,7 +4703,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4645,7 +4733,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4673,7 +4761,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4699,7 +4787,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4722,7 +4810,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4747,7 +4835,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4766,7 +4854,7 @@ class TestNodeStateGuard:
             _make_factory().execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4792,7 +4880,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4811,7 +4899,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4828,7 +4916,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=2,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4858,7 +4946,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4882,7 +4970,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4908,7 +4996,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4926,7 +5014,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4952,7 +5040,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -4975,7 +5063,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -5012,7 +5100,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -5034,16 +5122,22 @@ class TestNodeStateGuard:
 
         setup = make_recorder_with_run(source_node_id="source-0")
         register_test_node(setup.data_flow, setup.run_id, "transform-1")
-        setup.data_flow.create_row(
-            setup.run_id, setup.source_node_id, 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0
+        setup.data_flow.create_row_with_token(
+            setup.source_node_id,
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            token_id="tok-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
         )
-        setup.data_flow.create_token("row-1", token_id="tok-1")
 
         guard = NodeStateGuard(
             setup.execution,
             token_id="tok-1",
             node_id="transform-1",
-            run_id=setup.run_id,
+            member_token=setup.coordination_token.membership,
             step_index=1,
             input_data={"name": "test"},
             auto_fail_phase="transform_execution",
@@ -5076,16 +5170,22 @@ class TestNodeStateGuard:
 
         setup = make_recorder_with_run(source_node_id="source-0")
         register_test_node(setup.data_flow, setup.run_id, "transform-1")
-        setup.data_flow.create_row(
-            setup.run_id, setup.source_node_id, 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0
+        setup.data_flow.create_row_with_token(
+            setup.source_node_id,
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            token_id="tok-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
         )
-        setup.data_flow.create_token("row-1", token_id="tok-1")
 
         guard = NodeStateGuard(
             setup.execution,
             token_id="tok-1",
             node_id="transform-1",
-            run_id=setup.run_id,
+            member_token=setup.coordination_token.membership,
             step_index=1,
             input_data={"name": "test"},
             auto_fail_phase="transform_execution",
@@ -5109,7 +5209,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -5153,7 +5253,7 @@ class TestNodeStateGuard:
             factory.execution,
             token_id="tok_1",
             node_id="node_1",
-            run_id="run_1",
+            member_token=make_context(run_id="run_1").require_member_token(),
             step_index=1,
             input_data={"v": 1},
             auto_fail_phase="transform_execution",
@@ -5503,8 +5603,8 @@ class TestAggregationExecutorTerminality:
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
-        executor.buffer_row(nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "b"}, token_id="t2", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.process.return_value = TransformResult.success(
@@ -5558,7 +5658,7 @@ class TestAggregationExecutorTerminality:
         executor, factory, nid = self._make_agg_executor(count=1)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         # Transform crashes — inner except completes guard, then outer except tries cleanup
@@ -5576,7 +5676,7 @@ class TestAggregationExecutorTerminality:
         executor, factory, nid = self._make_agg_executor(count=1)
         contract = _make_contract()
 
-        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
+        _accept_adopted_aggregation_row(executor, nid, _make_token(data={"value": "a"}, token_id="t1", contract=contract))
 
         transform = _make_aggregation_transform("agg_transform")
         transform.process.return_value = TransformResult.success(
@@ -6014,6 +6114,32 @@ class TestTransformExecutorBatchPath:
 
         assert transform.is_batch_aware is False
 
+    def test_timed_out_batch_keeps_original_claim_context(self) -> None:
+        """Late batch work retains its claim after the scheduler restores ctx."""
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        contract = _make_contract()
+        transform = self._make_batch_transform()
+        waiter = _BatchWaiterDouble(side_effect=TimeoutError("timed out"))
+        _install_batch_adapter(executor, _BatchAdapterDouble(waiter))
+        token = _make_token(contract=contract)
+        ctx = make_context(token=token)
+        original_member = ctx.require_member_token()
+        original_claim = ctx.require_work_item()
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            executor.execute_transform(transform, token, ctx)
+
+        submitted_ctx = transform.accept.call_args[0][1]
+        ctx.work_item = None
+        ctx.member_token = None
+        ctx.state_id = "next-attempt"
+
+        assert submitted_ctx is not ctx
+        assert submitted_ctx.require_work_item() is original_claim
+        assert submitted_ctx.require_member_token() == original_member
+        assert submitted_ctx.state_id == "state_001"
+
     def test_non_batch_transform_uses_process(self) -> None:
         """A regular transform (no batch runtime protocol) uses process(), not accept()."""
         factory = _make_factory()
@@ -6213,7 +6339,8 @@ class TestTransformExecutorBatchPath:
         _install_batch_adapter(executor, mock_adapter)
 
         token = _make_token()
-        ctx = make_context(landscape=factory.execution)
+        ctx = make_context()
+        ctx.landscape = factory.execution
 
         _, _, error_sink = executor.execute_transform(transform, token, ctx)
 

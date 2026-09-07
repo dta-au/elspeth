@@ -16,11 +16,43 @@ from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.engine import Row
+from sqlalchemy.engine import Connection, Row
 from sqlalchemy.sql import Executable
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.schema import batches_table
+
+
+def batch_retry_lineage_ids_on(
+    conn: Connection,
+    *,
+    batch_id: str,
+    run_id: str,
+    aggregation_node_id: str,
+    retry_of_batch_id: str | None,
+) -> tuple[str, ...]:
+    """Read the validated retry chain on the receipt writer's fenced connection."""
+    lineage = [batch_id]
+    ancestor_id = retry_of_batch_id
+    while ancestor_id is not None:
+        if ancestor_id in lineage:
+            raise AuditIntegrityError(
+                f"aggregation batch {batch_id!r} has a cyclic retry lineage at ancestor {ancestor_id!r} — audit corruption"
+            )
+        ancestor = conn.execute(
+            select(
+                batches_table.c.run_id,
+                batches_table.c.aggregation_node_id,
+                batches_table.c.retry_of_batch_id,
+            ).where(batches_table.c.batch_id == ancestor_id)
+        ).one_or_none()
+        if ancestor is None or ancestor.run_id != run_id or ancestor.aggregation_node_id != aggregation_node_id:
+            raise AuditIntegrityError(
+                f"aggregation batch {batch_id!r} has a missing, foreign, or wrong-node retry ancestor {ancestor_id!r}"
+            )
+        lineage.append(ancestor_id)
+        ancestor_id = ancestor.retry_of_batch_id
+    return tuple(lineage)
 
 
 def batch_retry_lineage_ids(
