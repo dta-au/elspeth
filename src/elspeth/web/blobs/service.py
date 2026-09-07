@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import threading
+import traceback
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -3447,7 +3448,9 @@ class BlobServiceImpl:
                         BlobForkCleanupError(
                             blob_id=blob_id,
                             exc_type=type(cleanup_exc).__name__,
-                            detail=str(cleanup_exc),
+                            # Rollback failures are PEP 678 notes on the
+                            # primary error; keep them in returned evidence.
+                            detail="".join(traceback.format_exception_only(cleanup_exc)).strip(),
                         )
                     )
                     try:

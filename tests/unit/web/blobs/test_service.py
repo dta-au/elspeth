@@ -4416,6 +4416,51 @@ class TestCopyBlobsForFork:
         assert context is None
 
     @pytest.mark.asyncio
+    async def test_cleanup_preserves_commit_failure_and_failed_restore_evidence(
+        self, blob_service, session_id, target_session_id, db_engine, monkeypatch, compose_context
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        await blob_service.create_blob(session_id, "first.csv", b"first", "text/csv", session_operation_context=compose_context)
+        await self._copy(blob_service, session_id, target_session_id)
+        operation_id = self._fail_fork(blob_service, session_id, target_session_id)
+        target = (await blob_service.list_blobs(target_session_id, limit=None))[0]
+        storage = Path(target.storage_path)
+        original_commit = db_engine.dialect.do_commit
+        original_replace = os.replace
+        commit_failed = False
+
+        def fail_delete_commit(connection) -> None:
+            nonlocal commit_failed
+            if not commit_failed and list(storage.parent.glob(f".{storage.name}.delete-*")):
+                commit_failed = True
+                raise OperationalError("COMMIT", {}, RuntimeError("injected cleanup commit failure"))
+            original_commit(connection)
+
+        def fail_restore(source, destination, **kwargs) -> None:
+            if Path(destination) == storage and ".delete-" in Path(source).name:
+                raise PermissionError("injected restore permission failure")
+            original_replace(source, destination, **kwargs)
+
+        monkeypatch.setattr(db_engine.dialect, "do_commit", fail_delete_commit)
+        monkeypatch.setattr(os, "replace", fail_restore)
+        result = await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
+
+        assert commit_failed
+        assert not result.deleted_ids
+        assert len(result.errors) == 1
+        failure = result.errors[0]
+        assert failure.blob_id == target.id
+        assert failure.exc_type == "OperationalError"
+        assert "injected cleanup commit failure" in failure.detail
+        assert "PermissionError: injected restore permission failure" in failure.detail
+        assert "manual reconciliation required" in failure.detail
+        assert str(storage) in failure.detail
+        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        assert len(tombstones) == 1
+        assert str(tombstones[0]) in failure.detail
+
+    @pytest.mark.asyncio
     async def test_cleanup_records_recovery_failed_when_residual_check_cannot_run(
         self,
         blob_service: BlobServiceImpl,
