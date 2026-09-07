@@ -4149,7 +4149,13 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3ff2ad66f23de4bc",
         1,
         None,
-        line=219,
+        # CKPT-SNAP (elspeth-43ddb79074): 219 -> 205, POSITION ONLY. The fingerprint is
+        # byte-identical across the move; the -14 is the height of the deleted
+        # CheckpointManager._fenced_or_plain_write above it. Edited in place rather than
+        # delete-and-append: _identity_key includes site.line, so a pure line shift
+        # leaves a SURVIVING STALE ROW that the row count cannot see, and appending
+        # instead of moving is the merge shape that loses rows when two lanes both add.
+        line=205,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/manager.py",
@@ -4159,7 +4165,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c3ee61782a940776",
         1,
         None,
-        line=241,
+        # CKPT-SNAP (elspeth-43ddb79074): 241 -> 227, POSITION ONLY, same -14 and the
+        # same byte-identical fingerprint as the row above.
+        line=227,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",

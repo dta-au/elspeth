@@ -448,7 +448,18 @@ _EXPECTED_DML_COUNT = 151
 # value because the intervening tip delta touched no Python. The lane declared four
 # added SHAPES and none removed; this scan measured eleven added and four removed
 # ROWS: the same fact at two granularities, reconciled row by row before pinning.
-_EXPECTED_DML_INVENTORY_SHA256 = "b9ef22affdff788e2868cb27aca56d07083bc4813d5d9ad6024e0698b038975e"
+# CKPT-SNAP (elspeth-43ddb79074, ADR-048 D8): b9ef22af… -> the value below, at COUNT
+# 151 UNCHANGED and write shapes added and removed BOTH EMPTY. A balanced swap: the
+# count is actively reassuring and wrong, and only the row list separates it from no
+# change at all. Four rows move — two checkpoint constructions now take the run
+# subject from the token attribute, and two audit-export inserts keep BYTE-IDENTICAL
+# fingerprints and move on the owning symbol alone, register_verified_candidate ->
+# _register_verified_on. The sentence above about the intervening tip delta touching
+# no Python described the SINKFX landing and does NOT hold across this one, which
+# adds a 204-line test file and edits ten src modules. Re-derived on the merged tree
+# 79fefa4fe by RUNNING the gate, never by reasoning about rows, and agreed value for
+# value by an independent derivation from a git archive of the same sha.
+_EXPECTED_DML_INVENTORY_SHA256 = "015778654a1316cff2ad6e0c553583d430254e0809c0ff79b23a52d3cf7b8b9b"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -540,8 +551,15 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # tip; the two un-pinned callers arrived with the ADR-048 run-coordination
 # work), plus this lane's takeover_expired#2 above. Re-derived from the gate's
 # printed output on the rebased tree; no caller of this lane's was removed.
+# CKPT-SNAP (elspeth-43ddb79074, ADR-048 D8): 4abf5f61… -> the value below at COUNT
+# 269 UNCHANGED. A BALANCED SWAP, one row out and one in: delete_checkpoints#1 leaves
+# RunLifecycleCoordinator.run for the extracted
+# RunLifecycleCoordinator._delete_checkpoints_after_success. The count cannot see this
+# and never could; only the row list separates it from no change at all. Re-derived on
+# the merged tree 79fefa4fe from the gate's own printed live-vs-pinned output, and
+# agreed value for value by an independent derivation from a git archive of that sha.
 _EXPECTED_CALL_COUNT = 269
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "4abf5f610cef539417cbbb143c9dfd720b424c8a55d3dd8b9e971d440673a184"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "b53a18db3eac8c467467907e130adcfb6d5b92ac9af5fdcbaab839108ddb3850"
 # Subordinate edges 70 -> 80 (-5 +15): create_row_with_token's second
 # insert_row_with_token_on edge and record_coalesce_branch_loss's two edges
 # retired; _transition_on's two edges rotated with the group_losses
@@ -571,8 +589,18 @@ _EXPECTED_COORDINATION_CALL_SHA256 = "55dc60ee8f4d822eaea9b889920e77fff395d117fa
 # ExecutionRepository.complete_aggregation_result -> complete_batch and
 # complete_node_state, RunLifecycleRepository._abandon_undecided_tokens_in ->
 # record_token_outcome, TokenSchedulerRepository.adopt_group_losses.
-_EXPECTED_INTERNAL_EDGE_COUNT = 101
-_EXPECTED_INTERNAL_EDGE_SHA256 = "61f1c9b9264d11a6537402b0a956248b160914b5185fe44cae7a303ec1880786"
+# CKPT-SNAP (elspeth-43ddb79074, ADR-048 D8): 101 -> 100. ONE edge REMOVED, none
+# added: register_candidate -> register_verified_candidate. Both public verbs of the
+# audit-export registry now delegate to the shared leader-fenced seam
+# _register_verified_on, so the edge ceases to exist and the write it guarded is
+# FENCED rather than lost. Attributed BY ROW IDENTITY and not by arithmetic: the
+# unrelated deletion of CheckpointManager._fenced_or_plain_write is perfectly
+# correlated with a drop of one and explains the count exactly, and it is NOT the
+# cause — that method contributes no row to this inventory at any tree. Only the row
+# list separates the two. Re-derived on the merged tree 79fefa4fe by running the gate,
+# and agreed by an independent derivation from a git archive of that sha.
+_EXPECTED_INTERNAL_EDGE_COUNT = 100
+_EXPECTED_INTERNAL_EDGE_SHA256 = "554692a6c15e96282c6affce6d17150ed7aedd8180f7f95a494c04151517db5e"
 
 
 def _repo_root() -> Path:
