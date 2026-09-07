@@ -75,7 +75,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
-from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -106,11 +106,38 @@ def _work_item_for_state(repo: ExecutionRepository, state_id: str) -> TokenWorkI
             )
         ).one()
     return TokenSchedulerRepository(repo._db.engine).enqueue_ready_claimed(
-        run_id=leader.run_id,
+        member_token=leader.membership,
         token_id=state.token_id,
         row_id=row.row_id,
         node_id=state.node_id,
         step_index=state.step_index,
+        ingest_sequence=row.ingest_sequence,
+        row_payload_json="{}",
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
+
+
+def _work_item_for_token(factory: RecorderFactory, token_id: str) -> TokenWorkItem:
+    leader = leader_coordination_token(factory, "run-1")
+    with factory.execution._db.read_only_connection() as conn:
+        row = conn.execute(
+            select(rows_table).join(tokens_table, rows_table.c.row_id == tokens_table.c.row_id).where(tokens_table.c.token_id == token_id)
+        ).one()
+        existing = conn.execute(
+            select(token_work_items_table).where(
+                token_work_items_table.c.token_id == token_id,
+                token_work_items_table.c.node_id.is_(None),
+            )
+        ).one_or_none()
+        if existing is not None:
+            return item_from_mapping(existing._mapping)
+    return factory.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token_id,
+        row_id=row.row_id,
+        node_id=None,
+        step_index=0,
         ingest_sequence=row.ingest_sequence,
         row_payload_json="{}",
         lease_owner=leader.worker_id,
@@ -173,40 +200,40 @@ def _make_repo(
     factory = make_factory(db)
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         node_id="source-0",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="transform",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={},
         node_id="transform-1",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="aggregator",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
         config={},
         node_id="agg-1",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="csv_sink",
         node_type=NodeType.SINK,
         plugin_version="1.0",
         config={},
         node_id="sink-0",
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     return db, repo, factory
 
@@ -218,8 +245,16 @@ def _make_repo_with_token(
 ) -> tuple[LandscapeDB, ExecutionRepository, RecorderFactory, str]:
     """Create repo with a token ready for processing."""
     db, repo, factory = _make_repo(run_id=run_id, payload_store=payload_store)
-    factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    factory.data_flow.create_token("row-1", token_id="tok-1")
+    factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        token_id="tok-1",
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
     return db, repo, factory, "tok-1"
 
 
@@ -333,8 +368,16 @@ class TestCompleteNodeStateCrashPaths:
     def test_batch_begin_and_complete_success_states_preserves_per_token_rows(self) -> None:
         """Batch sink-state writes must still leave one auditable row per token."""
         db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
+        fac.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "second"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(fac, "run-1"),
+        )
 
         states = repo.begin_node_states_many(
             (
@@ -376,16 +419,16 @@ class TestCompleteNodeStateCrashPaths:
         for index in range(state_count):
             row_id = f"row-bulk-{index}"
             token_id = f"tok-bulk-{index}"
-            fac.data_flow.create_row(
-                "run-1",
+            fac.data_flow.create_row_with_token(
                 "source-0",
                 index + 1,
                 {"name": f"bulk-{index}"},
                 row_id=row_id,
                 source_row_index=index + 1,
                 ingest_sequence=index + 1,
+                token_id=token_id,
+                coordination_token=leader_coordination_token(fac, "run-1"),
             )
-            fac.data_flow.create_token(row_id, token_id=token_id)
             begin_entries.append((token_id, "sink-0", 2, {"name": f"bulk-{index}"}))
         states = repo.begin_node_states_many(tuple(begin_entries), coordination_token=_leader_token(repo))
 
@@ -430,16 +473,16 @@ class TestCompleteNodeStateCrashPaths:
         completion back) must hold without it.
         """
         db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row(
-            "run-1",
+        fac.data_flow.create_row_with_token(
             "source-0",
             1,
             {"name": "second"},
             row_id="row-2",
             source_row_index=1,
             ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
-        fac.data_flow.create_token("row-2", token_id="tok-2")
         state_b = repo.begin_node_state(tok, "sink-0", 2, {"name": "test"}, state_id="state-b", member_token=_leader_token(repo).membership)
         state_a = repo.begin_node_state(
             "tok-2", "sink-0", 2, {"name": "second"}, state_id="state-a", member_token=_leader_token(repo).membership
@@ -504,8 +547,16 @@ class TestCompleteNodeStateCrashPaths:
     def test_batch_begin_rowcount_mismatch_rolls_back_inserted_open_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Rowcount mismatches must abort inside the write transaction."""
         db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
+        fac.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "second"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(fac, "run-1"),
+        )
         original_connection = run_coordination_repository.begin_write
 
         from contextlib import contextmanager
@@ -672,7 +723,7 @@ class TestReleasedTokenLookup:
         # FAILED. Row-scoped release evidence sees the row as released; the
         # token-scoped read must admit only the member.
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_token("row-1", token_id="tok-late")
+        fac.data_flow.create_token("row-1", token_id="tok-late", coordination_token=leader_coordination_token(fac, "run-1"))
 
         member = repo.begin_node_state(tok, "transform-1", 1, {"name": "test"}, member_token=_leader_token(repo).membership)
         residual = repo.begin_node_state(
@@ -791,12 +842,12 @@ class TestRecordRoutingEventsRowcount:
         # Create a node state and edge so the routing event has valid references
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         routes = [RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE)]
@@ -813,8 +864,9 @@ class TestRecordRoutingEventsRowcount:
 
                 def patched_execute(stmt, *args: Any, **kwargs: Any):
                     result = original_execute(stmt, *args, **kwargs)
-                    # Intercept INSERT results to simulate zero rowcount
-                    if stmt.is_insert:
+                    # Intercept this payload INSERT; setup and authority writes
+                    # retain their real database results.
+                    if stmt.is_insert and stmt.table is routing_events_table:
                         return _RowcountResult(rowcount=0)
                     return result
 
@@ -1192,7 +1244,7 @@ class TestRetryBatch:
     def test_retry_batch_copies_members(self) -> None:
         """retry_batch copies all members from the original batch."""
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_token("row-1", token_id="tok-2")
+        fac.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(fac, "run-1"))
 
         batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
         _add_batch_member(repo, batch.batch_id, tok, 0)
@@ -1227,8 +1279,16 @@ class TestRetryBatch:
     def test_retry_batch_keeps_lineages_distinct_for_multiple_failed_batches(self) -> None:
         """Failed batches on the same aggregation node must not share one retry row."""
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_row("run-1", "source-0", 1, {"name": "second"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        fac.data_flow.create_token("row-2", token_id="tok-2")
+        fac.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "second"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            token_id="tok-2",
+            coordination_token=leader_coordination_token(fac, "run-1"),
+        )
 
         batch_a = repo.create_batch("agg-1", batch_id="batch-a", coordination_token=_leader_token(repo))
         _add_batch_member(repo, batch_a.batch_id, tok, 0)
@@ -1520,30 +1580,30 @@ class TestRecordRoutingEvent:
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         edge = fac.data_flow.register_edge(
-            run_id="run-2",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="wrong-run",
             mode=RoutingMode.MOVE,
             edge_id="edge-run-2",
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
 
         with pytest.raises(LandscapeRecordError, match="same run"):
@@ -1560,30 +1620,30 @@ class TestRecordRoutingEvent:
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         edge = fac.data_flow.register_edge(
-            run_id="run-2",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="wrong-run",
             mode=RoutingMode.MOVE,
             edge_id="edge-run-2",
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
 
         with pytest.raises(IntegrityError), db.write_connection() as conn:
@@ -1610,12 +1670,12 @@ class TestRecordRoutingEvent:
         _db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         event = repo.record_routing_event(state.state_id, "edge-1", RoutingMode.MOVE, member_token=_leader_token(repo).membership)
@@ -1631,12 +1691,12 @@ class TestRecordRoutingEvent:
         _db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         reason: ConfigGateReason = {"condition": "row['x'] > 0", "result": "true"}
@@ -1651,12 +1711,12 @@ class TestRecordRoutingEvent:
         _db, repo, fac, tok = _make_repo_with_token(payload_store=store)
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         reason: ConfigGateReason = {"condition": "row['x'] > 0", "result": "true"}
@@ -1674,12 +1734,12 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         with pytest.raises(AuditIntegrityError, match="does not match its canonical SHA-256 hash"):
@@ -1712,12 +1772,12 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
         reason: ConfigGateReason = {"condition": "x", "result": "true"}
 
@@ -1740,12 +1800,12 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         with pytest.raises(AuditIntegrityError, match="requires canonical reason bytes"):
@@ -1762,12 +1822,12 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         with pytest.raises(LandscapeRecordError, match="reason materialization failed"):
@@ -1788,23 +1848,23 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
-        fac.data_flow.create_row(
-            "run-1",
+        fac.data_flow.create_row_with_token(
             "source-0",
             1,
             {"name": "occupied"},
             row_id="row-occupied",
             source_row_index=1,
             ingest_sequence=1,
+            token_id="tok-occupied",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
-        fac.data_flow.create_token("row-occupied", token_id="tok-occupied")
         occupied_state = repo.begin_node_state(
             "tok-occupied", "transform-1", 1, {"name": "occupied"}, member_token=_leader_token(repo).membership
         )
@@ -1853,12 +1913,12 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token(payload_store=store)  # type: ignore[arg-type]
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
         reason: ConfigGateReason = {"condition": "x", "result": "true"}
 
@@ -1882,12 +1942,12 @@ class TestRecordRoutingEvent:
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for edge_id in ("edge-a", "edge-b"):
             fac.data_flow.register_edge(
-                run_id="run-1",
                 from_node_id="transform-1",
                 to_node_id="sink-0",
                 label=edge_id,
                 mode=RoutingMode.MOVE,
                 edge_id=edge_id,
+                coordination_token=leader_coordination_token(fac, "run-1"),
             )
         first_reason: ConfigGateReason = {"condition": "x", "result": "true"}
         divergent_reason: ConfigGateReason = {"condition": "y", "result": "true"}
@@ -1912,20 +1972,20 @@ class TestRecordRoutingEvent:
         _db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="path_a",
             mode=RoutingMode.COPY,
             edge_id="edge-a",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="path_b",
             mode=RoutingMode.COPY,
             edge_id="edge-b",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         routes = [
@@ -1948,12 +2008,12 @@ class TestRecordRoutingEvent:
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for edge_id in ("edge-a", "edge-b"):
             fac.data_flow.register_edge(
-                run_id="run-1",
                 from_node_id="transform-1",
                 to_node_id="sink-0",
                 label=edge_id,
                 mode=RoutingMode.COPY,
                 edge_id=edge_id,
+                coordination_token=leader_coordination_token(fac, "run-1"),
             )
         routes = [
             RoutingSpec(edge_id="edge-a", mode=RoutingMode.COPY),
@@ -1987,39 +2047,39 @@ class TestRecordRoutingEvent:
         db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="right-run",
             mode=RoutingMode.COPY,
             edge_id="edge-run-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
         fac.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-2")
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         fac.data_flow.register_node(
-            run_id="run-2",
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
         fac.data_flow.register_edge(
-            run_id="run-2",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="wrong-run",
             mode=RoutingMode.COPY,
             edge_id="edge-run-2",
+            coordination_token=leader_coordination_token(fac, "run-2"),
         )
 
         with pytest.raises(LandscapeRecordError, match="same run"):
@@ -2057,12 +2117,12 @@ class TestRecordRoutingEvent:
         _db, repo, fac, tok = _make_repo_with_token()
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         edge = fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="continue",
             mode=RoutingMode.MOVE,
             edge_id="edge-1",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
         pre_transaction_reads: list[str] = []
         original_fetchone = repo._ops.execute_fetchone
@@ -2100,12 +2160,12 @@ class TestRecordRoutingEvent:
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         for label in ("path-a", "path-b"):
             fac.data_flow.register_edge(
-                run_id="run-1",
                 from_node_id="transform-1",
                 to_node_id="sink-0",
                 label=label,
                 mode=RoutingMode.COPY,
                 edge_id=f"edge-{label}",
+                coordination_token=leader_coordination_token(fac, "run-1"),
             )
         pre_transaction_reads: list[str] = []
         original_fetchone = repo._ops.execute_fetchone
@@ -2230,13 +2290,13 @@ class TestRegisterArtifact:
         _db, repo, fac, tok = _make_repo_with_token()
         # Register a second sink
         fac.data_flow.register_node(
-            run_id="run-1",
             plugin_name="json_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         state0 = repo.begin_node_state(tok, "sink-0", 2, {"x": 1}, member_token=_leader_token(repo).membership)
@@ -2412,8 +2472,8 @@ class TestBatchLifecycleExtended:
     def test_get_batch_members_ordered_by_ordinal(self) -> None:
         """get_batch_members returns members ordered by ordinal."""
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_token("row-1", token_id="tok-2")
-        fac.data_flow.create_token("row-1", token_id="tok-3")
+        fac.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(fac, "run-1"))
+        fac.data_flow.create_token("row-1", token_id="tok-3", coordination_token=leader_coordination_token(fac, "run-1"))
 
         batch = repo.create_batch("agg-1", coordination_token=_leader_token(repo))
         _add_batch_member(repo, batch.batch_id, "tok-3", 2)
@@ -2428,7 +2488,7 @@ class TestBatchLifecycleExtended:
     def test_get_all_batch_members_for_run(self) -> None:
         """get_all_batch_members_for_run fetches members across all batches."""
         _db, repo, fac, tok = _make_repo_with_token()
-        fac.data_flow.create_token("row-1", token_id="tok-2")
+        fac.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(fac, "run-1"))
 
         b1 = repo.create_batch("agg-1", batch_id="batch-1", coordination_token=_leader_token(repo))
         _add_batch_member(repo, b1.batch_id, tok, 0)
@@ -2646,12 +2706,12 @@ class TestCallRecordingWithPayloadStore:
         _db, repo, fac, tok = _make_repo_with_token(payload_store=store)
         state = repo.begin_node_state(tok, "transform-1", 1, {"a": 1}, member_token=_leader_token(repo).membership)
         fac.data_flow.register_edge(
-            run_id="run-1",
             from_node_id="transform-1",
             to_node_id="sink-0",
             label="path-a",
             mode=RoutingMode.COPY,
             edge_id="edge-a",
+            coordination_token=leader_coordination_token(fac, "run-1"),
         )
 
         with pytest.raises(LandscapeRecordError, match=r"requires existing state_id=.*missing-edge"):
@@ -2687,19 +2747,20 @@ class TestResolveGroupMemberToken:
             row_id,
             token_id=token_id,
             lineage_path=tuple(LineageFrame(kind=FrameKind.FORK, group_id=g, member_key=m) for g, m in frames),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
     def test_resolves_the_token_whose_own_path_terminates_at_the_frame(self) -> None:
         setup = make_recorder_with_run(run_id="run-1")
         factory = setup.factory
-        factory.data_flow.create_row(
-            run_id="run-1",
+        factory.data_flow.create_row_with_token(
             source_node_id=setup.source_node_id,
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             row_id="row-1",
             data={},
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         # outer_a-only token: the frame IS its own terminal frame.
         self._mint(factory, run_id="run-1", row_id="row-1", token_id="tok-outer-a", frames=[("fg-outer", "outer_a")])
@@ -2735,14 +2796,14 @@ class TestResolveGroupMemberToken:
         descendant."""
         setup = make_recorder_with_run(run_id="run-1")
         factory = setup.factory
-        factory.data_flow.create_row(
-            run_id="run-1",
+        factory.data_flow.create_row_with_token(
             source_node_id=setup.source_node_id,
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             row_id="row-1",
             data={},
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         self._mint(
             factory,
@@ -2756,14 +2817,14 @@ class TestResolveGroupMemberToken:
             factory.execution.resolve_group_member_token(run_id="run-1", kind=FrameKind.FORK, group_id="fg-outer", member_key="outer_a")
 
     def _row(self, setup) -> str:
-        setup.factory.data_flow.create_row(
-            run_id="run-1",
+        setup.factory.data_flow.create_row_with_token(
             source_node_id=setup.source_node_id,
             row_index=0,
             source_row_index=0,
             ingest_sequence=0,
             row_id="row-1",
             data={},
+            coordination_token=leader_coordination_token(setup.factory, "run-1"),
         )
         return "row-1"
 
@@ -2776,6 +2837,7 @@ class TestResolveGroupMemberToken:
             row_id=row_id,
             merged_payload={"merged": True},
             merged_contract=SchemaContract(mode="OBSERVED", fields=(), locked=True),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
     def test_successful_inner_merge_supersedes_the_consumed_branch_token(self) -> None:
@@ -2791,15 +2853,21 @@ class TestResolveGroupMemberToken:
         setup = make_recorder_with_run(run_id="run-1")
         factory = setup.factory
         row_id = self._row(setup)
-        root = factory.data_flow.create_token(row_id)
+        root = factory.data_flow.create_token(row_id, coordination_token=leader_coordination_token(factory, "run-1"))
         (branch_a, branch_b), outer_group = factory.data_flow.fork_token(
-            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"), row_id=row_id, branches=["a", "b"]
+            parent_ref=TokenRef(token_id=root.token_id, run_id="run-1"),
+            row_id=row_id,
+            branches=["a", "b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_work_item_for_token(factory, (TokenRef(token_id=root.token_id, run_id="run-1")).token_id),
         )
         inner_children, _ = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=branch_b.token_id, run_id="run-1"),
             row_id=row_id,
             branches=["b1", "b2"],
             parent_lineage_path=branch_b.lineage_path,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_work_item_for_token(factory, (TokenRef(token_id=branch_b.token_id, run_id="run-1")).token_id),
         )
         merged_1 = self._merge(factory, inner_children, row_id)
 
@@ -2819,6 +2887,8 @@ class TestResolveGroupMemberToken:
             row_id=row_id,
             branches=["c1", "c2"],
             parent_lineage_path=merged_1.lineage_path,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_work_item_for_token(factory, (TokenRef(token_id=merged_1.token_id, run_id="run-1")).token_id),
         )
         merged_2 = self._merge(factory, second_children, row_id)
         assert resolve() == merged_2.token_id

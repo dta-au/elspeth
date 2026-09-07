@@ -38,7 +38,6 @@ def _setup(*, payload_store: MockPayloadStore | None = None) -> _ExecutionSetup:
         window_seconds=300,
     )
     row, token = recorder.data_flow.create_row_with_token(
-        recorder.run_id,
         recorder.source_node_id,
         0,
         {"value": 1},
@@ -47,7 +46,7 @@ def _setup(*, payload_store: MockPayloadStore | None = None) -> _ExecutionSetup:
         coordination_token=recorder.coordination_token,
     )
     item = recorder.factory.scheduler.enqueue_ready_claimed(
-        run_id=recorder.run_id,
+        member_token=member,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id="transform",
@@ -162,7 +161,6 @@ def test_stale_item_cannot_allocate_or_record_calls(verb: str) -> None:
 def test_item_cannot_authorize_a_different_tokens_state() -> None:
     setup = _setup()
     row, token = setup.recorder.data_flow.create_row_with_token(
-        setup.recorder.run_id,
         setup.recorder.source_node_id,
         1,
         {"value": 2},
@@ -285,11 +283,11 @@ def test_follower_can_record_routing_decisions(plural: bool) -> None:
     setup = _setup()
     state_id = _state(setup)
     edge = setup.recorder.data_flow.register_edge(
-        setup.recorder.run_id,
         "transform",
         "aggregate",
         "next",
         RoutingMode.MOVE,
+        coordination_token=leader_coordination_token(setup.recorder.factory, setup.recorder.run_id),
     )
     if plural:
         events = setup.recorder.execution.record_routing_events(
